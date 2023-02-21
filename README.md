@@ -37,6 +37,9 @@ OPENAI_KEY = 'YOURTOKENHERE'
 DISCORD_TOKEN = 'YOURTOKENHERE'
 ```
 
+### Configuration - Bot Tuning
+The `initialize_text` variable at the top of each script will set the tone for how the bot will respond. Telling it that it is a chatbot and with any specific style of responses, along with how to preface it's responses (in the case of the cli, it can name itself in the chat history this way.) will help with more appropriate responses.
+
 ### Running the bot
 Run the py file for your chosen interface
 
