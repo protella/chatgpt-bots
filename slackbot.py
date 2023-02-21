@@ -10,7 +10,7 @@ SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
 OPENAI_KEY = os.environ["OPENAI_KEY"]
 RESET_CONTEXT = "!reset"
-INITIALIZE_TEXT = "You are a chatbot that reluctantly answers questions with witty, sassy, and sarcastic responses."
+INITIALIZE_TEXT = "You are a chatbot that answers questions with accurate, informative, and and sometimes humorous responses."
 # INITIALIZE_TEXT = (
 #     "You are a chatbot that responds kindly and accurately to all questions."
 # )
