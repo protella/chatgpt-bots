@@ -1,0 +1,5 @@
+discord
+asyncio
+openai
+slack_bolt
+dotenv
