@@ -2,4 +2,4 @@ discord
 asyncio
 openai
 slack_bolt
-dotenv
+python-dotenv
