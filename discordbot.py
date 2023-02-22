@@ -58,9 +58,9 @@ class MyClient(discord.Client):
                 f"```My Memory has been wiped. I'm dumb again.```"
             )
             return
-
+        print(f"{message.content}\n")
         if message.content.startswith(TRIGGER):
-            await message.channel.send(f"```{context_mgr(message.content)}```")
+            await message.channel.send(f"{context_mgr(message.content)}")
 
 
 def context_mgr(ai_prompt):
@@ -76,7 +76,7 @@ def context_mgr(ai_prompt):
     debug_input = "Context: " + "\n".join(history) + "\nMe: " + ai_prompt
     output = get_ai_response(chat_input)
     history += [ai_prompt, output.strip()]
-    print(f"CHAT INPUT: {debug_input}\n")
+    # print(f"CHAT INPUT: {debug_input}\n")
     # print(f'HISTORY: {history}\n')
     return output
 
