@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 class ChatBot:
     def __init__(self, INITIALIZE_TEXT, filepath=""):
-        self.messages = []
+        self.messages = [INITIALIZE_TEXT]
         self.INITIALIZE_TEXT = INITIALIZE_TEXT
         self.initialized = 0
         self.filepath = filepath
@@ -25,9 +25,6 @@ class ChatBot:
         return "Rebooting. Beep Beep Boop. My memory has been wiped!"
 
     def context_mgr(self, user_message):
-        if self.initialized == 0:
-            self.messages.append(self.INITIALIZE_TEXT)
-            self.initialized = 1
 
         self.messages.append({"role": "user", "content": user_message})
         self.gpt_output = self.get_ai_response(self.messages)
