@@ -2,6 +2,7 @@ import discord
 import openai
 import os
 from dotenv import load_dotenv
+import bot_functions
 
 load_dotenv()
 
@@ -9,7 +10,7 @@ OPENAI_KEY = os.environ["OPENAI_KEY"]
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 TRIGGER = ""
 RESET_CONTEXT = "!reset"
-initialize_text = "You are a chatbot that reluctantly answers questions with witty, sassy, and sarcastic responses."
+initialize_text = "You are the Jarvis virtual assistant from the Ironman movies. Act and respond as such including the witty, snarky, and sarcastic responses typical of the Jarvis personality."
 initialized = 0
 history = []
 

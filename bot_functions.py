@@ -5,50 +5,54 @@ from dotenv import load_dotenv
 
 class ChatBot:
     def __init__(self, INITIALIZE_TEXT, filepath=""):
-        self.history = []
+        self.messages = []
         self.INITIALIZE_TEXT = INITIALIZE_TEXT
         self.initialized = 0
         self.filepath = filepath
+        self.gpt_output = {}
 
     load_dotenv()
+    
     openai.api_key = os.environ["OPENAI_KEY"]
 
-    def open_file(self):
-        with open(self.filepath, "r", encoding="utf-8") as infile:
-            return infile.read()
+    # def open_file(self):
+    #     with open(self.filepath, "r", encoding="utf-8") as infile:
+    #         return infile.read()
 
     def reset_history(self):
-        self.history = [self.INITIALIZE_TEXT]
+        self.messages = [self.INITIALIZE_TEXT]
 
         return "Rebooting. Beep Beep Boop. My memory has been wiped!"
 
-    def context_mgr(self, ai_prompt):
+    def context_mgr(self, user_message):
         if self.initialized == 0:
-            self.history.append(self.INITIALIZE_TEXT)
+            self.messages.append(self.INITIALIZE_TEXT)
             self.initialized = 1
 
-        chat_input = "context: " + "\n".join(self.history) + "\n" + ai_prompt
-        output = self.get_ai_response(chat_input)
-        self.history += [ai_prompt, output.strip()]
-        return output
+        self.messages.append({"role": "user", "content": user_message})
+        self.gpt_output = self.get_ai_response(self.messages)
+        
+        if self.gpt_output["role"] != "error":
+            self.messages.append(self.gpt_output.copy())
+        
+        return self.gpt_output["content"]
 
-    def get_ai_response(self, ai_prompt):
+    def get_ai_response(self, messages_history):
         try:
-            response = openai.Completion.create(
-                model="text-davinci-003",
-                prompt=ai_prompt,
-                temperature=0.7,
-                max_tokens=512,
-                top_p=1,
-                frequency_penalty=0,
-                presence_penalty=0,
-                # stop=['']
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=messages_history,
+                temperature=.5,
+                max_tokens=512
             )
-            return response.choices[0].text
+            return response.choices[0].message
 
-        except openai.error.InvalidRequestError as e:
-            error_output = f"Sorry, I ran out of token memory.\n{self.reset_history()}"
-            return error_output
+        except openai.error.InvalidRequestError as i:
+            print(f"##################\n{i}\n##################")
+            return {"role": "error", "content": "Sorry, I ran into an error with your request. Please try again."}
+            
 
         except openai.error.RateLimitError as r:
-            return "My servers are too busy! Try your request again."
+            print(f"##################\n{r}\n##################")
+            return {"role": "error", "content": "My servers are too busy or you're spamming me. Try your request again in a moment."}
+            
