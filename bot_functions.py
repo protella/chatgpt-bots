@@ -2,7 +2,6 @@ import openai
 import os
 from dotenv import load_dotenv
 
-
 class ChatBot:
     def __init__(self, INITIALIZE_TEXT, filepath=""):
         self.messages = [INITIALIZE_TEXT]
@@ -10,6 +9,7 @@ class ChatBot:
         self.initialized = 0
         self.filepath = filepath
         self.gpt_output = {}
+        self.usage = {}
 
     load_dotenv()
     
@@ -21,8 +21,9 @@ class ChatBot:
 
     def reset_history(self):
         self.messages = [self.INITIALIZE_TEXT]
+        self.usage = {}
 
-        return "Rebooting. Beep Beep Boop. My memory has been wiped!"
+        print("Rebooting. Beep Beep Boop. My memory has been wiped!")
 
     def context_mgr(self, user_message):
 
@@ -42,6 +43,7 @@ class ChatBot:
                 temperature=.5,
                 max_tokens=512
             )
+            self.usage = response.usage
             return response.choices[0].message
 
         except openai.error.InvalidRequestError as i:
@@ -52,4 +54,25 @@ class ChatBot:
         except openai.error.RateLimitError as r:
             print(f"##################\n{r}\n##################")
             return {"role": "error", "content": "My servers are too busy or you're spamming me. Try your request again in a moment."}
-            
+    
+    @staticmethod
+    def help_command():
+        print(f'''!quit or !exit - Duh.
+            !help - This help.
+            !reset - Clears the bots memory and resets the context to the default as configured in this script.
+            !history - Prints a json dump of the chat history since last reset.
+            !usage - Prints token usage stats since the last reset.                  
+            '''.replace('    ', ''))
+        
+    def usage_command(self):
+        if self.usage != {}:
+            print(f'''Cumulative Token stats since last reset:
+                Prompt Tokens: {self.usage.prompt_tokens}
+                Completion Tokens: {self.usage.completion_tokens}
+                Total Tokens: {self.usage.total_tokens}
+                '''.replace('    ', ''))
+        else:
+            print('No usage info yet. Ask the bot something and check again.')    
+        
+    def history_command(self):
+        print(self.messages)
