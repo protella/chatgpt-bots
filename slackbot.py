@@ -9,8 +9,6 @@ load_dotenv()
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
-# BOT_ID = "U01AF99F3JR"
-# CHANNEL_ID = "C04PQ5BK946"
 config_pattern = r"!config\s+(\S+)\s+(.+)"
 reset_pattern = r"^!reset\s+(\S+)$"
 # INITIALIZE_TEXT = {'role': 'system', 'content': '''You are a chatbot that answers questions with accurate,
