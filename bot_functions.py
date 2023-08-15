@@ -71,9 +71,7 @@ class ChatBot:
             !history - Prints a json dump of the chat history since last reset.
             !reset config - Sets the config options back to defaults, e.g., temperature, max_tokens, etc.
             !reset history - Clears the bots memory and resets the context to the default as configured in this script. (Always the first line of the '!history' output.)
-            !usage - Prints token usage stats since the last reset.
-                              
-            """.replace(
+            !usage - Prints token usage stats since the last reset.""".replace(
             "    ", ""
         )
 

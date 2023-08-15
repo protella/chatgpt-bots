@@ -6,7 +6,7 @@ Various ChatBot Integrations like Slack and Discord as well as a CLI based versi
 
 ## Getting Started
 
-Requires `Python 3.6+`
+Requires `Python 3.10+` as the script takes advantage of the new structural pattern matching (match/case/switch) in this version.
 
 ### Install venv module
 `python3 -m pip install --user venv`
@@ -38,17 +38,18 @@ DISCORD_TOKEN = 'YOURTOKENHERE'
 ```
 
 ### Configuration - Bot Tuning
-The `initialize_text` variable at the top of each script will set the tone for how the bot will respond. Telling it that it is a chatbot and with any specific style of responses will help with more appropriate responses.
+The `INITIALIZE_TEXT` variable at the top of each script will set the tone for how the bot will respond. Telling it that it is a chatbot and with any specific style of responses will help with more appropriate responses.
 
 ### Running the bot
-Run the py file for your chosen interface
-e.g.:
+Run the py file for your chosen interface, e.g.:
+
 - `python3 discordbot.py`
+- `python3 slackbot.py`
+- `python3 cli_bot.py`
 
 
 ## ToDo:
-- Update CLI client and Discord client to use the new commands functions
-- Add command functionality to allow for changing the initial chatbot see phrase
+- Add command functionality to allow for changing the initial chatbot init phrase
 - Clean up code, standardize style, move repeated client code to functions module
 
 

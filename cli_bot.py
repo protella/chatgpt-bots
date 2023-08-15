@@ -1,4 +1,5 @@
 import bot_functions
+import re
 
 RESET_CONTEXT = "!reset"
 INITIALIZE_TEXT = {
@@ -10,34 +11,60 @@ INITIALIZE_TEXT = {
         "    ", ""
     ),
 }
+config_pattern = r"!config\s+(\S+)\s+(.+)"
+reset_pattern = r"^!reset\s+(\S+)$"
 
 
 def cli_chat():
-    user_input = input("Me: ")
+    user_input = input("Me: ").lower()
 
-    match user_input.lower():
+    match user_input:
         case "!quit" | "!exit":
             print("Bye!")
             exit(0)
 
-        case "!reset":
-            print(MyBot.reset_history())
-
         case "!history":
-            print(MyBot.history_command())
+            print(gpt_Bot.history_command())
 
         case "!help":
-            print(MyBot.help_command())
+            print(gpt_Bot.help_command())
 
         case "!usage":
-            print(MyBot.usage_command())
+            print(gpt_Bot.usage_command())
+
+        case "!config":
+            print(gpt_Bot.view_config())
+            return
 
         case _:
-            print(f"Jarvis: {MyBot.context_mgr(user_input)}")
+            config_match_obj = re.match(config_pattern, user_input)
+            reset_match_obj = re.match(reset_pattern, user_input)
+            if config_match_obj:
+                setting, value = config_match_obj.groups()
+                response = gpt_Bot.set_config(setting, value)
+                print(f"{response}")
+                return
+
+            elif reset_match_obj:
+                parameter = reset_match_obj.group(1)
+                if parameter == "history":
+                    response = gpt_Bot.reset_history()
+                    print(f"{response}")
+                elif parameter == "config":
+                    response = gpt_Bot.reset_config()
+                    print(f"{response}")
+                else:
+                    print(f"Unknown reset parameter: {parameter}")
+
+            elif user_input.startswith("!"):
+                print("Invalid command. Type '!help' for a list of valid commands.")
+
+            else:
+                print(f"Jarvis: {gpt_Bot.context_mgr(user_input)}")
 
 
 if __name__ == "__main__":
-    MyBot = bot_functions.ChatBot(INITIALIZE_TEXT)
+    gpt_Bot = bot_functions.ChatBot(INITIALIZE_TEXT)
 
     while True:
         cli_chat()
