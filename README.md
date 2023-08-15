@@ -47,9 +47,9 @@ e.g.:
 
 
 ## ToDo:
-- Add commands for tracking and viewing token usage
-- Modularize commands. Possibly use a dict to map command functions to triggers (lambdas?)
-- Clean up code
+- Update CLI client and Discord client to use the new commands functions
+- Add command functionality to allow for changing the initial chatbot see phrase
+- Clean up code, standardize style, move repeated client code to functions module
 
 
 
