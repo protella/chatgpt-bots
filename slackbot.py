@@ -4,25 +4,33 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from dotenv import load_dotenv
 import re
+from textwrap import dedent
 
 load_dotenv()
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
-config_pattern = r"!config\s+(\S+)\s+(.+)"
-reset_pattern = r"^!reset\s+(\S+)$"
-# INITIALIZE_TEXT = {'role': 'system', 'content': '''You are a chatbot that answers questions with accurate,
-#                    informative, witty, and humorous responses.'''.replace('    ', '')}
 INITIALIZE_TEXT = {
     "role": "system",
-    "content": """Act like the Jarvis AI assistant from the Ironman movies.
-                        Respond with reluctance and using the same witty, snarky, and sarcastic responses typical of Jarvis's personality. 
-                        Keep your responses short, succinct, and to the point. Emulate emotions of a human.""".replace(
-        "    ", ""
-    ),
+    "content": dedent(
+        """\
+        You are a chatbot that answers questions with accurate, informative, and concise responses.
+        If you don't have an answer, you will inform the user that you don't know."""
+    ).replace("\n", " "),
 }
+# INITIALIZE_TEXT = {
+#     "role": "system",
+#     "content": dedent(
+#         """\
+#         Act like the Jarvis AI assistant from the Ironman movies.
+#         Respond with reluctance and using the same witty, snarky, and sarcastic responses typical of Jarvis's personality.
+#         Keep your responses short, succinct, and to the point. Emulate emotions of a human."""
+#     ).replace("\n", " "),
+# }
 
-
+config_pattern = r"!config\s+(\S+)\s+(.+)"
+reset_pattern = r"^!reset\s+(\S+)$"
+streaming_client = False
 app = App(token=SLACK_BOT_TOKEN)
 
 
@@ -31,14 +39,8 @@ app = App(token=SLACK_BOT_TOKEN)
 #     print(event['user'])
 
 
-@app.event("app_mention")
-def handle_mention(event, say):
-    text = event["text"][14:].lower().strip()
-    # print(text)
-    # if event['user'] == BOT_ID:
-    #     return
-
-    match text:
+def parse_text(text, say):
+    match text.lower():
         case "!history":
             say(f"```{gpt_Bot.history_command()}```")
             return
@@ -82,8 +84,29 @@ def handle_mention(event, say):
                 say(f"{gpt_Bot.context_mgr(text)}")
 
 
+user_id_pattern = re.compile(
+    r"<@[\w]+>"
+)  # pattern to match the slackbot's userID in channel messages
+
+
+@app.event("app_mention")
+def handle_mention(event, say):
+    text = re.sub(
+        user_id_pattern, "", event["text"]
+    ).strip()  # remove the slackbot's userID from the message using regex pattern matching
+    parse_text(text, say)
+
+
+@app.event("message")
+def handle_message_events(event, say):
+    channel_type = event["channel_type"]
+    if channel_type == "im":
+        text = event["text"]
+        parse_text(text, say)
+
+
 if __name__ == "__main__":
-    gpt_Bot = bot.ChatBot(INITIALIZE_TEXT)
+    gpt_Bot = bot.ChatBot(INITIALIZE_TEXT, streaming_client)
     handler = SocketModeHandler(
         app,
         SLACK_APP_TOKEN,

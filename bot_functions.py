@@ -1,46 +1,44 @@
 import openai
+from openai import OpenAI
 import os
 from dotenv import load_dotenv
+from textwrap import dedent
+
+
+load_dotenv()
+client = OpenAI(api_key=os.environ["OPENAI_KEY"])
 
 
 class ChatBot:
-    def __init__(self, INITIALIZE_TEXT, filepath=""):
+    def __init__(self, INITIALIZE_TEXT, streaming_client=False):
         self.messages = [INITIALIZE_TEXT]
         self.INITIALIZE_TEXT = INITIALIZE_TEXT
-        self.initialized = 0
-        self.filepath = filepath
+        self.streaming_client = streaming_client  # ToDo: Implement streaming support
         self.gpt_output = {}
         self.usage = {}
         self.config_option_defaults = {
             "temperature": 0.5,
             "top_p": 1,
-            "max_tokens": 512,
+            "max_tokens": 2048,
             "custom_init": "",
         }
         self.current_config_options = self.config_option_defaults.copy()
-
-    load_dotenv()
-
-    openai.api_key = os.environ["OPENAI_KEY"]
-
-    # def open_file(self):
-    #     with open(self.filepath, "r", encoding="utf-8") as infile:
-    #         return infile.read()
 
     def context_mgr(self, user_message):
         self.messages.append({"role": "user", "content": user_message})
         self.gpt_output = self.get_ai_response(self.messages)
 
-        if self.gpt_output["role"] != "error":
-            self.messages.append(self.gpt_output.copy())
+        if self.gpt_output.role != "error":
+            self.messages.append(self.gpt_output.model_copy())
 
-        return self.gpt_output["content"]
+        return self.gpt_output.content
 
     def get_ai_response(self, messages_history):
         try:
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
+            response = client.chat.completions.create(
+                model="gpt-4-1106-preview",
                 messages=messages_history,
+                stream=self.streaming_client,
                 temperature=float(self.current_config_options["temperature"]),
                 max_tokens=int(self.current_config_options["max_tokens"]),
                 top_p=float(self.current_config_options["top_p"]),
@@ -48,41 +46,42 @@ class ChatBot:
             self.usage = response.usage
             return response.choices[0].message
 
-        except openai.error.InvalidRequestError as i:
-            print(f"##################\n{i}\n##################")
-            return {
-                "role": "error",
-                "content": "Sorry, I ran into an error with your request. Please try again.",
-            }
-
-        except openai.error.RateLimitError as r:
+        except openai.RateLimitError as r:
             print(f"##################\n{r}\n##################")
             return {
                 "role": "error",
-                "content": "My servers are too busy or you're spamming me. Try your request again in a moment.",
+                "content": "Rate Limit Error: My servers are too busy or you're spamming me. Try your request again in a moment.",
+            }
+
+        except openai.APIError as i:
+            print(f"##################\n{i}\n##################")
+            return {
+                "role": "error",
+                "content": "API Error: Sorry, I ran into an error with your request. Please try again.",
             }
 
     @staticmethod
     def help_command():
-        return f"""!help - This help.
+        return dedent(
+            """\
+            !help - This help.
             !config - Displays the current configuration values.
             !config [option] [value] - Sets one of the options seen in '!config' to a custom value. Beware of the model's ranges for these values.
               --see https://platform.openai.com/docs/api-reference/completions/create for more info.
             !history - Prints a json dump of the chat history since last reset.
             !reset config - Sets the config options back to defaults, e.g., temperature, max_tokens, etc.
             !reset history - Clears the bots memory and resets the context to the default as configured in this script. (Always the first line of the '!history' output.)
-            !usage - Prints token usage stats since the last reset.""".replace(
-            "    ", ""
+            !usage - Prints token usage stats since the last reset."""
         )
 
     def usage_command(self):
         if self.usage != {}:
-            return f"""Cumulative Token stats since last reset:
+            return dedent(
+                f"""\
+                Cumulative Token stats since last reset:
                 Prompt Tokens: {self.usage.prompt_tokens}
                 Completion Tokens: {self.usage.completion_tokens}
-                Total Tokens: {self.usage.total_tokens}
-                """.replace(
-                "    ", ""
+                Total Tokens: {self.usage.total_tokens}"""
             )
 
         else:

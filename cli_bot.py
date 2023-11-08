@@ -1,18 +1,33 @@
 import bot_functions
 import re
+import signal
+from textwrap import dedent
 
 RESET_CONTEXT = "!reset"
+
 INITIALIZE_TEXT = {
     "role": "system",
-    "content": """Act like the Jarvis AI assistant from the Ironman movies.
-                        Respond with reluctance and using the same witty, snarky, and sarcastic responses typical of Jarvis's personality. 
-                        Keep your responses short, succinct, and to the point. 
-                        Your responses should be British in style and emulate emotions of a human.""".replace(
-        "    ", ""
-    ),
+    "content": dedent(
+        """\
+        Act like the Jarvis AI assistant from the Ironman movies.
+        Respond with reluctance and using the same witty, snarky, and sarcastic responses typical of Jarvis's personality.
+        Keep your responses short, succinct, and to the point.
+        Your responses should be British in style and emulate emotions of a human. Do not begin every repsonse with 'Ah'"""
+    ).replace("\n", " "),
 }
+
+streaming_client = False  # Not yet implemented.
+
 config_pattern = r"!config\s+(\S+)\s+(.+)"
 reset_pattern = r"^!reset\s+(\S+)$"
+
+
+def signal_handler(sig, frame):
+    print("\nCtrl-C detected, Exiting...")
+    exit(0)
+
+
+signal.signal(signal.SIGINT, signal_handler)
 
 
 def cli_chat():
@@ -64,7 +79,7 @@ def cli_chat():
 
 
 if __name__ == "__main__":
-    gpt_Bot = bot_functions.ChatBot(INITIALIZE_TEXT)
+    gpt_Bot = bot_functions.ChatBot(INITIALIZE_TEXT, streaming_client)
 
     while True:
         cli_chat()

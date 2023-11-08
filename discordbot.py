@@ -3,25 +3,28 @@ import discord
 import os
 from dotenv import load_dotenv
 import re
+from textwrap import dedent
 
 load_dotenv()
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 INITIALIZE_TEXT = {
     "role": "system",
-    "content": """Act like the Jarvis AI assistant from the Ironman movies.
-                        Respond with reluctance and using the same witty, snarky, and sarcastic responses typical of Jarvis's personality. 
-                        Keep your responses short, succinct, and to the point. Emulate emotions of a human.""".replace(
-        "    ", ""
-    ),
+    "content": dedent(
+        """\
+        Act like the Jarvis AI assistant from the Ironman movies.
+        Respond with reluctance and using the same witty, snarky, and sarcastic responses typical of Jarvis's personality. 
+        Keep your responses short, succinct, and to the point. Emulate emotions of a human."""
+    ).replace("\n", " "),
 }
+
 config_pattern = r"!config\s+(\S+)\s+(.+)"
 reset_pattern = r"^!reset\s+(\S+)$"
+streaming_client = False
 
-
-# def open_file(filepath):
-#     with open(filepath, "r", encoding="utf-8") as infile:
-#         return infile.read()
+user_id_pattern = re.compile(
+    r"<@[\w]+>"
+)  # pattern to match the slackbot's userID in channel messages
 
 
 class discordClt(discord.Client):
@@ -30,17 +33,15 @@ class discordClt(discord.Client):
         print("---------------------------------------------")
 
     async def on_message(self, message):
-        print(f"{message.content}\n")
-
-        text = message.content
-
-        # we do not want the bot to reply to itself
-        if message.author.id == self.user.id or message.content.startswith(
-            message.author.mention
-        ):
+        # we do not want the bot to reply to itself and only respond when @mentioned.
+        if message.author.bot or self.user.mention not in message.content:
             return
 
-        match text:
+        text = re.sub(
+            user_id_pattern, "", message.content
+        ).strip()  # remove the discord bot's userID from the message using regex pattern matching
+
+        match text.lower():
             case "!history":
                 await message.channel.send(f"```{gpt_Bot.history_command()}```")
                 return
@@ -57,8 +58,8 @@ class discordClt(discord.Client):
                 await message.channel.send(f"```{gpt_Bot.view_config()}```")
                 return
             case _:
-                config_match_obj = re.match(config_pattern, text)
-                reset_match_obj = re.match(reset_pattern, text)
+                config_match_obj = re.match(config_pattern, text.lower())
+                reset_match_obj = re.match(reset_pattern, text.lower())
                 if config_match_obj:
                     setting, value = config_match_obj.groups()
                     response = gpt_Bot.set_config(setting, value)
@@ -84,16 +85,14 @@ class discordClt(discord.Client):
                     )
 
                 else:
-                    await message.channel.send(
-                        f"{gpt_Bot.context_mgr(message.content)}"
-                    )
+                    await message.channel.send(f"{gpt_Bot.context_mgr(text)}")
 
 
 if __name__ == "__main__":
     intents = discord.Intents.default()
     intents.message_content = True
 
-    gpt_Bot = bot.ChatBot(INITIALIZE_TEXT)
+    gpt_Bot = bot.ChatBot(INITIALIZE_TEXT, streaming_client)
     discord_Client = discordClt(intents=intents)
     discord_Client.run(DISCORD_TOKEN)
 

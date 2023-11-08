@@ -50,6 +50,7 @@ Run the py file for your chosen interface, e.g.:
 
 ## ToDo:
 - Add command functionality to allow for changing the initial chatbot init phrase
+- Track context/history size using the usage stats and pop old items from the history to avoid going over the model's max context size (4k w/ 3.5-turbo) Adjust for different models if necessary.
 - Clean up code, standardize style, move repeated client code to functions module
 
 
