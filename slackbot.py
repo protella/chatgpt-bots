@@ -99,7 +99,7 @@ def handle_mention(event, say):
         user_id_pattern, "", event["text"]
     ).strip()  # remove the slackbot's userID from the message using regex pattern matching
     parse_text(text, say)
-    print(event)
+    # print(event)
 
 
 @app.event("message")
