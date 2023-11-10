@@ -75,7 +75,8 @@ def cli_chat():
                 print("Invalid command. Type '!help' for a list of valid commands.")
 
             else:
-                print(f"Jarvis: {gpt_Bot.context_mgr(user_input)}")
+                content_type = "text"
+                print(f"Jarvis: {gpt_Bot.context_mgr(user_input, content_type)}")
 
 
 if __name__ == "__main__":

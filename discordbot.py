@@ -85,7 +85,10 @@ class discordClt(discord.Client):
                     )
 
                 else:
-                    await message.channel.send(f"{gpt_Bot.context_mgr(text)}")
+                    content_type = "text"
+                    await message.channel.send(
+                        f"{gpt_Bot.context_mgr(text, content_type)}"
+                    )
 
 
 if __name__ == "__main__":

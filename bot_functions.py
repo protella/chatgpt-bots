@@ -24,14 +24,19 @@ class ChatBot:
         }
         self.current_config_options = self.config_option_defaults.copy()
 
-    def context_mgr(self, user_message):
-        self.messages.append({"role": "user", "content": user_message})
-        self.gpt_output = self.get_ai_response(self.messages)
+    def context_mgr(self, message_content, content_type="text"):
+        if content_type == "text":
+            self.messages.append({"role": "user", "content": message_content})
+            self.gpt_output = self.get_ai_response(self.messages)
 
-        if self.gpt_output.role != "error":
-            self.messages.append(self.gpt_output.model_copy())
+            if self.gpt_output.role != "error":
+                self.messages.append(self.gpt_output.model_copy())
 
-        return self.gpt_output.content
+            return self.gpt_output.content
+
+        elif content_type == "image":
+            # handle images
+            pass
 
     def get_ai_response(self, messages_history):
         try:

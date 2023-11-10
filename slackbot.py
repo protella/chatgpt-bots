@@ -14,7 +14,10 @@ INITIALIZE_TEXT = {
     "role": "system",
     "content": dedent(
         """\
-        You are a chatbot that answers questions with accurate, informative, and concise responses.
+        You are a helpful chatbot running in a corporate Slack workspace.
+        Respond with accurate, informative, and concise answers that are formatted appropriately for Slack, 
+        including markdown and special characters for bullet points, bold, italics, and code blocks as necessary. 
+        Always consider Slack formatting conventions in all messages within a conversation.
         If you don't have an answer, you will inform the user that you don't know."""
     ).replace("\n", " "),
 }
@@ -81,7 +84,8 @@ def parse_text(text, say):
                 say("`Invalid command. Type '!help' for a list of valid commands.`")
 
             else:
-                say(f"{gpt_Bot.context_mgr(text)}")
+                content_type = "text"
+                say(f"{gpt_Bot.context_mgr(text, content_type)}")
 
 
 user_id_pattern = re.compile(
@@ -95,6 +99,7 @@ def handle_mention(event, say):
         user_id_pattern, "", event["text"]
     ).strip()  # remove the slackbot's userID from the message using regex pattern matching
     parse_text(text, say)
+    print(event)
 
 
 @app.event("message")
