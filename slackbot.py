@@ -92,7 +92,8 @@ def process_and_respond(event, say):
     initial_response = say(f"Thinking... {LOADING_EMOJI}")
     initial_response_ts = initial_response['message']['ts']
 
-    text = re.sub(user_id_pattern, "", event.get("text", "")).strip()
+    # remove the slackbot's userID from the message using regex pattern matching
+    text = re.sub(user_id_pattern, "", event["text"]).strip()
     response = parse_text(text)
 
     try:
