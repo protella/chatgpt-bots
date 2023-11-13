@@ -6,7 +6,6 @@ from textwrap import dedent
 
 
 load_dotenv()
-client = OpenAI(api_key=os.environ["OPENAI_KEY"])
 
 
 class ChatBot:
@@ -23,6 +22,7 @@ class ChatBot:
             "custom_init": "",
         }
         self.current_config_options = self.config_option_defaults.copy()
+        self.client = OpenAI(api_key=os.environ["OPENAI_KEY"])
 
     def context_mgr(self, message_content, content_type="text"):
         if content_type == "text":
@@ -40,7 +40,7 @@ class ChatBot:
 
     def get_ai_response(self, messages_history):
         try:
-            response = client.chat.completions.create(
+            response = self.client.chat.completions.create(
                 model="gpt-4-1106-preview",
                 messages=messages_history,
                 stream=self.streaming_client,

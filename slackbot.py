@@ -8,6 +8,7 @@ from textwrap import dedent
 
 load_dotenv()
 
+LOADING_EMOJI = ":loading:"
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
 INITIALIZE_TEXT = {
@@ -31,8 +32,13 @@ INITIALIZE_TEXT = {
 #     ).replace("\n", " "),
 # }
 
-config_pattern = r"!config\s+(\S+)\s+(.+)"
-reset_pattern = r"^!reset\s+(\S+)$"
+# pattern to match commands
+config_pattern = re.compile(r"!config\s+(\S+)\s+(.+)")
+reset_pattern = re.compile(r"^!reset\s+(\S+)$")
+
+# pattern to match the slackbot's userID in channel messages
+user_id_pattern = re.compile(r"<@[\w]+>")
+
 streaming_client = False
 app = App(token=SLACK_BOT_TOKEN)
 
@@ -42,79 +48,75 @@ app = App(token=SLACK_BOT_TOKEN)
 #     print(event['user'])
 
 
-def parse_text(text, say):
+def parse_text(text):
     match text.lower():
         case "!history":
-            say(f"```{gpt_Bot.history_command()}```")
-            return
+            return f"```{gpt_Bot.history_command()}```"
 
         case "!help":
-            say(f"```{gpt_Bot.help_command()}```")
-            return
+            return f"```{gpt_Bot.help_command()}```"
 
         case "!usage":
-            say(f"```{gpt_Bot.usage_command()}```")
-            return
+            return f"```{gpt_Bot.usage_command()}```"
 
         case "!config":
-            say(f"```Current Configuration:\n{gpt_Bot.view_config()}```")
-            return
+            return f"```Current Configuration:\n{gpt_Bot.view_config()}```"
 
         case _:
-            config_match_obj = re.match(config_pattern, text)
-            reset_match_obj = re.match(reset_pattern, text)
-            if config_match_obj:
+            if config_match_obj := config_pattern.match(text):
                 setting, value = config_match_obj.groups()
                 response = gpt_Bot.set_config(setting, value)
-                say(f"```{response}```")
-                return
+                return f"```{response}```"
 
-            elif reset_match_obj:
+            elif reset_match_obj := reset_pattern.match(text):
                 parameter = reset_match_obj.group(1)
                 if parameter == "history":
                     response = gpt_Bot.reset_history()
-                    say(f"`{response}`")
+                    return f"`{response}`"
                 elif parameter == "config":
                     response = gpt_Bot.reset_config()
-                    say(f"`{response}`")
+                    return f"`{response}`"
                 else:
-                    say(f"Unknown reset parameter: {parameter}")
+                    return f"Unknown reset parameter: {parameter}"
 
             elif text.startswith("!"):
-                say("`Invalid command. Type '!help' for a list of valid commands.`")
+                return "`Invalid command. Type '!help' for a list of valid commands.`"
 
             else:
                 content_type = "text"
-                say(f"{gpt_Bot.context_mgr(text, content_type)}")
+                return f"{gpt_Bot.context_mgr(text, content_type)}"
 
 
-user_id_pattern = re.compile(
-    r"<@[\w]+>"
-)  # pattern to match the slackbot's userID in channel messages
+def process_and_respond(event, say):
+    channel_id = event['channel']
+    initial_response = say(f"Thinking... {LOADING_EMOJI}")
+    initial_response_ts = initial_response['message']['ts']
+
+    text = re.sub(user_id_pattern, "", event.get("text", "")).strip()
+    response = parse_text(text)
+
+    try:
+        app.client.chat_delete(channel=channel_id, ts=initial_response_ts)
+
+    except Exception as e:
+        say(":no_entry: `Sorry, I ran into an error deleting my own message.` :no_entry:")
+
+    say(response)
 
 
 @app.event("app_mention")
 def handle_mention(event, say):
-    text = re.sub(
-        user_id_pattern, "", event["text"]
-    ).strip()  # remove the slackbot's userID from the message using regex pattern matching
-    parse_text(text, say)
-    # print(event)
+    process_and_respond(event, say)
 
 
 @app.event("message")
 def handle_message_events(event, say):
-    channel_type = event["channel_type"]
-    if channel_type == "im":
-        text = event["text"]
-        parse_text(text, say)
+    if event["channel_type"] == "im":
+        process_and_respond(event, say)
 
 
 if __name__ == "__main__":
     gpt_Bot = bot.ChatBot(INITIALIZE_TEXT, streaming_client)
-    handler = SocketModeHandler(
-        app,
-        SLACK_APP_TOKEN,
-    )
+    handler = SocketModeHandler(app, SLACK_APP_TOKEN)
 
     handler.start()
