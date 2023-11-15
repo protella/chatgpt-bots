@@ -8,7 +8,7 @@ Various ChatBot Integrations like Slack and Discord as well as a CLI based versi
 
 Requires `Python 3.10+` as the script takes advantage of the new structural pattern matching (match/case/switch) in this version.
 
-### Install venv module
+### Install `venv` module
 `python3 -m pip install --user venv`
 
 ### Create virtual environment
@@ -21,7 +21,7 @@ source bin/activate
 ```
 
 ### Installing Dependencies:
-```pip3 install -r requirements.txt```
+```python3 -m pip install -U -r requirements.txt```
 
 ### Setup `.env` file
 - Aquire the necessary keys or tokens from the integration you're using. 
@@ -49,6 +49,8 @@ Run the py file for your chosen interface, e.g.:
 
 
 ## ToDo:
+- Add GPT-4v (Vision) support
+- Add Dalle-3 support
 - Add command functionality to allow for changing the initial chatbot init phrase
 - Track context/history size using the usage stats and pop old items from the history to avoid going over the model's max context size (4k w/ 3.5-turbo) Adjust for different models if necessary.
 - Clean up code, standardize style, move repeated client code to functions module

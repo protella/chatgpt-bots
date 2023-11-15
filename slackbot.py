@@ -35,11 +35,12 @@ INITIALIZE_TEXT = {
 # pattern to match commands
 config_pattern = re.compile(r"!config\s+(\S+)\s+(.+)")
 reset_pattern = re.compile(r"^!reset\s+(\S+)$")
-
 # pattern to match the slackbot's userID in channel messages
 user_id_pattern = re.compile(r"<@[\w]+>")
 
+content_type = "text"
 streaming_client = False
+chat_del_ts = []
 app = App(token=SLACK_BOT_TOKEN)
 
 
@@ -48,61 +49,71 @@ app = App(token=SLACK_BOT_TOKEN)
 #     print(event['user'])
 
 
-def parse_text(text):
+def parse_text(text, say):
     match text.lower():
         case "!history":
-            return f"```{gpt_Bot.history_command()}```"
+            say(f"```{gpt_Bot.history_command()}```")
 
         case "!help":
-            return f"```{gpt_Bot.help_command()}```"
+            say(f"```{gpt_Bot.help_command()}```")
 
         case "!usage":
-            return f"```{gpt_Bot.usage_command()}```"
+            say(f"```{gpt_Bot.usage_command()}```")
 
         case "!config":
-            return f"```Current Configuration:\n{gpt_Bot.view_config()}```"
+            say(f"```Current Configuration:\n{gpt_Bot.view_config()}```")
 
         case _:
             if config_match_obj := config_pattern.match(text):
                 setting, value = config_match_obj.groups()
                 response = gpt_Bot.set_config(setting, value)
-                return f"```{response}```"
+                say(f"```{response}```")
 
             elif reset_match_obj := reset_pattern.match(text):
                 parameter = reset_match_obj.group(1)
                 if parameter == "history":
                     response = gpt_Bot.reset_history()
-                    return f"`{response}`"
+                    say(f"`{response}`")
                 elif parameter == "config":
                     response = gpt_Bot.reset_config()
-                    return f"`{response}`"
+                    say(f"`{response}`")
                 else:
-                    return f"Unknown reset parameter: {parameter}"
+                    say(f"Unknown reset parameter: {parameter}")
 
             elif text.startswith("!"):
-                return "`Invalid command. Type '!help' for a list of valid commands.`"
+                say("`Invalid command. Type '!help' for a list of valid commands.`")
 
             else:
-                content_type = "text"
-                return f"{gpt_Bot.context_mgr(text, content_type)}"
+                return text
 
 
 def process_and_respond(event, say):
     channel_id = event['channel']
-    initial_response = say(f"Thinking... {LOADING_EMOJI}")
-    initial_response_ts = initial_response['message']['ts']
-
     # remove the slackbot's userID from the message using regex pattern matching
-    text = re.sub(user_id_pattern, "", event["text"]).strip()
-    response = parse_text(text)
+    message_text = parse_text(
+        re.sub(user_id_pattern, "", event['text']).strip(), say)
 
+    if message_text:
+        if gpt_Bot.processing:
+            response = say(
+                f":no_entry: `{gpt_Bot.context_mgr(message_text, content_type)}` :no_entry:")
+            chat_del_ts.append(response['message']['ts'])
+
+        else:
+            initial_response = say(f"Thinking... {LOADING_EMOJI}")
+            chat_del_ts.append(initial_response['message']['ts'])
+            response = say(gpt_Bot.context_mgr(message_text, content_type))
+            delete_chat_messages(channel_id, chat_del_ts, say)
+
+
+def delete_chat_messages(channel, timestamps, say):
     try:
-        app.client.chat_delete(channel=channel_id, ts=initial_response_ts)
+        for ts in timestamps:
+            app.client.chat_delete(channel=channel, ts=ts)
+        chat_del_ts.clear()
 
-    except Exception as e:
+    except Exception:
         say(":no_entry: `Sorry, I ran into an error deleting my own message.` :no_entry:")
-
-    say(response)
 
 
 @app.event("app_mention")

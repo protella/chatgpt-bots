@@ -15,6 +15,7 @@ class ChatBot:
         self.streaming_client = streaming_client  # ToDo: Implement streaming support
         self.gpt_output = {}
         self.usage = {}
+        self.processing = False
         self.config_option_defaults = {
             "temperature": 0.5,
             "top_p": 1,
@@ -25,18 +26,22 @@ class ChatBot:
         self.client = OpenAI(api_key=os.environ["OPENAI_KEY"])
 
     def context_mgr(self, message_content, content_type="text"):
-        if content_type == "text":
+        if content_type == "text" and self.processing == False:
+            self.processing = True
             self.messages.append({"role": "user", "content": message_content})
             self.gpt_output = self.get_ai_response(self.messages)
+            self.processing = False
 
             if self.gpt_output.role != "error":
                 self.messages.append(self.gpt_output.model_copy())
 
             return self.gpt_output.content
 
-        elif content_type == "image":
+        elif content_type == "image" and self.processing == False:
             # handle images
             pass
+        else:
+            return "I'm busy processing a previous request, please wait a moment and try again."
 
     def get_ai_response(self, messages_history):
         try:
