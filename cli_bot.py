@@ -76,7 +76,13 @@ def cli_chat():
 
             else:
                 content_type = "text"
-                print(f"Jarvis: {gpt_Bot.context_mgr(user_input, content_type)}")
+                response, is_error = gpt_Bot.context_mgr(
+                    user_input, content_type)
+                if is_error:
+                    print(
+                        f"Jarvis: Sorry, I ran into an error. The raw error details are as follows:\n\n{response}")
+                else:
+                    print(f"Jarvis: {response}")
 
 
 if __name__ == "__main__":

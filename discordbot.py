@@ -86,9 +86,16 @@ class discordClt(discord.Client):
 
                 else:
                     content_type = "text"
-                    await message.channel.send(
-                        f"{gpt_Bot.context_mgr(text, content_type)}"
-                    )
+                    response, is_error = gpt_Bot.context_mgr(
+                        text, content_type)
+                    if is_error:
+                        await message.channel.send(
+                            f":no_entry: `Sorry, I ran into an error. The raw error details are as follows:` :no_entry:\n```{response}```"
+                        )
+                    else:
+                        await message.channel.send(
+                            f"{response}"
+                        )
 
 
 if __name__ == "__main__":
