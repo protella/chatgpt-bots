@@ -1,3 +1,4 @@
+from math import fabs
 import openai
 from openai import OpenAI
 import os
@@ -17,58 +18,56 @@ class ChatBot:
         self.usage = {}
         self.processing = False
         self.config_option_defaults = {
-            "temperature": 0.5,
-            "top_p": 1,
-            "max_tokens": 2048,
-            "custom_init": "",
+            'temperature': 0.5,
+            'top_p': 1,
+            'max_tokens': 2048,
+            'custom_init': '',
         }
         self.current_config_options = self.config_option_defaults.copy()
-        self.client = OpenAI(api_key=os.environ["OPENAI_KEY"])
+        self.client = OpenAI(api_key=os.environ['OPENAI_KEY'])
 
-    def context_mgr(self, message_content, content_type="text"):
-        if content_type == "text" and self.processing == False:
+    def context_mgr(self, message_content, content_type='text'):
+        if content_type == 'text' and self.processing == False:
             self.processing = True
-            self.messages.append({"role": "user", "content": message_content})
+            self.messages.append({'role': 'user', 'content': message_content})
             self.gpt_output = self.get_ai_response(self.messages)
             self.processing = False
 
-            if self.gpt_output.role != "error":
-                self.messages.append(self.gpt_output.model_copy())
+            if hasattr(self.gpt_output, 'role'):
+                is_error = False
+                if self.gpt_output.role == 'assistant':
+                    self.messages.append(
+                        {'role': 'assistant', 'content': self.gpt_output.content})
 
-            return self.gpt_output.content
+                return self.gpt_output.content, is_error
+            else:
+                is_error = True
+                self.messages.pop()
+                return self.gpt_output, is_error
 
-        elif content_type == "image" and self.processing == False:
+        elif content_type == 'image' and self.processing == False:
             # handle images
             pass
+
         else:
             return "I'm busy processing a previous request, please wait a moment and try again."
 
     def get_ai_response(self, messages_history):
         try:
             response = self.client.chat.completions.create(
-                model="gpt-4-1106-preview",
+                model='gpt-4-1106-preview',
                 messages=messages_history,
                 stream=self.streaming_client,
-                temperature=float(self.current_config_options["temperature"]),
-                max_tokens=int(self.current_config_options["max_tokens"]),
-                top_p=float(self.current_config_options["top_p"]),
+                temperature=float(self.current_config_options['temperature']),
+                max_tokens=int(self.current_config_options['max_tokens']),
+                top_p=float(self.current_config_options['top_p']),
             )
             self.usage = response.usage
             return response.choices[0].message
 
-        except openai.RateLimitError as r:
-            print(f"##################\n{r}\n##################")
-            return {
-                "role": "error",
-                "content": "Rate Limit Error: My servers are too busy or you're spamming me. Try your request again in a moment.",
-            }
-
-        except openai.APIError as i:
-            print(f"##################\n{i}\n##################")
-            return {
-                "role": "error",
-                "content": "API Error: Sorry, I ran into an error with your request. Please try again.",
-            }
+        except Exception as e:
+            print(f'##################\n{e}\n##################')
+            return e
 
     @staticmethod
     def help_command():
@@ -87,15 +86,15 @@ class ChatBot:
     def usage_command(self):
         if self.usage != {}:
             return dedent(
-                f"""\
+                f'''\
                 Cumulative Token stats since last reset:
                 Prompt Tokens: {self.usage.prompt_tokens}
                 Completion Tokens: {self.usage.completion_tokens}
-                Total Tokens: {self.usage.total_tokens}"""
+                Total Tokens: {self.usage.total_tokens}'''
             )
 
         else:
-            return "No usage info yet. Ask the bot something and check again."
+            return 'No usage info yet. Ask the bot something and check again.'
 
     def history_command(self):
         return self.messages
@@ -103,22 +102,23 @@ class ChatBot:
     def set_config(self, setting, value):
         if setting in self.current_config_options:
             self.current_config_options[setting] = value
-            return f"Updated {setting} to {value}"
-        return f"Unknown setting: {setting}"
+            return f'Updated {setting} to {value}'
+        return f'Unknown setting: {setting}'
 
     def view_config(self):
-        return "\n".join(
-            f"{setting}: {value}"
+        return '\n'.join(
+            f'{setting}: {value}'
             for setting, value in self.current_config_options.items()
         )
 
     def reset_history(self):
         self.messages = [self.INITIALIZE_TEXT]
         self.usage = {}
+        self.processing = False
 
-        return "Rebooting. Beep Beep Boop. My memory has been wiped!"
+        return 'Rebooting. Beep Beep Boop. My memory has been wiped!'
 
     def reset_config(self):
         self.current_config_options = self.config_option_defaults
 
-        return "Configuration Defaults Reset!"
+        return 'Configuration Defaults Reset!'
