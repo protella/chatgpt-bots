@@ -76,7 +76,7 @@ def cli_chat():
 
             else:
                 content_type = "text"
-                response, is_error = gpt_Bot.context_mgr(
+                response, is_error = gpt_Bot.handle_content_type(
                     user_input, content_type)
                 if is_error:
                     print(

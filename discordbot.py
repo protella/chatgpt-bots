@@ -86,7 +86,7 @@ class discordClt(discord.Client):
 
                 else:
                     content_type = "text"
-                    response, is_error = gpt_Bot.context_mgr(
+                    response, is_error = gpt_Bot.handle_content_type(
                         text, content_type)
                     if is_error:
                         await message.channel.send(

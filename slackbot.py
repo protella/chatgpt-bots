@@ -32,7 +32,7 @@ INITIALIZE_TEXT = {
 #     ).replace('\n', ' '),
 # }
 
-# pattern to match commands
+# patterns to match commands
 config_pattern = re.compile(r'!config\s+(\S+)\s+(.+)')
 reset_pattern = re.compile(r'^!reset\s+(\S+)$')
 # pattern to match the slackbot's userID in channel messages
@@ -96,13 +96,13 @@ def process_and_respond(event, say):
     if message_text:
         if gpt_Bot.processing:
             response = say(
-                f':no_entry: `{gpt_Bot.context_mgr(message_text, content_type)}` :no_entry:')
+                f':no_entry: `{gpt_Bot.handle_content_type(message_text, content_type)}` :no_entry:')
             chat_del_ts.append(response['message']['ts'])
 
         else:
             initial_response = say(f'Thinking... {LOADING_EMOJI}')
             chat_del_ts.append(initial_response['message']['ts'])
-            response, is_error = gpt_Bot.context_mgr(
+            response, is_error = gpt_Bot.handle_content_type(
                 message_text, content_type)
             if is_error:
                 say(
@@ -120,8 +120,44 @@ def delete_chat_messages(channel, timestamps, say):
             app.client.chat_delete(channel=channel, ts=ts)
         chat_del_ts.clear()
 
-    except Exception:
-        say(':no_entry: `Sorry, I ran into an error deleting my own message.` :no_entry:')
+    except Exception as e:
+        say(
+            f':no_entry: `Sorry, I ran into an error deleting my own message.` :no_entry:\n```{e}```')
+
+
+@app.command('/dalle3')
+def handle_dalle3(ack, say, command):
+    ack()
+    if gpt_Bot.processing:
+        response = say(
+            f':no_entry: `{gpt_Bot.handle_busy()}` :no_entry:')
+        chat_del_ts.append(response['message']['ts'])
+    else:
+        content_type = "image"
+        user_id = command['user_id']
+        text = command['text']
+        cmd = command['command']
+        channel = command['channel_id']
+
+        app.client.chat_postMessage(
+            channel=channel, text=f'<@{user_id}> used `{cmd}`.\n*Prompt:*\n_{text}_')
+
+        temp_response = app.client.chat_postMessage(
+            channel=channel, text=f'Generating image, please wait... {LOADING_EMOJI}')
+
+        ts = [temp_response['ts']]
+        response, is_error = gpt_Bot.handle_content_type(text, content_type)
+
+        if is_error:
+            say(
+                f':no_entry: `Sorry, I ran into an error. The raw error details are as follows:` :no_entry:\n```{response}```')
+
+        else:
+            say(f"{response.data[0].url}\n*Revised Prompt:*\n_{response.data[0].revised_prompt}_")
+
+        delete_chat_messages(channel, ts, say)
+
+        # print(response)
 
 
 @app.event('app_mention')

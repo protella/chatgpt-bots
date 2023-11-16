@@ -23,6 +23,8 @@ source bin/activate
 ### Installing Dependencies:
 ```python3 -m pip install -U -r requirements.txt```
 
+- _Note: The included `requirements.txt` file includes all of the dependencies for all 3 clients in this repo._
+
 ### Setup `.env` file
 - Aquire the necessary keys or tokens from the integration you're using. 
 I.e., OpenAI, Slack and Discord tokens.

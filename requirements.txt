@@ -3,3 +3,4 @@ asyncio
 openai
 slack_bolt
 python-dotenv
+Pillow
