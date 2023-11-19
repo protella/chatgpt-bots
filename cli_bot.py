@@ -75,9 +75,7 @@ def cli_chat():
                 print("Invalid command. Type '!help' for a list of valid commands.")
 
             else:
-                content_type = "text"
-                response, is_error = gpt_Bot.handle_content_type(
-                    user_input, content_type)
+                response, is_error = gpt_Bot.chat_context_mgr(user_input)
                 if is_error:
                     print(
                         f"Jarvis: Sorry, I ran into an error. The raw error details are as follows:\n\n{response}")

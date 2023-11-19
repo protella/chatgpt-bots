@@ -2,14 +2,15 @@ from openai import OpenAI
 import os
 from dotenv import load_dotenv
 from textwrap import dedent
+import base64
 from io import BytesIO
 from PIL import Image
 
 
 load_dotenv()
-GPT4 = 'gpt-4-1106-preview'
-DALLE3 = 'dall-e-3'
-GPT4_VISION = 'gpt-4-vision-preview'
+GPT_MODEL = 'gpt-4-1106-preview'
+DALLE_MODEL = 'dall-e-3'
+GPT_VISION_MODEL = 'gpt-4-vision-preview'
 
 
 class ChatBot:
@@ -17,69 +18,64 @@ class ChatBot:
         self.messages = [INITIALIZE_TEXT]
         self.INITIALIZE_TEXT = INITIALIZE_TEXT
         self.streaming_client = streaming_client  # ToDo: Implement streaming support
-        self.gpt_output = {}
         self.usage = {}
         self.processing = False
         self.config_option_defaults = {
-            'temperature': 0.5,
+            'temperature': 0.5,  # 0.0 - 2.0
             'top_p': 1,
-            'max_tokens': 2048,
+            'max_tokens': 2048,  # max 4096
             'custom_init': '',
-            'model': GPT4,
-            'size': '1024x1024',
+            'gpt_model': GPT_MODEL,
+            'dalle_model': DALLE_MODEL,
+            'gpt_vision_model': GPT_VISION_MODEL,
+            'size': '1024x1024',  # 1024x1024, 1024x1792 or 1792x1024
             'quality': 'hd',  # standard or hd
-            'style': 'vivid',  # vivid or natural
-            'number': 1
+            'style': 'vivid',  # natural or vivid
+            'number': 1  # number of images. Only 1 supported for Dalle3
         }
         self.current_config_options = self.config_option_defaults.copy()
         self.client = OpenAI(api_key=os.environ['OPENAI_KEY'])
 
-    def handle_content_type(self, message_content, content_type='text'):
-        is_error = False
-
-        if self.processing:
-            return self.handle_busy()
-
-        else:
-            if content_type == 'text':
-                return self.chat_context_mgr(message_content)
-
-            elif content_type == 'image':
-                return self.image_context_mgr(message_content)
-
-            elif content_type == 'vision':
-                return self.vision_context_mgr(message_content)
-
     def chat_context_mgr(self, message_content):
         self.processing = True
-        self.current_config_options['model'] = GPT4
         self.messages.append({'role': 'user', 'content': message_content})
-        self.gpt_output = self.get_chatgpt_response(self.messages)
+        gpt_output = self.get_gpt_response(self.messages)
         self.processing = False
 
-        if hasattr(self.gpt_output, 'role'):
+        if hasattr(gpt_output, 'role'):
             is_error = False
-            if self.gpt_output.role == 'assistant':
+            if gpt_output.role == 'assistant':
                 self.messages.append(
-                    {'role': 'assistant', 'content': self.gpt_output.content})
+                    {'role': 'assistant', 'content': gpt_output.content})
 
-            return self.gpt_output.content, is_error
+            return gpt_output.content, is_error
         else:
             is_error = True
             self.messages.pop()
-            return self.gpt_output, is_error
+            return gpt_output, is_error
 
     def image_context_mgr(self, message_content):
         self.processing = True
-        self.current_config_options['model'] = DALLE3
-        is_error = False
-        self.gpt_output = self.get_dalle_response(message_content)
+        self.messages.append(
+            {'role': 'user', 'content': f'Dalle3 User Prompt: {message_content}'})
+        image, revised_prompt = self.get_dalle_response(message_content)
         self.processing = False
-        return self.gpt_output, is_error
+
+        if revised_prompt:
+            is_error = False
+            self.messages.append(
+                {'role': 'assistant', 'content': f'Pretend I just created an image with this Dalle3 Prompt: {revised_prompt}'})
+
+        else:
+            is_error = True
+            self.messages.pop()
+            image = None
+            revised_prompt = None
+
+        return image, revised_prompt, is_error
 
     def vision_context_mgr(self, message_content):
         self.processing = True
-        self.current_config_options['model'] = GPT4_VISION
         is_error = False
         # process vision
         self.processing = False
@@ -88,26 +84,38 @@ class ChatBot:
     def get_dalle_response(self, image_prompt):
         try:
             response = self.client.images.generate(
-                model=self.current_config_options['model'],
+                model=self.current_config_options['dalle_model'],
                 prompt=image_prompt,
                 size=self.current_config_options['size'],
                 quality=self.current_config_options['quality'],
                 style=self.current_config_options['style'],
-                n=1,
-                response_format='url'
+                n=1,  # Value of 1 is the only value supported in DALLE-3 as of now
+                response_format='b64_json'
             )
-            return response
+
+            image_binary = base64.b64decode(response.data[0].b64_json)
+            image_object = BytesIO(image_binary)
+            revised_prompt = response.data[0].revised_prompt
+            # Convert from webP format to PNG
+            with Image.open(image_object) as webp_image:
+                png_image = BytesIO()
+
+                webp_image.save(png_image, 'PNG')
+                png_image.seek(0)
+
+                return png_image, revised_prompt
+
         except Exception as e:
             print(f'##################\n{e}\n##################')
-            return e
+            return None, e
 
     def get_vision_response(self, messages_history):
         pass
 
-    def get_chatgpt_response(self, messages_history):
+    def get_gpt_response(self, messages_history):
         try:
             response = self.client.chat.completions.create(
-                model=self.current_config_options['model'],
+                model=self.current_config_options['gpt_model'],
                 messages=messages_history,
                 stream=self.streaming_client,
                 temperature=float(self.current_config_options['temperature']),
@@ -123,7 +131,7 @@ class ChatBot:
             return e
 
     def usage_command(self):
-        if self.usage != {}:
+        if self.usage:
             return dedent(
                 f'''\
                 Cumulative Token stats since last reset:
