@@ -64,7 +64,7 @@ class ChatBot:
         if revised_prompt:
             is_error = False
             self.messages.append(
-                {'role': 'assistant', 'content': f'Pretend I just created an image with this Dalle3 Prompt: {revised_prompt}'})
+                {'role': 'assistant', 'content': f'I just created an image with this Dalle3 Prompt: {revised_prompt}'})
 
         else:
             is_error = True

@@ -3,7 +3,7 @@ import re
 import signal
 from textwrap import dedent
 
-RESET_CONTEXT = "!reset"
+BOT_NAME = 'Jarvis'
 
 INITIALIZE_TEXT = {
     "role": "system",
@@ -78,9 +78,9 @@ def cli_chat():
                 response, is_error = gpt_Bot.chat_context_mgr(user_input)
                 if is_error:
                     print(
-                        f"Jarvis: Sorry, I ran into an error. The raw error details are as follows:\n\n{response}")
+                        f"{BOT_NAME}: Sorry, I ran into an error. The raw error details are as follows:\n\n{response}")
                 else:
-                    print(f"Jarvis: {response}")
+                    print(f"{BOT_NAME}: {response}")
 
 
 if __name__ == "__main__":

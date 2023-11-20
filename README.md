@@ -1,6 +1,9 @@
 # ChatGPT Bots
 Python based ChatGPT bot integrations
 
+## `Notice`
+`The Discord client is a little behind as I've spent the majority of time working on the Slack version. It should still work, but it's missing a lot of the functionality included in the Slack version. The CLI version is very basic as it's only text based.`
+
 ## Description
 Various ChatBot Integrations like Slack and Discord as well as a CLI based version using Python and OpenAPI's ChatGPT platform.
 

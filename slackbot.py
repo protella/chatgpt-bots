@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 import re
 from textwrap import dedent
 from time import sleep
+from spellchecker import SpellChecker
 
 load_dotenv()
 
@@ -30,9 +31,12 @@ reset_pattern = re.compile(r'^!reset\s+(\S+)$')
 # pattern to match the slackbot's userID in channel messages
 user_id_pattern = re.compile(r'<@[\w]+>')
 
-content_type = 'text'
-streaming_client = False
-chat_del_ts = []
+corrected_message_text = ''  # result of message being parsed by spelling correction
+threshold = 2   # Minimum number of phrase/word matches to assume user wants to generate an image
+trigger_words = []  # hold the dalle3 image creation trigger words from trigger_words.txt
+streaming_client = False  # not implemented...yet.
+chat_del_ts = []  # list of message timestamps to cleanup after a response returns
+spell = SpellChecker()
 app = App(token=SLACK_BOT_TOKEN)
 
 
@@ -81,10 +85,23 @@ def process_and_respond(event, say):
         re.sub(user_id_pattern, '', event['text']).strip(), say)
 
     if message_text:
+
+        trigger_check, corrected_message_text = check_for_image_generation(
+            message_text, trigger_words)
+
         if gpt_Bot.processing:
             response = app.client.chat_postMessage(
                 channel=channel_id, text=f':no_entry: `{gpt_Bot.handle_busy()}` :no_entry:')
             chat_del_ts.append(response['message']['ts'])
+
+        elif trigger_check:
+
+            message_event = {'user_id': event['user'],
+                             'text': corrected_message_text,
+                             'channel_id': channel_id,
+                             'command': '/dalle-3'
+                             }
+            process_image_and_respond(say, message_event)
 
         else:
             initial_response = say(f'Thinking... {LOADING_EMOJI}')
@@ -101,21 +118,7 @@ def process_and_respond(event, say):
             delete_chat_messages(channel_id, chat_del_ts, say)
 
 
-def delete_chat_messages(channel, timestamps, say):
-    try:
-        for ts in timestamps:
-            app.client.chat_delete(channel=channel, ts=ts)
-
-    except Exception as e:
-        say(
-            f':no_entry: `Sorry, I ran into an error deleting my own message.` :no_entry:\n```{e}```')
-    finally:
-        chat_del_ts.clear()
-
-
-@app.command('/dalle-3')
-def handle_dalle3(ack, say, command):
-    ack()
+def process_image_and_respond(say, command):
     user_id = command['user_id']
     text = command['text']
     cmd = command['command']
@@ -125,10 +128,15 @@ def handle_dalle3(ack, say, command):
         response = app.client.chat_postMessage(
             channel=channel, text=f':no_entry: `{gpt_Bot.handle_busy()}` :no_entry:')
         chat_del_ts.append(response['message']['ts'])
+
     else:
 
         app.client.chat_postMessage(
             channel=channel, text=f'<@{user_id}> used `{cmd}`.\n*Original Prompt:*\n_{text}_')
+
+        if not text:
+            say(':no_entry: You must provide a prompt when using `/dalle-3` :no_entry:')
+            return
 
         temp_response = app.client.chat_postMessage(
             channel=channel, text=f'Generating image, please wait... {LOADING_EMOJI}')
@@ -154,6 +162,57 @@ def handle_dalle3(ack, say, command):
         delete_chat_messages(channel, chat_del_ts, say)
 
 
+def check_for_image_generation(message, trigger_words, threshold=threshold):
+    corrected_message_text = correct_spelling(message)
+    message_lower = corrected_message_text.lower()
+    trigger_count = sum(word in message_lower for word in trigger_words)
+    return trigger_count >= threshold, corrected_message_text
+
+
+def correct_spelling(text):
+    corrected_words = []
+    words = text.split()
+
+    for word in words:
+        if word.lower() in spell.unknown([word.lower()]):
+            # Attempt to correct the word
+            corrected_word = spell.correction(word.lower())
+
+            # If correction returns None, use the original word
+            if corrected_word is None:
+                corrected_word = word
+
+            # Match the case of the original word
+            if word.isupper():
+                corrected_word = corrected_word.upper()
+            elif word[0].isupper():
+                corrected_word = corrected_word.capitalize()
+
+            corrected_words.append(corrected_word)
+        else:
+            corrected_words.append(word)
+
+    return ' '.join(corrected_words)
+
+
+def delete_chat_messages(channel, timestamps, say):
+    try:
+        for ts in timestamps:
+            app.client.chat_delete(channel=channel, ts=ts)
+
+    except Exception as e:
+        say(
+            f':no_entry: `Sorry, I ran into an error deleting my own message.` :no_entry:\n```{e}```')
+    finally:
+        chat_del_ts.clear()
+
+
+@app.command('/dalle-3')
+def handle_dalle3(ack, say, command):
+    ack()
+    process_image_and_respond(say, command)
+
+
 @app.event('app_mention')
 def handle_mention(event, say):
     process_and_respond(event, say)
@@ -165,6 +224,12 @@ def handle_message_events(event, say):
         process_and_respond(event, say)
 
 
+def read_trigger_words(file_path):
+    with open(file_path, 'r') as file:
+
+        return [line.strip() for line in file if line.strip()]
+
+
 def handle_error(say, error):
     say(
         f':no_entry: `Sorry, I ran into an error. The raw error details are as follows:` :no_entry:\n```{error}```')
@@ -173,5 +238,7 @@ def handle_error(say, error):
 if __name__ == '__main__':
     gpt_Bot = bot.ChatBot(INITIALIZE_TEXT, streaming_client)
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
+
+    trigger_words = read_trigger_words('trigger_words.txt')
 
     handler.start()
