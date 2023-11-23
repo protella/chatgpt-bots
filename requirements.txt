@@ -5,3 +5,4 @@ slack_bolt
 python-dotenv
 Pillow
 pyspellchecker
+requests

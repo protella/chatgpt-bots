@@ -31,14 +31,80 @@ class ChatBot:
             'size': '1024x1024',  # 1024x1024, 1024x1792 or 1792x1024
             'quality': 'hd',  # standard or hd
             'style': 'vivid',  # natural or vivid
-            'number': 1  # number of images. Only 1 supported for Dalle3
+            'number': 1,  # number of images. Only 1 supported for Dalle3
+            'detail': 'auto'  # vision parameter: auto, low, high
         }
         self.current_config_options = self.config_option_defaults.copy()
         self.client = OpenAI(api_key=os.environ['OPENAI_KEY'])
 
-    def chat_context_mgr(self, message_content):
+    def chat_context_mgr(self, message_text):
         self.processing = True
-        self.messages.append({'role': 'user', 'content': message_content})
+        self.messages.append({'role': 'user', 'content': message_text})
+        gpt_output = self.get_gpt_response(self.messages)
+        self.processing = False
+
+        if hasattr(gpt_output, 'role'):
+            is_error = False
+            if gpt_output.role == 'assistant':
+                self.messages.append(
+                    {'role': 'assistant', 'content': gpt_output.content.replace('\n', ' ')})
+
+            return gpt_output.content, is_error
+        else:
+            is_error = True
+            self.messages.pop()
+            return gpt_output, is_error
+
+    def image_context_mgr(self, message_text):
+        self.processing = True
+        self.messages.append(
+            {'role': 'user', 'content': f'Dalle3 User Prompt: {message_text}'})
+        image, revised_prompt = self.get_dalle_response(message_text)
+        self.processing = False
+
+        if revised_prompt:
+            is_error = False
+            self.messages.append(
+                {'role': 'assistant', 'content': dedent(
+                    f"""\
+                        Based on the DALL-E 3 prompt, I can imagine an image like this: {revised_prompt} 
+                        While I can't create or view images,
+                        I can describe what such an image might look like or the ideas it might convey.
+                        I will act as if I actually created the described image."""
+                ).replace('\n', ' ')})
+
+        else:
+            is_error = True
+            self.messages.pop()
+            image = None
+            revised_prompt = None
+
+        return image, revised_prompt, is_error
+
+    def vision_context_mgr(self, message_text, images):
+        self.processing = True
+        is_error = False
+        multi_part_msg = {
+            'role': 'user',
+            'content': [
+                {
+                    'type': 'text',
+                    'text': f'{message_text}'
+                }
+            ]
+        }
+
+        for image in images:
+            new_image_element = {
+                'type': 'image_url',
+                'image_url': {
+                    'url': f'data:image/png;base64,{image}',
+                    'detail': self.current_config_options['detail']
+                }
+            }
+            multi_part_msg['content'].append(new_image_element)
+
+        self.messages.append(multi_part_msg)
         gpt_output = self.get_gpt_response(self.messages)
         self.processing = False
 
@@ -53,33 +119,6 @@ class ChatBot:
             is_error = True
             self.messages.pop()
             return gpt_output, is_error
-
-    def image_context_mgr(self, message_content):
-        self.processing = True
-        self.messages.append(
-            {'role': 'user', 'content': f'Dalle3 User Prompt: {message_content}'})
-        image, revised_prompt = self.get_dalle_response(message_content)
-        self.processing = False
-
-        if revised_prompt:
-            is_error = False
-            self.messages.append(
-                {'role': 'assistant', 'content': f'I just created an image with this Dalle3 Prompt: {revised_prompt}'})
-
-        else:
-            is_error = True
-            self.messages.pop()
-            image = None
-            revised_prompt = None
-
-        return image, revised_prompt, is_error
-
-    def vision_context_mgr(self, message_content):
-        self.processing = True
-        is_error = False
-        # process vision
-        self.processing = False
-        return "Vision Response", is_error
 
     def get_dalle_response(self, image_prompt):
         try:
@@ -110,6 +149,7 @@ class ChatBot:
             return None, e
 
     def get_vision_response(self, messages_history):
+        # Not needed? Can use existing gpt response function below?
         pass
 
     def get_gpt_response(self, messages_history):
@@ -175,6 +215,7 @@ class ChatBot:
         return dedent(
             """\
             !help - This help.
+            /dalle-3 \{prompt\} generate an image via text with Dalle-3.
             !config - Displays the current configuration values.
             !config [option] [value] - Sets one of the options seen in '!config' to a custom value. Beware of the model's ranges for these values.
               --see https://platform.openai.com/docs/api-reference for more info.

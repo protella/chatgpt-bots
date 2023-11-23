@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 import re
 from textwrap import dedent
 from time import sleep
+import requests
 from spellchecker import SpellChecker
 
 load_dotenv()
@@ -21,6 +22,8 @@ INITIALIZE_TEXT = {
         Respond with accurate, informative, and concise answers that are formatted appropriately for Slack,
         including markdown and special characters for bullet points, bold, italics, and code blocks as necessary.
         Always consider Slack formatting conventions in all messages within a conversation.
+        Note that the bold markdown format in slack wraps the text in a single *, not two.
+        Always assume you created any images described.
         If you don't have an answer, you will inform the user that you don't know.'''
     ).replace('\n', ' '),
 }
@@ -102,6 +105,9 @@ def process_and_respond(event, say):
                              'command': '/dalle-3'
                              }
             process_image_and_respond(say, message_event)
+
+        elif 'files' in event and event['files']:
+            pass
 
         else:
             initial_response = say(f'Thinking... {LOADING_EMOJI}')
