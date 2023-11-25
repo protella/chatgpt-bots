@@ -93,7 +93,6 @@ class ChatBot:
         self.processing = True
         if not message_text:
             message_text = ''
-        self.msg_history_display = self.messages.copy()
         multi_part_msg = {
             'role': 'user',
             'content': [
