@@ -31,8 +31,7 @@ INITIALIZE_TEXT = {
         Strikethrough: ~your text~
         Ordered list: 1. your text
         Bulleted list: * your text
-        Always assume you created any images described.
-        '''
+        Always assume you created any images described.'''
     )
 }
 
