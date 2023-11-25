@@ -5,9 +5,12 @@ from textwrap import dedent
 import base64
 from io import BytesIO
 from PIL import Image
+from copy import deepcopy
 
 
-load_dotenv()
+load_dotenv()  # load auth tokens from .env file
+
+# Default models: https://platform.openai.com/docs/models
 GPT_MODEL = 'gpt-4-1106-preview'
 DALLE_MODEL = 'dall-e-3'
 GPT_VISION_MODEL = 'gpt-4-vision-preview'
@@ -37,17 +40,21 @@ class ChatBot:
         self.current_config_options = self.config_option_defaults.copy()
         self.client = OpenAI(api_key=os.environ['OPENAI_KEY'])
 
-    def chat_context_mgr(self, message_text):
+    def chat_context_mgr(self, message_text, files=''):
         self.processing = True
         self.messages.append({'role': 'user', 'content': message_text})
-        gpt_output = self.get_gpt_response(self.messages)
+
+        # Using vision model for all chat prompts since images passed to non-vision model throws an error.
+        # GPT4v is an extension of GPT4 with all the same functions and features.
+        gpt_output = self.get_gpt_response(
+            self.messages, self.current_config_options['gpt_vision_model'])
         self.processing = False
 
         if hasattr(gpt_output, 'role'):
             is_error = False
             if gpt_output.role == 'assistant':
                 self.messages.append(
-                    {'role': 'assistant', 'content': gpt_output.content.replace('\n', ' ')})
+                    {'role': 'assistant', 'content': gpt_output.content})
 
             return gpt_output.content, is_error
         else:
@@ -59,7 +66,8 @@ class ChatBot:
         self.processing = True
         self.messages.append(
             {'role': 'user', 'content': f'Dalle3 User Prompt: {message_text}'})
-        image, revised_prompt = self.get_dalle_response(message_text)
+        image, revised_prompt = self.get_dalle_response(
+            message_text, self.current_config_options['dalle_model'])
         self.processing = False
 
         if revised_prompt:
@@ -71,7 +79,7 @@ class ChatBot:
                         While I can't create or view images,
                         I can describe what such an image might look like or the ideas it might convey.
                         I will act as if I actually created the described image."""
-                ).replace('\n', ' ')})
+                )})
 
         else:
             is_error = True
@@ -83,7 +91,9 @@ class ChatBot:
 
     def vision_context_mgr(self, message_text, images):
         self.processing = True
-        is_error = False
+        if not message_text:
+            message_text = ''
+        self.msg_history_display = self.messages.copy()
         multi_part_msg = {
             'role': 'user',
             'content': [
@@ -105,7 +115,8 @@ class ChatBot:
             multi_part_msg['content'].append(new_image_element)
 
         self.messages.append(multi_part_msg)
-        gpt_output = self.get_gpt_response(self.messages)
+        gpt_output = self.get_gpt_response(
+            self.messages, self.current_config_options['gpt_vision_model'])
         self.processing = False
 
         if hasattr(gpt_output, 'role'):
@@ -120,10 +131,10 @@ class ChatBot:
             self.messages.pop()
             return gpt_output, is_error
 
-    def get_dalle_response(self, image_prompt):
+    def get_dalle_response(self, image_prompt, model):
         try:
             response = self.client.images.generate(
-                model=self.current_config_options['dalle_model'],
+                model=model,
                 prompt=image_prompt,
                 size=self.current_config_options['size'],
                 quality=self.current_config_options['quality'],
@@ -152,10 +163,10 @@ class ChatBot:
         # Not needed? Can use existing gpt response function below?
         pass
 
-    def get_gpt_response(self, messages_history):
+    def get_gpt_response(self, messages_history, model):
         try:
             response = self.client.chat.completions.create(
-                model=self.current_config_options['gpt_model'],
+                model=model,
                 messages=messages_history,
                 stream=self.streaming_client,
                 temperature=float(self.current_config_options['temperature']),
@@ -184,7 +195,18 @@ class ChatBot:
             return 'No usage info yet. Ask the bot something and check again.'
 
     def history_command(self):
-        return self.messages
+        # We don't want to display the b64 encoded images that may be present in the history, so replace them with placeholder text.
+        # This is done in a separate instance of the message history so that the images remain for the bot to analyze in future conversations.
+        display_history = deepcopy(self.messages)
+        for message in display_history:
+            if 'content' in message and isinstance(message['content'], list):
+                for content_item in message['content']:
+                    if isinstance(content_item, dict) and content_item.get('type') == 'image_url':
+                        # Replace image data with placeholder text
+                        content_item['image_url'] = {
+                            'url': 'Image content not displayed'}
+
+        return display_history
 
     def set_config(self, setting, value):
         if setting in self.current_config_options:

@@ -8,9 +8,12 @@ from textwrap import dedent
 from time import sleep
 import requests
 from spellchecker import SpellChecker
+import base64
 
-load_dotenv()
 
+load_dotenv()  # load auth tokens from .env file
+
+### Modify these values as needed ###
 LOADING_EMOJI = ':loading:'
 SLACK_BOT_TOKEN = environ['SLACK_BOT_TOKEN']
 SLACK_APP_TOKEN = environ['SLACK_APP_TOKEN']
@@ -22,11 +25,20 @@ INITIALIZE_TEXT = {
         Respond with accurate, informative, and concise answers that are formatted appropriately for Slack,
         including markdown and special characters for bullet points, bold, italics, and code blocks as necessary.
         Always consider Slack formatting conventions in all messages within a conversation.
-        Note that the bold markdown format in slack wraps the text in a single *, not two.
+        Here are some examples of common Slack markdown syntax:
+        Bold: *your text*
+        Italicize: _your text_
+        Strikethrough: ~your text~
+        Ordered list: 1. your text
+        Bulleted list: * your text
         Always assume you created any images described.
-        If you don't have an answer, you will inform the user that you don't know.'''
-    ).replace('\n', ' '),
+        '''
+    )
 }
+
+#
+### You shouldn't need to modify anything below this line ###
+#
 
 # patterns to match commands
 config_pattern = re.compile(r'!config\s+(\S+)\s+(.+)')
@@ -37,12 +49,17 @@ user_id_pattern = re.compile(r'<@[\w]+>')
 corrected_message_text = ''  # result of message being parsed by spelling correction
 threshold = 2   # Minimum number of phrase/word matches to assume user wants to generate an image
 trigger_words = []  # hold the dalle3 image creation trigger words from trigger_words.txt
-streaming_client = False  # not implemented...yet.
+streaming_client = False  # not implemented for Slack...yet.
 chat_del_ts = []  # list of message timestamps to cleanup after a response returns
+
+# GPT4 vision supported image types
+allowed_mimetypes = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
 spell = SpellChecker()
 app = App(token=SLACK_BOT_TOKEN)
 
 
+# Check the message text to see if a bot command was sent. Respond accordingly.
 def parse_text(text, say):
     match text.lower():
         case '!history':
@@ -87,28 +104,72 @@ def process_and_respond(event, say):
     message_text = parse_text(
         re.sub(user_id_pattern, '', event['text']).strip(), say)
 
-    if message_text:
+    if message_text or ('files' in event and event['files']):
 
+        #  Check if user is requesting Dalle3 image gen via chat and correct any spelling mistakes to improve accuracy.
         trigger_check, corrected_message_text = check_for_image_generation(
             message_text, trigger_words)
 
+        # If bot is still processing a previous request, inform user it's busy and track busy messages
         if gpt_Bot.processing:
             response = app.client.chat_postMessage(
                 channel=channel_id, text=f':no_entry: `{gpt_Bot.handle_busy()}` :no_entry:')
             chat_del_ts.append(response['message']['ts'])
 
+        # If intent was likely an dalle3 image gen request. Manually construct event msg since /dalle-3 repsonse is different
         elif trigger_check:
 
-            message_event = {'user_id': event['user'],
-                             'text': corrected_message_text,
-                             'channel_id': channel_id,
-                             'command': '/dalle-3'
-                             }
+            message_event = {
+                'user_id': event['user'],
+                'text': corrected_message_text,
+                'channel_id': channel_id,
+                'command': '/dalle-3'
+            }
             process_image_and_respond(say, message_event)
 
+        # If there are files in the message
         elif 'files' in event and event['files']:
-            pass
+            initial_response = say(f'Thinking... {LOADING_EMOJI}')
+            chat_del_ts.append(initial_response['message']['ts'])
 
+            files_data = event.get('files', [])
+            vision_files = []
+            # Future non-vision files. Requires preprocessing/extracting text.
+            other_files = []
+
+            # Iterate through files, check file type. If image, b64 encode it, else not supported type.
+            for file in files_data:
+                file_url = file.get('url_private')
+                file_mimetype = file.get('mimetype')
+
+                if file_url and file_mimetype in allowed_mimetypes:
+                    encoded_file = download_and_encode_file(
+                        say, file_url, SLACK_BOT_TOKEN)
+                    if encoded_file:
+                        vision_files.append(encoded_file)
+                else:
+                    encoded_file = download_and_encode_file(
+                        say, file_url, SLACK_BOT_TOKEN)
+                    if encoded_file:
+                        other_files.append(encoded_file)
+
+            if vision_files:
+                response, is_error = gpt_Bot.vision_context_mgr(
+                    message_text, vision_files)
+                if is_error:
+                    say(
+                        f':no_entry: `Sorry, I ran into an error. The raw error details are as follows:` :no_entry:\n```{response}```')
+
+                else:
+                    say(response)
+
+            elif other_files:
+                say(f':no_entry: `Sorry, GPT4 Vision only supports jpeg, png, webp, and non-animated gif file types at this time.` :no_entry:')
+
+            # Cleanup busy/loading chat msgs
+            delete_chat_messages(channel_id, chat_del_ts, say)
+
+        # If just a normal txt message, process with default chat context manager
         else:
             initial_response = say(f'Thinking... {LOADING_EMOJI}')
             chat_del_ts.append(initial_response['message']['ts'])
@@ -121,9 +182,11 @@ def process_and_respond(event, say):
             else:
                 say(response)
 
+            # Cleanup busy/loading chat msgs
             delete_chat_messages(channel_id, chat_del_ts, say)
 
 
+# Dalle-3 image gen via /dalle-3 command or via "fake" auto-modal selection via key-trigger words
 def process_image_and_respond(say, command):
     user_id = command['user_id']
     text = command['text']
@@ -144,15 +207,19 @@ def process_image_and_respond(say, command):
             say(':no_entry: You must provide a prompt when using `/dalle-3` :no_entry:')
             return
 
+        # Image gen takes a while. Give the user some indication things are processing.
         temp_response = app.client.chat_postMessage(
             channel=channel, text=f'Generating image, please wait... {LOADING_EMOJI}')
         chat_del_ts.append(temp_response['ts'])
 
+        # Dalle-3 always responds with a more detailed revised prompt.
         image, revised_prompt, is_error = gpt_Bot.image_context_mgr(text)
 
+        # revised_prompt holds any error values in this case
         if is_error:
             handle_error(say, revised_prompt)
 
+        # Build the response message and upload the generated image to Slack
         else:
             try:
                 response = app.client.files_upload_v2(
@@ -164,17 +231,34 @@ def process_image_and_respond(say, command):
             except Exception as e:
                 handle_error(say, revised_prompt)
 
+        # The successful response from Slack may be seen a bit before the message and image appear in Slack itself due to the client side
+            # processing and downloading the image. The processing message appears to get removed 4-5 sec before the iamge actually loads.
         # sleep(4)  # Yuck. Maybe use callbacks or other event triggers to wait for images to display in clients after being received by slack?
         delete_chat_messages(channel, chat_del_ts, say)
 
 
+# In order to download Files from Slack, the bot's request needs to be authenticated to the workspace via the Slackbot token
+def download_and_encode_file(say, file_url, bot_token):
+    headers = {'Authorization': f'Bearer {bot_token}'}
+    response = requests.get(file_url, headers=headers)
+
+    if response.status_code == 200:
+        return base64.b64encode(response.content).decode('utf-8')
+    else:
+        handle_error(say, response.status_code)
+        return None
+
+
+# Attempt to use Python's Spell checking library for 'fake' mode checks since this is not passed to GPT which is more forgiving with spelling errors.
 def check_for_image_generation(message, trigger_words, threshold=threshold):
     corrected_message_text = correct_spelling(message)
-    message_lower = corrected_message_text.lower()
-    trigger_count = sum(word in message_lower for word in trigger_words)
+    # Convert to a set to avoid substring matches (e.g. 'create' triggering from 'created')
+    message_words = set(corrected_message_text.lower().split())
+    trigger_count = sum(word in message_words for word in trigger_words)
     return trigger_count >= threshold, corrected_message_text
 
 
+# Check spelling and maintain capitalization of original message
 def correct_spelling(text):
     corrected_words = []
     words = text.split()
@@ -201,6 +285,7 @@ def correct_spelling(text):
     return ' '.join(corrected_words)
 
 
+# Process timestamps of any temporary status or progress messages the bot sends to Slack. Called to clean them up once a response completes.
 def delete_chat_messages(channel, timestamps, say):
     try:
         for ts in timestamps:
@@ -213,6 +298,7 @@ def delete_chat_messages(channel, timestamps, say):
         chat_del_ts.clear()
 
 
+# Slack event handlers
 @app.command('/dalle-3')
 def handle_dalle3(ack, say, command):
     ack()
@@ -230,6 +316,7 @@ def handle_message_events(event, say):
         process_and_respond(event, say)
 
 
+# Read the trigger_words txt file
 def read_trigger_words(file_path):
     with open(file_path, 'r') as file:
 
