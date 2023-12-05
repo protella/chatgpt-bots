@@ -236,7 +236,7 @@ class ChatBot:
         return dedent(
             """\
             !help - This help.
-            /dalle-3 \{prompt\} generate an image via text with Dalle-3.
+            /dalle-3 {prompt} generate an image via text with Dalle-3.
             !config - Displays the current configuration values.
             !config [option] [value] - Sets one of the options seen in '!config' to a custom value. Beware of the model's ranges for these values.
               --see https://platform.openai.com/docs/api-reference for more info.
