@@ -30,7 +30,7 @@ INITIALIZE_TEXT = {
         Italicize: _your text_
         Strikethrough: ~your text~
         Ordered list: 1. your text
-        Bulleted list: * your text
+        Bulleted list: - your text
         Always assume you created any images described.'''
     )
 }
