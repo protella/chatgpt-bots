@@ -2,15 +2,16 @@
 Python based ChatGPT bot integrations
 
 ## `Notice`
-`The Discord client is a little behind as I've spent the majority of time working on the Slack version. It should still work, but it's missing a lot of the functionality included in the Slack version. The CLI version is very basic as it's only text based.`
+The Discord client is a little behind as I've spent the majority of time working on the Slack version. It should still work, but it's missing a lot of the functionality included in the Slack version. The CLI version is very basic as it's only text based.
 
 ## Description
 ChatBot Integrations for Slack, Discord, and the CLI using Python and OpenAPI's ChatGPT platform.
 
 ## Getting Started
 
-- Requires `Python 3.10+` as the script takes advantage of the new structural pattern matching (match/case) in this version.
-- The setup of a Slack or Discord App is out of scope of this README. There's plenty of documentation online detailing these processes.
+Requires `Python 3.10+` as the script takes advantage of the new structural pattern matching (match/case) in this version.  
+
+The setup of a Slack or Discord App is out of scope of this README. There's plenty of documentation online detailing these processes.
   
 ### Slack quickstart guide: https://api.slack.com/start/quickstart
 #### The Slack event subscriptions and scope are as follows:
