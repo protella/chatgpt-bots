@@ -126,7 +126,7 @@ def process_and_respond(event, say):
             }
             process_image_and_respond(say, message_event)
 
-        # If there are files in the message
+        # If there are files in the message (GPT Vision request or other file types)
         elif 'files' in event and event['files']:
             initial_response = say(f'Thinking... {LOADING_EMOJI}')
             chat_del_ts.append(initial_response['message']['ts'])
@@ -156,8 +156,7 @@ def process_and_respond(event, say):
                 response, is_error = gpt_Bot.vision_context_mgr(
                     message_text, vision_files)
                 if is_error:
-                    say(
-                        f':no_entry: `Sorry, I ran into an error. The raw error details are as follows:` :no_entry:\n```{response}```')
+                    handle_error(say, response)
 
                 else:
                     say(response)
@@ -175,8 +174,7 @@ def process_and_respond(event, say):
             response, is_error = gpt_Bot.chat_context_mgr(
                 message_text)
             if is_error:
-                say(
-                    f':no_entry: `Sorry, I ran into an error. The raw error details are as follows:` :no_entry:\n```{response}```')
+                handle_error(say, response)
 
             else:
                 say(response)
@@ -185,7 +183,7 @@ def process_and_respond(event, say):
             delete_chat_messages(channel_id, chat_del_ts, say)
 
 
-# Dalle-3 image gen via /dalle-3 command or via "fake" auto-modal selection via key-trigger words
+# Dalle-3 image gen via /dalle-3 command or via "fake" auto-modal selection via keyword triggers
 def process_image_and_respond(say, command):
     user_id = command['user_id']
     text = command['text']
@@ -199,12 +197,12 @@ def process_image_and_respond(say, command):
 
     else:
 
-        app.client.chat_postMessage(
-            channel=channel, text=f'<@{user_id}> used `{cmd}`.\n*Original Prompt:*\n_{text}_')
-
         if not text:
             say(':no_entry: You must provide a prompt when using `/dalle-3` :no_entry:')
             return
+
+        app.client.chat_postMessage(
+            channel=channel, text=f'<@{user_id}> used `{cmd}`.\n*Original Prompt:*\n_{text}_')
 
         # Image gen takes a while. Give the user some indication things are processing.
         temp_response = app.client.chat_postMessage(
@@ -231,7 +229,7 @@ def process_image_and_respond(say, command):
                 handle_error(say, revised_prompt)
 
         # The successful response from Slack may be seen a bit before the message and image appear in Slack itself due to the client side
-            # processing and downloading the image. The processing message appears to get removed 4-5 sec before the iamge actually loads.
+        # processing and downloading the image. The processing message appears to get removed 4-5 sec before the iamge actually loads.
         # sleep(4)  # Yuck. Maybe use callbacks or other event triggers to wait for images to display in clients after being received by slack?
         delete_chat_messages(channel, chat_del_ts, say)
 
@@ -248,7 +246,7 @@ def download_and_encode_file(say, file_url, bot_token):
         return None
 
 
-# Attempt to use Python's Spell checking library for 'fake' mode checks since this is not passed to GPT which is more forgiving with spelling errors.
+# Attempt to use Python's Spell checking library for 'fake' modal checks since this is not passed to GPT which is more forgiving with spelling errors.
 def check_for_image_generation(message, trigger_words, threshold=threshold):
     corrected_message_text = correct_spelling(message)
     # Convert to a set to avoid substring matches (e.g. 'create' triggering from 'created')

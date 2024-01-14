@@ -78,7 +78,7 @@ class ChatBot:
                         Based on the DALL-E 3 prompt, I can imagine an image like this: {revised_prompt} 
                         While I can't create or view images,
                         I can describe what such an image might look like or the ideas it might convey.
-                        I will act as if I actually created the described image."""
+                        I will act as if I actually created the described image for the purposes of this chat."""
                 )})
 
         else:
