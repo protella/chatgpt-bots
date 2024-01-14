@@ -20,3 +20,5 @@ generate
 make
 illustration
 depiction
+depicting
+illustrating
