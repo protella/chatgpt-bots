@@ -9,18 +9,50 @@ ChatBot Integrations for Slack, Discord, and the CLI using Python and OpenAPI's 
 
 ## Getting Started
 
-Requires `Python 3.10+` as the script takes advantage of the new structural pattern matching (match/case/switch) in this version.
+- Requires `Python 3.10+` as the script takes advantage of the new structural pattern matching (match/case) in this version.
+- The setup of a Slack or Discord App is out of scope of this README. There's plenty of documentation online detailing these processes.
+  
+### Slack quickstart guide: https://api.slack.com/start/quickstart
+#### The Slack event subscriptions and scope are as follows:
 
-### Install `venv` module
+| Event Name  	| Description                                                       	| Required Scope    	|
+|-------------	|-------------------------------------------------------------------	|-------------------	|
+| app_mention 	| Subscribe to only the message events that mention your app or bot 	| app_mentions:read 	|
+| message.im  	| A message was posted in a direct message channel                  	| im:history        	|    
+    
+#### Slack OAuth & Permissions (Scopes):
+| Scope                	|
+|----------------------	|
+| app_mentions:read    	|
+| channels:history     	|
+| channels:join        	|
+| chat:write           	|
+| chat:write.customize 	|
+| commands             	|
+| files:read           	|
+| files:write          	|
+| im:history           	|
+| im:read              	|
+| im:write             	|
+
+---
+
+### Discord OAuth2 
+<img src="Docs/Discord_OAuth2.png" alt="image" width="40%" height="auto">
+
+---
+
+### Install `venv` module if you don't already have it
 `python3 -m pip install --user venv`
 
-### Create virtual environment
-`python3 -m venv chatgpt-bots`
+### Clone the repository
+`git clone https://github.com/protella/chatgpt-bots`
 
-### Activate venv
+### Create and Activate the Virtual Environment
 ```
 cd chatgpt-bots
-source bin/activate
+python3 -m venv chatbots
+source chatbots/bin/activate
 ```
 
 ### Installing Dependencies:
@@ -33,7 +65,7 @@ source bin/activate
 I.e., OpenAI, Slack and Discord tokens.
 The only required token is the OPENAI_KEY. The others depend on which integration you're using.
 
-- Create a `.env` file in this folder and populate it with your keys or tokens as follows:
+- Create a `.env` file in the root folder of the repo and populate it with your keys and tokens as follows:
 
 ```
 SLACK_BOT_TOKEN = 'YOURTOKENHERE'
@@ -54,9 +86,13 @@ Run the py file for your chosen interface, e.g.:
 
 
 ## ToDo:
+- Use Slack/Discord Threads to isolate and track individual conversations rather than maintaining a single conversation history across all users and channels.
+  - Use MongoDB as a document DB to hold the long term chat thread histories.
+  - For Slack, potentially use the API's conversation.history method to sync Slack's source of truth to the MongoDB
 - Add command functionality to allow for changing the initial chatbot init phrase
-- Track context/history size using the usage stats and pop old items from the history to avoid going over the model's max context size (4k w/ 3.5-turbo) Adjust for different models if necessary.
-- Clean up code, standardize style, move repeated client code to functions module
+- Update bot commands to use Slack/Discord's `/command` functionality rather than old school `!commands`
+- Track context/history size using the usage stats and pop old items from the history to avoid going over the model's max context size (4k w/ 3.5-turbo but not as much of an issue with GPT4 Turbo) Adjust for different models if necessary. Lower Priority
+- Clean up code, standardize style, move repeated client code to functions and utility modules. 
 
 
 
