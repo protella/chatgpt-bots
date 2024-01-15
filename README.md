@@ -93,7 +93,9 @@ Run the py file for your chosen interface, e.g.:
 - Add command functionality to allow for changing the initial chatbot init phrase
 - Update bot commands to use Slack/Discord's `/command` functionality rather than old school `!commands`
 - Track context/history size using the usage stats and pop old items from the history to avoid going over the model's max context size (4k w/ 3.5-turbo but not as much of an issue with GPT4 Turbo) Adjust for different models if necessary. Lower Priority
-- Clean up code, standardize style, move repeated client code to functions and utility modules. 
+- Clean up code, standardize style, move repeated client code to functions and utility modules.
+- Create manifest file for the app
+- Setup Github workflows and unit tests 
 
 
 
