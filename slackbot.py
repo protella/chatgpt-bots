@@ -1,4 +1,5 @@
 import bot_functions as bot
+import common_utils as utils
 from os import environ
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -7,7 +8,6 @@ import re
 from textwrap import dedent
 from time import sleep
 import requests
-from spellchecker import SpellChecker
 import base64
 
 
@@ -35,6 +35,9 @@ SYSTEM_PROMPT = {
     )
 }
 
+# Minimum number of word matches from the trigger words to assume user wants to generate an image
+trigger_threshold = 2
+
 #
 ### You shouldn't need to modify anything below this line ###
 #
@@ -46,7 +49,6 @@ reset_pattern = re.compile(r'^!reset\s+(\S+)$')
 user_id_pattern = re.compile(r'<@[\w]+>')
 
 corrected_message_text = ''  # result of message being parsed by spelling correction
-threshold = 2   # Minimum number of phrase/word matches to assume user wants to generate an image
 trigger_words = []  # hold the dalle3 image creation trigger words from trigger_words.txt
 streaming_client = False  # not implemented for Slack...yet.
 chat_del_ts = []  # list of message timestamps to cleanup after a response returns
@@ -54,7 +56,6 @@ chat_del_ts = []  # list of message timestamps to cleanup after a response retur
 # GPT4 vision supported image types
 allowed_mimetypes = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
-spell = SpellChecker()
 app = App(token=SLACK_BOT_TOKEN)
 
 
@@ -99,15 +100,21 @@ def parse_text(text, say):
 
 def process_and_respond(event, say):
     channel_id = event['channel']
+    thread_ts = event["ts"]
+
     # remove the slackbot's userID from the message using regex pattern matching
+    message_text = event.get('text') or event.get(
+        'message', {}).get('text', '')
+
+    # Clean up the message text and then pass it to the parse_text function
     message_text = parse_text(
-        re.sub(user_id_pattern, '', event['text']).strip(), say)
+        re.sub(user_id_pattern, '', message_text).strip(), say)
 
     if message_text or ('files' in event and event['files']):
 
         #  Check if user is requesting Dalle3 image gen via chat and correct any spelling mistakes to improve accuracy.
-        trigger_check, corrected_message_text = check_for_image_generation(
-            message_text, trigger_words)
+        trigger_check, corrected_message_text = utils.check_for_image_generation(
+            message_text, trigger_words, trigger_threshold)
 
         # If bot is still processing a previous request, inform user it's busy and track busy messages
         if gpt_Bot.processing:
@@ -156,7 +163,7 @@ def process_and_respond(event, say):
                 response, is_error = gpt_Bot.vision_context_mgr(
                     message_text, vision_files)
                 if is_error:
-                    handle_error(say, response)
+                    utils.handle_error(say, response)
 
                 else:
                     say(response)
@@ -167,17 +174,18 @@ def process_and_respond(event, say):
             # Cleanup busy/loading chat msgs
             delete_chat_messages(channel_id, chat_del_ts, say)
 
-        # If just a normal txt message, process with default chat context manager
+        # If just a normal text message, process with default chat context manager
         else:
-            initial_response = say(f'Thinking... {LOADING_EMOJI}')
+            initial_response = say(
+                text=f'Thinking... {LOADING_EMOJI}', thread_ts=thread_ts)
             chat_del_ts.append(initial_response['message']['ts'])
             response, is_error = gpt_Bot.chat_context_mgr(
                 message_text)
             if is_error:
-                handle_error(say, response)
+                utils.handle_error(say, response)
 
             else:
-                say(response)
+                say(text=response, thread_ts=thread_ts)
 
             # Cleanup busy/loading chat msgs
             delete_chat_messages(channel_id, chat_del_ts, say)
@@ -214,7 +222,7 @@ def process_image_and_respond(say, command):
 
         # revised_prompt holds any error values in this case
         if is_error:
-            handle_error(say, revised_prompt)
+            utils.handle_error(say, revised_prompt)
 
         # Build the response message and upload the generated image to Slack
         else:
@@ -226,7 +234,7 @@ def process_image_and_respond(say, command):
                     filename='Dalle3_image.png'
                 )
             except Exception as e:
-                handle_error(say, revised_prompt)
+                utils.handle_error(say, revised_prompt)
 
         # The successful response from the Slack API may be seen a few seconds before the uploaded image appears in the Slack client due to the client side
         # processing and downloading of the image. The processing message appears to get removed 4-5 sec before the image actually loads.
@@ -243,44 +251,8 @@ def download_and_encode_file(say, file_url, bot_token):
     if response.status_code == 200:
         return base64.b64encode(response.content).decode('utf-8')
     else:
-        handle_error(say, response.status_code)
+        utils.handle_error(say, response.status_code)
         return None
-
-
-# Attempt to use Python's Spell checking library for 'fake' modal checks since this is not passed to GPT which is more forgiving with spelling errors.
-def check_for_image_generation(message, trigger_words, threshold=threshold):
-    corrected_message_text = correct_spelling(message)
-    # Convert to a set to avoid substring matches (e.g. 'create' triggering from 'created')
-    message_words = set(corrected_message_text.lower().split())
-    trigger_count = sum(word in message_words for word in trigger_words)
-    return trigger_count >= threshold, corrected_message_text
-
-
-# Check spelling and maintain capitalization of original message
-def correct_spelling(text):
-    corrected_words = []
-    words = text.split()
-
-    for word in words:
-        if word.lower() in spell.unknown([word.lower()]):
-            # Attempt to correct the word
-            corrected_word = spell.correction(word.lower())
-
-            # If correction returns None, use the original word
-            if corrected_word is None:
-                corrected_word = word
-
-            # Match the case of the original word
-            if word.isupper():
-                corrected_word = corrected_word.upper()
-            elif word[0].isupper():
-                corrected_word = corrected_word.capitalize()
-
-            corrected_words.append(corrected_word)
-        else:
-            corrected_words.append(word)
-
-    return ' '.join(corrected_words)
 
 
 # Process timestamps of any temporary status or progress messages the bot sends to Slack. Called to clean them up once a response completes.
@@ -314,22 +286,10 @@ def handle_message_events(event, say):
         process_and_respond(event, say)
 
 
-# Read the trigger_words txt file
-def read_trigger_words(file_path):
-    with open(file_path, 'r') as file:
-
-        return [line.strip() for line in file if line.strip()]
-
-
-def handle_error(say, error):
-    say(
-        f':no_entry: `Sorry, I ran into an error. The raw error details are as follows:` :no_entry:\n```{error}```')
-
-
 if __name__ == '__main__':
     gpt_Bot = bot.ChatBot(SYSTEM_PROMPT, streaming_client)
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
 
-    trigger_words = read_trigger_words('trigger_words.txt')
+    trigger_words = utils.read_trigger_words('trigger_words.txt')
 
     handler.start()
