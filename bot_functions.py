@@ -17,9 +17,9 @@ GPT_VISION_MODEL = 'gpt-4-vision-preview'
 
 
 class ChatBot:
-    def __init__(self, INITIALIZE_TEXT, streaming_client=False):
-        self.messages = [INITIALIZE_TEXT]
-        self.INITIALIZE_TEXT = INITIALIZE_TEXT
+    def __init__(self, SYSTEM_PROMPT, streaming_client=False):
+        self.messages = [SYSTEM_PROMPT]
+        self.SYSTEM_PROMPT = SYSTEM_PROMPT
         self.streaming_client = streaming_client  # ToDo: Implement streaming support
         self.usage = {}
         self.processing = False
@@ -220,7 +220,7 @@ class ChatBot:
         )
 
     def reset_history(self):
-        self.messages = [self.INITIALIZE_TEXT]
+        self.messages = [self.SYSTEM_PROMPT]
         self.usage = {}
         self.processing = False
 

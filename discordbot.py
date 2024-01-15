@@ -8,7 +8,7 @@ from textwrap import dedent
 load_dotenv()
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-INITIALIZE_TEXT = {
+SYSTEM_PROMPT = {
     "role": "system",
     "content": dedent(
         """\
@@ -100,7 +100,7 @@ if __name__ == "__main__":
     intents = discord.Intents.default()
     intents.message_content = True
 
-    gpt_Bot = bot.ChatBot(INITIALIZE_TEXT, streaming_client)
+    gpt_Bot = bot.ChatBot(SYSTEM_PROMPT, streaming_client)
     discord_Client = discordClt(intents=intents)
     discord_Client.run(DISCORD_TOKEN)
 

@@ -5,7 +5,7 @@ from textwrap import dedent
 
 BOT_NAME = 'Jarvis'
 
-INITIALIZE_TEXT = {
+SYSTEM_PROMPT = {
     "role": "system",
     "content": dedent(
         """\
@@ -84,7 +84,7 @@ def cli_chat():
 
 
 if __name__ == "__main__":
-    gpt_Bot = bot_functions.ChatBot(INITIALIZE_TEXT, streaming_client)
+    gpt_Bot = bot_functions.ChatBot(SYSTEM_PROMPT, streaming_client)
 
     while True:
         cli_chat()

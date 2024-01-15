@@ -76,7 +76,7 @@ DISCORD_TOKEN = 'YOURTOKENHERE'
 ```
 
 ### Configuration - Bot Tuning
-The `INITIALIZE_TEXT` variable at the top of each script will set the tone for how the bot will respond. Telling it that it is a chatbot and with any specific style of responses will help with more appropriate responses.
+The `SYSTEM_PROMPT` variable at the top of each script will set the tone for how the bot will respond. Telling it that it is a chatbot and with any specific style of responses will help with more appropriate responses.
 
 ### Running the bot
 Run the py file for your chosen interface, e.g.:
@@ -89,7 +89,7 @@ Run the py file for your chosen interface, e.g.:
 ## ToDo:
 - Use Slack/Discord Threads to isolate and track individual conversations rather than maintaining a single conversation history across all users and channels.
   - Use MongoDB as a document DB to hold the long term chat thread histories.
-  - For Slack, potentially use the API's conversation.history method to sync Slack's source of truth to the MongoDB
+  - For Slack, potentially use the API's conversations.history method to sync Slack's source of truth to the MongoDB
 - Add command functionality to allow for changing the initial chatbot init phrase
 - Update bot commands to use Slack/Discord's `/command` functionality rather than old school `!commands`
 - Track context/history size using the usage stats and pop old items from the history to avoid going over the model's max context size (4k w/ 3.5-turbo but not as much of an issue with GPT4 Turbo) Adjust for different models if necessary. Lower Priority

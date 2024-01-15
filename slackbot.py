@@ -17,7 +17,7 @@ load_dotenv()  # load auth tokens from .env file
 LOADING_EMOJI = ':loading:'
 SLACK_BOT_TOKEN = environ['SLACK_BOT_TOKEN']
 SLACK_APP_TOKEN = environ['SLACK_APP_TOKEN']
-INITIALIZE_TEXT = {
+SYSTEM_PROMPT = {
     'role': 'system',
     'content': dedent(
         '''\
@@ -228,9 +228,10 @@ def process_image_and_respond(say, command):
             except Exception as e:
                 handle_error(say, revised_prompt)
 
-        # The successful response from Slack may be seen a bit before the message and image appear in Slack itself due to the client side
-        # processing and downloading the image. The processing message appears to get removed 4-5 sec before the iamge actually loads.
-        # sleep(4)  # Yuck. Maybe use callbacks or other event triggers to wait for images to display in clients after being received by slack?
+        # The successful response from the Slack API may be seen a few seconds before the uploaded image appears in the Slack client due to the client side
+        # processing and downloading of the image. The processing message appears to get removed 4-5 sec before the image actually loads.
+
+        # sleep(4)  # Yuck. Maybe use callbacks or other event triggers to wait for images to display in the client before removing the loading status?
         delete_chat_messages(channel, chat_del_ts, say)
 
 
@@ -326,7 +327,7 @@ def handle_error(say, error):
 
 
 if __name__ == '__main__':
-    gpt_Bot = bot.ChatBot(INITIALIZE_TEXT, streaming_client)
+    gpt_Bot = bot.ChatBot(SYSTEM_PROMPT, streaming_client)
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
 
     trigger_words = read_trigger_words('trigger_words.txt')
