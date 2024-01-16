@@ -49,6 +49,6 @@ def read_trigger_words(file_path):
         return [line.strip() for line in file if line.strip()]
 
 
-def handle_error(say, error):
+def handle_error(say, error, thread_ts=None):
     say(
-        f':no_entry: `Sorry, I ran into an error. The raw error details are as follows:` :no_entry:\n```{error}```')
+        f':no_entry: `Sorry, I ran into an error. The raw error details are as follows:` :no_entry:\n```{error}```', thread_ts=thread_ts)

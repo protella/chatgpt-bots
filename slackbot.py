@@ -6,7 +6,6 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from dotenv import load_dotenv
 import re
 from textwrap import dedent
-from time import sleep
 import requests
 import base64
 
@@ -60,39 +59,45 @@ app = App(token=SLACK_BOT_TOKEN)
 
 
 # Check the message text to see if a bot command was sent. Respond accordingly.
-def parse_text(text, say):
+def parse_text(text, say, thread_ts, is_thread=False):
+    if not is_thread:
+        thread_ts = None
+
     match text.lower():
         case '!history':
-            say(f'```{gpt_Bot.history_command()}```')
+            say(f'```{gpt_Bot.history_command()}```', thread_ts=thread_ts)
 
         case '!help':
-            say(f'```{gpt_Bot.help_command()}```')
+            say(f'```{gpt_Bot.help_command()}```', thread_ts=thread_ts)
 
         case '!usage':
-            say(f'```{gpt_Bot.usage_command()}```')
+            say(f'```{gpt_Bot.usage_command()}```', thread_ts=thread_ts)
 
         case '!config':
-            say(f'```Current Configuration:\n{gpt_Bot.view_config()}```')
+            say(f'```Current Configuration:\n{gpt_Bot.view_config()}```',
+                thread_ts=thread_ts)
 
         case _:
             if config_match_obj := config_pattern.match(text):
                 setting, value = config_match_obj.groups()
                 response = gpt_Bot.set_config(setting, value)
-                say(f'```{response}```')
+                say(f'```{response}```', thread_ts=thread_ts)
 
             elif reset_match_obj := reset_pattern.match(text):
                 parameter = reset_match_obj.group(1)
                 if parameter == 'history':
                     response = gpt_Bot.reset_history()
-                    say(f'`{response}`')
+                    say(f'`{response}`', thread_ts=thread_ts)
                 elif parameter == 'config':
                     response = gpt_Bot.reset_config()
-                    say(f'`{response}`')
+                    say(f'`{response}`', thread_ts=thread_ts)
                 else:
-                    say(f'Unknown reset parameter: {parameter}')
+                    say(f'Unknown reset parameter: {parameter}',
+                        thread_ts=thread_ts)
 
             elif text.startswith('!'):
-                say("`Invalid command. Type '!help' for a list of valid commands.`")
+                say("`Invalid command. Type '!help' for a list of valid commands.`",
+                    thread_ts=thread_ts)
 
             else:
                 return text
@@ -101,6 +106,9 @@ def parse_text(text, say):
 def process_and_respond(event, say):
     channel_id = event['channel']
     thread_ts = event["ts"]
+    is_thread = False
+    if 'thread_ts' in event:
+        is_thread = True
 
     # remove the slackbot's userID from the message using regex pattern matching
     message_text = event.get('text') or event.get(
@@ -108,7 +116,7 @@ def process_and_respond(event, say):
 
     # Clean up the message text and then pass it to the parse_text function
     message_text = parse_text(
-        re.sub(user_id_pattern, '', message_text).strip(), say)
+        re.sub(user_id_pattern, '', message_text).strip(), say, thread_ts, is_thread)
 
     if message_text or ('files' in event and event['files']):
 
@@ -119,7 +127,7 @@ def process_and_respond(event, say):
         # If bot is still processing a previous request, inform user it's busy and track busy messages
         if gpt_Bot.processing:
             response = app.client.chat_postMessage(
-                channel=channel_id, text=f':no_entry: `{gpt_Bot.handle_busy()}` :no_entry:')
+                channel=channel_id, text=f':no_entry: `{gpt_Bot.handle_busy()}` :no_entry:', thread_ts=event["ts"])
             chat_del_ts.append(response['message']['ts'])
 
         # If intent was likely an dalle3 image gen request. Manually construct event msg since /dalle-3 repsonse is different
@@ -131,11 +139,12 @@ def process_and_respond(event, say):
                 'channel_id': channel_id,
                 'command': '/dalle-3'
             }
-            process_image_and_respond(say, message_event)
+            process_image_and_respond(say, message_event, thread_ts)
 
         # If there are files in the message (GPT Vision request or other file types)
         elif 'files' in event and event['files']:
-            initial_response = say(f'Thinking... {LOADING_EMOJI}')
+            initial_response = say(
+                f'Thinking... {LOADING_EMOJI}', thread_ts=thread_ts)
             chat_del_ts.append(initial_response['message']['ts'])
 
             files_data = event.get('files', [])
@@ -166,10 +175,10 @@ def process_and_respond(event, say):
                     utils.handle_error(say, response)
 
                 else:
-                    say(response)
+                    say(response, thread_ts=thread_ts)
 
             elif other_files:
-                say(f':no_entry: `Sorry, GPT4 Vision only supports jpeg, png, webp, and non-animated gif file types at this time.` :no_entry:')
+                say(f':no_entry: `Sorry, GPT4 Vision only supports jpeg, png, webp, and non-animated gif file types at this time.` :no_entry:', thread_ts=thread_ts)
 
             # Cleanup busy/loading chat msgs
             delete_chat_messages(channel_id, chat_del_ts, say)
@@ -192,7 +201,7 @@ def process_and_respond(event, say):
 
 
 # Dalle-3 image gen via /dalle-3 command or via "fake" auto-modal selection via keyword triggers
-def process_image_and_respond(say, command):
+def process_image_and_respond(say, command, thread_ts=None):
     user_id = command['user_id']
     text = command['text']
     cmd = command['command']
@@ -200,21 +209,22 @@ def process_image_and_respond(say, command):
 
     if gpt_Bot.processing:
         response = app.client.chat_postMessage(
-            channel=channel, text=f':no_entry: `{gpt_Bot.handle_busy()}` :no_entry:')
+            channel=channel, text=f':no_entry: `{gpt_Bot.handle_busy()}` :no_entry:', thread_ts=thread_ts)
         chat_del_ts.append(response['message']['ts'])
 
     else:
 
         if not text:
-            say(':no_entry: You must provide a prompt when using `/dalle-3` :no_entry:')
+            say(':no_entry: You must provide a prompt when using `/dalle-3` :no_entry:',
+                thread_ts=thread_ts)
             return
 
         app.client.chat_postMessage(
-            channel=channel, text=f'<@{user_id}> used `{cmd}`.\n*Original Prompt:*\n_{text}_')
+            channel=channel, text=f'<@{user_id}> used `{cmd}`.\n*Original Prompt:*\n_{text}_', thread_ts=thread_ts)
 
         # Image gen takes a while. Give the user some indication things are processing.
         temp_response = app.client.chat_postMessage(
-            channel=channel, text=f'Generating image, please wait... {LOADING_EMOJI}')
+            channel=channel, text=f'Generating image, please wait... {LOADING_EMOJI}', thread_ts=thread_ts)
         chat_del_ts.append(temp_response['ts'])
 
         # Dalle-3 always responds with a more detailed revised prompt.
@@ -222,7 +232,7 @@ def process_image_and_respond(say, command):
 
         # revised_prompt holds any error values in this case
         if is_error:
-            utils.handle_error(say, revised_prompt)
+            utils.handle_error(say, revised_prompt, thread_ts=thread_ts)
 
         # Build the response message and upload the generated image to Slack
         else:
@@ -231,15 +241,13 @@ def process_image_and_respond(say, command):
                     channel=channel,
                     initial_comment=f'*DALL·E-3 generated revised Prompt:*\n_{revised_prompt}_',
                     file=image,
-                    filename='Dalle3_image.png'
+                    filename='Dalle3_image.png',
+                    thread_ts=thread_ts
                 )
+
             except Exception as e:
-                utils.handle_error(say, revised_prompt)
+                utils.handle_error(say, revised_prompt, thread_ts=thread_ts)
 
-        # The successful response from the Slack API may be seen a few seconds before the uploaded image appears in the Slack client due to the client side
-        # processing and downloading of the image. The processing message appears to get removed 4-5 sec before the image actually loads.
-
-        # sleep(4)  # Yuck. Maybe use callbacks or other event triggers to wait for images to display in the client before removing the loading status?
         delete_chat_messages(channel, chat_del_ts, say)
 
 
@@ -256,14 +264,14 @@ def download_and_encode_file(say, file_url, bot_token):
 
 
 # Process timestamps of any temporary status or progress messages the bot sends to Slack. Called to clean them up once a response completes.
-def delete_chat_messages(channel, timestamps, say):
+def delete_chat_messages(channel, timestamps, say, thread_ts=None):
     try:
         for ts in timestamps:
             app.client.chat_delete(channel=channel, ts=ts)
 
     except Exception as e:
         say(
-            f':no_entry: `Sorry, I ran into an error deleting my own message.` :no_entry:\n```{e}```')
+            f':no_entry: `Sorry, I ran into an error cleaning up my own messages.` :no_entry:\n```{e}```', thread_ts=thread_ts)
     finally:
         chat_del_ts.clear()
 
@@ -282,7 +290,13 @@ def handle_mention(event, say):
 
 @app.event('message')
 def handle_message_events(event, say):
-    if event['channel_type'] == 'im':
+    # Ignore 'message_changed' and other subtypes for now.
+    # Deleting the "Thinking..." message after a response returns triggers an additional Slack event
+    # which causes dupe responses by the bot in DMs w/ Threads.
+    if 'subtype' in event and event['subtype'] == 'message_changed':
+        return
+
+    elif event['channel_type'] == 'im':
         process_and_respond(event, say)
 
 
