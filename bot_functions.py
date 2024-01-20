@@ -22,7 +22,6 @@ class ChatBot:
         self.conversations = {}
         self.streaming_client = streaming_client  # ToDo: Implement streaming support
         self.usage = {}
-        self.processing = False
         self.config_option_defaults = {
             'temperature': 0.5,  # 0.0 - 2.0
             'top_p': 1,
