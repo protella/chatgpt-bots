@@ -79,12 +79,12 @@ def parse_text(text, say, thread_ts, is_thread=False):
                 thread_ts=thread_ts)
 
         case _:
-            if config_match_obj := config_pattern.match(text):
+            if config_match_obj := config_pattern.match(text.lower()):
                 setting, value = config_match_obj.groups()
                 response = gpt_Bot.set_config(setting, value)
                 say(f'```{response}```', thread_ts=thread_ts)
 
-            elif reset_match_obj := reset_pattern.match(text):
+            elif reset_match_obj := reset_pattern.match(text.lower()):
                 parameter = reset_match_obj.group(1)
                 if parameter == 'history':
                     response = gpt_Bot.reset_history(thread_ts)
