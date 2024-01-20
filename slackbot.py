@@ -214,7 +214,7 @@ def process_image_and_respond(say, command, thread_ts=None):
     cmd = command['command']
     channel = command['channel_id']
 
-    if gpt_Bot.processing:
+    if gpt_Bot.is_processing(thread_ts):
         response = app.client.chat_postMessage(
             channel=channel, text=f':no_entry: `{gpt_Bot.handle_busy()}` :no_entry:', thread_ts=thread_ts)
         chat_del_ts.append(response['message']['ts'])
