@@ -18,8 +18,9 @@ GPT_VISION_MODEL = 'gpt-4-vision-preview'
 
 class ChatBot:
     def __init__(self, SYSTEM_PROMPT, streaming_client=False):
-        self.messages = [SYSTEM_PROMPT]
+        # self.messages = [SYSTEM_PROMPT]
         self.SYSTEM_PROMPT = SYSTEM_PROMPT
+        self.conversations = {}
         self.streaming_client = streaming_client  # ToDo: Implement streaming support
         self.usage = {}
         self.processing = False
@@ -40,57 +41,85 @@ class ChatBot:
         self.current_config_options = self.config_option_defaults.copy()
         self.client = OpenAI(api_key=os.environ['OPENAI_KEY'])
 
-    def chat_context_mgr(self, message_text, files=''):
-        self.processing = True
-        self.messages.append({'role': 'user', 'content': message_text})
+    def chat_context_mgr(self, message_text, thread_id, files=''):
+
+        if thread_id not in self.conversations:
+            self.conversations[thread_id] = {
+                'messages': [self.SYSTEM_PROMPT],
+                'processing': False
+            }
+
+        self.conversations[thread_id]['processing'] = True
+
+        self.conversations[thread_id]['messages'].append(
+            {'role': 'user', 'content': message_text})
 
         # Using vision model for all chat prompts since images passed to non-vision model throws an error.
         # GPT4v is an extension of GPT4 with all the same functions and features.
         gpt_output = self.get_gpt_response(
-            self.messages, self.current_config_options['gpt_vision_model'])
-        self.processing = False
+            self.conversations[thread_id]['messages'], self.current_config_options['gpt_vision_model'])
+
+        self.conversations[thread_id]['processing'] = False
 
         if hasattr(gpt_output, 'role'):
             is_error = False
             if gpt_output.role == 'assistant':
-                self.messages.append(
+                self.conversations[thread_id]['messages'].append(
                     {'role': 'assistant', 'content': gpt_output.content})
-
             return gpt_output.content, is_error
         else:
             is_error = True
-            self.messages.pop()
+            self.conversations[thread_id]['messages'].pop()
             return gpt_output, is_error
 
-    def image_context_mgr(self, message_text):
-        self.processing = True
-        self.messages.append(
-            {'role': 'user', 'content': f'Dalle3 User Prompt: {message_text}'})
+    def image_context_mgr(self, message_text, thread_id):
+        # If the /dalle-3 command is used in a main channel, no thread, so just use 0 for the key
+        if not thread_id:
+            thread_id = "0"
+
+        if thread_id not in self.conversations:
+            self.conversations[thread_id] = {
+                'messages': [self.SYSTEM_PROMPT],
+                'processing': False
+            }
+
+        self.conversations[thread_id]['processing'] = True
+
+        self.conversations[thread_id]['messages'].append(
+            {'role': 'user', 'content': f'Dalle-3 User Prompt: {message_text}'})
+
         image, revised_prompt = self.get_dalle_response(
             message_text, self.current_config_options['dalle_model'])
-        self.processing = False
+
+        self.conversations[thread_id]['processing'] = False
 
         if revised_prompt:
             is_error = False
-            self.messages.append(
+            self.conversations[thread_id]['messages'].append(
                 {'role': 'assistant', 'content': dedent(
                     f"""\
-                        Based on the DALL-E 3 prompt, I can imagine an image like this: {revised_prompt} 
-                        While I can't create or view images,
+                        Based on the Dalle-3 user prompt, I can imagine I created an image like this: {revised_prompt}
                         I can describe what such an image might look like or the ideas it might convey.
-                        I will act as if I actually created the described image for the purposes of this chat."""
+                        I will act as if I created the described image for the purposes of this chat."""
                 )})
 
         else:
             is_error = True
-            self.messages.pop()
+            self.conversations[thread_id]['messages'].pop()
             image = None
             revised_prompt = None
 
         return image, revised_prompt, is_error
 
-    def vision_context_mgr(self, message_text, images):
-        self.processing = True
+    def vision_context_mgr(self, message_text, images, thread_id):
+
+        if thread_id not in self.conversations:
+            self.conversations[thread_id] = {
+                'messages': [self.SYSTEM_PROMPT],
+                'processing': False
+            }
+
+        self.conversations[thread_id]['processing'] = True
         if not message_text:
             message_text = ''
         multi_part_msg = {
@@ -113,21 +142,23 @@ class ChatBot:
             }
             multi_part_msg['content'].append(new_image_element)
 
-        self.messages.append(multi_part_msg)
+        self.conversations[thread_id]['messages'].append(multi_part_msg)
+
         gpt_output = self.get_gpt_response(
-            self.messages, self.current_config_options['gpt_vision_model'])
-        self.processing = False
+            self.conversations[thread_id]['messages'], self.current_config_options['gpt_vision_model'])
+
+        self.conversations[thread_id]['processing'] = False
 
         if hasattr(gpt_output, 'role'):
             is_error = False
             if gpt_output.role == 'assistant':
-                self.messages.append(
+                self.conversations[thread_id]['messages'].append(
                     {'role': 'assistant', 'content': gpt_output.content})
 
             return gpt_output.content, is_error
         else:
             is_error = True
-            self.messages.pop()
+            self.conversations[thread_id]['messages'].pop()
             return gpt_output, is_error
 
     def get_dalle_response(self, image_prompt, model):
@@ -180,7 +211,11 @@ class ChatBot:
             print(f'##################\n{e}\n##################')
             return e
 
-    def usage_command(self):
+    def is_processing(self, thread_id):
+        # Check if a specific thread is currently processing.
+        return self.conversations.get(thread_id, {}).get('processing', False)
+
+    def usage_command(self):  # Fix this later to aggregate all thread usage
         if self.usage:
             return dedent(
                 f'''\
@@ -193,10 +228,13 @@ class ChatBot:
         else:
             return 'No usage info yet. Ask the bot something and check again.'
 
-    def history_command(self):
+    def history_command(self, thread_id):
+
+        if not thread_id:
+            return '!history can only be run inside of a thread.'
         # We don't want to display the b64 encoded images that may be present in the history, so replace them with placeholder text.
         # This is done in a separate instance of the message history so that the images remain for the bot to analyze in future conversations.
-        display_history = deepcopy(self.messages)
+        display_history = deepcopy(self.conversations[thread_id]['messages'])
         for message in display_history:
             if 'content' in message and isinstance(message['content'], list):
                 for content_item in message['content']:
@@ -219,10 +257,13 @@ class ChatBot:
             for setting, value in self.current_config_options.items()
         )
 
-    def reset_history(self):
-        self.messages = [self.SYSTEM_PROMPT]
-        self.usage = {}
-        self.processing = False
+    def reset_history(self, thread_id):
+        if not thread_id:
+            return '!reset history can only be run inside of a thread.'
+
+        self.conversations[thread_id]['messages'] = [self.SYSTEM_PROMPT]
+        self.usage = {}  # Figure out what to do with usage stats in conversations
+        self.conversations[thread_id]['processing'] = False
 
         return 'Rebooting. Beep Beep Boop. My memory has been wiped!'
 

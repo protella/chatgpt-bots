@@ -65,7 +65,8 @@ def parse_text(text, say, thread_ts, is_thread=False):
 
     match text.lower():
         case '!history':
-            say(f'```{gpt_Bot.history_command()}```', thread_ts=thread_ts)
+            say(f'```{gpt_Bot.history_command(thread_ts)}```',
+                thread_ts=thread_ts)
 
         case '!help':
             say(f'```{gpt_Bot.help_command()}```', thread_ts=thread_ts)
@@ -86,7 +87,7 @@ def parse_text(text, say, thread_ts, is_thread=False):
             elif reset_match_obj := reset_pattern.match(text):
                 parameter = reset_match_obj.group(1)
                 if parameter == 'history':
-                    response = gpt_Bot.reset_history()
+                    response = gpt_Bot.reset_history(thread_ts)
                     say(f'`{response}`', thread_ts=thread_ts)
                 elif parameter == 'config':
                     response = gpt_Bot.reset_config()
@@ -105,10 +106,12 @@ def parse_text(text, say, thread_ts, is_thread=False):
 
 def process_and_respond(event, say):
     channel_id = event['channel']
-    thread_ts = event["ts"]
     is_thread = False
     if 'thread_ts' in event:
+        thread_ts = event['thread_ts']
         is_thread = True
+    else:
+        thread_ts = event["ts"]
 
     # remove the slackbot's userID from the message using regex pattern matching
     message_text = event.get('text') or event.get(
@@ -120,24 +123,28 @@ def process_and_respond(event, say):
 
     if message_text or ('files' in event and event['files']):
 
+        # If bot is still processing a previous request, inform user it's busy and track busy messages
+        if gpt_Bot.is_processing(thread_ts):
+
+            response = app.client.chat_postMessage(
+                channel=channel_id, text=f':no_entry: `{gpt_Bot.handle_busy()}` :no_entry:', thread_ts=event["ts"])
+            chat_del_ts.append(response['message']['ts'])
+            return
+
         #  Check if user is requesting Dalle3 image gen via chat and correct any spelling mistakes to improve accuracy.
         trigger_check, corrected_message_text = utils.check_for_image_generation(
             message_text, trigger_words, trigger_threshold)
 
-        # If bot is still processing a previous request, inform user it's busy and track busy messages
-        if gpt_Bot.processing:
-            response = app.client.chat_postMessage(
-                channel=channel_id, text=f':no_entry: `{gpt_Bot.handle_busy()}` :no_entry:', thread_ts=event["ts"])
-            chat_del_ts.append(response['message']['ts'])
-
         # If intent was likely an dalle3 image gen request. Manually construct event msg since /dalle-3 repsonse is different
-        elif trigger_check:
+        if trigger_check:
+            if ('files' in event and event['files']):
+                say(':warning:Ignoring included file with Dalle-3 request. Image gen based on provided images is not yet supported with Dalle-3.:warning:', thread_ts=thread_ts)
 
             message_event = {
                 'user_id': event['user'],
                 'text': corrected_message_text,
                 'channel_id': channel_id,
-                'command': '/dalle-3'
+                'command': 'dalle-3 via conversational chat'
             }
             process_image_and_respond(say, message_event, thread_ts)
 
@@ -152,25 +159,25 @@ def process_and_respond(event, say):
             # Future non-vision files. Requires preprocessing/extracting text.
             other_files = []
 
-            # Iterate through files, check file type. If image, b64 encode it, else not supported type.
+            # Iterate through files, check file type. If supported image type, b64 encode it, else not supported type.
             for file in files_data:
                 file_url = file.get('url_private')
                 file_mimetype = file.get('mimetype')
 
                 if file_url and file_mimetype in allowed_mimetypes:
                     encoded_file = download_and_encode_file(
-                        say, file_url, SLACK_BOT_TOKEN)
+                        say, file_url)
                     if encoded_file:
                         vision_files.append(encoded_file)
                 else:
                     encoded_file = download_and_encode_file(
-                        say, file_url, SLACK_BOT_TOKEN)
+                        say, file_url)
                     if encoded_file:
                         other_files.append(encoded_file)
 
             if vision_files:
                 response, is_error = gpt_Bot.vision_context_mgr(
-                    message_text, vision_files)
+                    message_text, vision_files, thread_ts)
                 if is_error:
                     utils.handle_error(say, response)
 
@@ -189,7 +196,7 @@ def process_and_respond(event, say):
                 text=f'Thinking... {LOADING_EMOJI}', thread_ts=thread_ts)
             chat_del_ts.append(initial_response['message']['ts'])
             response, is_error = gpt_Bot.chat_context_mgr(
-                message_text)
+                message_text, thread_ts)
             if is_error:
                 utils.handle_error(say, response)
 
@@ -228,7 +235,8 @@ def process_image_and_respond(say, command, thread_ts=None):
         chat_del_ts.append(temp_response['ts'])
 
         # Dalle-3 always responds with a more detailed revised prompt.
-        image, revised_prompt, is_error = gpt_Bot.image_context_mgr(text)
+        image, revised_prompt, is_error = gpt_Bot.image_context_mgr(
+            text, thread_ts)
 
         # revised_prompt holds any error values in this case
         if is_error:
@@ -252,8 +260,8 @@ def process_image_and_respond(say, command, thread_ts=None):
 
 
 # In order to download Files from Slack, the bot's request needs to be authenticated to the workspace via the Slackbot token
-def download_and_encode_file(say, file_url, bot_token):
-    headers = {'Authorization': f'Bearer {bot_token}'}
+def download_and_encode_file(say, file_url):
+    headers = {'Authorization': f'Bearer {SLACK_BOT_TOKEN}'}
     response = requests.get(file_url, headers=headers)
 
     if response.status_code == 200:
