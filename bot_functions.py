@@ -18,7 +18,6 @@ GPT_VISION_MODEL = 'gpt-4-vision-preview'
 
 class ChatBot:
     def __init__(self, SYSTEM_PROMPT, streaming_client=False):
-        # self.messages = [SYSTEM_PROMPT]
         self.SYSTEM_PROMPT = SYSTEM_PROMPT
         self.conversations = {}
         self.streaming_client = streaming_client  # ToDo: Implement streaming support
@@ -109,6 +108,8 @@ class ChatBot:
             image = None
             revised_prompt = None
 
+        self.conversations[thread_id]['processing'] = False
+
         return image, revised_prompt, is_error
 
     def vision_context_mgr(self, message_text, images, thread_id):
@@ -120,6 +121,7 @@ class ChatBot:
             }
 
         self.conversations[thread_id]['processing'] = True
+
         if not message_text:
             message_text = ''
         multi_part_msg = {
