@@ -2,10 +2,10 @@
 Python based ChatGPT bot integrations
 
 ## `Notice`
-The Discord client is a little behind as I've spent the majority of time working on the Slack version. It should still work, but it's missing a lot of the functionality included in the Slack version. The CLI version is very basic as it's only text based.
+The Discord client is a little behind as I've spent the majority of time working on the Slack version. It should still work, but it's missing a lot of the functionality included in the Slack version. The CLI version is very basic as it's only text based. All clients have basic threading support, though individual thread histories are only supported in the Slack client for now. 
 
 ## Description
-ChatBot Integrations for Slack, Discord, and the CLI using Python and OpenAPI's ChatGPT platform.
+ChatBot Integrations for Slack, Discord, and the CLI using Python and OpenAPI's ChatGPT platform. This bot is designed around GPT4 and supports GPT4 Vision and Dalle-3. 
 
 ## Getting Started
 
@@ -87,14 +87,15 @@ Run the py file for your chosen interface, e.g.:
 
 
 ## ToDo:
-- Use Slack/Discord Threads to isolate and track individual conversations rather than maintaining a single conversation history across all users and channels.
-  - Use MongoDB as a document DB to hold the long term chat thread histories.
-  - For Slack, potentially use the API's conversations.history method to sync Slack's source of truth to the MongoDB
+- Use Slack/Discord Threads to isolate and track individual conversations rather than maintaining a single conversation history across all users and channels. (Slack threads are working. Discord is still a shared history)
+  - For Slack, potentially use the API's conversations.history method on-demand to sync or update the Bot's conversation history after a restart
 - Add command functionality to allow for changing the initial chatbot init phrase
 - Update bot commands to use Slack/Discord's `/command` functionality rather than old school `!commands`
 - Track context/history size using the usage stats and pop old items from the history to avoid going over the model's max context size (4k w/ 3.5-turbo but not as much of an issue with GPT4 Turbo) Adjust for different models if necessary. Lower Priority
+- Add support for the bot to recognize individual users within a mult-user conversation.
+- Fix usage stats function. Decide how/what to track. Global stats or conversation stats, or both?
 - Clean up code, standardize style, move repeated client code to functions and utility modules.
-- Create manifest file for the app
+- Create Slack app manifest file
 - Setup Github workflows and unit tests 
 
 
