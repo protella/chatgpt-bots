@@ -93,6 +93,7 @@ Run the py file for your chosen interface, e.g.:
 - Update bot commands to use Slack/Discord's `/command` functionality rather than old school `!commands`
 - Track context/history size using the usage stats and pop old items from the history to avoid going over the model's max context size (4k w/ 3.5-turbo but not as much of an issue with GPT4 Turbo) Adjust for different models if necessary. Lower Priority
 - Add support for the bot to recognize individual users within a mult-user conversation.
+- With new Thread History Reloading from Slack, figure out what to do with messages in the Slack history that were not processed due to the bot being busy at the time. They show up in the history during a reload.
 - Fix usage stats function. Decide how/what to track. Global stats or conversation stats, or both?
 - Clean up code, standardize style, move repeated client code to functions and utility modules.
 - Create Slack app manifest file

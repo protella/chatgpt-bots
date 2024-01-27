@@ -22,3 +22,5 @@ illustration
 depiction
 depicting
 illustrating
+/dalle3
+/dalle-3
