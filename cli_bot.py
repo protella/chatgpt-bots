@@ -1,9 +1,10 @@
-import bot_functions
 import re
 import signal
 from textwrap import dedent
 
-BOT_NAME = 'Jarvis'
+import bot_functions
+
+BOT_NAME = "Jarvis"
 
 SYSTEM_PROMPT = {
     "role": "system",
@@ -32,7 +33,6 @@ signal.signal(signal.SIGINT, signal_handler)
 
 def cli_chat():
     try:
-
         user_input = input("Me: ").lower()
 
     except EOFError:
@@ -82,10 +82,13 @@ def cli_chat():
 
             else:
                 response, is_error = gpt_Bot.chat_context_mgr(
-                    user_input, thread_id="0", )
+                    user_input,
+                    thread_id="0",
+                )
                 if is_error:
                     print(
-                        f"{BOT_NAME}: Sorry, I ran into an error. The raw error details are as follows:\n\n{response}")
+                        f"{BOT_NAME}: Sorry, I ran into an error. The raw error details are as follows:\n\n{response}"
+                    )
                 else:
                     print(f"{BOT_NAME}: {response}")
 
