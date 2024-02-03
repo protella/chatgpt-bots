@@ -1,9 +1,11 @@
-import bot_functions as bot
-import discord
 import os
-from dotenv import load_dotenv
 import re
 from textwrap import dedent
+
+import discord
+from dotenv import load_dotenv
+
+import bot_functions as bot
 
 load_dotenv()
 
@@ -43,7 +45,9 @@ class discordClt(discord.Client):
 
         match text.lower():
             case "!history":
-                await message.channel.send(f"```{gpt_Bot.history_command()}```")
+                await message.channel.send(
+                    f"```{gpt_Bot.history_command(thread_id='0')}```"
+                )
                 return
 
             case "!help":
@@ -69,7 +73,7 @@ class discordClt(discord.Client):
                 elif reset_match_obj:
                     parameter = reset_match_obj.group(1)
                     if parameter == "history":
-                        response = gpt_Bot.reset_history()
+                        response = gpt_Bot.reset_history(thread_id="0")
                         await message.channel.send(f"`{response}`")
                     elif parameter == "config":
                         response = gpt_Bot.reset_config()
@@ -85,15 +89,13 @@ class discordClt(discord.Client):
                     )
 
                 else:
-                    response, is_error = gpt_Bot.chat_context_mgr(text)
+                    response, is_error = gpt_Bot.chat_context_mgr(text, thread_id="0")
                     if is_error:
                         await message.channel.send(
                             f":no_entry: `Sorry, I ran into an error. The raw error details are as follows:` :no_entry:\n```{response}```"
                         )
                     else:
-                        await message.channel.send(
-                            f"{response}"
-                        )
+                        await message.channel.send(f"{response}")
 
 
 if __name__ == "__main__":

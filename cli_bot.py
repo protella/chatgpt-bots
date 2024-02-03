@@ -1,9 +1,10 @@
-import bot_functions
 import re
 import signal
 from textwrap import dedent
 
-BOT_NAME = 'Jarvis'
+import bot_functions
+
+BOT_NAME = "Jarvis"
 
 SYSTEM_PROMPT = {
     "role": "system",
@@ -31,7 +32,12 @@ signal.signal(signal.SIGINT, signal_handler)
 
 
 def cli_chat():
-    user_input = input("Me: ").lower()
+    try:
+        user_input = input("Me: ").lower()
+
+    except EOFError:
+        print("\nCtrl-D detected, Exiting...")
+        exit(0)
 
     match user_input:
         case "!quit" | "!exit":
@@ -39,7 +45,7 @@ def cli_chat():
             exit(0)
 
         case "!history":
-            print(gpt_Bot.history_command())
+            print(gpt_Bot.history_command(thread_id="0"))
 
         case "!help":
             print(gpt_Bot.help_command())
@@ -63,7 +69,7 @@ def cli_chat():
             elif reset_match_obj:
                 parameter = reset_match_obj.group(1)
                 if parameter == "history":
-                    response = gpt_Bot.reset_history()
+                    response = gpt_Bot.reset_history(thread_id="0")
                     print(f"{response}")
                 elif parameter == "config":
                     response = gpt_Bot.reset_config()
@@ -75,10 +81,14 @@ def cli_chat():
                 print("Invalid command. Type '!help' for a list of valid commands.")
 
             else:
-                response, is_error = gpt_Bot.chat_context_mgr(user_input)
+                response, is_error = gpt_Bot.chat_context_mgr(
+                    user_input,
+                    thread_id="0",
+                )
                 if is_error:
                     print(
-                        f"{BOT_NAME}: Sorry, I ran into an error. The raw error details are as follows:\n\n{response}")
+                        f"{BOT_NAME}: Sorry, I ran into an error. The raw error details are as follows:\n\n{response}"
+                    )
                 else:
                     print(f"{BOT_NAME}: {response}")
 
