@@ -87,8 +87,7 @@ Run the py file for your chosen interface, e.g.:
 
 
 ## ToDo:
-- Use Slack/Discord Threads to isolate and track individual conversations rather than maintaining a single conversation history across all users and channels. (Slack threads are working. Discord is still a shared history)
-  - For Slack, potentially use the API's conversations.history method on-demand to sync or update the Bot's conversation history after a restart
+- Slack threads and thread history are working. Discord is still a shared history. 
 - Add command functionality to allow for changing the initial chatbot init phrase
 - Update bot commands to use Slack/Discord's `/command` functionality rather than old school `!commands`
 - Track context/history size using the usage stats and pop old items from the history to avoid going over the model's max context size (4k w/ 3.5-turbo but not as much of an issue with GPT4 Turbo) Adjust for different models if necessary. Lower Priority

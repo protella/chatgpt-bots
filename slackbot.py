@@ -142,14 +142,9 @@ def rebuild_thread_history(say, channel_id, thread_id, bot_user_id):
                             }
                         )
 
-        # message_payload = {"role": role, "content": content}
-
         gpt_Bot.conversations[thread_id]["messages"].append(
             {"role": role, "content": content}
         )
-        # print(format_message_for_debug(message_payload))
-    # print(gpt_Bot.conversations[thread_id])
-
 
 ############## DEBUG ##########
 def format_message_for_debug(message):

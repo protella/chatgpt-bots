@@ -44,7 +44,7 @@ class ChatBot:
         self.conversations[thread_id]["processing"] = True
 
         if not self.conversations[thread_id]["history_reloaded"]:
-            # Delete trailing message to avoid dupe message.
+            # Review the need for the pop(): Delete trailing message to avoid dupe message.
             self.conversations[thread_id]["messages"].pop()
             self.conversations[thread_id]["history_reloaded"] = False
 
@@ -55,7 +55,6 @@ class ChatBot:
         # Using vision model for all chat prompts since images passed to non-vision model throws an error.
         # GPT4v is an extension of GPT4 with all the same functions and features.
 
-        # print(self.conversations[thread_id]["messages"])
         gpt_output = self.get_gpt_response(
             self.conversations[thread_id]["messages"],
             self.current_config_options["gpt_vision_model"],
