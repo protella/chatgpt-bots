@@ -116,11 +116,11 @@ def rebuild_thread_history(say, channel_id, thread_id, bot_user_id):
         "history_reloaded": True,
     }
 
-    for msg in messages:
+    for msg in messages[:-1]:
         role = "assistant" if msg.get("user") == bot_user_id else "user"
         content = []
 
-        content.append({"type": "text", "text": msg.get("text")})
+        content.append({"type": "text", "text": remove_userid(msg.get("text"))})
 
         # Rebuild image history in b64 encoded format
         files = msg.get("files", [])
@@ -142,12 +142,12 @@ def rebuild_thread_history(say, channel_id, thread_id, bot_user_id):
                             }
                         )
 
-        message_payload = {"role": role, "content": content}
+        # message_payload = {"role": role, "content": content}
 
         gpt_Bot.conversations[thread_id]["messages"].append(
             {"role": role, "content": content}
         )
-        print(format_message_for_debug(message_payload))
+        # print(format_message_for_debug(message_payload))
     # print(gpt_Bot.conversations[thread_id])
 
 
@@ -175,7 +175,7 @@ def process_and_respond(event, say):
     # Remove the userID from the message using regex pattern matching
     # Clean up the message text and then pass it to the parse_text function
     message_text = parse_text(
-        re.sub(USER_ID_PATTERN, "", message_text).strip(), say, thread_ts, is_thread
+        remove_userid(message_text), say, thread_ts, is_thread
     )
 
     # Handle new or existing threads since last restart
@@ -374,6 +374,10 @@ def delete_chat_messages(channel, timestamps, say, thread_ts=None):
     finally:
         chat_del_ts.clear()
 
+def remove_userid(message_text):
+    message_text = re.sub(USER_ID_PATTERN, "", message_text).strip()
+    return message_text
+    
 
 # Slack event handlers
 @app.command("/dalle-3")
