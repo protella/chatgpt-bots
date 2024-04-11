@@ -12,9 +12,8 @@ from PIL import Image
 load_dotenv()  # load auth tokens from .env file
 
 # Default models: https://platform.openai.com/docs/models
-GPT_MODEL = "gpt-4-1106-preview"
+GPT_MODEL = "gpt-4-turbo"
 DALLE_MODEL = "dall-e-3"
-GPT_VISION_MODEL = "gpt-4-vision-preview"
 
 
 class ChatBot:
@@ -30,7 +29,6 @@ class ChatBot:
             "custom_init": "",
             "gpt_model": GPT_MODEL,
             "dalle_model": DALLE_MODEL,
-            "gpt_vision_model": GPT_VISION_MODEL,
             "size": "1024x1024",  # 1024x1024, 1024x1792 or 1792x1024
             "quality": "hd",  # standard or hd
             "style": "vivid",  # natural or vivid
@@ -57,7 +55,7 @@ class ChatBot:
 
         gpt_output = self.get_gpt_response(
             self.conversations[thread_id]["messages"],
-            self.current_config_options["gpt_vision_model"],
+            self.current_config_options["gpt_model"],
         )
         self.conversations[thread_id]["processing"] = False
 
@@ -154,7 +152,7 @@ class ChatBot:
 
         gpt_output = self.get_gpt_response(
             self.conversations[thread_id]["messages"],
-            self.current_config_options["gpt_vision_model"],
+            self.current_config_options["gpt_model"],
         )
 
         self.conversations[thread_id]["processing"] = False
