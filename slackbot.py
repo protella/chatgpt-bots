@@ -17,7 +17,7 @@ LOADING_EMOJI = ":loading:"
 SLACK_BOT_TOKEN = environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN = environ["SLACK_APP_TOKEN"]
 # Minimum number of word matches from the trigger words to assume user wants to generate an image
-TRIGGER_THREADHOLD = 2
+TRIGGER_THRESHOLD = 2
 
 SYSTEM_PROMPT = {
     "role": "system",
@@ -198,7 +198,7 @@ def process_and_respond(event, say):
 
         #  Check if user is requesting Dalle3 image gen via chat and correct any spelling mistakes to improve accuracy.
         trigger_check, corrected_message_text = utils.check_for_image_generation(
-            message_text, trigger_words, TRIGGER_THREADHOLD
+            message_text, trigger_words, TRIGGER_THRESHOLD
         )
 
         # If intent was likely an dalle3 image gen request...
