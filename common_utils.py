@@ -1,45 +1,54 @@
 import base64
-
+from copy import deepcopy
+from bot_functions import GPT_MODEL
 import requests
-from spellchecker import SpellChecker
 
-spell = SpellChecker()
+IMAGE_CHECK_SYSTEM_PROMPT = """You will be provided with a user's chat message for a chatgpt slackbot integration. 
+Determine if the user's intent is to request an image generation or if the message is just part of the ongoing chat conversation. 
+Also consider if the message is in the form of a question when making your determination.
+Respond with 'True' for image requests and 'False' otherwise. No other text should be provided except 'True' or 'False'."""
+
+IMAGE_GEN_SYSTEM_PROMPT = """You will be provided with a user's chat message and context history for a chatgpt slackbot integration.
+The message has been predetermined to be a request for a Dalle-3 generative art image. 
+Based solely on the chat history and user message provided, format your response as a straightforward 
+generative art prompt without any introductory text or explanation. 
+Ensure the prompt is descriptive and detailed."""
 
 
-# Attempt to use Python's Spell checking library for 'fake' modal checks since this is not passed to GPT which is more forgiving with spelling errors.
-def check_for_image_generation(message, trigger_words, threshold):
-    corrected_message_text = correct_spelling(message)
-    # Convert to a set to avoid substring matches (e.g. 'create' triggering from 'created')
-    message_words = set(corrected_message_text.lower().split())
-    trigger_count = sum(word in message_words for word in trigger_words)
-    return trigger_count >= threshold, corrected_message_text
+# Use ChatGPT to generate a Dalle-3 prompt based on the message and chat history
+def create_dalle3_prompt(message, gpt_Bot, thread_id):
+    gpt_Bot.conversations[thread_id]["processing"] = True
+    chat_history = deepcopy(gpt_Bot.conversations[thread_id]["messages"])
+    
+    chat_history.append(
+                {"role": "user", "content": [{"type": "text", "text": message}]}
+            )
+    chat_history[0]['content'] = IMAGE_GEN_SYSTEM_PROMPT
+    
+    dalle3_prompt = gpt_Bot.get_gpt_response(chat_history, GPT_MODEL)
+    
+    print(f'\nDalle-3 Prompt: {dalle3_prompt.content}\n')
 
+    gpt_Bot.conversations[thread_id]["processing"] = False
+    return dalle3_prompt
 
-# Check spelling and maintain capitalization of original message
-def correct_spelling(text):
-    corrected_words = []
-    words = text.split()
+# Use GPT4 to check if the user is requesting an image
+def check_for_image_generation(message, gpt_Bot, thread_id):
+    gpt_Bot.conversations[thread_id]["processing"] = True
 
-    for word in words:
-        if word.lower() in spell.unknown([word.lower()]):
-            # Attempt to correct the word
-            corrected_word = spell.correction(word.lower())
+    chat_history = deepcopy(gpt_Bot.conversations[thread_id]["messages"])
+    
+    chat_history.append(
+                {"role": "user", "content": [{"type": "text", "text": message}]}
+            )
+    chat_history[0]['content'] = IMAGE_CHECK_SYSTEM_PROMPT
 
-            # If correction returns None, use the original word
-            if corrected_word is None:
-                corrected_word = word
-
-            # Match the case of the original word
-            if word.isupper():
-                corrected_word = corrected_word.upper()
-            elif word[0].isupper():
-                corrected_word = corrected_word.capitalize()
-
-            corrected_words.append(corrected_word)
-        else:
-            corrected_words.append(word)
-
-    return " ".join(corrected_words)
+    # set temperature to 0.0 to be fully deterministic and reduce randomness for chance of non True/False response
+    is_image_request = gpt_Bot.get_gpt_response(chat_history, GPT_MODEL, temperature = 0.0)
+    
+    gpt_Bot.conversations[thread_id]["processing"] = False
+    print(f'\nImage Request Check: {is_image_request.content}\n')
+    return is_image_request.content.strip().lower() == 'true'
 
 
 # In order to download Files from Slack, the bot's request needs to be authenticated to the workspace via the Slackbot token
@@ -54,14 +63,36 @@ def download_and_encode_file(say, file_url, bot_token):
         return None
 
 
-# Read the trigger_words txt file
-def read_trigger_words(file_path):
-    with open(file_path, "r") as file:
-        return [line.strip() for line in file if line.strip()]
-
-
 def handle_error(say, error, thread_ts=None):
     say(
         f":no_entry: `Sorry, I ran into an error. The raw error details are as follows:` :no_entry:\n```{error}```",
         thread_ts=thread_ts,
     )
+
+############## DEBUG ##########
+def format_message_for_debug(conversation_history):
+    formatted_output = []
+    for message in conversation_history['messages']:
+        role = message['role']
+        content = message['content']
+        
+        message_texts = []  # To collect text and placeholders for each message
+
+        # Check if content is a list (typically for 'user' or 'assistant' with mixed content)
+        if isinstance(content, list):
+            # Process each content item in the list
+            for item in content:
+                if item['type'] == 'text':
+                    message_texts.append(item['text'])
+                elif item['type'] == 'image_url':
+                    # Add a placeholder for images
+                    message_texts.append("[Image Data]")
+        
+        # Join all parts of the message into a single string and append to the output
+        formatted_message = ' '.join(message_texts)
+        formatted_output.append(f"-- {role.capitalize()}: {formatted_message}")
+    
+    return "\n".join(formatted_output)
+
+
+###############################

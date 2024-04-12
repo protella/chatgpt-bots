@@ -65,7 +65,6 @@ class ChatBot:
                         "content": [{"type": "text", "text": gpt_output.content}],
                     }
                 )
-
             return gpt_output.content, is_error
         else:
             is_error = True
@@ -124,7 +123,6 @@ class ChatBot:
         return image, revised_prompt, is_error
 
     def vision_context_mgr(self, message_text, images, thread_id):
-        # self.rebuild_thread_history(thread_id)
 
         self.conversations[thread_id]["processing"] = True
 
@@ -198,13 +196,15 @@ class ChatBot:
             print(f"##################\n{e}\n##################")
             return None, e
 
-    def get_gpt_response(self, messages_history, model):
+    def get_gpt_response(self, messages_history, model, temperature=None):
+        if temperature is None:
+            temperature = self.current_config_options["temperature"]
         try:
             response = self.client.chat.completions.create(
                 model=model,
                 messages=messages_history,
                 stream=self.streaming_client,
-                temperature=float(self.current_config_options["temperature"]),
+                temperature=float(temperature),
                 max_tokens=int(self.current_config_options["max_tokens"]),
                 top_p=float(self.current_config_options["top_p"]),
             )
