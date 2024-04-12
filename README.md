@@ -7,6 +7,9 @@ The Discord client is a little behind as I've spent the majority of time working
 ## Description
 ChatBot Integrations for Slack, Discord, and the CLI using Python and OpenAPI's ChatGPT platform. This bot is designed around GPT4 and supports GPT4 Vision and Dalle-3. 
 
+## *New Features!* 
+The Slackbot now allows iteration on Dalle-3 images and will also determine if image creation is the appropriate action by using NLP. Talk to it just like you would with the ChatGPT website. Upload (multiple) images and have discussions or conduct analysis on them all in a single conversation (Slack Thread). Bugs possible on this branch! 
+
 ## Getting Started
 
 Requires `Python 3.10+` as the script takes advantage of the new structural pattern matching (match/case) in this version.  
@@ -87,6 +90,8 @@ Run the py file for your chosen interface, e.g.:
 
 
 ## ToDo:
+- Work on prompts to minimize the "I can't do this or that" from the model.
+- Cleanup new code around Dalle3 NLP Image gen.
 - Slack threads and thread history are working. Discord is still a shared history. 
 - Add command functionality to allow for changing the initial chatbot init phrase
 - Update bot commands to use Slack/Discord's `/command` functionality rather than old school `!commands`
