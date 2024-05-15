@@ -1,11 +1,16 @@
 # ChatGPT Bots
 Python based ChatGPT bot integrations
 
-## `Notice`
+## `Notice - Focusing on Slackbot over Discord and CLI for now.`
 The Discord client is a little behind as I've spent the majority of time working on the Slack version. It should still work, but it's missing a lot of the functionality included in the Slack version. The CLI version is very basic as it's only text based. All clients have basic threading support, though individual thread histories are only supported in the Slack client for now. 
 
 ## Description
 ChatBot Integrations for Slack, Discord, and the CLI using Python and OpenAPI's ChatGPT platform. This bot is designed around GPT4 and supports GPT4 Vision and Dalle-3. 
+
+## *New Features!* 
+The Slackbot now allows iteration on Dalle-3 images and will also determine if image creation is the appropriate action by using NLP. Talk to it just like you would with the ChatGPT website. Upload (multiple) images and have discussions or conduct analysis on them all in a single conversation (Slack Thread). 
+
+***Dev Note:*** I've tested this version for a month or two now and I've had very good success with using NLP to determine whether an image request is intended without explicitly asking for one. I was hesitant to merge this branch into master as it added an entirely new api request for the image gen check as well as a third for generating a behind-the-scenes image prompt that includes the previous conversation history as part of its context (this is how you can iterate on an image). These additional api requests added a bit more latency than felt acceptable, but this has been remedied by OpenAI's launch of the new `GPT-4o` model which is twice as fast (and 50% cheaper!).
 
 ## Getting Started
 
@@ -87,6 +92,9 @@ Run the py file for your chosen interface, e.g.:
 
 
 ## ToDo:
+- Fix bug w/ thread history rebuilds and Image gen check. Need to compare pre-post restart histories.
+- Work on prompts to minimize the "I can't do this or that" from the model.
+- Cleanup new code around Dalle3 NLP Image gen.
 - Slack threads and thread history are working. Discord is still a shared history. 
 - Add command functionality to allow for changing the initial chatbot init phrase
 - Update bot commands to use Slack/Discord's `/command` functionality rather than old school `!commands`

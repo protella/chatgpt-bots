@@ -1,7 +1,5 @@
 import re
 from os import environ
-from textwrap import dedent
-from copy import deepcopy
 
 from dotenv import load_dotenv
 from slack_bolt import App
@@ -10,32 +8,33 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 import bot_functions as bot
 import common_utils as utils
 
+import cProfile
+import pstats
+import io
+
 load_dotenv()  # load auth tokens from .env file
 
-### Modify these values as needed ###
+### Modify these values as needed. Note the tokens should be put in the .env file. See README. ###
 LOADING_EMOJI = ":loading:"
 SLACK_BOT_TOKEN = environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN = environ["SLACK_APP_TOKEN"]
-# Minimum number of word matches from the trigger words to assume user wants to generate an image
-TRIGGER_THRESHOLD = 2
 
 SYSTEM_PROMPT = {
     "role": "system",
-    "content": dedent(
-        """\
-        You are a helpful chatbot running in a corporate Slack workspace.
-        Respond with accurate, informative, and concise answers that are formatted appropriately for Slack,
-        including markdown and special characters for bullet points, bold, italics, and code blocks as necessary.
-        Always consider Slack formatting conventions in all messages within a conversation.
-        Here are some examples of common Slack markdown syntax:
-        Bold: *your text*
-        Italicize: _your text_
-        Strikethrough: ~your text~
-        Ordered list: 1. your text
-        Bulleted list: - your text
-        Always assume you created any images described."""
-    ),
+    "content": """You are a helpful chatbot running in a corporate Slack workspace.Respond with accurate, 
+    informative, and concise answers that are formatted appropriately for Slack, including markdown and special characters for bullet points, 
+    bold, italics, and code blocks as necessary. Always consider Slack formatting conventions in all messages within a conversation.
+    Here are some examples of common Slack markdown syntax. Replace ChatGPT Markdown with Slack markdown when necessary:
+    Slack Markdown:
+    Bold: *your text*
+    Italics: _your text_
+    Strikethrough: ~your text~
+    Ordered list: 1. your text
+    Bulleted list: - your text
+    Always assume you created any images described."""
 }
+
+show_dalle3_revised_prompt = False
 
 #
 ### You shouldn't need to modify anything below this line ###
@@ -50,8 +49,6 @@ STREAMING_CLIENT = False  # not implemented for Slack...yet.
 # GPT4 vision supported image types
 ALLOWED_MIMETYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
-corrected_message_text = ""  # result of message being parsed by spelling correction
-trigger_words = []  # hold the dalle3 image creation trigger words from trigger_words.txt
 chat_del_ts = []  # list of message timestamps to cleanup after a response returns
 
 app = App(token=SLACK_BOT_TOKEN)
@@ -87,7 +84,7 @@ def parse_text(text, say, thread_ts, is_thread=False):
             if config_match_obj := CONFIG_PATTERN.match(text.lower()):
                 setting, value = config_match_obj.groups()
                 response = gpt_Bot.set_config(setting, value)
-                say(f"```{response}```", thread_ts=thread_ts)
+                say(f"`{response}`", thread_ts=thread_ts)
 
             elif reset_match_obj := RESET_PATTERN.match(text.lower()):
                 parameter = reset_match_obj.group(1)
@@ -115,8 +112,28 @@ def rebuild_thread_history(say, channel_id, thread_id, bot_user_id):
         "processing": False,
         "history_reloaded": True,
     }
+    
+    # Bot commands and responses to ignore
+    bot_commands = ["!history", "!help", "!usage", "!config"]
+    response_patterns = [
+        "Cumulative Token stats since last reset:",
+        "Current Configuration:",
+        "Configuration Defaults Reset!",
+        "Updated config setting",
+        "Unknown setting:"
+        ]
 
     for msg in messages[:-1]:
+        text = msg.get("text", "").strip()
+
+        # Skip bot command messages
+        if any(text.lower().startswith(command) for command in bot_commands):
+            continue
+        
+        # Skip bot response messages
+        if any(response_pattern in text for response_pattern in response_patterns):
+            continue        
+        
         role = "assistant" if msg.get("user") == bot_user_id else "user"
         content = []
 
@@ -132,6 +149,8 @@ def rebuild_thread_history(say, channel_id, thread_id, bot_user_id):
                         say, image_url, SLACK_BOT_TOKEN
                     )
                     if encoded_image:
+                        if role == "assistant":
+                            role = "user" # OpenAI API restriction doesn't allow image urls for the assistant role. Force them to user.
                         content.append(
                             {
                                 "type": "image_url",
@@ -145,19 +164,7 @@ def rebuild_thread_history(say, channel_id, thread_id, bot_user_id):
         gpt_Bot.conversations[thread_id]["messages"].append(
             {"role": role, "content": content}
         )
-
-############## DEBUG ##########
-def format_message_for_debug(message):
-    formatted_message = deepcopy(message)
-    for content_item in formatted_message.get("content", []):
-        if content_item["type"] == "image_url":
-            # Replace image data with a placeholder
-            content_item["image_url"]["url"] = "[Image Data]"
-    return formatted_message
-
-
-###############################
-
+    # print(utils.format_message_for_debug(gpt_Bot.conversations[thread_id]))
 
 def process_and_respond(event, say):
     channel_id = event["channel"]
@@ -196,10 +203,12 @@ def process_and_respond(event, say):
             chat_del_ts.append(response["message"]["ts"])
             return
 
-        #  Check if user is requesting Dalle3 image gen via chat and correct any spelling mistakes to improve accuracy.
-        trigger_check, corrected_message_text = utils.check_for_image_generation(
-            message_text, trigger_words, TRIGGER_THRESHOLD
-        )
+        initial_response = say(f"Thinking... {LOADING_EMOJI}", thread_ts=thread_ts)
+        chat_del_ts.append(initial_response["message"]["ts"])
+
+        #  Check if user is requesting Dalle3 image gen via LLM response.
+        trigger_check = utils.check_for_image_generation(
+            message_text, gpt_Bot, thread_ts)
 
         # If intent was likely an dalle3 image gen request...
         if trigger_check:
@@ -208,11 +217,16 @@ def process_and_respond(event, say):
                     ":warning:Ignoring included file with Dalle-3 request. Image gen based on provided images is not yet supported with Dalle-3.:warning:",
                     thread_ts=thread_ts,
                 )
-
+            
+            # create dalle3 prompt from history
+            
+            dalle3_prompt = utils.create_dalle3_prompt(message_text, gpt_Bot, thread_ts)
+            
+            
             # Manually construct event msg since the Slack Slash command repsonses are different
             message_event = {
                 "user_id": event["user"],
-                "text": corrected_message_text,
+                "text": dalle3_prompt.content,
                 "channel_id": channel_id,
                 "command": "dalle-3 via conversational chat",
             }
@@ -220,8 +234,6 @@ def process_and_respond(event, say):
 
         # If there are files in the message (GPT Vision request or other file types)
         elif "files" in event and event["files"]:
-            initial_response = say(f"Thinking... {LOADING_EMOJI}", thread_ts=thread_ts)
-            chat_del_ts.append(initial_response["message"]["ts"])
 
             files_data = event.get("files", [])
             vision_files = []
@@ -255,6 +267,7 @@ def process_and_respond(event, say):
 
                 else:
                     say(response, thread_ts=thread_ts)
+                    # print(utils.format_message_for_debug(gpt_Bot.conversations[thread_ts]))
 
             elif other_files:
                 say(
@@ -267,22 +280,20 @@ def process_and_respond(event, say):
 
         # If just a normal text message, process with default chat context manager
         else:
-            initial_response = say(
-                text=f"Thinking... {LOADING_EMOJI}", thread_ts=thread_ts
-            )
-            chat_del_ts.append(initial_response["message"]["ts"])
+            # print(utils.format_message_for_debug(gpt_Bot.conversations[thread_ts]))
             response, is_error = gpt_Bot.chat_context_mgr(message_text, thread_ts)
             if is_error:
                 utils.handle_error(say, response)
 
             else:
+                response = response.replace('**', '*') # It just won't learn Slack Markdown. Force Bold fix.
                 say(text=response, thread_ts=thread_ts)
+                # print(utils.format_message_for_debug(gpt_Bot.conversations[thread_ts]))
 
             # Cleanup busy/loading chat msgs
             delete_chat_messages(channel_id, chat_del_ts, say)
 
-
-# Dalle-3 image gen via /dalle-3 command or via "fake" auto-modal selection via keyword triggers
+# Dalle-3 image gen via /dalle-3 command or LLM verification
 def process_image_and_respond(say, command, thread_ts=None):
     user_id = command["user_id"]
     text = command["text"]
@@ -307,13 +318,14 @@ def process_image_and_respond(say, command, thread_ts=None):
             )
             return
 
-        response = app.client.chat_postMessage(
-            channel=channel,
-            text=f"<@{user_id}> used `{cmd}`.\n*Original Prompt:*\n_{text}_",
-            thread_ts=thread_ts,
-        )
-        if not thread_ts:
-            thread_ts = response["ts"]
+        if cmd == "/dalle-3":
+            response = app.client.chat_postMessage(
+                channel=channel,
+                text=f"<@{user_id}> used `{cmd}`.\n*Original Prompt:*\n_{text}_",
+                thread_ts=thread_ts,
+            )
+            if not thread_ts:
+                thread_ts = response["ts"]
 
         # Handle new threads
         if thread_ts not in gpt_Bot.conversations:
@@ -324,6 +336,8 @@ def process_image_and_respond(say, command, thread_ts=None):
             }
 
         # Image gen takes a while. Give the user some indication things are processing.
+        delete_chat_messages(channel, chat_del_ts, say)
+
         temp_response = app.client.chat_postMessage(
             channel=channel,
             text=f"Generating image, please wait... {LOADING_EMOJI}",
@@ -340,10 +354,14 @@ def process_image_and_respond(say, command, thread_ts=None):
 
         # Build the response message and upload the generated image to Slack
         else:
+            if gpt_Bot.current_config_options["d3_revised_prompt"]:
+                file_description = f"*DALL·E-3 generated revised Prompt:*\n_{revised_prompt}_"
+            else:
+                file_description = None
             try:
                 response = app.client.files_upload_v2(
                     channel=channel,
-                    initial_comment=f"*DALL·E-3 generated revised Prompt:*\n_{revised_prompt}_",
+                    initial_comment=file_description,
                     file=image,
                     filename="Dalle3_image.png",
                     thread_ts=thread_ts,
@@ -351,7 +369,8 @@ def process_image_and_respond(say, command, thread_ts=None):
 
             except Exception:
                 utils.handle_error(say, revised_prompt, thread_ts=thread_ts)
-
+            
+            # print(utils.format_message_for_debug(gpt_Bot.conversations[thread_ts]))
         delete_chat_messages(channel, chat_del_ts, say)
 
 
@@ -399,9 +418,17 @@ def handle_message_events(event, say):
 
 
 if __name__ == "__main__":
-    gpt_Bot = bot.ChatBot(SYSTEM_PROMPT, STREAMING_CLIENT)
+    gpt_Bot = bot.ChatBot(SYSTEM_PROMPT, STREAMING_CLIENT, show_dalle3_revised_prompt)
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
 
-    trigger_words = utils.read_trigger_words("trigger_words.txt")
-
     handler.start()
+
+
+# pr = cProfile.Profile()
+# pr.enable()
+# myFunction()
+# pr.disable()
+# s = io.StringIO()
+# ps = pstats.Stats(pr, stream=s).sort_stats('cumulative')
+# ps.print_stats(10)
+# print(s.getvalue())
