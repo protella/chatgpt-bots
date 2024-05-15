@@ -1,6 +1,5 @@
 import re
 from os import environ
-from textwrap import dedent
 
 from dotenv import load_dotenv
 from slack_bolt import App
@@ -9,32 +8,33 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 import bot_functions as bot
 import common_utils as utils
 
+import cProfile
+import pstats
+import io
+
 load_dotenv()  # load auth tokens from .env file
 
-### Modify these values as needed ###
+### Modify these values as needed. Note the tokens should be put in the .env file. See README. ###
 LOADING_EMOJI = ":loading:"
-SHOW_DALLE_REVISED_PROMPT = False
 SLACK_BOT_TOKEN = environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN = environ["SLACK_APP_TOKEN"]
 
 SYSTEM_PROMPT = {
     "role": "system",
-    "content": dedent(
-        """\
-        You are a helpful chatbot running in a corporate Slack workspace.
-        Respond with accurate, informative, and concise answers that are formatted appropriately for Slack,
-        including markdown and special characters for bullet points, bold, italics, and code blocks as necessary.
-        Always consider Slack formatting conventions in all messages within a conversation.
-        Here are some examples of common Slack markdown syntax. Replace ChatGPT Markdown with Slack markdown when necessary:
-        Slack Markdown:
-        Bold: *your text*
-        Italics: _your text_
-        Strikethrough: ~your text~
-        Ordered list: 1. your text
-        Bulleted list: - your text
-        Always assume you created any images described."""
-    ),
+    "content": """You are a helpful chatbot running in a corporate Slack workspace.Respond with accurate, 
+    informative, and concise answers that are formatted appropriately for Slack, including markdown and special characters for bullet points, 
+    bold, italics, and code blocks as necessary. Always consider Slack formatting conventions in all messages within a conversation.
+    Here are some examples of common Slack markdown syntax. Replace ChatGPT Markdown with Slack markdown when necessary:
+    Slack Markdown:
+    Bold: *your text*
+    Italics: _your text_
+    Strikethrough: ~your text~
+    Ordered list: 1. your text
+    Bulleted list: - your text
+    Always assume you created any images described."""
 }
+
+show_dalle3_revised_prompt = False
 
 #
 ### You shouldn't need to modify anything below this line ###
@@ -84,7 +84,7 @@ def parse_text(text, say, thread_ts, is_thread=False):
             if config_match_obj := CONFIG_PATTERN.match(text.lower()):
                 setting, value = config_match_obj.groups()
                 response = gpt_Bot.set_config(setting, value)
-                say(f"```{response}```", thread_ts=thread_ts)
+                say(f"`{response}`", thread_ts=thread_ts)
 
             elif reset_match_obj := RESET_PATTERN.match(text.lower()):
                 parameter = reset_match_obj.group(1)
@@ -112,8 +112,28 @@ def rebuild_thread_history(say, channel_id, thread_id, bot_user_id):
         "processing": False,
         "history_reloaded": True,
     }
+    
+    # Bot commands and responses to ignore
+    bot_commands = ["!history", "!help", "!usage", "!config"]
+    response_patterns = [
+        "Cumulative Token stats since last reset:",
+        "Current Configuration:",
+        "Configuration Defaults Reset!",
+        "Updated config setting",
+        "Unknown setting:"
+        ]
 
     for msg in messages[:-1]:
+        text = msg.get("text", "").strip()
+
+        # Skip bot command messages
+        if any(text.lower().startswith(command) for command in bot_commands):
+            continue
+        
+        # Skip bot response messages
+        if any(response_pattern in text for response_pattern in response_patterns):
+            continue        
+        
         role = "assistant" if msg.get("user") == bot_user_id else "user"
         content = []
 
@@ -129,6 +149,8 @@ def rebuild_thread_history(say, channel_id, thread_id, bot_user_id):
                         say, image_url, SLACK_BOT_TOKEN
                     )
                     if encoded_image:
+                        if role == "assistant":
+                            role = "user" # OpenAI API restriction doesn't allow image urls for the assistant role. Force them to user.
                         content.append(
                             {
                                 "type": "image_url",
@@ -142,7 +164,7 @@ def rebuild_thread_history(say, channel_id, thread_id, bot_user_id):
         gpt_Bot.conversations[thread_id]["messages"].append(
             {"role": role, "content": content}
         )
-
+    # print(utils.format_message_for_debug(gpt_Bot.conversations[thread_id]))
 
 def process_and_respond(event, say):
     channel_id = event["channel"]
@@ -258,7 +280,7 @@ def process_and_respond(event, say):
 
         # If just a normal text message, process with default chat context manager
         else:
-
+            # print(utils.format_message_for_debug(gpt_Bot.conversations[thread_ts]))
             response, is_error = gpt_Bot.chat_context_mgr(message_text, thread_ts)
             if is_error:
                 utils.handle_error(say, response)
@@ -270,7 +292,6 @@ def process_and_respond(event, say):
 
             # Cleanup busy/loading chat msgs
             delete_chat_messages(channel_id, chat_del_ts, say)
-
 
 # Dalle-3 image gen via /dalle-3 command or LLM verification
 def process_image_and_respond(say, command, thread_ts=None):
@@ -333,7 +354,7 @@ def process_image_and_respond(say, command, thread_ts=None):
 
         # Build the response message and upload the generated image to Slack
         else:
-            if SHOW_DALLE_REVISED_PROMPT:
+            if gpt_Bot.current_config_options["d3_revised_prompt"]:
                 file_description = f"*DALL·E-3 generated revised Prompt:*\n_{revised_prompt}_"
             else:
                 file_description = None
@@ -397,7 +418,17 @@ def handle_message_events(event, say):
 
 
 if __name__ == "__main__":
-    gpt_Bot = bot.ChatBot(SYSTEM_PROMPT, STREAMING_CLIENT)
+    gpt_Bot = bot.ChatBot(SYSTEM_PROMPT, STREAMING_CLIENT, show_dalle3_revised_prompt)
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
 
     handler.start()
+
+
+# pr = cProfile.Profile()
+# pr.enable()
+# myFunction()
+# pr.disable()
+# s = io.StringIO()
+# ps = pstats.Stats(pr, stream=s).sort_stats('cumulative')
+# ps.print_stats(10)
+# print(s.getvalue())
