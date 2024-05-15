@@ -6,7 +6,12 @@ import requests
 IMAGE_CHECK_SYSTEM_PROMPT = """You will be provided with a user's chat message for a chatgpt slackbot integration. 
 Determine if the user's intent is to request an image generation or if the message is just part of the ongoing chat conversation. 
 Also consider if the message is in the form of a question when making your determination.
-Respond with 'True' for image requests and 'False' otherwise. No other text should be provided except 'True' or 'False'."""
+Respond with 'True' for image requests and 'False' otherwise. No other text should be provided except 'True' or 'False'.
+For example:
+User message: "Can you create an image of a sunset over the mountains?"
+Response: True
+User message: "What do you think about the new policy?"
+Response: False"""
 
 IMAGE_GEN_SYSTEM_PROMPT = """You will be provided with a user's chat message and context history for a chatgpt slackbot integration.
 The message has been predetermined to be a request for a Dalle-3 generative art image. 
@@ -35,7 +40,6 @@ def create_dalle3_prompt(message, gpt_Bot, thread_id):
 # Use GPT4 to check if the user is requesting an image
 def check_for_image_generation(message, gpt_Bot, thread_id):
     gpt_Bot.conversations[thread_id]["processing"] = True
-
     chat_history = deepcopy(gpt_Bot.conversations[thread_id]["messages"])
     
     chat_history.append(
@@ -43,8 +47,8 @@ def check_for_image_generation(message, gpt_Bot, thread_id):
             )
     chat_history[0]['content'] = IMAGE_CHECK_SYSTEM_PROMPT
 
-    # set temperature to 0.0 to be fully deterministic and reduce randomness for chance of non True/False response
-    is_image_request = gpt_Bot.get_gpt_response(chat_history, GPT_MODEL, temperature = 0.0)
+    # set temperature to 0.0 to be fully deterministic and reduce randomness for chance of non True/False response. Low Max tokens helps force T/F Response
+    is_image_request = gpt_Bot.get_gpt_response(chat_history, GPT_MODEL, temperature = 0.0, max_tokens=5)
     
     gpt_Bot.conversations[thread_id]["processing"] = False
     # print(f'\nImage Request Check: {is_image_request.content}\n')
@@ -88,6 +92,10 @@ def format_message_for_debug(conversation_history):
                     # Add a placeholder for images
                     message_texts.append("[Image Data]")
         
+        elif isinstance(content, str):
+            # Directly append the content if it's a string
+            message_texts.append(content)
+                    
         # Join all parts of the message into a single string and append to the output
         formatted_message = ' '.join(message_texts)
         formatted_output.append(f"-- {role.capitalize()}: {formatted_message}")

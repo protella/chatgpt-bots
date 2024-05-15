@@ -92,6 +92,7 @@ Run the py file for your chosen interface, e.g.:
 
 
 ## ToDo:
+- Fix bug w/ thread history rebuilds and Image gen check. Need to compare pre-post restart histories.
 - Work on prompts to minimize the "I can't do this or that" from the model.
 - Cleanup new code around Dalle3 NLP Image gen.
 - Slack threads and thread history are working. Discord is still a shared history. 
