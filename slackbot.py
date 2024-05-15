@@ -1,7 +1,6 @@
 import re
-from os import environ, replace
+from os import environ
 from textwrap import dedent
-from copy import deepcopy
 
 from dotenv import load_dotenv
 from slack_bolt import App
