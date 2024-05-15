@@ -12,7 +12,7 @@ from PIL import Image
 load_dotenv()  # load auth tokens from .env file
 
 # Default models: https://platform.openai.com/docs/models
-GPT_MODEL = "gpt-4-turbo"
+GPT_MODEL = "gpt-4o"
 DALLE_MODEL = "dall-e-3"
 
 
@@ -23,15 +23,15 @@ class ChatBot:
         self.streaming_client = streaming_client  # ToDo: Implement streaming support
         self.usage = {}
         self.config_option_defaults = {
-            "temperature": 0.5,  # 0.0 - 2.0
+            "temperature": 1,  # 0.0 - 2.0
             "top_p": 1,
             "max_tokens": 2048,  # max 4096
             "custom_init": "",
             "gpt_model": GPT_MODEL,
             "dalle_model": DALLE_MODEL,
-            "size": "1024x1024",  # 1024x1024, 1024x1792 or 1792x1024
+            "size": "1024x1024",  # 1024x1024, 1024x1792, or 1792x1024
             "quality": "hd",  # standard or hd
-            "style": "vivid",  # natural or vivid
+            "style": "natural",  # natural or vivid
             "number": 1,  # number of images. Only 1 supported for Dalle3
             "detail": "auto",  # vision parameter: auto, low, high
         }

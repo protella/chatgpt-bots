@@ -21,13 +21,13 @@ def create_dalle3_prompt(message, gpt_Bot, thread_id):
     chat_history = deepcopy(gpt_Bot.conversations[thread_id]["messages"])
     
     chat_history.append(
-                {"role": "user", "content": [{"type": "text", "text": message}]}
+        {"role": "user", "content": [{"type": "text", "text": message}]}
             )
     chat_history[0]['content'] = IMAGE_GEN_SYSTEM_PROMPT
     
     dalle3_prompt = gpt_Bot.get_gpt_response(chat_history, GPT_MODEL)
     
-    print(f'\nDalle-3 Prompt: {dalle3_prompt.content}\n')
+    # print(f'\nDalle-3 Prompt: {dalle3_prompt.content}\n')
 
     gpt_Bot.conversations[thread_id]["processing"] = False
     return dalle3_prompt
@@ -47,7 +47,7 @@ def check_for_image_generation(message, gpt_Bot, thread_id):
     is_image_request = gpt_Bot.get_gpt_response(chat_history, GPT_MODEL, temperature = 0.0)
     
     gpt_Bot.conversations[thread_id]["processing"] = False
-    print(f'\nImage Request Check: {is_image_request.content}\n')
+    # print(f'\nImage Request Check: {is_image_request.content}\n')
     return is_image_request.content.strip().lower() == 'true'
 
 
