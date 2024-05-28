@@ -6,6 +6,7 @@ import discord
 from dotenv import load_dotenv
 
 import bot_functions as bot
+import common_utils as utils
 
 load_dotenv()
 
@@ -89,6 +90,13 @@ class discordClt(discord.Client):
                     )
 
                 else:
+                    if "0" not in gpt_Bot.conversations:
+                        gpt_Bot.conversations["0"] = {
+                        "messages": [SYSTEM_PROMPT],
+                        "processing": False,
+                        "history_reloaded": False,
+                    }
+                    print(gpt_Bot.conversations)                    
                     response, is_error = gpt_Bot.chat_context_mgr(text, thread_id="0")
                     if is_error:
                         await message.channel.send(

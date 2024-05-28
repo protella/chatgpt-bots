@@ -12,7 +12,7 @@ from PIL import Image
 load_dotenv()  # load auth tokens from .env file
 
 # Default models: https://platform.openai.com/docs/models
-GPT_MODEL = "gpt-4-turbo"
+GPT_MODEL = "gpt-4o"
 DALLE_MODEL = "dall-e-3"
 
 
