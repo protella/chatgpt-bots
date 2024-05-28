@@ -2,8 +2,6 @@ import base64
 import os
 from copy import deepcopy
 from io import BytesIO
-from textwrap import dedent
-
 from dotenv import load_dotenv
 from openai import OpenAI
 from PIL import Image
@@ -17,27 +15,29 @@ DALLE_MODEL = "dall-e-3"
 
 
 class ChatBot:
-    def __init__(self, SYSTEM_PROMPT, streaming_client=False):
+    def __init__(self, SYSTEM_PROMPT, streaming_client=False, show_dalle3_revised_prompt=False):
         self.SYSTEM_PROMPT = SYSTEM_PROMPT
         self.conversations = {}
+        self.show_dalle3_revised_prompt = show_dalle3_revised_prompt
         self.streaming_client = streaming_client  # ToDo: Implement streaming support
         self.usage = {}
         self.config_option_defaults = {
-            "temperature": 0.5,  # 0.0 - 2.0
+            "temperature": 1,  # 0.0 - 2.0
             "top_p": 1,
             "max_tokens": 2048,  # max 4096
             "custom_init": "",
             "gpt_model": GPT_MODEL,
             "dalle_model": DALLE_MODEL,
-            "size": "1024x1024",  # 1024x1024, 1024x1792 or 1792x1024
+            "size": "1024x1024",  # 1024x1024, 1024x1792, or 1792x1024
             "quality": "hd",  # standard or hd
-            "style": "vivid",  # natural or vivid
+            "style": "natural",  # natural or vivid
             "number": 1,  # number of images. Only 1 supported for Dalle3
             "detail": "auto",  # vision parameter: auto, low, high
+            "d3_revised_prompt": self.show_dalle3_revised_prompt
         }
         self.current_config_options = self.config_option_defaults.copy()
         self.client = OpenAI(api_key=os.environ["OPENAI_KEY"])
-
+        
     def chat_context_mgr(self, message_text, thread_id, files=""):
         self.conversations[thread_id]["processing"] = True
 
@@ -65,7 +65,6 @@ class ChatBot:
                         "content": [{"type": "text", "text": gpt_output.content}],
                     }
                 )
-
             return gpt_output.content, is_error
         else:
             is_error = True
@@ -102,12 +101,9 @@ class ChatBot:
                     "content": [
                         {
                             "type": "text",
-                            "text": dedent(
-                                f"""\
-                        Based on the Dalle-3 user prompt, I can imagine I created an image like this: {revised_prompt}
-                        I can describe what such an image might look like or the ideas it might convey.
-                        I will act as if I created the described image for the purposes of this chat."""
-                            ),
+                            "text": f"""Based on the Dalle-3 user prompt, I can imagine I created an image like this: {revised_prompt}
+                            I can describe what such an image might look like or the ideas it might convey.
+                            I will act as if I created the described image for the purposes of this chat."""
                         }
                     ],
                 }
@@ -124,7 +120,6 @@ class ChatBot:
         return image, revised_prompt, is_error
 
     def vision_context_mgr(self, message_text, images, thread_id):
-        # self.rebuild_thread_history(thread_id)
 
         self.conversations[thread_id]["processing"] = True
 
@@ -198,14 +193,18 @@ class ChatBot:
             print(f"##################\n{e}\n##################")
             return None, e
 
-    def get_gpt_response(self, messages_history, model):
+    def get_gpt_response(self, messages_history, model, temperature=None, max_tokens=None):
+        if temperature is None:
+            temperature = self.current_config_options["temperature"]
+        if max_tokens is None:
+            max_tokens = self.current_config_options["max_tokens"]
         try:
             response = self.client.chat.completions.create(
                 model=model,
                 messages=messages_history,
                 stream=self.streaming_client,
-                temperature=float(self.current_config_options["temperature"]),
-                max_tokens=int(self.current_config_options["max_tokens"]),
+                temperature=float(temperature),
+                max_tokens=int(max_tokens),
                 top_p=float(self.current_config_options["top_p"]),
             )
             self.usage = response.usage
@@ -221,13 +220,10 @@ class ChatBot:
 
     def usage_command(self):  # Fix this later to aggregate all thread usage
         if self.usage:
-            return dedent(
-                f"""\
-                Cumulative Token stats since last reset:
-                Prompt Tokens: {self.usage.prompt_tokens}
-                Completion Tokens: {self.usage.completion_tokens}
-                Total Tokens: {self.usage.total_tokens}"""
-            )
+            return f"""Cumulative Token stats since last reset:
+Prompt Tokens: {self.usage.prompt_tokens}
+Completion Tokens: {self.usage.completion_tokens}
+Total Tokens: {self.usage.total_tokens}"""
 
         else:
             return "No usage info yet. Ask the bot something and check again."
@@ -254,8 +250,10 @@ class ChatBot:
 
     def set_config(self, setting, value):
         if setting in self.current_config_options:
+            if isinstance(value, str) and value.lower() in ["true", "false"]: # Ensure Bools are handled properly.
+                value = value.lower() == "true" # Note == for comparison
             self.current_config_options[setting] = value
-            return f"Updated {setting} to {value}"
+            return f"Updated config setting '{setting}' to '{value}'"
         return f"Unknown setting: {setting}"
 
     def view_config(self):
@@ -271,18 +269,15 @@ class ChatBot:
 
     @staticmethod
     def help_command():
-        return dedent(
-            """\
-            !help - This help.
-            /dalle-3 {prompt} generate an image via text with Dalle-3.
-            !config - Displays the current configuration values. For now, these are global settings for everyone.
-            !config [option] [value] - Sets one of the options seen in '!config' to a custom value. Beware of the model's ranges for these values.
-              --see https://platform.openai.com/docs/api-reference for more info.
-            !history - Prints a json dump of the chat history since last reset.
-            !reset config - Sets the config options back to defaults, e.g., temperature, max_tokens, etc.
-            !reset history - Command deprecated. Start a new thread with the bot for a fresh conversation.
-            !usage - Prints token usage stats since the last reset."""
-        )
+        return """!help - This help.
+    /dalle-3 {prompt} generate an image via text with Dalle-3.
+    !config - Displays the current configuration values. For now, these are global settings for everyone.
+    !config [option] [value] - Sets one of the options seen in '!config' to a custom value. Beware of the model's ranges for these values.
+    --see https://platform.openai.com/docs/api-reference for more info.
+    !history - Prints a json dump of the chat history since last reset.
+    !reset config - Sets the config options back to defaults, e.g., temperature, max_tokens, etc.
+    !reset history - Command deprecated. Start a new thread with the bot for a fresh conversation.
+    !usage - Prints token usage stats since the last reset."""
 
     @staticmethod
     def handle_busy():
