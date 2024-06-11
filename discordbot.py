@@ -92,11 +92,11 @@ class discordClt(discord.Client):
 
                 elif reset_match_obj:
                     parameter = reset_match_obj.group(1)
-                    # Resetting History no longer supported in the bot functions module.
-                    # if parameter == "history":
-                    #     response = gpt_Bot.reset_history(thread_id="0")
-                    #     await message.channel.send(f"`{response}`")
-                    if parameter == "config":
+                    # Reset history no longer supported in bot_functions.py. Add functionality here for now.
+                    if parameter == "history":
+                        response = await reset_history(thread_ts)
+                        await message.channel.send("`Chat History cleared.`")
+                    elif parameter == "config":
                         response = gpt_Bot.reset_config()
                         await message.channel.send(f"`{response}`")
                     else:
@@ -111,11 +111,7 @@ class discordClt(discord.Client):
 
                 else:
                     if thread_ts not in gpt_Bot.conversations:
-                        gpt_Bot.conversations[thread_ts] = {
-                        "messages": [SYSTEM_PROMPT],
-                        "processing": False,
-                        "history_reloaded": True,
-                    }
+                        await reset_history(thread_ts)
 
                     await self.queue.put((message, text))
                     
@@ -177,6 +173,13 @@ async def delete_chat_messages(channel, ids):
             await channel.send(f":no_entry: `Sorry, I ran into an error cleaning up my own messages.` :no_entry:\n```{e}```")
                 
     chat_del_ts.clear()
+
+async def reset_history(thread_ts):
+    gpt_Bot.conversations[thread_ts] = {
+    "messages": [SYSTEM_PROMPT],
+    "processing": False,
+    "history_reloaded": True,
+    }
 
 if __name__ == "__main__":
     intents = discord.Intents.default()
