@@ -1,3 +1,4 @@
+from fileinput import filename
 import os
 import re
 import discord
@@ -6,7 +7,7 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 
 import bot_functions as bot
-# import common_utils as utils
+import common_utils as utils
 
 load_dotenv()
 
@@ -24,6 +25,8 @@ SYSTEM_PROMPT = {
         Use discord markdown, code blocks, formatted text, and emojis where appropriate.
         Remember, don't be cute, be ruthless, stay witty, clever, snarky, and sarcastic."""
 }
+
+show_dalle3_revised_prompt = False
 
 config_pattern = r"!config\s+(\S+)\s+(.+)"
 reset_pattern = r"^!reset\s+(\S+)$"
@@ -65,9 +68,10 @@ class discordClt(discord.Client):
 
         match text.lower():
             case "!history":
-                await message.channel.send(
-                    f"```{gpt_Bot.history_command(thread_id='0')}```"
-                )
+                if thread_ts not in gpt_Bot.conversations:
+                    await message.channel.send("`No history yet.`")
+                    return
+                await self.send_paginated_message(message.channel, f"```{gpt_Bot.history_command(thread_ts)}```")
                 return
 
             case "!help":
@@ -120,7 +124,7 @@ class discordClt(discord.Client):
                         temp_message = await message.channel.send(f"{busy_response}")
                         chat_del_ts.append(temp_message.id)
     
-    @tasks.loop(seconds=1)
+    @tasks.loop(seconds=.5)
     async def process_queue(self):
         if not self.queue.empty() and not self.processing:
             message, text = await self.queue.get()
@@ -130,14 +134,46 @@ class discordClt(discord.Client):
                 initial_response = await message.channel.send(f"Thinking... {LOADING_EMOJI}")
                 chat_del_ts.append(initial_response.id)
                 
-                response, is_error = await self.fetch_openai_response(text, thread_ts)
+                #  Check if user is requesting Dalle3 image gen via LLM response.
+                img_check = await self.image_check(text, gpt_Bot, thread_ts)
                 
-                if is_error:
-                    await message.channel.send(
-                        f":no_entry: `Sorry, I ran into an error. The raw error details are as follows:` :no_entry:\n```{response}```"
-                    )
+                if img_check:
+                    if message.attachments:
+                        await message.channel.send(":warning: `Ignoring included file with Dalle-3 request. Image gen based on provided images is not yet supported with Dalle-3.` :warning:")
+                        
+                    dalle3_prompt = await self.create_dalle3_prompt(text, gpt_Bot, thread_ts)
+                    # print(dalle3_prompt.content)
+                    
+                    # Image gen takes a while. Give the user some indication things are processing.
+                    await delete_chat_messages(message.channel, chat_del_ts)
+
+                    initial_response = await message.channel.send(f"Generating image, please wait... {LOADING_EMOJI}")
+                    chat_del_ts.append(initial_response.id)
+                    
+                    # Dalle-3 always responds with a more detailed revised prompt.
+                    image, revised_prompt, is_error = await self.create_dalle3_image(dalle3_prompt.content, thread_ts)
+                    
+                    # revised_prompt holds any error values in this case
+                    if is_error:
+                        await message.channel.send(
+                            f":no_entry: `Sorry, I ran into an error. The raw error details are as follows:` :no_entry:\n```{revised_prompt}```")
+                    else:
+                        if gpt_Bot.current_config_options["d3_revised_prompt"]:
+                            image_description = f"*DALL·E-3 generated revised Prompt:*\n_{revised_prompt}_"
+                        else:
+                            image_description = None
+                            
+                        discord_image = discord.File(image, filename = "dalle3_image.png")
+                        await message.channel.send(content = image_description, file = discord_image)
+                
                 else:
-                    await self.send_paginated_message(message.channel, response)
+                    response, is_error = await self.fetch_openai_response(text, thread_ts)
+                    
+                    if is_error:
+                        await message.channel.send(
+                            f":no_entry: `Sorry, I ran into an error. The raw error details are as follows:` :no_entry:\n```{response}```")
+                    else:
+                        await self.send_paginated_message(message.channel, response)
             finally:
                 self.processing = False
                 self.queue.task_done()
@@ -152,9 +188,24 @@ class discordClt(discord.Client):
                 # Delete the busy messages for the current message
                 await delete_chat_messages(message.channel, chat_del_ts)
 
-    async def fetch_openai_response(self, text, thread_id):
+    async def create_dalle3_image(self, text, thread_ts):
         loop = asyncio.get_event_loop()
-        response, is_error = await loop.run_in_executor(None, gpt_Bot.chat_context_mgr, text, thread_id)
+        image, revised_prompt, is_error = await loop.run_in_executor(None, gpt_Bot.image_context_mgr, text, thread_ts)
+        return image, revised_prompt, is_error
+    
+    async def image_check(self, text, gpt_Bot, thread_ts):
+        loop = asyncio.get_event_loop()
+        is_img_request = await loop.run_in_executor(None, utils.check_for_image_generation, text, gpt_Bot, thread_ts)
+        return is_img_request
+
+    async def create_dalle3_prompt(self, text, gpt_Bot, thread_ts):
+        loop = asyncio.get_event_loop()
+        dalle3_prompt = await loop.run_in_executor(None, utils.create_dalle3_prompt, text, gpt_Bot, thread_ts)
+        return dalle3_prompt
+        
+    async def fetch_openai_response(self, text, thread_ts):
+        loop = asyncio.get_event_loop()
+        response, is_error = await loop.run_in_executor(None, gpt_Bot.chat_context_mgr, text, thread_ts)
         return response, is_error
 
     async def send_paginated_message(self, channel, message):
@@ -185,7 +236,7 @@ if __name__ == "__main__":
     intents = discord.Intents.default()
     intents.message_content = True
 
-    gpt_Bot = bot.ChatBot(SYSTEM_PROMPT, streaming_client)
+    gpt_Bot = bot.ChatBot(SYSTEM_PROMPT, streaming_client, show_dalle3_revised_prompt)
     discord_Client = discordClt(intents=intents)
     discord_Client.run(DISCORD_TOKEN)
 
