@@ -1,4 +1,3 @@
-from fileinput import filename
 import os
 import re
 import discord
