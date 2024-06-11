@@ -8,9 +8,10 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 import bot_functions as bot
 import common_utils as utils
 
-import cProfile
-import pstats
-import io
+# For performance profiling.
+# import cProfile
+# import pstats
+# import io
 
 load_dotenv()  # load auth tokens from .env file
 
