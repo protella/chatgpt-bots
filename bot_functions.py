@@ -28,9 +28,9 @@ class ChatBot:
             "custom_init": "",
             "gpt_model": GPT_MODEL,
             "dalle_model": DALLE_MODEL,
-            "size": "1024x1024",  # 1024x1024, 1024x1792, or 1792x1024
-            "quality": "hd",  # standard or hd
-            "style": "natural",  # natural or vivid
+            "size": "1024x1024",  # Dalle3 parameter: 1024x1024, 1024x1792, or 1792x1024
+            "quality": "hd",  # Dalle3 parameter: standard or hd
+            "style": "natural",  # Dalle3 parameter: natural or vivid
             "number": 1,  # number of images. Only 1 supported for Dalle3
             "detail": "auto",  # vision parameter: auto, low, high
             "d3_revised_prompt": self.show_dalle3_revised_prompt
@@ -101,9 +101,9 @@ class ChatBot:
                     "content": [
                         {
                             "type": "text",
-                            "text": f"""Based on the Dalle-3 user prompt, I can imagine I created an image like this: {revised_prompt}
-                            I can describe what such an image might look like or the ideas it might convey.
-                            I will act as if I created the described image for the purposes of this chat."""
+                            "text": f"""Based on the Dalle-3 user prompt, I created an image like this: {revised_prompt}
+                            I can describe what this images looks like and the ideas it might convey.
+                            I will act as if I created the this image in the context of this chat."""
                         }
                     ],
                 }
