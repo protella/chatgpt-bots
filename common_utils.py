@@ -17,7 +17,7 @@ IMAGE_GEN_SYSTEM_PROMPT = """You will be provided with a user's chat message and
 The message has been predetermined to be a request for a Dalle-3 generative art image. 
 Based solely on the chat history and user message provided, format your response as a straightforward 
 generative art prompt without any introductory text or explanation. 
-Ensure the prompt is descriptive and detailed."""
+Ensure the prompt is descriptive and detailed, but not too long."""
 
 
 # Use ChatGPT to generate a Dalle-3 prompt based on the message and chat history
