@@ -21,7 +21,7 @@ streaming_client = False  # Not yet implemented.
 
 config_pattern = r"!config\s+(\S+)\s+(.+)"
 reset_pattern = r"^!reset\s+(\S+)$"
-
+thread_id = "0"
 
 def signal_handler(sig, frame):
     print("\nCtrl-C detected, Exiting...")
@@ -30,6 +30,7 @@ def signal_handler(sig, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 
+ 
 
 def cli_chat():
     try:
@@ -83,7 +84,7 @@ def cli_chat():
             else:
                 response, is_error = gpt_Bot.chat_context_mgr(
                     user_input,
-                    thread_id="0",
+                    thread_id,
                 )
                 if is_error:
                     print(
@@ -95,6 +96,12 @@ def cli_chat():
 
 if __name__ == "__main__":
     gpt_Bot = bot_functions.ChatBot(SYSTEM_PROMPT, streaming_client)
+    
+    gpt_Bot.conversations[thread_id] = {
+        "messages": [SYSTEM_PROMPT],
+        "processing": False,
+        "history_reloaded": False,
+    }   
 
     while True:
         cli_chat()
