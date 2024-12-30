@@ -77,20 +77,21 @@ def parse_text(text, say, thread_ts, is_thread=False):
 
         case "!config":
             say(
-                f"```Current Configuration:\n{gpt_Bot.view_config()}```",
+                f"```Current Configuration:\n{gpt_Bot.view_config(thread_ts)}```",
                 thread_ts=thread_ts,
             )
 
         case _:
             if config_match_obj := CONFIG_PATTERN.match(text.lower()):
                 setting, value = config_match_obj.groups()
-                response = gpt_Bot.set_config(setting, value)
+                print(f"CONFIG CHANGE: {thread_ts}\n")
+                response = gpt_Bot.set_config(setting, value, thread_ts)
                 say(f"`{response}`", thread_ts=thread_ts)
 
             elif reset_match_obj := RESET_PATTERN.match(text.lower()):
                 parameter = reset_match_obj.group(1)
                 if parameter == "config":
-                    response = gpt_Bot.reset_config()
+                    response = gpt_Bot.reset_config(thread_ts)
                     say(f"`{response}`", thread_ts=thread_ts)
                 else:
                     say(f"Unknown reset parameter: {parameter}", thread_ts=thread_ts)
@@ -109,19 +110,21 @@ def rebuild_thread_history(say, channel_id, thread_id, bot_user_id):
     response = app.client.conversations_replies(channel=channel_id, ts=thread_id)
     messages = response.get("messages", [])
     gpt_Bot.conversations[thread_id] = {
-        "messages": [SYSTEM_PROMPT],
+        "messages": [SYSTEM_PROMPT], # Assume default system prompt for now.
         "processing": False,
         "history_reloaded": True,
     }
     
     # Bot commands and responses to ignore
-    bot_commands = ["!history", "!help", "!usage", "!config"]
+    bot_commands = ["!history", "!help", "!usage", "!config", "!reset"]
     response_patterns = [
         "Cumulative Token stats since last reset:",
         "Current Configuration:",
         "Configuration Defaults Reset!",
         "Updated config setting",
-        "Unknown setting:"
+        "Unknown setting:",
+        "Invalid command.",
+        "[HISTORY]"
         ]
 
     for msg in messages[:-1]:
@@ -129,10 +132,12 @@ def rebuild_thread_history(say, channel_id, thread_id, bot_user_id):
 
         # Skip bot command messages
         if any(text.lower().startswith(command) for command in bot_commands):
+            # print(f"Skipped bot command: {text}")
             continue
         
         # Skip bot response messages
         if any(response_pattern in text for response_pattern in response_patterns):
+            # print(f"Skipped bot response: {text}")
             continue        
         
         role = "assistant" if msg.get("user") == bot_user_id else "user"
@@ -175,12 +180,6 @@ def process_and_respond(event, say):
     # Get the message from the Slack event
     message_text = event.get("text") or event.get("message", {}).get("text", "")
 
-    # Remove the userID from the message using regex pattern matching
-    # Clean up the message text and then pass it to the parse_text function
-    message_text = parse_text(
-        remove_userid(message_text), say, thread_ts, is_thread
-    )
-
     # Handle new or existing threads since last restart
     if thread_ts not in gpt_Bot.conversations:
         if is_thread:
@@ -188,10 +187,20 @@ def process_and_respond(event, say):
 
         else:
             gpt_Bot.conversations[thread_ts] = {
-                "messages": [SYSTEM_PROMPT],
+                "messages": [gpt_Bot.SYSTEM_PROMPT],
                 "processing": False,
                 "history_reloaded": False,
             }
+        print(f"Initialized threads: {list(gpt_Bot.conversations.keys())}\n")  # Debug
+        print(f"Initialized conversation: {gpt_Bot.conversations}\n")  # Debug
+        
+            
+    # Remove the userID from the message using regex pattern matching
+    # Clean up the message text and then pass it to the parse_text function
+    message_text = parse_text(
+        remove_userid(message_text), say, thread_ts, is_thread
+    )
+
 
     if message_text or ("files" in event and event["files"]):
         # If bot is still processing a previous request, inform user it's busy and track busy messages
@@ -264,7 +273,7 @@ def process_and_respond(event, say):
                     message_text, vision_files, thread_ts
                 )
                 if is_error:
-                    utils.handle_error(say, response)
+                    utils.handle_error(say, response, thread_ts=thread_ts)
 
                 else:
                     say(response, thread_ts=thread_ts)

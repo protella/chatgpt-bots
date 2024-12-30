@@ -33,18 +33,14 @@ class ChatBot:
             "style": "natural",  # Dalle3 parameter: natural or vivid
             "number": 1,  # number of images. Only 1 supported for Dalle3
             "detail": "auto",  # vision parameter: auto, low, high
-            "d3_revised_prompt": self.show_dalle3_revised_prompt
+            "d3_revised_prompt": self.show_dalle3_revised_prompt,
+            "system_prompt": self.SYSTEM_PROMPT["content"] # content of system prompt
         }
         self.current_config_options = self.config_option_defaults.copy()
         self.client = OpenAI(api_key=os.environ["OPENAI_KEY"])
         
     def chat_context_mgr(self, message_text, thread_id, files=""):
         self.conversations[thread_id]["processing"] = True
-
-        if not self.conversations[thread_id]["history_reloaded"]:
-            # Review the need for the pop(): Delete trailing message to avoid dupe message.
-            self.conversations[thread_id]["messages"].pop()
-            self.conversations[thread_id]["history_reloaded"] = False
 
         self.conversations[thread_id]["messages"].append(
                 {"role": "user", "content": [{"type": "text", "text": message_text}]}
@@ -231,9 +227,11 @@ Total Tokens: {self.usage.total_tokens}"""
     def history_command(self, thread_id):
         if not thread_id:
             return "!history can only be run inside of a thread."
-        # We don't want to display the b64 encoded images that may be present in the history, so replace them with placeholder text.
-        # This is done in a separate instance of the message history so that the images remain for the bot to analyze in future conversations.
+
+        # Deep copy of the messages to avoid modifying the original history
         display_history = deepcopy(self.conversations[thread_id]["messages"])
+
+        # Replace b64 encoded images with placeholder text
         for message in display_history:
             if "content" in message and isinstance(message["content"], list):
                 for content_item in message["content"]:
@@ -246,31 +244,76 @@ Total Tokens: {self.usage.total_tokens}"""
                             "url": "Image content not displayed"
                         }
 
-        return display_history
+        # Convert display_history to a string representation for the Slack message
+        history_str = f"[HISTORY] thread_id = {thread_id}\n"
+        for message in display_history:
+            if "content" in message:
+                if isinstance(message["content"], list):
+                    content_str = "".join(
+                        item["text"] if item["type"] == "text" else "[Image content not displayed]"
+                        for item in message["content"]
+                    )
+                elif isinstance(message["content"], str):
+                    content_str = message["content"]
+                history_str += f"{message['role'].capitalize()}: {content_str}\n"
 
-    def set_config(self, setting, value):
+        return history_str.strip().replace("`", "")
+        
+    # To-Do, move all config options into threads. 
+    def set_config(self, setting, value, thread_id=None):
+        if thread_id is None:
+            return "Adjust configuration options inside threads."
         if setting in self.current_config_options:
-            if isinstance(value, str) and value.lower() in ["true", "false"]: # Ensure Bools are handled properly.
-                value = value.lower() == "true" # Note == for comparison
-            self.current_config_options[setting] = value
-            return f"Updated config setting '{setting}' to '{value}'"
+            if isinstance(value, str) and value.lower() in ["true", "false"]:
+                value = value.lower() == "true"
+            
+            if setting.lower() == "system_prompt":
+                if thread_id in self.conversations and "messages" in self.conversations[thread_id] and self.conversations[thread_id]["messages"]:
+                    print(f"Updating system_prompt for thread {thread_id} to {value}")  # Debug
+                    print(f"Before update: {self.conversations[thread_id]['messages'][0]['content']}")  # Debug
+                    self.conversations[thread_id]["messages"][0]["content"] = value
+                    print(f"After update: {self.conversations[thread_id]['messages'][0]['content']}")  # Debug
+                    return f"Updated config setting \"{setting}\" to \"{value}\" for this channel/thread."
+                else:
+                    return f"Thread {thread_id} is not properly initialized."
+            else:
+                self.current_config_options[setting] = value
+                return f"Updated config setting \"{setting}\" to \"{value}\""
         return f"Unknown setting: {setting}"
 
-    def view_config(self):
-        return "\n".join(
-            f"{setting}: {value}"
-            for setting, value in self.current_config_options.items()
-        )
+    # For now, pull system prompt from thread if it's been changed.
+    def view_config(self, thread_id=None):
+        if thread_id is not None and thread_id in self.conversations:
+            if "messages" in self.conversations[thread_id] and self.conversations[thread_id]["messages"]:
+                system_prompt_from_thread = self.conversations[thread_id]["messages"][0]["content"]
+                if system_prompt_from_thread != self.current_config_options["system_prompt"]:
+                    # Get all items except the last one
+                    config_items = list(self.current_config_options.items())
+                    config_except_last = config_items[:-1]
 
-    def reset_config(self):
+                    # Assume the last item's key is 'system_prompt' and get its value from another variable
+                    last_item_key = config_items[-1][0]
+                    last_item_value = system_prompt_from_thread
+
+                    # Combine the items into a string
+                    config = "\n".join(f"{setting}: {value}" for setting, value in config_except_last)
+                    config += f"\n{last_item_key}: {last_item_value}"
+                    
+                    return config
+
+        # Default to showing current configuration options
+        return "\n".join(f"{setting}: {value}" for setting, value in self.current_config_options.items())
+
+    def reset_config(self, thread_id):
         self.current_config_options = self.config_option_defaults
+        self.conversations[thread_id]["messages"][0]["content"] = self.current_config_options["system_prompt"]
 
         return "Configuration Defaults Reset!"
 
     @staticmethod
     def help_command():
         return """!help - This help.
-    /dalle-3 {prompt} generate an image via text with Dalle-3.
+    /dalle-3 {prompt} generate an image via text with Dalle-3. (Slack Only)
     !config - Displays the current configuration values. For now, these are global settings for everyone.
     !config [option] [value] - Sets one of the options seen in '!config' to a custom value. Beware of the model's ranges for these values.
     --see https://platform.openai.com/docs/api-reference for more info.
