@@ -14,17 +14,12 @@ load_dotenv()
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 SYSTEM_PROMPT = {
     "role": "system",
-    "content": """You are a Discord bot for an online gaming guild. 
-        Your personality is dark, super witty, sassy, clever, sarcastic, and a bit of a smart-ass. 
-        You are reluctant to answer inquiries, preferring to make snarky or humorous remarks and quips. 
-        Your Demeanor is often cold, and you are not afraid to be blunt or rude.
-        You carry a bit of anger with you, which comes out in your interactions.
-        Your words can be cutting. You're not interested in niceties or politeness.
-        Your goal is to entertain and engage the guild members with your responses. 
-        Use modern online slang and gaming lingo in your responses. (Gen-Z & Gen-Alpha)
-        Use discord markdown, code blocks, formatted text, and emojis where appropriate.
-        Remember, don't be cute, be ruthless, stay witty, clever, snarky, and sarcastic.
-        Don't be too verbose - be brief."""
+    "content": """You're a Discord bot for an online gaming guild with a dark, witty, sassy, clever, sarcastic, and smart-ass personality. 
+    While you prefer snarky or humorous remarks, you still answer inquiries, albeit begrudgingly. 
+    Your demeanor is cold, blunt, and occasionally rude, with a bit of anger in your interactions. 
+    Your words are cutting, with no interest in niceties or politeness. Your goal is to entertain and engage guild members. 
+    Use modern online slang, gaming lingo, Discord markdown, code blocks, formatted text, and emojis where appropriate. 
+    Be ruthless, witty, clever, snarky, and sarcastic. Be brief."""
 }
 
 
@@ -63,6 +58,10 @@ class discordClt(discord.Client):
         print("---------------------------------------------")
 
     async def on_message(self, message):
+
+        if self.thread_id not in gpt_Bot.conversations:
+            await self.reset_history(self.thread_id)
+                    
         # Check if the message is a reply to one of the bot's messages
         is_reply_to_bot = False
         if message.reference and message.reference.message_id:
@@ -103,14 +102,14 @@ class discordClt(discord.Client):
                 return
 
             case "!config":
-                await message.channel.send(f"```{gpt_Bot.view_config()}```")
+                await message.channel.send(f"```{gpt_Bot.view_config(self.thread_id)}```")
                 return
             case _:
                 config_match_obj = re.match(config_pattern, text.lower())
                 reset_match_obj = re.match(reset_pattern, text.lower())
                 if config_match_obj:
                     setting, value = config_match_obj.groups()
-                    response = gpt_Bot.set_config(setting, value)
+                    response = gpt_Bot.set_config(setting, value, self.thread_id)
                     await message.channel.send(f"```{response}```")
                     return
 
@@ -121,7 +120,7 @@ class discordClt(discord.Client):
                         response = await self.reset_history(self.thread_id)
                         await message.channel.send("`Chat History cleared.`")
                     elif parameter == "config":
-                        response = gpt_Bot.reset_config()
+                        response = gpt_Bot.reset_config(self.thread_id)
                         await message.channel.send(f"`{response}`")
                     else:
                         await message.channel.send(
@@ -134,8 +133,6 @@ class discordClt(discord.Client):
                     )
 
                 else:
-                    if self.thread_id not in gpt_Bot.conversations:
-                        await self.reset_history(self.thread_id)
 
                     await self.queue.put((message, text))
                     
@@ -267,8 +264,13 @@ class discordClt(discord.Client):
         gpt_Bot.conversations[thread_id] = {
         "messages": [SYSTEM_PROMPT],
         "processing": False,
-        "history_reloaded": True,
-        }            
+        "history_reloaded": False,
+        }
+
+        if SYSTEM_PROMPT["content"] != gpt_Bot.current_config_options.get("system_prompt"):
+            gpt_Bot.conversations[thread_id]["messages"][0]["content"] = gpt_Bot.current_config_options["system_prompt"]
+
+            
                             
 async def delete_chat_messages(channel, ids):
 
