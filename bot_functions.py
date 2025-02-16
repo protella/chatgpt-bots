@@ -87,7 +87,6 @@ class ChatBot:
             message_text, self.current_config_options["dalle_model"]
         )
 
-        self.conversations[thread_id]["processing"] = False
 
         if revised_prompt:
             is_error = False
@@ -305,7 +304,7 @@ Total Tokens: {self.usage.total_tokens}"""
         return "\n".join(f"{setting}: {value}" for setting, value in self.current_config_options.items())
 
     def reset_config(self, thread_id):
-        self.current_config_options = self.config_option_defaults
+        self.current_config_options = self.config_option_defaults.copy()
         self.conversations[thread_id]["messages"][0]["content"] = self.current_config_options["system_prompt"]
 
         return "Configuration Defaults Reset!"

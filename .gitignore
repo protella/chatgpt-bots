@@ -143,3 +143,4 @@ dmypy.json
 
 # Local logs
 logs/
+*.err

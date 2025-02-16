@@ -90,6 +90,8 @@ Run the py file for your chosen interface, e.g.:
 
 
 ## ToDo:
+- Implement Search API. OpenAI doesn't provide one (yet?), so need to use third party search APIs.
+- Implement RAG for Atlassian's JIRA/Confluence to be able to query via NLP
 - Implement some basic text extraction for PDFs and other file types for analysis of non-image types.
 - Fix bug w/ thread history rebuilds and Image gen check. Need to compare pre-post restart histories.
 - Discord is still uses a shared history. Not sure how to handle threads/conversations w/ Discord. 
