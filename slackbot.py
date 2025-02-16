@@ -22,7 +22,7 @@ SLACK_APP_TOKEN = environ["SLACK_APP_TOKEN"]
 
 SYSTEM_PROMPT = {
     "role": "system",
-    "content": """You are a helpful chatbot running in a corporate Slack workspace.Respond with accurate, 
+    "content": """You are a helpful chatbot running in a corporate Slack workspace. Respond with accurate, 
     informative, and concise answers that are formatted appropriately for Slack, including markdown and special characters for bullet points, 
     bold, italics, and code blocks as necessary. Always consider Slack formatting conventions in all messages within a conversation.
     Here are some examples of common Slack markdown syntax. Replace ChatGPT Markdown with Slack markdown when necessary:
@@ -191,8 +191,8 @@ def process_and_respond(event, say):
                 "processing": False,
                 "history_reloaded": False,
             }
-        print(f"Initialized threads: {list(gpt_Bot.conversations.keys())}\n")  # Debug
-        print(f"Initialized conversation: {gpt_Bot.conversations}\n")  # Debug
+        # print(f"Initialized threads: {list(gpt_Bot.conversations.keys())}\n")  # Debug
+        # print(f"Initialized conversation: {gpt_Bot.conversations}\n")  # Debug
         
             
     # Remove the userID from the message using regex pattern matching

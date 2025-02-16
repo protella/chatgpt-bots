@@ -69,7 +69,7 @@ def download_and_encode_file(say, file_url, bot_token):
 
 def handle_error(say, error, thread_ts=None):
     say(
-        f":no_entry: `Sorry, I ran into an error. The raw error details are as follows:` :no_entry:\n```{error}```",
+        f":no_entry: `An error occurred. Error details:` :no_entry:\n```{error}```",
         thread_ts=thread_ts,
     )
 
