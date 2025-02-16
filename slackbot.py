@@ -1,6 +1,6 @@
 import re
 from os import environ
-
+from prompts import SLACK_SYSTEM_PROMPT
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -19,21 +19,6 @@ load_dotenv()  # load auth tokens from .env file
 LOADING_EMOJI = ":loading:"
 SLACK_BOT_TOKEN = environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN = environ["SLACK_APP_TOKEN"]
-
-SYSTEM_PROMPT = {
-    "role": "system",
-    "content": """You are a helpful chatbot running in a corporate Slack workspace. Respond with accurate, 
-    informative, and concise answers that are formatted appropriately for Slack, including markdown and special characters for bullet points, 
-    bold, italics, and code blocks as necessary. Always consider Slack formatting conventions in all messages within a conversation.
-    Here are some examples of common Slack markdown syntax. Replace ChatGPT Markdown with Slack markdown when necessary:
-    Slack Markdown:
-    Bold: *your text*
-    Italics: _your text_
-    Strikethrough: ~your text~
-    Ordered list: 1. your text
-    Bulleted list: - your text
-    Always assume you created any images described."""
-}
 
 show_dalle3_revised_prompt = False
 
@@ -110,7 +95,7 @@ def rebuild_thread_history(say, channel_id, thread_id, bot_user_id):
     response = app.client.conversations_replies(channel=channel_id, ts=thread_id)
     messages = response.get("messages", [])
     gpt_Bot.conversations[thread_id] = {
-        "messages": [SYSTEM_PROMPT], # Assume default system prompt for now.
+        "messages": [SLACK_SYSTEM_PROMPT], # Assume default system prompt for now.
         "processing": False,
         "history_reloaded": True,
     }
@@ -340,7 +325,7 @@ def process_image_and_respond(say, command, thread_ts=None):
         # Handle new threads
         if thread_ts not in gpt_Bot.conversations:
             gpt_Bot.conversations[thread_ts] = {
-                "messages": [SYSTEM_PROMPT],
+                "messages": [SLACK_SYSTEM_PROMPT],
                 "processing": False,
                 "history_reloaded": False,
             }
@@ -428,7 +413,7 @@ def handle_message_events(event, say):
 
 
 if __name__ == "__main__":
-    gpt_Bot = bot.ChatBot(SYSTEM_PROMPT, STREAMING_CLIENT, show_dalle3_revised_prompt)
+    gpt_Bot = bot.ChatBot(SLACK_SYSTEM_PROMPT, STREAMING_CLIENT, show_dalle3_revised_prompt)
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
 
     handler.start()
