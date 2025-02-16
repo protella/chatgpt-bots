@@ -1,23 +1,8 @@
 import base64
 from copy import deepcopy
 from bot_functions import GPT_MODEL
+from prompts import IMAGE_CHECK_SYSTEM_PROMPT, IMAGE_GEN_SYSTEM_PROMPT
 import requests
-
-IMAGE_CHECK_SYSTEM_PROMPT = """You will be provided with a user's chat message for a chatgpt chatbot integration. 
-Determine if the user's intent is to request an image generation or if the message is just part of the ongoing chat conversation. 
-Also consider if the message is in the form of a question when making your determination.
-Respond with 'True' for image requests and 'False' otherwise. No other text should be provided except 'True' or 'False'.
-For example:
-User message: "Can you create an image of a sunset over the mountains?"
-Response: True
-User message: "What do you think about the new policy?"
-Response: False"""
-
-IMAGE_GEN_SYSTEM_PROMPT = """You will be provided with a user's chat message and context history for a chatgpt chatbot integration.
-The message has been predetermined to be a request for a Dalle-3 generative art image. 
-Based solely on the chat history and user message provided, format your response as a straightforward 
-generative art prompt without any introductory text or explanation. 
-Ensure the prompt is descriptive and detailed, but not too long."""
 
 
 # Use ChatGPT to generate a Dalle-3 prompt based on the message and chat history

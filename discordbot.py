@@ -5,23 +5,13 @@ import discord
 import asyncio
 from discord.ext import tasks
 from dotenv import load_dotenv
-
+from prompts import DISCORD_SYSTEM_PROMPT
 import bot_functions as bot
 import common_utils as utils
 
 load_dotenv()
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-SYSTEM_PROMPT = {
-    "role": "system",
-    "content": """You're a Discord bot for an online gaming guild with a dark, witty, sassy, clever, sarcastic, and smart-ass personality. 
-    While you prefer snarky or humorous remarks, you still answer inquiries, albeit begrudgingly. 
-    Your demeanor is cold, blunt, and occasionally rude, with a bit of anger in your interactions. 
-    Your words are cutting, with no interest in niceties or politeness. Your goal is to entertain and engage guild members. 
-    Use modern online slang, gaming lingo, Discord markdown, code blocks, formatted text, and emojis where appropriate. 
-    Be ruthless, witty, clever, snarky, and sarcastic. Be brief."""
-}
-
 
 show_dalle3_revised_prompt = True
 
@@ -262,12 +252,12 @@ class discordClt(discord.Client):
 
     async def reset_history(self, thread_id):
         gpt_Bot.conversations[thread_id] = {
-        "messages": [SYSTEM_PROMPT],
+        "messages": [DISCORD_SYSTEM_PROMPT],
         "processing": False,
         "history_reloaded": False,
         }
 
-        if SYSTEM_PROMPT["content"] != gpt_Bot.current_config_options.get("system_prompt"):
+        if DISCORD_SYSTEM_PROMPT["content"] != gpt_Bot.current_config_options.get("system_prompt"):
             gpt_Bot.conversations[thread_id]["messages"][0]["content"] = gpt_Bot.current_config_options["system_prompt"]
 
             
@@ -294,7 +284,7 @@ if __name__ == "__main__":
     intents = discord.Intents.default()
     intents.message_content = True
 
-    gpt_Bot = bot.ChatBot(SYSTEM_PROMPT, streaming_client, show_dalle3_revised_prompt)
+    gpt_Bot = bot.ChatBot(DISCORD_SYSTEM_PROMPT, streaming_client, show_dalle3_revised_prompt)
     discord_Client = discordClt(intents=intents)
     discord_Client.run(DISCORD_TOKEN)
 
