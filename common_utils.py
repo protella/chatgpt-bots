@@ -33,7 +33,7 @@ def check_for_image_generation(message, gpt_Bot, thread_id):
     chat_history[0]['content'] = IMAGE_CHECK_SYSTEM_PROMPT
 
     # set temperature to 0.0 to be fully deterministic and reduce randomness for chance of non True/False response. Low Max tokens helps force T/F Response
-    is_image_request = gpt_Bot.get_gpt_response(chat_history, GPT_MODEL, temperature = 0.0, max_tokens=5)
+    is_image_request = gpt_Bot.get_gpt_response(chat_history, GPT_MODEL, temperature = 0.0, max_completion_tokens=5)
     
     gpt_Bot.conversations[thread_id]["processing"] = False
     # print(f'\nImage Request Check: {is_image_request.content}\n')
