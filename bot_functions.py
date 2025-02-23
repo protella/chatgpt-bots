@@ -24,7 +24,7 @@ class ChatBot:
         self.config_option_defaults = {
             "temperature": 1,  # 0.0 - 2.0
             "top_p": 1,
-            "max_tokens": 2048,  # max 4096
+            "max_completion_tokens": 2048,  # max 4096
             "custom_init": "",
             "gpt_model": GPT_MODEL,
             "dalle_model": DALLE_MODEL,
@@ -188,18 +188,18 @@ class ChatBot:
             print(f"##################\n{e}\n##################")
             return None, e
 
-    def get_gpt_response(self, messages_history, model, temperature=None, max_tokens=None):
+    def get_gpt_response(self, messages_history, model, temperature=None, max_completion_tokens=None):
         if temperature is None:
             temperature = self.current_config_options["temperature"]
-        if max_tokens is None:
-            max_tokens = self.current_config_options["max_tokens"]
+        if max_completion_tokens is None:
+            max_completion_tokens = self.current_config_options["max_completion_tokens"]
         try:
             response = self.client.chat.completions.create(
                 model=model,
                 messages=messages_history,
                 stream=self.streaming_client,
                 temperature=float(temperature),
-                max_tokens=int(max_tokens),
+                max_completion_tokens=int(max_completion_tokens),
                 top_p=float(self.current_config_options["top_p"]),
             )
             self.usage = response.usage
@@ -317,7 +317,7 @@ Total Tokens: {self.usage.total_tokens}"""
     !config [option] [value] - Sets one of the options seen in '!config' to a custom value. Beware of the model's ranges for these values.
     --see https://platform.openai.com/docs/api-reference for more info.
     !history - Prints a json dump of the chat history since last reset.
-    !reset config - Sets the config options back to defaults, e.g., temperature, max_tokens, etc.
+    !reset config - Sets the config options back to defaults, e.g., temperature, max_completion_tokens, etc.
     !reset history - Command deprecated. Start a new thread with the bot for a fresh conversation.
     !usage - Prints token usage stats since the last reset."""
 
