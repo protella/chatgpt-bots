@@ -19,6 +19,7 @@ load_dotenv()  # load auth tokens from .env file
 LOADING_EMOJI = ":loading:"
 SLACK_BOT_TOKEN = environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN = environ["SLACK_APP_TOKEN"]
+DALLE3_CMD = environ["DALLE3_CMD"]
 
 show_dalle3_revised_prompt = False
 
@@ -313,7 +314,7 @@ def process_image_and_respond(say, command, thread_ts=None):
             )
             return
 
-        if cmd == "/dalle-3":
+        if cmd == DALLE3_CMD:
             response = app.client.chat_postMessage(
                 channel=channel,
                 text=f"<@{user_id}> used `{cmd}`.\n*Original Prompt:*\n_{text}_",
@@ -389,7 +390,7 @@ def remove_userid(message_text):
     
 
 # Slack event handlers
-@app.command("/dalle-3")
+@app.command(DALLE3_CMD)
 def handle_dalle3(ack, say, command):
     ack()
     process_image_and_respond(say, command)
