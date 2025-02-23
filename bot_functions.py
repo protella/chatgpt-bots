@@ -22,7 +22,7 @@ class ChatBot:
         self.streaming_client = streaming_client  # ToDo: Implement streaming support
         self.usage = {}
         self.config_option_defaults = {
-            "temperature": 1,  # 0.0 - 2.0
+            "temperature": .8,  # 0.0 - 2.0
             "top_p": 1,
             "max_completion_tokens": 2048,  # max 4096
             "custom_init": "",

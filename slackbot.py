@@ -4,6 +4,7 @@ from prompts import SLACK_SYSTEM_PROMPT
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+from markdown_to_mrkdwn import SlackMarkdownConverter
 
 import bot_functions as bot
 import common_utils as utils
@@ -14,6 +15,7 @@ import common_utils as utils
 # import io
 
 load_dotenv()  # load auth tokens from .env file
+mrkdown_converter = SlackMarkdownConverter()
 
 ### Modify these values as needed. Note the tokens should be put in the .env file. See README. ###
 LOADING_EMOJI = ":loading:"
@@ -262,8 +264,9 @@ def process_and_respond(event, say):
                     utils.handle_error(say, response, thread_ts=thread_ts)
 
                 else:
+                    converted_text = mrkdown_converter.convert(response)
+                    response = re.sub(r'\s+,', ',', converted_text) # Remove extra spaces before commas
                     say(response, thread_ts=thread_ts)
-                    # print(utils.format_message_for_debug(gpt_Bot.conversations[thread_ts]))
 
             elif other_files:
                 say(
@@ -276,15 +279,14 @@ def process_and_respond(event, say):
 
         # If just a normal text message, process with default chat context manager
         else:
-            # print(utils.format_message_for_debug(gpt_Bot.conversations[thread_ts]))
             response, is_error = gpt_Bot.chat_context_mgr(message_text, thread_ts)
             if is_error:
                 utils.handle_error(say, response)
 
             else:
-                response = response.replace('**', '*') # It just won't learn Slack Markdown. Force Bold fix.
+                converted_text = mrkdown_converter.convert(response)
+                response = re.sub(r'\s+,', ',', converted_text) # Remove extra spaces before commas
                 say(text=response, thread_ts=thread_ts)
-                # print(utils.format_message_for_debug(gpt_Bot.conversations[thread_ts]))
 
             # Cleanup busy/loading chat msgs
             delete_chat_messages(channel_id, chat_del_ts, say)
