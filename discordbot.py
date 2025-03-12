@@ -11,7 +11,7 @@ import common_utils as utils
 
 load_dotenv()
 
-DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 
 show_dalle3_revised_prompt = True
 
