@@ -37,7 +37,7 @@ class ChatBot:
             "system_prompt": self.SYSTEM_PROMPT["content"] # content of system prompt
         }
         self.current_config_options = self.config_option_defaults.copy()
-        self.client = OpenAI(api_key=os.environ["OPENAI_KEY"])
+        self.client = OpenAI(api_key=os.environ.get("OPENAI_KEY"))
         
     def chat_context_mgr(self, message_text, thread_id, files=""):
         self.conversations[thread_id]["processing"] = True

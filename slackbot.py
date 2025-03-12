@@ -19,12 +19,9 @@ mrkdown_converter = SlackMarkdownConverter()
 
 ### Modify these values as needed. Note the tokens should be put in the .env file. See README. ###
 LOADING_EMOJI = ":loading:"
-SLACK_BOT_TOKEN = environ["SLACK_BOT_TOKEN"]
-SLACK_APP_TOKEN = environ["SLACK_APP_TOKEN"]
-DALLE3_CMD = environ["DALLE3_CMD"]
-
-if DALLE3_CMD == "":
-    DALLE3_CMD = "/dalle-3"
+SLACK_BOT_TOKEN = environ.get("SLACK_BOT_TOKEN")
+SLACK_APP_TOKEN = environ.get("SLACK_APP_TOKEN")
+DALLE3_CMD = environ.get("DALLE3_CMD", "/dalle-3")
 
 show_dalle3_revised_prompt = False
 

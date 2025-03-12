@@ -1,12 +1,9 @@
 import re
 import signal
-from textwrap import dedent
 from prompts import CLI_SYSTEM_PROMPT
 import bot_functions
 
 BOT_NAME = "Jarvis"
-
-
 
 streaming_client = False  # Not yet implemented.
 
