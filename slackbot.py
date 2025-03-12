@@ -23,6 +23,9 @@ SLACK_BOT_TOKEN = environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN = environ["SLACK_APP_TOKEN"]
 DALLE3_CMD = environ["DALLE3_CMD"]
 
+if DALLE3_CMD == "":
+    DALLE3_CMD = "/dalle-3"
+
 show_dalle3_revised_prompt = False
 
 #
