@@ -15,12 +15,29 @@ DALLE_MODEL = "dall-e-3"
 
 
 class ChatBot:
+    """
+    A class that handles interactions with OpenAI's API for chat completions and image generation.
+    
+    This class manages conversations with OpenAI's GPT models and DALL-E models,
+    handling message history, configuration options, and API responses.
+    """
+    
     def __init__(self, SYSTEM_PROMPT, streaming_client=False, show_dalle3_revised_prompt=False):
+        """
+        Initialize a new ChatBot instance.
+        
+        Args:
+            SYSTEM_PROMPT (dict): The system prompt to use for conversations.
+            streaming_client (bool, optional): Whether to use streaming for responses. Defaults to False.
+            show_dalle3_revised_prompt (bool, optional): Whether to show DALL-E 3's revised prompts. Defaults to False.
+        """
         self.SYSTEM_PROMPT = SYSTEM_PROMPT
         self.conversations = {}
         self.show_dalle3_revised_prompt = show_dalle3_revised_prompt
         self.streaming_client = streaming_client  # ToDo: Implement streaming support
         self.usage = {}
+        
+        # Default configuration options
         self.config_option_defaults = {
             "temperature": .8,  # 0.0 - 2.0
             "top_p": 1,
@@ -40,18 +57,33 @@ class ChatBot:
         self.client = OpenAI(api_key=os.environ.get("OPENAI_KEY"))
         
     def chat_context_mgr(self, message_text, thread_id, files=""):
+        """
+        Manage the context for a chat conversation.
+        
+        Args:
+            message_text (str): The message text from the user.
+            thread_id (str): The ID of the thread/conversation.
+            files (str, optional): Any files attached to the message. Defaults to "".
+            
+        Returns:
+            tuple: (response_content, is_error) where response_content is the GPT response
+                  and is_error is a boolean indicating if an error occurred.
+        """
         self.conversations[thread_id]["processing"] = True
 
+        # Add user message to conversation history
         self.conversations[thread_id]["messages"].append(
                 {"role": "user", "content": [{"type": "text", "text": message_text}]}
             )
 
+        # Get response from GPT
         gpt_output = self.get_gpt_response(
             self.conversations[thread_id]["messages"],
             self.current_config_options["gpt_model"],
         )
         self.conversations[thread_id]["processing"] = False
 
+        # Process the response
         if hasattr(gpt_output, "role"):
             is_error = False
             if gpt_output.role == "assistant":
@@ -63,14 +95,26 @@ class ChatBot:
                 )
             return gpt_output.content, is_error
         else:
+            # Handle error case
             is_error = True
-            self.conversations[thread_id]["messages"].pop()
-
+            self.conversations[thread_id]["messages"].pop()  # Remove the user message on error
             return gpt_output, is_error
 
     def image_context_mgr(self, message_text, thread_id):
+        """
+        Manage the context for an image generation conversation.
+        
+        Args:
+            message_text (str): The prompt for image generation.
+            thread_id (str): The ID of the thread/conversation.
+            
+        Returns:
+            tuple: (image, revised_prompt, is_error) where image is the generated image,
+                  revised_prompt is DALL-E's revised prompt, and is_error indicates if an error occurred.
+        """
         self.conversations[thread_id]["processing"] = True
 
+        # Add user message to conversation history
         self.conversations[thread_id]["messages"].append(
             {
                 "role": "user",
@@ -83,11 +127,12 @@ class ChatBot:
             }
         )
 
+        # Generate image with DALL-E
         image, revised_prompt = self.get_dalle_response(
             message_text, self.current_config_options["dalle_model"]
         )
 
-
+        # Process the response
         if revised_prompt:
             is_error = False
             self.conversations[thread_id]["messages"].append(
@@ -103,10 +148,9 @@ class ChatBot:
                     ],
                 }
             )
-
         else:
             is_error = True
-            self.conversations[thread_id]["messages"].pop()
+            self.conversations[thread_id]["messages"].pop()  # Remove the user message on error
             image = None
             revised_prompt = None
 
@@ -115,9 +159,21 @@ class ChatBot:
         return image, revised_prompt, is_error
 
     def vision_context_mgr(self, message_text, images, thread_id):
-
+        """
+        Manage the context for a vision-based conversation.
+        
+        Args:
+            message_text (str): The message text from the user.
+            images (list): List of base64-encoded images.
+            thread_id (str): The ID of the thread/conversation.
+            
+        Returns:
+            tuple: (response_content, is_error) where response_content is the GPT response
+                  and is_error is a boolean indicating if an error occurred.
+        """
         self.conversations[thread_id]["processing"] = True
 
+        # Prepare the multipart message with text and images
         if not message_text:
             message_text = ""
         multi_part_msg = {
@@ -125,6 +181,7 @@ class ChatBot:
             "content": [{"type": "text", "text": f"{message_text}"}],
         }
 
+        # Add each image to the message
         for image in images:
             new_image_element = {
                 "type": "image_url",
@@ -135,8 +192,10 @@ class ChatBot:
             }
             multi_part_msg["content"].append(new_image_element)
 
+        # Add the multipart message to conversation history
         self.conversations[thread_id]["messages"].append(multi_part_msg)
 
+        # Get response from GPT
         gpt_output = self.get_gpt_response(
             self.conversations[thread_id]["messages"],
             self.current_config_options["gpt_model"],
@@ -144,6 +203,7 @@ class ChatBot:
 
         self.conversations[thread_id]["processing"] = False
 
+        # Process the response
         if hasattr(gpt_output, "role"):
             is_error = False
             if gpt_output.role == "assistant":
@@ -153,15 +213,27 @@ class ChatBot:
                         "content": [{"type": "text", "text": gpt_output.content}],
                     }
                 )
-
             return gpt_output.content, is_error
         else:
+            # Handle error case
             is_error = True
-            self.conversations[thread_id]["messages"].pop()
+            self.conversations[thread_id]["messages"].pop()  # Remove the user message on error
             return gpt_output, is_error
 
     def get_dalle_response(self, image_prompt, model):
+        """
+        Generate an image using DALL-E.
+        
+        Args:
+            image_prompt (str): The prompt for image generation.
+            model (str): The DALL-E model to use.
+            
+        Returns:
+            tuple: (image, revised_prompt) where image is the generated image
+                  and revised_prompt is DALL-E's revised prompt.
+        """
         try:
+            # Call the OpenAI API to generate an image
             response = self.client.images.generate(
                 model=model,
                 prompt=image_prompt,
@@ -172,16 +244,16 @@ class ChatBot:
                 response_format="b64_json",
             )
 
+            # Process the response
             image_binary = base64.b64decode(response.data[0].b64_json)
             image_object = BytesIO(image_binary)
             revised_prompt = response.data[0].revised_prompt
+            
             # Convert from webP format to PNG
             with Image.open(image_object) as webp_image:
                 png_image = BytesIO()
-
                 webp_image.save(png_image, "PNG")
                 png_image.seek(0)
-
                 return png_image, revised_prompt
 
         except Exception as e:
@@ -189,11 +261,28 @@ class ChatBot:
             return None, e
 
     def get_gpt_response(self, messages_history, model, temperature=None, max_completion_tokens=None):
+        """
+        Get a response from GPT.
+        
+        Args:
+            messages_history (list): The conversation history.
+            model (str): The GPT model to use.
+            temperature (float, optional): The temperature for response generation. 
+                                          Defaults to the current config value.
+            max_completion_tokens (int, optional): The maximum number of tokens for completion.
+                                                 Defaults to the current config value.
+            
+        Returns:
+            object: The GPT response or an error.
+        """
+        # Use default values from config if not specified
         if temperature is None:
             temperature = self.current_config_options["temperature"]
         if max_completion_tokens is None:
             max_completion_tokens = self.current_config_options["max_completion_tokens"]
+            
         try:
+            # Call the OpenAI API for chat completion
             response = self.client.chat.completions.create(
                 model=model,
                 messages=messages_history,
@@ -210,20 +299,42 @@ class ChatBot:
             return e
 
     def is_processing(self, thread_id):
-        # Check if a specific thread is currently processing.
+        """
+        Check if a specific thread is currently processing.
+        
+        Args:
+            thread_id (str): The ID of the thread/conversation.
+            
+        Returns:
+            bool: True if the thread is processing, False otherwise.
+        """
         return self.conversations.get(thread_id, {}).get("processing", False)
 
-    def usage_command(self):  # Fix this later to aggregate all thread usage
+    def usage_command(self):
+        """
+        Get the token usage statistics.
+        
+        Returns:
+            str: A string representation of the token usage statistics.
+        """
         if self.usage:
             return f"""Cumulative Token stats since last reset:
 Prompt Tokens: {self.usage.prompt_tokens}
 Completion Tokens: {self.usage.completion_tokens}
 Total Tokens: {self.usage.total_tokens}"""
-
         else:
             return "No usage info yet. Ask the bot something and check again."
 
     def history_command(self, thread_id):
+        """
+        Get the conversation history for a thread.
+        
+        Args:
+            thread_id (str): The ID of the thread/conversation.
+            
+        Returns:
+            str: A string representation of the conversation history.
+        """
         if not thread_id:
             return "!history can only be run inside of a thread."
 
@@ -260,28 +371,52 @@ Total Tokens: {self.usage.total_tokens}"""
         
     # To-Do, move all config options into threads. 
     def set_config(self, setting, value, thread_id=None):
+        """
+        Set a configuration option.
+        
+        Args:
+            setting (str): The configuration option to set.
+            value (any): The value to set the configuration option to.
+            thread_id (str, optional): The ID of the thread/conversation. Defaults to None.
+            
+        Returns:
+            str: A message indicating the result of the operation.
+        """
         if thread_id is None:
             return "Adjust configuration options inside threads."
+            
         if setting in self.current_config_options:
+            # Convert string "true"/"false" to boolean
             if isinstance(value, str) and value.lower() in ["true", "false"]:
                 value = value.lower() == "true"
             
+            # Special handling for system_prompt
             if setting.lower() == "system_prompt":
                 if thread_id in self.conversations and "messages" in self.conversations[thread_id] and self.conversations[thread_id]["messages"]:
-                    print(f"Updating system_prompt for thread {thread_id} to {value}")  # Debug
-                    print(f"Before update: {self.conversations[thread_id]['messages'][0]['content']}")  # Debug
+                    # print(f"Updating system_prompt for thread {thread_id} to {value}")  # Debug
+                    # print(f"Before update: {self.conversations[thread_id]['messages'][0]['content']}")  # Debug
                     self.conversations[thread_id]["messages"][0]["content"] = value
-                    print(f"After update: {self.conversations[thread_id]['messages'][0]['content']}")  # Debug
+                    # print(f"After update: {self.conversations[thread_id]['messages'][0]['content']}")  # Debug
                     return f"Updated config setting \"{setting}\" to \"{value}\" for this channel/thread."
                 else:
                     return f"Thread {thread_id} is not properly initialized."
             else:
+                # Update the configuration option
                 self.current_config_options[setting] = value
                 return f"Updated config setting \"{setting}\" to \"{value}\""
+                
         return f"Unknown setting: {setting}"
 
-    # For now, pull system prompt from thread if it's been changed.
     def view_config(self, thread_id=None):
+        """
+        View the current configuration options.
+        
+        Args:
+            thread_id (str, optional): The ID of the thread/conversation. Defaults to None.
+            
+        Returns:
+            str: A string representation of the current configuration options.
+        """
         if thread_id is not None and thread_id in self.conversations:
             if "messages" in self.conversations[thread_id] and self.conversations[thread_id]["messages"]:
                 system_prompt_from_thread = self.conversations[thread_id]["messages"][0]["content"]
@@ -304,6 +439,15 @@ Total Tokens: {self.usage.total_tokens}"""
         return "\n".join(f"{setting}: {value}" for setting, value in self.current_config_options.items())
 
     def reset_config(self, thread_id):
+        """
+        Reset the configuration options to defaults.
+        
+        Args:
+            thread_id (str): The ID of the thread/conversation.
+            
+        Returns:
+            str: A message indicating the result of the operation.
+        """
         self.current_config_options = self.config_option_defaults.copy()
         self.conversations[thread_id]["messages"][0]["content"] = self.current_config_options["system_prompt"]
 
@@ -311,16 +455,29 @@ Total Tokens: {self.usage.total_tokens}"""
 
     @staticmethod
     def help_command():
-        return """!help - This help.
+        """
+        Get help information about available commands.
+        
+        Returns:
+            str: A string containing help information.
+        """
+        return """
+    !help - This help.
     /dalle-3 {prompt} generate an image via text with Dalle-3. (Slack Only)
     !config - Displays the current configuration values. For now, these are global settings for everyone.
     !config [option] [value] - Sets one of the options seen in '!config' to a custom value. Beware of the model's ranges for these values.
     --see https://platform.openai.com/docs/api-reference for more info.
     !history - Prints a json dump of the chat history since last reset.
     !reset config - Sets the config options back to defaults, e.g., temperature, max_completion_tokens, etc.
-    !reset history - Command deprecated. Start a new thread with the bot for a fresh conversation.
+    !reset history - Resets conversation history. Command deprecated in Slack. Start a new thread in Slack.
     !usage - Prints token usage stats since the last reset."""
 
     @staticmethod
     def handle_busy():
+        """
+        Get a message indicating the bot is busy.
+        
+        Returns:
+            str: A message indicating the bot is busy.
+        """
         return "I'm busy processing a previous request, please wait a moment and try again."
