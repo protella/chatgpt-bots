@@ -426,10 +426,8 @@ class ChatBot:
             # Special handling for system_prompt
             if setting.lower() == "system_prompt":
                 if thread_id in self.conversations and "messages" in self.conversations[thread_id] and self.conversations[thread_id]["messages"]:
-                    # print(f"Updating system_prompt for thread {thread_id} to {value}")  # Debug
-                    # print(f"Before update: {self.conversations[thread_id]['messages'][0]['content']}")  # Debug
                     self.conversations[thread_id]["messages"][0]["content"] = value
-                    # print(f"After update: {self.conversations[thread_id]['messages'][0]['content']}")  # Debug
+
                     return f"Updated config setting \"{setting}\" to \"{value}\" for this channel/thread."
                 else:
                     return f"Thread {thread_id} is not properly initialized."
