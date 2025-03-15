@@ -38,13 +38,13 @@ def cli_chat():
     and displays the bot's response.
     """
     try:
-        user_input = input("Me: ").lower()
+        user_input = input("Me: ")
     except EOFError:
         print("\nCtrl-D detected, Exiting...")
         exit(0)
 
     # Process commands
-    match user_input:
+    match user_input.lower():
         case "!quit" | "!exit":
             print("Bye!")
             exit(0)
@@ -64,8 +64,8 @@ def cli_chat():
 
         case _:
             # Check for config and reset commands
-            config_match_obj = re.match(config_pattern, user_input)
-            reset_match_obj = re.match(reset_pattern, user_input)
+            config_match_obj = re.match(config_pattern, user_input.lower())
+            reset_match_obj = re.match(reset_pattern, user_input.lower())
             
             if config_match_obj:
                 setting, value = config_match_obj.groups()
@@ -79,7 +79,6 @@ def cli_chat():
                     # Reset the conversation history
                     gpt_Bot.conversations[thread_id] = {
                         "messages": [CLI_SYSTEM_PROMPT],
-                        "processing": False,
                         "history_reloaded": True,
                     }
                     print("Chat History cleared.")
@@ -94,6 +93,7 @@ def cli_chat():
 
             else:
                 # Process normal chat message
+                print(f"{BOT_NAME}: Thinking...")
                 response, is_error = gpt_Bot.chat_context_mgr(
                     user_input,
                     thread_id,
@@ -106,7 +106,10 @@ def cli_chat():
                     print(f"{BOT_NAME}: {response}")
 
 
-if __name__ == "__main__":
+def main():
+    """
+    Main function to run the CLI chat bot.
+    """
     # Initialize the ChatBot
     api_key = os.environ.get("OPENAI_KEY")
     if not api_key:
@@ -116,12 +119,12 @@ if __name__ == "__main__":
         print("You can get an API key from: https://platform.openai.com/api-keys")
         exit(1)
     
+    global gpt_Bot
     gpt_Bot = bot_functions.ChatBot(CLI_SYSTEM_PROMPT, streaming_client)
     
     # Initialize conversation
     gpt_Bot.conversations[thread_id] = {
         "messages": [CLI_SYSTEM_PROMPT],
-        "processing": False,
         "history_reloaded": True,
     }   
 
@@ -132,3 +135,8 @@ if __name__ == "__main__":
     
     while True:
         cli_chat()
+
+
+if __name__ == "__main__":
+    # Run the main function
+    main()
