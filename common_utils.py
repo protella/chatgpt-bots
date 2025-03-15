@@ -1,8 +1,35 @@
 import base64
+import os
 from copy import deepcopy
 from bot_functions import GPT_MODEL
 from prompts import IMAGE_CHECK_SYSTEM_PROMPT, IMAGE_GEN_SYSTEM_PROMPT
 import requests
+from dataclasses import dataclass
+from dotenv import load_dotenv
+from logger import setup_logger, get_log_level, get_logger
+
+# Unset any existing log level environment variables to ensure .env values are used
+if "UTILS_LOG_LEVEL" in os.environ:
+    del os.environ["UTILS_LOG_LEVEL"]
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging level from environment variable with fallback to INFO
+LOG_LEVEL_NAME = os.environ.get("UTILS_LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = get_log_level(LOG_LEVEL_NAME)
+# Initialize logger with the configured log level
+logger = get_logger('common_utils', LOG_LEVEL)
+
+@dataclass
+class Prompt:
+    """
+    A class to represent a prompt for OpenAI's API.
+    
+    Attributes:
+        content (str): The content of the prompt.
+    """
+    content: str
 
 
 def create_dalle3_prompt(message, gpt_Bot, thread_id):
@@ -21,10 +48,25 @@ def create_dalle3_prompt(message, gpt_Bot, thread_id):
     Returns:
         object: The GPT response containing the DALL-E 3 prompt.
     """
-    gpt_Bot.conversations[thread_id]["processing"] = True
+    logger.info(f"Creating DALL-E 3 prompt from history for thread {thread_id}")
     
     # Create a deep copy of the conversation history to avoid modifying the original
     chat_history = deepcopy(gpt_Bot.conversations[thread_id]["messages"])
+    
+    # Replace base64 encoded images with descriptive placeholders to improve performance
+    # while maintaining context about the images
+    for message_obj in chat_history:
+        if "content" in message_obj and isinstance(message_obj["content"], list):
+            for i, content_item in enumerate(message_obj["content"]):
+                if (isinstance(content_item, dict) and 
+                    content_item.get("type") == "image_url" and 
+                    "image_url" in content_item):
+                    # For DALL-E 3 prompt generation, we want to preserve the context that an image was shown
+                    # So we use a more descriptive placeholder than in the image check function
+                    message_obj["content"][i] = {
+                        "type": "text",
+                        "text": "[An image was shared in the conversation]"
+                    }
     
     # Add the user's message to the chat history
     chat_history.append(
@@ -36,42 +78,63 @@ def create_dalle3_prompt(message, gpt_Bot, thread_id):
     
     # Get a response from GPT to use as a DALL-E 3 prompt
     dalle3_prompt = gpt_Bot.get_gpt_response(chat_history, GPT_MODEL)
-    
-    # For debugging
-    # print(f'\nDalle-3 Prompt: {dalle3_prompt.content}\n')
 
-    gpt_Bot.conversations[thread_id]["processing"] = False
     return dalle3_prompt
 
 
 def check_for_image_generation(message, gpt_Bot, thread_id):
     """
-    Use GPT-4 to check if the user is requesting an image generation.
-    
-    This function creates a copy of the conversation history, adds the user's message,
-    changes the system prompt to the image check prompt, and gets a response from GPT
-    that indicates whether the user is requesting an image generation.
+    Check if a message is requesting image generation.
     
     Args:
-        message (str): The user's message.
+        message (str): The message to check.
         gpt_Bot (ChatBot): The ChatBot instance.
         thread_id (str): The ID of the thread/conversation.
         
     Returns:
         bool: True if the user is requesting an image generation, False otherwise.
     """
-    gpt_Bot.conversations[thread_id]["processing"] = True
+    logger.info(f"Checking if message is requesting image generation: {message[:50]}...")
     
     # Create a deep copy of the conversation history to avoid modifying the original
     chat_history = deepcopy(gpt_Bot.conversations[thread_id]["messages"])
+    
+    # Log the original system prompt for debugging
+    original_system_prompt = chat_history[0]['content']
+    logger.debug(f"Original system prompt: {original_system_prompt[:100]}...")
+    
+    # Log the conversation history length for debugging
+    history_length = len(chat_history)
+    logger.debug(f"Conversation history length: {history_length}")
+    
+    # Replace base64 encoded images with placeholders to improve performance
+    for message_obj in chat_history:
+        if "content" in message_obj and isinstance(message_obj["content"], list):
+            for i, content_item in enumerate(message_obj["content"]):
+                if (isinstance(content_item, dict) and 
+                    content_item.get("type") == "image_url" and 
+                    "image_url" in content_item):
+                    # Replace with a simple placeholder
+                    message_obj["content"][i] = {
+                        "type": "text",
+                        "text": "[Image content not included for performance]"
+                    }
     
     # Add the user's message to the chat history
     chat_history.append(
         {"role": "user", "content": [{"type": "text", "text": message}]}
     )
     
+    # Add a final explicit instruction message to ensure True/False response
+    chat_history.append(
+        {"role": "user", "content": [{"type": "text", "text": "Based on my last message, am I requesting an image generation? Answer with ONLY the word 'True' or 'False'."}]}
+    )
+    
     # Change the system prompt to the image check prompt
     chat_history[0]['content'] = IMAGE_CHECK_SYSTEM_PROMPT
+    
+    # Log the modified system prompt for debugging
+    logger.debug(f"Image check system prompt: {IMAGE_CHECK_SYSTEM_PROMPT[:100]}...")
 
     # Set temperature to 0.0 to be fully deterministic and reduce randomness
     # Low max tokens helps force True/False response
@@ -79,16 +142,31 @@ def check_for_image_generation(message, gpt_Bot, thread_id):
         chat_history, 
         GPT_MODEL, 
         temperature=0.0, 
-        max_completion_tokens=5
+        max_completion_tokens=10  # Increased from 5 to 10 to ensure we get the full response
     )
     
-    gpt_Bot.conversations[thread_id]["processing"] = False
+    # Log the full response for debugging
+    logger.info(f"Image check response: '{is_image_request.content}'")
     
-    # For debugging
-    # print(f'\nImage Request Check: {is_image_request.content}\n')
+    # Check for keywords in the response that indicate an image request
+    response_text = is_image_request.content.strip().lower()
     
-    # Return True if the response is 'true', False otherwise
-    return is_image_request.content.strip().lower() == 'true'
+    # More robust checking for True/False responses
+    if response_text == 'true' or 'true' in response_text:
+        logger.info("Image check result: True (matched 'true')")
+        return True
+    elif 'image' in response_text and ('generat' in response_text or 'creat' in response_text):
+        logger.info("Image check result: True (matched image generation keywords)")
+        return True
+    elif 'picture' in response_text and ('generat' in response_text or 'creat' in response_text):
+        logger.info("Image check result: True (matched picture generation keywords)")
+        return True
+    elif 'dall' in response_text and 'e' in response_text:
+        logger.info("Image check result: True (matched DALL-E reference)")
+        return True
+    else:
+        logger.info("Image check result: False (no image generation intent detected)")
+        return False
 
 
 def download_and_encode_file(say, file_url, bot_token):
@@ -106,11 +184,15 @@ def download_and_encode_file(say, file_url, bot_token):
     Returns:
         str or None: The base64-encoded file content, or None if an error occurred.
     """
+    logger.info(f"Downloading and encoding file from {file_url}")
+    
     headers = {"Authorization": f"Bearer {bot_token}"}
     response = requests.get(file_url, headers=headers)
 
     if response.status_code == 200:
-        return base64.b64encode(response.content).decode("utf-8")
+        encoded_file = base64.b64encode(response.content).decode("utf-8")
+        logger.debug(f"Successfully encoded file (size: {len(encoded_file)} bytes)")
+        return encoded_file
     else:
         handle_error(say, response.status_code)
         return None
@@ -125,10 +207,15 @@ def handle_error(say, error, thread_ts=None):
         error (any): The error to handle.
         thread_ts (str, optional): The timestamp of the thread to reply to. Defaults to None.
     """
-    say(
-        f":no_entry: `An error occurred. Error details:` :no_entry:\n```{error}```",
-        thread_ts=thread_ts,
-    )
+    logger.error(f"Handling error: {error}")
+    
+    try:
+        say(
+            f":no_entry: `An error occurred. Error details:` :no_entry:\n```{error}```",
+            thread_ts=thread_ts,
+        )
+    except Exception as e:
+        logger.error(f"Error sending error message: {e}", exc_info=True)
 
 
 def format_message_for_debug(conversation_history):

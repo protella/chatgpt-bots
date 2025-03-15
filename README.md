@@ -72,6 +72,10 @@ DALLE3_CMD = '/dalle-3' # For Slack, the slash command you want to use to force 
 OPENAI_KEY = 'YOURTOKENHERE'
 DISCORD_TOKEN = 'YOURTOKENHERE'
 DISCORD_ALLOWED_CHANNEL_IDS = '1234567890, 1234567890' # Discord channel IDs that the bot is permitted to talk in.
+SLACK_LOG_LEVEL = "WARNING" # Optional: Set log level for Slack bot (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+DISCORD_LOG_LEVEL = "WARNING" # Optional: Set log level for Discord bot (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+BOT_LOG_LEVEL = "WARNING" # Optional: Set log level for bot functions (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+UTILS_LOG_LEVEL = "WARNING" # Optional: Set log level for utility functions (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 ```
 
 ### Configuration - Bot Prompt Tuning
