@@ -4,7 +4,6 @@ from copy import deepcopy
 from bot_functions import GPT_MODEL
 from prompts import IMAGE_CHECK_SYSTEM_PROMPT, IMAGE_GEN_SYSTEM_PROMPT
 import requests
-from dataclasses import dataclass
 from dotenv import load_dotenv
 from logger import setup_logger, get_log_level, get_logger
 
@@ -20,17 +19,6 @@ LOG_LEVEL_NAME = os.environ.get("UTILS_LOG_LEVEL", "INFO").upper()
 LOG_LEVEL = get_log_level(LOG_LEVEL_NAME)
 # Initialize logger with the configured log level
 logger = get_logger('common_utils', LOG_LEVEL)
-
-@dataclass
-class Prompt:
-    """
-    A class to represent a prompt for OpenAI's API.
-    
-    Attributes:
-        content (str): The content of the prompt.
-    """
-    content: str
-
 
 def create_dalle3_prompt(message, gpt_Bot, thread_id):
     """
