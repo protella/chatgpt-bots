@@ -2,7 +2,7 @@
 
 
 
-## [Unreleased] - AI Optimizations Branch
+## [0.1.0] - 2025-03-18 - AI Optimizations Release
 
 ### Added
 - New logging system (logger.py) with configurable log levels and rotating file handlers
@@ -17,6 +17,9 @@
 - Logs directory with .gitkeep to maintain directory structure
 - Signal handling for graceful exits in CLI bot
 - Proper environment variable checking in CLI bot
+- Integrated OpenAI Responses API for improved conversation context management
+  - Support for previous_response_id for maintaining conversation context
+  - Optimized token usage with new API
 
 ### Changed
 - Added comprehensive docstrings to all classes and methods across the codebase
@@ -29,6 +32,7 @@
 - Improved DALL-E 3 prompt generation with better parameter handling
 - Enhanced image generation detection with clearer code structure
 - Better formatting of help command output
+- Improved CLI bot response handling with detailed logging
 
 ### Fixed
 - More robust file attachment handling in Discord bot
@@ -36,6 +40,8 @@
 - Improved thread history rebuilding with better error handling
 - Enhanced message parsing with clearer code structure
 - Updated .gitignore to exclude log files but keep the logs directory structure
+- Fixed CLI bot conversation context to properly utilize the OpenAI Responses API
+- Fixed duplicate responses in CLI bot by properly implementing previous_response_id
 
 ### Developer Notes
 - The logging system can be configured through environment variables:
