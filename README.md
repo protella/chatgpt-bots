@@ -4,6 +4,10 @@ Python based ChatGPT bot integrations
 ## Description
 ChatBot Integrations for Slack, Discord, and the CLI using Python and OpenAPI's ChatGPT platform. This bot is designed around GPT4 and supports GPT4 Vision and Dalle-3. The bots allow iteration on Dalle-3 images and will also determine if image creation is the appropriate action by using NLP. Talk to it just like you would with the ChatGPT website. Upload (multiple) images and have discussions or conduct analysis on them all in a single conversation (Slack Thread or Discord Channel). The Discord client is still a bit behind in development. The CLI client is for basic testing only.
 
+## Recent Changes
+
+For a detailed list of recent changes and improvements, please see the [CHANGELOG.md](CHANGELOG.md) file.
+
 ## Getting Started
 
 Requires `Python 3.10+` as the script takes advantage of the new structural pattern matching (match/case) in this version.  
@@ -68,11 +72,23 @@ The only required token is the OPENAI_KEY. The others depend on which integratio
 ```
 SLACK_BOT_TOKEN = 'YOURTOKENHERE'
 SLACK_APP_TOKEN = 'YOURTOKENHERE'
+
 DALLE3_CMD = '/dalle-3' # For Slack, the slash command you want to use to force trigger a dalle-3 image gen
+
 OPENAI_KEY = 'YOURTOKENHERE'
+
 DISCORD_TOKEN = 'YOURTOKENHERE'
 DISCORD_ALLOWED_CHANNEL_IDS = '1234567890, 1234567890' # Discord channel IDs that the bot is permitted to talk in.
+
+SLACK_LOG_LEVEL = "WARNING" # Optional: Set log level for Slack bot (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+DISCORD_LOG_LEVEL = "WARNING" # Optional: Set log level for Discord bot (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+BOT_LOG_LEVEL = "WARNING" # Optional: Set log level for bot functions (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+UTILS_LOG_LEVEL = "WARNING" # Optional: Set log level for utility functions (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+CONSOLE_LOGGING_ENABLED = "TRUE" # Optional: Enable/disable console logging (TRUE/FALSE)
 ```
+
+### Logging Configuration
+The bots support a comprehensive logging system that can be configured through the environment variables shown above. Logs are stored in the `logs` directory with automatic rotation when they reach 10MB in size.
 
 ### Configuration - Bot Prompt Tuning
 The `prompts.py` file contains the various system prompts the script will use to set the tone for how the bot will respond. Telling it that it is a chatbot and with any specific style of responses will help with more appropriate responses.
@@ -107,6 +123,5 @@ Run the py file for your chosen interface, e.g.:
 - Clean up code, standardize style, move repeated client code to functions and utility modules.
 - Create Slack app manifest file
 - Setup Github workflows and unit tests 
-
 
 
