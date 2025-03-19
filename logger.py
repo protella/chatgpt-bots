@@ -125,6 +125,7 @@ slack_logger = None
 discord_logger = None
 bot_logger = None
 utils_logger = None
+cli_bot_logger = None
 
 def get_logger(name, log_level=None):
     """
@@ -137,7 +138,7 @@ def get_logger(name, log_level=None):
     Returns:
         logging.Logger: The requested logger.
     """
-    global app_logger, slack_logger, discord_logger, bot_logger, utils_logger
+    global app_logger, slack_logger, discord_logger, bot_logger, utils_logger, cli_bot_logger
     
     # Check if we're requesting one of our predefined loggers
     if name == 'app' and app_logger is not None:
@@ -150,6 +151,8 @@ def get_logger(name, log_level=None):
         return bot_logger
     elif name == 'utils' and utils_logger is not None:
         return utils_logger
+    elif name == 'cli_bot' and cli_bot_logger is not None:
+        return cli_bot_logger
     
     # If the logger doesn't exist or we're not requesting a predefined one,
     # create it with the specified log level or get the existing one
@@ -170,5 +173,7 @@ def get_logger(name, log_level=None):
             bot_logger = logger
         elif name == 'utils':
             utils_logger = logger
+        elif name == 'cli_bot':
+            cli_bot_logger = logger
     
     return logger 
