@@ -144,3 +144,7 @@ dmypy.json
 # Local logs
 logs/*
 !logs/.gitkeep
+
+# Cursor
+.cursor/
+.cursor/**

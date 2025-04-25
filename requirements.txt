@@ -1,7 +1,13 @@
-python-dotenv
-discord
-asyncio
-openai
-slack_bolt
-Pillow
-requests
+slack-bolt==1.23.0
+openai==1.76.0
+aiosqlite==0.19.0
+python-dotenv==1.0.0
+Pillow==10.1.0
+requests==2.31.0
+
+# Testing and linting
+pytest==7.4.3
+pytest-cov==4.1.0
+pytest-asyncio==0.23.5
+ruff==0.1.6
+mypy==1.7.1

@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./.env:/app/.env
+      - sqlite_data:/data
+      - ./logs:/app/logs
+    command: python app/clients/slack/slack_bot.py
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTEST_DISABLE_PLUGIN_AUTOLOAD=cacheprovider
+    restart: unless-stopped
+    init: true
+
+volumes:
+  sqlite_data:
+    name: slackbot_sqlite_data 
