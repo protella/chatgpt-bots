@@ -3,6 +3,7 @@
 import os
 import sys
 import logging
+import json
 from typing import Dict, List, Any, Optional
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -13,6 +14,8 @@ from app.core.chatbot import ChatBot
 from app.core.queue import QueueManager
 from app.core.history import rebuild_thread_history, remove_slack_mentions, get_user_info
 from app.core.logging import setup_logger
+from app.core.config import ConfigService
+from app.core.intent_service import is_image_request
 
 # Load environment variables
 load_dotenv()
@@ -22,6 +25,9 @@ logger = setup_logger(__name__)
 
 # Initialize the queue manager
 queue_manager = QueueManager.get_instance()
+
+# Initialize the config service
+config_service = ConfigService()
 
 # Initialize Slack app with bot token and socket mode
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
@@ -123,6 +129,16 @@ def process_and_respond(event: Dict[str, Any], say) -> None:
         if user_first_name:
             message_text = f"[username={user_first_name}] {message_text}"
         
+        # Get thread configuration
+        thread_config = config_service.get(thread_ts)
+        
+        # Check for config updates in the message
+        extracted_config = config_service.extract_config_from_text(message_text)
+        if extracted_config:
+            config_service.update(thread_ts, extracted_config)
+            thread_config = config_service.get(thread_ts)
+            logger.info(f"Updated config from message: {extracted_config}")
+        
         # Send "thinking" message
         thinking_response = say(
             text="Thinking...",
@@ -207,11 +223,21 @@ def process_and_respond(event: Dict[str, Any], say) -> None:
                 # This is a new conversation, not part of a thread
                 logger.info("Starting new conversation")
         
-        # Get response from OpenAI
+        # Determine if message is an image request
+        is_image_gen = False
+        if not images:  # Only check text intent if no images attached
+            try:
+                is_image_gen = is_image_request(message_text, thread_ts, thread_config)
+                logger.info(f"Intent detection for thread {thread_ts}: image_request={is_image_gen}")
+            except Exception as e:
+                logger.error(f"Error in intent detection: {str(e)}")
+        
+        # Get response from OpenAI (will add image-specific routing in next phase)
         response = chatbot.get_response(
             input_text=message_text,
             thread_id=thread_ts,
-            images=images
+            images=images,
+            config=thread_config  # Pass thread config to chatbot
         )
         
         # Clean up temporary messages
@@ -276,14 +302,175 @@ def handle_message(event, say):
 
 @app.command("/chatgpt-config-dev")
 def handle_config_command(ack, body, respond):
-    """Handle the configuration slash command (stub for now)."""
+    """Handle the configuration slash command."""
     logger.info(f"Received /chatgpt-config-dev command from user {body.get('user_id')}")
     
     # Acknowledge the command
     ack()
     
-    # Respond with a placeholder message
-    respond("Configuration options will be available in a future update.")
+    # Extract thread ID from the context (if available)
+    channel_id = body.get("channel_id")
+    thread_ts = body.get("thread_ts")
+    
+    thread_id = thread_ts if thread_ts else f"user_{body.get('user_id')}"
+    
+    try:
+        # Get current config for this thread
+        current_config = config_service.get(thread_id)
+        
+        # Check for a reset request in the text
+        command_text = body.get("text", "").strip().lower()
+        if command_text == "reset":
+            config_service.reset(thread_id)
+            respond({
+                "response_type": "ephemeral",
+                "text": "Configuration has been reset to defaults for this thread."
+            })
+            return
+        
+        # Format config as a message block
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "Thread Configuration",
+                    "emoji": True
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Thread ID:* {thread_id}\n*Status:* Active"
+                }
+            },
+            {
+                "type": "divider"
+            }
+        ]
+        
+        # Add config sections
+        sections = [
+            {
+                "title": "Model Settings",
+                "fields": [
+                    {"key": "gpt_model", "label": "GPT Model"},
+                    {"key": "temperature", "label": "Temperature"},
+                    {"key": "top_p", "label": "Top P"},
+                    {"key": "max_output_tokens", "label": "Max Tokens"}
+                ]
+            },
+            {
+                "title": "Image Generation Settings",
+                "fields": [
+                    {"key": "image_model", "label": "Image Model"},
+                    {"key": "size", "label": "Size"},
+                    {"key": "quality", "label": "Quality"},
+                    {"key": "style", "label": "Style"},
+                    {"key": "number", "label": "Number of Images"},
+                    {"key": "detail", "label": "Vision Detail"}
+                ]
+            }
+        ]
+        
+        for section in sections:
+            # Add section header
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*{section['title']}*"
+                }
+            })
+            
+            # Add fields
+            fields_text = []
+            for field in section["fields"]:
+                key = field["key"]
+                value = current_config.get(key, "Not set")
+                fields_text.append(f"*{field['label']}*: {value}")
+            
+            # Split into columns (max 10 fields per section)
+            for i in range(0, len(fields_text), 10):
+                blocks.append({
+                    "type": "section",
+                    "fields": [
+                        {
+                            "type": "mrkdwn",
+                            "text": text
+                        } for text in fields_text[i:i+10]
+                    ]
+                })
+        
+        # Add reset button
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Reset to Defaults",
+                        "emoji": True
+                    },
+                    "value": "reset_config",
+                    "action_id": "reset_config"
+                }
+            ]
+        })
+        
+        # Respond with the config details
+        respond({
+            "response_type": "ephemeral",
+            "blocks": blocks
+        })
+        
+    except Exception as e:
+        logger.error(f"Error handling config command: {str(e)}")
+        respond({
+            "response_type": "ephemeral",
+            "text": f"Error retrieving configuration: {str(e)}"
+        })
+
+@app.action("reset_config")
+def handle_reset_action(ack, body, respond):
+    """Handle the reset config button action."""
+    ack()
+    
+    user_id = body.get("user", {}).get("id")
+    channel_id = body.get("channel", {}).get("id")
+    message_ts = body.get("message", {}).get("ts")
+    
+    # Extract thread info from the original message if available
+    original_text = body.get("message", {}).get("text", "")
+    thread_id_match = None
+    
+    # If we can extract the thread ID from the text
+    if "Thread ID:" in original_text:
+        thread_id_parts = original_text.split("Thread ID:")[1].split("\n")[0].strip()
+        thread_id_match = thread_id_parts
+    
+    thread_id = thread_id_match if thread_id_match else f"user_{user_id}"
+    
+    try:
+        # Reset the config
+        config_service.reset(thread_id)
+        
+        # Respond with confirmation
+        respond({
+            "response_type": "ephemeral",
+            "replace_original": False,
+            "text": f"Configuration for thread {thread_id} has been reset to defaults."
+        })
+        
+    except Exception as e:
+        logger.error(f"Error resetting config: {str(e)}")
+        respond({
+            "response_type": "ephemeral",
+            "replace_original": False,
+            "text": f"Error resetting configuration: {str(e)}"
+        })
 
 def main():
     """Main entry point for the Slack bot."""

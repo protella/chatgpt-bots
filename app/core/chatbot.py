@@ -44,7 +44,8 @@ class ChatBot:
     def get_response(self, 
                      input_text: str, 
                      thread_id: str, 
-                     images: Optional[List[str]] = None) -> Dict[str, Any]:
+                     images: Optional[List[str]] = None,
+                     config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Get a response from OpenAI's API for the given input.
         Handles both text-only and multimodal (text + images) requests.
@@ -53,6 +54,7 @@ class ChatBot:
             input_text: The text input from the user
             thread_id: The thread ID to maintain conversation context
             images: Optional list of base64-encoded image strings
+            config: Optional configuration overrides for this request
             
         Returns:
             dict: Response containing content, success flag, and optional error
@@ -64,9 +66,17 @@ class ChatBot:
             # Prepare the messages list for the API call
             messages = []
             
+            # Use system prompt from config if provided, otherwise use default
+            system_prompt = prompts.SLACK_SYSTEM_PROMPT
+            if config and "system_prompt" in config:
+                system_prompt = {
+                    "role": "system",
+                    "content": config["system_prompt"]
+                }
+                
             # Only add system prompt for new threads
             if is_new_thread:
-                messages.append(prompts.SLACK_SYSTEM_PROMPT)
+                messages.append(system_prompt)
             
             # Add user message with the text content
             user_message: Dict[str, Any] = {
@@ -82,12 +92,17 @@ class ChatBot:
             
             # Add images if provided
             if images:
+                # Get vision detail level from config (default to "auto")
+                detail = "auto"
+                if config and "detail" in config:
+                    detail = config["detail"]
+                    
                 for image_base64 in images:
                     user_message["content"].append({
                         "type": "image_url",
                         "image_url": {
                             "url": f"data:image/png;base64,{image_base64}",
-                            "detail": "auto"
+                            "detail": detail
                         }
                     })
             
@@ -95,19 +110,31 @@ class ChatBot:
             
             logger.info(f"Sending request to OpenAI for thread {thread_id}")
             
-            # Get configuration options (placeholder - will be implemented in Phase 4)
-            # In a real implementation, this would come from core/config.py
+            # Get configuration options from provided config or use defaults
             max_tokens = 4096
             temperature = 0.7
+            model = self.model
+            
+            if config:
+                if "max_output_tokens" in config:
+                    max_tokens = config["max_output_tokens"]
+                if "temperature" in config:
+                    temperature = config["temperature"]
+                if "gpt_model" in config:
+                    model = config["gpt_model"]
             
             # Prepare API call parameters
             params = {
-                "model": self.model,
+                "model": model,
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
                 "store": True,  # Store conversation state in OpenAI
             }
+            
+            # Add top_p if in config
+            if config and "top_p" in config:
+                params["top_p"] = config["top_p"]
             
             # Add previous_response_id for continuing conversations
             if not is_new_thread and thread_id in self.thread_responses:

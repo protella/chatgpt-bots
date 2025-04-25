@@ -114,10 +114,10 @@ User: "Imagine a world where robots and humans live together"
 Response: True"""
 
 IMAGE_GEN_SYSTEM_PROMPT = """You will be provided with a user's chat message and context history for a chatbot integration.
-The message has been predetermined to be a request for a DALL-E 3 generative art image. 
+The message has been predetermined to be a request for a OpenAI's generative art image models. 
 Your task is to create an optimal prompt for DALL-E 3 image generation based on the user's request and conversation context.
 
-Guidelines for creating effective DALL-E 3 prompts:
+Guidelines for creating effective Image generation prompts:
 1. Be specific and descriptive - include details about subject, setting, lighting, mood, style, and perspective
 2. Include artistic style references when appropriate (e.g., "in the style of impressionism", "photorealistic", "digital art")
 3. Mention color palettes or specific colors that would enhance the image
@@ -127,6 +127,6 @@ Guidelines for creating effective DALL-E 3 prompts:
 7. Keep the prompt between 50-150 words for optimal results
 
 Format your response as a straightforward generative art prompt WITHOUT any introductory text, explanations, or quotation marks.
-Do NOT include phrases like "Here's a prompt:" or "DALL-E 3 prompt:".
+Do NOT include phrases like "Here's an image prompt:" or "DALL-E 3 prompt:".
 Do NOT include any disclaimers, notes, or additional commentary.
-Simply output the prompt text that should be sent directly to DALL-E 3."""
+Simply output the prompt text that should be sent directly to the image generation model."""

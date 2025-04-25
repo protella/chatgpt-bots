@@ -9,6 +9,9 @@ services:
       - ./.env:/app/.env
       - sqlite_data:/data
       - ./logs:/logs
+      - ./app:/app/app
+      - ./tests:/app/tests
+      - ./prompts.py:/app/prompts.py
     command: python app/clients/slack/slack_bot.py
     environment:
       - PYTHONUNBUFFERED=1

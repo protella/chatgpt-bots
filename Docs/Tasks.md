@@ -113,8 +113,7 @@
   - Handles revised prompts (For Dalle-3 only)
 
 - [ ] **Vision Input Handling**
-  - Accept up to 4 images in allowed formats
-  - Convert Slack URLs to B64 on first load only
+  - Now handled in the standard model get_response since GPT4.1 is multi-modal.
 
 - [ ] **B64 Constraints**
   - Images **never** passed unless required by OpenAI
