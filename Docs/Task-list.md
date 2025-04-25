@@ -57,30 +57,30 @@
 
 ## Phase 2 – OpenAI API Integration
 
-- [ ] **Responses API Adapter**
-  - `chatbot.py`: `get_text_response`, `get_image_response`, `get_vision_response`
-  - Handles `previous_response_id`
+- [x] **Responses API Adapter**
+  - `chatbot.py`: `get_response` handles text, images, and vision in one unified method
+  - Handles `previous_response_id` to maintain conversation context
   - Tracks usage tokens
 
-- [ ] **Test:** stub OpenAI and test valid/invalid usage
+- [x] **Test:** mock OpenAI and test valid/invalid usage
 
 ---
 
 ## Phase 3 – Slack Event Handling
 
-- [ ] **SlackBot Entrypoint**
+- [x] **SlackBot Entrypoint**
   - Create `clients/slack/slack_bot.py`
   - Connect using `App(token=SLACK_BOT_TOKEN)`
   - Respond to `app_mention`, `message.im`, `/chatgpt-config-dev`
 
-- [ ] **History Rebuild Logic**
+- [x] **History Rebuild Logic**
   - Add `core/history.py`
   - On new event with unknown thread_ts:
     - Fetch all messages in thread
     - Extract text, images
     - Rebuild initial OpenAI message payload
 
-- [ ] **Test:** trigger a mock thread rebuild and check token format
+- [x] **Test:** trigger a mock thread rebuild and check token format
 
 ---
 

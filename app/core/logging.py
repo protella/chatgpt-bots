@@ -23,9 +23,18 @@ def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     if logger.hasHandlers():
         logger.handlers.clear()
     
-    # Create logs directory if it doesn't exist
-    logs_dir = Path(os.environ.get("LOGS_DIR", "/app/logs"))
+    # Determine logs directory - prefer mounted /logs in container,
+    # fall back to environment variable, then to local logs folder
+    if os.path.exists("/logs") and os.access("/logs", os.W_OK):
+        # Container environment with mounted /logs
+        logs_dir = Path("/logs")
+    else:
+        # Local development environment
+        project_root = Path(os.environ.get("PROJECT_ROOT", os.getcwd()))
+        logs_dir = project_root / "logs"
+    
     logs_dir.mkdir(exist_ok=True)
+    logger.debug(f"Using logs directory: {logs_dir}")
     
     # Common log format
     formatter = logging.Formatter(
@@ -54,7 +63,7 @@ def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     logger.addHandler(error_handler)
     
     # Console handler (optional, controlled by CONSOLE_LOGGING_ENABLED)
-    console_logging_enabled = os.environ.get("CONSOLE_LOGGING_ENABLED", "false").lower() in (
+    console_logging_enabled = os.environ.get("CONSOLE_LOGGING_ENABLED", "true").lower() in (
         "true", "1", "yes", "y"
     )
     

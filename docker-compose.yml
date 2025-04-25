@@ -8,7 +8,7 @@ services:
     volumes:
       - ./.env:/app/.env
       - sqlite_data:/data
-      - ./logs:/app/logs
+      - ./logs:/logs
     command: python app/clients/slack/slack_bot.py
     environment:
       - PYTHONUNBUFFERED=1

@@ -5,16 +5,17 @@ WORKDIR /app
 
 # Install dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir pytest-cov pytest-asyncio
 
 # Create non-root user
 RUN groupadd -r botuser && useradd -r -g botuser botuser
 
-# Create data and cache directories and set permissions
+# Create data and logs directories and set permissions
 RUN mkdir -p /data && \
     mkdir -p /app/.pytest_cache && \
-    mkdir -p /app/logs && \
-    chown -R botuser:botuser /data /app/.pytest_cache /app/logs
+    mkdir -p /logs && \
+    chown -R botuser:botuser /data /app/.pytest_cache /logs
 
 # Copy application code
 COPY . .

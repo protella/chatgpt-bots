@@ -40,8 +40,8 @@ def test_console_logging_enabled(mock_logging_setup):
 
 
 def test_console_logging_disabled(mock_logging_setup):
-    """Test that console logging is disabled by default."""
-    with mock.patch.dict(os.environ, {}, clear=True):  # Clear all env vars
+    """Test that console logging can be disabled with environment variable."""
+    with mock.patch.dict(os.environ, {"CONSOLE_LOGGING_ENABLED": "false"}):
         with mock.patch('app.core.logging.logging.StreamHandler', autospec=True) as mock_stream:
             logger = setup_logger("test_logger")
             
