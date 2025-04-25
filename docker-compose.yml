@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   bot:
     build:
@@ -11,11 +9,15 @@ services:
       - ./logs:/logs
       - ./app:/app/app
       - ./tests:/app/tests
+      - ./tests/coverage:/tmp/coverage
       - ./prompts.py:/app/prompts.py
     command: python app/clients/slack/slack_bot.py
+    env_file:
+      - .env
     environment:
       - PYTHONUNBUFFERED=1
       - PYTEST_DISABLE_PLUGIN_AUTOLOAD=cacheprovider
+      - COVERAGE_FILE=/tmp/coverage/.coverage
     restart: unless-stopped
     init: true
 

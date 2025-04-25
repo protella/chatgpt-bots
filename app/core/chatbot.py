@@ -1,14 +1,18 @@
 import os
-import logging
 from typing import Dict, List, Optional, Any
 import openai
-from openai.types.chat import ChatCompletion
+import sys
+import re
+
+# Add the root directory to sys.path to allow importing prompts
+sys.path.insert(0, '/app')
 
 # Import system prompt
-import prompts
+from prompts import SLACK_SYSTEM_PROMPT
 
 # Import logging
 from app.core.logging import setup_logger
+from app.core.history import remove_personalization_tags
 
 logger = setup_logger(__name__)
 
@@ -25,21 +29,25 @@ class ChatBot:
         Args:
             api_key: OpenAI API key. If None, will try to get from environment.
         """
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        self.api_key = api_key or os.environ.get("OPENAI_KEY")
         if not self.api_key:
             logger.error("OpenAI API key not found")
             raise ValueError("OpenAI API key is required")
         
         self.client = openai.OpenAI(api_key=self.api_key)
         
-        # Cache to store previous_response_id for each thread
-        self.thread_responses: Dict[str, str] = {}
+        # Dictionary to track conversations: thread_id -> conversation data
+        # Each conversation contains:
+        # - messages: List of all messages in the conversation
+        # - response_id: The OpenAI response ID from the last API call
+        self.conversations: Dict[str, Dict[str, Any]] = {}
         
         # Cache to store token usage metrics
         self.token_usage: Dict[str, Dict[str, int]] = {}
         
-        # Default model to use
-        self.model = "gpt-4.1-2025-04-14"
+        # Default model to use - get from environment or use fallback
+        self.model = os.environ.get("GPT_MODEL", "gpt-4.1-2025-04-14")
+        logger.info(f"Using model: {self.model} for chat")
     
     def get_response(self, 
                      input_text: str, 
@@ -47,36 +55,46 @@ class ChatBot:
                      images: Optional[List[str]] = None,
                      config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        Get a response from OpenAI's API for the given input.
-        Handles both text-only and multimodal (text + images) requests.
+        Get a response from the OpenAI Responses API.
         
         Args:
-            input_text: The text input from the user
-            thread_id: The thread ID to maintain conversation context
-            images: Optional list of base64-encoded image strings
-            config: Optional configuration overrides for this request
-            
+            input_text: The user's message
+            thread_id: The Slack thread ID to associate with this conversation
+            images: Optional list of base64-encoded images to include
+            config: Optional configuration overrides
+        
         Returns:
-            dict: Response containing content, success flag, and optional error
+            Dict containing response content and metadata
         """
         try:
+            config = config or {}
+            
             # Check if this is a new thread or continuing conversation
-            is_new_thread = thread_id not in self.thread_responses
+            is_new_thread = thread_id not in self.conversations
             
             # Prepare the messages list for the API call
             messages = []
             
-            # Use system prompt from config if provided, otherwise use default
-            system_prompt = prompts.SLACK_SYSTEM_PROMPT
-            if config and "system_prompt" in config:
-                system_prompt = {
-                    "role": "system",
-                    "content": config["system_prompt"]
-                }
-                
-            # Only add system prompt for new threads
+            # Get system prompt (from config or default)
+            system_content = config.get("system_prompt", SLACK_SYSTEM_PROMPT)
+            system_message = {
+                "role": "system",
+                "content": system_content
+            }
+            
+            # Initialize new conversation if needed
             if is_new_thread:
-                messages.append(system_prompt)
+                logger.info(f"Starting new conversation for thread {thread_id}")
+                # For new threads, we just need the system prompt to start
+                messages.append(system_message)
+                self.conversations[thread_id] = {
+                    "messages": [system_message],
+                    "response_id": None
+                }
+            else:
+                # For existing threads, include all previous messages
+                messages = self.conversations[thread_id]["messages"].copy()
+                logger.info(f"Continuing conversation for thread {thread_id} with {len(messages)} existing messages")
             
             # Add user message with the text content
             user_message: Dict[str, Any] = {
@@ -93,9 +111,7 @@ class ChatBot:
             # Add images if provided
             if images:
                 # Get vision detail level from config (default to "auto")
-                detail = "auto"
-                if config and "detail" in config:
-                    detail = config["detail"]
+                detail = config.get("detail", "auto")
                     
                 for image_base64 in images:
                     user_message["content"].append({
@@ -106,69 +122,72 @@ class ChatBot:
                         }
                     })
             
+            # Add the user message to the list for the API call
             messages.append(user_message)
             
-            logger.info(f"Sending request to OpenAI for thread {thread_id}")
+            # Add the user message to our stored conversation
+            self.conversations[thread_id]["messages"].append(user_message)
+            
+            # If this is a request to repeat conversation history, clean personalization tags
+            # from all messages to ensure they don't appear in the response
+            if "repeat" in input_text.lower() and "conversation" in input_text.lower():
+                logger.info("Detected conversation repeat request, cleaning personalization tags")
+                # Clean up all messages before sending to API
+                for msg in messages:
+                    if msg["role"] == "user" and isinstance(msg["content"], list):
+                        for content_item in msg["content"]:
+                            if content_item["type"] == "text":
+                                content_item["text"] = remove_personalization_tags(content_item["text"])
+            
+            logger.info(f"Sending request to OpenAI for thread {thread_id} with {len(messages)} messages")
             
             # Get configuration options from provided config or use defaults
-            max_tokens = 4096
-            temperature = 0.7
-            model = self.model
-            
-            if config:
-                if "max_output_tokens" in config:
-                    max_tokens = config["max_output_tokens"]
-                if "temperature" in config:
-                    temperature = config["temperature"]
-                if "gpt_model" in config:
-                    model = config["gpt_model"]
-            
-            # Prepare API call parameters
+            max_tokens = config.get("max_output_tokens", 4096)
+            temperature = config.get("temperature", 0.8)
+            top_p = config.get("top_p", 1.0)
+            model = config.get("gpt_model", self.model)
+                
+            # Prepare API parameters
             params = {
                 "model": model,
                 "messages": messages,
-                "max_tokens": max_tokens,
                 "temperature": temperature,
-                "store": True,  # Store conversation state in OpenAI
+                "top_p": top_p,
+                "max_tokens": max_tokens,
             }
             
-            # Add top_p if in config
-            if config and "top_p" in config:
-                params["top_p"] = config["top_p"]
-            
-            # Add previous_response_id for continuing conversations
-            if not is_new_thread and thread_id in self.thread_responses:
-                params["previous_response_id"] = self.thread_responses[thread_id]
-                logger.debug(f"Using previous_response_id: {self.thread_responses[thread_id]}")
-            
-            # Make the API call
+            # Call the OpenAI API
             response = self.client.chat.completions.create(**params)
             
-            # Store the response ID for future messages in this thread
-            self.thread_responses[thread_id] = response.id
-            logger.debug(f"Stored new response ID: {response.id} for thread {thread_id}")
+            # Store the response ID for future continuation
+            self.conversations[thread_id]["response_id"] = response.id
             
-            # Track token usage for this thread
-            if hasattr(response, 'usage') and response.usage:
-                self.token_usage[thread_id] = {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens
-                }
-                logger.info(f"Thread {thread_id} token usage: {self.token_usage[thread_id]}")
+            # Add the assistant's response to our stored conversation
+            assistant_message = {
+                "role": "assistant",
+                "content": response.choices[0].message.content
+            }
+            self.conversations[thread_id]["messages"].append(assistant_message)
             
-            # Extract and return the response content
+            # Extract and store token usage
+            self.token_usage[thread_id] = {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens
+            }
+            
+            # Return the response
             return {
-                "content": response.choices[0].message.content,
                 "success": True,
+                "content": response.choices[0].message.content,
                 "error": None
             }
             
         except Exception as e:
-            logger.error(f"Error getting OpenAI response: {str(e)}")
+            logger.error(f"Error in ChatBot.get_response: {str(e)}")
             return {
-                "content": "",
                 "success": False,
+                "content": "",
                 "error": str(e)
             }
     
@@ -182,4 +201,18 @@ class ChatBot:
         Returns:
             dict: Token usage statistics or None if not available
         """
-        return self.token_usage.get(thread_id) 
+        return self.token_usage.get(thread_id)
+    
+    def initialize_from_history(self, thread_id: str, messages: List[Dict[str, Any]]) -> None:
+        """
+        Initialize a conversation from existing message history (like from a Slack thread).
+        
+        Args:
+            thread_id: The Slack thread ID to associate with this conversation
+            messages: List of messages in the conversation in OpenAI format
+        """
+        self.conversations[thread_id] = {
+            "messages": messages,
+            "response_id": None  # Will be set on first API call
+        }
+        logger.info(f"Initialized conversation for thread {thread_id} with {len(messages)} messages from history") 

@@ -8,7 +8,7 @@ import os
 import json
 import sqlite3
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 import re
 
 import prompts
@@ -16,20 +16,26 @@ import prompts
 # Initialize logger
 logger = logging.getLogger(__name__)
 
+# Get model configuration from environment variables
+GPT_MODEL = os.environ.get("GPT_MODEL", "gpt-4.1-2025-04-14")
+GPT_IMAGE_MODEL = os.environ.get("GPT_IMAGE_MODEL", "gpt-image-1")
+DALLE_MODEL = os.environ.get("DALLE_MODEL", "dall-e-3")
+
 # Default config values
 DEFAULT_CONFIG = {
     "temperature": 0.8,
     "top_p": 1.0,
     "max_output_tokens": 2048,
     "custom_init": "",
-    "gpt_model": "gpt-4.1-2025-04-14",
-    "image_model": "gpt-image-1",
-    "size": "1024x1024",
-    "quality": "hd",
+    "gpt_model": GPT_MODEL,
+    "image_model": GPT_IMAGE_MODEL,
+    "size": "auto", # 1024x1024, 1536x1024 (landscape), 1024x1536 (portrait), or auto
+    "quality": "auto",
     "style": "natural",
     "number": 1,
     "detail": "auto",
     "d3_revised_prompt": False,
+    "moderation": "low", # "auto" or "low"
     "system_prompt": prompts.SLACK_SYSTEM_PROMPT["content"]
 }
 
@@ -207,16 +213,40 @@ class ConfigService:
             extracted_config["style"] = style
         
         # Image model
-        if re.search(r'\b(dall-?e-?3|gpt-image-1)\b', text.lower()):
-            if re.search(r'\bdall-?e-?3\b', text.lower()):
-                extracted_config["image_model"] = "dall-e-3"
-            elif re.search(r'\bgpt-image-1\b', text.lower()):
-                extracted_config["image_model"] = "gpt-image-1"
+        dalle_pattern = r'\bdall-?e-?3\b'
+        gpt_image_pattern = r'\bgpt-image-1\b'
         
-        # Image quality (DALL-E 3)
-        if re.search(r'\b(standard|hd)\s+quality\b', text.lower()):
-            quality = re.search(r'\b(standard|hd)\s+quality\b', text.lower()).group(1)
-            extracted_config["quality"] = quality
+        model_detected = None
+        if re.search(rf'\b({dalle_pattern}|{gpt_image_pattern})\b', text.lower()):
+            if re.search(dalle_pattern, text.lower()):
+                extracted_config["image_model"] = DALLE_MODEL
+                model_detected = DALLE_MODEL
+            elif re.search(gpt_image_pattern, text.lower()):
+                extracted_config["image_model"] = GPT_IMAGE_MODEL
+                model_detected = GPT_IMAGE_MODEL
+        
+        # Image quality - model specific validation
+        if re.search(r'\b(standard|hd|auto|low|medium|high)\s+quality\b', text.lower()):
+            quality = re.search(r'\b(standard|hd|auto|low|medium|high)\s+quality\b', text.lower()).group(1)
+            
+            # Validate quality based on the detected or default model
+            if model_detected is None:
+                model_detected = DEFAULT_CONFIG["image_model"]
+            
+            if model_detected == DALLE_MODEL and quality in ["standard", "hd"]:
+                # Valid DALL-E 3 quality
+                extracted_config["quality"] = quality
+            elif model_detected == GPT_IMAGE_MODEL and quality in ["auto", "low", "medium", "high"]:
+                # Valid GPT-Image-1 quality
+                extracted_config["quality"] = quality
+            else:
+                # Use appropriate default for the model
+                if model_detected == DALLE_MODEL:
+                    extracted_config["quality"] = "standard"
+                    logger.warning(f"Invalid quality '{quality}' for {model_detected}, using 'standard'")
+                else:
+                    extracted_config["quality"] = "auto"
+                    logger.warning(f"Invalid quality '{quality}' for {model_detected}, using 'auto'")
         
         # Image size
         size_patterns = {

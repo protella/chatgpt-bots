@@ -1,3 +1,8 @@
+"""Thread history reconstruction helpers for Slack.
+
+This module provides functions to rebuild conversation history from Slack threads.
+"""
+
 import os
 import base64
 import logging
@@ -21,6 +26,9 @@ ALLOWED_MIMETYPES = [
     "image/gif",
 ]
 
+# Initialize constants
+SLACK_BOT_THINKING_MESSAGES = ["_Thinking..._", "_Processing..._", "_Working on it..._"]
+
 def remove_slack_mentions(text: str) -> str:
     """
     Remove Slack mention formatting from text (e.g., <@U123456>).
@@ -41,145 +49,140 @@ def remove_slack_mentions(text: str) -> str:
     cleaned_text = re.sub(r'\s+([,.!?])', r'\1', cleaned_text)
     return cleaned_text.strip()
 
-def download_and_encode_image(image_url: str, bot_token: str) -> Optional[str]:
+def download_and_encode_image(url: str, token: str) -> str:
     """
     Download an image from Slack and encode it as base64.
     
     Args:
-        image_url: The Slack URL for the image
-        bot_token: The Slack bot token for authentication
+        url: The Slack file URL
+        token: Slack API token
         
     Returns:
-        Base64-encoded image string or None if download fails
+        Base64-encoded image data as string
     """
-    logger.info(f"Downloading image from {image_url}")
-    
-    headers = {"Authorization": f"Bearer {bot_token}"}
-    try:
-        response = requests.get(image_url, headers=headers)
-        
-        if response.status_code == 200:
-            encoded_image = base64.b64encode(response.content).decode("utf-8")
-            logger.debug(f"Successfully encoded image (size: {len(encoded_image)} bytes)")
-            return encoded_image
-        else:
-            logger.error(f"Failed to download image: status code {response.status_code}")
-            return None
-    except Exception as e:
-        logger.error(f"Error downloading and encoding image: {str(e)}")
-        return None
+    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        return base64.b64encode(response.content).decode('utf-8')
+    else:
+        raise Exception(f"Failed to download image: {response.status_code}")
 
-def rebuild_thread_history(client, channel_id: str, thread_ts: str, bot_user_id: str) -> List[Dict[str, Any]]:
+def rebuild_thread_history(
+    client: Any, 
+    channel_id: str, 
+    thread_ts: str, 
+    bot_user_id: str
+) -> List[Dict[str, Any]]:
     """
-    Rebuild conversation history for a Slack thread.
+    Rebuild a conversation history from a Slack thread.
     
     Args:
-        client: The Slack client
-        channel_id: The Slack channel ID
-        thread_ts: The thread timestamp
-        bot_user_id: The bot's user ID
+        client: Slack client
+        channel_id: Channel ID
+        thread_ts: Thread timestamp
+        bot_user_id: Bot user ID
         
     Returns:
-        List of messages for OpenAI API
+        List of messages in the OpenAI format
     """
-    logger.info(f"Rebuilding conversation history for thread {thread_ts}")
+    # Get thread messages
+    result = client.conversations_replies(
+        channel=channel_id,
+        ts=thread_ts,
+        limit=100
+    )
     
-    # Start with system prompt
-    messages = [prompts.SLACK_SYSTEM_PROMPT]
+    # Extract just the messages
+    messages = result.get("messages", [])
     
-    # Bot commands and responses to ignore when rebuilding history
-    skip_messages = [
-        "Thinking...",
-        "Generating image",
-        "I'm busy processing",
-        "!help",
-        "!usage",
-        "!config",
-        "!reset"
+    # Remove the current message (last message) to avoid processing it twice
+    if len(messages) > 0:
+        messages = messages[:-1]
+    
+    # Find the last user message and remove it - it's likely a "repeat conversation" request
+    # or something we don't want in repeats
+    last_user_message_index = None
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("user") != bot_user_id:
+            last_user_message_index = i
+            break
+            
+    if last_user_message_index is not None:
+        logger.info(f"Removing last user message from history to prevent repetition")
+        messages.pop(last_user_message_index)
+    
+    # Initialize OpenAI messages with system prompt
+    openai_messages = [
+        {
+            "role": "system",
+            "content": "You are a helpful assistant."
+        }
     ]
     
-    try:
-        # Fetch conversation replies from Slack API
-        response = client.conversations_replies(channel=channel_id, ts=thread_ts)
-        thread_messages = response.get("messages", [])
+    # Get the Slack token for downloading files
+    slack_token = os.environ.get("SLACK_BOT_TOKEN")
+    
+    # Process messages
+    for message in messages:
+        # Skip bot thinking messages
+        if (message.get("user") == bot_user_id and 
+            any(thinking in message.get("text", "") for thinking in SLACK_BOT_THINKING_MESSAGES)):
+            continue
         
-        # Process each message in the thread except the most recent (it will be added separately)
-        for msg in thread_messages[:-1]:
-            text = msg.get("text", "").strip()
+        # Determine role
+        if message.get("user") == bot_user_id:
+            role = "assistant"
+        else:
+            role = "user"
+        
+        # Initialize content
+        content = []
+        
+        # Add text content
+        if message.get("text"):
+            message_text = message.get("text")
             
-            # Skip empty messages, bot commands, and processing messages
-            if not text or any(text.startswith(cmd) for cmd in skip_messages) or any(cmd in text for cmd in skip_messages):
-                continue
+            # Remove personalization tags from user messages
+            # These are for internal use and shouldn't appear in the conversation history
+            if role == "user":
+                message_text = remove_personalization_tags(message_text)
             
-            # Determine message role based on user ID
-            role = "assistant" if msg.get("user") == bot_user_id else "user"
-            content = []
-            
-            # Remove slack mentions and add text content
-            cleaned_text = remove_slack_mentions(text)
-            if cleaned_text:
-                content.append({
-                    "type": "text",
-                    "text": cleaned_text
-                })
-            
-            # Process file attachments (images)
-            files = msg.get("files", [])
-            for file in files:
-                if file.get("mimetype") in ALLOWED_MIMETYPES:
-                    image_url = file.get("url_private")
-                    if image_url:
-                        # Get bot token from environment
-                        slack_bot_token = os.environ.get("SLACK_BOT_TOKEN")
-                        if not slack_bot_token:
-                            logger.error("SLACK_BOT_TOKEN not found in environment")
-                            continue
-                            
-                        # Download and encode the image
-                        encoded_image = download_and_encode_image(
-                            image_url, slack_bot_token
+            content.append({
+                "type": "text",
+                "text": message_text
+            })
+        
+        # Add image content if any
+        has_image_error = False
+        if "files" in message and message["files"]:
+            for file in message["files"]:
+                if file.get("mimetype", "").startswith("image/"):
+                    # Download and encode image
+                    try:
+                        image_data = download_and_encode_image(
+                            file["url_private"], 
+                            slack_token
                         )
-                        
-                        if encoded_image:
-                            # OpenAI API doesn't support images from assistant, so force to user
-                            if role == "assistant":
-                                # We'll create a new message from the "user" to show this image
-                                image_msg = {
-                                    "role": "user",
-                                    "content": [{
-                                        "type": "image_url",
-                                        "image_url": {
-                                            "url": f"data:image/png;base64,{encoded_image}",
-                                            "detail": "auto"
-                                        }
-                                    }]
-                                }
-                                if image_msg["content"]:
-                                    messages.append(image_msg)
-                            else:
-                                # Add image to current user message
-                                content.append({
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/png;base64,{encoded_image}",
-                                        "detail": "auto"
-                                    }
-                                })
-            
-            # Add message to history if it has content
-            if content:
-                messages.append({
-                    "role": role,
-                    "content": content
-                })
+                        content.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{image_data}",
+                                "detail": "auto"
+                            }
+                        })
+                    except Exception as e:
+                        # Log error but continue processing
+                        logger.error(f"Error processing image: {str(e)}")
+                        has_image_error = True
         
-        logger.info(f"Rebuilt conversation history with {len(messages) - 1} messages (excluding system prompt)")
-        return messages
-        
-    except Exception as e:
-        logger.error(f"Error rebuilding thread history: {str(e)}")
-        # Return just the system prompt if we failed to rebuild history
-        return [prompts.SLACK_SYSTEM_PROMPT]
+        # Add the message to the OpenAI messages if it has content
+        if content:
+            openai_messages.append({
+                "role": role,
+                "content": content
+            })
+    
+    return openai_messages
 
 def get_user_info(client, user_id: str) -> Optional[str]:
     """
@@ -209,4 +212,20 @@ def get_user_info(client, user_id: str) -> Optional[str]:
         return first_name
     except Exception as e:
         logger.error(f"Error getting user info: {str(e)}")
-        return None 
+        return None
+
+def remove_personalization_tags(text: str) -> str:
+    """
+    Remove personalization tags from message text (e.g., [username=Peter]).
+    
+    Args:
+        text: Text that may contain personalization tags
+        
+    Returns:
+        Text with personalization tags removed
+    """
+    # This pattern matches personalization tags like [username=Peter]
+    username_pattern = r"\[username=[^\]]+\]\s*"
+    # Replace tags with empty string
+    cleaned_text = re.sub(username_pattern, "", text)
+    return cleaned_text.strip() 

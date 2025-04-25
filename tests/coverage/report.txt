@@ -1,0 +1,16 @@
+Name                             Stmts   Miss  Cover
+----------------------------------------------------
+app/__init__.py                      0      0   100%
+app/clients/__init__.py              0      0   100%
+app/clients/slack/__init__.py        0      0   100%
+app/clients/slack/slack_bot.py     222     57    74%
+app/core/__init__.py                 0      0   100%
+app/core/chatbot.py                 60      6    90%
+app/core/config.py                 114     22    81%
+app/core/history.py                 66      8    88%
+app/core/image_service.py           44      0   100%
+app/core/intent_service.py          20      0   100%
+app/core/logging.py                 32      2    94%
+app/core/queue.py                   87     28    68%
+----------------------------------------------------
+TOTAL                              645    123    81%

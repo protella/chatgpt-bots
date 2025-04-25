@@ -2,6 +2,7 @@
 
 import pytest
 from unittest.mock import patch, MagicMock
+import prompts
 
 from app.core.intent_service import is_image_request
 
@@ -72,6 +73,11 @@ class TestIntentService:
         
         assert result is True
         mock_openai.return_value.chat.completions.create.assert_called_once()
+        
+        # Verify that the system message contains the correct prompt
+        call_args = mock_openai.return_value.chat.completions.create.call_args[1]
+        assert call_args['messages'][0]['role'] == 'system'
+        assert call_args['messages'][0]['content'] == prompts.IMAGE_CHECK_SYSTEM_PROMPT
 
     @patch('app.core.intent_service.OpenAI')
     def test_is_image_request_false(self, mock_openai, mock_openai_false):
@@ -83,6 +89,11 @@ class TestIntentService:
         
         assert result is False
         mock_openai.return_value.chat.completions.create.assert_called_once()
+        
+        # Verify that the system message contains the correct prompt
+        call_args = mock_openai.return_value.chat.completions.create.call_args[1]
+        assert call_args['messages'][0]['role'] == 'system'
+        assert call_args['messages'][0]['content'] == prompts.IMAGE_CHECK_SYSTEM_PROMPT
 
     @patch('app.core.intent_service.OpenAI')
     def test_is_image_request_invalid_response(self, mock_openai, mock_openai_invalid):

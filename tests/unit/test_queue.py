@@ -5,7 +5,8 @@ import time
 from unittest import mock
 
 import pytest
-import pytest_asyncio
+
+pytest_plugins = ['pytest_asyncio']
 
 # Mock the logger before importing QueueManager
 with mock.patch('app.core.logging.setup_logger', return_value=mock.MagicMock()):

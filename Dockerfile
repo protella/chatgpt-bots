@@ -14,11 +14,15 @@ RUN groupadd -r botuser && useradd -r -g botuser botuser
 # Create data and logs directories and set permissions
 RUN mkdir -p /data && \
     mkdir -p /app/.pytest_cache && \
+    mkdir -p /tmp/coverage && \
     mkdir -p /logs && \
-    chown -R botuser:botuser /data /app/.pytest_cache /logs
+    chown -R botuser:botuser /data /app/.pytest_cache /tmp/coverage /logs
 
 # Copy application code
 COPY . .
+
+# Install the local package in development mode
+RUN pip install -e .
 
 # Create a start script
 RUN echo '#!/bin/bash\npython app/clients/slack/slack_bot.py' > /app/start.sh && \

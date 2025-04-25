@@ -1,4 +1,4 @@
-.PHONY: build run test test-local test-cov test-unit shell clean
+.PHONY: build run test test-local test-cov test-unit shell clean test-coverage
 
 build:
 	docker build -t slackbot-v2 .
@@ -12,6 +12,10 @@ test:
 
 test-cov:
 	docker compose run --rm bot python -m pytest
+
+# Comprehensive test coverage report 
+test-coverage:
+	docker compose run --rm bot bash -c "coverage run -m pytest tests/ && coverage report --include='app/*' > tests/coverage/report.txt && cat tests/coverage/report.txt"
 
 # Local tests (run outside of Docker)
 test-local:

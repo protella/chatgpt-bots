@@ -4,6 +4,8 @@ aiosqlite==0.19.0
 python-dotenv==1.0.0
 Pillow==10.1.0
 requests==2.31.0
+httpx==0.28.1
+setuptools>=79.0.0
 
 # Testing and linting
 pytest==8.3.5

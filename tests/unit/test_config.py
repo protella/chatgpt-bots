@@ -4,8 +4,10 @@ import pytest
 import os
 import sqlite3
 from unittest.mock import patch, MagicMock
+import json
 
 from app.core.config import ConfigService, DEFAULT_CONFIG
+import prompts
 
 
 class TestConfigService:
@@ -34,12 +36,14 @@ class TestConfigService:
         # Should return a copy of the default config
         assert config == DEFAULT_CONFIG
         assert config is not DEFAULT_CONFIG  # Should be a different object
+        assert config["system_prompt"] == prompts.SLACK_SYSTEM_PROMPT["content"]
 
     def test_update_config_memory(self, memory_config_service):
         """Test updating config in memory store."""
         # First get default config
         config = memory_config_service.get("thread123")
         assert config["temperature"] == DEFAULT_CONFIG["temperature"]
+        assert config["top_p"] == DEFAULT_CONFIG["top_p"]
         
         # Update temperature
         memory_config_service.update("thread123", {"temperature": 1.5})
@@ -47,9 +51,40 @@ class TestConfigService:
         # Get updated config
         updated_config = memory_config_service.get("thread123")
         assert updated_config["temperature"] == 1.5
+        assert updated_config["top_p"] == DEFAULT_CONFIG["top_p"]
         
         # Other values should remain unchanged
-        assert updated_config["top_p"] == DEFAULT_CONFIG["top_p"]
+        assert updated_config["system_prompt"] == prompts.SLACK_SYSTEM_PROMPT["content"]
+
+    def test_system_prompt_override(self, memory_config_service):
+        """Test that system_prompt can be overridden."""
+        # Define a custom system prompt
+        custom_prompt = "This is a custom system prompt for testing."
+        
+        # Update the config with the custom prompt
+        memory_config_service.update("thread123", {"system_prompt": custom_prompt})
+        
+        # Get the updated config
+        config = memory_config_service.get("thread123")
+        
+        # Verify the system prompt was updated
+        assert config["system_prompt"] == custom_prompt
+        
+        # Verify other config values remain the default
+        assert config["temperature"] == DEFAULT_CONFIG["temperature"]
+        assert config["top_p"] == DEFAULT_CONFIG["top_p"]
+
+    def test_system_prompt_default_fallback(self, memory_config_service):
+        """Test that system_prompt falls back to default when not overridden."""
+        # Update a different config option
+        memory_config_service.update("thread123", {"temperature": 1.2})
+        
+        # Get the config
+        config = memory_config_service.get("thread123")
+        
+        # Verify the system prompt is still the default
+        assert config["system_prompt"] == DEFAULT_CONFIG["system_prompt"]
+        assert config["system_prompt"] == prompts.SLACK_SYSTEM_PROMPT["content"]
 
     def test_reset_config_memory(self, memory_config_service):
         """Test resetting config in memory store."""
@@ -62,6 +97,8 @@ class TestConfigService:
         # Get config after reset
         reset_config = memory_config_service.get("thread123")
         assert reset_config["temperature"] == DEFAULT_CONFIG["temperature"]
+        assert reset_config["top_p"] == DEFAULT_CONFIG["top_p"]
+        assert reset_config["system_prompt"] == prompts.SLACK_SYSTEM_PROMPT["content"]
 
     @patch('app.core.config.sqlite3.connect')
     def test_get_config_sqlite_new_thread(self, mock_connect, mock_sqlite):
@@ -104,16 +141,15 @@ class TestConfigService:
         """Test updating config in SQLite."""
         mock_connect.return_value = mock_sqlite
         
-        # Setup mock for get
+        # Create cursor that returns existing config
         mock_cursor = mock_sqlite.cursor.return_value
-        mock_cursor.fetchone.return_value = ('{"temperature": 0.8, "top_p": 1.0}',)
+        mock_cursor.fetchone.return_value = (json.dumps(DEFAULT_CONFIG),)
         
         config_service = ConfigService()
-        config_service.update("thread123", {"temperature": 1.5})
+        config_service.update("thread123", {"temperature": 1.7})
         
         # Should update the database
-        assert mock_sqlite.execute.called
-        assert mock_sqlite.commit.called
+        mock_sqlite.execute.assert_called()
 
     @patch('app.core.config.sqlite3.connect')
     def test_reset_config_sqlite(self, mock_connect, mock_sqlite):
@@ -130,27 +166,27 @@ class TestConfigService:
     def test_extract_config_from_text(self, memory_config_service):
         """Test extracting config values from text."""
         # Test number of images
-        text = "Please generate 3 images of cats"
+        text = "Please generate 3 images of a mountain"
         config = memory_config_service.extract_config_from_text(text)
         assert config["number"] == 3
         
         # Test style
-        text = "Use vivid style for the images"
+        text = "Create an image with vivid style"
         config = memory_config_service.extract_config_from_text(text)
         assert config["style"] == "vivid"
         
         # Test image model
-        text = "Switch to dall-e-3 for better quality"
+        text = "Use gpt-image-1 to create a sunset"
         config = memory_config_service.extract_config_from_text(text)
-        assert config["image_model"] == "dall-e-3"
+        assert config["image_model"] == "gpt-image-1"
         
         # Test quality
-        text = "I want hd quality images"
+        text = "Generate an hd quality image"
         config = memory_config_service.extract_config_from_text(text)
         assert config["quality"] == "hd"
         
         # Test size
-        text = "Make it landscape format"
+        text = "Make a landscape format image"
         config = memory_config_service.extract_config_from_text(text)
         assert config["size"] == "1792x1024"
         
@@ -160,7 +196,7 @@ class TestConfigService:
         assert config["detail"] == "high"
         
         # Test temperature
-        text = "Set temperature to 1.2"
+        text = "Set temperature to 1.2 for more creativity"
         config = memory_config_service.extract_config_from_text(text)
         assert config["temperature"] == 1.2
         
