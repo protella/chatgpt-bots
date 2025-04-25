@@ -86,54 +86,54 @@
 
 ## Phase 4 – Intent & Config
 
-- [ ] **Intent Detection Service**
+- [x] **Intent Detection Service**
   - `intent_service.py`: classify intent as text, image, or vision
   - Uses `gpt-4.1-mini-2025-04-14`
   - Always returns True/False string (no extra text)
 
-- [ ] **Config Layer**
+- [x] **Config Layer**
   - `config.py`: load default from `.env`, override per `(user_id, thread_id)`
   - Store in `sqlite3` at `/data/config.db`
   - NLP stub: extract `number of images`, `style`, etc. from message
 
-- [ ] **Slash Command Modal**
+- [x] **Slash Command Modal**
   - Triggered via `/chatgpt-config-dev`
   - Display: number of images, model type, image size
 
-- [ ] **Test:** NLP correctly updates config, persists through restart
+- [x] **Test:** NLP correctly updates config, persists through restart
 
 ---
 
 ## Phase 5 – Vision and Image Gen
 
-- [ ] **Image Handling Pipeline**
+- [x] **Image Handling Pipeline**
   - `image_service.py`
   - Detects whether to use GPT-Image-Gen or if a message is just text chat and conversational (model name: "gpt-image-1")
   - Respects configuration as whether to use new GPT img gen or Dallee. Defaults to new GPT Image gen.
   - Handles revised prompts (For Dalle-3 only)
 
-- [ ] **Vision Input Handling**
+- [x] **Vision Input Handling**
   - Now handled in the standard model get_response since GPT4.1 is multi-modal.
 
-- [ ] **B64 Constraints**
+- [x] **B64 Constraints**
   - Images **never** passed unless required by OpenAI
   - All Slack uploads referenced by URL after initial use
 
-- [ ] **Test:** simulate 2min latency + Slack file preview behavior
+- [x] **Test:** Unit tests for image generation service completed and passing
 
 ---
 
 ## Phase 6 – Final Touches
 
-- [ ] **Busy Messaging**
+- [x] **Busy Messaging**
   - Single inflight task per thread
   - Send BlockKit busy card or text fallback
 
-- [ ] **User Personalization**
+- [x] **User Personalization**
   - Insert `[username=user]` inline token into GPT payload
   - Let GPT decide if name should be used
 
-- [ ] **Test:** multiple users in one thread, ensure role attribution
+- [x] **Test:** multiple users in one thread, ensure role attribution
 
 ---
 

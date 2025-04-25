@@ -74,14 +74,21 @@ def clean_temp_messages(channel_id: str, thread_ts: str) -> None:
     """
     key = f"{channel_id}:{thread_ts}"
     if key in cleanup_messages and cleanup_messages[key]:
+        logger.info(f"Cleaning up {len(cleanup_messages[key])} temporary messages in thread {thread_ts}")
+        
         for ts in cleanup_messages[key]:
             try:
                 app.client.chat_delete(channel=channel_id, ts=ts)
+                logger.debug(f"Successfully deleted temporary message {ts}")
             except Exception as e:
-                logger.debug(f"Error deleting message: {str(e)}")
+                # This is not a critical error - just log and continue
+                logger.debug(f"Error deleting temporary message {ts}: {str(e)}")
         
-        # Clear the list
+        # Clear the list after attempting to delete all messages
         cleanup_messages[key] = []
+        logger.info(f"Cleanup completed for thread {thread_ts}")
+    else:
+        logger.debug(f"No temporary messages to clean up for thread {thread_ts}")
 
 def process_and_respond(event: Dict[str, Any], say) -> None:
     """
@@ -106,7 +113,7 @@ def process_and_respond(event: Dict[str, Any], say) -> None:
     if queue_manager.is_processing_sync(thread_ts):
         logger.info(f"Thread {thread_ts} is already processing")
         busy_response = say(
-            text="I'm busy processing another request in this thread. Please wait a moment.",
+            text="I'm still working on your last request. Please wait a moment and try again.",
             thread_ts=thread_ts
         )
         if cleanup_key not in cleanup_messages:
@@ -124,10 +131,12 @@ def process_and_respond(event: Dict[str, Any], say) -> None:
         message_text = event.get("text", "")
         message_text = remove_slack_mentions(message_text)
         
-        # Add username context if available
+        # Get user's first name for personalization
         user_first_name = get_user_info(app.client, user_id)
         if user_first_name:
+            # Inject personalization tag at the beginning of the message
             message_text = f"[username={user_first_name}] {message_text}"
+            logger.info(f"Added personalization tag for user {user_first_name}")
         
         # Get thread configuration
         thread_config = config_service.get(thread_ts)
@@ -232,7 +241,7 @@ def process_and_respond(event: Dict[str, Any], say) -> None:
             except Exception as e:
                 logger.error(f"Error in intent detection: {str(e)}")
         
-        # Get response from OpenAI (will add image-specific routing in next phase)
+        # Get response from OpenAI
         response = chatbot.get_response(
             input_text=message_text,
             thread_id=thread_ts,
@@ -249,7 +258,7 @@ def process_and_respond(event: Dict[str, Any], say) -> None:
         else:
             logger.error(f"Error from OpenAI: {response['error']}")
             say(
-                text=f"I'm sorry, I encountered an error: {response['error']}",
+                text=":warning: Something went wrong. Please try again or contact support.",
                 thread_ts=thread_ts
             )
     
@@ -261,7 +270,7 @@ def process_and_respond(event: Dict[str, Any], say) -> None:
             
             # Send error message
             say(
-                text=f"Sorry, I encountered an unexpected error: {str(e)}",
+                text=":warning: Something went wrong. Please try again or contact support.",
                 thread_ts=thread_ts
             )
         except Exception as inner_e:
