@@ -1,0 +1,20 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+
+# Your rule content
+
+- Always make sure you're in the correct project folder before running commands or doing file operations.
+  - The correct folder for this project is: ~/environments/chatgpt-bots-dev/
+- When running docker commands, always run them with sudo
+- Always review and update the task list as you work on various features and to understand what's been done and what's next.
+  - Don't mark an item as complete until you've received confirmation from the user or a unit test that it's working properly
+- Always write unit tests (store them in the project root's tests folder as needed) for each feature and run the test suite after making changes. Start and stop the services as needed to faciliate your tests with "docker compose". Act like this is a mini cicd pipeline.
+- If there is a database compoonent to this project, assume it is already initialized unless you get errors that migrations haven't been applied, then ask the user for confirmation. 
+  - NEVER run any destructive migrations without confirmation from the user. 
+- This project runs in docker. Always use the docker compose file in the root to run the services. Don't try to manually run commands or python files outside of test scripts or other very specific situations where you might be trying to debug.
+- You previously setup a makefile in the project root for managing the tests. Don't build one-off tests to run manually, build them into the test suite with makefile and test them before completing your turn.
+- You have access to the context7 and Brave Search MCP tools. Use them as needed.
+  
