@@ -1,5 +1,93 @@
-# ChatGPT Bots
-Python based ChatGPT bot integrations
+# Slack AI Chatbot (V2)
+
+This project is a refactoring of the original chatbot to improve architecture, performance, and maintainability. The V2 version focuses exclusively on the Slack client while maintaining a modular design for future integration with other clients.
+
+## Features
+
+- Integration with Slack using the Slackbolt SDK
+- OpenAI integration using the modern Responses API
+- PostgreSQL database for storing conversation history and user configurations
+- Image generation capabilities using both dalle-3 and gpt-image-1 models
+- Contextual conversation handling with OpenAI's conversation history
+- NLP-based configuration management
+- Visual feedback for user requests
+- Docker containerization
+
+## Requirements
+
+- Docker and Docker Compose
+- Python 3.12 (for local development)
+- Slack API credentials
+- OpenAI API key
+
+## Environment Setup
+
+1. Ensure your `.env` file is properly configured with:
+   - Slack credentials (SLACK_BOT_TOKEN, SLACK_APP_TOKEN)
+   - OpenAI API key (OPENAI_KEY)
+   - Model configuration
+   - UI configuration
+   - Logging configuration
+
+2. Build and run the Docker containers:
+
+```bash
+# Build the containers
+make build
+
+# Start the services
+make up
+
+# View logs
+make logs
+```
+
+## Development
+
+### Running Tests
+
+```bash
+# Run all tests
+make test
+
+# Run tests with coverage report
+make test-coverage
+```
+
+### Stopping the Services
+
+```bash
+# Stop the services
+make down
+
+# Clean up everything including volumes
+make clean
+```
+
+## Project Structure
+
+- `slackbot.py` - Main Slack client code
+- `bot_functions.py` - Core bot functions
+- `common_utils.py` - Shared utility functions
+- `logger.py` - Logging configuration
+- `queue_manager.py` - Request queue management
+- `prompts.py` - System prompts for the LLM
+- `init_db.py` - Main database initialization script
+- `db/` - Database module
+  - `__init__.py` - Package initialization
+  - `connection.py` - Database connection management
+  - `init_db.py` - Database initialization logic
+  - `models.py` - Database models and operations
+  - `schema.sql` - Database schema definition
+- `tests/` - Test files
+- `Dockerfile` - Container definition
+- `docker-compose.yml` - Service orchestration
+
+## Database Schema
+
+- `conversations` - Links Slack thread IDs to OpenAI conversation IDs
+- `user_configs` - Stores per-user configuration options
+- `status_messages` - Tracks temporary status messages for cleanup
 
 ## Description
 ChatBot Integrations for Slack, Discord, and the CLI using Python and OpenAPI's ChatGPT platform. This bot is designed around GPT4 and supports GPT4 Vision and Dalle-3. The bots allow iteration on Dalle-3 images and will also determine if image creation is the appropriate action by using NLP. Talk to it just like you would with the ChatGPT website. Upload (multiple) images and have discussions or conduct analysis on them all in a single conversation (Slack Thread or Discord Channel). The Discord client is still a bit behind in development. The CLI client is for basic testing only.
