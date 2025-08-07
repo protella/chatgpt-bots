@@ -1,7 +1,6 @@
 import base64
 import os
 from copy import deepcopy
-from bot_functions import GPT_MODEL
 from prompts import IMAGE_CHECK_SYSTEM_PROMPT, IMAGE_GEN_SYSTEM_PROMPT
 import requests
 from dotenv import load_dotenv
@@ -13,6 +12,10 @@ if "UTILS_LOG_LEVEL" in os.environ:
 
 # Load environment variables
 load_dotenv()
+
+# Read model configuration from environment
+GPT_MODEL = os.environ.get("GPT_MODEL", "gpt-5")
+UTILITY_MODEL = os.environ.get("UTILITY_MODEL", GPT_MODEL)
 
 # Configure logging level from environment variable with fallback to INFO
 LOG_LEVEL_NAME = os.environ.get("UTILS_LOG_LEVEL", "INFO").upper()
@@ -64,7 +67,7 @@ def create_dalle3_prompt(message, gpt_Bot, thread_id):
     # Change the system prompt to the image generation prompt
     chat_history[0]['content'] = IMAGE_GEN_SYSTEM_PROMPT
     
-    # Get a response from GPT to use as a DALL-E 3 prompt
+    # Get a response from GPT to use as a DALL-E 3 prompt (use primary GPT model)
     dalle3_prompt = gpt_Bot.get_gpt_response(chat_history, GPT_MODEL)
 
     return dalle3_prompt
@@ -85,7 +88,7 @@ def check_for_image_generation(message, gpt_Bot, thread_id):
     logger.info(f"Checking if message is requesting image generation: {message[:50]}...")
     
     # Create a deep copy of the conversation history to avoid modifying the original
-    chat_history = deepcopy(gpt_Bot.conversations[thread_id]["messages"])
+    chat_history = deepcopy(gpt_Bot.conversations[thread_id]["messages"]) 
     
     # Log the original system prompt for debugging
     original_system_prompt = chat_history[0]['content']
@@ -124,11 +127,14 @@ def check_for_image_generation(message, gpt_Bot, thread_id):
     # Log the modified system prompt for debugging
     logger.debug(f"Image check system prompt: {IMAGE_CHECK_SYSTEM_PROMPT[:100]}...")
 
+    # Determine model for utility checks
+    model_for_check = UTILITY_MODEL
+
     # Set temperature to 0.0 to be fully deterministic and reduce randomness
     # Low max tokens helps force True/False response
     is_image_request = gpt_Bot.get_gpt_response(
         chat_history, 
-        GPT_MODEL, 
+        model_for_check, 
         temperature=1, 
         max_completion_tokens=10  # Increased from 5 to 10 to ensure we get the full response
     )

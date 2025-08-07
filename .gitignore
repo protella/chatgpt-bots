@@ -145,3 +145,7 @@ dmypy.json
 # Local logs
 logs/*
 !logs/.gitkeep
+
+# BMAD Method Folders
+.bmad-core/
+.bmad-infrastructure-devops/
