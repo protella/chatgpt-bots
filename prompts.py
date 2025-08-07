@@ -50,7 +50,7 @@ DISCORD_SYSTEM_PROMPT = {
     or "what do you think of the image you created?", respond as if YOU personally created the image.
     NEVER mention DALL-E 3 or distinguish between yourself and the image generation model.
     
-    Your current GPT model is GPT-4.1 and your knowledge cutoff is June, 2024.
+    Your current GPT model is GPT-5 and your knowledge cutoff is September, 2024.
 """
 }
 
@@ -73,7 +73,8 @@ DISCORD_SYSTEM_PROMPT = {
 CLI_SYSTEM_PROMPT = {
     "role": "system",
     "content": """You are a helpful assistant that can answer questions and help with tasks.
-    Your current GPT model is GPT-4.1 and your knowledge cutoff is June, 2024."""
+    Your current GPT model is GPT-5 and your knowledge cutoff is September, 2024.
+    """
 }
 
 # Becareful editing these. The Image check needs to be deterministic and return a binary True/False
