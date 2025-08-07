@@ -20,8 +20,8 @@ LOG_LEVEL = get_log_level(LOG_LEVEL_NAME)
 logger = get_logger('bot_functions', LOG_LEVEL)
 
 # Default models: https://platform.openai.com/docs/models
-GPT_MODEL = "gpt-5"
-DALLE_MODEL = "dall-e-3"
+GPT_MODEL = os.environ.get("GPT_MODEL", "gpt-5")
+DALLE_MODEL = os.environ.get("DALLE_MODEL", "dall-e-3")
 
 
 class ChatBot:
