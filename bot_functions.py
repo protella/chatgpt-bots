@@ -20,7 +20,7 @@ LOG_LEVEL = get_log_level(LOG_LEVEL_NAME)
 logger = get_logger('bot_functions', LOG_LEVEL)
 
 # Default models: https://platform.openai.com/docs/models
-GPT_MODEL = "gpt-4.1-2025-04-14"
+GPT_MODEL = "gpt-5"
 DALLE_MODEL = "dall-e-3"
 
 
@@ -49,7 +49,7 @@ class ChatBot:
         
         # Default configuration options
         self.config_option_defaults = {
-            "temperature": .8,  # 0.0 - 2.0
+            "temperature": 1,  # 0.0 - 2.0
             "top_p": 1,
             "max_completion_tokens": 2048,  # max 4096
             "custom_init": "",

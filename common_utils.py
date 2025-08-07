@@ -129,7 +129,7 @@ def check_for_image_generation(message, gpt_Bot, thread_id):
     is_image_request = gpt_Bot.get_gpt_response(
         chat_history, 
         GPT_MODEL, 
-        temperature=0.0, 
+        temperature=1, 
         max_completion_tokens=10  # Increased from 5 to 10 to ensure we get the full response
     )
     
