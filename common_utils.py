@@ -129,14 +129,40 @@ def check_for_image_generation(message, gpt_Bot, thread_id):
 
     # Determine model for utility checks
     model_for_check = UTILITY_MODEL
+    logger.info(f"Using model for image check: {model_for_check}")
 
-    # Set temperature to 0.0 to be fully deterministic and reduce randomness
-    # Low max tokens helps force True/False response
+    # Configure parameters based on model
+    # Check if it's a GPT-5 reasoning model
+    # Reasoning models: gpt-5, gpt-5-mini, gpt-5-nano (with dates)
+    model_lower = model_for_check.lower()
+    is_gpt5_reasoning = (
+        model_lower.startswith("gpt-5") and 
+        not "chat" in model_lower and
+        any(x in model_lower for x in ["gpt-5-", "gpt-5-mini", "gpt-5-nano"])
+    )
+    
+    if is_gpt5_reasoning:
+        # GPT-5 reasoning models (nano, mini, full) only support temperature=1
+        logger.debug("Configuring for GPT-5 reasoning model (temperature fixed at 1)")
+        temperature = 1
+        reasoning_effort = "minimal"  # Fastest reasoning for simple True/False
+        verbosity = "low"  # Short responses
+        max_completion_tokens = None  # Let model determine tokens needed
+    else:
+        # GPT-4, GPT-5-chat, and earlier models support temperature variations
+        logger.debug("Configuring for non-reasoning model (temperature 0.0 for deterministic output)")
+        temperature = 0.0  # Zero temperature for most deterministic True/False
+        reasoning_effort = None  # Not supported
+        verbosity = None  # Not supported
+        max_completion_tokens = 10  # Works fine with 10 tokens
+
     is_image_request = gpt_Bot.get_gpt_response(
         chat_history, 
         model_for_check, 
-        temperature=1, 
-        max_completion_tokens=10  # Increased from 5 to 10 to ensure we get the full response
+        temperature=temperature,
+        reasoning_effort=reasoning_effort,
+        verbosity=verbosity,
+        max_completion_tokens=max_completion_tokens
     )
     
     # Log the full response for debugging
