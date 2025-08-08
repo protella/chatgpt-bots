@@ -49,7 +49,7 @@ class ChatBot:
         
         # Default configuration options
         self.config_option_defaults = {
-            "temperature": 1,  # 0.0 - 2.0
+            "temperature": .8,  # 0.0 - 2.0
             "top_p": 1,
             "max_completion_tokens": 2048,  # max 4096
             "custom_init": "",
@@ -280,7 +280,7 @@ class ChatBot:
             print(f"##################\n{e}\n##################")
             return None, e
 
-    def get_gpt_response(self, messages_history, model, temperature=None, max_completion_tokens=None):
+    def get_gpt_response(self, messages_history, model, temperature=None, max_completion_tokens=None, reasoning_effort=None, verbosity=None):
         """
         Get a response from GPT.
         
@@ -291,6 +291,8 @@ class ChatBot:
                                           Defaults to the current config value.
             max_completion_tokens (int, optional): The maximum number of tokens for completion.
                                                  Defaults to the current config value.
+            reasoning_effort (str, optional): GPT-5 only - controls reasoning depth (minimal/low/medium/high).
+            verbosity (str, optional): GPT-5 only - controls response length (low/medium/high).
             
         Returns:
             object: The GPT response or an error.
@@ -302,15 +304,50 @@ class ChatBot:
             max_completion_tokens = self.current_config_options["max_completion_tokens"]
             
         try:
-            # Call the OpenAI API for chat completion
-            response = self.client.chat.completions.create(
-                model=model,
-                messages=messages_history,
-                stream=self.streaming_client,
-                temperature=float(temperature),
-                max_completion_tokens=int(max_completion_tokens),
-                top_p=float(self.current_config_options["top_p"]),
+            # Build API call parameters
+            api_params = {
+                "model": model,
+                "messages": messages_history,
+                "stream": self.streaming_client,
+            }
+            
+            # Determine if this is a GPT-5 reasoning model
+            # Reasoning models: gpt-5, gpt-5-mini, gpt-5-nano (with dates)
+            # Non-reasoning: gpt-5-chat-latest, gpt-4 models, etc.
+            model_lower = model.lower()
+            is_gpt5_reasoning = (
+                model_lower.startswith("gpt-5") and 
+                not "chat" in model_lower and
+                any(x in model_lower for x in ["gpt-5-", "gpt-5-mini", "gpt-5-nano"])
             )
+            
+            # Handle temperature based on model type
+            if is_gpt5_reasoning:
+                # GPT-5 reasoning models only support temperature=1
+                if temperature != 1:
+                    logger.debug(f"GPT-5 reasoning model detected, forcing temperature to 1 (was {temperature})")
+                api_params["temperature"] = 1.0
+                # GPT-5 reasoning models don't support top_p variations either
+            else:
+                # GPT-4, GPT-5-chat, and earlier support temperature and top_p
+                api_params["temperature"] = float(temperature)
+                api_params["top_p"] = float(self.current_config_options["top_p"])
+            
+            # Add max_completion_tokens only if specified (None means let model decide)
+            if max_completion_tokens is not None:
+                api_params["max_completion_tokens"] = int(max_completion_tokens)
+            
+            # Add GPT-5 reasoning-specific parameters only for reasoning models
+            if is_gpt5_reasoning:
+                if reasoning_effort is not None:
+                    api_params["reasoning_effort"] = reasoning_effort
+                    logger.debug(f"Using reasoning_effort: {reasoning_effort}")
+                if verbosity is not None:
+                    api_params["verbosity"] = verbosity
+                    logger.debug(f"Using verbosity: {verbosity}")
+            
+            # Call the OpenAI API for chat completion
+            response = self.client.chat.completions.create(**api_params)
             self.usage = response.usage
             return response.choices[0].message
 
