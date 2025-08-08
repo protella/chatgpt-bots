@@ -457,7 +457,7 @@ def process_image_and_respond(say, command, thread_ts=None, lock_already_held=Fa
     cmd = command["command"]
     channel = command["channel_id"]
 
-    logger.info(f"Processing image request: thread_ts={thread_ts}, text={text}, lock_already_held={lock_already_held}")
+    logger.info(f"Processing image request: thread_ts={thread_ts}, text_length={len(text) if text else 0}, lock_already_held={lock_already_held}")
 
     # Only check/acquire lock if not already held
     if not lock_already_held:
@@ -528,7 +528,7 @@ def process_image_and_respond(say, command, thread_ts=None, lock_already_held=Fa
             chat_del_ts[thread_ts].append(temp_response["ts"])
 
         # Generate image with DALL-E 3
-        logger.info(f"Calling image_context_mgr with text={text}")
+        logger.info(f"Calling image_context_mgr with text_length={len(text) if text else 0}")
         try:
             image, revised_prompt, is_error = gpt_Bot.image_context_mgr(text, thread_ts)
             logger.info(f"image_context_mgr returned: is_error={is_error}")
