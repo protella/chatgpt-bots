@@ -1,4 +1,5 @@
 import re
+import threading
 from os import environ
 from prompts import SLACK_SYSTEM_PROMPT
 from dotenv import load_dotenv
@@ -47,8 +48,9 @@ STREAMING_CLIENT = False  # not implemented for Slack...yet.
 # GPT4 vision supported image types
 ALLOWED_MIMETYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
-# List of message timestamps to cleanup after a response returns
-chat_del_ts = []  
+# Dictionary of message timestamps to cleanup after a response returns (per thread)
+chat_del_ts = {}
+chat_del_ts_lock = threading.Lock()  
 
 # Initialize Slack app
 app = App(token=SLACK_BOT_TOKEN)
@@ -252,7 +254,10 @@ def process_and_respond(event, say):
             text=f":no_entry: `{gpt_Bot.handle_busy()}` :no_entry:",
             thread_ts=thread_ts,
         )
-        chat_del_ts.append(response["message"]["ts"])
+        with chat_del_ts_lock:
+            if thread_ts not in chat_del_ts:
+                chat_del_ts[thread_ts] = []
+            chat_del_ts[thread_ts].append(response["message"]["ts"])
         return
 
     # Try to start processing this thread
@@ -293,7 +298,10 @@ def process_and_respond(event, say):
         if message_text or ("files" in event and event["files"]):
             # Send initial "thinking" message
             initial_response = say(f"Thinking... {LOADING_EMOJI}", thread_ts=thread_ts)
-            chat_del_ts.append(initial_response["message"]["ts"])
+            with chat_del_ts_lock:
+                if thread_ts not in chat_del_ts:
+                    chat_del_ts[thread_ts] = []
+                chat_del_ts[thread_ts].append(initial_response["message"]["ts"])
 
             # Check if user is requesting DALL-E 3 image generation
             logger.info(f"Checking if message is requesting image generation: {message_text}")
@@ -397,7 +405,7 @@ def process_and_respond(event, say):
                     )
 
                 # Cleanup busy/loading chat msgs
-                delete_chat_messages_sync(channel_id, chat_del_ts, say)
+                delete_chat_messages_sync(channel_id, thread_ts, say)
 
             # If just a normal text message, process with default chat context manager
             else:
@@ -417,7 +425,7 @@ def process_and_respond(event, say):
                     utils.handle_error(say, str(e), thread_ts=thread_ts)
 
                 # Cleanup busy/loading chat msgs
-                delete_chat_messages_sync(channel_id, chat_del_ts, say)
+                delete_chat_messages_sync(channel_id, thread_ts, say)
     except Exception as e:
         logger.error(f"Unexpected error in process_and_respond: {e}", exc_info=True)
         try:
@@ -460,7 +468,10 @@ def process_image_and_respond(say, command, thread_ts=None):
             text=f":no_entry: `{gpt_Bot.handle_busy()}` :no_entry:",
             thread_ts=thread_ts,
         )
-        chat_del_ts.append(response["message"]["ts"])
+        with chat_del_ts_lock:
+            if thread_ts not in chat_del_ts:
+                chat_del_ts[thread_ts] = []
+            chat_del_ts[thread_ts].append(response["message"]["ts"])
         return
 
     # Try to start processing this thread
@@ -501,7 +512,7 @@ def process_image_and_respond(say, command, thread_ts=None):
             }
 
         # Cleanup any previous status messages
-        delete_chat_messages_sync(channel, chat_del_ts, say)
+        delete_chat_messages_sync(channel, thread_ts, say)
 
         # Send "generating" message
         logger.info("Sending 'generating image' message")
@@ -510,7 +521,10 @@ def process_image_and_respond(say, command, thread_ts=None):
             text=f"Generating image, please wait... {LOADING_EMOJI}",
             thread_ts=thread_ts,
         )
-        chat_del_ts.append(temp_response["ts"])
+        with chat_del_ts_lock:
+            if thread_ts not in chat_del_ts:
+                chat_del_ts[thread_ts] = []
+            chat_del_ts[thread_ts].append(temp_response["ts"])
 
         # Generate image with DALL-E 3
         logger.info(f"Calling image_context_mgr with text={text}")
@@ -550,7 +564,7 @@ def process_image_and_respond(say, command, thread_ts=None):
             utils.handle_error(say, str(e), thread_ts=thread_ts)
             
         # Cleanup status messages
-        delete_chat_messages_sync(channel, chat_del_ts, say)
+        delete_chat_messages_sync(channel, thread_ts, say)
     except Exception as e:
         logger.error(f"Unexpected error in process_image_and_respond: {e}", exc_info=True)
         try:
@@ -566,20 +580,23 @@ def process_image_and_respond(say, command, thread_ts=None):
         queue_manager.finish_processing_sync(thread_ts)
 
 
-def delete_chat_messages_sync(channel, timestamps, say, thread_ts=None):
+def delete_chat_messages_sync(channel, thread_ts, say):
     """
     Delete temporary status or progress messages the bot sends to Slack.
     
     Args:
         channel (str): The channel ID.
-        timestamps (list): List of message timestamps to delete.
+        thread_ts (str): The timestamp of the thread.
         say (callable): A function to send messages to Slack.
-        thread_ts (str, optional): The timestamp of the thread. Defaults to None.
     """
+    # Get timestamps for this thread and remove from dictionary
+    with chat_del_ts_lock:
+        timestamps = chat_del_ts.pop(thread_ts, [])
+    
     if not timestamps:
         return
         
-    logger.debug(f"Deleting {len(timestamps)} messages")
+    logger.debug(f"Deleting {len(timestamps)} messages for thread {thread_ts}")
     try:
         for ts in timestamps:
             try:
@@ -594,8 +611,6 @@ def delete_chat_messages_sync(channel, timestamps, say, thread_ts=None):
             f":no_entry: `Sorry, I ran into an error cleaning up my own messages.` :no_entry:\n```{e}```",
             thread_ts=thread_ts,
         )
-    finally:
-        chat_del_ts.clear()
 
 
 def remove_userid(message_text):
