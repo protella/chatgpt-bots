@@ -332,15 +332,13 @@ def process_and_respond(event, say):
                     "command": "dalle-3 via conversational chat",
                 }
                 
-                # Release thread lock before image processing
-                logger.info("Finishing processing before calling process_image_and_respond")
-                queue_manager.finish_processing_sync(thread_ts)
-                
-                logger.info("Calling process_image_and_respond")
-                process_image_and_respond(say, message_event, thread_ts)
+                # Call process_image_and_respond with lock_already_held=True
+                # The lock will be released by the finally block in process_and_respond
+                logger.info("Calling process_image_and_respond with existing lock")
+                process_image_and_respond(say, message_event, thread_ts, lock_already_held=True)
                 logger.info("Returned from process_image_and_respond")
                 
-                return  # Prevent duplicate finish_processing_sync calls
+                return  # Exit early, finally block will handle cleanup
 
             # If there are files in the message (GPT Vision request or other file types)
             elif "files" in event and event["files"]:
@@ -441,7 +439,7 @@ def process_and_respond(event, say):
         queue_manager.finish_processing_sync(thread_ts)
 
 
-def process_image_and_respond(say, command, thread_ts=None):
+def process_image_and_respond(say, command, thread_ts=None, lock_already_held=False):
     """
     Process an image generation request and respond with the generated image.
     
@@ -452,32 +450,35 @@ def process_image_and_respond(say, command, thread_ts=None):
         say (callable): A function to send messages to Slack.
         command (dict): The command data containing the prompt and user info.
         thread_ts (str, optional): The timestamp of the thread. Defaults to None.
+        lock_already_held (bool, optional): Whether the processing lock is already held. Defaults to False.
     """
     user_id = command["user_id"]
     text = command["text"]
     cmd = command["command"]
     channel = command["channel_id"]
 
-    logger.info(f"Processing image request: thread_ts={thread_ts}, text={text}")
+    logger.info(f"Processing image request: thread_ts={thread_ts}, text={text}, lock_already_held={lock_already_held}")
 
-    # Check if this thread is already processing
-    if queue_manager.is_processing_sync(thread_ts):
-        logger.info(f"Thread {thread_ts} is already processing, sending busy message")
-        response = app.client.chat_postMessage(
-            channel=channel,
-            text=f":no_entry: `{gpt_Bot.handle_busy()}` :no_entry:",
-            thread_ts=thread_ts,
-        )
-        with chat_del_ts_lock:
-            if thread_ts not in chat_del_ts:
-                chat_del_ts[thread_ts] = []
-            chat_del_ts[thread_ts].append(response["message"]["ts"])
-        return
+    # Only check/acquire lock if not already held
+    if not lock_already_held:
+        # Check if this thread is already processing
+        if queue_manager.is_processing_sync(thread_ts):
+            logger.info(f"Thread {thread_ts} is already processing, sending busy message")
+            response = app.client.chat_postMessage(
+                channel=channel,
+                text=f":no_entry: `{gpt_Bot.handle_busy()}` :no_entry:",
+                thread_ts=thread_ts,
+            )
+            with chat_del_ts_lock:
+                if thread_ts not in chat_del_ts:
+                    chat_del_ts[thread_ts] = []
+                chat_del_ts[thread_ts].append(response["message"]["ts"])
+            return
 
-    # Try to start processing this thread
-    if not queue_manager.start_processing_sync(thread_ts):
-        logger.info(f"Failed to start processing thread {thread_ts}")
-        return  # Another concurrent call got here first
+        # Try to start processing this thread
+        if not queue_manager.start_processing_sync(thread_ts):
+            logger.info(f"Failed to start processing thread {thread_ts}")
+            return  # Another concurrent call got here first
 
     try:
         # Validate prompt
@@ -575,9 +576,10 @@ def process_image_and_respond(say, command, thread_ts=None):
         except:
             pass
     finally:
-        # Always cleanup, even if there was an error
-        logger.info(f"Finishing processing for thread {thread_ts}")
-        queue_manager.finish_processing_sync(thread_ts)
+        # Only release lock if we acquired it (not if it was already held)
+        if not lock_already_held:
+            logger.info(f"Finishing processing for thread {thread_ts}")
+            queue_manager.finish_processing_sync(thread_ts)
 
 
 def delete_chat_messages_sync(channel, thread_ts, say):
