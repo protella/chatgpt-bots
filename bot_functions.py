@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from PIL import Image
 from logger import setup_logger, get_log_level, get_logger
+from common_utils import get_model_capabilities
 
 # Unset any existing log level environment variables to ensure .env values are used
 if "BOT_LOG_LEVEL" in os.environ:
@@ -313,22 +314,15 @@ class ChatBot:
                 "stream": self.streaming_client,
             }
             
-            # Determine if this is a GPT-5 reasoning model
-            # Reasoning models: gpt-5, gpt-5-mini, gpt-5-nano (with dates)
-            # Non-reasoning: gpt-5-chat-latest, gpt-4 models, etc.
-            model_lower = model.lower()
-            is_gpt5_reasoning = (
-                model_lower.startswith("gpt-5") and 
-                not "chat" in model_lower and
-                any(x in model_lower for x in ["gpt-5-", "gpt-5-mini", "gpt-5-nano"])
-            )
+            # Determine model capabilities
+            capabilities = get_model_capabilities(model)
             
-            # Handle temperature based on model type
-            if is_gpt5_reasoning:
+            # Handle temperature based on model capabilities
+            if capabilities["is_reasoning"]:
                 # GPT-5 reasoning models only support temperature=1
-                if temperature != 1:
-                    logger.debug(f"GPT-5 reasoning model detected, forcing temperature to 1 (was {temperature})")
-                api_params["temperature"] = 1.0
+                if temperature != capabilities["fixed_temperature"]:
+                    logger.debug(f"GPT-5 reasoning model detected, forcing temperature to {capabilities['fixed_temperature']} (was {temperature})")
+                api_params["temperature"] = capabilities["fixed_temperature"]
                 # GPT-5 reasoning models don't support top_p variations either
             else:
                 # GPT-4, GPT-5-chat, and earlier support temperature and top_p
@@ -340,18 +334,23 @@ class ChatBot:
                 api_params["max_completion_tokens"] = int(max_completion_tokens)
             
             # Add GPT-5 reasoning-specific parameters only for reasoning models
-            if is_gpt5_reasoning:
+            if capabilities["supports_reasoning_effort"]:
                 # Use provided values or fall back to config defaults
                 if reasoning_effort is not None:
                     api_params["reasoning_effort"] = reasoning_effort
+                elif "reasoning_effort" in self.current_config_options:
+                    api_params["reasoning_effort"] = self.current_config_options["reasoning_effort"]
                 else:
-                    api_params["reasoning_effort"] = self.current_config_options.get("reasoning_effort", "medium")
+                    api_params["reasoning_effort"] = "medium"
                 logger.debug(f"Using reasoning_effort: {api_params.get('reasoning_effort')}")
-                
+            
+            if capabilities["supports_verbosity"]:
                 if verbosity is not None:
                     api_params["verbosity"] = verbosity
+                elif "verbosity" in self.current_config_options:
+                    api_params["verbosity"] = self.current_config_options["verbosity"]
                 else:
-                    api_params["verbosity"] = self.current_config_options.get("verbosity", "medium")
+                    api_params["verbosity"] = "medium"
                 logger.debug(f"Using verbosity: {api_params.get('verbosity')}")
             
             # Call the OpenAI API for chat completion

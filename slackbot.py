@@ -283,6 +283,12 @@ def process_and_respond(event, say):
             remove_userid(message_text), say, thread_ts, is_thread
         )
 
+        # If parse_text returned None, it means a command was processed
+        # Don't continue with normal message processing
+        if message_text is None:
+            logger.debug(f"Command was processed for thread {thread_ts}, skipping normal message processing")
+            return
+
         # Process the message if there's text or files
         if message_text or ("files" in event and event["files"]):
             # Send initial "thinking" message
