@@ -579,9 +579,9 @@ def delete_chat_messages_sync(channel, timestamps, say, thread_ts=None):
             try:
                 app.client.chat_delete(channel=channel, ts=ts)
             except Exception as e:
-                # Silently ignore errors for individual message deletions
-                logger.debug(f"Error deleting message {ts}: {e}")
-                pass
+                # Log errors for individual message deletions at debug level
+                # These are often expected (e.g., message already deleted)
+                logger.debug(f"Failed to delete message {ts}: {e}")
     except Exception as e:
         logger.error(f"Error deleting messages: {e}", exc_info=True)
         say(
