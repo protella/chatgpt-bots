@@ -23,6 +23,60 @@ LOG_LEVEL = get_log_level(LOG_LEVEL_NAME)
 # Initialize logger with the configured log level
 logger = get_logger('common_utils', LOG_LEVEL)
 
+def get_model_capabilities(model_name):
+    """
+    Determine the capabilities and constraints of a given model.
+    
+    Args:
+        model_name (str): The name of the model to check
+        
+    Returns:
+        dict: A dictionary containing model capabilities and constraints:
+            - is_reasoning: bool - Whether this is a reasoning model
+            - supports_temperature: bool - Whether temperature parameter is supported
+            - supports_top_p: bool - Whether top_p parameter is supported
+            - fixed_temperature: float or None - Fixed temperature value if constrained
+            - supports_reasoning_effort: bool - Whether reasoning_effort parameter is supported
+            - supports_verbosity: bool - Whether verbosity parameter is supported
+            - model_family: str - The model family (gpt-5, gpt-4, etc.)
+    """
+    model_lower = model_name.lower()
+    
+    # GPT-5 reasoning models: gpt-5, gpt-5-mini, gpt-5-nano (without 'chat' in name)
+    # These models have dates like gpt-5-2025-01-07
+    is_gpt5_reasoning = (
+        model_lower.startswith("gpt-5") and 
+        "chat" not in model_lower and
+        any(variant in model_lower for variant in ["gpt-5-2", "gpt-5-mini", "gpt-5-nano", "gpt-5-0"])
+    )
+    
+    # GPT-5 chat models (e.g., gpt-5-chat-latest)
+    is_gpt5_chat = model_lower.startswith("gpt-5") and "chat" in model_lower
+    
+    # Determine model family
+    if model_lower.startswith("gpt-5"):
+        model_family = "gpt-5"
+    elif model_lower.startswith("gpt-4"):
+        model_family = "gpt-4"
+    elif model_lower.startswith("gpt-3"):
+        model_family = "gpt-3"
+    else:
+        model_family = "unknown"
+    
+    capabilities = {
+        "is_reasoning": is_gpt5_reasoning,
+        "supports_temperature": not is_gpt5_reasoning,  # Reasoning models don't support temperature variation
+        "supports_top_p": not is_gpt5_reasoning,  # Reasoning models don't support top_p
+        "fixed_temperature": 1.0 if is_gpt5_reasoning else None,
+        "supports_reasoning_effort": is_gpt5_reasoning,
+        "supports_verbosity": is_gpt5_reasoning,
+        "model_family": model_family,
+        "is_gpt5_chat": is_gpt5_chat
+    }
+    
+    logger.debug(f"Model capabilities for {model_name}: {capabilities}")
+    return capabilities
+
 def create_dalle3_prompt(message, gpt_Bot, thread_id):
     """
     Use ChatGPT to generate a DALL-E 3 prompt based on the message and chat history.
@@ -131,20 +185,13 @@ def check_for_image_generation(message, gpt_Bot, thread_id):
     model_for_check = UTILITY_MODEL
     logger.info(f"Using model for image check: {model_for_check}")
 
-    # Configure parameters based on model
-    # Check if it's a GPT-5 reasoning model
-    # Reasoning models: gpt-5, gpt-5-mini, gpt-5-nano (with dates)
-    model_lower = model_for_check.lower()
-    is_gpt5_reasoning = (
-        model_lower.startswith("gpt-5") and 
-        not "chat" in model_lower and
-        any(x in model_lower for x in ["gpt-5-", "gpt-5-mini", "gpt-5-nano"])
-    )
+    # Configure parameters based on model capabilities
+    capabilities = get_model_capabilities(model_for_check)
     
-    if is_gpt5_reasoning:
+    if capabilities["is_reasoning"]:
         # GPT-5 reasoning models (nano, mini, full) only support temperature=1
         logger.debug("Configuring for GPT-5 reasoning model (temperature fixed at 1)")
-        temperature = 1
+        temperature = capabilities["fixed_temperature"]
         reasoning_effort = "minimal"  # Fastest reasoning for simple True/False
         verbosity = "low"  # Short responses
         max_completion_tokens = None  # Let model determine tokens needed
@@ -152,17 +199,26 @@ def check_for_image_generation(message, gpt_Bot, thread_id):
         # GPT-4, GPT-5-chat, and earlier models support temperature variations
         logger.debug("Configuring for non-reasoning model (temperature 0.0 for deterministic output)")
         temperature = 0.0  # Zero temperature for most deterministic True/False
-        reasoning_effort = None  # Not supported
-        verbosity = None  # Not supported
+        reasoning_effort = None  # Not supported - don't pass to API
+        verbosity = None  # Not supported - don't pass to API
         max_completion_tokens = 10  # Works fine with 10 tokens
 
+    # Build parameters dict, only including supported parameters
+    api_params = {
+        "temperature": temperature,
+        "max_completion_tokens": max_completion_tokens
+    }
+    
+    # Only add reasoning-specific parameters if they're supported and not None
+    if capabilities["supports_reasoning_effort"] and reasoning_effort is not None:
+        api_params["reasoning_effort"] = reasoning_effort
+    if capabilities["supports_verbosity"] and verbosity is not None:
+        api_params["verbosity"] = verbosity
+    
     is_image_request = gpt_Bot.get_gpt_response(
         chat_history, 
-        model_for_check, 
-        temperature=temperature,
-        reasoning_effort=reasoning_effort,
-        verbosity=verbosity,
-        max_completion_tokens=max_completion_tokens
+        model_for_check,
+        **api_params
     )
     
     # Log the full response for debugging
