@@ -10,7 +10,15 @@ For a detailed list of recent changes and improvements, please see the [CHANGELO
 
 ## Getting Started
 
-Requires `Python 3.10+` as the script takes advantage of the new structural pattern matching (match/case) in this version.  
+Requires `Python 3.10+` as the script takes advantage of the new structural pattern matching (match/case) in this version.
+
+### GPT-5 Model Support
+**Important**: GPT-5 models require the latest OpenAI SDK. Update with: `pip install openai --upgrade`
+
+**GPT-5 Breaking Changes:**
+- GPT-5 reasoning models (`gpt-5`, `gpt-5-mini`, `gpt-5-nano`) only support `temperature=1.0` and do not support `top_p`
+- GPT-5 chat variant (`gpt-5-chat-latest`) supports standard temperature and top_p parameters
+- New parameters for GPT-5 reasoning models: `reasoning_effort` (minimal/low/medium/high) and `verbosity` (low/medium/high)  
 
 The setup of a Slack or Discord App is out of scope of this README. There's plenty of documentation online detailing these processes.
   

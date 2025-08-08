@@ -279,7 +279,7 @@ class ChatBot:
                 return png_image, revised_prompt
 
         except Exception as e:
-            print(f"##################\n{e}\n##################")
+            logger.error(f"Error generating DALL-E image: {e}", exc_info=True)
             return None, e
 
     def get_gpt_response(self, messages_history, model, temperature=None, max_completion_tokens=None, reasoning_effort=None, verbosity=None):
@@ -360,7 +360,7 @@ class ChatBot:
             return response.choices[0].message
 
         except Exception as e:
-            print(f"##################\n{e}\n##################")
+            logger.error(f"Error getting GPT response: {e}", exc_info=True)
             return e
 
     def is_processing(self, thread_id):
