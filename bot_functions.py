@@ -20,7 +20,7 @@ LOG_LEVEL = get_log_level(LOG_LEVEL_NAME)
 logger = get_logger('bot_functions', LOG_LEVEL)
 
 # Default models: https://platform.openai.com/docs/models
-GPT_MODEL = os.environ.get("GPT_MODEL", "gpt-5")
+GPT_MODEL = os.environ.get("GPT_MODEL", "gpt-5-chat-latest")
 DALLE_MODEL = os.environ.get("DALLE_MODEL", "dall-e-3")
 
 
@@ -49,9 +49,11 @@ class ChatBot:
         
         # Default configuration options
         self.config_option_defaults = {
-            "temperature": .8,  # 0.0 - 2.0
-            "top_p": 1,
+            "temperature": .8,  # 0.0 - 2.0 (GPT-5 reasoning models only support 1.0)
+            "top_p": 1, # 0.0 - 1.0 (not supported in GPT-5 reasoning models)
             "max_completion_tokens": 2048,  # max 4096
+            "reasoning_effort": "medium",  # GPT-5 only: minimal, low, medium, high
+            "verbosity": "medium",  # GPT-5 only: low, medium, high
             "custom_init": "",
             "gpt_model": GPT_MODEL,
             "dalle_model": DALLE_MODEL,
@@ -339,12 +341,18 @@ class ChatBot:
             
             # Add GPT-5 reasoning-specific parameters only for reasoning models
             if is_gpt5_reasoning:
+                # Use provided values or fall back to config defaults
                 if reasoning_effort is not None:
                     api_params["reasoning_effort"] = reasoning_effort
-                    logger.debug(f"Using reasoning_effort: {reasoning_effort}")
+                else:
+                    api_params["reasoning_effort"] = self.current_config_options.get("reasoning_effort", "medium")
+                logger.debug(f"Using reasoning_effort: {api_params.get('reasoning_effort')}")
+                
                 if verbosity is not None:
                     api_params["verbosity"] = verbosity
-                    logger.debug(f"Using verbosity: {verbosity}")
+                else:
+                    api_params["verbosity"] = self.current_config_options.get("verbosity", "medium")
+                logger.debug(f"Using verbosity: {api_params.get('verbosity')}")
             
             # Call the OpenAI API for chat completion
             response = self.client.chat.completions.create(**api_params)

@@ -14,7 +14,7 @@ if "UTILS_LOG_LEVEL" in os.environ:
 load_dotenv()
 
 # Read model configuration from environment
-GPT_MODEL = os.environ.get("GPT_MODEL", "gpt-5")
+GPT_MODEL = os.environ.get("GPT_MODEL", "gpt-5-chat-latest")
 UTILITY_MODEL = os.environ.get("UTILITY_MODEL", GPT_MODEL)
 
 # Configure logging level from environment variable with fallback to INFO

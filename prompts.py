@@ -89,6 +89,11 @@ Consider the following when making your determination:
 4. Requests for the bot to "imagine" something visual
 5. Requests that mention DALL-E, image generation, or art creation
 6. Context from previous messages that might indicate the current message is continuing an image request
+7. IMPORTANT: If an image was recently generated in the conversation and the user is asking for modifications 
+   (e.g., "make it blue", "add a dog", "change the background", "make it all green apples"), this IS an image request
+
+Pay special attention to follow-up messages after image generation. Requests to modify, change, adjust, or redo 
+visual elements from a recently generated image should be considered image generation requests.
 
 Even if the message is phrased as a question, if the intent is to get an image created, respond with 'True'.
 If the message is just asking for information, having a conversation, or requesting non-image content, respond with 'False'.
@@ -112,7 +117,19 @@ User: "What's the capital of France?"
 Response: False
 
 User: "Imagine a world where robots and humans live together"
-Response: True"""
+Response: True
+
+Context: [Previous message generated an image of a fruit basket]
+User: "Make it all green apples"
+Response: True
+
+Context: [Previous message generated an image of a city]
+User: "Add more buildings"
+Response: True
+
+Context: [Previous message was regular conversation]
+User: "Make it blue"
+Response: False"""
 
 IMAGE_GEN_SYSTEM_PROMPT = """You will be provided with a user's chat message and context history for a chatbot integration.
 The message has been predetermined to be a request for a DALL-E 3 generative art image. 
