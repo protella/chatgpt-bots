@@ -1,5 +1,6 @@
 import re
 import threading
+import logging
 from os import environ
 from prompts import SLACK_SYSTEM_PROMPT
 from dotenv import load_dotenv
@@ -81,17 +82,9 @@ def parse_text(text, say, thread_ts, is_thread=False):
         thread_ts = None
 
     match text.lower():
-        case "!history":
-            logger.info(f"History command received in thread {thread_ts}")
-            say(f"```{gpt_Bot.history_command(thread_ts)}```", thread_ts=thread_ts)
-
         case "!help":
             logger.info(f"Help command received in thread {thread_ts}")
             say(f"```{gpt_Bot.help_command()}```", thread_ts=thread_ts)
-
-        case "!usage":
-            logger.info(f"Usage command received in thread {thread_ts}")
-            say(f"```{gpt_Bot.usage_command()}```", thread_ts=thread_ts)
 
         case "!config":
             logger.info(f"Config command received in thread {thread_ts}")
@@ -155,7 +148,7 @@ def rebuild_thread_history(say, channel_id, thread_id, bot_user_id):
         }
         
         # Bot commands and responses to ignore when rebuilding history
-        bot_commands = ["!history", "!help", "!usage", "!config", "!reset"]
+        bot_commands = ["!help", "!config", "!reset"]
         response_patterns = [
             "Cumulative Token stats since last reset:",
             "Current Configuration:",
@@ -166,64 +159,115 @@ def rebuild_thread_history(say, channel_id, thread_id, bot_user_id):
             "[HISTORY]",
             "Thinking...",
             "Generating image",
-            "I'm busy processing"
+            "I'm busy processing",
+            ":no_entry:",  # Error messages
+            ":warning:",   # Warning messages
+            "An error occurred",
+            "Sorry, I ran into"
             ]
 
         # Process each message in the thread
         for msg in messages[:-1]:  # Skip the most recent message (current one)
             text = msg.get("text", "").strip()
             
-            # Skip empty messages
-            if not text:
+            # Skip empty messages (unless they have files)
+            if not text and not msg.get("files"):
                 continue
 
             # Skip bot command messages
             if any(text.lower().startswith(command) for command in bot_commands):
                 continue
             
-            # Skip bot response messages
+            # Skip bot response messages (including errors)
             if any(response_pattern in text for response_pattern in response_patterns):
-                continue        
+                continue
+            
             
             # Determine message role (assistant or user)
             role = "assistant" if msg.get("user") == bot_user_id else "user"
+            
+            # Check if this is a DALL-E image upload from the assistant
+            is_dalle_upload = False
+            dalle_image_b64 = None
+            if role == "assistant" and msg.get("files"):
+                for file in msg.get("files", []):
+                    if file.get("mimetype") in ALLOWED_MIMETYPES:
+                        # Check if this looks like a DALL-E image
+                        if "dalle" in file.get("name", "").lower() or (text and "image I created" in text):
+                            is_dalle_upload = True
+                            # Download and encode the DALL-E image
+                            image_url = file.get("url_private")
+                            if image_url:
+                                try:
+                                    dalle_image_b64 = utils.download_and_encode_file(
+                                        say, image_url, SLACK_BOT_TOKEN
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Error encoding DALL-E image: {e}", exc_info=True)
+                            break
+            
+            # Handle DALL-E uploads specially - split into two messages
+            if is_dalle_upload and dalle_image_b64:
+                # First, add an assistant message with the text
+                assistant_text = text if text else "I've created an image based on your request."
+                gpt_Bot.conversations[thread_id]["messages"].append({
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": assistant_text}]
+                })
+                
+                # Then add the image as a user message (for API compatibility)
+                gpt_Bot.conversations[thread_id]["messages"].append({
+                    "role": "user",
+                    "content": [{
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{dalle_image_b64}"
+                    }]
+                })
+                
+                # Skip normal processing since we handled it
+                continue
+            
+            # Normal message processing for non-DALL-E messages
             content = []
-
+            
             # Add text content
-            content.append({"type": "text", "text": remove_userid(msg.get("text"))})
-
-            # Rebuild image history in b64 encoded format
-            files = msg.get("files", [])
-            for file in files:
-                if file.get("mimetype") in ALLOWED_MIMETYPES:
-                    image_url = file.get("url_private")
-                    if image_url:
-                        try:
-                            encoded_image = utils.download_and_encode_file(
-                                say, image_url, SLACK_BOT_TOKEN
-                            )
-                            if encoded_image:
-                                if role == "assistant":
-                                    # OpenAI API restriction doesn't allow image urls for the assistant role
-                                    role = "user"  # Force them to user
-                                content.append(
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {
-                                            "url": f"data:image/png;base64,{encoded_image}",
-                                            "detail": gpt_Bot.current_config_options["detail"],
-                                        },
-                                    }
+            if text:
+                if role == "assistant":
+                    content.append({"type": "output_text", "text": remove_userid(text)})
+                else:
+                    content.append({"type": "input_text", "text": remove_userid(text)})
+            
+            # Process user-uploaded images
+            if role == "user":
+                files = msg.get("files", [])
+                for file in files:
+                    if file.get("mimetype") in ALLOWED_MIMETYPES:
+                        image_url = file.get("url_private")
+                        if image_url:
+                            try:
+                                encoded_image = utils.download_and_encode_file(
+                                    say, image_url, SLACK_BOT_TOKEN
                                 )
-                        except Exception as e:
-                            logger.error(f"Error encoding image: {e}", exc_info=True)
-
-            # Add message to conversation history
-            gpt_Bot.conversations[thread_id]["messages"].append(
-                {"role": role, "content": content}
-            )
+                                if encoded_image:
+                                    content.append({
+                                        "type": "input_image",
+                                        "image_url": f"data:image/png;base64,{encoded_image}"
+                                    })
+                            except Exception as e:
+                                logger.error(f"Error encoding user image: {e}", exc_info=True)
+            
+            # Only add message to conversation history if it has content
+            if content:
+                gpt_Bot.conversations[thread_id]["messages"].append(
+                    {"role": role, "content": content}
+                )
         
         logger.info(f"Rebuilt conversation history with {len(gpt_Bot.conversations[thread_id]['messages']) - 1} messages")
+        
+        # Debug: Log the formatted conversation history
+        if logger.isEnabledFor(logging.DEBUG):
+            formatted_history = utils.format_message_for_debug(gpt_Bot.conversations[thread_id])
+            logger.debug(f"Rebuilt conversation history:\n{formatted_history}")
     except Exception as e:
         logger.error(f"Error rebuilding thread history: {e}", exc_info=True)
         raise
@@ -303,21 +347,23 @@ def process_and_respond(event, say):
                     chat_del_ts[thread_ts] = []
                 chat_del_ts[thread_ts].append(initial_response["message"]["ts"])
 
-            # Check if user is requesting DALL-E 3 image generation
-            logger.info(f"Checking if message is requesting image generation: {message_text}")
-            trigger_check = utils.check_for_image_generation(
-                message_text, gpt_Bot, thread_ts)
-            logger.info(f"Image generation check result: {trigger_check}")
+            # Check if there are files in the message first - this means vision request, not image generation
+            has_files = "files" in event and event["files"]
+            
+            # Only check for image generation if there are NO files
+            # Files present = vision request, not image generation
+            if not has_files:
+                logger.info(f"No files present, checking if message is requesting image generation: {message_text}")
+                trigger_check = utils.check_for_image_generation(
+                    message_text, gpt_Bot, thread_ts)
+                logger.info(f"Image generation check result: {trigger_check}")
+            else:
+                logger.info("Files present in message, treating as vision request")
+                trigger_check = False
 
-            # If intent was likely a DALL-E 3 image gen request
+            # If intent was likely a DALL-E 3 image gen request (and no files present)
             if trigger_check:
                 logger.info(f"Processing image generation request: {message_text}")
-                if "files" in event and event["files"]:
-                    logger.warning("Ignoring included file with Dalle-3 request")
-                    say(
-                        ":warning:Ignoring included file with Dalle-3 request. Image gen based on provided images is not yet supported with Dalle-3.:warning:",
-                        thread_ts=thread_ts,
-                    )
                 
                 # Create DALL-E 3 prompt from history
                 logger.info("Creating DALL-E 3 prompt from history")
@@ -341,7 +387,7 @@ def process_and_respond(event, say):
                 return  # Exit early, finally block will handle cleanup
 
             # If there are files in the message (GPT Vision request or other file types)
-            elif "files" in event and event["files"]:
+            elif has_files:
                 logger.info("Processing message with files")
                 files_data = event.get("files", [])
                 vision_files = []
@@ -544,7 +590,8 @@ def process_image_and_respond(say, command, thread_ts=None, lock_already_held=Fa
                     file_description = f"*DALL·E-3 generated revised Prompt:*\n_{revised_prompt}_"
                     logger.info(f"Revised prompt: {revised_prompt}")
                 else:
-                    file_description = None
+                    # Always include some text so we have context when rebuilding from Slack
+                    file_description = "Here's the image I created for you."
                     
                 try:
                     # Upload the generated image to Slack

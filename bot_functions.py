@@ -1,6 +1,6 @@
 import base64
 import os
-from copy import deepcopy
+import logging
 from io import BytesIO
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -46,7 +46,6 @@ class ChatBot:
         self.conversations = {}
         self.show_dalle3_revised_prompt = show_dalle3_revised_prompt
         self.streaming_client = streaming_client  # ToDo: Implement streaming support
-        self.usage = {}
         
         # Default configuration options
         self.config_option_defaults = {
@@ -89,8 +88,26 @@ class ChatBot:
         try:
             # Add user message to conversation history
             self.conversations[thread_id]["messages"].append(
-                {"role": "user", "content": [{"type": "text", "text": message_text}]}
+                {"role": "user", "content": [{"type": "input_text", "text": message_text}]}
             )
+            
+            # Debug: Log what we're about to send to the API
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"Messages being sent to API (count: {len(self.conversations[thread_id]['messages'])})")
+                # Log first and last few messages to avoid huge logs
+                msgs = self.conversations[thread_id]["messages"]
+                if len(msgs) <= 5:
+                    for i, msg in enumerate(msgs):
+                        logger.debug(f"  Message {i}: role={msg.get('role', 'system')}, content_type={type(msg.get('content'))}")
+                else:
+                    # Log first 2 and last 3 messages
+                    for i in range(2):
+                        msg = msgs[i]
+                        logger.debug(f"  Message {i}: role={msg.get('role', 'system')}, content_type={type(msg.get('content'))}")
+                    logger.debug(f"  ... {len(msgs) - 5} messages omitted ...")
+                    for i in range(len(msgs) - 3, len(msgs)):
+                        msg = msgs[i]
+                        logger.debug(f"  Message {i}: role={msg.get('role', 'system')}, content_type={type(msg.get('content'))}")
 
             # Get response from GPT
             gpt_output = self.get_gpt_response(
@@ -105,7 +122,7 @@ class ChatBot:
                     self.conversations[thread_id]["messages"].append(
                         {
                             "role": "assistant",
-                            "content": [{"type": "text", "text": gpt_output.content}],
+                            "content": [{"type": "output_text", "text": gpt_output.content}],
                         }
                     )
                 return gpt_output.content, is_error
@@ -140,7 +157,7 @@ class ChatBot:
                     "role": "user",
                     "content": [
                         {
-                            "type": "text",
+                            "type": "input_text",
                             "text": f"Dalle-3 User Prompt: {message_text}",
                         }
                     ],
@@ -155,19 +172,60 @@ class ChatBot:
             # Process the response
             if revised_prompt:
                 is_error = False
-                self.conversations[thread_id]["messages"].append(
-                    {
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"""Based on the Dalle-3 user prompt, I created an image like this: {revised_prompt}
-                                I can describe what this images looks like and the ideas it might convey.
-                                I will act as if I created the this image in the context of this chat."""
-                            }
-                        ],
-                    }
-                )
+                
+                # Convert the image to base64 for storage in conversation history
+                # The image is returned as a BytesIO object from get_dalle_response
+                if image:
+                    image.seek(0)  # Reset to beginning of BytesIO
+                    image_bytes = image.read()
+                    image_b64 = base64.b64encode(image_bytes).decode('utf-8')
+                    image.seek(0)  # Reset again so it can still be uploaded to Slack
+                    
+                    # Add both the text description and the image to conversation history
+                    # Note: We use "user" role for the image due to API limitations
+                    # but the text makes it clear this is an assistant-generated image
+                    self.conversations[thread_id]["messages"].append(
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": f"""Based on the Dalle-3 user prompt, I created an image like this: {revised_prompt}
+                                    I can describe what this images looks like and the ideas it might convey.
+                                    I will act as if I created the this image in the context of this chat."""
+                                }
+                            ],
+                        }
+                    )
+                    
+                    # Add the actual image as a separate "user" message for API compatibility
+                    # The system prompt tells the model these are its own creations
+                    self.conversations[thread_id]["messages"].append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_image",
+                                    "image_url": f"data:image/png;base64,{image_b64}"
+                                }
+                            ],
+                        }
+                    )
+                else:
+                    # If no image (shouldn't happen), just add the text
+                    self.conversations[thread_id]["messages"].append(
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": f"""Based on the Dalle-3 user prompt, I created an image like this: {revised_prompt}
+                                    I can describe what this images looks like and the ideas it might convey.
+                                    I will act as if I created the this image in the context of this chat."""
+                                }
+                            ],
+                        }
+                    )
             else:
                 is_error = True
                 self.conversations[thread_id]["messages"].pop()  # Remove the user message on error
@@ -200,17 +258,14 @@ class ChatBot:
                 message_text = ""
             multi_part_msg = {
                 "role": "user",
-                "content": [{"type": "text", "text": f"{message_text}"}],
+                "content": [{"type": "input_text", "text": f"{message_text}"}],
             }
 
             # Add each image to the message
             for image in images:
                 new_image_element = {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/png;base64,{image}",
-                        "detail": self.current_config_options["detail"],
-                    },
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{image}"
                 }
                 multi_part_msg["content"].append(new_image_element)
 
@@ -230,7 +285,7 @@ class ChatBot:
                     self.conversations[thread_id]["messages"].append(
                         {
                             "role": "assistant",
-                            "content": [{"type": "text", "text": gpt_output.content}],
+                            "content": [{"type": "output_text", "text": gpt_output.content}],
                         }
                     )
                 return gpt_output.content, is_error
@@ -307,12 +362,30 @@ class ChatBot:
             max_completion_tokens = self.current_config_options["max_completion_tokens"]
             
         try:
-            # Build API call parameters
+            # Extract system prompt and user messages from history
+            system_prompt = None
+            user_messages = []
+            
+            for msg in messages_history:
+                if msg.get("role") == "system":
+                    system_prompt = msg.get("content", "")
+                else:
+                    # Messages should already be in Responses API format
+                    user_messages.append(msg)
+            
+            # Build API call parameters for Responses API
             api_params = {
                 "model": model,
-                "messages": messages_history,
-                "stream": self.streaming_client,
+                "input": user_messages,  # Responses API uses 'input' not 'messages'
+                "store": False,  # Don't store since we're managing history locally
             }
+            
+            # Debug: Log the number and types of messages being sent
+            logger.debug(f"Sending to Responses API: {len(user_messages)} messages (excluding system prompt)")
+            
+            # Add system prompt as instructions if present
+            if system_prompt:
+                api_params["instructions"] = system_prompt
             
             # Determine model capabilities
             capabilities = get_model_capabilities(model)
@@ -329,34 +402,41 @@ class ChatBot:
                 api_params["temperature"] = float(temperature)
                 api_params["top_p"] = float(self.current_config_options["top_p"])
             
-            # Add max_completion_tokens only if specified (None means let model decide)
+            # Add max_output_tokens only if specified (None means let model decide)
             if max_completion_tokens is not None:
-                api_params["max_completion_tokens"] = int(max_completion_tokens)
+                api_params["max_output_tokens"] = int(max_completion_tokens)
             
             # Add GPT-5 reasoning-specific parameters only for reasoning models
             if capabilities["supports_reasoning_effort"]:
                 # Use provided values or fall back to config defaults
-                if reasoning_effort is not None:
-                    api_params["reasoning_effort"] = reasoning_effort
-                elif "reasoning_effort" in self.current_config_options:
-                    api_params["reasoning_effort"] = self.current_config_options["reasoning_effort"]
-                else:
-                    api_params["reasoning_effort"] = "medium"
-                logger.debug(f"Using reasoning_effort: {api_params.get('reasoning_effort')}")
+                effort_value = reasoning_effort
+                if effort_value is None:
+                    effort_value = self.current_config_options.get("reasoning_effort", "medium")
+                
+                # Reasoning effort goes under 'reasoning' parameter
+                api_params["reasoning"] = {"effort": effort_value}
+                logger.debug(f"Using reasoning effort: {effort_value}")
             
             if capabilities["supports_verbosity"]:
-                if verbosity is not None:
-                    api_params["verbosity"] = verbosity
-                elif "verbosity" in self.current_config_options:
-                    api_params["verbosity"] = self.current_config_options["verbosity"]
-                else:
-                    api_params["verbosity"] = "medium"
-                logger.debug(f"Using verbosity: {api_params.get('verbosity')}")
+                verbosity_value = verbosity
+                if verbosity_value is None:
+                    verbosity_value = self.current_config_options.get("verbosity", "medium")
+                
+                # Verbosity goes under 'text' parameter for GPT-5 models
+                api_params["text"] = {"verbosity": verbosity_value}
+                logger.debug(f"Using verbosity: {verbosity_value}")
             
-            # Call the OpenAI API for chat completion
-            response = self.client.chat.completions.create(**api_params)
-            self.usage = response.usage
-            return response.choices[0].message
+            # Call the OpenAI Responses API
+            response = self.client.responses.create(**api_params)
+            
+            # Convert response to match expected format
+            # Responses API returns response.output_text
+            class MessageWrapper:
+                def __init__(self, content):
+                    self.content = content
+                    self.role = "assistant"
+            
+            return MessageWrapper(response.output_text)
 
         except Exception as e:
             logger.error(f"Error getting GPT response: {e}", exc_info=True)
@@ -379,71 +459,6 @@ class ChatBot:
         # It always returns False since processing state is now managed by QueueManager
         return False
 
-    def usage_command(self):
-        """
-        Get the token usage statistics.
-        
-        Returns:
-            str: A string representation of the token usage statistics.
-        """
-        logger.info("Viewing token usage")
-        
-        if self.usage:
-            usage_str = f"""
-            Cumulative Token stats since last reset:
-            Prompt Tokens: {self.usage.prompt_tokens}
-            Completion Tokens: {self.usage.completion_tokens}
-            Total Tokens: {self.usage.total_tokens}"""
-        else:
-            usage_str = "No usage info yet. Ask the bot something and check again."
-        return usage_str
-
-    def history_command(self, thread_id):
-        """
-        Get the conversation history for a thread.
-        
-        Args:
-            thread_id (str): The ID of the thread/conversation.
-            
-        Returns:
-            str: A string representation of the conversation history.
-        """
-        logger.info(f"Viewing history for thread {thread_id}")
-        
-        if not thread_id:
-            return "!history can only be run inside of a thread."
-
-        # Deep copy of the messages to avoid modifying the original history
-        display_history = deepcopy(self.conversations[thread_id]["messages"])
-
-        # Replace b64 encoded images with placeholder text
-        for message in display_history:
-            if "content" in message and isinstance(message["content"], list):
-                for content_item in message["content"]:
-                    if (
-                        isinstance(content_item, dict)
-                        and content_item.get("type") == "image_url"
-                    ):
-                        # Replace image data with placeholder text
-                        content_item["image_url"] = {
-                            "url": "Image content not displayed"
-                        }
-
-        # Convert display_history to a string representation for the Slack message
-        history_str = f"[HISTORY] thread_id = {thread_id}\n"
-        for message in display_history:
-            if "content" in message:
-                if isinstance(message["content"], list):
-                    content_str = "".join(
-                        item["text"] if item["type"] == "text" else "[Image content not displayed]"
-                        for item in message["content"]
-                    )
-                elif isinstance(message["content"], str):
-                    content_str = message["content"]
-                history_str += f"{message['role'].capitalize()}: {content_str}\n"
-
-        return history_str.strip().replace("`", "")
-        
     # To-Do, move all config options into threads. 
     def set_config(self, setting, value, thread_id=None):
         """
@@ -548,10 +563,8 @@ class ChatBot:
     !config - Displays the current configuration values. For now, these are global settings for everyone.
     !config [option] [value] - Sets one of the options seen in '!config' to a custom value. Beware of the model's ranges for these values.
     --see https://platform.openai.com/docs/api-reference for more info.
-    !history - Prints a json dump of the chat history since last reset.
     !reset config - Sets the config options back to defaults, e.g., temperature, max_completion_tokens, etc.
-    !reset history - Resets conversation history. Command deprecated in Slack. Start a new thread in Slack.
-    !usage - Prints token usage stats since the last reset."""
+    !reset history - Resets conversation history. Command deprecated in Slack. Start a new thread in Slack."""
         
         return help_str
 
