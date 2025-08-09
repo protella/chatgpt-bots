@@ -1,0 +1,221 @@
+TITLE: Slack Bot v2 — Conversation State, Image Handling, and Image-Intent Detection (Using Responses API + Image Tool)
+
+GOALS
+- Preserve conversational context without bloating tokens or mixing roles.
+- Use the new image generation tool (not DALL·E-3) for multi-turn image work.
+- Handle “smart image request” detection (e.g., “Add more buildings”) reliably.
+- Support both: (A) Responses-managed state and (B) Locally-managed state.
+
+-------------------------------------------------------------------------------
+KEY PRINCIPLES
+1) Separate text from pixels:
+   - Assistant output is text; images are tool outputs (artifacts).
+   - Keep images out of the assistant’s “message content.” Treat images as assets.
+2) Rehydrate on demand:
+   - Only attach images back to a request (as user input) when the user references them.
+3) Use short, stable breadcrumbs:
+   - Keep small text breadcrumbs (e.g., “[image:img_1234] created ‘neon skyline’”) in the transcript.
+   - Store the actual image bytes/URLs separately in an asset ledger.
+
+-------------------------------------------------------------------------------
+OPTION A — RESPONSES-MANAGED STATE (previous_response_id)
+Use Responses API to carry the chain state. Keep local storage minimal.
+
+A1) Data you persist per Slack thread:
+   - last_response_id: the most recent Responses ID for the MAIN chain
+   - assets: [{ id, url_or_b64, caption/revised_prompt, created_at }]
+   - last_action, last_asset_id (optional)
+   - intent_chain_last_id (for classifier, see below)
+
+A2) Making a normal text turn:
+   - Call responses.create with:
+     - instructions: your system prompt
+     - input: [{role:user, content:[{type:input_text, text:...}, (optional input_image(s) if needed this turn)]}]
+     - previous_response_id: last_response_id
+     - tools: [{"type":"image_generation"}, ...] (registered each turn)
+   - Update last_response_id with resp.id.
+   - If the model invoked the image tool, you’ll receive tool events + image artifacts in the same response.
+
+A3) Generating images:
+   - The model calls the image_generation tool; you receive image artifacts/URLs as tool outputs in the same response.
+   - Post those images to Slack, AND store them in `assets[]`. Do NOT put the pixels into assistant content.
+   - Add a small assistant breadcrumb to the chain (e.g., “Created image [image:img_1234] — ‘neon skyline’”).
+
+A4) Follow-up edits (“Make it orange”):
+   - Rehydrate the referenced image for this turn:
+     - Attach the specific image(s) as input_image alongside the user’s text.
+     - Continue the chain with previous_response_id = last_response_id.
+   - The model can either call image_generation again or produce guidance; you handle tool outputs accordingly.
+
+A5) Pros/Cons:
+   + Minimal local bookkeeping; strong continuity of tool state and chain context.
+   – You must keep and pass `previous_response_id` and always resend instructions/tools.
+   – If a chain corrupts, you may prefer a local fallback (Option B).
+
+-------------------------------------------------------------------------------
+OPTION B — LOCALLY-MANAGED STATE (no previous_response_id)
+You keep your own compact transcript and assets; each request is stateless from the API’s perspective.
+
+B1) Data you persist per Slack thread:
+   - messages: compact list of user/assistant text turns (no pixels)
+   - assets: [{ id, url_or_b64, caption/revised_prompt, created_at }]
+   - state flags: last_action, last_asset_id, etc.
+
+B2) On each user turn:
+   - Build a condensed prompt: (system prompt) + recent N turns of text + minimal breadcrumbs.
+   - If the user references an image, attach only the referenced image(s) as input_image for THIS turn.
+   - Call responses.create WITHOUT previous_response_id (store=False if you want zero server retention).
+   - Append assistant text from the response to your local `messages`.
+   - For any tool-produced images, store in `assets[]` and add a tiny breadcrumb message.
+
+B3) Pros/Cons:
+   + Full control; zero dependency on server-side state; easy to reset or fork.
+   – You pay a small token cost per turn to resend recent context.
+   – You manually manage tool continuity (usually fine with a short rolling window).
+
+-------------------------------------------------------------------------------
+IMAGE HANDLING WITHOUT LOSING CONTEXT
+- Never embed large base64 images into prior assistant messages.
+- Keep a per-thread asset ledger:
+  assets[]: { id, source, url_or_b64, caption/revised_prompt, created_at, slack_meta? }
+- In messages history, record short breadcrumbs like:
+  “Assistant: Created image [image:img_ab12] — ‘neon skyline at night’”.
+- When the user references an image (e.g., “Make it orange”, “Use the second one”):
+  1) Resolve which asset they mean (last image by default; ordinal words; explicit token like [image:img_ab12]; keyword in caption).
+  2) Attach that image as input_image on THIS request only.
+  3) Let the model call the image_generation tool again to produce the edit.
+
+-------------------------------------------------------------------------------
+SMART IMAGE REQUEST CHECK (INTENT) — NEW IMAGE TOOL
+Goal: detect “generate/edit image” intent even if the text alone is ambiguous, using minimal overhead and no main-chain pollution.
+
+Two proven designs:
+
+INTENT OPTION 1 — Shadow Micro-Chain (stateful on nano)
+- Keep a tiny, separate Responses chain with the nano model:
+  - Persist intent_prev_id per thread.
+  - Each user turn, send a one-screen prompt:
+    Context:
+      - last_action: image_generated | text_reply
+      - last_asset_id: img_ab12 (if any)
+      - last_captions: “neon skyline at night” (optional, truncated)
+    User: “Add more buildings”
+    Output ONLY: True or False (is this an image generation/edit request?)
+  - Call responses.create with previous_response_id = intent_prev_id and store the new resp.id back.
+  - Route based on True/False.
+- Pros: extremely cheap tokens; the nano chain “remembers” tiny crumbs.
+- Cons: you still keep a second chain id per thread (very small overhead).
+
+INTENT OPTION 2 — Stateless Digest (no previous_response_id)
+- Maintain your own event log locally (last ~6 events):
+  e.g., “image_generated(asset=img_ab12, caption=‘neon skyline’) | assistant: Created image [#1] | user: Add more buildings”
+- Each intent check builds a small digest string and asks the nano model for True/False.
+- Pros: one request; no server-side state; very explicit control of what context the classifier sees.
+- Cons: a few more tokens per check compared to the micro-chain.
+
+Either option cleanly avoids polluting the main conversation chain.
+
+-------------------------------------------------------------------------------
+RECOMMENDED DATA SHAPES
+
+Per-thread state (common):
+{
+  "messages": [
+    { "role":"system", "text":"<system prompt>" },
+    { "role":"user", "text":"..." },
+    { "role":"assistant", "text":"Created image [image:img_ab12] — 'neon skyline'"},
+    ...
+  ],
+  "assets": [
+    { "id":"img_ab12", "url_or_b64":"...", "caption":"neon skyline at night", "created_at": 1723200000 }
+  ],
+  "flags": { "last_action":"image_generated", "last_asset_id":"img_ab12" },
+
+  // Option A (Responses-managed state)
+  "last_response_id": "resp_123",
+
+  // Intent micro-chain (if used)
+  "intent_prev_id": "resp_987"
+}
+
+Intent digest (Option 2 example):
+"image_generated(asset=img_ab12, caption='neon skyline') | user:'Add more buildings'"
+
+-------------------------------------------------------------------------------
+REQUEST PATTERNS (PSEUDOCODE)
+
+Common setup (both options):
+tools = [{"type": "image_generation"}]
+
+Main text turn (Option A, with previous_response_id):
+responses.create(
+  model="gpt-5-chat-latest",
+  instructions=SYSTEM_PROMPT,
+  input=[{
+    "role":"user",
+    "content":[
+      {"type":"input_text","text": user_text},
+      *maybe_input_images  // only if referenced this turn
+    ]
+  }],
+  tools=tools,
+  previous_response_id=state.last_response_id
+)
+// Save: state.last_response_id = resp.id
+// Post assistant text; store image tool outputs to assets[]; append breadcrumb.
+
+Main text turn (Option B, local state, no previous_response_id):
+responses.create(
+  model="gpt-5-chat-latest",
+  instructions=SYSTEM_PROMPT,
+  input=build_compact_window(messages, breadcrumbs, referenced_images),
+  tools=tools,
+  store=False
+)
+// Post assistant text; store image tool outputs; append breadcrumb.
+
+Intent check (Option 1, micro-chain):
+prompt = render_intent_prompt(flags, last_asset_caption, user_text)  // tiny
+resp = responses.create(
+  model="gpt-5-nano",
+  instructions="Return only True or False.",
+  input=[{"role":"user","content":[{"type":"input_text","text":prompt}]}],
+  previous_response_id=state.intent_prev_id,
+  store=True,
+  reasoning={"effort":"minimal"},
+  text={"verbosity":"low"}
+)
+state.intent_prev_id = resp.id
+decision = resp.output_text.strip().lower().startswith("t")
+
+Intent check (Option 2, stateless digest):
+digest = build_digest(last_events, k=6)
+prompt = f"Context: {digest}\nUser: {user_text}\nReturn only True or False."
+resp = responses.create(
+  model="gpt-5-nano",
+  instructions="Return only True or False.",
+  input=[{"role":"user","content":[{"type":"input_text","text":prompt}]}],
+  store=False
+)
+decision = resp.output_text.strip().lower().startswith("t")
+
+-------------------------------------------------------------------------------
+SLACK POSTING FLOW (brief)
+- Post assistant text first (chat.postMessage or chat.update).
+- Post image artifacts separately (files async flow) and associate:
+  assets[].slack_meta = { file_id, ts }
+- Keep your transcript small: store assistant breadcrumbs (text) not pixels.
+
+-------------------------------------------------------------------------------
+LATENCY & COST TIPS
+- Keep “messages” to the last 8–12 turns; inject only referenced images this turn.
+- Summarize older context into a short assistant/system note every N turns.
+- For intent checks, prefer nano + minimal reasoning effort + low verbosity.
+- Throttle Slack updates (streaming) to ≤1/sec per thread with a small coalescing buffer.
+
+-------------------------------------------------------------------------------
+BOTTOM LINE
+- Use the image tool; treat images as assets, not assistant text.
+- Rehydrate only the images referenced this turn as input_image.
+- For image intent detection, use a small, separate nano pathway (micro-chain or stateless digest) so your main chain stays clean and fast.
+- Choose Option A (Responses-managed) if you like server-side continuity, or Option B (Local) if you want full control and simple resets. Both are compatible with the image tool and the on-demand rehydration strategy.
