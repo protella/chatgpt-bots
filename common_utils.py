@@ -104,18 +104,18 @@ def create_dalle3_prompt(message, gpt_Bot, thread_id):
         if "content" in message_obj and isinstance(message_obj["content"], list):
             for i, content_item in enumerate(message_obj["content"]):
                 if (isinstance(content_item, dict) and 
-                    content_item.get("type") == "image_url" and 
+                    content_item.get("type") == "input_image" and 
                     "image_url" in content_item):
                     # For DALL-E 3 prompt generation, we want to preserve the context that an image was shown
                     # So we use a more descriptive placeholder than in the image check function
                     message_obj["content"][i] = {
-                        "type": "text",
+                        "type": "input_text",
                         "text": "[An image was shared in the conversation]"
                     }
     
     # Add the user's message to the chat history
     chat_history.append(
-        {"role": "user", "content": [{"type": "text", "text": message}]}
+        {"role": "user", "content": [{"type": "input_text", "text": message}]}
     )
     
     # Change the system prompt to the image generation prompt
@@ -157,22 +157,22 @@ def check_for_image_generation(message, gpt_Bot, thread_id):
         if "content" in message_obj and isinstance(message_obj["content"], list):
             for i, content_item in enumerate(message_obj["content"]):
                 if (isinstance(content_item, dict) and 
-                    content_item.get("type") == "image_url" and 
+                    content_item.get("type") == "input_image" and 
                     "image_url" in content_item):
                     # Replace with a simple placeholder
                     message_obj["content"][i] = {
-                        "type": "text",
+                        "type": "input_text",
                         "text": "[Image content not included for performance]"
                     }
     
     # Add the user's message to the chat history
     chat_history.append(
-        {"role": "user", "content": [{"type": "text", "text": message}]}
+        {"role": "user", "content": [{"type": "input_text", "text": message}]}
     )
     
     # Add a final explicit instruction message to ensure True/False response
     chat_history.append(
-        {"role": "user", "content": [{"type": "text", "text": "Based on my last message, am I requesting an image generation? Answer with ONLY the word 'True' or 'False'."}]}
+        {"role": "user", "content": [{"type": "input_text", "text": "Based on my last message, am I requesting an image generation? Answer with ONLY the word 'True' or 'False'."}]}
     )
     
     # Change the system prompt to the image check prompt
@@ -220,6 +220,11 @@ def check_for_image_generation(message, gpt_Bot, thread_id):
         model_for_check,
         **api_params
     )
+    
+    # Check if we got an error
+    if not hasattr(is_image_request, 'content'):
+        logger.error(f"Error in image check: {is_image_request}")
+        return False
     
     # Log the full response for debugging
     logger.info(f"Image check response: '{is_image_request.content}'")
@@ -318,9 +323,9 @@ def format_message_for_debug(conversation_history):
         if isinstance(content, list):
             # Process each content item in the list
             for item in content:
-                if item['type'] == 'text':
-                    message_texts.append(item['text'])
-                elif item['type'] == 'image_url':
+                if item['type'] in ['text', 'input_text', 'output_text']:
+                    message_texts.append(item.get('text', ''))
+                elif item['type'] == 'input_image':
                     # Add a placeholder for images
                     message_texts.append("[Image Data]")
         
