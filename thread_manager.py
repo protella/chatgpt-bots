@@ -19,6 +19,7 @@ class ThreadState:
     system_prompt: Optional[str] = None
     last_activity: float = field(default_factory=time.time)
     is_processing: bool = False
+    pending_clarification: Optional[Dict[str, Any]] = None
     
     def add_message(self, role: str, content: Any):
         """Add a message to the thread history"""

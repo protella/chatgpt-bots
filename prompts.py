@@ -77,63 +77,58 @@ CLI_SYSTEM_PROMPT = {
     """
 }
 
-# Becareful editing these. The Image check needs to be deterministic and return a binary True/False
+# Becareful editing these. The intent classifier needs to be deterministic
 
-IMAGE_CHECK_SYSTEM_PROMPT = """You will be provided with a user's chat message and conversation history for a chatbot integration. 
-Your task is to determine if the user's intent is to request an image generation or creation.
+IMAGE_INTENT_SYSTEM_PROMPT = """You will be provided with a user's chat message and conversation history for a chatbot integration. 
+Your task is to determine the user's intent regarding image operations.
 
-Consider the following when making your determination:
-1. Direct requests like "create an image", "generate a picture", "make an image", "draw", "show me", "visualize", etc.
-2. Requests that imply image creation like "I want to see", "can you show me what X looks like", etc.
-3. Descriptions that are clearly meant for image generation like "a sunset over mountains with purple sky"
-4. Requests for the bot to "imagine" something visual
-5. Requests that mention DALL-E, image generation, or art creation
-6. Context from previous messages that might indicate the current message is continuing an image request
-7. IMPORTANT: If an image was recently generated in the conversation and the user is asking for modifications 
-   (e.g., "make it blue", "add a dog", "change the background", "make it all green apples"), this IS an image request
+Analyze the request and classify it into one of these five categories:
 
-Pay special attention to follow-up messages after image generation. Requests to modify, change, adjust, or redo 
-visual elements from a recently generated image should be considered image generation requests.
+1. **"new"** - User clearly wants a brand new image generated from scratch
+   - Examples: "create an image of...", "generate a new...", "make another one", "try a different version", "start over"
+   - Clear generation language without reference to existing images
 
-Even if the message is phrased as a question, if the intent is to get an image created, respond with 'True'.
-If the message is just asking for information, having a conversation, or requesting non-image content, respond with 'False'.
+2. **"edit"** - User clearly wants to modify an existing image (recently generated or mentioned)
+   - Examples: "make it sharper", "adjust the colors", "fix the lighting", "change the blue to red"
+   - Direct modification language referring to existing image elements
+   - Words like: adjust, fix, change, modify, edit, correct, enhance (when referring to existing)
 
-Respond ONLY with 'True' for image requests and 'False' otherwise. No other text should be provided.
+3. **"vision"** - User wants to analyze, describe, or get information about an image
+   - Examples: "describe this", "what's in this image", "what do you see", "analyze this", "tell me about this"
+   - Questions about image content, not requests to create or modify
+   - Information extraction from existing images
 
-Examples:
-User: "Can you create an image of a sunset over the mountains?"
-Response: True
+4. **"ambiguous"** - Image-related request but unclear intent
+   - Examples: "I need a sharper image", "something with better lighting", "how about with a sunset"
+   - Could reasonably be interpreted as multiple categories
+   - Missing clear indicators of intent
 
-User: "What do you think about the new policy?"
-Response: False
+5. **"none"** - Not related to image operations at all
+   - Regular conversation or non-visual requests
+   - General questions not about images
 
-User: "I'd like to see a futuristic cityscape"
-Response: True
+Consider the conversation context:
+- If user uploaded an image with analysis language, classify as "vision"
+- If a recent image was generated/uploaded, lean toward "edit" for modification language
+- But still mark as "ambiguous" if the user's intent isn't crystal clear
+- Requests for "another" or "different" typically mean "new" even with recent images
 
-User: "Draw me a cat wearing a hat"
-Response: True
-
-User: "What's the capital of France?"
-Response: False
-
-User: "Imagine a world where robots and humans live together"
-Response: True
-
-Context: [Previous message generated an image of a fruit basket]
-User: "Make it all green apples"
-Response: True
-
-Context: [Previous message generated an image of a city]
-User: "Add more buildings"
-Response: True
-
-Context: [Previous message was regular conversation]
-User: "Make it blue"
-Response: False"""
+Respond with ONLY one word: "new", "edit", "vision", "ambiguous", or "none". No other text should be provided."""
 
 IMAGE_ANALYSIS_PROMPT = """Describe this image focusing on: 
 Subject identification, specific colors and their locations, placement of objects in the scene, artistic style, lighting conditions, composition, and any distinctive visual elements. 
 Be concise and technical. Do not add questions, interpretations, or conversational elements."""
+
+VISION_ENHANCEMENT_PROMPT = """You will enhance a user's question about an image to ensure a focused and informative vision analysis.
+
+Given the user's question, create an enhanced prompt that:
+- For vague requests ("describe this", "what is this"): Ask for a clear, focused description of the main subject, key visual elements, and overall scene
+- For specific questions: Keep the question mostly unchanged, perhaps adding a request for relevant context
+- Avoids unnecessary sections like accessibility warnings, alternative descriptions, or follow-up questions
+
+Keep the enhanced prompt concise and natural. Aim for informative but not exhaustive analysis.
+
+Output only the enhanced prompt text, no explanations or formatting."""
 
 IMAGE_EDIT_SYSTEM_PROMPT = """You will be provided with a description of an existing image and a user's edit request for modifying that image.
 Your task is to create an optimal prompt for image editing that preserves the original composition while making the requested changes.

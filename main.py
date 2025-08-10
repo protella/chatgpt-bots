@@ -94,13 +94,21 @@ class ChatBotV2:
                 elif response.type == "image":
                     # Send image
                     image_data = response.content
-                    client.send_image(
+                    file_url = client.send_image(
                         message.channel_id,
                         message.thread_id,
                         image_data.to_bytes(),
                         f"generated_image.{image_data.format}",
-                        f"🎨 Generated image: _{image_data.prompt}_"
+                        f"Generated image: {image_data.prompt}"
                     )
+                    
+                    # Update thread state with the URL
+                    if file_url:
+                        self.processor.update_last_image_url(
+                            message.channel_id,
+                            message.thread_id,
+                            file_url
+                        )
                 elif response.type == "error":
                     # Send error message
                     client.handle_error(

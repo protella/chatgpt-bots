@@ -112,8 +112,8 @@ class SlackBot(BaseClient):
             self.log_error(f"Error sending message: {e}")
             return False
     
-    def send_image(self, channel_id: str, thread_id: str, image_data: bytes, filename: str, caption: str = "") -> bool:
-        """Send an image to Slack"""
+    def send_image(self, channel_id: str, thread_id: str, image_data: bytes, filename: str, caption: str = "") -> Optional[str]:
+        """Send an image to Slack and return the file URL"""
         try:
             # Use files_upload_v2 for image upload
             result = self.app.client.files_upload_v2(
@@ -123,11 +123,20 @@ class SlackBot(BaseClient):
                 filename=filename,
                 initial_comment=caption
             )
-            self.log_info(f"Image uploaded: {filename}")
-            return True
+            
+            # Extract the file URL from the response
+            if result and "files" in result and len(result["files"]) > 0:
+                file_info = result["files"][0]
+                file_url = file_info.get("url_private", file_info.get("permalink"))
+                self.log_info(f"Image uploaded: {filename} - URL: {file_url}")
+                return file_url
+            else:
+                self.log_warning("Image uploaded but no URL found in response")
+                return None
+                
         except SlackApiError as e:
             self.log_error(f"Error uploading image: {e}")
-            return False
+            return None
     
     def send_thinking_indicator(self, channel_id: str, thread_id: str) -> Optional[str]:
         """Send thinking indicator to Slack"""
@@ -201,10 +210,15 @@ class SlackBot(BaseClient):
                 attachments = []
                 files = msg.get("files", [])
                 for file in files:
+                    # Determine file type based on mimetype
+                    mimetype = file.get("mimetype", "")
+                    file_type = "image" if mimetype.startswith("image/") else "file"
+                    
                     attachments.append({
-                        "type": "file",
+                        "type": file_type,
                         "name": file.get("name"),
-                        "mimetype": file.get("mimetype")
+                        "mimetype": mimetype,
+                        "url": file.get("url_private", file.get("permalink"))
                     })
                 
                 messages.append(Message(
@@ -225,10 +239,46 @@ class SlackBot(BaseClient):
             self.log_error(f"Error getting thread history: {e}")
             return []
     
-    def download_file(self, file_url: str, file_id: str) -> Optional[bytes]:
-        """Download a file from Slack"""
+    def download_file(self, file_url: str, file_id: Optional[str] = None) -> Optional[bytes]:
+        """Download a file from Slack
+        
+        Args:
+            file_url: The Slack file URL (can be url_private or permalink)
+            file_id: Optional file ID (will be extracted from URL if not provided)
+        """
         try:
             import requests
+            
+            # If file_id not provided, try to extract from URL
+            if not file_id:
+                # URL format: https://files.slack.com/files-pri/[TEAM]-[FILE_ID]/filename
+                # or https://[team].slack.com/files/[USER]/[FILE_ID]/filename
+                import re
+                
+                # Try to extract file ID from the URL
+                patterns = [
+                    r'/files-pri/[^/]+-([^/]+)/',  # files-pri format
+                    r'/files/[^/]+/([^/]+)/',       # permalink format
+                ]
+                
+                for pattern in patterns:
+                    match = re.search(pattern, file_url)
+                    if match:
+                        file_id = match.group(1)
+                        self.log_debug(f"Extracted file ID from URL: {file_id}")
+                        break
+                
+                if not file_id:
+                    # If we can't extract ID, try direct download with the URL
+                    self.log_debug("Could not extract file ID, trying direct download")
+                    headers = {"Authorization": f"Bearer {config.slack_bot_token}"}
+                    response = requests.get(file_url, headers=headers)
+                    
+                    if response.status_code == 200:
+                        return response.content
+                    else:
+                        self.log_error(f"Failed to download file directly: HTTP {response.status_code}")
+                        return None
             
             # Get file info to get the private URL
             file_info = self.app.client.files_info(file=file_id)
@@ -326,13 +376,18 @@ class SlackBot(BaseClient):
         elif response.type == "image":
             # response.content should be ImageData
             image_data = response.content
-            self.send_image(
+            file_url = self.send_image(
                 channel_id,
                 thread_id,
                 image_data.to_bytes(),
                 f"generated_image.{image_data.format}",
-                f"🎨 Generated image: _{image_data.prompt}_"
+                f"Generated image: {image_data.prompt}"
             )
+            
+            # Store the URL in the image data for tracking
+            if file_url:
+                image_data.slack_url = file_url
+                
         elif response.type == "error":
             formatted_error = self.format_error_message(response.content)
             self.send_message(channel_id, thread_id, formatted_error)
