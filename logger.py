@@ -1,179 +1,144 @@
-import os
+"""
+Logging module for Slack Bot V2
+Provides structured logging with different levels and modules
+"""
 import logging
-from logging.handlers import RotatingFileHandler
 import sys
-from dotenv import load_dotenv
-
-# Create logs directory if it doesn't exist
-os.makedirs('logs', exist_ok=True)
-
-# Unset any existing log level environment variables to ensure .env values are used
-if "CONSOLE_LOGGING_ENABLED" in os.environ:
-    del os.environ["CONSOLE_LOGGING_ENABLED"]
-
-# Load environment variables
-load_dotenv()
-
-# Define log level mapping
-LOG_LEVELS = {
-    'DEBUG': logging.DEBUG,
-    'INFO': logging.INFO,
-    'WARNING': logging.WARNING,
-    'ERROR': logging.ERROR,
-    'CRITICAL': logging.CRITICAL
-}
-
-# Environment variables for logging:
-# - Log levels: SLACK_LOG_LEVEL, DISCORD_LOG_LEVEL, BOT_LOG_LEVEL, UTILS_LOG_LEVEL
-# - Console toggle: CONSOLE_LOGGING_ENABLED (TRUE/FALSE)
+from datetime import datetime
+from typing import Optional
+from config import config
 
 
-def get_log_level(level_name, default=logging.INFO):
+class ColoredFormatter(logging.Formatter):
+    """Custom formatter with colors for terminal output"""
+    
+    COLORS = {
+        'DEBUG': '\033[36m',    # Cyan
+        'INFO': '\033[32m',     # Green
+        'WARNING': '\033[33m',  # Yellow
+        'ERROR': '\033[31m',    # Red
+        'CRITICAL': '\033[35m', # Magenta
+    }
+    RESET = '\033[0m'
+    
+    def format(self, record):
+        log_color = self.COLORS.get(record.levelname, self.RESET)
+        record.levelname = f"{log_color}{record.levelname}{self.RESET}"
+        return super().format(record)
+
+
+def setup_logger(
+    name: str = "slack_bot",
+    level: Optional[str] = None,
+    log_file: Optional[str] = None
+) -> logging.Logger:
     """
-    Convert a string log level name to its numeric value.
+    Set up a logger with specified configuration
     
     Args:
-        level_name (str): The name of the log level (DEBUG, INFO, WARNING, ERROR, CRITICAL).
-        default (int): The default log level to use if level_name is invalid.
-        
-    Returns:
-        int: The numeric log level value.
-    """
-    return LOG_LEVELS.get(level_name.upper(), default)
-
-# Configure logging
-def setup_logger(name, log_level=logging.INFO):
-    """
-    Set up a logger with both console and file handlers.
+        name: Logger name
+        level: Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        log_file: Optional file path for logging to file
     
-    Args:
-        name (str): The name of the logger.
-        log_level (int): The logging level (default: logging.INFO).
-        
     Returns:
-        logging.Logger: The configured logger.
+        Configured logger instance
     """
-    # Get the logger
     logger = logging.getLogger(name)
     
-    # Set the logger's level
-    logger.setLevel(log_level)
+    # Use config level if not specified, check for platform-specific levels
+    if level is None:
+        if "slack" in name.lower():
+            level = config.slack_log_level
+        elif "discord" in name.lower():
+            level = config.discord_log_level
+        elif "utils" in name.lower() or "openai" in name.lower():
+            level = config.utils_log_level
+        else:
+            level = config.log_level
     
-    # Clear existing handlers to avoid duplicates
+    logger.setLevel(getattr(logging, level.upper()))
+    
+    # Prevent propagation to avoid duplicate messages
+    logger.propagate = False
+    
+    # Return early if logger already has handlers (avoid duplicates)
     if logger.handlers:
-        logger.handlers.clear()
+        return logger
     
-    # Create formatters
-    console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
-    
-    # Check if console logging is enabled (default to TRUE if not specified)
-    console_logging_enabled = os.environ.get("CONSOLE_LOGGING_ENABLED", "TRUE").upper() == "TRUE"
-    
-    # Create console handler if enabled
-    if console_logging_enabled:
+    # Console handler with colors (only if enabled)
+    if config.console_logging_enabled:
         console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(log_level)
+        console_formatter = ColoredFormatter(
+            '%(asctime)s | %(levelname)s | %(name)s | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
         console_handler.setFormatter(console_formatter)
         logger.addHandler(console_handler)
     
-    # Create file handlers
-    general_file_handler = RotatingFileHandler(
-        'logs/app.log', 
-        maxBytes=10*1024*1024,  # 10MB
-        backupCount=5
-    )
-    general_file_handler.setLevel(log_level)
-    general_file_handler.setFormatter(file_formatter)
-    
-    error_file_handler = RotatingFileHandler(
-        'logs/error.log', 
-        maxBytes=10*1024*1024,  # 10MB
-        backupCount=5
-    )
-    error_file_handler.setLevel(logging.ERROR)
-    error_file_handler.setFormatter(file_formatter)
-    
-    # Add file handlers to logger
-    logger.addHandler(general_file_handler)
-    logger.addHandler(error_file_handler)
-    
-    # Ensure propagation is set to False to prevent duplicate logs
-    logger.propagate = False
+    # File handler if specified
+    if log_file:
+        file_handler = logging.FileHandler(log_file)
+        file_formatter = logging.Formatter(
+            '%(asctime)s | %(levelname)s | %(name)s | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        file_handler.setFormatter(file_formatter)
+        logger.addHandler(file_handler)
     
     return logger
 
-def log_session_marker(logger, marker_type="START"):
-    """
-    Log a session marker to clearly separate different bot sessions in the logs.
-    
-    Args:
-        logger (logging.Logger): The logger to use.
-        marker_type (str): The type of marker (START or END).
-    """
-    separator = "="*80
-    if marker_type.upper() == "START":
-        logger.info(f"\n{separator}\n{logger.name.upper()} SERVICE STARTING - NEW SESSION\n{separator}")
-    elif marker_type.upper() == "END":
-        logger.info(f"\n{separator}\n{logger.name.upper()} SERVICE SHUTDOWN\n{separator}")
-    else:
-        logger.info(f"\n{separator}\n{marker_type}\n{separator}")
 
-# Initialize logger references but don't create them yet
-app_logger = None
-slack_logger = None
-discord_logger = None
-bot_logger = None
-utils_logger = None
-cli_bot_logger = None
+class LoggerMixin:
+    """Mixin class to provide logging capabilities to other classes"""
+    
+    @property
+    def logger(self) -> logging.Logger:
+        """Get or create a logger for this class"""
+        if not hasattr(self, '_logger'):
+            self._logger = setup_logger(
+                name=f"slack_bot.{self.__class__.__name__}"
+            )
+        return self._logger
+    
+    def log_debug(self, message: str, **kwargs):
+        """Log debug message"""
+        self.logger.debug(message, extra=kwargs)
+    
+    def log_info(self, message: str, **kwargs):
+        """Log info message"""
+        self.logger.info(message, extra=kwargs)
+    
+    def log_warning(self, message: str, **kwargs):
+        """Log warning message"""
+        self.logger.warning(message, extra=kwargs)
+    
+    def log_error(self, message: str, exc_info=False, **kwargs):
+        """Log error message"""
+        self.logger.error(message, exc_info=exc_info, extra=kwargs)
+    
+    def log_critical(self, message: str, exc_info=False, **kwargs):
+        """Log critical message"""
+        self.logger.critical(message, exc_info=exc_info, extra=kwargs)
 
-def get_logger(name, log_level=None):
-    """
-    Get a logger by name, creating it if it doesn't exist.
-    
-    Args:
-        name (str): The name of the logger.
-        log_level (int, optional): The log level to use. If None, uses the existing logger's level.
-        
-    Returns:
-        logging.Logger: The requested logger.
-    """
-    global app_logger, slack_logger, discord_logger, bot_logger, utils_logger, cli_bot_logger
-    
-    # Check if we're requesting one of our predefined loggers
-    if name == 'app' and app_logger is not None:
-        return app_logger
-    elif name == 'slack' and slack_logger is not None:
-        return slack_logger
-    elif name == 'discord' and discord_logger is not None:
-        return discord_logger
-    elif name == 'bot' and bot_logger is not None:
-        return bot_logger
-    elif name == 'utils' and utils_logger is not None:
-        return utils_logger
-    elif name == 'cli_bot' and cli_bot_logger is not None:
-        return cli_bot_logger
-    
-    # If the logger doesn't exist or we're not requesting a predefined one,
-    # create it with the specified log level or get the existing one
-    logger = logging.getLogger(name)
-    
-    # If a log level was specified, set up the logger with that level
-    if log_level is not None:
-        logger = setup_logger(name, log_level)
-        
-        # Update our references if this is one of our predefined loggers
-        if name == 'app':
-            app_logger = logger
-        elif name == 'slack':
-            slack_logger = logger
-        elif name == 'discord':
-            discord_logger = logger
-        elif name == 'bot':
-            bot_logger = logger
-        elif name == 'utils':
-            utils_logger = logger
-        elif name == 'cli_bot':
-            cli_bot_logger = logger
-    
-    return logger 
+
+# Main logger instance
+main_logger = setup_logger("slack_bot")
+
+
+def log_session_start():
+    """Log session start marker"""
+    main_logger.info("=" * 60)
+    main_logger.info(f"Session started at {datetime.now().isoformat()}")
+    main_logger.info(f"Debug mode: {config.debug_mode}")
+    main_logger.info(f"GPT Model: {config.gpt_model}")
+    main_logger.info(f"Utility Model: {config.utility_model}")
+    main_logger.info(f"Image Model: {config.image_model}")
+    main_logger.info(f"Log Level: {config.log_level}")
+    main_logger.info("=" * 60)
+
+
+def log_session_end():
+    """Log session end marker"""
+    main_logger.info("=" * 60)
+    main_logger.info(f"Session ended at {datetime.now().isoformat()}")
+    main_logger.info("=" * 60)

@@ -1,768 +1,332 @@
+"""
+Slack Bot Client Implementation
+All Slack-specific functionality
+"""
 import re
-import threading
-import logging
-from os import environ
-from prompts import SLACK_SYSTEM_PROMPT
-from dotenv import load_dotenv
+import base64
+from typing import Optional, List, Dict, Any
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-from markdown_to_mrkdwn import SlackMarkdownConverter
-from queue_manager import QueueManager
-from logger import log_session_marker, setup_logger, get_log_level, get_logger
-
-import bot_functions as bot
-import common_utils as utils
-
-## For performance profiling.
-# import cProfile
-# import pstats
-# import io
-
-# Unset any existing log level environment variables to ensure .env values are used
-if "SLACK_LOG_LEVEL" in environ:
-    del environ["SLACK_LOG_LEVEL"]
-
-# Load environment variables and initialize converter
-load_dotenv()
-mrkdown_converter = SlackMarkdownConverter()
-
-# Configuration variables
-LOADING_EMOJI = ":loading:"
-SLACK_BOT_TOKEN = environ.get("SLACK_BOT_TOKEN")
-SLACK_APP_TOKEN = environ.get("SLACK_APP_TOKEN")
-DALLE3_CMD = environ.get("DALLE3_CMD", "/dalle-3")
-
-# Configure logging level from environment variable with fallback to INFO
-LOG_LEVEL_NAME = environ.get("SLACK_LOG_LEVEL", "INFO").upper()
-LOG_LEVEL = get_log_level(LOG_LEVEL_NAME)
-# Initialize logger with the configured log level
-logger = get_logger('slack_bot', LOG_LEVEL)
-
-show_dalle3_revised_prompt = False
-
-# Patterns to match commands
-CONFIG_PATTERN = re.compile(r"!config\s+(\S+)\s+(.+)")
-RESET_PATTERN = re.compile(r"^!reset\s+(\S+)$")
-# Pattern to match the slackbot's userID in channel messages
-USER_ID_PATTERN = re.compile(r"<@[\w]+>")
-STREAMING_CLIENT = False  # not implemented for Slack...yet.
-# GPT4 vision supported image types
-ALLOWED_MIMETYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
-
-# Dictionary of message timestamps to cleanup after a response returns (per thread)
-chat_del_ts = {}
-chat_del_ts_lock = threading.Lock()  
-
-# Initialize Slack app
-app = App(token=SLACK_BOT_TOKEN)
-
-# Call the auth.test method to capture bot info
-response = app.client.auth_test()
-# Extract the Slackbot's user ID
-bot_user_id = response.get("user_id")
-
-# Initialize the queue manager
-queue_manager = QueueManager()
+from slack_sdk.errors import SlackApiError
+from base_client import BaseClient, Message, Response
+from config import config
+from markdown_converter import MarkdownConverter
 
 
-def parse_text(text, say, thread_ts, is_thread=False):
-    """
-    Parse the message text to check if a bot command was sent and respond accordingly.
+class SlackBot(BaseClient):
+    """Slack-specific bot implementation"""
     
-    Args:
-        text (str): The message text to parse.
-        say (callable): A function to send messages to Slack.
-        thread_ts (str): The timestamp of the thread.
-        is_thread (bool, optional): Whether the message is in a thread. Defaults to False.
+    def __init__(self, message_handler=None):
+        super().__init__("SlackBot")
+        self.app = App(token=config.slack_bot_token)
+        self.handler = None
+        self.message_handler = message_handler  # Callback for processing messages
+        self.markdown_converter = MarkdownConverter(platform="slack")
         
-    Returns:
-        str or None: The message text if it's not a command, None otherwise.
-    """
-    if not is_thread:
-        thread_ts = None
-
-    match text.lower():
-        case "!help":
-            logger.info(f"Help command received in thread {thread_ts}")
-            say(f"```{gpt_Bot.help_command()}```", thread_ts=thread_ts)
-
-        case "!config":
-            logger.info(f"Config command received in thread {thread_ts}")
-            say(
-                f"```Current Configuration:\n{gpt_Bot.view_config(thread_ts)}```",
-                thread_ts=thread_ts,
+        # Register Slack event handlers
+        self._register_handlers()
+    
+    def _register_handlers(self):
+        """Register Slack-specific event handlers"""
+        
+        @self.app.event("app_mention")
+        def handle_app_mention(event, say, client):
+            self._handle_slack_message(event, client)
+        
+        @self.app.event("message")
+        def handle_message(event, say, client):
+            # Only process DMs and non-bot messages
+            if event.get("channel_type") == "im" and not event.get("bot_id"):
+                self._handle_slack_message(event, client)
+    
+    def _handle_slack_message(self, event: Dict[str, Any], client):
+        """Convert Slack event to universal Message format"""
+        
+        # Skip message_changed events
+        if event.get("subtype") == "message_changed":
+            return
+        
+        # Extract and clean text
+        text = event.get("text", "")
+        text = self._clean_mentions(text)
+        
+        # Process attachments (files)
+        attachments = []
+        files = event.get("files", [])
+        for file in files:
+            if file.get("mimetype", "").startswith("image/"):
+                attachments.append({
+                    "type": "image",
+                    "url": file.get("url_private"),
+                    "id": file.get("id"),
+                    "name": file.get("name"),
+                    "mimetype": file.get("mimetype")
+                })
+        
+        # Create universal message
+        message = Message(
+            text=text,
+            user_id=event.get("user"),
+            channel_id=event.get("channel"),
+            thread_id=event.get("thread_ts") or event.get("ts"),
+            attachments=attachments,
+            metadata={
+                "ts": event.get("ts"),
+                "slack_client": client
+            }
+        )
+        
+        # Call the message handler if set
+        if self.message_handler:
+            self.message_handler(message, self)
+    
+    def _clean_mentions(self, text: str) -> str:
+        """Remove Slack user mentions from text"""
+        return re.sub(r'<@[A-Z0-9]+>', '', text).strip()
+    
+    def start(self):
+        """Start the Slack bot"""
+        self.handler = SocketModeHandler(self.app, config.slack_app_token)
+        self.log_info("Starting Slack bot in socket mode...")
+        self.handler.start()
+    
+    def stop(self):
+        """Stop the Slack bot"""
+        if self.handler:
+            self.log_info("Stopping Slack bot...")
+            self.handler.close()
+    
+    def send_message(self, channel_id: str, thread_id: str, text: str) -> bool:
+        """Send a text message to Slack"""
+        try:
+            # Format text for Slack
+            formatted_text = self.format_text(text)
+            
+            self.app.client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_id,
+                text=formatted_text
             )
-
-        case _:
-            if config_match_obj := CONFIG_PATTERN.match(text.lower()):
-                setting, value = config_match_obj.groups()
-                logger.info(f"Config change: {setting}={value} in thread {thread_ts}")
-                response = gpt_Bot.set_config(setting, value, thread_ts)
-                say(f"`{response}`", thread_ts=thread_ts)
-
-            elif reset_match_obj := RESET_PATTERN.match(text.lower()):
-                parameter = reset_match_obj.group(1)
-                if parameter == "config":
-                    logger.info(f"Config reset in thread {thread_ts}")
-                    response = gpt_Bot.reset_config(thread_ts)
-                    say(f"`{response}`", thread_ts=thread_ts)
-                else:
-                    logger.warning(f"Unknown reset parameter: {parameter} in thread {thread_ts}")
-                    say(f"Unknown reset parameter: {parameter}", thread_ts=thread_ts)
-
-            elif text.startswith("!"):
-                logger.warning(f"Invalid command received: {text} in thread {thread_ts}")
-                say(
-                    "`Invalid command. Type '!help' for a list of valid commands.`",
-                    thread_ts=thread_ts,
-                )
-
-            else:
-                return text
-
-
-def rebuild_thread_history(say, channel_id, thread_id, bot_user_id):
-    """
-    Rebuild the conversation history for a thread from Slack's API.
+            return True
+        except SlackApiError as e:
+            self.log_error(f"Error sending message: {e}")
+            return False
     
-    This function fetches the conversation history from Slack's API and reconstructs
-    the conversation history in the ChatBot's format, including handling images.
+    def send_image(self, channel_id: str, thread_id: str, image_data: bytes, filename: str, caption: str = "") -> bool:
+        """Send an image to Slack"""
+        try:
+            # Use files_upload_v2 for image upload
+            result = self.app.client.files_upload_v2(
+                channel=channel_id,  # Changed from channels to channel (singular)
+                thread_ts=thread_id,
+                file=image_data,
+                filename=filename,
+                initial_comment=caption
+            )
+            self.log_info(f"Image uploaded: {filename}")
+            return True
+        except SlackApiError as e:
+            self.log_error(f"Error uploading image: {e}")
+            return False
     
-    Args:
-        say (callable): A function to send messages to Slack.
-        channel_id (str): The ID of the channel.
-        thread_id (str): The ID of the thread.
-        bot_user_id (str): The ID of the bot user.
-    """
-    logger.info(f"Rebuilding conversation history for thread {thread_id}")
+    def send_thinking_indicator(self, channel_id: str, thread_id: str) -> Optional[str]:
+        """Send thinking indicator to Slack"""
+        try:
+            result = self.app.client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_id,
+                text=f"{config.thinking_emoji} Thinking..."
+            )
+            return result.get("ts")  # Return message timestamp for deletion
+        except SlackApiError as e:
+            self.log_error(f"Error sending thinking indicator: {e}")
+            return None
     
-    # Fetch conversation replies from Slack API
-    try:
-        response = app.client.conversations_replies(channel=channel_id, ts=thread_id)
-        messages = response.get("messages", [])
+    def delete_message(self, channel_id: str, message_id: str) -> bool:
+        """Delete a message from Slack"""
+        try:
+            self.app.client.chat_delete(
+                channel=channel_id,
+                ts=message_id
+            )
+            return True
+        except SlackApiError as e:
+            self.log_debug(f"Could not delete message: {e}")
+            return False
+    
+    def update_message(self, channel_id: str, message_id: str, text: str) -> bool:
+        """Update a message in Slack"""
+        try:
+            self.app.client.chat_update(
+                channel=channel_id,
+                ts=message_id,
+                text=text
+            )
+            return True
+        except SlackApiError as e:
+            self.log_error(f"Could not update message: {e}")
+            return False
+    
+    def get_thread_history(self, channel_id: str, thread_id: str, limit: int = 50) -> List[Message]:
+        """Get thread history from Slack"""
+        messages = []
         
-        # Initialize conversation with default system prompt
-        gpt_Bot.conversations[thread_id] = {
-            "messages": [SLACK_SYSTEM_PROMPT], # Assume default system prompt for now.
-            "history_reloaded": True,
-        }
-        
-        # Bot commands and responses to ignore when rebuilding history
-        bot_commands = ["!help", "!config", "!reset"]
-        response_patterns = [
-            "Cumulative Token stats since last reset:",
-            "Current Configuration:",
-            "Configuration Defaults Reset!",
-            "Updated config setting",
-            "Unknown setting:",
-            "Invalid command.",
-            "[HISTORY]",
-            "Thinking...",
-            "Generating image",
-            "I'm busy processing",
-            ":no_entry:",  # Error messages
-            ":warning:",   # Warning messages
-            "An error occurred",
-            "Sorry, I ran into"
-            ]
-
-        # Process each message in the thread
-        for msg in messages[:-1]:  # Skip the most recent message (current one)
-            text = msg.get("text", "").strip()
+        try:
+            result = self.app.client.conversations_replies(
+                channel=channel_id,
+                ts=thread_id,
+                limit=limit
+            )
             
-            # Skip empty messages (unless they have files)
-            if not text and not msg.get("files"):
-                continue
-
-            # Skip bot command messages
-            if any(text.lower().startswith(command) for command in bot_commands):
-                continue
+            slack_messages = result.get("messages", [])
             
-            # Skip bot response messages (including errors)
-            if any(response_pattern in text for response_pattern in response_patterns):
-                continue
-            
-            
-            # Determine message role (assistant or user)
-            role = "assistant" if msg.get("user") == bot_user_id else "user"
-            
-            # Check if this is a DALL-E image upload from the assistant
-            is_dalle_upload = False
-            dalle_image_b64 = None
-            if role == "assistant" and msg.get("files"):
-                for file in msg.get("files", []):
-                    if file.get("mimetype") in ALLOWED_MIMETYPES:
-                        # Check if this looks like a DALL-E image
-                        if "dalle" in file.get("name", "").lower() or (text and "image I created" in text):
-                            is_dalle_upload = True
-                            # Download and encode the DALL-E image
-                            image_url = file.get("url_private")
-                            if image_url:
-                                try:
-                                    dalle_image_b64 = utils.download_and_encode_file(
-                                        say, image_url, SLACK_BOT_TOKEN
-                                    )
-                                except Exception as e:
-                                    logger.error(f"Error encoding DALL-E image: {e}", exc_info=True)
-                            break
-            
-            # Handle DALL-E uploads specially - split into two messages
-            if is_dalle_upload and dalle_image_b64:
-                # First, add an assistant message with the text
-                assistant_text = text if text else "I've created an image based on your request."
-                gpt_Bot.conversations[thread_id]["messages"].append({
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": assistant_text}]
-                })
+            for msg in slack_messages:
+                # Skip loading indicators and system messages
+                text = msg.get("text", "")
+                if "Thinking" in text:
+                    continue
+                # Skip busy/processing messages
+                if ":warning:" in text and "currently processing" in text:
+                    continue
                 
-                # Then add the image as a user message (for API compatibility)
-                gpt_Bot.conversations[thread_id]["messages"].append({
-                    "role": "user",
-                    "content": [{
-                        "type": "input_image",
-                        "image_url": f"data:image/png;base64,{dalle_image_b64}"
-                    }]
-                })
+                # Determine role
+                is_bot = bool(msg.get("bot_id"))
                 
-                # Skip normal processing since we handled it
-                continue
-            
-            # Normal message processing for non-DALL-E messages
-            content = []
-            
-            # Add text content
-            if text:
-                if role == "assistant":
-                    content.append({"type": "output_text", "text": remove_userid(text)})
-                else:
-                    content.append({"type": "input_text", "text": remove_userid(text)})
-            
-            # Process user-uploaded images
-            if role == "user":
+                # Clean text
+                text = msg.get("text", "")
+                if not is_bot:
+                    text = self._clean_mentions(text)
+                
+                # Check for files
+                attachments = []
                 files = msg.get("files", [])
                 for file in files:
-                    if file.get("mimetype") in ALLOWED_MIMETYPES:
-                        image_url = file.get("url_private")
-                        if image_url:
-                            try:
-                                encoded_image = utils.download_and_encode_file(
-                                    say, image_url, SLACK_BOT_TOKEN
-                                )
-                                if encoded_image:
-                                    content.append({
-                                        "type": "input_image",
-                                        "image_url": f"data:image/png;base64,{encoded_image}"
-                                    })
-                            except Exception as e:
-                                logger.error(f"Error encoding user image: {e}", exc_info=True)
+                    attachments.append({
+                        "type": "file",
+                        "name": file.get("name"),
+                        "mimetype": file.get("mimetype")
+                    })
+                
+                messages.append(Message(
+                    text=text,
+                    user_id=msg.get("user", "bot" if is_bot else "unknown"),
+                    channel_id=channel_id,
+                    thread_id=thread_id,
+                    attachments=attachments,
+                    metadata={
+                        "ts": msg.get("ts"),
+                        "is_bot": is_bot
+                    }
+                ))
             
-            # Only add message to conversation history if it has content
-            if content:
-                gpt_Bot.conversations[thread_id]["messages"].append(
-                    {"role": role, "content": content}
-                )
-        
-        logger.info(f"Rebuilt conversation history with {len(gpt_Bot.conversations[thread_id]['messages']) - 1} messages")
-        
-        # Debug: Log the formatted conversation history
-        if logger.isEnabledFor(logging.DEBUG):
-            formatted_history = utils.format_message_for_debug(gpt_Bot.conversations[thread_id])
-            logger.debug(f"Rebuilt conversation history:\n{formatted_history}")
-    except Exception as e:
-        logger.error(f"Error rebuilding thread history: {e}", exc_info=True)
-        raise
-
-
-def process_and_respond(event, say):
-    """
-    Process a message event and respond accordingly.
+            return messages
+            
+        except SlackApiError as e:
+            self.log_error(f"Error getting thread history: {e}")
+            return []
     
-    This function handles new or existing threads, processes messages with or without files,
-    and manages the bot's response.
-    
-    Args:
-        event (dict): The Slack event to process.
-        say (callable): A function to send messages to Slack.
-    """
-    channel_id = event["channel"]
-    is_thread = "thread_ts" in event
-    thread_ts = event["thread_ts"] if is_thread else event["ts"]
-
-    logger.info(f"Processing message in thread {thread_ts}")
-
-    # Check if this thread is already processing a message
-    if queue_manager.is_processing_sync(thread_ts):
-        logger.info(f"Thread {thread_ts} is already processing, sending busy message")
-        response = app.client.chat_postMessage(
-            channel=channel_id,
-            text=f":no_entry: `{gpt_Bot.handle_busy()}` :no_entry:",
-            thread_ts=thread_ts,
-        )
-        with chat_del_ts_lock:
-            if thread_ts not in chat_del_ts:
-                chat_del_ts[thread_ts] = []
-            chat_del_ts[thread_ts].append(response["message"]["ts"])
-        return
-
-    # Try to start processing this thread
-    if not queue_manager.start_processing_sync(thread_ts):
-        logger.info(f"Failed to start processing thread {thread_ts}")
-        return  # Another concurrent call got here first
-
-    try:
-        # Get the message from the Slack event
-        message_text = event.get("text") or event.get("message", {}).get("text", "")
-        logger.debug(f"Message text: {message_text}")
-
-        # Handle new or existing threads since last restart
-        if thread_ts not in gpt_Bot.conversations:
-            logger.info(f"Initializing new conversation for thread {thread_ts}")
-            if is_thread:
-                # Rebuild history for existing thread
-                rebuild_thread_history(say, channel_id, thread_ts, bot_user_id)
-            else:
-                # Initialize new conversation
-                gpt_Bot.conversations[thread_ts] = {
-                    "messages": [gpt_Bot.SYSTEM_PROMPT],
-                    "history_reloaded": False,
-                }
-            
-        # Remove the userID from the message and parse it
-        message_text = parse_text(
-            remove_userid(message_text), say, thread_ts, is_thread
-        )
-
-        # If parse_text returned None, it means a command was processed
-        # Don't continue with normal message processing
-        if message_text is None:
-            logger.debug(f"Command was processed for thread {thread_ts}, skipping normal message processing")
-            return
-
-        # Process the message if there's text or files
-        if message_text or ("files" in event and event["files"]):
-            # Send initial "thinking" message
-            initial_response = say(f"Thinking... {LOADING_EMOJI}", thread_ts=thread_ts)
-            with chat_del_ts_lock:
-                if thread_ts not in chat_del_ts:
-                    chat_del_ts[thread_ts] = []
-                chat_del_ts[thread_ts].append(initial_response["message"]["ts"])
-
-            # Check if there are files in the message first - this means vision request, not image generation
-            has_files = "files" in event and event["files"]
-            
-            # Only check for image generation if there are NO files
-            # Files present = vision request, not image generation
-            if not has_files:
-                logger.info(f"No files present, checking if message is requesting image generation: {message_text}")
-                trigger_check = utils.check_for_image_generation(
-                    message_text, gpt_Bot, thread_ts)
-                logger.info(f"Image generation check result: {trigger_check}")
-            else:
-                logger.info("Files present in message, treating as vision request")
-                trigger_check = False
-
-            # If intent was likely a DALL-E 3 image gen request (and no files present)
-            if trigger_check:
-                logger.info(f"Processing image generation request: {message_text}")
-                
-                # Create DALL-E 3 prompt from history
-                logger.info("Creating DALL-E 3 prompt from history")
-                dalle3_prompt = utils.create_dalle3_prompt(message_text, gpt_Bot, thread_ts)
-                logger.debug(f"DALL-E 3 prompt: {dalle3_prompt.content}")
-                
-                # Manually construct event msg since the Slack Slash command responses are different
-                message_event = {
-                    "user_id": event["user"],
-                    "text": dalle3_prompt.content,
-                    "channel_id": channel_id,
-                    "command": "dalle-3 via conversational chat",
-                }
-                
-                # Call process_image_and_respond with lock_already_held=True
-                # The lock will be released by the finally block in process_and_respond
-                logger.info("Calling process_image_and_respond with existing lock")
-                process_image_and_respond(say, message_event, thread_ts, lock_already_held=True)
-                logger.info("Returned from process_image_and_respond")
-                
-                return  # Exit early, finally block will handle cleanup
-
-            # If there are files in the message (GPT Vision request or other file types)
-            elif has_files:
-                logger.info("Processing message with files")
-                files_data = event.get("files", [])
-                vision_files = []
-                # Future non-vision files. Requires preprocessing/extracting text.
-                other_files = []
-
-                # Process each file
-                for file in files_data:
-                    file_url = file.get("url_private")
-                    file_mimetype = file.get("mimetype")
-                    logger.info(f"Processing file: {file.get('name')} ({file_mimetype})")
-
-                    if file_url and file_mimetype in ALLOWED_MIMETYPES:
-                        try:
-                            encoded_file = utils.download_and_encode_file(
-                                say, file_url, SLACK_BOT_TOKEN
-                            )
-                            if encoded_file:
-                                vision_files.append(encoded_file)
-                                logger.info(f"Added file to vision files: {file.get('name')}")
-                        except Exception as e:
-                            logger.error(f"Error encoding vision file: {e}", exc_info=True)
-                    else:
-                        try:
-                            encoded_file = utils.download_and_encode_file(
-                                say, file_url, SLACK_BOT_TOKEN
-                            )
-                            if encoded_file:
-                                other_files.append(encoded_file)
-                                logger.info(f"Added file to other files: {file.get('name')}")
-                        except Exception as e:
-                            logger.error(f"Error encoding other file: {e}", exc_info=True)
-
-                # Handle vision files
-                if vision_files:
-                    logger.info(f"Processing {len(vision_files)} vision files")
-                    try:
-                        response, is_error = gpt_Bot.vision_context_mgr(
-                            message_text, vision_files, thread_ts
-                        )
-                        if is_error:
-                            logger.error(f"Error in vision context manager: {response}")
-                            utils.handle_error(say, response, thread_ts=thread_ts)
-                        else:
-                            logger.info("Vision processing successful")
-                            converted_text = mrkdown_converter.convert(response)
-                            response = re.sub(r'\s+,', ',', converted_text)  # Remove extra spaces before commas
-                            say(response, thread_ts=thread_ts)
-                    except Exception as e:
-                        logger.error(f"Error processing vision files: {e}", exc_info=True)
-                        utils.handle_error(say, str(e), thread_ts=thread_ts)
-
-                # Handle unsupported file types
-                elif other_files:
-                    logger.warning("Unsupported file types received")
-                    say(
-                        ":no_entry: `Sorry, GPT4 Vision only supports jpeg, png, webp, and non-animated gif file types at this time.` :no_entry:",
-                        thread_ts=thread_ts,
-                    )
-
-                # Cleanup busy/loading chat msgs
-                delete_chat_messages_sync(channel_id, thread_ts, say)
-
-            # If just a normal text message, process with default chat context manager
-            else:
-                logger.info("Processing normal text message")
-                try:
-                    response, is_error = gpt_Bot.chat_context_mgr(message_text, thread_ts)
-                    if is_error:
-                        logger.error(f"Error in chat context manager: {response}")
-                        utils.handle_error(say, response)
-                    else:
-                        logger.info("Chat processing successful")
-                        converted_text = mrkdown_converter.convert(response)
-                        response = re.sub(r'\s+,', ',', converted_text)  # Remove extra spaces before commas
-                        say(text=response, thread_ts=thread_ts)
-                except Exception as e:
-                    logger.error(f"Error processing text message: {e}", exc_info=True)
-                    utils.handle_error(say, str(e), thread_ts=thread_ts)
-
-                # Cleanup busy/loading chat msgs
-                delete_chat_messages_sync(channel_id, thread_ts, say)
-    except Exception as e:
-        logger.error(f"Unexpected error in process_and_respond: {e}", exc_info=True)
+    def download_file(self, file_url: str, file_id: str) -> Optional[bytes]:
+        """Download a file from Slack"""
         try:
-            say(
-                f":no_entry: `Sorry, I ran into an unexpected error.` :no_entry:\n```{str(e)}```",
-                thread_ts=thread_ts,
-            )
-        except:
-            pass
-    finally:
-        # Always cleanup, even if there was an error
-        logger.info(f"Finishing processing for thread {thread_ts}")
-        queue_manager.finish_processing_sync(thread_ts)
-
-
-def process_image_and_respond(say, command, thread_ts=None, lock_already_held=False):
-    """
-    Process an image generation request and respond with the generated image.
-    
-    This function handles DALL-E 3 image generation requests from the /dalle-3 command
-    or from the LLM verification process.
-    
-    Args:
-        say (callable): A function to send messages to Slack.
-        command (dict): The command data containing the prompt and user info.
-        thread_ts (str, optional): The timestamp of the thread. Defaults to None.
-        lock_already_held (bool, optional): Whether the processing lock is already held. Defaults to False.
-    """
-    user_id = command["user_id"]
-    text = command["text"]
-    cmd = command["command"]
-    channel = command["channel_id"]
-
-    logger.info(f"Processing image request: thread_ts={thread_ts}, text_length={len(text) if text else 0}, lock_already_held={lock_already_held}")
-
-    # Only check/acquire lock if not already held
-    if not lock_already_held:
-        # Check if this thread is already processing
-        if queue_manager.is_processing_sync(thread_ts):
-            logger.info(f"Thread {thread_ts} is already processing, sending busy message")
-            response = app.client.chat_postMessage(
-                channel=channel,
-                text=f":no_entry: `{gpt_Bot.handle_busy()}` :no_entry:",
-                thread_ts=thread_ts,
-            )
-            with chat_del_ts_lock:
-                if thread_ts not in chat_del_ts:
-                    chat_del_ts[thread_ts] = []
-                chat_del_ts[thread_ts].append(response["message"]["ts"])
-            return
-
-        # Try to start processing this thread
-        if not queue_manager.start_processing_sync(thread_ts):
-            logger.info(f"Failed to start processing thread {thread_ts}")
-            return  # Another concurrent call got here first
-
-    try:
-        # Validate prompt
-        if not text:
-            logger.warning("Empty prompt received")
-            app.client.chat_postEphemeral(
-                channel=channel,
-                user=user_id,
-                text=":no_entry: You must provide a prompt when using `/dalle-3` :no_entry:",
-                thread_ts=thread_ts,
-            )
-            return
-
-        # Handle slash command
-        if cmd == DALLE3_CMD:
-            logger.info(f"Processing slash command {cmd}")
-            response = app.client.chat_postMessage(
-                channel=channel,
-                text=f"<@{user_id}> used `{cmd}`.\n*Original Prompt:*\n_{text}_",
-                thread_ts=thread_ts,
-            )
-            if not thread_ts:
-                thread_ts = response["ts"]
-                logger.info(f"Created new thread with ts={thread_ts}")
-
-        # Initialize new thread if needed
-        if thread_ts not in gpt_Bot.conversations:
-            logger.info(f"Initializing new conversation for thread {thread_ts}")
-            gpt_Bot.conversations[thread_ts] = {
-                "messages": [SLACK_SYSTEM_PROMPT],
-                "history_reloaded": False,
-            }
-
-        # Cleanup any previous status messages
-        delete_chat_messages_sync(channel, thread_ts, say)
-
-        # Send "generating" message
-        logger.info("Sending 'generating image' message")
-        temp_response = app.client.chat_postMessage(
-            channel=channel,
-            text=f"Generating image, please wait... {LOADING_EMOJI}",
-            thread_ts=thread_ts,
-        )
-        with chat_del_ts_lock:
-            if thread_ts not in chat_del_ts:
-                chat_del_ts[thread_ts] = []
-            chat_del_ts[thread_ts].append(temp_response["ts"])
-
-        # Generate image with DALL-E 3
-        logger.info(f"Calling image_context_mgr with text_length={len(text) if text else 0}")
-        try:
-            image, revised_prompt, is_error = gpt_Bot.image_context_mgr(text, thread_ts)
-            logger.info(f"image_context_mgr returned: is_error={is_error}")
-
-            # Handle error case
-            if is_error:
-                logger.error(f"Error generating image: {revised_prompt}")
-                utils.handle_error(say, revised_prompt, thread_ts=thread_ts)
-            # Handle successful image generation
-            else:
-                logger.info("Image generated successfully")
-                if gpt_Bot.current_config_options["d3_revised_prompt"]:
-                    file_description = f"*DALL·E-3 generated revised Prompt:*\n_{revised_prompt}_"
-                    logger.info(f"Revised prompt: {revised_prompt}")
-                else:
-                    # Always include some text so we have context when rebuilding from Slack
-                    file_description = "Here's the image I created for you."
-                    
-                try:
-                    # Upload the generated image to Slack
-                    logger.info("Uploading image to Slack")
-                    response = app.client.files_upload_v2(
-                        channel=channel,
-                        initial_comment=file_description,
-                        file=image,
-                        filename="Dalle3_image.png",
-                        thread_ts=thread_ts,
-                    )
-                    logger.info("Image uploaded successfully")
-                except Exception as e:
-                    logger.error(f"Error uploading image: {e}", exc_info=True)
-                    utils.handle_error(say, str(e), thread_ts=thread_ts)
-        except Exception as e:
-            logger.error(f"Error in image generation process: {e}", exc_info=True)
-            utils.handle_error(say, str(e), thread_ts=thread_ts)
+            # Get file info
+            file_info = self.app.client.files_info(file=file_id)
+            url = file_info["file"]["url_private"]
             
-        # Cleanup status messages
-        delete_chat_messages_sync(channel, thread_ts, say)
-    except Exception as e:
-        logger.error(f"Unexpected error in process_image_and_respond: {e}", exc_info=True)
-        try:
-            say(
-                f":no_entry: `Sorry, I ran into an unexpected error generating the image.` :no_entry:\n```{str(e)}```",
-                thread_ts=thread_ts,
+            # Download file
+            response = self.app.client.api_call(
+                api_method="GET",
+                url=url,
+                headers={"Authorization": f"Bearer {config.slack_bot_token}"}
             )
-        except:
-            pass
-    finally:
-        # Only release lock if we acquired it (not if it was already held)
-        if not lock_already_held:
-            logger.info(f"Finishing processing for thread {thread_ts}")
-            queue_manager.finish_processing_sync(thread_ts)
-
-
-def delete_chat_messages_sync(channel, thread_ts, say):
-    """
-    Delete temporary status or progress messages the bot sends to Slack.
+            
+            return response.data
+            
+        except SlackApiError as e:
+            self.log_error(f"Error downloading file: {e}")
+            return None
     
-    Args:
-        channel (str): The channel ID.
-        thread_ts (str): The timestamp of the thread.
-        say (callable): A function to send messages to Slack.
-    """
-    # Get timestamps for this thread and remove from dictionary
-    with chat_del_ts_lock:
-        timestamps = chat_del_ts.pop(thread_ts, [])
+    def format_text(self, text: str) -> str:
+        """Format text for Slack using mrkdwn"""
+        return self.markdown_converter.convert(text)
     
-    if not timestamps:
-        return
+    def send_busy_message(self, channel_id: str, thread_id: str):
+        """Send a busy message"""
+        self.send_message(
+            channel_id,
+            thread_id,
+            ":warning: `This thread is currently processing another request. Please wait a moment and try again.`"
+        )
+    
+    def format_error_message(self, error: str) -> str:
+        """Format error messages for Slack with emojis and code blocks"""
+        import re
         
-    logger.debug(f"Deleting {len(timestamps)} messages for thread {thread_ts}")
-    try:
-        for ts in timestamps:
+        # Extract error code if present
+        error_code_match = re.search(r'Error code: (\d+)', error)
+        error_code = error_code_match.group(1) if error_code_match else "Unknown"
+        
+        # Try to extract the actual error message
+        if "{'error':" in error:
+            # Parse OpenAI API error format
             try:
-                app.client.chat_delete(channel=channel, ts=ts)
-            except Exception as e:
-                # Log errors for individual message deletions at debug level
-                # These are often expected (e.g., message already deleted)
-                logger.debug(f"Failed to delete message {ts}: {e}")
-    except Exception as e:
-        logger.error(f"Error deleting messages: {e}", exc_info=True)
-        say(
-            f":no_entry: `Sorry, I ran into an error cleaning up my own messages.` :no_entry:\n```{e}```",
-            thread_ts=thread_ts,
-        )
-
-
-def remove_userid(message_text):
-    """
-    Remove user IDs from a message text.
-    
-    Args:
-        message_text (str): The message text to process.
+                import json
+                error_dict_str = error[error.find("{'error':"):].replace("'", '"')
+                error_dict = json.loads(error_dict_str)
+                error_message = error_dict.get('error', {}).get('message', error)
+                error_type = error_dict.get('error', {}).get('type', 'unknown_error')
+            except:
+                # Fallback to simpler extraction
+                if "'message':" in error:
+                    msg_start = error.find("'message': '") + len("'message': '")
+                    msg_end = error.find("',", msg_start)
+                    if msg_end > msg_start:
+                        error_message = error[msg_start:msg_end]
+                    else:
+                        error_message = error
+                else:
+                    error_message = error
+                error_type = "api_error"
+        else:
+            error_message = error
+            error_type = "general_error"
         
-    Returns:
-        str: The message text with user IDs removed.
-    """
-    message_text = re.sub(USER_ID_PATTERN, "", message_text).strip()
-    return message_text
+        # Format the error message for Slack
+        formatted = f":warning: *Oops! Something went wrong*\n\n"
+        formatted += f"*Error Code:* `{error_code}`\n"
+        formatted += f"*Type:* `{error_type}`\n\n"
+        formatted += f"*Details:*\n```{error_message}```\n\n"
+        formatted += f":bulb: *What you can do:*\n"
+        
+        # Add helpful suggestions based on error type
+        if "rate_limit" in error_type.lower():
+            formatted += "• Wait a moment and try again\n"
+            formatted += "• The API rate limit has been reached"
+        elif "invalid_request" in error_type.lower():
+            formatted += "• Try rephrasing your request\n"
+            formatted += "• The request format may be invalid"
+        elif "context_length" in error_message.lower():
+            formatted += "• Start a new thread\n"
+            formatted += "• The conversation has become too long"
+        else:
+            formatted += "• Try again in a moment\n"
+            formatted += "• If the problem persists, contact support"
+        
+        return formatted
     
-
-# Slack event handlers
-@app.command(DALLE3_CMD)
-def handle_dalle3(ack, say, command):
-    """
-    Handle the /dalle-3 command.
-    
-    Args:
-        ack (callable): A function to acknowledge the command.
-        say (callable): A function to send messages to Slack.
-        command (dict): The command data.
-    """
-    logger.info(f"Received /dalle-3 command from user {command['user_id']}")
-    ack()
-    # Process the command synchronously
-    process_image_and_respond(say, command)
-
-
-@app.event("app_mention")
-def handle_mention(event, say):
-    """
-    Handle app mention events.
-    
-    Args:
-        event (dict): The event data.
-        say (callable): A function to send messages to Slack.
-    """
-    logger.info(f"Received app mention from user {event.get('user')}")
-    # Process the event synchronously
-    process_and_respond(event, say)
-
-
-@app.event("message")
-def handle_message_events(event, say):
-    """
-    Handle message events.
-    
-    Args:
-        event (dict): The event data.
-        say (callable): A function to send messages to Slack.
-    """
-    # Ignore specific subtypes that cause issues
-    # 'message_changed' is triggered when we delete the "Thinking..." message
-    # which can cause duplicate responses in DMs with Threads
-    if "subtype" in event and event["subtype"] == "message_changed":
-        logger.debug(f"Ignoring message_changed event to prevent duplicate responses")
-        return
-
-    # Only process direct messages to the bot
-    elif event["channel_type"] == "im":
-        # Check if this is a bot message
-        if event.get("bot_id") or event.get("user") == bot_user_id:
-            logger.debug(f"Ignoring message from bot: {event.get('text', '')}")
-            return
-            
-        logger.info(f"Received direct message from user {event.get('user')}")
-        # Process the event synchronously
-        process_and_respond(event, say)
-
-
-if __name__ == "__main__":
-    # Log session start marker
-    log_session_marker(logger, "START")
-    
-    # Log the configured log level after the session marker
-    logger.info(f"Slack logger initialized with log level: {LOG_LEVEL_NAME}")
-    
-    logger.info("Starting Slackbot")
-    gpt_Bot = bot.ChatBot(SLACK_SYSTEM_PROMPT, STREAMING_CLIENT, show_dalle3_revised_prompt)
-    handler = SocketModeHandler(app, SLACK_APP_TOKEN)
-
-    try:
-        logger.info("Starting SocketModeHandler")
-        handler.start()
-    except Exception as e:
-        logger.critical(f"Failed to start Slack bot: {e}", exc_info=True)
-        raise
-    finally:
-        # Log session end marker
-        log_session_marker(logger, "END")
-
-
-## Performance profiling code
-# pr = cProfile.Profile()
-# pr.enable()
-# myFunction()
-# pr.disable()
-# s = io.StringIO()
-# ps = pstats.Stats(pr, stream=s).sort_stats('cumulative')
-# ps.print_stats(10)
-# print(s.getvalue())
+    def handle_response(self, channel_id: str, thread_id: str, response: Response):
+        """Handle a Response object and send to Slack"""
+        if response.type == "text":
+            self.send_message(channel_id, thread_id, response.content)
+        elif response.type == "image":
+            # response.content should be ImageData
+            image_data = response.content
+            self.send_image(
+                channel_id,
+                thread_id,
+                image_data.to_bytes(),
+                f"generated_image.{image_data.format}",
+                f"Generated image: {image_data.prompt}"
+            )
+        elif response.type == "error":
+            formatted_error = self.format_error_message(response.content)
+            self.send_message(channel_id, thread_id, formatted_error)
