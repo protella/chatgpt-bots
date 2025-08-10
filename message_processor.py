@@ -10,7 +10,7 @@ from thread_manager import ThreadStateManager
 from openai_client import OpenAIClient, ImageData
 from config import config
 from logger import LoggerMixin
-from prompts import SLACK_SYSTEM_PROMPT, DISCORD_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT
+from prompts import SLACK_SYSTEM_PROMPT, DISCORD_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, IMAGE_ANALYSIS_PROMPT
 
 
 class MessageProcessor(LoggerMixin):
@@ -63,16 +63,36 @@ class MessageProcessor(LoggerMixin):
             # Build user content
             user_content = self._build_user_content(message.text, image_inputs)
             
-            # Classify intent
-            intent = self.openai_client.classify_intent(
-                thread_state.get_recent_messages(),
-                message.text
-            )
+            # Determine intent based on context
+            if image_inputs:
+                # User uploaded images - determine if it's vision or edit request
+                if not message.text or message.text.strip() == "":
+                    # No text with images - default to vision (analyze)
+                    intent = "vision"
+                    self.log_debug("No text with images - defaulting to vision analysis")
+                else:
+                    # Has text with images - classify if it's edit or vision
+                    intent = self.openai_client.classify_intent(
+                        thread_state.get_recent_messages(),
+                        message.text
+                    )
+                    # If classified as image generation with uploaded images, it's an edit
+                    if intent in ["new_image", "modify_image"]:
+                        intent = "edit_image"
+                    else:
+                        # Text request with images = vision analysis
+                        intent = "vision"
+            else:
+                # No images uploaded - standard classification
+                intent = self.openai_client.classify_intent(
+                    thread_state.get_recent_messages(),
+                    message.text if message.text else ""
+                )
             
             self.log_debug(f"Classified intent: {intent}")
             
-            # Update thinking indicator if generating image
-            if intent in ["new_image", "modify_image"] and thinking_id:
+            # Update thinking indicator if generating/editing image
+            if intent in ["new_image", "modify_image", "edit_image"] and thinking_id:
                 self._update_thinking_for_image(client, message.channel_id, thinking_id)
             
             # Generate response based on intent
@@ -85,6 +105,16 @@ class MessageProcessor(LoggerMixin):
                     message.thread_id,
                     client
                 )
+            elif intent == "edit_image":
+                # User uploaded images with edit request
+                response = self._handle_image_edit(
+                    message.text,
+                    image_inputs,
+                    thread_state
+                )
+            elif intent == "vision":
+                # Vision analysis with uploaded images
+                response = self._handle_text_response(user_content, thread_state, client)
             else:
                 response = self._handle_text_response(user_content, thread_state, client)
             
@@ -163,8 +193,14 @@ class MessageProcessor(LoggerMixin):
     ) -> List[Dict]:
         """Process message attachments (mainly images)"""
         image_inputs = []
+        image_count = 0
+        max_images = 10
         
         for attachment in message.attachments:
+            # Stop if we've reached the limit
+            if image_count >= max_images:
+                self.log_warning(f"Limiting to {max_images} images (user uploaded more)")
+                break
             if attachment.get("type") == "image":
                 try:
                     # Download the image
@@ -177,12 +213,15 @@ class MessageProcessor(LoggerMixin):
                         # Convert to base64
                         base64_data = base64.b64encode(image_data).decode('utf-8')
                         
+                        # Format for Responses API with base64
+                        mimetype = attachment.get("mimetype", "image/png")
                         image_inputs.append({
                             "type": "input_image",
-                            "image": {"base64": base64_data}
+                            "image_url": f"data:{mimetype};base64,{base64_data}"
                         })
                         
-                        self.log_debug(f"Processed image: {attachment.get('name')}")
+                        image_count += 1
+                        self.log_debug(f"Processed image {image_count}/{max_images}: {attachment.get('name')}")
                 
                 except Exception as e:
                     self.log_error(f"Error processing attachment: {e}")
@@ -314,9 +353,11 @@ class MessageProcessor(LoggerMixin):
                         previous_prompts.append(content[prompt_start:].strip())
                     elif "Generated image:" in content:
                         has_previous_images = True
-                        # Extract the prompt from the Slack upload comment
+                        # Extract the prompt from the upload comment
                         prompt_start = content.find("Generated image:") + len("Generated image:")
-                        previous_prompts.append(content[prompt_start:].strip())
+                        # Strip any formatting characters and emoji
+                        prompt = content[prompt_start:].strip().strip("_")
+                        previous_prompts.append(prompt)
             
             if has_previous_images:
                 # User is asking to modify a previous image
@@ -350,6 +391,124 @@ class MessageProcessor(LoggerMixin):
         
         # Generate a new image based on the modification request
         return self._handle_image_generation(context_prompt, thread_state)
+    
+    def _handle_image_edit(
+        self,
+        text: str,
+        image_inputs: List[Dict],
+        thread_state
+    ) -> Response:
+        """Handle image editing with uploaded images"""
+        # Extract base64 data and mime types from image inputs
+        input_images = []
+        input_mimetypes = []
+        for img_input in image_inputs:
+            if img_input.get("type") == "input_image":
+                # Extract from data URL format
+                image_url = img_input.get("image_url", "")
+                if image_url.startswith("data:"):
+                    # Parse data URL: data:image/png;base64,xxxxx
+                    parts = image_url.split(",", 1)
+                    if len(parts) == 2:
+                        header, base64_data = parts
+                        # Extract mimetype from header
+                        mimetype_part = header.split(";")[0].replace("data:", "")
+                        mimetype = mimetype_part if mimetype_part else "image/png"
+                        
+                        # OpenAI doesn't support GIF for editing, convert to PNG
+                        if mimetype == "image/gif":
+                            self.log_warning("Converting GIF to PNG for image edit (GIF not supported)")
+                            mimetype = "image/png"
+                        
+                        input_images.append(base64_data)
+                        input_mimetypes.append(mimetype)
+        
+        if not input_images:
+            # Shouldn't happen but fallback to generation
+            return self._handle_image_generation(text, thread_state)
+        
+        self.log_info(f"Editing {len(input_images)} uploaded image(s)")
+        
+        # First, analyze the uploaded images to get context
+        self.log_debug("Analyzing uploaded images for context")
+        
+        # Log the analysis prompt
+        print("\n" + "="*80)
+        print("DEBUG: IMAGE EDIT FLOW - STEP 1: ANALYZE IMAGE")
+        print("="*80)
+        print(f"Analysis Question: {IMAGE_ANALYSIS_PROMPT}")
+        print("="*80)
+        
+        try:
+            # Analyze the images to understand what's in them
+            image_description = self.openai_client.analyze_images(
+                images=input_images,
+                question=IMAGE_ANALYSIS_PROMPT,
+                detail="high"
+            )
+            
+            # Log the full analysis result
+            print("\n" + "="*80)
+            print("DEBUG: IMAGE EDIT FLOW - STEP 2: ANALYSIS RESULT")
+            print("="*80)
+            print(f"Image Description (Full):\n{image_description}")
+            print("="*80)
+            
+            # Log what we're sending to the enhancer
+            print("\n" + "="*80)
+            print("DEBUG: IMAGE EDIT FLOW - STEP 3: INPUTS FOR ENHANCEMENT")
+            print("="*80)
+            print(f"Image Description: {image_description[:200]}..." if len(image_description) > 200 else f"Image Description: {image_description}")
+            print(f"\nUser's Edit Request: {text}")
+            print("="*80)
+            
+            # Store the description and user request separately for clean enhancement
+            image_analysis = image_description
+            user_edit_request = text
+            
+        except Exception as e:
+            self.log_warning(f"Failed to analyze images, continuing without context: {e}")
+            image_analysis = None
+            user_edit_request = text
+            print("\n" + "="*80)
+            print("DEBUG: IMAGE EDIT FLOW - ANALYSIS FAILED")
+            print("="*80)
+            print(f"Error: {e}")
+            print(f"Falling back to user prompt only: {text}")
+            print("="*80)
+        
+        # Get thread config for settings
+        thread_config = config.get_thread_config(thread_state.config_overrides)
+        
+        # Use the edit_image API with separated inputs
+        try:
+            image_data = self.openai_client.edit_image(
+                input_images=input_images,
+                input_mimetypes=input_mimetypes,
+                prompt=user_edit_request,  # Just the user's request
+                image_description=image_analysis,  # The analyzed description
+                input_fidelity=thread_config.get("input_fidelity", "high"),
+                background=thread_config.get("image_background", "auto"),
+                output_format=thread_config.get("image_format", "png"),
+                output_compression=thread_config.get("image_compression", 100),
+                enhance_prompt=True,
+                conversation_history=thread_state.messages if thread_state.messages else None
+            )
+        except Exception as e:
+            self.log_error(f"Error editing image: {e}")
+            return Response(
+                type="error",
+                content=f"Failed to edit image: {str(e)}"
+            )
+        
+        # Add breadcrumb to thread state
+        thread_state.add_message("user", text or "Edit uploaded image")
+        thread_state.add_message("assistant", f"Generated image: {image_data.prompt}")
+        
+        return Response(
+            type="image",
+            content=image_data
+        )
     
     def update_thread_config(
         self,

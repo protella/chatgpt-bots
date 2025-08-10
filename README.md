@@ -2,7 +2,7 @@
 Python based ChatGPT bot integrations
 
 ## Description
-ChatBot Integrations for Slack, Discord, and the CLI using Python and OpenAPI's ChatGPT platform. This bot is designed around GPT4 and supports GPT4 Vision and Dalle-3. The bots allow iteration on Dalle-3 images and will also determine if image creation is the appropriate action by using NLP. Talk to it just like you would with the ChatGPT website. Upload (multiple) images and have discussions or conduct analysis on them all in a single conversation (Slack Thread or Discord Channel). The Discord client is still a bit behind in development. The CLI client is for basic testing only.
+ChatBot Integrations for Slack and Discord using Python and OpenAI's Responses API. This bot V2 is designed for GPT-5 models and supports image generation with gpt-image-1 (DALL-E 3 coming soon). The bot uses intelligent intent classification to determine when to generate images vs text responses. Conversations are stateless with Slack/Discord as the source of truth, rebuilding context from platform history on demand. Discord client V2 is under development.
 
 ## Recent Changes
 
@@ -12,13 +12,14 @@ For a detailed list of recent changes and improvements, please see the [CHANGELO
 
 Requires `Python 3.10+` as the script takes advantage of the new structural pattern matching (match/case) in this version.
 
-### GPT-5 Model Support
-**Important**: GPT-5 models require the latest OpenAI SDK. Update with: `pip install openai --upgrade`
+### Model Support
+**V2 Architecture**: Uses OpenAI's Responses API (not Chat Completions)
 
-**GPT-5 Breaking Changes:**
-- GPT-5 reasoning models (`gpt-5`, `gpt-5-mini`, `gpt-5-nano`) only support `temperature=1.0` and do not support `top_p`
-- GPT-5 chat variant (`gpt-5-chat-latest`) supports standard temperature and top_p parameters
-- New parameters for GPT-5 reasoning models: `reasoning_effort` (minimal/low/medium/high) and `verbosity` (low/medium/high)  
+**Supported Models:**
+- GPT-5 reasoning models (`gpt-5-mini`, `gpt-5-nano`) - Fixed `temperature=1.0`, no `top_p`
+- GPT-5 chat models (`gpt-5-chat-latest`) - Standard temperature/top_p support
+- Image generation: `gpt-image-1` (default), DALL-E 3 (coming soon)
+- Utility model for intent classification: `gpt-5-mini` or `gpt-5-nano`  
 
 The setup of a Slack or Discord App is out of scope of this README. There's plenty of documentation online detailing these processes.
   
@@ -78,21 +79,52 @@ The only required token is the OPENAI_KEY. The others depend on which integratio
 - Create a `.env` file in the root of your venv folder and populate it with your keys, tokens, other vars as follows:
 
 ```
+# Required
 SLACK_BOT_TOKEN = 'YOURTOKENHERE'
 SLACK_APP_TOKEN = 'YOURTOKENHERE'
-
-DALLE3_CMD = '/dalle-3' # For Slack, the slash command you want to use to force trigger a dalle-3 image gen
-
 OPENAI_KEY = 'YOURTOKENHERE'
 
-DISCORD_TOKEN = 'YOURTOKENHERE'
-DISCORD_ALLOWED_CHANNEL_IDS = '1234567890, 1234567890' # Discord channel IDs that the bot is permitted to talk in.
+# Model Configuration
+GPT_MODEL = 'gpt-5-chat-latest'
+GPT_IMAGE_MODEL = 'gpt-image-1'
+UTILITY_MODEL = 'gpt-5-mini-2025-08-07'
+DALLE_MODEL = 'dall-e-3'
 
-SLACK_LOG_LEVEL = "WARNING" # Optional: Set log level for Slack bot (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-DISCORD_LOG_LEVEL = "WARNING" # Optional: Set log level for Discord bot (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-BOT_LOG_LEVEL = "WARNING" # Optional: Set log level for bot functions (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-UTILS_LOG_LEVEL = "WARNING" # Optional: Set log level for utility functions (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-CONSOLE_LOGGING_ENABLED = "TRUE" # Optional: Enable/disable console logging (TRUE/FALSE)
+# Default Generation Parameters
+DEFAULT_TEMPERATURE = '0.8'  # 0.0-2.0
+DEFAULT_MAX_TOKENS = '4096'
+DEFAULT_TOP_P = '1.0'  # 0.0-1.0
+DEFAULT_REASONING_EFFORT = 'medium'  # minimal/low/medium/high
+DEFAULT_VERBOSITY = 'medium'  # low/medium/high
+
+# Image Generation Defaults  
+DEFAULT_IMAGE_SIZE = '1024x1024'  # 1024x1024/1024x1792/1792x1024
+DEFAULT_IMAGE_QUALITY = 'hd'  # standard/hd
+DEFAULT_IMAGE_STYLE = 'natural'  # natural/vivid
+DEFAULT_IMAGE_NUMBER = '1'
+DEFAULT_INPUT_FIDELITY = 'high'  # high/low - high preserves original
+
+# Vision Defaults
+DEFAULT_DETAIL_LEVEL = 'auto'  # auto/low/high
+
+# UI Configuration  
+THINKING_EMOJI = ':hourglass_flowing_sand:'
+
+# Discord (V2 under development)
+DISCORD_TOKEN = 'YOURTOKENHERE'
+DISCORD_ALLOWED_CHANNEL_IDS = '1234567890, 1234567890'
+
+# Logging Configuration
+SLACK_LOG_LEVEL = "WARNING"
+DISCORD_LOG_LEVEL = "WARNING"
+BOT_LOG_LEVEL = "WARNING"
+UTILS_LOG_LEVEL = "WARNING"
+CONSOLE_LOGGING_ENABLED = "TRUE"
+LOG_DIRECTORY = "logs"
+
+# Cleanup Configuration (cron format)
+CLEANUP_SCHEDULE = "0 0 * * *"  # Daily at midnight
+CLEANUP_MAX_AGE_HOURS = "24"
 ```
 
 ### Logging Configuration
@@ -101,12 +133,17 @@ The bots support a comprehensive logging system that can be configured through t
 ### Configuration - Bot Prompt Tuning
 The `prompts.py` file contains the various system prompts the script will use to set the tone for how the bot will respond. Telling it that it is a chatbot and with any specific style of responses will help with more appropriate responses.
 
+### Configuration - Memory Cleanup
+Thread cleanup runs on a schedule (cron format):
+- `CLEANUP_SCHEDULE` - Cron expression (default: "0 0 * * *" for daily at midnight)
+- `CLEANUP_MAX_AGE_HOURS` - Remove threads older than this (default: 24 hours)
+
 ### Running the bot
 Run the py file for your chosen interface, e.g.:
 
-- `python3 discordbot.py`
-- `python3 slackbot.py`
-- `python3 cli_bot.py`
+- `python3 slackbot.py` - Run Slack bot
+- `python3 discordbot.py` - (V2 under development)
+- `python3 main.py --platform slack` - Alternative with platform parameter
 
 ### Running as a service/daemon
 - You can run the script in the background with NOHUP on Linux so you can close the terminal and it will continue to run:
@@ -117,19 +154,25 @@ Run the py file for your chosen interface, e.g.:
   - `pm2 start /path/to/venv/chatgpt-bots/slackbot.py --name "SlackBot" --interpreter=/path/to/venv/chatgpt-bots/bin/python3 --output=/path/to/venv/chatgpt-bots/slackbot.log --error=/path/to/venv/chatgpt-bots/slackbot.err`
 - You could also build a systemd service definition for it.
 
-## ToDo:
-- Implement Search API. OpenAI doesn't provide one (yet?), so need to use third party search APIs.
-- Implement RAG for Atlassian's JIRA/Confluence to be able to query via NLP
-- Implement some basic text extraction for PDFs and other file types for analysis of non-image types.
-- Fix bug w/ thread history rebuilds and Image gen check. Need to compare pre-post restart histories.
-- Discord is still uses a shared history. Not sure how to handle threads/conversations w/ Discord. 
-- Add command functionality to allow for changing the initial chatbot init phrase
-- Update bot commands to use Slack/Discord's `/command` functionality rather than old school `!commands`
-- Track context/history size using the usage stats and pop old items from the history to avoid going over the model's max context size (4k w/ 3.5-turbo but not as much of an issue with GPT4 Turbo) Adjust for different models if necessary. Lower Priority
-- Add support for the bot to recognize individual users within a mult-user conversation.
-- Fix usage stats function. Decide how/what to track. Global stats or conversation stats, or both?
-- Clean up code, standardize style, move repeated client code to functions and utility modules.
-- Create Slack app manifest file
-- Setup Github workflows and unit tests 
+## V2 Implementation Status:
+
+### Completed ✅
+- Client-based architecture with abstract base class
+- Stateless design with platform as source of truth
+- Thread state rebuilding from Slack history
+- Intent classification for image vs text responses
+- Image generation with context awareness
+- Thread locking for concurrent request handling
+- Configurable cleanup with cron scheduling
+- Error formatting with emojis and code blocks
+- Markdown to Slack mrkdwn conversion
+
+### Pending Implementation 🚧
+- GPT Vision functionality for uploaded images
+- Response streaming (experimental)
+- File handling for non-image files (PDFs, docs)
+- Discord V2 client
+- Multi-workspace support
+- Rate limiting and usage tracking 
 
 

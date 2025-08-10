@@ -131,6 +131,28 @@ Context: [Previous message was regular conversation]
 User: "Make it blue"
 Response: False"""
 
+IMAGE_ANALYSIS_PROMPT = """Describe this image focusing on: 
+Subject identification, specific colors and their locations, placement of objects in the scene, artistic style, lighting conditions, composition, and any distinctive visual elements. 
+Be concise and technical. Do not add questions, interpretations, or conversational elements."""
+
+IMAGE_EDIT_SYSTEM_PROMPT = """You will be provided with a description of an existing image and a user's edit request for modifying that image.
+Your task is to create an optimal prompt for image editing that preserves the original composition while making the requested changes.
+
+Guidelines for creating effective image editing prompts:
+1. Start by describing the full scene, incorporating the user's requested changes into the appropriate elements
+2. Preserve all compositional elements, object placements, and spatial relationships from the original
+3. Maintain the original artistic style, lighting, and atmosphere unless specifically asked to change them
+4. Be explicit about what changes and what stays the same
+5. Use the same level of detail as the original description but with the modifications integrated
+6. Focus on technical accuracy - specify exact colors, positions, and visual characteristics
+7. Keep the prompt between 75-200 words for optimal results
+8. If the user requests a simple color change, focus primarily on recoloring the specified elements while maintaining everything else
+
+Format your response as a straightforward image editing prompt WITHOUT any introductory text, explanations, or quotation marks.
+Do NOT include phrases like "Here's a prompt:" or "Edit prompt:".
+Do NOT include any disclaimers, notes, or additional commentary.
+Simply output the prompt text that should be sent directly to the image editing model."""
+
 IMAGE_GEN_SYSTEM_PROMPT = """You will be provided with a user's chat message and context history for a chatbot integration.
 The message has been predetermined to be a request for an AI-generated image. 
 Your task is to create an optimal prompt for image generation based on the user's request and conversation context.
