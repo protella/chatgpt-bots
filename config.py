@@ -77,7 +77,7 @@ class BotConfig:
     
     # Cleanup settings
     cleanup_schedule: str = field(default_factory=lambda: os.getenv("CLEANUP_SCHEDULE", "0 0 * * *"))  # Default: midnight daily
-    cleanup_max_age_hours: int = field(default_factory=lambda: int(os.getenv("CLEANUP_MAX_AGE_HOURS", "24")))
+    cleanup_max_age_hours: float = field(default_factory=lambda: float(os.getenv("CLEANUP_MAX_AGE_HOURS", "24")))
     
     def validate(self) -> bool:
         """Validate required configuration"""
