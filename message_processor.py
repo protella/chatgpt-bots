@@ -137,9 +137,12 @@ class MessageProcessor(LoggerMixin):
                     if intent == "vision":
                         # Already correctly classified as vision/analysis
                         pass
-                    elif intent in ["new_image", "ambiguous_image"]:
-                        # With uploaded images, these become edit requests
+                    elif intent == "new_image":
+                        # "new_image" with uploads means edit
                         intent = "edit_image"
+                    elif intent == "ambiguous_image":
+                        # Ambiguous with uploads - default to vision for things like "compare"
+                        intent = "vision"
                     elif intent == "edit_image":
                         # Already correctly classified
                         pass

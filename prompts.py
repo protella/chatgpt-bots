@@ -93,9 +93,9 @@ Analyze the request and classify it into one of these five categories:
    - Direct modification language referring to existing image elements
    - Words like: adjust, fix, change, modify, edit, correct, enhance (when referring to existing)
 
-3. **"vision"** - User wants to analyze, describe, or get information about an image
-   - Examples: "describe this", "what's in this image", "what do you see", "analyze this", "tell me about this"
-   - Questions about image content, not requests to create or modify
+3. **"vision"** - User wants to analyze, describe, compare, or get information about images
+   - Examples: "describe this", "what's in this image", "what do you see", "analyze this", "tell me about this", "compare these", "what's the difference"
+   - Questions about image content, comparisons, or analysis requests
    - Information extraction from existing images
 
 4. **"ambiguous"** - Image-related request but unclear intent
