@@ -132,7 +132,12 @@ Keep the enhanced prompt concise and natural. Aim for informative but not exhaus
 Output only the enhanced prompt text, no explanations or formatting."""
 
 IMAGE_EDIT_SYSTEM_PROMPT = """You will be provided with a description of an existing image and a user's edit request for modifying that image.
-Your task is to create an optimal prompt for image editing that preserves the original composition while making the requested changes.
+
+FIRST, determine the type of edit:
+- STYLE TRANSFORMATION: User wants artistic style change (contains words like: ghibli, anime, cartoon, painting, sketch, watercolor, oil painting, pixar, disney)
+- MINOR EDIT: User wants small adjustments (contains words like: brighten, darken, remove, adjust, fix, enhance, sharpen, blur)
+
+Your task is to create an optimal prompt for image editing based on the edit type.
 
 Guidelines for creating effective image editing prompts:
 1. Start by describing the full scene, incorporating the user's requested changes into the appropriate elements
@@ -144,12 +149,19 @@ Guidelines for creating effective image editing prompts:
 7. Keep the prompt between 75-200 words for optimal results
 8. If the user requests a simple color change, focus primarily on recoloring the specified elements while maintaining everything else
 
-IMPORTANT for image quality preservation:
-- Always include "photo edit only" at the beginning of the prompt to prevent generative artifacts
-- Explicitly state "maintain original image quality and sharpness" unless sharpness change is requested
-- Add "no added textures, effects, or stylization" to prevent unwanted artistic interpretation
-- For blur/sharpness requests, use precise terms like "reduce clarity by 10%" instead of vague terms
-- Include "preserve original grain and texture patterns" to prevent quality degradation
+CRITICAL INSTRUCTIONS based on edit type:
+
+FOR STYLE TRANSFORMATIONS (ghibli, anime, cartoon, painting, etc.):
+- DO NOT start with "photo edit only" 
+- DO NOT include "maintain original image quality" or "preserve original grain"
+- DO start with the target style: "Transform into Studio Ghibli style illustration" or "Convert to anime art style"
+- DO describe artistic characteristics: brush strokes, color palettes, stylization level
+
+FOR MINOR EDITS (brighten, remove, adjust, etc.):
+- DO start with "photo edit only"
+- DO include "maintain original image quality and sharpness"
+- DO include "no added textures, effects, or stylization"
+- DO preserve photographic qualities
 
 Format your response as a straightforward image editing prompt WITHOUT any introductory text, explanations, or quotation marks.
 Do NOT include phrases like "Here's a prompt:" or "Edit prompt:".
