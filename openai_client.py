@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from openai import OpenAI
 from config import config
 from logger import LoggerMixin
-from prompts import IMAGE_CHECK_SYSTEM_PROMPT, IMAGE_GEN_SYSTEM_PROMPT, IMAGE_EDIT_SYSTEM_PROMPT
+from prompts import IMAGE_INTENT_SYSTEM_PROMPT, IMAGE_GEN_SYSTEM_PROMPT, IMAGE_EDIT_SYSTEM_PROMPT, VISION_ENHANCEMENT_PROMPT
 
 
 @dataclass
@@ -175,7 +175,7 @@ class OpenAIClient(LoggerMixin):
             request_params = {
                 "model": config.utility_model,
                 "input": [
-                    {"role": "developer", "content": IMAGE_CHECK_SYSTEM_PROMPT},
+                    {"role": "developer", "content": IMAGE_INTENT_SYSTEM_PROMPT},
                     {"role": "user", "content": context}
                 ],
                 "max_output_tokens": 100,
@@ -208,14 +208,20 @@ class OpenAIClient(LoggerMixin):
             # Debug logging
             self.log_debug(f"Image check raw result: '{result}' for message: '{last_user_message[:50]}...'")
             
-            # Convert to our intent categories
-            if result == "true":
-                # If there was a recent image and user wants image, it's likely a modification
-                if has_recent_image:
-                    intent = "modify_image"
-                else:
-                    intent = "new_image"
+            # Map the 5-state classifier results to intent categories
+            if result == "new":
+                intent = "new_image"
+            elif result == "edit":
+                intent = "edit_image"
+            elif result == "vision":
+                intent = "vision"
+            elif result == "ambiguous":
+                intent = "ambiguous_image"
+            elif result == "none":
+                intent = "text_only"
             else:
+                # Fallback for unexpected responses
+                self.log_warning(f"Unexpected classifier result: '{result}', defaulting to text_only")
                 intent = "text_only"
             
             self.log_debug(f"Classified intent: {intent}")
@@ -516,11 +522,64 @@ class OpenAIClient(LoggerMixin):
             self.log_warning(f"Failed to enhance prompt: {e}")
             return prompt  # Return original on error
     
+    def _enhance_vision_prompt(self, user_question: str) -> str:
+        """
+        Enhance a vision analysis prompt for more detailed responses
+        
+        Args:
+            user_question: Original user question about the image
+        
+        Returns:
+            Enhanced prompt for better vision analysis
+        """
+        try:
+            # Build request parameters
+            request_params = {
+                "model": config.utility_model,
+                "input": [
+                    {"role": "developer", "content": VISION_ENHANCEMENT_PROMPT},
+                    {"role": "user", "content": user_question}
+                ],
+                "max_output_tokens": 200,
+                "store": False,
+            }
+            
+            # Check if we're using a GPT-5 reasoning model
+            if config.utility_model.startswith("gpt-5") and "chat" not in config.utility_model.lower():
+                request_params["temperature"] = 1.0
+                request_params["reasoning"] = {"effort": "minimal"}
+                request_params["text"] = {"verbosity": "low"}
+            else:
+                request_params["temperature"] = 0.7
+            
+            response = self.client.responses.create(**request_params)
+            
+            enhanced = ""
+            if response.output:
+                for item in response.output:
+                    if hasattr(item, "content") and item.content:
+                        for content in item.content:
+                            if hasattr(content, "text"):
+                                enhanced += content.text
+            
+            enhanced = enhanced.strip()
+            
+            if enhanced and len(enhanced) > 10:
+                self.log_debug(f"Enhanced vision prompt: {enhanced[:100]}...")
+                return enhanced
+            else:
+                return user_question  # Fallback to original
+                
+        except Exception as e:
+            self.log_warning(f"Failed to enhance vision prompt: {e}")
+            return user_question
+    
     def analyze_images(
         self,
         images: List[str],
         question: str,
-        detail: Optional[str] = None
+        detail: Optional[str] = None,
+        enhance_prompt: bool = True
     ) -> str:
         """
         Analyze one or more images with a question
@@ -529,6 +588,7 @@ class OpenAIClient(LoggerMixin):
             images: List of base64 encoded image data (max 10)
             question: Question about the image(s)
             detail: Analysis detail level (auto, low, high)
+            enhance_prompt: Whether to enhance the question for better analysis
         
         Returns:
             Analysis response
@@ -540,8 +600,14 @@ class OpenAIClient(LoggerMixin):
             self.log_warning(f"Limiting to 10 images (received {len(images)})")
             images = images[:10]
         
+        # Enhance the question if requested
+        enhanced_question = question
+        if enhance_prompt:
+            enhanced_question = self._enhance_vision_prompt(question)
+            self.log_info(f"Vision analysis with enhanced prompt: {enhanced_question[:100]}...")
+        
         # Build content array with text and images
-        content = [{"type": "input_text", "text": question}]
+        content = [{"type": "input_text", "text": enhanced_question}]
         
         for image_data in images:
             # Use data URL format for base64 images
@@ -551,15 +617,20 @@ class OpenAIClient(LoggerMixin):
             })
         
         try:
-            response = self.client.responses.create(
-                model=config.gpt_model,
-                input=[
+            # Build request parameters
+            request_params = {
+                "model": config.gpt_model,
+                "input": [
                     {
                         "role": "user",
                         "content": content
                     }
-                ]
-            )
+                ],
+                "max_output_tokens": 1500,  # Reasonable limit for vision analysis
+                "store": False  # Don't store vision analysis calls
+            }
+            
+            response = self.client.responses.create(**request_params)
             
             # Extract response text
             output_text = ""
