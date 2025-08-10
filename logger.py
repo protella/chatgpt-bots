@@ -4,8 +4,10 @@ Provides structured logging with different levels and modules
 """
 import logging
 import sys
+import os
 from datetime import datetime
 from typing import Optional
+from logging.handlers import RotatingFileHandler
 from config import config
 
 
@@ -65,6 +67,11 @@ def setup_logger(
     if logger.handlers:
         return logger
     
+    # Create logs directory if it doesn't exist
+    logs_dir = config.log_directory
+    if not os.path.exists(logs_dir):
+        os.makedirs(logs_dir)
+    
     # Console handler with colors (only if enabled)
     if config.console_logging_enabled:
         console_handler = logging.StreamHandler(sys.stdout)
@@ -75,15 +82,38 @@ def setup_logger(
         console_handler.setFormatter(console_formatter)
         logger.addHandler(console_handler)
     
-    # File handler if specified
+    # File handlers - always create these
+    file_formatter = logging.Formatter(
+        '%(asctime)s | %(levelname)s | %(name)s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # Main app log file (all levels)
+    app_log_file = os.path.join(logs_dir, "app.log")
+    app_handler = RotatingFileHandler(
+        app_log_file,
+        maxBytes=10 * 1024 * 1024,  # 10MB
+        backupCount=5
+    )
+    app_handler.setFormatter(file_formatter)
+    logger.addHandler(app_handler)
+    
+    # Error log file (ERROR and CRITICAL only)
+    error_log_file = os.path.join(logs_dir, "error.log")
+    error_handler = RotatingFileHandler(
+        error_log_file,
+        maxBytes=10 * 1024 * 1024,  # 10MB
+        backupCount=5
+    )
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(file_formatter)
+    logger.addHandler(error_handler)
+    
+    # Custom file handler if specified (in addition to defaults)
     if log_file:
-        file_handler = logging.FileHandler(log_file)
-        file_formatter = logging.Formatter(
-            '%(asctime)s | %(levelname)s | %(name)s | %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        file_handler.setFormatter(file_formatter)
-        logger.addHandler(file_handler)
+        custom_handler = logging.FileHandler(log_file)
+        custom_handler.setFormatter(file_formatter)
+        logger.addHandler(custom_handler)
     
     return logger
 

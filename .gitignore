@@ -153,3 +153,7 @@ logs/*
 # Ignore the OpenAI API reference PDF so it is not tracked by git
 API Reference - OpenAI API.pdf
 
+
+# Logs
+logs/
+*.log

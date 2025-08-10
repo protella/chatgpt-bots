@@ -38,7 +38,7 @@ class ChatBotV2:
         
         # Initialize platform-specific client
         if self.platform == "slack":
-            from slackbot import SlackBot
+            from slack_client import SlackBot
             self.client = SlackBot(message_handler=self.handle_message)
         elif self.platform == "discord":
             # Future: from discordbot import DiscordBot
@@ -99,7 +99,7 @@ class ChatBotV2:
                         message.thread_id,
                         image_data.to_bytes(),
                         f"generated_image.{image_data.format}",
-                        f"Generated image: {image_data.prompt}"
+                        f"🎨 Generated image: _{image_data.prompt}_"
                     )
                 elif response.type == "error":
                     # Send error message
@@ -131,16 +131,46 @@ class ChatBotV2:
     def start_cleanup_thread(self):
         """Start background thread for periodic cleanup"""
         def cleanup_worker():
+            from croniter import croniter
+            import datetime
+            
+            try:
+                # Validate cron expression
+                cron = croniter(config.cleanup_schedule, datetime.datetime.now())
+                main_logger.info(f"Cleanup schedule configured: {config.cleanup_schedule} (cron format)")
+                main_logger.info(f"Cleanup will remove threads older than {config.cleanup_max_age_hours} hours")
+            except Exception as e:
+                main_logger.error(f"Invalid cron expression '{config.cleanup_schedule}': {e}")
+                main_logger.info("Falling back to daily at midnight (0 0 * * *)")
+                cron = croniter("0 0 * * *", datetime.datetime.now())
+            
             while self.running:
                 try:
-                    # Clean up old thread states every 30 minutes
-                    time.sleep(1800)
+                    # Calculate next run time
+                    next_run = cron.get_next(datetime.datetime)
+                    now = datetime.datetime.now()
+                    seconds_until_next = (next_run - now).total_seconds()
+                    
+                    # Log when next cleanup will occur
+                    if seconds_until_next > 3600:
+                        main_logger.info(f"Next cleanup scheduled for {next_run.strftime('%Y-%m-%d %H:%M:%S')} ({seconds_until_next/3600:.1f} hours from now)")
+                    else:
+                        main_logger.info(f"Next cleanup scheduled for {next_run.strftime('%Y-%m-%d %H:%M:%S')} ({seconds_until_next/60:.1f} minutes from now)")
+                    
+                    # Sleep until next scheduled time
+                    time.sleep(seconds_until_next)
+                    
                     if self.running:
-                        self.processor.thread_manager.cleanup_old_threads()
+                        main_logger.info(f"Running scheduled cleanup (removing threads older than {config.cleanup_max_age_hours} hours)...")
+                        # Convert hours to seconds for the cleanup function
+                        max_age_seconds = config.cleanup_max_age_hours * 3600
+                        self.processor.thread_manager.cleanup_old_threads(max_age=max_age_seconds)
                         stats = self.processor.get_stats()
                         main_logger.info(f"Cleanup complete. Stats: {stats}")
                 except Exception as e:
                     main_logger.error(f"Error in cleanup thread: {e}")
+                    # Wait 5 minutes before retrying on error
+                    time.sleep(300)
         
         self.cleanup_thread = Thread(target=cleanup_worker, daemon=True)
         self.cleanup_thread.start()
