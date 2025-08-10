@@ -630,6 +630,12 @@ class OpenAIClient(LoggerMixin):
                 "store": False  # Don't store vision analysis calls
             }
             
+            # Add GPT-5 reasoning parameters if using a reasoning model
+            if config.gpt_model.startswith("gpt-5") and "chat" not in config.gpt_model.lower():
+                request_params["temperature"] = 1.0  # Fixed for reasoning models
+                request_params["reasoning"] = {"effort": "medium"}  # Medium effort for balanced analysis
+                request_params["text"] = {"verbosity": "medium"}  # Medium verbosity for clear but concise responses
+            
             response = self.client.responses.create(**request_params)
             
             # Extract response text

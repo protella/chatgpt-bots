@@ -161,16 +161,16 @@ Run the py file for your chosen interface, e.g.:
 - Stateless design with platform as source of truth
 - Thread state rebuilding from Slack history
 - Intent classification for image vs text responses
-- Image generation with context awareness
+- Image generation and editing with context awareness
+- Vision analysis for uploaded images
 - Thread locking for concurrent request handling
 - Configurable cleanup with cron scheduling
 - Error formatting with emojis and code blocks
 - Markdown to Slack mrkdwn conversion
+- Unsupported file type notifications
 
 ### Pending Implementation 🚧
-- GPT Vision functionality for uploaded images
 - Response streaming (experimental)
-- File handling for non-image files (PDFs, docs)
 - Discord V2 client
 - Multi-workspace support
 - Rate limiting and usage tracking 

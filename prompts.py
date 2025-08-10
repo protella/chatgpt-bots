@@ -125,6 +125,7 @@ Given the user's question, create an enhanced prompt that:
 - For vague requests ("describe this", "what is this"): Ask for a clear, focused description of the main subject, key visual elements, and overall scene
 - For specific questions: Keep the question mostly unchanged, perhaps adding a request for relevant context
 - Avoids unnecessary sections like accessibility warnings, alternative descriptions, or follow-up questions
+- If analyzing multiple images: Request clear labeling as "Image 1:", "Image 2:", etc. at the start of each image's description
 
 Keep the enhanced prompt concise and natural. Aim for informative but not exhaustive analysis.
 
@@ -142,6 +143,13 @@ Guidelines for creating effective image editing prompts:
 6. Focus on technical accuracy - specify exact colors, positions, and visual characteristics
 7. Keep the prompt between 75-200 words for optimal results
 8. If the user requests a simple color change, focus primarily on recoloring the specified elements while maintaining everything else
+
+IMPORTANT for image quality preservation:
+- Always include "photo edit only" at the beginning of the prompt to prevent generative artifacts
+- Explicitly state "maintain original image quality and sharpness" unless sharpness change is requested
+- Add "no added textures, effects, or stylization" to prevent unwanted artistic interpretation
+- For blur/sharpness requests, use precise terms like "reduce clarity by 10%" instead of vague terms
+- Include "preserve original grain and texture patterns" to prevent quality degradation
 
 Format your response as a straightforward image editing prompt WITHOUT any introductory text, explanations, or quotation marks.
 Do NOT include phrases like "Here's a prompt:" or "Edit prompt:".
