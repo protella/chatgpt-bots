@@ -54,14 +54,17 @@ class SlackBot(BaseClient):
         attachments = []
         files = event.get("files", [])
         for file in files:
-            if file.get("mimetype", "").startswith("image/"):
-                attachments.append({
-                    "type": "image",
-                    "url": file.get("url_private"),
-                    "id": file.get("id"),
-                    "name": file.get("name"),
-                    "mimetype": file.get("mimetype")
-                })
+            mimetype = file.get("mimetype", "")
+            # Determine file type based on mimetype
+            file_type = "image" if mimetype.startswith("image/") else "file"
+            
+            attachments.append({
+                "type": file_type,
+                "url": file.get("url_private"),
+                "id": file.get("id"),
+                "name": file.get("name"),
+                "mimetype": mimetype
+            })
         
         # Create universal message
         message = Message(

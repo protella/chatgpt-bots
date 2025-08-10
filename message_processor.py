@@ -5,7 +5,7 @@ Client-agnostic message processing logic
 import base64
 import re
 import time
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from base_client import BaseClient, Message, Response
 from thread_manager import ThreadStateManager
 from openai_client import OpenAIClient, ImageData
@@ -58,8 +58,43 @@ class MessageProcessor(LoggerMixin):
             if not thread_state.system_prompt:
                 thread_state.system_prompt = self._get_system_prompt(client)
             
-            # Process any attachments (images)
-            image_inputs = self._process_attachments(message, client)
+            # Process any attachments (images and other files)
+            image_inputs, unsupported_files = self._process_attachments(message, client)
+            
+            # Check for unsupported files and notify user
+            if unsupported_files:
+                file_types = set()
+                file_names = []
+                for file in unsupported_files:
+                    file_types.add(file['mimetype'])
+                    file_names.append(file['name'])
+                
+                types_str = ", ".join(sorted(file_types))
+                files_str = ", ".join(f"*{name}*" for name in file_names)
+                
+                unsupported_msg = "⚠️ *Unsupported File Type*\n\n"
+                unsupported_msg += f"I noticed you uploaded: {files_str}\n\n"
+                unsupported_msg += f"*File type(s):* `{types_str}`\n\n"
+                unsupported_msg += "───────────────\n"
+                unsupported_msg += "*Currently supported:*\n"
+                unsupported_msg += "• Images (JPEG, PNG, GIF, WebP)\n\n"
+                unsupported_msg += "_Support for additional file types may be added in the future._"
+                
+                # If there's also text or images, continue processing those
+                if (message.text and message.text.strip()) or image_inputs:
+                    unsupported_msg += "\n\nI'll process your text/image request now."
+                    # Add the unsupported files warning to conversation
+                    thread_state.add_message("user", f"[Uploaded unsupported file(s): {files_str}]")
+                    thread_state.add_message("assistant", unsupported_msg)
+                    # Continue processing if we have text or images
+                else:
+                    # Only unsupported files were uploaded, nothing else to process
+                    thread_state.add_message("user", f"[Uploaded unsupported file(s): {files_str}]")
+                    thread_state.add_message("assistant", unsupported_msg)
+                    return Response(
+                        type="text",
+                        content=unsupported_msg
+                    )
             
             # Build user content
             user_content = self._build_user_content(message.text, image_inputs)
@@ -280,18 +315,27 @@ class MessageProcessor(LoggerMixin):
         self,
         message: Message,
         client: BaseClient
-    ) -> List[Dict]:
-        """Process message attachments (mainly images)"""
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """Process message attachments (mainly images)
+        
+        Returns:
+            Tuple of (image_inputs, unsupported_files)
+        """
         image_inputs = []
+        unsupported_files = []
         image_count = 0
         max_images = 10
         
         for attachment in message.attachments:
-            # Stop if we've reached the limit
-            if image_count >= max_images:
-                self.log_warning(f"Limiting to {max_images} images (user uploaded more)")
-                break
-            if attachment.get("type") == "image":
+            file_type = attachment.get("type", "unknown")
+            file_name = attachment.get("name", "unnamed file")
+            
+            if file_type == "image":
+                # Stop if we've reached the image limit
+                if image_count >= max_images:
+                    self.log_warning(f"Limiting to {max_images} images (user uploaded more)")
+                    continue
+                    
                 try:
                     # Download the image
                     image_data = client.download_file(
@@ -311,12 +355,21 @@ class MessageProcessor(LoggerMixin):
                         })
                         
                         image_count += 1
-                        self.log_debug(f"Processed image {image_count}/{max_images}: {attachment.get('name')}")
+                        self.log_debug(f"Processed image {image_count}/{max_images}: {file_name}")
                 
                 except Exception as e:
                     self.log_error(f"Error processing attachment: {e}")
+            else:
+                # Track unsupported file types
+                mimetype = attachment.get("mimetype", "unknown")
+                unsupported_files.append({
+                    "name": file_name,
+                    "type": file_type,
+                    "mimetype": mimetype
+                })
+                self.log_debug(f"Unsupported file type: {file_type} ({mimetype}) - {file_name}")
         
-        return image_inputs
+        return image_inputs, unsupported_files
     
     def _build_user_content(self, text: str, image_inputs: List[Dict]) -> Any:
         """Build user message content"""
@@ -646,6 +699,32 @@ class MessageProcessor(LoggerMixin):
                     context += f"{i}. Uploaded image\n"
                 else:
                     context += f"{i}. Generated: {img['description'][:100]}...\n"
+            
+            # Include vision analysis if available for better context
+            # Search backwards for analysis that mentions these specific images
+            for msg in reversed(thread_state.messages):
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        # Check if this message contains analysis of our current images
+                        # Either by checking for URLs or for "Image X:" pattern with multiple images
+                        has_current_images = False
+                        
+                        # Check if any of our current image URLs are mentioned
+                        if uploaded_image_urls:
+                            has_current_images = any(url in content for url in uploaded_image_urls)
+                        
+                        # Or check if it's analyzing multiple images (likely our batch)
+                        if not has_current_images and len(all_available_images) > 1:
+                            has_current_images = ("Image 1:" in content and "Image 2:" in content)
+                        
+                        if has_current_images:
+                            context += "\nAnalysis of these images:\n"
+                            # Extract the first part of analysis that likely contains image descriptions
+                            # Limit to reasonable length to avoid token overflow
+                            analysis_excerpt = content[:1500]
+                            context += analysis_excerpt + "\n"
+                            break
             
             context += f"\nUser reference: '{user_text}'\n"
             context += "Which image number best matches the user's reference? Respond with just the number."
