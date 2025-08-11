@@ -233,13 +233,16 @@ class MessageProcessor(LoggerMixin):
                 # Check if we have uploaded images or need to find recent ones
                 if image_inputs:
                     # User uploaded images with edit request
+                    # Extract URLs from attachments for tracking
+                    attachment_urls = [att.get("url") for att in message.attachments if att.get("type") == "image"]
                     response = self._handle_image_edit(
                         message.text,
                         image_inputs,
                         thread_state,
                         client,
                         message.channel_id,
-                        thinking_id
+                        thinking_id,
+                        attachment_urls
                     )
                 else:
                     # Try to find and edit recent image
@@ -258,9 +261,15 @@ class MessageProcessor(LoggerMixin):
                     response = self._handle_vision_analysis(message.text, image_inputs, thread_state, message.attachments, 
                                                            client, message.channel_id, thinking_id)
                 else:
-                    # Vision-related question but no images - treat as follow-up text question
-                    self.log_debug("Vision intent detected but no images attached - treating as text follow-up")
-                    response = self._handle_text_response(user_content, thread_state, client, message.channel_id, thinking_id)
+                    # Vision-related question but no images - try to find previous images
+                    self.log_debug("Vision intent detected but no images attached - searching for previous images")
+                    response = self._handle_vision_without_upload(
+                        message.text, 
+                        thread_state, 
+                        client, 
+                        message.channel_id, 
+                        thinking_id
+                    )
             else:
                 response = self._handle_text_response(user_content, thread_state, client, message.channel_id, thinking_id)
             
@@ -337,7 +346,8 @@ class MessageProcessor(LoggerMixin):
                     for attachment in hist_msg.attachments:
                         if attachment.get("type") == "image":
                             url = attachment.get("url")
-                            if url and content and "Generated image:" in content:
+                            # Check for both generated and edited image markers
+                            if url and content and ("Generated image:" in content or "Edited image:" in content):
                                 # Append URL to the breadcrumb if not already present
                                 if "<" not in content:  # Don't add if URL already there
                                     content += f" <{url}>"
@@ -436,25 +446,38 @@ class MessageProcessor(LoggerMixin):
         for msg in thread_state.messages:
             if msg.get("role") == "assistant":
                 content = msg.get("content", "")
-                if isinstance(content, str) and "Generated image:" in content:
-                    # Extract URL if present
-                    url = None
-                    if "<" in content and ">" in content:
-                        url_start = content.rfind("<")
-                        url_end = content.rfind(">")
-                        if url_start < url_end:
-                            url = content[url_start + 1:url_end]
-                    
-                    # Extract description
-                    desc_start = content.find("Generated image:") + len("Generated image:")
-                    desc_end = content.find("<") if "<" in content else len(content)
-                    description = content[desc_start:desc_end].strip()
-                    
-                    if url:
-                        image_registry.append({
-                            "url": url,
-                            "description": description
-                        })
+                if isinstance(content, str):
+                    # Check for any image markers
+                    image_markers = ["Generated image:", "Edited image:", "Analyzed uploaded image:"]
+                    for marker in image_markers:
+                        if marker in content:
+                            # Extract URL if present
+                            url = None
+                            if "<" in content and ">" in content:
+                                url_start = content.rfind("<")
+                                url_end = content.rfind(">")
+                                if url_start < url_end:
+                                    url = content[url_start + 1:url_end]
+                            
+                            # Extract description based on marker type
+                            if marker == "Analyzed uploaded image:":
+                                # For analysis, we want to note this is the original uploaded image
+                                desc_start = content.find(marker) + len(marker)
+                                desc_end = content.find("<") if "<" in content else len(content)
+                                description = f"[Original] {content[desc_start:desc_end].strip()}"
+                            else:
+                                # For generated/edited images
+                                desc_start = content.find(marker) + len(marker)
+                                desc_end = content.find("<") if "<" in content else len(content)
+                                description = content[desc_start:desc_end].strip()
+                            
+                            if url or marker == "Image analysis:":
+                                image_registry.append({
+                                    "url": url if url else "[Uploaded image - URL pending]",
+                                    "description": description,
+                                    "type": marker.replace(":", "").lower().replace(" ", "_")
+                                })
+                            break  # Only process first marker found
         
         return image_registry
     
@@ -797,11 +820,8 @@ class MessageProcessor(LoggerMixin):
                 except Exception as e:
                     self.log_error(f"Error in final correction update: {e}")
             
-            # Check if response used web search and add citation note
-            if config.enable_web_search:
-                # Look for indicators that web search was used
-                if any(marker in response_text for marker in ["[1]", "[2]", "[3]", "http://", "https://"]):
-                    self.log_info("Response includes web search results")
+            # Note: To properly detect if web search was used, we'd need to track
+            # tool events during streaming. The presence of URLs doesn't mean web search was used.
             
             # Add assistant response to thread state
             thread_state.add_message("assistant", response_text)
@@ -1140,6 +1160,30 @@ class MessageProcessor(LoggerMixin):
             # No previous images, treat as new generation
             return self._handle_image_generation(text, thread_state, client, channel_id, thinking_id)
     
+    def _handle_vision_without_upload(
+        self,
+        text: str,
+        thread_state,
+        client: BaseClient,
+        channel_id: str,
+        thinking_id: Optional[str]
+    ) -> Response:
+        """Handle vision request when no images are uploaded - use text response with context"""
+        
+        # Check if we have any images in the conversation that provide context
+        image_registry = self._extract_image_registry(thread_state)
+        has_images = bool(image_registry) or self._has_recent_image(thread_state)
+        
+        if has_images:
+            # We have image context in the conversation - let the model use that
+            self.log_info("Vision intent with image context in history - using text response with context")
+        else:
+            self.log_info("Vision intent but no images found in conversation")
+        
+        # Always use text response - the model will have context from the thread history
+        # This avoids re-analysis and keeps responses concise
+        return self._handle_text_response(text, thread_state, client, channel_id, thinking_id)
+    
     def _handle_image_edit(
         self,
         text: str,
@@ -1147,7 +1191,8 @@ class MessageProcessor(LoggerMixin):
         thread_state,
         client: BaseClient,
         channel_id: str,
-        thinking_id: Optional[str]
+        thinking_id: Optional[str],
+        attachment_urls: Optional[List[str]] = None
     ) -> Response:
         """Handle image editing with uploaded images"""
         self._update_status(client, channel_id, thinking_id, "Processing uploaded images...")
@@ -1208,13 +1253,10 @@ class MessageProcessor(LoggerMixin):
             print(f"Image Description (Full):\n{image_description}")
             print("="*80)
             
-            # Log what we're sending to the enhancer
-            print("\n" + "="*80)
-            print("DEBUG: IMAGE EDIT FLOW - STEP 3: INPUTS FOR ENHANCEMENT")
-            print("="*80)
-            print(f"Image Description: {image_description[:200]}..." if len(image_description) > 200 else f"Image Description: {image_description}")
-            print(f"\nUser's Edit Request: {text}")
-            print("="*80)
+            # Don't show the analysis - just update status to show we're editing
+            # The analysis is only used internally for better edit quality
+            if thinking_id:
+                self._update_status(client, channel_id, thinking_id, "Editing your image...")
             
             # Store the description and user request separately for clean enhancement
             image_analysis = image_description
@@ -1235,10 +1277,7 @@ class MessageProcessor(LoggerMixin):
         thread_config = config.get_thread_config(thread_state.config_overrides)
         
         # Use the edit_image API with separated inputs
-        self._update_status(client, channel_id, thinking_id, "Enhancing your edit request...")
-        
         try:
-            self._update_status(client, channel_id, thinking_id, "Editing your image...")
             
             image_data = self.openai_client.edit_image(
                 input_images=input_images,
@@ -1259,9 +1298,23 @@ class MessageProcessor(LoggerMixin):
                 content=f"Failed to edit image: {str(e)}"
             )
         
-        # Add breadcrumb to thread state
-        thread_state.add_message("user", text or "Edit uploaded image")
-        thread_state.add_message("assistant", f"Generated image: {image_data.prompt}")
+        # Add breadcrumb to thread state with URLs for consistency with rebuild
+        user_breadcrumb = text or "Edit uploaded image"
+        if attachment_urls:
+            user_breadcrumb += f" [Uploaded {len(attachment_urls)} file(s)]"
+            for url in attachment_urls:
+                user_breadcrumb += f" <{url}>"
+        thread_state.add_message("user", user_breadcrumb)
+        
+        # Include brief context about what was uploaded and edited for future vision questions
+        # This helps the model answer follow-up questions without re-analysis
+        if image_analysis:
+            # Add a brief note about the original image content (first 200 chars of analysis)
+            brief_context = image_analysis[:200] + "..." if len(image_analysis) > 200 else image_analysis
+            assistant_breadcrumb = f"Edited image: {image_data.prompt} [Original: {brief_context}]"
+        else:
+            assistant_breadcrumb = f"Edited image: {image_data.prompt}"
+        thread_state.add_message("assistant", assistant_breadcrumb)
         
         return Response(
             type="image",

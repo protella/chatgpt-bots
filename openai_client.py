@@ -355,6 +355,10 @@ class OpenAIClient(LoggerMixin):
                         except Exception as callback_error:
                             self.log_warning(f"Stream completion callback error: {callback_error}")
                         break
+                    elif event_type and "tool" in event_type:
+                        # Log tool-related events for visibility
+                        self.log_info(f"Tool event: {event_type}")
+                        continue
                     else:
                         # Only log unhandled events for debugging
                         pass
@@ -496,6 +500,10 @@ class OpenAIClient(LoggerMixin):
                         except Exception as callback_error:
                             self.log_warning(f"Stream completion callback error: {callback_error}")
                         break
+                    elif event_type and "tool" in event_type:
+                        # Log tool-related events for visibility
+                        self.log_info(f"Tool event: {event_type}")
+                        continue
                     else:
                         # Only log unhandled events for debugging
                         pass
