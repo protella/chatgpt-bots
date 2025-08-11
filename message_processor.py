@@ -36,12 +36,25 @@ class MessageProcessor(LoggerMixin):
         """
         thread_key = f"{message.channel_id}:{message.thread_id}"
         
+        # Log request start with clear markers
+        username = message.metadata.get("username", message.user_id) if message.metadata else message.user_id
+        self.log_info("="*80)
+        self.log_info(f"REQUEST START | Thread: {thread_key} | User: {username}")
+        self.log_info(f"Message: {message.text[:100] if message.text else 'No text'}{'...' if message.text and len(message.text) > 100 else ''}")
+        self.log_info("="*80)
+        
+        request_start_time = time.time()
+        
         # Check if thread is busy
         if not self.thread_manager.acquire_thread_lock(
             message.thread_id, 
             message.channel_id,
             timeout=0  # Don't wait, return immediately if busy
         ):
+            elapsed = time.time() - request_start_time
+            self.log_info("="*80)
+            self.log_info(f"REQUEST END | Thread: {thread_key} | Status: BUSY | Time: {elapsed:.2f}s")
+            self.log_info("="*80)
             return Response(
                 type="busy",
                 content="Thread is currently processing another request"
@@ -91,6 +104,10 @@ class MessageProcessor(LoggerMixin):
                     # Only unsupported files were uploaded, nothing else to process
                     thread_state.add_message("user", f"[Uploaded unsupported file(s): {files_str}]")
                     thread_state.add_message("assistant", unsupported_msg)
+                    elapsed = time.time() - request_start_time
+                    self.log_info("="*80)
+                    self.log_info(f"REQUEST END | Thread: {thread_key} | Status: UNSUPPORTED_FILE | Time: {elapsed:.2f}s")
+                    self.log_info("="*80)
                     return Response(
                         type="text",
                         content=unsupported_msg
@@ -108,7 +125,8 @@ class MessageProcessor(LoggerMixin):
                 
                 intent = self.openai_client.classify_intent(
                     thread_state.get_recent_messages(),
-                    combined_context
+                    combined_context,
+                    has_attached_images=len(image_inputs) > 0
                 )
                 
                 # Clear the pending clarification
@@ -131,7 +149,8 @@ class MessageProcessor(LoggerMixin):
                                       "Understanding your request...")
                     intent = self.openai_client.classify_intent(
                         thread_state.get_recent_messages(),
-                        message.text
+                        message.text,
+                        has_attached_images=len(image_inputs) > 0
                     )
                     # Handle classification based on uploaded images
                     if intent == "vision":
@@ -156,7 +175,8 @@ class MessageProcessor(LoggerMixin):
                                   "Understanding your request...")
                 intent = self.openai_client.classify_intent(
                     thread_state.get_recent_messages(),
-                    message.text if message.text else ""
+                    message.text if message.text else "",
+                    has_attached_images=False  # Already checked - no images here
                 )
             
             self.log_debug(f"Classified intent: {intent}")
@@ -175,9 +195,23 @@ class MessageProcessor(LoggerMixin):
                     
                     # Add clarification to thread history
                     thread_state.add_message("user", message.text)
-                    clarification_msg = "Would you like me to modify the image I just created, or generate a completely new one?"
+                    
+                    # Check if it's an uploaded image or generated one
+                    has_uploaded = any("files.slack.com" in msg.get("content", "") 
+                                     for msg in thread_state.messages[-5:] 
+                                     if msg.get("role") == "user")
+                    
+                    if has_uploaded:
+                        clarification_msg = "Would you like me to edit the uploaded image, or create a new image based on your description?"
+                    else:
+                        clarification_msg = "Would you like me to modify the image I just created, or generate a completely new one?"
+                    
                     thread_state.add_message("assistant", clarification_msg)
                     
+                    elapsed = time.time() - request_start_time
+                    self.log_info("="*80)
+                    self.log_info(f"REQUEST END | Thread: {thread_key} | Status: CLARIFICATION | Time: {elapsed:.2f}s")
+                    self.log_info("="*80)
                     return Response(
                         type="text",
                         content=clarification_msg
@@ -237,10 +271,19 @@ class MessageProcessor(LoggerMixin):
             print(json.dumps(thread_state.messages, indent=2))
             print("="*80 + "\n")
             
+            elapsed = time.time() - request_start_time
+            response_type = response.type if response else "None"
+            self.log_info("="*80)
+            self.log_info(f"REQUEST END | Thread: {thread_key} | Status: {response_type.upper()} | Time: {elapsed:.2f}s")
+            self.log_info("="*80)
             return response
             
         except Exception as e:
             self.log_error(f"Error processing message: {e}", exc_info=True)
+            elapsed = time.time() - request_start_time
+            self.log_info("="*80)
+            self.log_info(f"REQUEST END | Thread: {thread_key} | Status: ERROR | Time: {elapsed:.2f}s")
+            self.log_info("="*80)
             return Response(
                 type="error",
                 content=str(e)
@@ -416,7 +459,7 @@ class MessageProcessor(LoggerMixin):
     
     def _has_recent_image(self, thread_state) -> bool:
         """Check if there are recent images in the conversation"""
-        # Check last few messages for image generation breadcrumbs
+        # Check last few messages for image generation breadcrumbs or uploaded images
         for msg in thread_state.messages[-5:]:  # Check last 5 messages
             if msg.get("role") == "assistant":
                 content = msg.get("content", "")
@@ -428,6 +471,12 @@ class MessageProcessor(LoggerMixin):
                         "created an image",
                         "edited image:"
                     ]):
+                        return True
+            elif msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    # Look for uploaded image URLs (Slack format)
+                    if "files.slack.com" in content or "[Uploaded" in content:
                         return True
         
         # Also check asset ledger if available
@@ -515,16 +564,41 @@ class MessageProcessor(LoggerMixin):
         # Update status before generating
         self._update_status(client, channel_id, thinking_id, "Generating response...")
         
-        # Generate response using the appropriate messages
-        response_text = self.openai_client.create_text_response(
-            messages=messages_for_api,
-            model=thread_config["model"],
-            temperature=thread_config["temperature"],
-            max_tokens=thread_config["max_tokens"],
-            system_prompt=system_prompt,
-            reasoning_effort=thread_config.get("reasoning_effort"),
-            verbosity=thread_config.get("verbosity")
-        )
+        # Check if web search should be available
+        if config.enable_web_search:
+            # Use web search model if specified, otherwise use thread config model
+            model = config.web_search_model or thread_config["model"]
+            
+            # Generate response with web search tool available
+            response_text = self.openai_client.create_text_response_with_tools(
+                messages=messages_for_api,
+                tools=[{"type": "web_search"}],
+                model=model,
+                temperature=thread_config["temperature"],
+                max_tokens=thread_config["max_tokens"],
+                system_prompt=system_prompt,
+                reasoning_effort=thread_config.get("reasoning_effort"),
+                verbosity=thread_config.get("verbosity"),
+                store=False  # Match the existing behavior
+            )
+        else:
+            # Generate response without tools
+            response_text = self.openai_client.create_text_response(
+                messages=messages_for_api,
+                model=thread_config["model"],
+                temperature=thread_config["temperature"],
+                max_tokens=thread_config["max_tokens"],
+                system_prompt=system_prompt,
+                reasoning_effort=thread_config.get("reasoning_effort"),
+                verbosity=thread_config.get("verbosity")
+            )
+        
+        # Check if response used web search and add citation note
+        if config.enable_web_search:
+            # Look for indicators that web search was used
+            # OpenAI typically includes numbered citations [1], [2] or URLs when web search is used
+            if any(marker in response_text for marker in ["[1]", "[2]", "[3]", "http://", "https://"]):
+                self.log_info("Response includes web search results")
         
         # Add assistant response to thread state
         thread_state.add_message("assistant", response_text)
@@ -533,7 +607,6 @@ class MessageProcessor(LoggerMixin):
             type="text",
             content=response_text
         )
-    
     def _handle_vision_analysis(self, user_text: str, image_inputs: List[Dict], thread_state, attachments: List[Dict],
                                client: BaseClient, channel_id: str, thinking_id: Optional[str]) -> Response:
         """Handle vision analysis of uploaded images"""

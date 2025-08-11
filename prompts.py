@@ -93,10 +93,11 @@ Analyze the request and classify it into one of these five categories:
    - Direct modification language referring to existing image elements
    - Words like: adjust, fix, change, modify, edit, correct, enhance (when referring to existing)
 
-3. **"vision"** - User wants to analyze, describe, compare, or get information about images
-   - Examples: "describe this", "what's in this image", "what do you see", "analyze this", "tell me about this", "compare these", "what's the difference"
-   - Questions about image content, comparisons, or analysis requests
-   - Information extraction from existing images
+3. **"vision"** - User wants to analyze, describe, compare, or get information about UPLOADED/ATTACHED images
+   - REQUIRES: Actual image files attached to the message (photos, screenshots, pictures)
+   - Examples WITH images: "describe this image", "what's in this photo", "analyze this screenshot", "tell me about this picture"
+   - NOT vision: General questions like "what is X?" or "explain Y" without attached images
+   - Information extraction from uploaded visual content only
 
 4. **"ambiguous"** - Image-related request but unclear intent
    - Examples: "I need a sharper image", "something with better lighting", "how about with a sunset"
@@ -106,14 +107,20 @@ Analyze the request and classify it into one of these five categories:
 5. **"none"** - Not related to image operations at all
    - Regular conversation or non-visual requests
    - General questions not about images
+   - URLs or links (even if formatted like <http://example.com|example.com>)
+   - Questions about websites or web content
 
 Consider the conversation context:
+- Vision classification REQUIRES actual image attachments - not just questions about things
 - If user uploaded an image with analysis language, classify as "vision"
 - If a recent image was generated/uploaded, lean toward "edit" for modification language
 - But still mark as "ambiguous" if the user's intent isn't crystal clear
 - Requests for "another" or "different" typically mean "new" even with recent images
+- URLs/links are NOT images - classify questions about websites as "none"
+- General questions ("what is X?", "explain Y", "how does Z work?") without images are "none", not "vision"
 
-Respond with ONLY one word: "new", "edit", "vision", "ambiguous", or "none". No other text should be provided."""
+CRITICAL: Respond with EXACTLY ONE WORD from this list: "new", "edit", "vision", "ambiguous", "none"
+Do NOT provide any explanation, reasoning, or additional text. Just the single word."""
 
 IMAGE_ANALYSIS_PROMPT = """Describe this image focusing on: 
 Subject identification, specific colors and their locations, placement of objects in the scene, artistic style, lighting conditions, composition, and any distinctive visual elements. 
@@ -162,7 +169,7 @@ FOR MINOR EDITS (brighten, remove, adjust, etc.):
 - DO include "maintain original image quality and sharpness"
 - DO include "no added textures, effects, or stylization"
 - DO preserve photographic qualities
-- DO ensure the contrast is maintained and add a soft focus to the image
+- DO ensure the contrast is maintained
 
 Format your response as a straightforward image editing prompt WITHOUT any introductory text, explanations, or quotation marks.
 Do NOT include phrases like "Here's a prompt:" or "Edit prompt:".

@@ -62,6 +62,10 @@ class BotConfig:
     # UI Configuration
     thinking_emoji: str = field(default_factory=lambda: os.getenv("THINKING_EMOJI", ":hourglass_flowing_sand:"))
     
+    # Web search configuration
+    enable_web_search: bool = field(default_factory=lambda: os.getenv("ENABLE_WEB_SEARCH", "true").lower() == "true")
+    web_search_model: str = field(default_factory=lambda: os.getenv("WEB_SEARCH_MODEL", ""))  # Empty = use default model
+    
     # Logging configuration
     log_level: str = field(default_factory=lambda: os.getenv("BOT_LOG_LEVEL", "INFO"))
     slack_log_level: str = field(default_factory=lambda: os.getenv("SLACK_LOG_LEVEL", "INFO"))

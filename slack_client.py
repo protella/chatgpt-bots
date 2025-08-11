@@ -22,6 +22,7 @@ class SlackBot(BaseClient):
         self.handler = None
         self.message_handler = message_handler  # Callback for processing messages
         self.markdown_converter = MarkdownConverter(platform="slack")
+        self.user_cache = {}  # Cache user info to avoid repeated API calls
         
         # Register Slack event handlers
         self._register_handlers()
@@ -38,6 +39,28 @@ class SlackBot(BaseClient):
             # Only process DMs and non-bot messages
             if event.get("channel_type") == "im" and not event.get("bot_id"):
                 self._handle_slack_message(event, client)
+    
+    def get_username(self, user_id: str, client) -> str:
+        """Get username from user ID, with caching"""
+        if user_id in self.user_cache:
+            return self.user_cache[user_id]
+        
+        try:
+            # Fetch user info from Slack API
+            result = client.users_info(user=user_id)
+            if result["ok"]:
+                user_info = result["user"]
+                # Prefer display name, fall back to real name, then just the ID
+                username = (user_info.get("profile", {}).get("display_name") or 
+                          user_info.get("profile", {}).get("real_name") or 
+                          user_info.get("name") or 
+                          user_id)
+                self.user_cache[user_id] = username
+                return username
+        except Exception as e:
+            self.log_debug(f"Could not fetch username for {user_id}: {e}")
+        
+        return user_id  # Fallback to user ID if fetch fails
     
     def _handle_slack_message(self, event: Dict[str, Any], client):
         """Convert Slack event to universal Message format"""
@@ -66,16 +89,21 @@ class SlackBot(BaseClient):
                 "mimetype": mimetype
             })
         
+        # Get username for logging
+        user_id = event.get("user")
+        username = self.get_username(user_id, client) if user_id else "unknown"
+        
         # Create universal message
         message = Message(
             text=text,
-            user_id=event.get("user"),
+            user_id=user_id,
             channel_id=event.get("channel"),
             thread_id=event.get("thread_ts") or event.get("ts"),
             attachments=attachments,
             metadata={
                 "ts": event.get("ts"),
-                "slack_client": client
+                "slack_client": client,
+                "username": username  # Add username to metadata
             }
         )
         

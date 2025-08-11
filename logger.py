@@ -159,11 +159,10 @@ def log_session_start():
     """Log session start marker"""
     main_logger.info("=" * 60)
     main_logger.info(f"Session started at {datetime.now().isoformat()}")
-    main_logger.info(f"Debug mode: {config.debug_mode}")
+    main_logger.info(f"Log Level: {config.log_level}")
     main_logger.info(f"GPT Model: {config.gpt_model}")
     main_logger.info(f"Utility Model: {config.utility_model}")
     main_logger.info(f"Image Model: {config.image_model}")
-    main_logger.info(f"Log Level: {config.log_level}")
     main_logger.info("=" * 60)
 
 
