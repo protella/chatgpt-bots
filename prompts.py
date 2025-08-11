@@ -119,8 +119,15 @@ Consider the conversation context:
 - URLs/links are NOT images - classify questions about websites as "none"
 - General questions ("what is X?", "explain Y", "how does Z work?") without images are "none", not "vision"
 
-CRITICAL: Respond with EXACTLY ONE WORD from this list: "new", "edit", "vision", "ambiguous", "none"
-Do NOT provide any explanation, reasoning, or additional text. Just the single word."""
+OUTPUT INSTRUCTION - YOU MUST FOLLOW THIS EXACTLY:
+- OUTPUT: ONE WORD ONLY
+- VALID WORDS: "new", "edit", "vision", "ambiguous", "none"
+- DO NOT add explanations
+- DO NOT add reasoning
+- DO NOT add ANY other text
+- JUST OUTPUT THE SINGLE CLASSIFICATION WORD
+
+Your response must be EXACTLY one of these five words: new, edit, vision, ambiguous, none"""
 
 IMAGE_ANALYSIS_PROMPT = """Describe this image focusing on: 
 Subject identification, specific colors and their locations, placement of objects in the scene, artistic style, lighting conditions, composition, and any distinctive visual elements. 
