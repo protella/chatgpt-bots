@@ -162,6 +162,7 @@ FOR MINOR EDITS (brighten, remove, adjust, etc.):
 - DO include "maintain original image quality and sharpness"
 - DO include "no added textures, effects, or stylization"
 - DO preserve photographic qualities
+- DO ensure the contrast is maintained and add a soft focus to the image
 
 Format your response as a straightforward image editing prompt WITHOUT any introductory text, explanations, or quotation marks.
 Do NOT include phrases like "Here's a prompt:" or "Edit prompt:".
