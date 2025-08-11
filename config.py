@@ -83,6 +83,16 @@ class BotConfig:
     cleanup_schedule: str = field(default_factory=lambda: os.getenv("CLEANUP_SCHEDULE", "0 0 * * *"))  # Default: midnight daily
     cleanup_max_age_hours: float = field(default_factory=lambda: float(os.getenv("CLEANUP_MAX_AGE_HOURS", "24")))
     
+    # Streaming configuration
+    enable_streaming: bool = field(default_factory=lambda: os.getenv("ENABLE_STREAMING", "true").lower() == "true")
+    slack_streaming: bool = field(default_factory=lambda: os.getenv("SLACK_STREAMING", "true").lower() == "true")
+    streaming_update_interval: float = field(default_factory=lambda: float(os.getenv("STREAMING_UPDATE_INTERVAL", "2.0")))
+    streaming_min_interval: float = field(default_factory=lambda: float(os.getenv("STREAMING_MIN_INTERVAL", "1.0")))
+    streaming_max_interval: float = field(default_factory=lambda: float(os.getenv("STREAMING_MAX_INTERVAL", "30.0")))
+    streaming_buffer_size: int = field(default_factory=lambda: int(os.getenv("STREAMING_BUFFER_SIZE", "500")))
+    streaming_circuit_breaker_threshold: int = field(default_factory=lambda: int(os.getenv("STREAMING_CIRCUIT_BREAKER_THRESHOLD", "5")))
+    streaming_circuit_breaker_cooldown: int = field(default_factory=lambda: int(os.getenv("STREAMING_CIRCUIT_BREAKER_COOLDOWN", "300")))
+    
     def validate(self) -> bool:
         """Validate required configuration"""
         if not self.slack_bot_token:
@@ -121,6 +131,16 @@ class BotConfig:
             
             # Vision
             "detail_level": self.default_detail_level,
+            
+            # Streaming
+            "enable_streaming": self.enable_streaming,
+            "slack_streaming": self.slack_streaming,
+            "streaming_update_interval": self.streaming_update_interval,
+            "streaming_min_interval": self.streaming_min_interval,
+            "streaming_max_interval": self.streaming_max_interval,
+            "streaming_buffer_size": self.streaming_buffer_size,
+            "streaming_circuit_breaker_threshold": self.streaming_circuit_breaker_threshold,
+            "streaming_circuit_breaker_cooldown": self.streaming_circuit_breaker_cooldown,
         }
         
         if overrides:

@@ -67,8 +67,8 @@ class ChatBotV2:
             # Process the message and get intent
             response = self.processor.process_message(message, client, thinking_id)
             
-            # Delete thinking indicator
-            if thinking_id:
+            # Delete thinking indicator (but not if streaming was used - it's already the response)
+            if thinking_id and not (response and response.metadata.get("streamed")):
                 client.delete_message(message.channel_id, thinking_id)
             
             # Handle the response
@@ -84,13 +84,15 @@ class ChatBotV2:
                             response.content
                         )
                 elif response.type == "text":
-                    # Format and send text
-                    formatted_text = client.format_text(response.content)
-                    client.send_message(
-                        message.channel_id,
-                        message.thread_id,
-                        formatted_text
-                    )
+                    # If streaming was used, the message is already displayed
+                    if not response.metadata.get("streamed"):
+                        # Format and send text
+                        formatted_text = client.format_text(response.content)
+                        client.send_message(
+                            message.channel_id,
+                            message.thread_id,
+                            formatted_text
+                        )
                 elif response.type == "image":
                     # Send image
                     image_data = response.content

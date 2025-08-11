@@ -12,6 +12,7 @@ from openai_client import OpenAIClient, ImageData
 from config import config
 from logger import LoggerMixin
 from prompts import SLACK_SYSTEM_PROMPT, DISCORD_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, IMAGE_ANALYSIS_PROMPT
+from streaming import StreamingBuffer, RateLimitManager
 
 
 class MessageProcessor(LoggerMixin):
@@ -525,6 +526,12 @@ class MessageProcessor(LoggerMixin):
                               channel_id: str = None, thinking_id: Optional[str] = None,
                               attachment_urls: Optional[List[str]] = None) -> Response:
         """Handle text-only response generation"""
+        # Check if streaming is enabled and supported
+        if (hasattr(client, 'supports_streaming') and client.supports_streaming() and 
+            thinking_id is not None):  # Streaming requires a message ID to update
+            return self._handle_streaming_text_response(user_content, thread_state, client, channel_id, thinking_id, attachment_urls)
+        
+        # Fall back to non-streaming logic
         # For vision requests with images, store only a text breadcrumb with URLs, not the base64 data
         if isinstance(user_content, list):
             # Extract text and count images from the multi-part content
@@ -607,6 +614,216 @@ class MessageProcessor(LoggerMixin):
             type="text",
             content=response_text
         )
+    
+    def _handle_streaming_text_response(self, user_content: Any, thread_state, client: BaseClient, 
+                                      channel_id: str = None, thinking_id: Optional[str] = None,
+                                      attachment_urls: Optional[List[str]] = None) -> Response:
+        """Handle text-only response generation with streaming support"""
+        # Check if client supports streaming
+        if not hasattr(client, 'supports_streaming') or not client.supports_streaming():
+            self.log_debug("Client doesn't support streaming, falling back to non-streaming")
+            return self._handle_text_response(user_content, thread_state, client, channel_id, thinking_id, attachment_urls)
+        
+        # Get streaming configuration from client
+        streaming_config = client.get_streaming_config() if hasattr(client, 'get_streaming_config') else {}
+        
+        # Create streaming buffer and rate limit manager
+        buffer = StreamingBuffer(
+            update_interval=streaming_config.get("update_interval", 2.0),
+            buffer_size_threshold=streaming_config.get("buffer_size", 500),
+            min_update_interval=streaming_config.get("min_interval", 1.0)
+        )
+        
+        rate_limiter = RateLimitManager(
+            base_interval=streaming_config.get("update_interval", 2.0),
+            min_interval=streaming_config.get("min_interval", 1.0),
+            max_interval=streaming_config.get("max_interval", 30.0),
+            failure_threshold=streaming_config.get("circuit_breaker_threshold", 5),
+            cooldown_seconds=streaming_config.get("circuit_breaker_cooldown", 300)
+        )
+        
+        self.log_info("Starting streaming response generation")
+        
+        # Process user content for thread state (same as non-streaming)
+        if isinstance(user_content, list):
+            # Extract text and count images from the multi-part content
+            text_parts = []
+            image_count = 0
+            for item in user_content:
+                if item.get("type") == "input_text":
+                    text_parts.append(item.get("text", ""))
+                elif item.get("type") == "input_image":
+                    image_count += 1
+            
+            # Create breadcrumb text for thread history
+            breadcrumb_text = " ".join(text_parts).strip()
+            if image_count > 0:
+                breadcrumb_text += f" [Uploaded {image_count} file(s)]"
+                # Add URLs if we have them
+                if attachment_urls:
+                    for url in attachment_urls:
+                        breadcrumb_text += f" <{url}>"
+            
+            # Add simplified breadcrumb to thread state (no base64 data)
+            thread_state.add_message("user", breadcrumb_text)
+            
+            # Use the full content with images for the actual API call
+            messages_for_api = thread_state.messages[:-1] + [{"role": "user", "content": user_content}]
+        else:
+            # Simple text content - add as-is
+            thread_state.add_message("user", user_content)
+            messages_for_api = thread_state.messages
+        
+        # Get thread config
+        thread_config = config.get_thread_config(thread_state.config_overrides)
+        
+        # Use thread's system prompt (which is now platform-specific)
+        system_prompt = thread_state.system_prompt or self._get_system_prompt(client)
+        
+        # Update status before generating
+        self._update_status(client, channel_id, thinking_id, "Generating response...")
+        
+        # Post an initial message to get the message ID for streaming updates
+        initial_message = f"{config.thinking_emoji} Generating response..."
+        if thinking_id:
+            # Update existing thinking message
+            message_id = thinking_id
+            client.update_message(channel_id, message_id, initial_message)
+        else:
+            # We need a way to post a message and get its ID - this would depend on client implementation
+            self.log_warning("No thinking_id provided for streaming - falling back to non-streaming")
+            return self._handle_text_response(user_content, thread_state, client, channel_id, thinking_id, attachment_urls)
+        
+        # Define the streaming callback
+        def stream_callback(text_chunk: str):
+            """Callback function called with each text chunk from OpenAI"""
+            # Check if this is the completion signal (None)
+            if text_chunk is None:
+                # Stream is complete - flush any remaining buffered text
+                if buffer.has_pending_update() and rate_limiter.can_make_request():
+                    self.log_info("Flushing final buffered text")
+                    rate_limiter.record_request_attempt()
+                    # Use raw text for final flush - no fence closing needed since stream is complete
+                    final_text = buffer.get_complete_text()
+                    try:
+                        result = client.update_message_streaming(channel_id, message_id, final_text)
+                        if result["success"]:
+                            rate_limiter.record_success()
+                            buffer.mark_updated()
+                    except Exception as e:
+                        self.log_error(f"Error flushing final text: {e}")
+                return
+            
+            if not text_chunk:
+                return
+                
+            # Add chunk to buffer
+            buffer.add_chunk(text_chunk)
+            
+            # Check if it's time to update
+            if buffer.should_update() and rate_limiter.can_make_request():
+                rate_limiter.record_request_attempt()
+                
+                # Get display-safe text with closed fences
+                display_text = buffer.get_display_text()
+                
+                # Call client.update_message_streaming
+                try:
+                    result = client.update_message_streaming(channel_id, message_id, display_text)
+                    
+                    if result["success"]:
+                        rate_limiter.record_success()
+                        buffer.mark_updated()
+                        buffer.update_interval_setting(rate_limiter.get_current_interval())
+                    else:
+                        if result["rate_limited"]:
+                            # Handle rate limit response
+                            if result["retry_after"]:
+                                rate_limiter.set_retry_after(result["retry_after"])
+                            rate_limiter.record_failure(is_rate_limit=True)
+                            
+                            # Check if we should fall back to non-streaming
+                            if not rate_limiter.is_streaming_enabled():
+                                self.log_warning("Circuit breaker opened - will complete without further streaming")
+                        else:
+                            rate_limiter.record_failure(is_rate_limit=False)
+                            self.log_warning(f"Message update failed: {result.get('error', 'Unknown error')}")
+                            
+                except Exception as e:
+                    rate_limiter.record_failure(is_rate_limit=False)
+                    self.log_error(f"Error updating streaming message: {e}")
+        
+        # Start streaming from OpenAI with the callback
+        try:
+            if config.enable_web_search:
+                # Use web search model if specified, otherwise use thread config model
+                model = config.web_search_model or thread_config["model"]
+                
+                # Generate response with web search tool available
+                response_text = self.openai_client.create_streaming_response_with_tools(
+                    messages=messages_for_api,
+                    tools=[{"type": "web_search"}],
+                    stream_callback=stream_callback,
+                    model=model,
+                    temperature=thread_config["temperature"],
+                    max_tokens=thread_config["max_tokens"],
+                    system_prompt=system_prompt,
+                    reasoning_effort=thread_config.get("reasoning_effort"),
+                    verbosity=thread_config.get("verbosity"),
+                    store=False  # Match the existing behavior
+                )
+            else:
+                # Generate response without tools
+                response_text = self.openai_client.create_streaming_response(
+                    messages=messages_for_api,
+                    stream_callback=stream_callback,
+                    model=thread_config["model"],
+                    temperature=thread_config["temperature"],
+                    max_tokens=thread_config["max_tokens"],
+                    system_prompt=system_prompt,
+                    reasoning_effort=thread_config.get("reasoning_effort"),
+                    verbosity=thread_config.get("verbosity")
+                )
+            
+            # Safety check: ensure all text was sent (should be handled by flush in callback)
+            # This is a fallback in case the flush didn't work for some reason
+            if response_text != buffer.last_sent_text:
+                self.log_warning(f"Text mismatch after streaming - sending correction update "
+                               f"(sent: {len(buffer.last_sent_text)}, should be: {len(response_text)} chars)")
+                try:
+                    final_result = client.update_message_streaming(channel_id, message_id, response_text)
+                    if not final_result["success"]:
+                        self.log_error(f"Final correction update failed: {final_result.get('error', 'Unknown error')}")
+                except Exception as e:
+                    self.log_error(f"Error in final correction update: {e}")
+            
+            # Check if response used web search and add citation note
+            if config.enable_web_search:
+                # Look for indicators that web search was used
+                if any(marker in response_text for marker in ["[1]", "[2]", "[3]", "http://", "https://"]):
+                    self.log_info("Response includes web search results")
+            
+            # Add assistant response to thread state
+            thread_state.add_message("assistant", response_text)
+            
+            # Log streaming stats
+            stats = rate_limiter.get_stats()
+            buffer_stats = buffer.get_stats()
+            self.log_info(f"Streaming completed: {stats['successful_requests']}/{stats['total_requests']} updates, "
+                         f"final length: {buffer_stats['text_length']} chars")
+            
+            return Response(
+                type="text",
+                content=response_text,
+                metadata={"streamed": True, "message_id": message_id}
+            )
+            
+        except Exception as e:
+            self.log_error(f"Error in streaming response generation: {e}")
+            # Fall back to non-streaming on error
+            self.log_info("Falling back to non-streaming due to error")
+            return self._handle_text_response(user_content, thread_state, client, channel_id, thinking_id, attachment_urls)
+
     def _handle_vision_analysis(self, user_text: str, image_inputs: List[Dict], thread_state, attachments: List[Dict],
                                client: BaseClient, channel_id: str, thinking_id: Optional[str]) -> Response:
         """Handle vision analysis of uploaded images"""
