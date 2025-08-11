@@ -131,10 +131,102 @@ class OpenAIClient(LoggerMixin):
             self.log_error(f"Error creating text response: {e}", exc_info=True)
             raise
     
+    def create_text_response_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        system_prompt: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        verbosity: Optional[str] = None,
+        store: bool = False
+    ) -> str:
+        """
+        Create text response with tools (e.g., web search)
+        
+        Args:
+            messages: Conversation messages
+            tools: List of tools to enable (e.g., [{"type": "web_search"}])
+            model: Model to use (defaults to config)
+            temperature: Sampling temperature
+            max_tokens: Maximum tokens to generate
+            top_p: Top-p sampling
+            system_prompt: System prompt to use
+            reasoning_effort: Reasoning effort for GPT-5 reasoning models
+            verbosity: Output verbosity for GPT-5 reasoning models
+            store: Whether to store the response
+        
+        Returns:
+            Generated text response
+        """
+        model = model or config.gpt_model
+        temperature = temperature if temperature is not None else config.default_temperature
+        max_tokens = max_tokens or config.default_max_tokens
+        top_p = top_p if top_p is not None else config.default_top_p
+        
+        # Build request parameters
+        request_params = {
+            "model": model,
+            "input": messages,
+            "tools": tools,
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+            "store": store,
+        }
+        
+        # Add system prompt if provided
+        if system_prompt:
+            request_params["instructions"] = system_prompt
+        
+        # Handle model-specific parameters
+        if model.startswith("gpt-5"):
+            # Check if it's a reasoning model (not chat model)
+            is_reasoning_model = "chat" not in model.lower()
+            
+            if is_reasoning_model:
+                # GPT-5 reasoning models (nano, mini, full)
+                # Fixed temperature, supports reasoning_effort and verbosity
+                request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
+                reasoning_effort = reasoning_effort or config.default_reasoning_effort
+                request_params["reasoning"] = {"effort": reasoning_effort}
+                verbosity = verbosity or config.default_verbosity
+                request_params["text"] = {"verbosity": verbosity}
+            else:
+                # GPT-5 chat models - standard parameters only
+                request_params["top_p"] = top_p
+        else:
+            # GPT-4 and other models - include top_p
+            request_params["top_p"] = top_p
+        
+        self.log_debug(f"Creating text response with tools using model {model}, tools: {tools}")
+        
+        try:
+            response = self.client.responses.create(**request_params)
+            
+            # Extract text from response
+            output_text = ""
+            if response.output:
+                for item in response.output:
+                    if hasattr(item, "content") and item.content:
+                        for content in item.content:
+                            if hasattr(content, "text"):
+                                output_text += content.text
+            
+            self.log_info(f"Generated response with tools: {len(output_text)} chars")
+            return output_text
+            
+        except Exception as e:
+            self.log_error(f"Error creating response with tools: {e}", exc_info=True)
+            raise
+    
     def classify_intent(
         self,
         messages: List[Dict[str, Any]],
-        last_user_message: str
+        last_user_message: str,
+        has_attached_images: bool = False
     ) -> str:
         """
         Classify user intent using a lightweight model
@@ -142,6 +234,7 @@ class OpenAIClient(LoggerMixin):
         Args:
             messages: Recent conversation context (last 6-8 exchanges)
             last_user_message: The latest user message to classify
+            has_attached_images: Whether the current message has images attached
         
         Returns:
             Intent classification: 'new_image', 'modify_image', or 'text_only'
@@ -169,6 +262,12 @@ class OpenAIClient(LoggerMixin):
                 context += f"{role}: {content}\n"
         
         context += f"\nCurrent User Message:\n{last_user_message}"
+        
+        # Add image attachment status to context
+        if has_attached_images:
+            context += f"\n\nIMPORTANT: The user has attached images with this message."
+        else:
+            context += f"\n\nIMPORTANT: No images are attached to this message."
         
         try:
             # Build request parameters
@@ -204,6 +303,12 @@ class OpenAIClient(LoggerMixin):
                                 result += content.text
             
             result = result.strip().lower()
+            
+            # Validate that we got a single word response
+            if ' ' in result or len(result) > 20:
+                # Classifier returned a full sentence instead of a word
+                self.log_error(f"Classifier returned invalid response (expected single word): '{result[:100]}...'")
+                result = "none"  # Default to text_only for safety
             
             # Debug logging
             self.log_debug(f"Image check raw result: '{result}' for message: '{last_user_message[:50]}...'")
