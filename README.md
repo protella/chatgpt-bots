@@ -172,7 +172,6 @@ Run the py file for your chosen interface, e.g.:
 ### Pending Implementation 🚧
 - Response streaming (experimental)
 - Discord V2 client
-- Multi-workspace support
-- Rate limiting and usage tracking 
+- Rate limiting - auto retry/falloff
 
 
