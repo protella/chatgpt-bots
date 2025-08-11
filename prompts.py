@@ -84,7 +84,8 @@ Your task is to determine the user's intent regarding image operations.
 
 Analyze the request and classify it into one of these five categories:
 
-1. **"new"** - User clearly wants a brand new image generated from scratch
+1. **"new"** - User clearly wants a brand new image generated from scratch. 
+   - Consider if an image request or edit was already made in the conversation. If not, likely NOT a new image request even if it matches the below examples.
    - Examples: "create an image of...", "generate a new...", "make another one", "try a different version", "start over"
    - Clear generation language without reference to existing images
 

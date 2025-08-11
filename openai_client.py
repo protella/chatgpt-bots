@@ -4,7 +4,7 @@ Handles all interactions with OpenAI's GPT and image generation models
 """
 import base64
 from io import BytesIO
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Callable
 from dataclasses import dataclass
 from openai import OpenAI
 from config import config
@@ -220,6 +220,295 @@ class OpenAIClient(LoggerMixin):
             
         except Exception as e:
             self.log_error(f"Error creating response with tools: {e}", exc_info=True)
+            raise
+    
+    def create_streaming_response(
+        self,
+        messages: List[Dict[str, Any]],
+        stream_callback: Callable[[str], None],
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        system_prompt: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        verbosity: Optional[str] = None,
+        store: bool = False,
+    ) -> str:
+        """
+        Create a streaming text response using the Responses API
+        
+        Args:
+            messages: List of message dictionaries
+            stream_callback: Function to call with text chunks as they arrive
+            model: Model to use (defaults to config)
+            temperature: Sampling temperature
+            max_tokens: Maximum tokens in response
+            top_p: Nucleus sampling parameter (not supported by GPT-5 reasoning models)
+            system_prompt: System instructions
+            reasoning_effort: For GPT-5 models (minimal, low, medium, high)
+            verbosity: For GPT-5 models (low, medium, high)
+            store: Whether to store the response (default False for stateless)
+        
+        Returns:
+            Complete generated text response
+        """
+        model = model or config.gpt_model
+        temperature = temperature if temperature is not None else config.default_temperature
+        max_tokens = max_tokens or config.default_max_tokens
+        top_p = top_p if top_p is not None else config.default_top_p
+        
+        # Build input for Responses API
+        input_messages = []
+        
+        # Add system prompt if provided
+        if system_prompt:
+            input_messages.append({
+                "role": "developer",
+                "content": system_prompt
+            })
+        
+        # Add conversation messages
+        input_messages.extend(messages)
+        
+        # Build request parameters
+        request_params = {
+            "model": model,
+            "input": input_messages,
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+            "store": store,
+            "stream": True,  # Enable streaming
+        }
+        
+        # Handle model-specific parameters
+        if model.startswith("gpt-5"):
+            # Check if it's a reasoning model (not chat model)
+            is_reasoning_model = "chat" not in model.lower()
+            
+            if is_reasoning_model:
+                # GPT-5 reasoning models (nano, mini, full)
+                # Fixed temperature, supports reasoning_effort and verbosity
+                request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
+                reasoning_effort = reasoning_effort or config.default_reasoning_effort
+                request_params["reasoning"] = {"effort": reasoning_effort}
+                verbosity = verbosity or config.default_verbosity
+                request_params["text"] = {"verbosity": verbosity}
+            else:
+                # GPT-5 chat models - standard parameters only
+                # temperature and top_p work normally, no reasoning/verbosity
+                request_params["top_p"] = top_p
+        else:
+            # GPT-4 and other models - include top_p
+            request_params["top_p"] = top_p
+        
+        self.log_debug(f"Creating streaming response with model {model}, temp {temperature}")
+        
+        try:
+            response = self.client.responses.create(**request_params)
+            
+            complete_text = ""
+            
+            # Process streaming events
+            for event in response:
+                try:
+                    # Get event type without logging every single one
+                    event_type = getattr(event, 'type', 'unknown')
+                    
+                    if event_type == "response.created":
+                        self.log_info("Stream started")
+                        continue
+                    elif event_type == "response.output_item.added":
+                        continue  # Skip without logging
+                    elif event_type in ["response.output_item.delta", "response.output_text.delta"]:
+                        # Extract text from delta event
+                        text_chunk = None
+                        
+                        # For response.output_text.delta, the text is directly in event.delta
+                        if event_type == "response.output_text.delta" and hasattr(event, 'delta'):
+                            text_chunk = event.delta
+                        # For response.output_item.delta, need to dig deeper
+                        elif hasattr(event, 'delta') and event.delta:
+                            if hasattr(event.delta, 'content') and event.delta.content:
+                                for content in event.delta.content:
+                                    if hasattr(content, 'text') and content.text:
+                                        text_chunk = content.text
+                                        break
+                        
+                        # If we found text, process it
+                        if text_chunk:
+                            complete_text += text_chunk
+                            # Call the callback with the text chunk
+                            try:
+                                stream_callback(text_chunk)
+                            except Exception as callback_error:
+                                self.log_warning(f"Stream callback error: {callback_error}")
+                        continue
+                    elif event_type == "response.output_item.done":
+                        continue  # Skip without logging
+                    elif event_type in ["response.done", "response.completed"]:
+                        self.log_info("Stream completed")
+                        # Signal the callback that streaming is complete with None
+                        # This allows it to flush any remaining buffered text
+                        try:
+                            stream_callback(None)
+                        except Exception as callback_error:
+                            self.log_warning(f"Stream completion callback error: {callback_error}")
+                        break
+                    else:
+                        # Only log unhandled events for debugging
+                        pass
+                        
+                except Exception as event_error:
+                    self.log_warning(f"Error processing stream event: {event_error}")
+                    continue
+            
+            self.log_info(f"Generated streaming response: {len(complete_text)} chars")
+            return complete_text
+            
+        except Exception as e:
+            self.log_error(f"Error creating streaming response: {e}", exc_info=True)
+            raise
+    
+    def create_streaming_response_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        stream_callback: Callable[[str], None],
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        system_prompt: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        verbosity: Optional[str] = None,
+        store: bool = False
+    ) -> str:
+        """
+        Create streaming text response with tools (e.g., web search)
+        
+        Args:
+            messages: Conversation messages
+            tools: List of tools to enable (e.g., [{"type": "web_search"}])
+            stream_callback: Function to call with text chunks as they arrive
+            model: Model to use (defaults to config)
+            temperature: Sampling temperature
+            max_tokens: Maximum tokens to generate
+            top_p: Top-p sampling
+            system_prompt: System prompt to use
+            reasoning_effort: Reasoning effort for GPT-5 reasoning models
+            verbosity: Output verbosity for GPT-5 reasoning models
+            store: Whether to store the response
+        
+        Returns:
+            Complete generated text response
+        """
+        model = model or config.gpt_model
+        temperature = temperature if temperature is not None else config.default_temperature
+        max_tokens = max_tokens or config.default_max_tokens
+        top_p = top_p if top_p is not None else config.default_top_p
+        
+        # Build request parameters
+        request_params = {
+            "model": model,
+            "input": messages,
+            "tools": tools,
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+            "store": store,
+            "stream": True,  # Enable streaming
+        }
+        
+        # Add system prompt if provided
+        if system_prompt:
+            request_params["instructions"] = system_prompt
+        
+        # Handle model-specific parameters
+        if model.startswith("gpt-5"):
+            # Check if it's a reasoning model (not chat model)
+            is_reasoning_model = "chat" not in model.lower()
+            
+            if is_reasoning_model:
+                # GPT-5 reasoning models (nano, mini, full)
+                # Fixed temperature, supports reasoning_effort and verbosity
+                request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
+                reasoning_effort = reasoning_effort or config.default_reasoning_effort
+                request_params["reasoning"] = {"effort": reasoning_effort}
+                verbosity = verbosity or config.default_verbosity
+                request_params["text"] = {"verbosity": verbosity}
+            else:
+                # GPT-5 chat models - standard parameters only
+                request_params["top_p"] = top_p
+        else:
+            # GPT-4 and other models - include top_p
+            request_params["top_p"] = top_p
+        
+        self.log_debug(f"Creating streaming response with tools using model {model}, tools: {tools}")
+        
+        try:
+            response = self.client.responses.create(**request_params)
+            
+            complete_text = ""
+            
+            # Process streaming events
+            for event in response:
+                try:
+                    # Get event type without logging every single one
+                    event_type = getattr(event, 'type', 'unknown')
+                    
+                    if event_type == "response.created":
+                        self.log_info("Stream started")
+                        continue
+                    elif event_type == "response.output_item.added":
+                        continue  # Skip without logging
+                    elif event_type in ["response.output_item.delta", "response.output_text.delta"]:
+                        # Extract text from delta event
+                        text_chunk = None
+                        
+                        # For response.output_text.delta, the text is directly in event.delta
+                        if event_type == "response.output_text.delta" and hasattr(event, 'delta'):
+                            text_chunk = event.delta
+                        # For response.output_item.delta, need to dig deeper
+                        elif hasattr(event, 'delta') and event.delta:
+                            if hasattr(event.delta, 'content') and event.delta.content:
+                                for content in event.delta.content:
+                                    if hasattr(content, 'text') and content.text:
+                                        text_chunk = content.text
+                                        break
+                        
+                        # If we found text, process it
+                        if text_chunk:
+                            complete_text += text_chunk
+                            # Call the callback with the text chunk
+                            try:
+                                stream_callback(text_chunk)
+                            except Exception as callback_error:
+                                self.log_warning(f"Stream callback error: {callback_error}")
+                        continue
+                    elif event_type == "response.output_item.done":
+                        continue  # Skip without logging
+                    elif event_type in ["response.done", "response.completed"]:
+                        self.log_info("Stream completed")
+                        # Signal the callback that streaming is complete with None
+                        # This allows it to flush any remaining buffered text
+                        try:
+                            stream_callback(None)
+                        except Exception as callback_error:
+                            self.log_warning(f"Stream completion callback error: {callback_error}")
+                        break
+                    else:
+                        # Only log unhandled events for debugging
+                        pass
+                        
+                except Exception as event_error:
+                    self.log_warning(f"Error processing stream event: {event_error}")
+                    continue
+            
+            self.log_info(f"Generated streaming response with tools: {len(complete_text)} chars")
+            return complete_text
+            
+        except Exception as e:
+            self.log_error(f"Error creating streaming response with tools: {e}", exc_info=True)
             raise
     
     def classify_intent(

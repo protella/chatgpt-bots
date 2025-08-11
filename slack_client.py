@@ -400,6 +400,81 @@ class SlackBot(BaseClient):
         
         return formatted
     
+    def supports_streaming(self) -> bool:
+        """Returns True if streaming is enabled for Slack"""
+        return config.enable_streaming and config.slack_streaming
+    
+    def get_streaming_config(self) -> Dict:
+        """Returns platform-specific streaming configuration"""
+        return {
+            "update_interval": config.streaming_update_interval,
+            "min_interval": config.streaming_min_interval,
+            "max_interval": config.streaming_max_interval,
+            "buffer_size": config.streaming_buffer_size,
+            "circuit_breaker_threshold": config.streaming_circuit_breaker_threshold,
+            "circuit_breaker_cooldown": config.streaming_circuit_breaker_cooldown,
+            "platform": "slack"
+        }
+    
+    def update_message_streaming(self, channel_id: str, message_id: str, text: str) -> Dict:
+        """Updates a message with rate limit awareness"""
+        try:
+            # Format text for Slack using markdown conversion
+            formatted_text = self.format_text(text)
+            
+            # Call Slack API's chat_update method
+            result = self.app.client.chat_update(
+                channel=channel_id,
+                ts=message_id,
+                text=formatted_text
+            )
+            
+            # Return success status
+            return {
+                "success": True,
+                "rate_limited": False,
+                "retry_after": None,
+                "result": result
+            }
+            
+        except SlackApiError as e:
+            # Handle 429 rate limit responses
+            if e.response.status_code == 429:
+                # Extract retry-after header
+                retry_after = None
+                if hasattr(e.response, 'headers') and 'Retry-After' in e.response.headers:
+                    try:
+                        retry_after = int(e.response.headers['Retry-After'])
+                    except (ValueError, KeyError):
+                        retry_after = None
+                
+                self.log_debug(f"Rate limited updating message in channel {channel_id}. Retry after: {retry_after}")
+                
+                return {
+                    "success": False,
+                    "rate_limited": True,
+                    "retry_after": retry_after,
+                    "error": str(e)
+                }
+            else:
+                # Handle other API errors
+                self.log_error(f"Error updating message in streaming: {e}")
+                return {
+                    "success": False,
+                    "rate_limited": False,
+                    "retry_after": None,
+                    "error": str(e)
+                }
+        except Exception as e:
+            # Handle unexpected errors
+            self.log_error(f"Unexpected error updating message in streaming: {e}")
+            return {
+                "success": False,
+                "rate_limited": False,
+                "retry_after": None,
+                "error": str(e)
+            }
+
     def handle_response(self, channel_id: str, thread_id: str, response: Response):
         """Handle a Response object and send to Slack"""
         if response.type == "text":
