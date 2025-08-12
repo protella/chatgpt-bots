@@ -234,6 +234,7 @@ class OpenAIClient(LoggerMixin):
         reasoning_effort: Optional[str] = None,
         verbosity: Optional[str] = None,
         store: bool = False,
+        tool_callback: Optional[Callable[[str, str], None]] = None,
     ) -> str:
         """
         Create a streaming text response using the Responses API
@@ -249,6 +250,7 @@ class OpenAIClient(LoggerMixin):
             reasoning_effort: For GPT-5 models (minimal, low, medium, high)
             verbosity: For GPT-5 models (low, medium, high)
             store: Whether to store the response (default False for stateless)
+            tool_callback: Optional callback for tool events (event_type, status)
         
         Returns:
             Complete generated text response
@@ -315,6 +317,11 @@ class OpenAIClient(LoggerMixin):
                     # Get event type without logging every single one
                     event_type = getattr(event, 'type', 'unknown')
                     
+                    # DEBUG: Log ALL events to see what's actually coming through
+                    if event_type not in ["response.output_item.added", "response.output_item.delta", 
+                                         "response.output_text.delta", "response.output_item.done"]:
+                        self.log_debug(f"Stream event received: {event_type}")
+                    
                     if event_type == "response.created":
                         self.log_info("Stream started")
                         continue
@@ -355,7 +362,27 @@ class OpenAIClient(LoggerMixin):
                         except Exception as callback_error:
                             self.log_warning(f"Stream completion callback error: {callback_error}")
                         break
-                    elif event_type and "tool" in event_type:
+                    elif event_type and ("call" in event_type or "tool" in event_type):
+                        # Handle specific tool events
+                        if tool_callback:
+                            if event_type == "response.web_search_call.in_progress":
+                                tool_callback("web_search", "started")
+                            elif event_type == "response.web_search_call.searching":
+                                tool_callback("web_search", "searching")
+                            elif event_type == "response.web_search_call.completed":
+                                tool_callback("web_search", "completed")
+                            elif event_type == "response.file_search_call.in_progress":
+                                tool_callback("file_search", "started")
+                            elif event_type == "response.file_search_call.searching":
+                                tool_callback("file_search", "searching")
+                            elif event_type == "response.file_search_call.completed":
+                                tool_callback("file_search", "completed")
+                            elif event_type == "response.image_generation_call.in_progress":
+                                tool_callback("image_generation", "started")
+                            elif event_type == "response.image_generation_call.generating":
+                                tool_callback("image_generation", "generating")
+                            elif event_type == "response.image_generation_call.completed":
+                                tool_callback("image_generation", "completed")
                         # Log tool-related events for visibility
                         self.log_info(f"Tool event: {event_type}")
                         continue
@@ -386,7 +413,8 @@ class OpenAIClient(LoggerMixin):
         system_prompt: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
         verbosity: Optional[str] = None,
-        store: bool = False
+        store: bool = False,
+        tool_callback: Optional[Callable[[str, str], None]] = None
     ) -> str:
         """
         Create streaming text response with tools (e.g., web search)
@@ -403,6 +431,7 @@ class OpenAIClient(LoggerMixin):
             reasoning_effort: Reasoning effort for GPT-5 reasoning models
             verbosity: Output verbosity for GPT-5 reasoning models
             store: Whether to store the response
+            tool_callback: Optional callback for tool events (event_type, status)
         
         Returns:
             Complete generated text response
@@ -460,6 +489,11 @@ class OpenAIClient(LoggerMixin):
                     # Get event type without logging every single one
                     event_type = getattr(event, 'type', 'unknown')
                     
+                    # DEBUG: Log ALL events to see what's actually coming through
+                    if event_type not in ["response.output_item.added", "response.output_item.delta", 
+                                         "response.output_text.delta", "response.output_item.done"]:
+                        self.log_debug(f"Stream event received: {event_type}")
+                    
                     if event_type == "response.created":
                         self.log_info("Stream started")
                         continue
@@ -500,7 +534,27 @@ class OpenAIClient(LoggerMixin):
                         except Exception as callback_error:
                             self.log_warning(f"Stream completion callback error: {callback_error}")
                         break
-                    elif event_type and "tool" in event_type:
+                    elif event_type and ("call" in event_type or "tool" in event_type):
+                        # Handle specific tool events
+                        if tool_callback:
+                            if event_type == "response.web_search_call.in_progress":
+                                tool_callback("web_search", "started")
+                            elif event_type == "response.web_search_call.searching":
+                                tool_callback("web_search", "searching")
+                            elif event_type == "response.web_search_call.completed":
+                                tool_callback("web_search", "completed")
+                            elif event_type == "response.file_search_call.in_progress":
+                                tool_callback("file_search", "started")
+                            elif event_type == "response.file_search_call.searching":
+                                tool_callback("file_search", "searching")
+                            elif event_type == "response.file_search_call.completed":
+                                tool_callback("file_search", "completed")
+                            elif event_type == "response.image_generation_call.in_progress":
+                                tool_callback("image_generation", "started")
+                            elif event_type == "response.image_generation_call.generating":
+                                tool_callback("image_generation", "generating")
+                            elif event_type == "response.image_generation_call.completed":
+                                tool_callback("image_generation", "completed")
                         # Log tool-related events for visibility
                         self.log_info(f"Tool event: {event_type}")
                         continue
