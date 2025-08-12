@@ -79,15 +79,18 @@ CLI_SYSTEM_PROMPT = {
 
 # Becareful editing these. The intent classifier needs to be deterministic
 
-IMAGE_INTENT_SYSTEM_PROMPT = """You will be provided with a user's chat message and conversation history for a chatbot integration. 
-Your task is to determine the user's intent regarding image operations.
+IMAGE_INTENT_SYSTEM_PROMPT = """You are an intent classifier for a chatbot. You will see a conversation history followed by the user's latest message.
+Your task is to classify ONLY the user's LATEST message into one of five categories based on their intent.
 
-Analyze the request and classify it into one of these five categories:
+IMPORTANT: Focus on the PATTERN of the conversation. If the conversation has been primarily text-based responses, assume ambiguous requests like "again" or "another" mean text, not images.
 
-1. **"new"** - User clearly wants a brand new image generated from scratch. 
-   - Consider if an image request or edit was already made in the conversation. If not, likely NOT a new image request even if it matches the below examples.
-   - Examples: "create an image of...", "generate a new...", "make another one", "try a different version", "start over"
-   - Clear generation language without reference to existing images
+Classify the LATEST user message into one of these categories:
+
+1. **"new"** - User wants a brand new image generated from scratch. 
+   - Clear image generation language: "create an image", "generate", "draw", "make a picture", "visualize"
+   - OR continuation requests ("again", "another", "one more") IF the previous response was an image generation
+   - Context matters: "again" after an image = new image; "again" after text data = more text data
+   - Clear generation intent based on conversation pattern
 
 2. **"edit"** - User clearly wants to modify an existing image (recently generated or mentioned)
    - Examples: "make it sharper", "adjust the colors", "fix the lighting", "change the blue to red"
@@ -111,14 +114,16 @@ Analyze the request and classify it into one of these five categories:
    - URLs or links (even if formatted like <http://example.com|example.com>)
    - Questions about websites or web content
 
-Consider the conversation context:
-- Vision classification REQUIRES actual image attachments - not just questions about things
-- If user uploaded an image with analysis language, classify as "vision"
-- If a recent image was generated/uploaded, lean toward "edit" for modification language
-- But still mark as "ambiguous" if the user's intent isn't crystal clear
-- Requests for "another" or "different" typically mean "new" even with recent images
+Consider the conversation context and PATTERN:
+- Look at what the LAST assistant response was - that sets expectation for "again" or "another"
+- If the last response was text/data, "again" means more text/data → classify as "none"
+- If the last response was an image, "again" means another image → classify as "new"
+- Vision classification REQUIRES actual image attachments mentioned in the message metadata
 - URLs/links are NOT images - classify questions about websites as "none"
-- General questions ("what is X?", "explain Y", "how does Z work?") without images are "none", not "vision"
+- Data/information requests ("pull", "fetch", "get", "show", "update") are contextual:
+  - With image keywords → "new" (e.g., "show me an image of...")
+  - Without image keywords → "none" (e.g., "show me the data", "pull the indices")
+- When in doubt about continuation requests, match the previous response type
 
 OUTPUT INSTRUCTION - YOU MUST FOLLOW THIS EXACTLY:
 - OUTPUT: ONE WORD ONLY

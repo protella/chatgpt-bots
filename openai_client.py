@@ -536,15 +536,25 @@ class OpenAIClient(LoggerMixin):
         Returns:
             Intent classification: 'new_image', 'modify_image', or 'text_only'
         """
-        # Create conversation history for context
-        context = "Conversation History:\n"
+        # Build properly structured conversation
+        conversation_messages = []
+        
+        # Add system prompt as developer message
+        conversation_messages.append({
+            "role": "developer",
+            "content": IMAGE_INTENT_SYSTEM_PROMPT
+        })
+        
+        # Track if we've seen recent images
         has_recent_image = False
         
-        for msg in messages:  # Include all messages for full context
+        # Add historical messages with proper roles
+        for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
+            
+            # Handle multi-part content
             if isinstance(content, list):
-                # Handle multi-part content
                 text_parts = [c.get("text", "") for c in content if c.get("type") == "input_text"]
                 content = " ".join(text_parts)
             
@@ -552,29 +562,44 @@ class OpenAIClient(LoggerMixin):
             if role == "assistant" and "generated image" in content.lower():
                 has_recent_image = True
             
-            # Truncate very long messages to keep context reasonable
+            # Truncate very long messages to keep tokens reasonable
             if len(content) > 500:
-                context += f"{role}: {content[:500]}...\n"
-            else:
-                context += f"{role}: {content}\n"
+                content = content[:500] + "..."
+            
+            # Add message with proper role
+            conversation_messages.append({
+                "role": role,
+                "content": content
+            })
         
-        context += f"\nCurrent User Message:\n{last_user_message}"
-        
-        # Add image attachment status to context
+        # Add the current message to classify with metadata
+        current_msg_with_metadata = last_user_message
         if has_attached_images:
-            context += f"\n\nIMPORTANT: The user has attached images with this message."
-        else:
-            context += f"\n\nIMPORTANT: No images are attached to this message."
+            current_msg_with_metadata += "\n[Note: User has attached images with this message]"
+        
+        conversation_messages.append({
+            "role": "user",
+            "content": current_msg_with_metadata
+        })
+        
+        # Add classification instruction as final user message
+        conversation_messages.append({
+            "role": "user", 
+            "content": "Based on this conversation, classify the user's latest message. Respond with ONLY one of: new, edit, vision, ambiguous, or none."
+        })
+        
+        # Debug logging
+        self.log_debug(f"Intent classification with {len(conversation_messages)} messages")
+        self.log_debug(f"Historical messages: {len(messages)}, has_recent_image: {has_recent_image}")
+        if hasattr(config, 'debug_intent_classification') and config.debug_intent_classification:
+            self.log_debug(f"Messages structure: {conversation_messages[-3:]}")  # Last 3 messages
         
         try:
-            # Build request parameters
+            # Build request parameters with properly structured conversation
             request_params = {
                 "model": config.utility_model,
-                "input": [
-                    {"role": "developer", "content": IMAGE_INTENT_SYSTEM_PROMPT},
-                    {"role": "user", "content": context}
-                ],
-                "max_output_tokens": 100,
+                "input": conversation_messages,
+                "max_output_tokens": 20,  # Only need one word response
                 "store": False,  # Never store classification calls
             }
             
@@ -582,8 +607,8 @@ class OpenAIClient(LoggerMixin):
             if config.utility_model.startswith("gpt-5") and "chat" not in config.utility_model.lower():
                 # GPT-5 reasoning model - use fixed temperature and reasoning parameters
                 request_params["temperature"] = 1.0  # Fixed for reasoning models
-                request_params["reasoning"] = {"effort": "minimal"}  # Minimal for speed
-                request_params["text"] = {"verbosity": "low"}  # Low verbosity for simple True/False
+                request_params["reasoning"] = {"effort": config.utility_reasoning_effort}  # Use utility config
+                request_params["text"] = {"verbosity": config.utility_verbosity}  # Use utility config
             else:
                 # GPT-4 or other models - use standard parameters
                 request_params["temperature"] = 0.3  # Low temperature for consistent classification
@@ -794,8 +819,8 @@ class OpenAIClient(LoggerMixin):
             # Check if we're using a GPT-5 reasoning model
             if config.utility_model.startswith("gpt-5") and "chat" not in config.utility_model.lower():
                 request_params["temperature"] = 1.0
-                request_params["reasoning"] = {"effort": "minimal"}
-                request_params["text"] = {"verbosity": "low"}
+                request_params["reasoning"] = {"effort": config.utility_reasoning_effort}
+                request_params["text"] = {"verbosity": config.utility_verbosity}
             else:
                 request_params["temperature"] = 0.7
             
@@ -885,8 +910,8 @@ class OpenAIClient(LoggerMixin):
             if config.utility_model.startswith("gpt-5") and "chat" not in config.utility_model.lower():
                 # GPT-5 reasoning model - use fixed temperature and reasoning parameters
                 request_params["temperature"] = 1.0  # Fixed for reasoning models
-                request_params["reasoning"] = {"effort": "minimal"}  # Minimal effort for faster processing
-                request_params["text"] = {"verbosity": "low"}  # Low verbosity for concise prompts
+                request_params["reasoning"] = {"effort": config.utility_reasoning_effort}  # Use utility config
+                request_params["text"] = {"verbosity": config.utility_verbosity}  # Use utility config
             else:
                 # GPT-4 or other models - use standard parameters
                 request_params["temperature"] = 0.7  # Moderate temperature for creative prompts
@@ -949,8 +974,8 @@ class OpenAIClient(LoggerMixin):
             # Check if we're using a GPT-5 reasoning model
             if config.utility_model.startswith("gpt-5") and "chat" not in config.utility_model.lower():
                 request_params["temperature"] = 1.0
-                request_params["reasoning"] = {"effort": "minimal"}
-                request_params["text"] = {"verbosity": "low"}
+                request_params["reasoning"] = {"effort": config.utility_reasoning_effort}
+                request_params["text"] = {"verbosity": config.utility_verbosity}
             else:
                 request_params["temperature"] = 0.7
             
@@ -1035,8 +1060,8 @@ class OpenAIClient(LoggerMixin):
             # Add GPT-5 reasoning parameters if using a reasoning model
             if config.gpt_model.startswith("gpt-5") and "chat" not in config.gpt_model.lower():
                 request_params["temperature"] = 1.0  # Fixed for reasoning models
-                request_params["reasoning"] = {"effort": "medium"}  # Medium effort for balanced analysis
-                request_params["text"] = {"verbosity": "medium"}  # Medium verbosity for clear but concise responses
+                request_params["reasoning"] = {"effort": config.analysis_reasoning_effort}  # Use analysis config
+                request_params["text"] = {"verbosity": config.analysis_verbosity}  # Use analysis config
             
             response = self.client.responses.create(**request_params)
             

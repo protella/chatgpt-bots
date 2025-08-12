@@ -722,12 +722,12 @@ class MessageProcessor(LoggerMixin):
             """Callback function called with each text chunk from OpenAI"""
             # Check if this is the completion signal (None)
             if text_chunk is None:
-                # Stream is complete - flush any remaining buffered text
+                # Stream is complete - flush any remaining buffered text WITHOUT loading indicator
                 if buffer.has_pending_update() and rate_limiter.can_make_request():
                     self.log_info("Flushing final buffered text")
                     rate_limiter.record_request_attempt()
-                    # Use raw text for final flush - no fence closing needed since stream is complete
-                    final_text = buffer.get_complete_text()
+                    # Use raw text for final flush - no loading indicator since stream is complete
+                    final_text = buffer.get_complete_text()  # No loading indicator on completion
                     try:
                         result = client.update_message_streaming(channel_id, message_id, final_text)
                         if result["success"]:
@@ -749,10 +749,12 @@ class MessageProcessor(LoggerMixin):
                 
                 # Get display-safe text with closed fences
                 display_text = buffer.get_display_text()
+                # Add loading indicator at the end to show streaming is in progress
+                display_text_with_indicator = f"{display_text} {config.thinking_emoji}"
                 
-                # Call client.update_message_streaming
+                # Call client.update_message_streaming with indicator
                 try:
-                    result = client.update_message_streaming(channel_id, message_id, display_text)
+                    result = client.update_message_streaming(channel_id, message_id, display_text_with_indicator)
                     
                     if result["success"]:
                         rate_limiter.record_success()
@@ -808,11 +810,14 @@ class MessageProcessor(LoggerMixin):
                     verbosity=thread_config.get("verbosity")
                 )
             
-            # Safety check: ensure all text was sent (should be handled by flush in callback)
-            # This is a fallback in case the flush didn't work for some reason
-            if response_text != buffer.last_sent_text:
-                self.log_warning(f"Text mismatch after streaming - sending correction update "
-                               f"(sent: {len(buffer.last_sent_text)}, should be: {len(response_text)} chars)")
+            # Safety check: ensure all text was sent AND remove loading indicator
+            # Always send a final update to ensure the loading indicator is removed
+            if response_text != buffer.last_sent_text or True:  # Always update to remove indicator
+                if response_text != buffer.last_sent_text:
+                    self.log_warning(f"Text mismatch after streaming - sending correction update "
+                                   f"(sent: {len(buffer.last_sent_text)}, should be: {len(response_text)} chars)")
+                else:
+                    self.log_debug("Sending final update to ensure loading indicator is removed")
                 try:
                     final_result = client.update_message_streaming(channel_id, message_id, response_text)
                     if not final_result["success"]:
@@ -840,6 +845,16 @@ class MessageProcessor(LoggerMixin):
             
         except Exception as e:
             self.log_error(f"Error in streaming response generation: {e}")
+            
+            # Try to remove the loading indicator if we had a message_id
+            if message_id and hasattr(client, 'update_message_streaming'):
+                try:
+                    # Send whatever text we have without the loading indicator
+                    error_text = buffer.get_complete_text() if buffer.has_content() else "An error occurred during streaming."
+                    client.update_message_streaming(channel_id, message_id, error_text)
+                except Exception as cleanup_error:
+                    self.log_debug(f"Could not remove loading indicator: {cleanup_error}")
+            
             # Fall back to non-streaming on error
             self.log_info("Falling back to non-streaming due to error")
             return self._handle_text_response(user_content, thread_state, client, channel_id, thinking_id, attachment_urls)
@@ -1049,8 +1064,8 @@ class MessageProcessor(LoggerMixin):
                     model=config.utility_model,
                     temperature=0.1,
                     max_tokens=50,  # Increased to handle reasoning tokens
-                    reasoning_effort="minimal",  # Minimal for simple matching
-                    verbosity="low"  # Low verbosity for number response
+                    reasoning_effort=config.utility_reasoning_effort,  # Use utility config
+                    verbosity=config.utility_verbosity  # Use utility config
                 )
                 
                 # Parse response to get index
