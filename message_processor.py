@@ -703,11 +703,10 @@ class MessageProcessor(LoggerMixin):
         # Use thread's system prompt (which is now platform-specific)
         system_prompt = thread_state.system_prompt or self._get_system_prompt(client)
         
-        # Update status before generating
-        self._update_status(client, channel_id, thinking_id, "Generating response...")
-        
         # Post an initial message to get the message ID for streaming updates
-        initial_message = f"{config.thinking_emoji} Generating response..."
+        # For streaming with potential tools, start with "Working on it" 
+        # (will be overridden if tools are used)
+        initial_message = f"{config.thinking_emoji} Working on it..."
         if thinking_id:
             # Update existing thinking message
             message_id = thinking_id
@@ -716,6 +715,74 @@ class MessageProcessor(LoggerMixin):
             # We need a way to post a message and get its ID - this would depend on client implementation
             self.log_warning("No thinking_id provided for streaming - falling back to non-streaming")
             return self._handle_text_response(user_content, thread_state, client, channel_id, thinking_id, attachment_urls)
+        
+        # Track tool states for status updates
+        tool_states = {
+            "web_search": False,
+            "file_search": False,
+            "image_generation": False
+        }
+        
+        # Track search counts
+        search_counts = {
+            "web_search": 0,
+            "file_search": 0
+        }
+        
+        # Track if we've started streaming text yet
+        text_streaming_started = False
+        
+        # Define tool event callback
+        def tool_callback(tool_type: str, status: str):
+            """Handle tool events for status updates"""
+            if status == "started":
+                # Tool just started - update status with appropriate emoji
+                if tool_type == "web_search":
+                    if not tool_states["web_search"]:
+                        tool_states["web_search"] = True
+                    search_counts["web_search"] += 1
+                    # Show search count consistently for all searches
+                    status_msg = f"{config.web_search_emoji} Searching the web (query {search_counts['web_search']})..."
+                    try:
+                        # Use update_message_streaming for consistency with streaming flow
+                        result = client.update_message_streaming(channel_id, message_id, status_msg)
+                        if result["success"]:
+                            self.log_info(f"Web search #{search_counts['web_search']} started - updated status")
+                        else:
+                            self.log_warning(f"Failed to update web search status: {result.get('error', 'Unknown error')}")
+                    except Exception as e:
+                        self.log_error(f"Error updating web search status: {e}")
+                elif tool_type == "file_search":
+                    if not tool_states["file_search"]:
+                        tool_states["file_search"] = True
+                    search_counts["file_search"] += 1
+                    # Show search count consistently for all searches
+                    status_msg = f"{config.web_search_emoji} Searching files (query {search_counts['file_search']})..."
+                    try:
+                        result = client.update_message_streaming(channel_id, message_id, status_msg)
+                        if result["success"]:
+                            self.log_info(f"File search #{search_counts['file_search']} started - updated status")
+                        else:
+                            self.log_warning(f"Failed to update file search status: {result.get('error', 'Unknown error')}")
+                    except Exception as e:
+                        self.log_error(f"Error updating file search status: {e}")
+                elif tool_type == "image_generation" and not tool_states["image_generation"]:
+                    tool_states["image_generation"] = True
+                    status_msg = f"{config.circle_loader_emoji} Generating image..."
+                    try:
+                        result = client.update_message_streaming(channel_id, message_id, status_msg)
+                        if result["success"]:
+                            self.log_info(f"Image generation started - updated status")
+                        else:
+                            self.log_warning(f"Failed to update image gen status: {result.get('error', 'Unknown error')}")
+                    except Exception as e:
+                        self.log_error(f"Error updating image gen status: {e}")
+            elif status == "completed":
+                # Tool completed - clear the status for that tool
+                if tool_type in tool_states:
+                    tool_states[tool_type] = False
+                    # Don't update status here - let the next event (another tool or text streaming) handle it
+                    self.log_info(f"{tool_type} completed")
         
         # Define the streaming callback
         def stream_callback(text_chunk: str):
@@ -750,7 +817,8 @@ class MessageProcessor(LoggerMixin):
                 # Get display-safe text with closed fences
                 display_text = buffer.get_display_text()
                 # Add loading indicator at the end to show streaming is in progress
-                display_text_with_indicator = f"{display_text} {config.thinking_emoji}"
+                # Use loading_ellipse_emoji for streaming content instead of thinking_emoji
+                display_text_with_indicator = f"{display_text} {config.loading_ellipse_emoji}"
                 
                 # Call client.update_message_streaming with indicator
                 try:
@@ -789,6 +857,7 @@ class MessageProcessor(LoggerMixin):
                     messages=messages_for_api,
                     tools=[{"type": "web_search"}],
                     stream_callback=stream_callback,
+                    tool_callback=tool_callback,  # Add tool callback
                     model=model,
                     temperature=thread_config["temperature"],
                     max_tokens=thread_config["max_tokens"],
@@ -802,6 +871,7 @@ class MessageProcessor(LoggerMixin):
                 response_text = self.openai_client.create_streaming_response(
                     messages=messages_for_api,
                     stream_callback=stream_callback,
+                    tool_callback=tool_callback,  # Add tool callback even without tools (in case of built-in tools)
                     model=thread_config["model"],
                     temperature=thread_config["temperature"],
                     max_tokens=thread_config["max_tokens"],
