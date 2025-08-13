@@ -255,6 +255,16 @@ class MessageProcessor(LoggerMixin):
                         thinking_id
                     )
             elif intent == "vision":
+                # Update status to show we're analyzing images (handle plural)
+                if image_inputs:
+                    image_count = len(image_inputs)
+                    if image_count == 1:
+                        status_msg = f"{config.analyze_emoji} Analyzing image..."
+                    else:
+                        status_msg = f"{config.analyze_emoji} Analyzing {image_count} images..."
+                else:
+                    status_msg = f"{config.analyze_emoji} Looking for images to analyze..."
+                self._update_status(client, message.channel_id, thinking_id, status_msg)
                 # Vision analysis - but check if we actually have images
                 if image_inputs:
                     # User uploaded images for vision analysis
@@ -519,20 +529,21 @@ class MessageProcessor(LoggerMixin):
         client_name = client.name.lower()
         
         if "slack" in client_name:
-            return SLACK_SYSTEM_PROMPT["content"]
+            return SLACK_SYSTEM_PROMPT
         elif "discord" in client_name:
-            return DISCORD_SYSTEM_PROMPT["content"]
+            return DISCORD_SYSTEM_PROMPT
         else:
             # Default/CLI prompt
-            return CLI_SYSTEM_PROMPT["content"]
+            return CLI_SYSTEM_PROMPT
     
-    def _update_status(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], message: str):
+    def _update_status(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], message: str, emoji: Optional[str] = None):
         """Update the thinking indicator with a status message"""
         if thinking_id and hasattr(client, 'update_message'):
+            status_emoji = emoji or config.thinking_emoji
             client.update_message(
                 channel_id,
                 thinking_id,
-                f"{config.thinking_emoji} {message}"
+                f"{status_emoji} {message}"
             )
             self.log_debug(f"Status updated: {message}")
         elif not thinking_id:
@@ -543,7 +554,8 @@ class MessageProcessor(LoggerMixin):
     def _update_thinking_for_image(self, client: BaseClient, channel_id: str, thinking_id: str):
         """Update the thinking indicator to show image generation message"""
         self._update_status(client, channel_id, thinking_id, 
-                          "Generating image. This could take up to a minute, please wait...")
+                          "Generating image. This could take up to a minute, please wait...",
+                          emoji=config.circle_loader_emoji)
     
     def _handle_text_response(self, user_content: Any, thread_state, client: BaseClient, 
                               channel_id: str = None, thinking_id: Optional[str] = None,
@@ -938,8 +950,6 @@ class MessageProcessor(LoggerMixin):
                 content="No images found to analyze"
             )
         
-        self._update_status(client, channel_id, thinking_id, "Processing uploaded images...")
-        
         # Extract base64 data from image inputs
         images_to_analyze = []
         for img_input in image_inputs:
@@ -960,12 +970,17 @@ class MessageProcessor(LoggerMixin):
         
         self.log_info(f"Analyzing {len(images_to_analyze)} image(s) with prompt: {user_text[:100]}...")
         
-        self._update_status(client, channel_id, thinking_id, "Analyzing your image...")
+        # Update status with proper pluralization
+        if len(images_to_analyze) == 1:
+            status_msg = "Analyzing your image..."
+        else:
+            status_msg = f"Analyzing {len(images_to_analyze)} images..."
+        self._update_status(client, channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
         
         # Analyze images with enhanced prompt
         analysis_result = self.openai_client.analyze_images(
             images=images_to_analyze,
-            question=user_text if user_text else "Please provide a comprehensive analysis of this image.",
+            question=user_text if user_text else "Please describe this image.",
             detail="high",
             enhance_prompt=True  # Enable prompt enhancement for detailed analysis
         )
@@ -999,7 +1014,7 @@ class MessageProcessor(LoggerMixin):
         thread_config = config.get_thread_config(thread_state.config_overrides)
         
         # Generate image with conversation context for better prompt enhancement
-        self._update_status(client, channel_id, thinking_id, "Creating your image...")
+        self._update_status(client, channel_id, thinking_id, "Creating your image...", emoji=config.circle_loader_emoji)
         
         image_data = self.openai_client.generate_image(
             prompt=prompt,
@@ -1165,7 +1180,7 @@ class MessageProcessor(LoggerMixin):
         thinking_id: Optional[str]
     ) -> Response:
         """Handle image modification request by finding and editing the target image"""
-        self._update_status(client, channel_id, thinking_id, "Finding the image to edit...")
+        self._update_status(client, channel_id, thinking_id, "Finding the image to edit...", emoji=config.web_search_emoji)
         
         # Try to find target image URL from conversation
         target_url = self._find_target_image(text, thread_state, client)
@@ -1186,7 +1201,7 @@ class MessageProcessor(LoggerMixin):
                     
                     # Analyze the image first
                     self.log_debug("Analyzing image for context")
-                    self._update_status(client, channel_id, thinking_id, "Analyzing the image...")
+                    self._update_status(client, channel_id, thinking_id, "Analyzing the image...", emoji=config.analyze_emoji)
                     
                     image_description = self.openai_client.analyze_images(
                         images=[base64_data],
@@ -1202,7 +1217,7 @@ class MessageProcessor(LoggerMixin):
                     thread_config = config.get_thread_config(thread_state.config_overrides)
                     
                     # Edit the image
-                    self._update_status(client, channel_id, thinking_id, "Editing your image...")
+                    self._update_status(client, channel_id, thinking_id, "Editing your image...", emoji=config.circle_loader_emoji)
                     
                     edited_image = self.openai_client.edit_image(
                         input_images=[base64_data],
@@ -1219,7 +1234,7 @@ class MessageProcessor(LoggerMixin):
                     
                     # Add breadcrumbs
                     thread_state.add_message("user", text)
-                    thread_state.add_message("assistant", f"Generated image: {edited_image.prompt}")
+                    thread_state.add_message("assistant", f"Edited image: {edited_image.prompt}")
                     
                     return Response(
                         type="image",
@@ -1314,7 +1329,12 @@ class MessageProcessor(LoggerMixin):
         
         # First, analyze the uploaded images to get context
         self.log_debug("Analyzing uploaded images for context")
-        self._update_status(client, channel_id, thinking_id, "Analyzing your uploaded image...")
+        # Update status with proper pluralization
+        if len(input_images) == 1:
+            status_msg = "Analyzing your uploaded image..."
+        else:
+            status_msg = f"Analyzing {len(input_images)} uploaded images..."
+        self._update_status(client, channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
         
         # Log the analysis prompt
         print("\n" + "="*80)
@@ -1341,7 +1361,7 @@ class MessageProcessor(LoggerMixin):
             # Don't show the analysis - just update status to show we're editing
             # The analysis is only used internally for better edit quality
             if thinking_id:
-                self._update_status(client, channel_id, thinking_id, "Editing your image...")
+                self._update_status(client, channel_id, thinking_id, "Editing your image...", emoji=config.circle_loader_emoji)
             
             # Store the description and user request separately for clean enhancement
             image_analysis = image_description

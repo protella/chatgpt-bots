@@ -72,6 +72,7 @@ class BotConfig:
     web_search_emoji: str = field(default_factory=lambda: os.getenv("WEB_SEARCH_EMOJI", ":web_search:"))
     loading_ellipse_emoji: str = field(default_factory=lambda: os.getenv("LOADING_ELLIPSE_EMOJI", ":loading-ellipse:"))
     circle_loader_emoji: str = field(default_factory=lambda: os.getenv("CIRCLE_LOADER_EMOJI", ":circle-loader:"))
+    analyze_emoji: str = field(default_factory=lambda: os.getenv("ANALYZE_EMOJI", ":analyze:"))
     
     # Web search configuration
     enable_web_search: bool = field(default_factory=lambda: os.getenv("ENABLE_WEB_SEARCH", "true").lower() == "true")
