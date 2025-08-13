@@ -796,9 +796,17 @@ class MessageProcessor(LoggerMixin):
                     # Don't update status here - let the next event (another tool or text streaming) handle it
                     self.log_info(f"{tool_type} completed")
         
+        # Track current streaming message and overflow
+        current_message_id = message_id
+        current_part = 1
+        overflow_buffer = ""
+        message_char_limit = 3700  # Leave room for indicators
+        
         # Define the streaming callback
         def stream_callback(text_chunk: str):
             """Callback function called with each text chunk from OpenAI"""
+            nonlocal current_message_id, current_part, overflow_buffer
+            
             # Check if this is the completion signal (None)
             if text_chunk is None:
                 # Stream is complete - flush any remaining buffered text WITHOUT loading indicator
@@ -808,7 +816,7 @@ class MessageProcessor(LoggerMixin):
                     # Use raw text for final flush - no loading indicator since stream is complete
                     final_text = buffer.get_complete_text()  # No loading indicator on completion
                     try:
-                        result = client.update_message_streaming(channel_id, message_id, final_text)
+                        result = client.update_message_streaming(channel_id, current_message_id, final_text)
                         if result["success"]:
                             rate_limiter.record_success()
                             buffer.mark_updated()
@@ -828,35 +836,70 @@ class MessageProcessor(LoggerMixin):
                 
                 # Get display-safe text with closed fences
                 display_text = buffer.get_display_text()
-                # Add loading indicator at the end to show streaming is in progress
-                # Use loading_ellipse_emoji for streaming content instead of thinking_emoji
-                display_text_with_indicator = f"{display_text} {config.loading_ellipse_emoji}"
                 
-                # Call client.update_message_streaming with indicator
-                try:
-                    result = client.update_message_streaming(channel_id, message_id, display_text_with_indicator)
+                # Check if we need to overflow to a new message
+                if len(display_text) > message_char_limit:
+                    # Split at the limit
+                    first_part = display_text[:message_char_limit]
+                    overflow_buffer = display_text[message_char_limit:]
                     
-                    if result["success"]:
-                        rate_limiter.record_success()
-                        buffer.mark_updated()
-                        buffer.update_interval_setting(rate_limiter.get_current_interval())
-                    else:
-                        if result["rate_limited"]:
-                            # Handle rate limit response
-                            if result["retry_after"]:
-                                rate_limiter.set_retry_after(result["retry_after"])
-                            rate_limiter.record_failure(is_rate_limit=True)
+                    # Update current message with continuation indicator
+                    final_first_part = f"{first_part}\n\n*Continued in next message...*"
+                    try:
+                        result = client.update_message_streaming(channel_id, current_message_id, final_first_part)
+                        if result["success"]:
+                            # Post a new message for overflow
+                            current_part += 1
+                            continuation_text = f"*Part {current_part} (continued)*\n\n{overflow_buffer} {config.loading_ellipse_emoji}"
                             
-                            # Check if we should fall back to non-streaming
-                            if not rate_limiter.is_streaming_enabled():
-                                self.log_warning("Circuit breaker opened - will complete without further streaming")
+                            # Send new message and get its ID
+                            new_msg_result = client.send_message_get_ts(channel_id, thinking_id, continuation_text)
+                            if new_msg_result and "ts" in new_msg_result:
+                                current_message_id = new_msg_result["ts"]
+                                # Reset buffer with overflow content
+                                buffer.reset()
+                                buffer.add_chunk(overflow_buffer)
+                                buffer.mark_updated()
+                                self.log_info(f"Created overflow message part {current_part}")
+                    except Exception as e:
+                        self.log_error(f"Error handling message overflow: {e}")
+                else:
+                    # Normal update with loading indicator
+                    display_text_with_indicator = f"{display_text} {config.loading_ellipse_emoji}"
+                    
+                    # Call client.update_message_streaming with indicator
+                    try:
+                        result = client.update_message_streaming(channel_id, current_message_id, display_text_with_indicator)
+                        
+                        if result["success"]:
+                            rate_limiter.record_success()
+                            buffer.mark_updated()
+                            buffer.update_interval_setting(rate_limiter.get_current_interval())
                         else:
-                            rate_limiter.record_failure(is_rate_limit=False)
-                            self.log_warning(f"Message update failed: {result.get('error', 'Unknown error')}")
+                            if result["rate_limited"]:
+                                # Handle rate limit response
+                                if result["retry_after"]:
+                                    rate_limiter.set_retry_after(result["retry_after"])
+                                rate_limiter.record_failure(is_rate_limit=True)
+                                
+                                # Check if we should fall back to non-streaming
+                                if not rate_limiter.is_streaming_enabled():
+                                    self.log_warning("Circuit breaker opened - will complete without further streaming")
+                                    # Try to clear the thinking indicator
+                                    try:
+                                        clear_text = buffer.last_sent_text if buffer.last_sent_text else "Processing..."
+                                        if len(clear_text) > 3900:
+                                            clear_text = clear_text[:3800] + "\n\n*Response too long - see next message*"
+                                        client.update_message_streaming(channel_id, message_id, clear_text)
+                                    except Exception as clear_error:
+                                        self.log_error(f"Failed to clear indicator after circuit break: {clear_error}")
+                            else:
+                                rate_limiter.record_failure(is_rate_limit=False)
+                                self.log_warning(f"Message update failed: {result.get('error', 'Unknown error')}")
                             
-                except Exception as e:
-                    rate_limiter.record_failure(is_rate_limit=False)
-                    self.log_error(f"Error updating streaming message: {e}")
+                    except Exception as e:
+                        rate_limiter.record_failure(is_rate_limit=False)
+                        self.log_error(f"Error updating streaming message: {e}")
         
         # Start streaming from OpenAI with the callback
         try:
@@ -893,19 +936,50 @@ class MessageProcessor(LoggerMixin):
                 )
             
             # Safety check: ensure all text was sent AND remove loading indicator
-            # Always send a final update to ensure the loading indicator is removed
-            if response_text != buffer.last_sent_text or True:  # Always update to remove indicator
-                if response_text != buffer.last_sent_text:
-                    self.log_warning(f"Text mismatch after streaming - sending correction update "
-                                   f"(sent: {len(buffer.last_sent_text)}, should be: {len(response_text)} chars)")
-                else:
-                    self.log_debug("Sending final update to ensure loading indicator is removed")
+            # Note: current_message_id might be different from message_id if we overflowed
+            # We need to update the current message (which might be part 2, 3, etc)
+            if current_part > 1:
+                # We're on an overflow message - just remove the loading indicator
+                self.log_debug(f"Removing loading indicator from part {current_part}")
                 try:
-                    final_result = client.update_message_streaming(channel_id, message_id, response_text)
-                    if not final_result["success"]:
-                        self.log_error(f"Final correction update failed: {final_result.get('error', 'Unknown error')}")
+                    # Get the current display text without loading indicator
+                    final_part_text = buffer.get_complete_text()
+                    if final_part_text:
+                        # Add the part indicator
+                        final_part_text = f"*Part {current_part} (continued)*\n\n{final_part_text}"
+                        final_result = client.update_message_streaming(channel_id, current_message_id, final_part_text)
+                        if not final_result["success"]:
+                            self.log_error(f"Failed to remove indicator from part {current_part}: {final_result.get('error', 'Unknown error')}")
                 except Exception as e:
-                    self.log_error(f"Error in final correction update: {e}")
+                    self.log_error(f"Error removing indicator from overflow message: {e}")
+            else:
+                # Original message - check if we need to handle any remaining text
+                if response_text != buffer.last_sent_text or True:  # Always update to remove indicator
+                    if response_text != buffer.last_sent_text:
+                        self.log_warning(f"Text mismatch after streaming - sending correction update "
+                                       f"(sent: {len(buffer.last_sent_text)}, should be: {len(response_text)} chars)")
+                    else:
+                        self.log_debug("Sending final update to ensure loading indicator is removed")
+                    try:
+                        # Check if message is too long for a single update
+                        if len(response_text) > 3900:  # Slack's approximate limit
+                            # This shouldn't happen if streaming overflow worked correctly
+                            # But handle it as a fallback
+                            truncated_text = response_text[:3800] + "\n\n*Continued in next message...*"
+                            final_result = client.update_message_streaming(channel_id, message_id, truncated_text)
+                            
+                            # Send the rest as new messages
+                            overflow_text = response_text[3800:]
+                            client.send_message(channel_id, thinking_id, f"*...continued*\n\n{overflow_text}")
+                            
+                            if not final_result["success"]:
+                                self.log_error(f"Final truncated update failed: {final_result.get('error', 'Unknown error')}")
+                        else:
+                            final_result = client.update_message_streaming(channel_id, current_message_id, response_text)
+                            if not final_result["success"]:
+                                self.log_error(f"Final correction update failed: {final_result.get('error', 'Unknown error')}")
+                    except Exception as e:
+                        self.log_error(f"Error in final correction update: {e}")
             
             # Note: To properly detect if web search was used, we'd need to track
             # tool events during streaming. The presence of URLs doesn't mean web search was used.
