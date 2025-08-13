@@ -5,6 +5,8 @@ Client-agnostic message processing logic
 import base64
 import re
 import time
+import datetime
+import pytz
 from typing import Dict, Any, List, Optional, Tuple
 from base_client import BaseClient, Message, Response
 from thread_manager import ThreadStateManager
@@ -70,7 +72,8 @@ class MessageProcessor(LoggerMixin):
             
             # Set platform-specific system prompt if not already set
             if not thread_state.system_prompt:
-                thread_state.system_prompt = self._get_system_prompt(client)
+                user_timezone = message.metadata.get("user_timezone", "UTC") if message.metadata else "UTC"
+                thread_state.system_prompt = self._get_system_prompt(client, user_timezone)
             
             # Process any attachments (images and other files)
             image_inputs, unsupported_files = self._process_attachments(message, client)
@@ -524,17 +527,33 @@ class MessageProcessor(LoggerMixin):
         
         return False
     
-    def _get_system_prompt(self, client: BaseClient) -> str:
-        """Get the appropriate system prompt based on the client platform"""
+    def _get_system_prompt(self, client: BaseClient, user_timezone: str = "UTC") -> str:
+        """Get the appropriate system prompt based on the client platform with user's timezone"""
         client_name = client.name.lower()
         
+        # Get base prompt for the platform
         if "slack" in client_name:
-            return SLACK_SYSTEM_PROMPT
+            base_prompt = SLACK_SYSTEM_PROMPT
         elif "discord" in client_name:
-            return DISCORD_SYSTEM_PROMPT
+            base_prompt = DISCORD_SYSTEM_PROMPT
         else:
             # Default/CLI prompt
-            return CLI_SYSTEM_PROMPT
+            base_prompt = CLI_SYSTEM_PROMPT
+        
+        # Get current time in user's timezone
+        try:
+            user_tz = pytz.timezone(user_timezone)
+            current_time = datetime.datetime.now(pytz.UTC).astimezone(user_tz)
+            timezone_name = user_tz.zone
+        except:
+            # Fallback to UTC if timezone is invalid
+            current_time = datetime.datetime.now(pytz.UTC)
+            timezone_name = "UTC"
+        
+        # Format time context
+        time_context = f"\n\nCurrent date and time: {current_time.strftime('%A, %B %d, %Y at %I:%M %p')} ({timezone_name})"
+        
+        return base_prompt + time_context
     
     def _update_status(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], message: str, emoji: Optional[str] = None):
         """Update the thinking indicator with a status message"""
@@ -601,7 +620,7 @@ class MessageProcessor(LoggerMixin):
         thread_config = config.get_thread_config(thread_state.config_overrides)
         
         # Use thread's system prompt (which is now platform-specific)
-        system_prompt = thread_state.system_prompt or self._get_system_prompt(client)
+        system_prompt = thread_state.system_prompt or self._get_system_prompt(client, "UTC")
         
         # Update status before generating
         self._update_status(client, channel_id, thinking_id, "Generating response...")
@@ -713,7 +732,7 @@ class MessageProcessor(LoggerMixin):
         thread_config = config.get_thread_config(thread_state.config_overrides)
         
         # Use thread's system prompt (which is now platform-specific)
-        system_prompt = thread_state.system_prompt or self._get_system_prompt(client)
+        system_prompt = thread_state.system_prompt or self._get_system_prompt(client, "UTC")
         
         # Post an initial message to get the message ID for streaming updates
         # For streaming with potential tools, start with "Working on it" 

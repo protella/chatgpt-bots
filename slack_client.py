@@ -45,8 +45,8 @@ class SlackBot(BaseClient):
     
     def get_username(self, user_id: str, client) -> str:
         """Get username from user ID, with caching"""
-        if user_id in self.user_cache:
-            return self.user_cache[user_id]
+        if user_id in self.user_cache and 'username' in self.user_cache[user_id]:
+            return self.user_cache[user_id]['username']
         
         try:
             # Fetch user info from Slack API
@@ -58,12 +58,34 @@ class SlackBot(BaseClient):
                           user_info.get("profile", {}).get("real_name") or 
                           user_info.get("name") or 
                           user_id)
-                self.user_cache[user_id] = username
+                
+                # Cache both username and timezone info
+                self.user_cache[user_id] = {
+                    'username': username,
+                    'timezone': user_info.get('tz', 'UTC'),
+                    'tz_label': user_info.get('tz_label', 'UTC'),
+                    'tz_offset': user_info.get('tz_offset', 0)
+                }
                 return username
         except Exception as e:
             self.log_debug(f"Could not fetch username for {user_id}: {e}")
         
         return user_id  # Fallback to user ID if fetch fails
+    
+    def get_user_timezone(self, user_id: str, client) -> str:
+        """Get user's timezone, fetching if necessary"""
+        # Check cache first
+        if user_id in self.user_cache and 'timezone' in self.user_cache[user_id]:
+            return self.user_cache[user_id]['timezone']
+        
+        # Fetch user info (which will also cache it)
+        self.get_username(user_id, client)
+        
+        # Return timezone from cache or default to UTC
+        if user_id in self.user_cache and 'timezone' in self.user_cache[user_id]:
+            return self.user_cache[user_id]['timezone']
+        
+        return 'UTC'  # Default fallback
     
     def _handle_slack_message(self, event: Dict[str, Any], client):
         """Convert Slack event to universal Message format"""
@@ -92,9 +114,10 @@ class SlackBot(BaseClient):
                 "mimetype": mimetype
             })
         
-        # Get username for logging
+        # Get username and timezone for logging
         user_id = event.get("user")
         username = self.get_username(user_id, client) if user_id else "unknown"
+        user_timezone = self.get_user_timezone(user_id, client) if user_id else "UTC"
         
         # Create universal message
         message = Message(
@@ -106,7 +129,8 @@ class SlackBot(BaseClient):
             metadata={
                 "ts": event.get("ts"),
                 "slack_client": client,
-                "username": username  # Add username to metadata
+                "username": username,  # Add username to metadata
+                "user_timezone": user_timezone  # Add timezone to metadata
             }
         )
         
