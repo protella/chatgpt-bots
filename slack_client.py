@@ -16,6 +16,9 @@ from markdown_converter import MarkdownConverter
 class SlackBot(BaseClient):
     """Slack-specific bot implementation"""
     
+    # Slack message limit (leaving buffer for formatting)
+    MAX_MESSAGE_LENGTH = 3900
+    
     def __init__(self, message_handler=None):
         super().__init__("SlackBot")
         self.app = App(token=config.slack_bot_token)
@@ -128,20 +131,88 @@ class SlackBot(BaseClient):
             self.handler.close()
     
     def send_message(self, channel_id: str, thread_id: str, text: str) -> bool:
-        """Send a text message to Slack"""
+        """Send a text message to Slack, splitting if needed"""
         try:
             # Format text for Slack
             formatted_text = self.format_text(text)
             
-            self.app.client.chat_postMessage(
-                channel=channel_id,
-                thread_ts=thread_id,
-                text=formatted_text
-            )
+            # Check if we need to split the message
+            if len(formatted_text) <= self.MAX_MESSAGE_LENGTH:
+                # Single message
+                self.app.client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=thread_id,
+                    text=formatted_text
+                )
+            else:
+                # Split into multiple messages
+                chunks = self._split_message(formatted_text)
+                for i, chunk in enumerate(chunks, 1):
+                    # Add pagination indicator
+                    paginated_chunk = f"*Part {i}/{len(chunks)}*\n\n{chunk}"
+                    self.app.client.chat_postMessage(
+                        channel=channel_id,
+                        thread_ts=thread_id,
+                        text=paginated_chunk
+                    )
             return True
         except SlackApiError as e:
             self.log_error(f"Error sending message: {e}")
             return False
+    
+    def _split_message(self, text: str) -> List[str]:
+        """Split a long message into chunks that fit within Slack's limit"""
+        # Account for pagination indicator overhead (~20 chars)
+        chunk_size = self.MAX_MESSAGE_LENGTH - 50
+        chunks = []
+        
+        # Try to split on paragraph boundaries first
+        paragraphs = text.split('\n\n')
+        current_chunk = ""
+        
+        for para in paragraphs:
+            # If a single paragraph is too long, split it by sentences
+            if len(para) > chunk_size:
+                sentences = para.replace('. ', '.\n').split('\n')
+                for sentence in sentences:
+                    if len(current_chunk) + len(sentence) + 2 <= chunk_size:
+                        current_chunk += sentence + " "
+                    else:
+                        if current_chunk:
+                            chunks.append(current_chunk.strip())
+                        current_chunk = sentence + " "
+            elif len(current_chunk) + len(para) + 2 <= chunk_size:
+                current_chunk += para + "\n\n"
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = para + "\n\n"
+        
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        return chunks
+    
+    def send_message_get_ts(self, channel_id: str, thread_id: str, text: str) -> Dict:
+        """Send a message and return the response including timestamp"""
+        try:
+            # Format text for Slack
+            formatted_text = self.format_text(text)
+            
+            # Ensure it fits in one message for streaming continuation
+            if len(formatted_text) > self.MAX_MESSAGE_LENGTH:
+                formatted_text = formatted_text[:self.MAX_MESSAGE_LENGTH - 50] + "\n\n*...truncated*"
+            
+            result = self.app.client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_id,
+                text=formatted_text
+            )
+            
+            return {"success": True, "ts": result["ts"]}
+        except SlackApiError as e:
+            self.log_error(f"Error sending message: {e}")
+            return {"success": False, "error": str(e)}
     
     def send_image(self, channel_id: str, thread_id: str, image_data: bytes, filename: str, caption: str = "") -> Optional[str]:
         """Send an image to Slack and return the file URL"""
@@ -421,6 +492,10 @@ class SlackBot(BaseClient):
         try:
             # Format text for Slack using markdown conversion
             formatted_text = self.format_text(text)
+            
+            # Truncate if too long during streaming
+            if len(formatted_text) > self.MAX_MESSAGE_LENGTH:
+                formatted_text = formatted_text[:self.MAX_MESSAGE_LENGTH - 100] + "\n\n*...continuing...*"
             
             # Call Slack API's chat_update method
             result = self.app.client.chat_update(
