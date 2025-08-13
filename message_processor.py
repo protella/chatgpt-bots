@@ -281,7 +281,8 @@ class MessageProcessor(LoggerMixin):
                         thread_state, 
                         client, 
                         message.channel_id, 
-                        thinking_id
+                        thinking_id,
+                        message
                     )
             else:
                 response = self._handle_text_response(user_content, thread_state, client, message, thinking_id)
@@ -1393,7 +1394,8 @@ class MessageProcessor(LoggerMixin):
         thread_state,
         client: BaseClient,
         channel_id: str,
-        thinking_id: Optional[str]
+        thinking_id: Optional[str],
+        message: Message
     ) -> Response:
         """Handle vision request when no images are uploaded - use text response with context"""
         
@@ -1409,7 +1411,7 @@ class MessageProcessor(LoggerMixin):
         
         # Always use text response - the model will have context from the thread history
         # This avoids re-analysis and keeps responses concise
-        return self._handle_text_response(text, thread_state, client, channel_id, thinking_id)
+        return self._handle_text_response(text, thread_state, client, message, thinking_id)
     
     def _handle_image_edit(
         self,
