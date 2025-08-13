@@ -95,6 +95,10 @@ class BotConfig:
     cleanup_schedule: str = field(default_factory=lambda: os.getenv("CLEANUP_SCHEDULE", "0 0 * * *"))  # Default: midnight daily
     cleanup_max_age_hours: float = field(default_factory=lambda: float(os.getenv("CLEANUP_MAX_AGE_HOURS", "24")))
     
+    # API Timeout settings (in seconds)
+    api_timeout_read: float = field(default_factory=lambda: float(os.getenv("API_TIMEOUT_READ", "180")))  # Overall timeout for API requests
+    api_timeout_streaming_chunk: float = field(default_factory=lambda: float(os.getenv("API_TIMEOUT_STREAMING_CHUNK", "30")))  # Max time between streaming chunks
+    
     # Streaming configuration
     enable_streaming: bool = field(default_factory=lambda: os.getenv("ENABLE_STREAMING", "true").lower() == "true")
     slack_streaming: bool = field(default_factory=lambda: os.getenv("SLACK_STREAMING", "true").lower() == "true")

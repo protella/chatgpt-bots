@@ -66,6 +66,7 @@ class SlackBot(BaseClient):
                     'tz_label': user_info.get('tz_label', 'UTC'),
                     'tz_offset': user_info.get('tz_offset', 0)
                 }
+                self.log_debug(f"Cached timezone info for {username}: tz={user_info.get('tz')}, tz_label={user_info.get('tz_label')}")
                 return username
         except Exception as e:
             self.log_debug(f"Could not fetch username for {user_id}: {e}")
@@ -119,6 +120,11 @@ class SlackBot(BaseClient):
         username = self.get_username(user_id, client) if user_id else "unknown"
         user_timezone = self.get_user_timezone(user_id, client) if user_id else "UTC"
         
+        # Get timezone label (EST, PST, etc.) if available
+        user_tz_label = None
+        if user_id in self.user_cache and 'tz_label' in self.user_cache[user_id]:
+            user_tz_label = self.user_cache[user_id]['tz_label']
+        
         # Create universal message
         message = Message(
             text=text,
@@ -130,7 +136,8 @@ class SlackBot(BaseClient):
                 "ts": event.get("ts"),
                 "slack_client": client,
                 "username": username,  # Add username to metadata
-                "user_timezone": user_timezone  # Add timezone to metadata
+                "user_timezone": user_timezone,  # Add timezone to metadata
+                "user_tz_label": user_tz_label  # Add timezone label (EST, PST, etc.)
             }
         )
         

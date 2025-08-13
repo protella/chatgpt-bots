@@ -70,10 +70,10 @@ class MessageProcessor(LoggerMixin):
                 client
             )
             
-            # Set platform-specific system prompt if not already set
-            if not thread_state.system_prompt:
-                user_timezone = message.metadata.get("user_timezone", "UTC") if message.metadata else "UTC"
-                thread_state.system_prompt = self._get_system_prompt(client, user_timezone)
+            # Always regenerate system prompt to get current time
+            user_timezone = message.metadata.get("user_timezone", "UTC") if message.metadata else "UTC"
+            user_tz_label = message.metadata.get("user_tz_label", None) if message.metadata else None
+            thread_state.system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label)
             
             # Process any attachments (images and other files)
             image_inputs, unsupported_files = self._process_attachments(message, client)
@@ -284,7 +284,7 @@ class MessageProcessor(LoggerMixin):
                         thinking_id
                     )
             else:
-                response = self._handle_text_response(user_content, thread_state, client, message.channel_id, thinking_id)
+                response = self._handle_text_response(user_content, thread_state, client, message, thinking_id)
             
             # DEBUG: Print conversation history after processing
             import json
@@ -307,9 +307,28 @@ class MessageProcessor(LoggerMixin):
             self.log_info("="*80)
             self.log_info(f"REQUEST END | Thread: {thread_key} | Status: ERROR | Time: {elapsed:.2f}s")
             self.log_info("="*80)
+            
+            # Check if this is a timeout error
+            error_str = str(e)
+            error_type = type(e).__name__
+            
+            # Check for various timeout error types
+            if any(timeout_indicator in error_str.lower() or timeout_indicator in error_type.lower() 
+                   for timeout_indicator in ['timeout', 'readtimeout', 'connecttimeout', 'timeouterror']):
+                # Timeout-specific error message
+                error_message = (
+                    "The request timed out while waiting for a response. "
+                    "This can happen with complex requests or when the service is busy. "
+                    "Please try again in a moment."
+                )
+                self.log_warning(f"Request timeout after {elapsed:.2f} seconds for thread {thread_key}")
+            else:
+                # Generic error message with details
+                error_message = str(e)
+            
             return Response(
                 type="error",
-                content=str(e)
+                content=error_message
             )
         finally:
             self.thread_manager.release_thread_lock(
@@ -527,7 +546,7 @@ class MessageProcessor(LoggerMixin):
         
         return False
     
-    def _get_system_prompt(self, client: BaseClient, user_timezone: str = "UTC") -> str:
+    def _get_system_prompt(self, client: BaseClient, user_timezone: str = "UTC", user_tz_label: Optional[str] = None) -> str:
         """Get the appropriate system prompt based on the client platform with user's timezone"""
         client_name = client.name.lower()
         
@@ -544,14 +563,23 @@ class MessageProcessor(LoggerMixin):
         try:
             user_tz = pytz.timezone(user_timezone)
             current_time = datetime.datetime.now(pytz.UTC).astimezone(user_tz)
-            timezone_name = user_tz.zone
+            
+            # Use abbreviated timezone label if available (EST, PST, etc.), otherwise full name
+            if user_tz_label:
+                timezone_display = user_tz_label
+            else:
+                # Try to get the abbreviated name from the current time
+                timezone_display = current_time.strftime('%Z')
+                if not timezone_display or timezone_display == user_tz.zone:
+                    # If strftime doesn't give us an abbreviation, use the full zone name
+                    timezone_display = user_tz.zone
         except:
             # Fallback to UTC if timezone is invalid
             current_time = datetime.datetime.now(pytz.UTC)
-            timezone_name = "UTC"
+            timezone_display = "UTC"
         
         # Format time context
-        time_context = f"\n\nCurrent date and time: {current_time.strftime('%A, %B %d, %Y at %I:%M %p')} ({timezone_name})"
+        time_context = f"\n\nCurrent date and time: {current_time.strftime('%A, %B %d, %Y at %I:%M %p')} ({timezone_display})"
         
         return base_prompt + time_context
     
@@ -577,13 +605,13 @@ class MessageProcessor(LoggerMixin):
                           emoji=config.circle_loader_emoji)
     
     def _handle_text_response(self, user_content: Any, thread_state, client: BaseClient, 
-                              channel_id: str = None, thinking_id: Optional[str] = None,
+                              message: Message, thinking_id: Optional[str] = None,
                               attachment_urls: Optional[List[str]] = None) -> Response:
         """Handle text-only response generation"""
         # Check if streaming is enabled and supported
         if (hasattr(client, 'supports_streaming') and client.supports_streaming() and 
             thinking_id is not None):  # Streaming requires a message ID to update
-            return self._handle_streaming_text_response(user_content, thread_state, client, channel_id, thinking_id, attachment_urls)
+            return self._handle_streaming_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls)
         
         # Fall back to non-streaming logic
         # For vision requests with images, store only a text breadcrumb with URLs, not the base64 data
@@ -620,10 +648,13 @@ class MessageProcessor(LoggerMixin):
         thread_config = config.get_thread_config(thread_state.config_overrides)
         
         # Use thread's system prompt (which is now platform-specific)
-        system_prompt = thread_state.system_prompt or self._get_system_prompt(client, "UTC")
+        # Always regenerate to get current time
+        user_timezone = message.metadata.get("user_timezone", "UTC") if message.metadata else "UTC"
+        user_tz_label = message.metadata.get("user_tz_label", None) if message.metadata else None
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label)
         
         # Update status before generating
-        self._update_status(client, channel_id, thinking_id, "Generating response...")
+        self._update_status(client, message.channel_id, thinking_id, "Generating response...")
         
         # Check if web search should be available
         if config.enable_web_search:
@@ -670,13 +701,13 @@ class MessageProcessor(LoggerMixin):
         )
     
     def _handle_streaming_text_response(self, user_content: Any, thread_state, client: BaseClient, 
-                                      channel_id: str = None, thinking_id: Optional[str] = None,
+                                      message: Message, thinking_id: Optional[str] = None,
                                       attachment_urls: Optional[List[str]] = None) -> Response:
         """Handle text-only response generation with streaming support"""
         # Check if client supports streaming
         if not hasattr(client, 'supports_streaming') or not client.supports_streaming():
             self.log_debug("Client doesn't support streaming, falling back to non-streaming")
-            return self._handle_text_response(user_content, thread_state, client, channel_id, thinking_id, attachment_urls)
+            return self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls)
         
         # Get streaming configuration from client
         streaming_config = client.get_streaming_config() if hasattr(client, 'get_streaming_config') else {}
@@ -732,7 +763,10 @@ class MessageProcessor(LoggerMixin):
         thread_config = config.get_thread_config(thread_state.config_overrides)
         
         # Use thread's system prompt (which is now platform-specific)
-        system_prompt = thread_state.system_prompt or self._get_system_prompt(client, "UTC")
+        # Always regenerate to get current time
+        user_timezone = message.metadata.get("user_timezone", "UTC") if message.metadata else "UTC"
+        user_tz_label = message.metadata.get("user_tz_label", None) if message.metadata else None
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label)
         
         # Post an initial message to get the message ID for streaming updates
         # For streaming with potential tools, start with "Working on it" 
@@ -741,11 +775,11 @@ class MessageProcessor(LoggerMixin):
         if thinking_id:
             # Update existing thinking message
             message_id = thinking_id
-            client.update_message(channel_id, message_id, initial_message)
+            client.update_message(message.channel_id, message_id, initial_message)
         else:
             # We need a way to post a message and get its ID - this would depend on client implementation
             self.log_warning("No thinking_id provided for streaming - falling back to non-streaming")
-            return self._handle_text_response(user_content, thread_state, client, channel_id, thinking_id, attachment_urls)
+            return self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls)
         
         # Track tool states for status updates
         tool_states = {
@@ -776,7 +810,7 @@ class MessageProcessor(LoggerMixin):
                     status_msg = f"{config.web_search_emoji} Searching the web (query {search_counts['web_search']})..."
                     try:
                         # Use update_message_streaming for consistency with streaming flow
-                        result = client.update_message_streaming(channel_id, message_id, status_msg)
+                        result = client.update_message_streaming(message.channel_id, message_id, status_msg)
                         if result["success"]:
                             self.log_info(f"Web search #{search_counts['web_search']} started - updated status")
                         else:
@@ -790,7 +824,7 @@ class MessageProcessor(LoggerMixin):
                     # Show search count consistently for all searches
                     status_msg = f"{config.web_search_emoji} Searching files (query {search_counts['file_search']})..."
                     try:
-                        result = client.update_message_streaming(channel_id, message_id, status_msg)
+                        result = client.update_message_streaming(message.channel_id, message_id, status_msg)
                         if result["success"]:
                             self.log_info(f"File search #{search_counts['file_search']} started - updated status")
                         else:
@@ -801,7 +835,7 @@ class MessageProcessor(LoggerMixin):
                     tool_states["image_generation"] = True
                     status_msg = f"{config.circle_loader_emoji} Generating image..."
                     try:
-                        result = client.update_message_streaming(channel_id, message_id, status_msg)
+                        result = client.update_message_streaming(message.channel_id, message_id, status_msg)
                         if result["success"]:
                             self.log_info(f"Image generation started - updated status")
                         else:
@@ -835,7 +869,7 @@ class MessageProcessor(LoggerMixin):
                     # Use raw text for final flush - no loading indicator since stream is complete
                     final_text = buffer.get_complete_text()  # No loading indicator on completion
                     try:
-                        result = client.update_message_streaming(channel_id, current_message_id, final_text)
+                        result = client.update_message_streaming(message.channel_id, current_message_id, final_text)
                         if result["success"]:
                             rate_limiter.record_success()
                             buffer.mark_updated()
@@ -865,14 +899,14 @@ class MessageProcessor(LoggerMixin):
                     # Update current message with continuation indicator
                     final_first_part = f"{first_part}\n\n*Continued in next message...*"
                     try:
-                        result = client.update_message_streaming(channel_id, current_message_id, final_first_part)
+                        result = client.update_message_streaming(message.channel_id, current_message_id, final_first_part)
                         if result["success"]:
                             # Post a new message for overflow
                             current_part += 1
                             continuation_text = f"*Part {current_part} (continued)*\n\n{overflow_buffer} {config.loading_ellipse_emoji}"
                             
                             # Send new message and get its ID
-                            new_msg_result = client.send_message_get_ts(channel_id, thinking_id, continuation_text)
+                            new_msg_result = client.send_message_get_ts(message.channel_id, thinking_id, continuation_text)
                             if new_msg_result and "ts" in new_msg_result:
                                 current_message_id = new_msg_result["ts"]
                                 # Reset buffer with overflow content
@@ -888,7 +922,7 @@ class MessageProcessor(LoggerMixin):
                     
                     # Call client.update_message_streaming with indicator
                     try:
-                        result = client.update_message_streaming(channel_id, current_message_id, display_text_with_indicator)
+                        result = client.update_message_streaming(message.channel_id, current_message_id, display_text_with_indicator)
                         
                         if result["success"]:
                             rate_limiter.record_success()
@@ -909,7 +943,7 @@ class MessageProcessor(LoggerMixin):
                                         clear_text = buffer.last_sent_text if buffer.last_sent_text else "Processing..."
                                         if len(clear_text) > 3900:
                                             clear_text = clear_text[:3800] + "\n\n*Response too long - see next message*"
-                                        client.update_message_streaming(channel_id, message_id, clear_text)
+                                        client.update_message_streaming(message.channel_id, message_id, clear_text)
                                     except Exception as clear_error:
                                         self.log_error(f"Failed to clear indicator after circuit break: {clear_error}")
                             else:
@@ -966,7 +1000,7 @@ class MessageProcessor(LoggerMixin):
                     if final_part_text:
                         # Add the part indicator
                         final_part_text = f"*Part {current_part} (continued)*\n\n{final_part_text}"
-                        final_result = client.update_message_streaming(channel_id, current_message_id, final_part_text)
+                        final_result = client.update_message_streaming(message.channel_id, current_message_id, final_part_text)
                         if not final_result["success"]:
                             self.log_error(f"Failed to remove indicator from part {current_part}: {final_result.get('error', 'Unknown error')}")
                 except Exception as e:
@@ -985,16 +1019,16 @@ class MessageProcessor(LoggerMixin):
                             # This shouldn't happen if streaming overflow worked correctly
                             # But handle it as a fallback
                             truncated_text = response_text[:3800] + "\n\n*Continued in next message...*"
-                            final_result = client.update_message_streaming(channel_id, message_id, truncated_text)
+                            final_result = client.update_message_streaming(message.channel_id, message_id, truncated_text)
                             
                             # Send the rest as new messages
                             overflow_text = response_text[3800:]
-                            client.send_message(channel_id, thinking_id, f"*...continued*\n\n{overflow_text}")
+                            client.send_message(message.channel_id, thinking_id, f"*...continued*\n\n{overflow_text}")
                             
                             if not final_result["success"]:
                                 self.log_error(f"Final truncated update failed: {final_result.get('error', 'Unknown error')}")
                         else:
-                            final_result = client.update_message_streaming(channel_id, current_message_id, response_text)
+                            final_result = client.update_message_streaming(message.channel_id, current_message_id, response_text)
                             if not final_result["success"]:
                                 self.log_error(f"Final correction update failed: {final_result.get('error', 'Unknown error')}")
                     except Exception as e:
@@ -1026,13 +1060,13 @@ class MessageProcessor(LoggerMixin):
                 try:
                     # Send whatever text we have without the loading indicator
                     error_text = buffer.get_complete_text() if buffer.has_content() else "An error occurred during streaming."
-                    client.update_message_streaming(channel_id, message_id, error_text)
+                    client.update_message_streaming(message.channel_id, message_id, error_text)
                 except Exception as cleanup_error:
                     self.log_debug(f"Could not remove loading indicator: {cleanup_error}")
             
             # Fall back to non-streaming on error
             self.log_info("Falling back to non-streaming due to error")
-            return self._handle_text_response(user_content, thread_state, client, channel_id, thinking_id, attachment_urls)
+            return self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls)
 
     def _handle_vision_analysis(self, user_text: str, image_inputs: List[Dict], thread_state, attachments: List[Dict],
                                client: BaseClient, channel_id: str, thinking_id: Optional[str]) -> Response:

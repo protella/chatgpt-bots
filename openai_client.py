@@ -3,6 +3,7 @@ OpenAI Client wrapper for Responses API
 Handles all interactions with OpenAI's GPT and image generation models
 """
 import base64
+import time
 from io import BytesIO
 from typing import Optional, List, Dict, Any, Tuple, Callable
 from dataclasses import dataclass
@@ -30,8 +31,19 @@ class OpenAIClient(LoggerMixin):
     """Wrapper for OpenAI API using Responses API"""
     
     def __init__(self):
-        self.client = OpenAI(api_key=config.openai_api_key)
-        self.log_info("OpenAI client initialized")
+        # Initialize OpenAI client with timeout directly
+        # The OpenAI SDK accepts timeout as a parameter
+        self.client = OpenAI(
+            api_key=config.openai_api_key,
+            timeout=config.api_timeout_read,  # Use read timeout as the overall timeout
+            max_retries=0  # Disable retries to fail fast on timeout
+        )
+        
+        # Store streaming timeout for later use
+        self.stream_timeout_seconds = config.api_timeout_streaming_chunk
+        
+        self.log_info(f"OpenAI client initialized with timeout: {config.api_timeout_read}s, "
+                     f"streaming_chunk: {self.stream_timeout_seconds}s, max_retries: 0")
     
     def create_text_response(
         self,
@@ -310,10 +322,16 @@ class OpenAIClient(LoggerMixin):
             response = self.client.responses.create(**request_params)
             
             complete_text = ""
+            last_chunk_time = time.time()
             
             # Process streaming events
             for event in response:
                 try:
+                    # Check for streaming timeout
+                    time_since_last_chunk = time.time() - last_chunk_time
+                    if time_since_last_chunk > self.stream_timeout_seconds:
+                        raise TimeoutError(f"Stream timeout: No data received for {self.stream_timeout_seconds} seconds")
+                    
                     # Get event type without logging every single one
                     event_type = getattr(event, 'type', 'unknown')
                     
@@ -345,6 +363,7 @@ class OpenAIClient(LoggerMixin):
                         # If we found text, process it
                         if text_chunk:
                             complete_text += text_chunk
+                            last_chunk_time = time.time()  # Reset timeout timer
                             # Call the callback with the text chunk
                             try:
                                 stream_callback(text_chunk)
@@ -482,10 +501,16 @@ class OpenAIClient(LoggerMixin):
             response = self.client.responses.create(**request_params)
             
             complete_text = ""
+            last_chunk_time = time.time()
             
             # Process streaming events
             for event in response:
                 try:
+                    # Check for streaming timeout
+                    time_since_last_chunk = time.time() - last_chunk_time
+                    if time_since_last_chunk > self.stream_timeout_seconds:
+                        raise TimeoutError(f"Stream timeout: No data received for {self.stream_timeout_seconds} seconds")
+                    
                     # Get event type without logging every single one
                     event_type = getattr(event, 'type', 'unknown')
                     
@@ -517,6 +542,7 @@ class OpenAIClient(LoggerMixin):
                         # If we found text, process it
                         if text_chunk:
                             complete_text += text_chunk
+                            last_chunk_time = time.time()  # Reset timeout timer
                             # Call the callback with the text chunk
                             try:
                                 stream_callback(text_chunk)
