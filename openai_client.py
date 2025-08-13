@@ -44,6 +44,7 @@ class OpenAIClient(LoggerMixin):
         
         self.log_info(f"OpenAI client initialized with timeout: {config.api_timeout_read}s, "
                      f"streaming_chunk: {self.stream_timeout_seconds}s, max_retries: 0")
+        self.log_debug(f"Client timeout object: {self.client.timeout}, type: {type(self.client.timeout)}")
     
     def create_text_response(
         self,
@@ -332,6 +333,9 @@ class OpenAIClient(LoggerMixin):
                     if time_since_last_chunk > self.stream_timeout_seconds:
                         raise TimeoutError(f"Stream timeout: No data received for {self.stream_timeout_seconds} seconds")
                     
+                    # Reset timeout on ANY event (not just text content)
+                    last_chunk_time = time.time()
+                    
                     # Get event type without logging every single one
                     event_type = getattr(event, 'type', 'unknown')
                     
@@ -363,7 +367,6 @@ class OpenAIClient(LoggerMixin):
                         # If we found text, process it
                         if text_chunk:
                             complete_text += text_chunk
-                            last_chunk_time = time.time()  # Reset timeout timer
                             # Call the callback with the text chunk
                             try:
                                 stream_callback(text_chunk)
@@ -469,6 +472,7 @@ class OpenAIClient(LoggerMixin):
             "max_output_tokens": max_tokens,
             "store": store,
             "stream": True,  # Enable streaming
+            "parallel_tool_calls": True,  # Allow parallel tool execution
         }
         
         # Add system prompt if provided
@@ -511,6 +515,9 @@ class OpenAIClient(LoggerMixin):
                     if time_since_last_chunk > self.stream_timeout_seconds:
                         raise TimeoutError(f"Stream timeout: No data received for {self.stream_timeout_seconds} seconds")
                     
+                    # Reset timeout on ANY event (not just text content)
+                    last_chunk_time = time.time()
+                    
                     # Get event type without logging every single one
                     event_type = getattr(event, 'type', 'unknown')
                     
@@ -542,7 +549,6 @@ class OpenAIClient(LoggerMixin):
                         # If we found text, process it
                         if text_chunk:
                             complete_text += text_chunk
-                            last_chunk_time = time.time()  # Reset timeout timer
                             # Call the callback with the text chunk
                             try:
                                 stream_callback(text_chunk)
@@ -693,7 +699,12 @@ class OpenAIClient(LoggerMixin):
                 # GPT-4 or other models - use standard parameters
                 request_params["temperature"] = 0.3  # Low temperature for consistent classification
             
+            self.log_debug(f"About to call responses.create for intent classification at {time.strftime('%H:%M:%S')}")
+            self.log_debug(f"Using model: {config.utility_model}, timeout: {self.client.timeout}s")
+            
             response = self.client.responses.create(**request_params)
+            
+            self.log_debug(f"Response received from API at {time.strftime('%H:%M:%S')}")
             
             # Extract True/False response
             result = ""
@@ -736,6 +747,10 @@ class OpenAIClient(LoggerMixin):
             
         except Exception as e:
             self.log_error(f"Error classifying intent: {e}")
+            self.log_error(f"Exception type: {type(e).__name__}")
+            self.log_error(f"Occurred at: {time.strftime('%H:%M:%S')}")
+            import traceback
+            self.log_error(f"Traceback: {traceback.format_exc()}")
             return 'text_only'  # Default to text on error
     
     def generate_image(
