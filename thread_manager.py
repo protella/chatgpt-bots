@@ -45,14 +45,36 @@ class AssetLedger:
     thread_ts: str
     images: List[Dict[str, Any]] = field(default_factory=list)
     
-    def add_image(self, image_data: str, prompt: str, timestamp: float, slack_url: Optional[str] = None):
-        """Add an image to the ledger"""
+    def add_image(self, image_data: str, prompt: str, timestamp: float, slack_url: Optional[str] = None, source: str = "generated", original_url: Optional[str] = None):
+        """Add an image to the ledger
+        
+        Args:
+            image_data: Base64 encoded image data
+            prompt: Description or prompt for the image
+            timestamp: When the image was added
+            slack_url: URL if uploaded to Slack
+            source: Source of image - 'generated', 'attachment', 'url'
+            original_url: Original URL if image was downloaded from web
+        """
         self.images.append({
             "data": image_data,
             "prompt": prompt[:100],  # Store first 100 chars as breadcrumb
             "timestamp": timestamp,
-            "slack_url": slack_url
+            "slack_url": slack_url,
+            "source": source,
+            "original_url": original_url
         })
+    
+    def add_url_image(self, image_data: str, url: str, timestamp: float, slack_url: Optional[str] = None):
+        """Add an image downloaded from a URL"""
+        self.add_image(
+            image_data=image_data,
+            prompt=f"Image from URL: {url}",
+            timestamp=timestamp,
+            slack_url=slack_url,
+            source="url",
+            original_url=url
+        )
     
     def get_recent_images(self, count: int = 5) -> List[Dict[str, Any]]:
         """Get the most recent images"""

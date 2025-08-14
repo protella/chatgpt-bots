@@ -15,6 +15,7 @@ from config import config
 from logger import LoggerMixin
 from prompts import SLACK_SYSTEM_PROMPT, DISCORD_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, IMAGE_ANALYSIS_PROMPT
 from streaming import StreamingBuffer, RateLimitManager
+from image_url_handler import ImageURLHandler
 
 
 class MessageProcessor(LoggerMixin):
@@ -23,6 +24,7 @@ class MessageProcessor(LoggerMixin):
     def __init__(self):
         self.thread_manager = ThreadStateManager()
         self.openai_client = OpenAIClient()
+        self.image_url_handler = ImageURLHandler()
         self.log_info("MessageProcessor initialized")
     
     def process_message(self, message: Message, client: BaseClient, thinking_id: Optional[str] = None) -> Optional[Response]:
@@ -401,12 +403,45 @@ class MessageProcessor(LoggerMixin):
         
         return thread_state
     
+    def _extract_slack_file_urls(self, text: str) -> List[str]:
+        """Extract Slack file URLs from message text
+        
+        Args:
+            text: Message text that may contain Slack file URLs
+            
+        Returns:
+            List of Slack file URLs found
+        """
+        import re
+        
+        # Slack wraps URLs in angle brackets <URL>
+        # Pattern to match Slack file URLs
+        pattern = r'<(https?://[^>]*slack\.com/files/[^>]+)>'
+        
+        urls = re.findall(pattern, text)
+        
+        # Also check for unwrapped Slack file URLs (but avoid capturing trailing >)
+        pattern2 = r'(https?://[^\s>]*slack\.com/files/[^\s>]+)'
+        urls2 = re.findall(pattern2, text)
+        
+        # Combine and dedupe
+        all_urls = list(set(urls + urls2))
+        
+        # Filter to only image files
+        image_urls = []
+        for url in all_urls:
+            # Check if URL looks like it points to an image
+            if any(ext in url.lower() for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp', 'image']):
+                image_urls.append(url)
+        
+        return image_urls
+    
     def _process_attachments(
         self,
         message: Message,
         client: BaseClient
     ) -> Tuple[List[Dict], List[Dict]]:
-        """Process message attachments (mainly images)
+        """Process message attachments and extract images from URLs in text
         
         Returns:
             Tuple of (image_inputs, unsupported_files)
@@ -416,6 +451,7 @@ class MessageProcessor(LoggerMixin):
         image_count = 0
         max_images = 10
         
+        # First, process regular attachments
         for attachment in message.attachments:
             file_type = attachment.get("type", "unknown")
             file_name = attachment.get("name", "unnamed file")
@@ -441,7 +477,9 @@ class MessageProcessor(LoggerMixin):
                         mimetype = attachment.get("mimetype", "image/png")
                         image_inputs.append({
                             "type": "input_image",
-                            "image_url": f"data:{mimetype};base64,{base64_data}"
+                            "image_url": f"data:{mimetype};base64,{base64_data}",
+                            "source": "attachment",
+                            "filename": file_name
                         })
                         
                         image_count += 1
@@ -458,6 +496,83 @@ class MessageProcessor(LoggerMixin):
                     "mimetype": mimetype
                 })
                 self.log_debug(f"Unsupported file type: {file_type} ({mimetype}) - {file_name}")
+        
+        # Second, check for image URLs in the message text
+        if message.text and image_count < max_images:
+            # First check for Slack file URLs and handle them specially
+            slack_file_urls = self._extract_slack_file_urls(message.text)
+            
+            if slack_file_urls and hasattr(client, '__class__') and client.__class__.__name__ == 'SlackBot':
+                self.log_debug(f"Found {len(slack_file_urls)} Slack file URL(s) to process")
+                
+                for url in slack_file_urls:
+                    if image_count >= max_images:
+                        break
+                    
+                    # Download the Slack file using the client's download_file method
+                    self.log_info(f"Downloading Slack file from URL: {url}")
+                    file_data = client.download_file(url)
+                    
+                    if file_data:
+                        # Convert to base64
+                        base64_data = base64.b64encode(file_data).decode('utf-8')
+                        
+                        # Determine mimetype from URL or default to PNG
+                        mimetype = "image/png"
+                        if '.jpg' in url.lower() or '.jpeg' in url.lower():
+                            mimetype = "image/jpeg"
+                        elif '.gif' in url.lower():
+                            mimetype = "image/gif"
+                        elif '.webp' in url.lower():
+                            mimetype = "image/webp"
+                        
+                        image_inputs.append({
+                            "type": "input_image",
+                            "image_url": f"data:{mimetype};base64,{base64_data}",
+                            "source": "slack_url",
+                            "original_url": url
+                        })
+                        
+                        image_count += 1
+                        self.log_info(f"Added Slack file image {image_count}/{max_images}: {url}")
+                    else:
+                        self.log_warning(f"Failed to download Slack file from URL: {url}")
+            
+            # Now check for external image URLs
+            
+            # Get Slack token if this is a Slack client (for non-Slack URLs that might need auth)
+            auth_token = None
+            if hasattr(client, '__class__') and client.__class__.__name__ == 'SlackBot':
+                from config import config
+                auth_token = config.slack_bot_token
+            
+            downloaded_images, failed_urls = self.image_url_handler.process_urls_from_text(message.text, auth_token)
+            
+            for img_data in downloaded_images:
+                if image_count >= max_images:
+                    self.log_warning(f"Limiting to {max_images} images (found more URLs)")
+                    break
+                
+                # Format for Responses API
+                image_inputs.append({
+                    "type": "input_image",
+                    "image_url": f"data:{img_data['mimetype']};base64,{img_data['base64_data']}",
+                    "source": "url",
+                    "original_url": img_data['url']
+                })
+                
+                image_count += 1
+                self.log_info(f"Added image from URL {image_count}/{max_images}: {img_data['url']}")
+                
+                # Store the image data for potential upload to Slack/Discord later
+                # This will be handled by the AssetLedger tracking
+                if hasattr(message, 'url_images'):
+                    message.url_images.append(img_data)
+                else:
+                    message.url_images = [img_data]
+            
+            if failed_urls:
+                self.log_warning(f"Failed to download images from URLs: {', '.join(failed_urls)}")
         
         return image_inputs, unsupported_files
     
@@ -1078,8 +1193,10 @@ class MessageProcessor(LoggerMixin):
                 content="No images found to analyze"
             )
         
-        # Extract base64 data from image inputs
+        # Extract base64 data from image inputs and track URL images
         images_to_analyze = []
+        url_images = []  # Track URL-sourced images
+        
         for img_input in image_inputs:
             if img_input.get("type") == "input_image":
                 # Extract from data URL format
@@ -1089,6 +1206,13 @@ class MessageProcessor(LoggerMixin):
                     if len(parts) == 2:
                         _, base64_data = parts
                         images_to_analyze.append(base64_data)
+                        
+                        # Track URL-sourced images in AssetLedger
+                        if img_input.get("source") == "url":
+                            url_images.append({
+                                "base64_data": base64_data,
+                                "original_url": img_input.get("original_url", "")
+                            })
         
         if not images_to_analyze:
             return Response(
@@ -1113,14 +1237,38 @@ class MessageProcessor(LoggerMixin):
             enhance_prompt=True  # Enable prompt enhancement for detailed analysis
         )
         
+        # Track URL images in AssetLedger
+        if url_images:
+            asset_ledger = self.thread_manager.get_or_create_asset_ledger(thread_state.thread_ts)
+            for url_img in url_images:
+                asset_ledger.add_url_image(
+                    image_data=url_img["base64_data"],
+                    url=url_img["original_url"],
+                    timestamp=time.time()
+                )
+                self.log_debug(f"Added URL image to AssetLedger: {url_img['original_url']}")
+        
         # Create breadcrumb for thread state with URLs
         breadcrumb_text = user_text if user_text else "Analyze image"
-        breadcrumb_text += f" [Uploaded {len(images_to_analyze)} file(s)]"
+        
+        # Count images by source
+        attachment_count = sum(1 for img in image_inputs if img.get("source") == "attachment")
+        url_count = sum(1 for img in image_inputs if img.get("source") == "url")
+        
+        if attachment_count > 0:
+            breadcrumb_text += f" [Uploaded {attachment_count} file(s)]"
+        if url_count > 0:
+            breadcrumb_text += f" [Found {url_count} image(s) from URL(s)]"
         
         # Add URLs from attachments if available
         for att in attachments:
             if att.get("url"):
                 breadcrumb_text += f" <{att['url']}>"
+        
+        # Add URLs from URL-sourced images
+        for img_input in image_inputs:
+            if img_input.get("source") == "url" and img_input.get("original_url"):
+                breadcrumb_text += f" <{img_input['original_url']}>"
         
         # Add to thread state
         thread_state.add_message("user", breadcrumb_text)
