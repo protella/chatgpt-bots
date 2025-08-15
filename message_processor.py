@@ -513,6 +513,7 @@ class MessageProcessor(LoggerMixin):
         unsupported_files = []
         image_count = 0
         max_images = 10
+        processed_file_ids = set()  # Track processed file IDs to avoid duplicates
         
         # First, process regular attachments
         for attachment in message.attachments:
@@ -526,10 +527,15 @@ class MessageProcessor(LoggerMixin):
                     continue
                     
                 try:
+                    # Track this file ID to avoid reprocessing
+                    file_id = attachment.get("id")
+                    if file_id:
+                        processed_file_ids.add(file_id)
+                    
                     # Download the image
                     image_data = client.download_file(
                         attachment.get("url"),
-                        attachment.get("id")
+                        file_id
                     )
                     
                     if image_data:
@@ -571,6 +577,16 @@ class MessageProcessor(LoggerMixin):
                 for url in slack_file_urls:
                     if image_count >= max_images:
                         break
+                    
+                    # Extract file ID from URL to check if already processed
+                    file_id = None
+                    if hasattr(client, 'extract_file_id_from_url'):
+                        file_id = client.extract_file_id_from_url(url)
+                    
+                    # Skip if we already processed this file as an attachment
+                    if file_id and file_id in processed_file_ids:
+                        self.log_debug(f"Skipping duplicate Slack file {file_id} from URL")
+                        continue
                     
                     # Download the Slack file using the client's download_file method
                     self.log_info(f"Downloading Slack file from URL: {url}")
@@ -1335,12 +1351,15 @@ class MessageProcessor(LoggerMixin):
             else:
                 user_question = user_text
             
+            # Inject stored image analyses for better context
+            enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state)
+            
             analysis_result = self.openai_client.analyze_images(
                 images=images_to_analyze,
                 question=user_question,
                 detail="high",
                 enhance_prompt=True,  # Use vision enhancement for natural responses
-                conversation_history=thread_state.messages,  # Pass full conversation context
+                conversation_history=enhanced_messages,  # Pass enhanced conversation with image analyses
                 system_prompt=system_prompt  # Pass platform system prompt
             )
             self.log_debug(f"Vision analysis completed: {len(analysis_result)} chars")
@@ -1453,6 +1472,9 @@ class MessageProcessor(LoggerMixin):
         # Get thread config
         thread_config = config.get_thread_config(thread_state.config_overrides)
         
+        # Inject stored image analyses for style consistency
+        enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state)
+        
         # Generate image with conversation context for better prompt enhancement
         self._update_status(client, channel_id, thinking_id, "Creating your image...", emoji=config.circle_loader_emoji)
         
@@ -1461,7 +1483,7 @@ class MessageProcessor(LoggerMixin):
             size=thread_config.get("image_size"),
             quality=thread_config.get("image_quality"),
             enhance_prompt=True,
-            conversation_history=thread_state.messages  # Use full conversation history
+            conversation_history=enhanced_messages  # Use enhanced conversation with image analyses
         )
         
         # Store in asset ledger
@@ -1660,6 +1682,9 @@ class MessageProcessor(LoggerMixin):
                     # Get thread config
                     thread_config = config.get_thread_config(thread_state.config_overrides)
                     
+                    # Inject stored image analyses for style matching
+                    enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state)
+                    
                     # Edit the image
                     self._update_status(client, channel_id, thinking_id, "Editing your image...", emoji=config.circle_loader_emoji)
                     
@@ -1673,7 +1698,7 @@ class MessageProcessor(LoggerMixin):
                         output_format=thread_config.get("image_format", "png"),
                         output_compression=thread_config.get("image_compression", 100),
                         enhance_prompt=True,
-                        conversation_history=thread_state.messages
+                        conversation_history=enhanced_messages  # Pass enhanced conversation with image analyses
                     )
                     
                     # Add breadcrumbs
@@ -1827,6 +1852,9 @@ class MessageProcessor(LoggerMixin):
         # Get thread config for settings
         thread_config = config.get_thread_config(thread_state.config_overrides)
         
+        # Inject stored image analyses for style matching
+        enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state) if thread_state.messages else None
+        
         # Use the edit_image API with separated inputs
         try:
             
@@ -1840,7 +1868,7 @@ class MessageProcessor(LoggerMixin):
                 output_format=thread_config.get("image_format", "png"),
                 output_compression=thread_config.get("image_compression", 100),
                 enhance_prompt=True,
-                conversation_history=thread_state.messages if thread_state.messages else None
+                conversation_history=enhanced_messages  # Pass enhanced conversation with image analyses
             )
         except Exception as e:
             self.log_error(f"Error editing image: {e}")
