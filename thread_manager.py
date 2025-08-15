@@ -26,13 +26,15 @@ class ThreadState:
     
     def add_message(self, role: str, content: Any, db = None, thread_key: str = None, message_ts: str = None):
         """Add a message to the thread history"""
-        self.messages.append({
+        msg = {
             "role": role,
             "content": content
-        })
+        }
+        
+        self.messages.append(msg)
         self.last_activity = time.time()
         
-        # Save to database if available
+        # Save to database if available (message_ts is only stored in DB for linking)
         if db and thread_key:
             db.cache_message(thread_key, role, content, message_ts)
     

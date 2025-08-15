@@ -103,6 +103,7 @@ class DatabaseManager(LoggerMixin):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 thread_id TEXT NOT NULL,
                 url TEXT NOT NULL UNIQUE,
+                message_ts TEXT,  -- Links image to specific message
                 image_type TEXT,
                 prompt TEXT,
                 analysis TEXT,
@@ -128,6 +129,7 @@ class DatabaseManager(LoggerMixin):
             CREATE TABLE IF NOT EXISTS users (
                 user_id TEXT PRIMARY KEY,
                 username TEXT,
+                real_name TEXT,
                 config_json TEXT,
                 timezone TEXT DEFAULT 'UTC',
                 tz_label TEXT,
@@ -138,6 +140,40 @@ class DatabaseManager(LoggerMixin):
         """)
         
         self.conn.commit()
+        
+        # Run migrations for existing databases
+        self._run_migrations()
+    
+    def _run_migrations(self):
+        """Run database migrations to update schema for existing databases."""
+        try:
+            # Check if message_ts column exists in images table
+            cursor = self.conn.execute("PRAGMA table_info(images)")
+            columns = [col[1] for col in cursor.fetchall()]
+            
+            if 'message_ts' not in columns:
+                self.log_info("DB: Adding message_ts column to images table")
+                self.conn.execute("""
+                    ALTER TABLE images 
+                    ADD COLUMN message_ts TEXT
+                """)
+                self.conn.commit()
+                self.log_info("DB: Successfully added message_ts column")
+            
+            # Check if real_name column exists in users table
+            cursor = self.conn.execute("PRAGMA table_info(users)")
+            columns = [col[1] for col in cursor.fetchall()]
+            
+            if 'real_name' not in columns:
+                self.log_info("DB: Adding real_name column to users table")
+                self.conn.execute("""
+                    ALTER TABLE users 
+                    ADD COLUMN real_name TEXT
+                """)
+                self.conn.commit()
+                self.log_info("DB: Successfully added real_name column")
+        except Exception as e:
+            self.log_error(f"DB: Migration error: {e}", exc_info=True)
     
     # Thread operations
     
@@ -325,7 +361,8 @@ class DatabaseManager(LoggerMixin):
     
     def save_image_metadata(self, thread_id: str, url: str, image_type: str,
                            prompt: Optional[str] = None, analysis: Optional[str] = None,
-                           original_analysis: Optional[str] = None, metadata: Optional[Dict] = None):
+                           original_analysis: Optional[str] = None, metadata: Optional[Dict] = None,
+                           message_ts: Optional[str] = None):
         """
         Save image metadata (NO base64 data).
         
@@ -337,6 +374,7 @@ class DatabaseManager(LoggerMixin):
             analysis: Full vision analysis
             original_analysis: For edited images, the pre-edit analysis
             metadata: Additional metadata
+            message_ts: Message timestamp to link image to specific message
         """
         self.log_debug(f"DB: Saving image - thread={thread_id}, url={url[:100]}, "
                       f"type={image_type}, has_analysis={bool(analysis)}, "
@@ -346,10 +384,10 @@ class DatabaseManager(LoggerMixin):
         try:
             self.conn.execute("""
                 INSERT OR REPLACE INTO images 
-                (thread_id, url, image_type, prompt, analysis, original_analysis, metadata_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (thread_id, url, image_type, prompt, analysis, original_analysis, metadata_json, message_ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (thread_id, url, image_type, prompt, analysis, original_analysis,
-                  json.dumps(metadata) if metadata else None))
+                  json.dumps(metadata) if metadata else None, message_ts))
             
             self.log_info(f"DB: Successfully saved image metadata for {url[:50]}... in thread {thread_id}")
             
@@ -384,6 +422,33 @@ class DatabaseManager(LoggerMixin):
             return img
         
         return None
+    
+    def get_images_by_message(self, thread_id: str, message_ts: str) -> List[Dict]:
+        """
+        Get images associated with a specific message.
+        
+        Args:
+            thread_id: Thread identifier
+            message_ts: Message timestamp
+            
+        Returns:
+            List of image metadata dictionaries
+        """
+        cursor = self.conn.execute("""
+            SELECT * FROM images 
+            WHERE thread_id = ? AND message_ts = ?
+            ORDER BY created_at ASC
+        """, (thread_id, message_ts))
+        
+        images = []
+        for row in cursor:
+            img = dict(row)
+            if img.get("metadata_json"):
+                img["metadata"] = json.loads(img["metadata_json"])
+                del img["metadata_json"]
+            images.append(img)
+        
+        return images
     
     def find_thread_images(self, thread_id: str, image_type: Optional[str] = None) -> List[Dict]:
         """
@@ -535,10 +600,56 @@ class DatabaseManager(LoggerMixin):
         
         return None
     
+    def save_user_info(self, user_id: str, username: str = None, real_name: str = None,
+                       timezone: str = None, tz_label: str = None, tz_offset: int = None):
+        """
+        Save comprehensive user information.
+        
+        Args:
+            user_id: User identifier
+            username: Display/username
+            real_name: User's real name
+            timezone: Timezone string
+            tz_label: Timezone label
+            tz_offset: Offset in seconds from UTC
+        """
+        # Build update query dynamically based on provided fields
+        updates = []
+        params = []
+        
+        if username is not None:
+            updates.append("username = ?")
+            params.append(username)
+        if real_name is not None:
+            updates.append("real_name = ?")
+            params.append(real_name)
+        if timezone is not None:
+            updates.append("timezone = ?")
+            params.append(timezone)
+        if tz_label is not None:
+            updates.append("tz_label = ?")
+            params.append(tz_label)
+        if tz_offset is not None:
+            updates.append("tz_offset = ?")
+            params.append(tz_offset)
+        
+        if updates:
+            updates.append("last_seen = CURRENT_TIMESTAMP")
+            params.append(user_id)
+            
+            query = f"""
+                UPDATE users 
+                SET {', '.join(updates)}
+                WHERE user_id = ?
+            """
+            self.conn.execute(query, params)
+            
+            logger.debug(f"Updated user info for {user_id}: username={username}, real_name={real_name}, tz={timezone}")
+    
     def save_user_timezone(self, user_id: str, timezone: str, 
                           tz_label: Optional[str] = None, tz_offset: Optional[int] = None):
         """
-        Save user timezone information.
+        Save user timezone information (kept for compatibility).
         
         Args:
             user_id: User identifier
@@ -546,13 +657,7 @@ class DatabaseManager(LoggerMixin):
             tz_label: Timezone label
             tz_offset: Offset in seconds from UTC
         """
-        self.conn.execute("""
-            UPDATE users 
-            SET timezone = ?, tz_label = ?, tz_offset = ?, last_seen = CURRENT_TIMESTAMP
-            WHERE user_id = ?
-        """, (timezone, tz_label, tz_offset, user_id))
-        
-        logger.debug(f"Saved timezone for user {user_id}: {timezone}")
+        self.save_user_info(user_id, timezone=timezone, tz_label=tz_label, tz_offset=tz_offset)
     
     def get_user_timezone(self, user_id: str) -> Optional[Tuple[str, str, int]]:
         """

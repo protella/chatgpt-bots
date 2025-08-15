@@ -72,27 +72,30 @@ class SlackBot(BaseClient):
             result = client.users_info(user=user_id)
             if result["ok"]:
                 user_info = result["user"]
+                # Get both display name and real name
+                display_name = user_info.get("profile", {}).get("display_name")
+                real_name = user_info.get("profile", {}).get("real_name")
                 # Prefer display name, fall back to real name, then just the ID
-                username = (user_info.get("profile", {}).get("display_name") or 
-                          user_info.get("profile", {}).get("real_name") or 
-                          user_info.get("name") or 
-                          user_id)
+                username = display_name or real_name or user_info.get("name") or user_id
                 
                 # Cache both username and timezone info in memory
                 self.user_cache[user_id] = {
                     'username': username,
+                    'real_name': real_name,
                     'timezone': user_info.get('tz', 'UTC'),
                     'tz_label': user_info.get('tz_label', 'UTC'),
                     'tz_offset': user_info.get('tz_offset', 0)
                 }
                 
-                # Save to database
+                # Save to database with all user info
                 self.db.get_or_create_user(user_id, username)
-                self.db.save_user_timezone(
+                self.db.save_user_info(
                     user_id,
-                    user_info.get('tz', 'UTC'),
-                    user_info.get('tz_label', 'UTC'),
-                    user_info.get('tz_offset', 0)
+                    username=username,
+                    real_name=real_name,
+                    timezone=user_info.get('tz', 'UTC'),
+                    tz_label=user_info.get('tz_label', 'UTC'),
+                    tz_offset=user_info.get('tz_offset', 0)
                 )
                 
                 self.log_debug(f"Cached timezone info for {username}: tz={user_info.get('tz')}, tz_label={user_info.get('tz_label')}")
@@ -160,10 +163,12 @@ class SlackBot(BaseClient):
         username = self.get_username(user_id, client) if user_id else "unknown"
         user_timezone = self.get_user_timezone(user_id, client) if user_id else "UTC"
         
-        # Get timezone label (EST, PST, etc.) if available
+        # Get timezone label (EST, PST, etc.) and real name if available
         user_tz_label = None
-        if user_id in self.user_cache and 'tz_label' in self.user_cache[user_id]:
-            user_tz_label = self.user_cache[user_id]['tz_label']
+        user_real_name = None
+        if user_id in self.user_cache:
+            user_tz_label = self.user_cache[user_id].get('tz_label')
+            user_real_name = self.user_cache[user_id].get('real_name')
         
         # Create universal message
         message = Message(
@@ -176,6 +181,7 @@ class SlackBot(BaseClient):
                 "ts": event.get("ts"),
                 "slack_client": client,
                 "username": username,  # Add username to metadata
+                "user_real_name": user_real_name,  # Add real name to metadata
                 "user_timezone": user_timezone,  # Add timezone to metadata
                 "user_tz_label": user_tz_label  # Add timezone label (EST, PST, etc.)
             }
@@ -411,6 +417,32 @@ class SlackBot(BaseClient):
         except SlackApiError as e:
             self.log_error(f"Error getting thread history: {e}")
             return []
+    
+    def extract_file_id_from_url(self, file_url: str) -> Optional[str]:
+        """Extract file ID from a Slack file URL
+        
+        Args:
+            file_url: The Slack file URL
+            
+        Returns:
+            File ID if found, None otherwise
+        """
+        import re
+        
+        # Try to extract file ID from the URL
+        patterns = [
+            r'/files-pri/[^/]+-([^/]+)/',  # files-pri format
+            r'/files/[^/]+/([^/]+)/',       # permalink format
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, file_url)
+            if match:
+                file_id = match.group(1)
+                self.log_debug(f"Extracted file ID from URL: {file_id}")
+                return file_id
+        
+        return None
     
     def download_file(self, file_url: str, file_id: Optional[str] = None) -> Optional[bytes]:
         """Download a file from Slack
