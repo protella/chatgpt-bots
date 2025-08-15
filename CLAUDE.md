@@ -153,3 +153,4 @@ Currently no automated tests. Manual testing approach:
 4. Verify thread state recovery after restart
 5. Check config overrides are applied correctly
 - Never start the bot on your own. The user will manage running state. If you need the bot restarted, request the user to do so.
+- ALWAYS include full context in any API calls. NEVER restrict or limit context/previous responses in history to "x" previous messages. Every request should be full, unlimited context.

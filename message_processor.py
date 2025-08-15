@@ -21,11 +21,12 @@ from image_url_handler import ImageURLHandler
 class MessageProcessor(LoggerMixin):
     """Handles message processing logic independent of chat platform"""
     
-    def __init__(self):
-        self.thread_manager = ThreadStateManager()
+    def __init__(self, db = None):
+        self.thread_manager = ThreadStateManager(db=db)
         self.openai_client = OpenAIClient()
         self.image_url_handler = ImageURLHandler()
-        self.log_info("MessageProcessor initialized")
+        self.db = db  # Database manager
+        self.log_info(f"MessageProcessor initialized {'with' if db else 'without'} database")
     
     def process_message(self, message: Message, client: BaseClient, thinking_id: Optional[str] = None) -> Optional[Response]:
         """
@@ -72,6 +73,19 @@ class MessageProcessor(LoggerMixin):
                 client
             )
             
+            # Check if this thread had a previous timeout
+            if hasattr(thread_state, 'had_timeout') and thread_state.had_timeout:
+                # Send timeout notification to user
+                timeout_msg = f"⚠️ Your previous request timed out after {int(config.api_timeout_read)} seconds. Please try again."
+                client.post_message(
+                    channel_id=message.channel_id,
+                    text=timeout_msg,
+                    thread_ts=message.thread_id
+                )
+                # Clear the timeout flag
+                thread_state.had_timeout = False
+                self.log_info(f"Notified user about previous timeout in thread {thread_key}")
+            
             # Always regenerate system prompt to get current time
             user_timezone = message.metadata.get("user_timezone", "UTC") if message.metadata else "UTC"
             user_tz_label = message.metadata.get("user_tz_label", None) if message.metadata else None
@@ -103,13 +117,15 @@ class MessageProcessor(LoggerMixin):
                 if (message.text and message.text.strip()) or image_inputs:
                     unsupported_msg += "\n\nI'll process your text/image request now."
                     # Add the unsupported files warning to conversation
-                    thread_state.add_message("user", f"[Uploaded unsupported file(s): {files_str}]")
-                    thread_state.add_message("assistant", unsupported_msg)
+                    thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+                    thread_state.add_message("user", f"[Uploaded unsupported file(s): {files_str}]", db=self.db, thread_key=thread_key)
+                    thread_state.add_message("assistant", unsupported_msg, db=self.db, thread_key=thread_key)
                     # Continue processing if we have text or images
                 else:
                     # Only unsupported files were uploaded, nothing else to process
-                    thread_state.add_message("user", f"[Uploaded unsupported file(s): {files_str}]")
-                    thread_state.add_message("assistant", unsupported_msg)
+                    thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+                    thread_state.add_message("user", f"[Uploaded unsupported file(s): {files_str}]", db=self.db, thread_key=thread_key)
+                    thread_state.add_message("assistant", unsupported_msg, db=self.db, thread_key=thread_key)
                     elapsed = time.time() - request_start_time
                     self.log_info("="*80)
                     self.log_info(f"REQUEST END | Thread: {thread_key} | Status: UNSUPPORTED_FILE | Time: {elapsed:.2f}s")
@@ -130,7 +146,7 @@ class MessageProcessor(LoggerMixin):
                 combined_context = f"{original_request} - Clarification: {message.text}"
                 
                 intent = self.openai_client.classify_intent(
-                    thread_state.get_recent_messages(),
+                    thread_state.messages,  # Use full conversation history
                     combined_context,
                     has_attached_images=len(image_inputs) > 0
                 )
@@ -154,7 +170,7 @@ class MessageProcessor(LoggerMixin):
                     self._update_status(client, message.channel_id, thinking_id, 
                                       "Understanding your request...")
                     intent = self.openai_client.classify_intent(
-                        thread_state.get_recent_messages(),
+                        thread_state.messages,  # Use full conversation history
                         message.text,
                         has_attached_images=len(image_inputs) > 0
                     )
@@ -180,7 +196,7 @@ class MessageProcessor(LoggerMixin):
                 self._update_status(client, message.channel_id, thinking_id, 
                                   "Understanding your request...")
                 intent = self.openai_client.classify_intent(
-                    thread_state.get_recent_messages(),
+                    thread_state.messages,  # Use full conversation history
                     message.text if message.text else "",
                     has_attached_images=False  # Already checked - no images here
                 )
@@ -200,7 +216,8 @@ class MessageProcessor(LoggerMixin):
                     }
                     
                     # Add clarification to thread history
-                    thread_state.add_message("user", message.text)
+                    thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+                    thread_state.add_message("user", message.text, db=self.db, thread_key=thread_key)
                     
                     # Check if it's an uploaded image or generated one
                     has_uploaded = any("files.slack.com" in msg.get("content", "") 
@@ -212,7 +229,7 @@ class MessageProcessor(LoggerMixin):
                     else:
                         clarification_msg = "Would you like me to modify the image I just created, or generate a completely new one?"
                     
-                    thread_state.add_message("assistant", clarification_msg)
+                    thread_state.add_message("assistant", clarification_msg, db=self.db, thread_key=thread_key)
                     
                     elapsed = time.time() - request_start_time
                     self.log_info("="*80)
@@ -274,7 +291,7 @@ class MessageProcessor(LoggerMixin):
                 if image_inputs:
                     # User uploaded images for vision analysis
                     response = self._handle_vision_analysis(message.text, image_inputs, thread_state, message.attachments, 
-                                                           client, message.channel_id, thinking_id)
+                                                           client, message.channel_id, thinking_id, message)
                 else:
                     # Vision-related question but no images - try to find previous images
                     self.log_debug("Vision intent detected but no images attached - searching for previous images")
@@ -339,6 +356,51 @@ class MessageProcessor(LoggerMixin):
                 message.channel_id
             )
     
+    def _inject_image_analyses(self, messages: List[Dict], thread_state) -> List[Dict]:
+        """Inject stored image analyses into conversation for context"""
+        if not self.db:
+            return messages
+            
+        thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+        enhanced_messages = []
+        
+        for msg in messages:
+            # Add the original message
+            enhanced_messages.append(msg)
+            
+            # Check if this is a user message with image URLs
+            if msg.get("role") == "user" and msg.get("content"):
+                content = str(msg["content"])
+                
+                # Look for URLs in the content
+                import re
+                # Match URLs in angle brackets or plain URLs
+                url_pattern = r'(?:<(https?://[^\s>]+)>|(https?://[^\s<>]+))'
+                matches = re.findall(url_pattern, content)
+                urls = [url[0] if url[0] else url[1] for url in matches]
+                
+                # For each URL, check if we have stored analysis
+                analyses_added = []
+                for url in urls:
+                    # Skip if we already added analysis for this URL
+                    if url in analyses_added:
+                        continue
+                        
+                    img_data = self.db.get_image_analysis_by_url(thread_key, url)
+                    if img_data and img_data.get("analysis"):
+                        # Add comprehensive analysis as developer/system context
+                        enhanced_messages.append({
+                            "role": "developer",
+                            "content": f"[Comprehensive Visual Analysis of image at {url}]:\n{img_data['analysis']}\n[End of visual analysis - use this context to answer questions about the image]"
+                        })
+                        analyses_added.append(url)
+                        self.log_debug(f"Injected stored analysis for image: {url}")
+        
+        if len(enhanced_messages) > len(messages):
+            self.log_info(f"Enhanced conversation with {len(enhanced_messages) - len(messages)} stored image analyses")
+        
+        return enhanced_messages
+    
     def _get_or_rebuild_thread_state(
         self,
         message: Message,
@@ -397,7 +459,8 @@ class MessageProcessor(LoggerMixin):
                         if attachment.get("type") == "image" and attachment.get("url"):
                             content += f" <{attachment['url']}>"
                 
-                thread_state.add_message(role, content)
+                thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+                thread_state.add_message(role, content, db=self.db, thread_key=thread_key)
             
             self.log_info(f"Rebuilt thread with {len(thread_state.messages)} messages")
         
@@ -415,13 +478,13 @@ class MessageProcessor(LoggerMixin):
         import re
         
         # Slack wraps URLs in angle brackets <URL>
-        # Pattern to match Slack file URLs
-        pattern = r'<(https?://[^>]*slack\.com/files/[^>]+)>'
+        # Pattern to match Slack file URLs (files.slack.com format)
+        pattern = r'<(https?://files\.slack\.com/[^>]+)>'
         
         urls = re.findall(pattern, text)
         
         # Also check for unwrapped Slack file URLs (but avoid capturing trailing >)
-        pattern2 = r'(https?://[^\s>]*slack\.com/files/[^\s>]+)'
+        pattern2 = r'(https?://files\.slack\.com/[^\s>]+)'
         urls2 = re.findall(pattern2, text)
         
         # Combine and dedupe
@@ -538,7 +601,13 @@ class MessageProcessor(LoggerMixin):
                     else:
                         self.log_warning(f"Failed to download Slack file from URL: {url}")
             
-            # Now check for external image URLs
+            # Now check for external image URLs (excluding already-processed Slack URLs)
+            # Create a modified text with Slack URLs removed to avoid double-processing
+            text_for_url_processing = message.text
+            for slack_url in slack_file_urls:
+                text_for_url_processing = text_for_url_processing.replace(slack_url, "")
+                # Also remove angle bracket wrapped versions
+                text_for_url_processing = text_for_url_processing.replace(f"<{slack_url}>", "")
             
             # Get Slack token if this is a Slack client (for non-Slack URLs that might need auth)
             auth_token = None
@@ -546,7 +615,7 @@ class MessageProcessor(LoggerMixin):
                 from config import config
                 auth_token = config.slack_bot_token
             
-            downloaded_images, failed_urls = self.image_url_handler.process_urls_from_text(message.text, auth_token)
+            downloaded_images, failed_urls = self.image_url_handler.process_urls_from_text(text_for_url_processing, auth_token)
             
             for img_data in downloaded_images:
                 if image_count >= max_images:
@@ -751,14 +820,19 @@ class MessageProcessor(LoggerMixin):
                         breadcrumb_text += f" <{url}>"
             
             # Add simplified breadcrumb to thread state (no base64 data)
-            thread_state.add_message("user", breadcrumb_text)
+            thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+            thread_state.add_message("user", breadcrumb_text, db=self.db, thread_key=thread_key)
             
             # Use the full content with images for the actual API call
             messages_for_api = thread_state.messages[:-1] + [{"role": "user", "content": user_content}]
         else:
             # Simple text content - add as-is
-            thread_state.add_message("user", user_content)
+            thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+            thread_state.add_message("user", user_content, db=self.db, thread_key=thread_key)
             messages_for_api = thread_state.messages
+        
+        # Inject stored image analyses into the conversation for full context
+        messages_for_api = self._inject_image_analyses(messages_for_api, thread_state)
         
         # Get thread config
         thread_config = config.get_thread_config(thread_state.config_overrides)
@@ -809,7 +883,8 @@ class MessageProcessor(LoggerMixin):
                 self.log_info("Response includes web search results")
         
         # Add assistant response to thread state
-        thread_state.add_message("assistant", response_text)
+        thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+        thread_state.add_message("assistant", response_text, db=self.db, thread_key=thread_key)
         
         return Response(
             type="text",
@@ -866,14 +941,19 @@ class MessageProcessor(LoggerMixin):
                         breadcrumb_text += f" <{url}>"
             
             # Add simplified breadcrumb to thread state (no base64 data)
-            thread_state.add_message("user", breadcrumb_text)
+            thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+            thread_state.add_message("user", breadcrumb_text, db=self.db, thread_key=thread_key)
             
             # Use the full content with images for the actual API call
             messages_for_api = thread_state.messages[:-1] + [{"role": "user", "content": user_content}]
         else:
             # Simple text content - add as-is
-            thread_state.add_message("user", user_content)
+            thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+            thread_state.add_message("user", user_content, db=self.db, thread_key=thread_key)
             messages_for_api = thread_state.messages
+        
+        # Inject stored image analyses into the conversation for full context
+        messages_for_api = self._inject_image_analyses(messages_for_api, thread_state)
         
         # Get thread config
         thread_config = config.get_thread_config(thread_state.config_overrides)
@@ -1130,6 +1210,11 @@ class MessageProcessor(LoggerMixin):
                     else:
                         self.log_debug("Sending final update to ensure loading indicator is removed")
                     try:
+                        # Handle empty response
+                        if not response_text:
+                            response_text = "I apologize, but I wasn't able to generate a response. Please try again."
+                            self.log_warning("Empty response detected, using fallback message")
+                        
                         # Check if message is too long for a single update
                         if len(response_text) > 3900:  # Slack's approximate limit
                             # This shouldn't happen if streaming overflow worked correctly
@@ -1154,7 +1239,8 @@ class MessageProcessor(LoggerMixin):
             # tool events during streaming. The presence of URLs doesn't mean web search was used.
             
             # Add assistant response to thread state
-            thread_state.add_message("assistant", response_text)
+            thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+            thread_state.add_message("assistant", response_text, db=self.db, thread_key=thread_key)
             
             # Log streaming stats
             stats = rate_limiter.get_stats()
@@ -1185,7 +1271,7 @@ class MessageProcessor(LoggerMixin):
             return self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls)
 
     def _handle_vision_analysis(self, user_text: str, image_inputs: List[Dict], thread_state, attachments: List[Dict],
-                               client: BaseClient, channel_id: str, thinking_id: Optional[str]) -> Response:
+                               client: BaseClient, channel_id: str, thinking_id: Optional[str], message: Message) -> Response:
         """Handle vision analysis of uploaded images"""
         if not image_inputs:
             return Response(
@@ -1229,24 +1315,97 @@ class MessageProcessor(LoggerMixin):
             status_msg = f"Analyzing {len(images_to_analyze)} images..."
         self._update_status(client, channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
         
-        # Analyze images with enhanced prompt
-        analysis_result = self.openai_client.analyze_images(
-            images=images_to_analyze,
-            question=user_text if user_text else "Please describe this image.",
-            detail="high",
-            enhance_prompt=True  # Enable prompt enhancement for detailed analysis
-        )
+        # Single vision API call with both analysis context and user question
+        analysis_result = None
         
-        # Track URL images in AssetLedger
-        if url_images:
-            asset_ledger = self.thread_manager.get_or_create_asset_ledger(thread_state.thread_ts)
-            for url_img in url_images:
-                asset_ledger.add_url_image(
-                    image_data=url_img["base64_data"],
-                    url=url_img["original_url"],
-                    timestamp=time.time()
-                )
-                self.log_debug(f"Added URL image to AssetLedger: {url_img['original_url']}")
+        try:
+            self.log_info("Starting vision analysis with user question")
+            
+            # Get platform system prompt for consistent personality/formatting
+            user_timezone = message.metadata.get("user_timezone", "UTC") if message.metadata else "UTC"
+            user_tz_label = message.metadata.get("user_tz_label", None) if message.metadata else None
+            system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label)
+            
+            # Use the user's question directly - it will be enhanced for natural conversation
+            # If no text provided with image, let the model infer from full conversation context
+            if not user_text:
+                # Pass empty question - the full conversation history will provide context
+                user_question = ""
+                self.log_debug("No text with image - relying on conversation context")
+            else:
+                user_question = user_text
+            
+            analysis_result = self.openai_client.analyze_images(
+                images=images_to_analyze,
+                question=user_question,
+                detail="high",
+                enhance_prompt=True,  # Use vision enhancement for natural responses
+                conversation_history=thread_state.messages,  # Pass full conversation context
+                system_prompt=system_prompt  # Pass platform system prompt
+            )
+            self.log_debug(f"Vision analysis completed: {len(analysis_result)} chars")
+            
+            
+        except TimeoutError as e:
+            self.log_error(f"Vision analysis timed out: {e}")
+            return Response(
+                type="error",
+                content=f"Image analysis timed out after {int(config.api_timeout_read)} seconds. Please try again."
+            )
+            
+        except Exception as e:
+            self.log_error(f"Vision analysis failed: {e}", exc_info=True)
+            return Response(
+                type="error",
+                content=f"Failed to analyze image: {str(e)}"
+            )
+        
+        # Track all analyzed images in AssetLedger and database
+        asset_ledger = self.thread_manager.get_or_create_asset_ledger(thread_state.thread_ts)
+        thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+        
+        # Save to database with error handling
+        try:
+            # Track URL images and save analysis
+            if url_images:
+                for url_img in url_images:
+                    asset_ledger.add_url_image(
+                        image_data=url_img["base64_data"],
+                        url=url_img["original_url"],
+                        timestamp=time.time()
+                    )
+                    self.log_debug(f"Added URL image to AssetLedger: {url_img['original_url']}")
+                    
+                    # Save comprehensive vision analysis for URL images
+                    if self.db:
+                        self.db.save_image_metadata(
+                            thread_id=thread_key,
+                            url=url_img["original_url"],
+                            image_type="url",
+                            prompt=user_text if user_text else "Vision analysis",
+                            analysis=analysis_result,  # Store the vision analysis result
+                            metadata={"timestamp": time.time()}
+                        )
+                        self.log_debug(f"Saved comprehensive vision analysis for URL image: {url_img['original_url']}")
+            
+            # Save analysis for all attachments (Slack uploaded images)
+            if attachments and self.db:
+                for att in attachments:
+                    if att.get("url"):
+                        # Save the comprehensive vision analysis to database
+                        self.db.save_image_metadata(
+                            thread_id=thread_key,
+                            url=att["url"],
+                            image_type="uploaded",
+                            prompt=user_text if user_text else "Vision analysis",
+                            analysis=analysis_result,  # Store the vision analysis result
+                            metadata={"timestamp": time.time()}
+                        )
+                        self.log_debug(f"Saved comprehensive vision analysis for uploaded image: {att['url']}")
+                        
+        except Exception as e:
+            self.log_error(f"Failed to save image metadata to database: {e}", exc_info=True)
+            # Continue anyway - don't fail the whole request due to DB issues
         
         # Create breadcrumb for thread state with URLs
         breadcrumb_text = user_text if user_text else "Analyze image"
@@ -1270,9 +1429,14 @@ class MessageProcessor(LoggerMixin):
             if img_input.get("source") == "url" and img_input.get("original_url"):
                 breadcrumb_text += f" <{img_input['original_url']}>"
         
-        # Add to thread state
-        thread_state.add_message("user", breadcrumb_text)
-        thread_state.add_message("assistant", analysis_result)
+        # Add to thread state with error handling
+        thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+        try:
+            thread_state.add_message("user", breadcrumb_text, db=self.db, thread_key=thread_key)
+            thread_state.add_message("assistant", analysis_result, db=self.db, thread_key=thread_key)
+        except Exception as e:
+            self.log_error(f"Failed to save messages to database: {e}", exc_info=True)
+            # Continue anyway - messages are in memory at least
         
         return Response(
             type="text",
@@ -1297,21 +1461,25 @@ class MessageProcessor(LoggerMixin):
             size=thread_config.get("image_size"),
             quality=thread_config.get("image_quality"),
             enhance_prompt=True,
-            conversation_history=thread_state.get_recent_messages()  # Pass conversation context
+            conversation_history=thread_state.messages  # Use full conversation history
         )
         
         # Store in asset ledger
         asset_ledger = self.thread_manager.get_or_create_asset_ledger(thread_state.thread_ts)
+        thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
         asset_ledger.add_image(
             image_data.base64_data,
             image_data.prompt,  # Use the enhanced prompt
-            time.time()
+            time.time(),
+            db=self.db,
+            thread_id=thread_key
         )
         
         # Add breadcrumb to thread state with the enhanced prompt used
-        thread_state.add_message("user", prompt)
+        thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+        thread_state.add_message("user", prompt, db=self.db, thread_key=thread_key)
         # URL will be added after upload, for now just the prompt
-        thread_state.add_message("assistant", f"Generated image: {image_data.prompt}")
+        thread_state.add_message("assistant", f"Generated image: {image_data.prompt}", db=self.db, thread_key=thread_key)
         
         return Response(
             type="image",
@@ -1481,7 +1649,7 @@ class MessageProcessor(LoggerMixin):
                     
                     image_description = self.openai_client.analyze_images(
                         images=[base64_data],
-                        question="Describe this image focusing on subject, colors, composition, and style.",
+                        question=IMAGE_ANALYSIS_PROMPT,
                         detail="high"
                     )
                     
@@ -1509,8 +1677,9 @@ class MessageProcessor(LoggerMixin):
                     )
                     
                     # Add breadcrumbs
-                    thread_state.add_message("user", text)
-                    thread_state.add_message("assistant", f"Edited image: {edited_image.prompt}")
+                    thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+                    thread_state.add_message("user", text, db=self.db, thread_key=thread_key)
+                    thread_state.add_message("assistant", f"Edited image: {edited_image.prompt}", db=self.db, thread_key=thread_key)
                     
                     return Response(
                         type="image",
@@ -1686,17 +1855,30 @@ class MessageProcessor(LoggerMixin):
             user_breadcrumb += f" [Uploaded {len(attachment_urls)} file(s)]"
             for url in attachment_urls:
                 user_breadcrumb += f" <{url}>"
-        thread_state.add_message("user", user_breadcrumb)
+        thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+        thread_state.add_message("user", user_breadcrumb, db=self.db, thread_key=thread_key)
         
-        # Include brief context about what was uploaded and edited for future vision questions
+        # Store edited image in asset ledger
+        asset_ledger = self.thread_manager.get_or_create_asset_ledger(thread_state.thread_ts)
+        thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+        asset_ledger.add_image(
+            image_data.base64_data,
+            image_data.prompt,  # The enhanced edit prompt
+            time.time(),
+            source="edited",
+            db=self.db,
+            thread_id=thread_key,
+            analysis=image_analysis  # Store the full analysis
+        )
+        
+        # Include full context about what was uploaded and edited for future vision questions
         # This helps the model answer follow-up questions without re-analysis
         if image_analysis:
-            # Add a brief note about the original image content (first 200 chars of analysis)
-            brief_context = image_analysis[:200] + "..." if len(image_analysis) > 200 else image_analysis
-            assistant_breadcrumb = f"Edited image: {image_data.prompt} [Original: {brief_context}]"
+            # Include the full analysis - no truncation
+            assistant_breadcrumb = f"Edited image: {image_data.prompt} [Original: {image_analysis}]"
         else:
             assistant_breadcrumb = f"Edited image: {image_data.prompt}"
-        thread_state.add_message("assistant", assistant_breadcrumb)
+        thread_state.add_message("assistant", assistant_breadcrumb, db=self.db, thread_key=thread_key)
         
         return Response(
             type="image",

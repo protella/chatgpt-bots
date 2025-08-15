@@ -140,7 +140,7 @@ Be concise and technical. Do not add questions, interpretations, or conversation
 
 VISION_ENHANCEMENT_PROMPT = """You will enhance a user's question about an image to ensure a helpful and natural vision analysis.
 
-Given the user's question, create an enhanced prompt that:
+Given the user's question or request, create an enhanced prompt that:
 - For vague requests ("describe this", "what is this"): Ask for an engaging, conversational description that covers what's in the image, key visual details, and the overall scene or mood
 - For specific questions: Keep the user's question as-is, but add "Please answer in a natural, conversational tone"
 - Avoids dry technical language, bullet points, or overly structured responses (unless specifically requested)
