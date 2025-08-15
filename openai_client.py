@@ -684,9 +684,8 @@ class OpenAIClient(LoggerMixin):
             if role == "assistant" and "generated image" in content.lower():
                 has_recent_image = True
             
-            # Truncate very long messages to keep tokens reasonable
-            if len(content) > 500:
-                content = content[:500] + "..."
+            # Pass full message content without truncation
+            # This ensures the intent classifier has complete context
             
             # Add message with proper role
             conversation_messages.append({
