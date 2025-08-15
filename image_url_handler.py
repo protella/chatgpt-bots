@@ -80,23 +80,15 @@ class ImageURLHandler:
                 parsed = urlparse(url)
                 path = unquote(parsed.path.lower())
                 
-                # Skip Slack file URLs - these are handled separately
-                if 'slack.com/files/' in url or 'slack-files.com' in url:
-                    continue
-                
                 # Check if the path ends with an image extension
                 if any(path.endswith(ext.lower()) for ext in IMAGE_EXTENSIONS):
                     urls.append(url)
-                # Check for common image hosting patterns (but not Slack)
-                elif any(host in parsed.netloc for host in ['imgur.com', 'cloudinary.com', 'cdn.discordapp.com']):
+                # Check for common image hosting patterns (including Slack)
+                elif any(host in parsed.netloc for host in ['imgur.com', 'cloudinary.com', 'cdn.discordapp.com', 'slack.com', 'slack-files.com']):
                     urls.append(url)
         
-        # Filter out any Slack file URLs that might have been caught
-        filtered_urls = []
-        for url in urls:
-            if 'slack.com/files/' in url or 'slack-files.com' in url:
-                continue
-            filtered_urls.append(url)
+        # Include all URLs for processing (Slack URLs will use auth token)
+        filtered_urls = urls
         
         # Remove duplicates while preserving order
         seen = set()
@@ -194,6 +186,9 @@ class ImageURLHandler:
             headers = {}
             if auth_token:
                 headers['Authorization'] = f"Bearer {auth_token}"
+                logger.debug(f"Using auth token for {url}: Bearer {auth_token[:10]}...")
+            else:
+                logger.debug(f"No auth token for {url}")
             
             # Download the image
             response = requests.get(url, headers=headers, timeout=self.timeout, allow_redirects=True)
@@ -296,9 +291,15 @@ class ImageURLHandler:
             is_slack_url = 'slack.com/files/' in url or 'slack-files.com' in url
             token_to_use = auth_token if is_slack_url else None
             
-            # This shouldn't happen anymore since we filter Slack URLs earlier
+            # Debug logging
             if is_slack_url:
-                logger.debug(f"Skipping Slack file URL (should be handled separately): {url}")
+                logger.info(f"Processing Slack URL: {url}")
+                logger.info(f"Auth token available: {bool(auth_token)}")
+            
+            # For Slack URLs, we need the auth token
+            if is_slack_url and not auth_token:
+                logger.warning(f"Slack file URL requires authentication token: {url}")
+                failed_urls.append(url)
                 continue
             
             # Validate the URL

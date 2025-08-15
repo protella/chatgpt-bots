@@ -157,3 +157,9 @@ API Reference - OpenAI API.pdf
 # Logs
 logs/
 *.log
+
+# SQLite databases
+data/
+*.db
+*.db-wal
+*.db-shm

@@ -3,7 +3,9 @@ OpenAI Client wrapper for Responses API
 Handles all interactions with OpenAI's GPT and image generation models
 """
 import base64
+import signal
 import time
+from contextlib import contextmanager
 from io import BytesIO
 from typing import Optional, List, Dict, Any, Tuple, Callable
 from dataclasses import dataclass
@@ -11,6 +13,20 @@ from openai import OpenAI
 from config import config
 from logger import LoggerMixin
 from prompts import IMAGE_INTENT_SYSTEM_PROMPT, IMAGE_GEN_SYSTEM_PROMPT, IMAGE_EDIT_SYSTEM_PROMPT, VISION_ENHANCEMENT_PROMPT
+
+
+@contextmanager
+def timeout(seconds):
+    """Context manager for enforcing timeouts using threading"""
+    import threading
+    
+    def timeout_handler():
+        raise TimeoutError(f"Operation timed out after {seconds} seconds")
+    
+    # For now, just yield without timeout enforcement
+    # The OpenAI client already has its own timeout handling
+    # TODO: Implement proper threading-based timeout if needed
+    yield
 
 
 @dataclass
@@ -126,6 +142,7 @@ class OpenAIClient(LoggerMixin):
         self.log_debug(f"Creating text response with model {model}, temp {temperature}")
         
         try:
+            # API call with built-in timeout (configured in client initialization)
             response = self.client.responses.create(**request_params)
             
             # Extract text from response
@@ -217,6 +234,7 @@ class OpenAIClient(LoggerMixin):
         self.log_debug(f"Creating text response with tools using model {model}, tools: {tools}")
         
         try:
+            # API call with built-in timeout (configured in client initialization)
             response = self.client.responses.create(**request_params)
             
             # Extract text from response
@@ -323,18 +341,27 @@ class OpenAIClient(LoggerMixin):
             response = self.client.responses.create(**request_params)
             
             complete_text = ""
-            last_chunk_time = time.time()
+            last_chunk_time = None  # Don't start timer until first event
+            first_event = True
             
             # Process streaming events
             for event in response:
                 try:
-                    # Check for streaming timeout
-                    time_since_last_chunk = time.time() - last_chunk_time
-                    if time_since_last_chunk > self.stream_timeout_seconds:
-                        raise TimeoutError(f"Stream timeout: No data received for {self.stream_timeout_seconds} seconds")
+                    current_time = time.time()
                     
-                    # Reset timeout on ANY event (not just text content)
-                    last_chunk_time = time.time()
+                    # Only check timeout after first event has been received
+                    if last_chunk_time is not None:
+                        time_since_last_chunk = current_time - last_chunk_time
+                        # Log if event took unusually long but don't error
+                        if time_since_last_chunk > self.stream_timeout_seconds:
+                            self.log_warning(f"Stream event took {time_since_last_chunk:.1f}s to arrive (timeout is {self.stream_timeout_seconds}s)")
+                    elif first_event:
+                        # Log time to first event for monitoring
+                        self.log_debug("Received first streaming event")
+                        first_event = False
+                    
+                    # Update timer for next iteration
+                    last_chunk_time = current_time
                     
                     # Get event type without logging every single one
                     event_type = getattr(event, 'type', 'unknown')
@@ -505,18 +532,27 @@ class OpenAIClient(LoggerMixin):
             response = self.client.responses.create(**request_params)
             
             complete_text = ""
-            last_chunk_time = time.time()
+            last_chunk_time = None  # Don't start timer until first event
+            first_event = True
             
             # Process streaming events
             for event in response:
                 try:
-                    # Check for streaming timeout
-                    time_since_last_chunk = time.time() - last_chunk_time
-                    if time_since_last_chunk > self.stream_timeout_seconds:
-                        raise TimeoutError(f"Stream timeout: No data received for {self.stream_timeout_seconds} seconds")
+                    current_time = time.time()
                     
-                    # Reset timeout on ANY event (not just text content)
-                    last_chunk_time = time.time()
+                    # Only check timeout after first event has been received
+                    if last_chunk_time is not None:
+                        time_since_last_chunk = current_time - last_chunk_time
+                        # Log if event took unusually long but don't error
+                        if time_since_last_chunk > self.stream_timeout_seconds:
+                            self.log_warning(f"Stream event took {time_since_last_chunk:.1f}s to arrive (timeout is {self.stream_timeout_seconds}s)")
+                    elif first_event:
+                        # Log time to first event for monitoring
+                        self.log_debug("Received first streaming event")
+                        first_event = False
+                    
+                    # Update timer for next iteration
+                    last_chunk_time = current_time
                     
                     # Get event type without logging every single one
                     event_type = getattr(event, 'type', 'unknown')
@@ -814,6 +850,7 @@ class OpenAIClient(LoggerMixin):
             # - style parameter
             
             # Use the images.generate API for image generation
+            self.log_debug(f"Calling generate_image API with {config.api_timeout_read}s timeout")
             response = self.client.images.generate(**params)
             
             # Extract image data from response
@@ -1101,7 +1138,9 @@ class OpenAIClient(LoggerMixin):
         images: List[str],
         question: str,
         detail: Optional[str] = None,
-        enhance_prompt: bool = True
+        enhance_prompt: bool = True,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        system_prompt: Optional[str] = None
     ) -> str:
         """
         Analyze one or more images with a question
@@ -1125,7 +1164,7 @@ class OpenAIClient(LoggerMixin):
         # Enhance the question if requested
         enhanced_question = question
         if enhance_prompt:
-            enhanced_question = self._enhance_vision_prompt(question)
+            enhanced_question = self._enhance_vision_prompt(question, conversation_history)
             self.log_info(f"Vision analysis with enhanced prompt: {enhanced_question[:100]}...")
         
         # Build content array with text and images
@@ -1139,16 +1178,30 @@ class OpenAIClient(LoggerMixin):
             })
         
         try:
-            # Build request parameters
+            # Build request parameters with conversation history
+            input_messages = []
+            
+            # Add platform system prompt if provided (for consistent personality/formatting)
+            if system_prompt:
+                input_messages.append({
+                    "role": "developer",
+                    "content": system_prompt
+                })
+            
+            # Include FULL conversation history if provided (including all developer messages)
+            if conversation_history:
+                input_messages.extend(conversation_history)
+            
+            # Add the current vision request
+            input_messages.append({
+                "role": "user",
+                "content": content
+            })
+            
             request_params = {
                 "model": config.gpt_model,
-                "input": [
-                    {
-                        "role": "user",
-                        "content": content
-                    }
-                ],
-                "max_output_tokens": 1500,  # Reasonable limit for vision analysis
+                "input": input_messages,
+                "max_output_tokens": config.vision_max_tokens,  # Use higher limit for vision with reasoning
                 "store": False  # Don't store vision analysis calls
             }
             
@@ -1158,16 +1211,34 @@ class OpenAIClient(LoggerMixin):
                 request_params["reasoning"] = {"effort": config.analysis_reasoning_effort}  # Use analysis config
                 request_params["text"] = {"verbosity": config.analysis_verbosity}  # Use analysis config
             
+            # API call with built-in timeout (configured in client initialization)
+            self.log_debug(f"Calling analyze_images API with {config.api_timeout_read}s timeout")
             response = self.client.responses.create(**request_params)
             
             # Extract response text
             output_text = ""
             if response.output:
                 for item in response.output:
+                    # Handle message/text type items
                     if hasattr(item, "content") and item.content:
                         for content in item.content:
+                            # Handle output_text type for GPT-5 responses
                             if hasattr(content, "text"):
                                 output_text += content.text
+                            # Also check for type attribute
+                            elif hasattr(content, "type") and content.type == "output_text" and hasattr(content, "text"):
+                                output_text += content.text
+            
+            if not output_text:
+                # Log the full response structure to debug
+                self.log_warning(f"analyze_images returned empty response")
+                self.log_debug(f"Response output structure: {response.output if response.output else 'No output'}")
+                
+                # Check if we only got reasoning tokens
+                if response.usage and hasattr(response.usage, "output_tokens_details"):
+                    details = response.usage.output_tokens_details
+                    if hasattr(details, "reasoning_tokens") and details.reasoning_tokens > 0:
+                        self.log_warning(f"Response contained {details.reasoning_tokens} reasoning tokens but no text output")
             
             return output_text
             
@@ -1277,6 +1348,7 @@ class OpenAIClient(LoggerMixin):
                 params["mask"] = BytesIO(mask_bytes)
             
             # Use the images.edit API
+            self.log_debug(f"Calling edit_image API with {config.api_timeout_read}s timeout")
             response = self.client.images.edit(**params)
             
             # Extract image data from response

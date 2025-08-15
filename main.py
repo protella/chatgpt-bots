@@ -21,7 +21,7 @@ class ChatBotV2:
     def __init__(self, platform: str = "slack"):
         self.platform = platform.lower()
         self.client: Optional[BaseClient] = None
-        self.processor = MessageProcessor()
+        self.processor = None  # Will be initialized after client
         self.cleanup_thread = None
         self.running = False
         
@@ -40,9 +40,12 @@ class ChatBotV2:
         if self.platform == "slack":
             from slack_client import SlackBot
             self.client = SlackBot(message_handler=self.handle_message)
+            # Initialize processor with database from client
+            self.processor = MessageProcessor(db=self.client.db)
         elif self.platform == "discord":
             # Future: from discordbot import DiscordBot
             # self.client = DiscordBot(message_handler=self.handle_message)
+            # self.processor = MessageProcessor(db=self.client.db)
             main_logger.error("Discord platform not yet implemented")
             sys.exit(1)
         else:

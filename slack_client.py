@@ -11,6 +11,7 @@ from slack_sdk.errors import SlackApiError
 from base_client import BaseClient, Message, Response
 from config import config
 from markdown_converter import MarkdownConverter
+from database import DatabaseManager
 
 
 class SlackBot(BaseClient):
@@ -26,6 +27,9 @@ class SlackBot(BaseClient):
         self.message_handler = message_handler  # Callback for processing messages
         self.markdown_converter = MarkdownConverter(platform="slack")
         self.user_cache = {}  # Cache user info to avoid repeated API calls
+        
+        # Initialize database manager
+        self.db = DatabaseManager(platform="slack")
         
         # Register Slack event handlers
         self._register_handlers()
@@ -45,8 +49,23 @@ class SlackBot(BaseClient):
     
     def get_username(self, user_id: str, client) -> str:
         """Get username from user ID, with caching"""
+        # Check memory cache first
         if user_id in self.user_cache and 'username' in self.user_cache[user_id]:
             return self.user_cache[user_id]['username']
+        
+        # Check database for user
+        user_data = self.db.get_or_create_user(user_id)
+        if user_data.get('username'):
+            # Load from DB to memory cache
+            tz_info = self.db.get_user_timezone(user_id)
+            if tz_info:
+                self.user_cache[user_id] = {
+                    'username': user_data['username'],
+                    'timezone': tz_info[0],
+                    'tz_label': tz_info[1],
+                    'tz_offset': tz_info[2] or 0
+                }
+                return user_data['username']
         
         try:
             # Fetch user info from Slack API
@@ -59,13 +78,23 @@ class SlackBot(BaseClient):
                           user_info.get("name") or 
                           user_id)
                 
-                # Cache both username and timezone info
+                # Cache both username and timezone info in memory
                 self.user_cache[user_id] = {
                     'username': username,
                     'timezone': user_info.get('tz', 'UTC'),
                     'tz_label': user_info.get('tz_label', 'UTC'),
                     'tz_offset': user_info.get('tz_offset', 0)
                 }
+                
+                # Save to database
+                self.db.get_or_create_user(user_id, username)
+                self.db.save_user_timezone(
+                    user_id,
+                    user_info.get('tz', 'UTC'),
+                    user_info.get('tz_label', 'UTC'),
+                    user_info.get('tz_offset', 0)
+                )
+                
                 self.log_debug(f"Cached timezone info for {username}: tz={user_info.get('tz')}, tz_label={user_info.get('tz_label')}")
                 return username
         except Exception as e:
@@ -75,9 +104,20 @@ class SlackBot(BaseClient):
     
     def get_user_timezone(self, user_id: str, client) -> str:
         """Get user's timezone, fetching if necessary"""
-        # Check cache first
+        # Check memory cache first
         if user_id in self.user_cache and 'timezone' in self.user_cache[user_id]:
             return self.user_cache[user_id]['timezone']
+        
+        # Check database
+        tz_info = self.db.get_user_timezone(user_id)
+        if tz_info:
+            # Load to memory cache
+            if user_id not in self.user_cache:
+                self.user_cache[user_id] = {}
+            self.user_cache[user_id]['timezone'] = tz_info[0]
+            self.user_cache[user_id]['tz_label'] = tz_info[1]
+            self.user_cache[user_id]['tz_offset'] = tz_info[2] or 0
+            return tz_info[0]
         
         # Fetch user info (which will also cache it)
         self.get_username(user_id, client)
@@ -414,14 +454,36 @@ class SlackBot(BaseClient):
                         return None
             
             # Get file info to get the private URL
+            self.log_debug(f"Getting file info for file ID: {file_id}")
             file_info = self.app.client.files_info(file=file_id)
-            url_private = file_info["file"]["url_private"]
+            
+            # Check if file exists and is accessible
+            if not file_info.get("ok"):
+                self.log_error(f"Failed to get file info: {file_info.get('error', 'Unknown error')}")
+                return None
+            
+            # Get the URL for downloading
+            file_data = file_info.get("file", {})
+            url_private = file_data.get("url_private") or file_data.get("url_private_download")
+            
+            if not url_private:
+                self.log_error("No private URL found in file info")
+                self.log_debug(f"File info keys: {file_data.keys()}")
+                return None
+            
+            self.log_debug(f"Downloading from private URL: {url_private[:50]}...")
             
             # Download file using requests with auth header
             headers = {"Authorization": f"Bearer {config.slack_bot_token}"}
             response = requests.get(url_private, headers=headers)
             
             if response.status_code == 200:
+                # Check if we got actual image data
+                content_type = response.headers.get('content-type', '').lower()
+                if 'text/html' in content_type:
+                    self.log_error(f"Got HTML instead of image data from private URL")
+                    self.log_debug(f"Response preview: {response.text[:200]}")
+                    return None
                 return response.content
             else:
                 self.log_error(f"Failed to download file: HTTP {response.status_code}")

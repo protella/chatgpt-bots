@@ -7,26 +7,33 @@ This document outlines the integration of SQLite as a persistent storage layer f
 
 ### What's Currently in Memory (Lost on Restart)
 1. **Thread State** (`ThreadState` class)
-   - Message history (rebuilt from Slack)
+   - Message history (LIMITED TO 20 MESSAGES)
    - Config overrides per thread
    - System prompts per thread
    - Processing state/locks
    - Pending clarifications
 
 2. **Asset Ledger** (`AssetLedger` class)
-   - Generated image data (base64)
+   - Generated image data (base64 - MEMORY INTENSIVE)
    - Image prompts (truncated to 100 chars)
    - Slack URLs for images
    - Timestamps
+   - LIMITED TO 10 RECENT IMAGES
 
 3. **Thread Locks** (`ThreadLockManager`)
    - Active processing locks
    - Thread busy state
 
-4. **Rate Limiting State** (`RateLimitManager`)
-   - Circuit breaker state
-   - Failure counts
-   - Backoff intervals
+4. **User Cache** (`SlackClient.user_cache`)
+   - Username
+   - Timezone (tz)
+   - Timezone label (tz_label)
+   - Timezone offset (tz_offset)
+   - Must re-fetch from Slack API after restart
+
+5. **Rate Limiting State** (`RateLimitManager`)
+   - Circuit breaker state (resets every 60s)
+   - Not needed for persistence
 
 ## Database Architecture
 
@@ -106,8 +113,10 @@ CREATE TABLE users (
                        --   "input_fidelity": "high",
                        --   "detail_level": "auto"
                        -- }
-    total_requests INTEGER DEFAULT 0,
-    total_images INTEGER DEFAULT 0,
+    -- Timezone caching (new)
+    timezone TEXT DEFAULT 'UTC',  -- User's timezone
+    tz_label TEXT,  -- Timezone label (e.g., "Pacific Standard Time")
+    tz_offset INTEGER DEFAULT 0,  -- Offset in seconds from UTC
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_seen TIMESTAMP
 );
@@ -182,9 +191,9 @@ class DatabaseManager:
     def cache_message(thread_id, role, content, metadata)
     def get_cached_messages(thread_id)  # No limit - get all messages
     
-    # Image operations
-    def save_image_metadata(thread_id, url, type, prompt, analysis)
-    def get_image_analysis(url)
+    # Image operations (NO BASE64 STORAGE)
+    def save_image_metadata(thread_id, url, type, prompt, analysis)  # Full prompt & analysis, no base64
+    def get_image_analysis_by_url(thread_id, url)  # Thread-isolated lookup
     def find_thread_images(thread_id, image_type=None)
     
     # User operations (simple, clean)
@@ -217,16 +226,18 @@ class DatabaseManager:
 
 ### Moves to Database (Persistent)
 - Thread configurations
-- Image URLs and analyses
-- User preferences
-- Message cache (optional)
+- Image URLs and analyses (NO BASE64 DATA)
+- User preferences (including timezone)
+- Message cache (unlimited history)
+- Full image prompts (not truncated)
+- Full vision analyses (not truncated)
 
 ### Stays in Memory (Transient)
 - Active thread locks
 - Current processing state
 - Streaming buffers
-- Rate limiting/circuit breaker state
-- Recent message buffer for context
+- Rate limiting state (resets every 60s anyway)
+- Base64 image data (never stored in DB)
 
 ## Optimizations Enabled by Database
 
@@ -239,7 +250,7 @@ class DatabaseManager:
   - New messages → Update cache as they arrive
 
 ### 2. Complete Image Context
-- **Current**: 200-char truncated analysis in breadcrumbs
+- **Current**: 100-char truncated analysis in AssetLedger
 - **With DB**: Full analysis stored for EVERY processed image:
   - Direct vision requests
   - Internal analysis for image generation enhancement
@@ -248,18 +259,41 @@ class DatabaseManager:
 - **Enhanced context**: When building prompts, include full analysis from DB
   - Example: User says "edit the hat" → We send model the full analysis + edit request
   - Model has complete context without polluting Slack thread
-- **Always available**: Any image ever processed can be referenced
-- **No more**: "I can't see that image" responses
+- **Thread Isolation**: Each thread's images are isolated - no cross-thread sharing
+- **No Base64 Storage**: Only URLs and metadata stored, not raw image data
 
 ### 3. Complete Message History
-- **Current**: Keep last 20 messages in memory
+- **Current**: Keep last 20 messages in memory, only 6 for recent context
 - **With DB**: Unlimited history, all messages always sent
 - **No truncation**: Full conversation context every time
+- **Instant Recovery**: No expensive Slack API rebuilds after restart
 
 ### 4. Configuration Persistence
 - **Current**: Lost on restart
 - **With DB**: Per-thread and per-user configs persist
-- **Hierarchical**: User defaults → Thread overrides
+- **Hierarchical**: BotConfig (.env) → User defaults (DB) → Thread overrides (DB)
+- **Phase 1**: Backend support only, no user commands
+
+## New Features Added Since Plan (Already Implemented)
+
+### Features to Consider for DB Integration:
+1. **URL Image Processing** (`image_url_handler.py`)
+   - Downloads and processes external image URLs
+   - Currently re-processes on each mention
+   - With DB: Store analysis per thread (maintain isolation)
+
+2. **User Timezone Injection**
+   - Currently cached in `SlackClient.user_cache`
+   - Lost on restart, requires Slack API call
+   - With DB: Permanent timezone storage in users table
+
+3. **Pagination Support**
+   - Smart message splitting for Slack limits
+   - No DB storage needed - rebuilds naturally
+
+4. **Streaming Enhancements**
+   - Circuit breaker resets every 60s
+   - No DB storage needed
 
 ## New Features Enabled (FUTURE - NOT IN PHASE 1)
 
@@ -332,13 +366,17 @@ class DatabaseManager:
 ### Key Integration Points
 - `SlackClient.__init__()` - Create DatabaseManager with platform='slack'
 - `DiscordClient.__init__()` - Create DatabaseManager with platform='discord'
+- `SlackClient._get_or_cache_user_info()` - Store timezone in users table
 - `ThreadStateManager` - Receives DB instance from client
+- `ThreadStateManager.get_or_create_thread()` - Check DB first before creating new
+- `AssetLedger.add_image()` - Store URL and metadata only, NO base64
 - `MessageProcessor._handle_image_edit()` - Save full analysis to DB
 - `MessageProcessor._handle_vision_without_upload()` - Query DB for analysis
 - `MessageProcessor._build_messages()` - Inject DB analysis when image URLs mentioned
   - When preparing messages for model, check for image URLs
   - Pull full analysis from DB and include in context
   - User never sees the analysis in Slack
+- `image_url_handler.py` - Store processed URL metadata per thread
 
 ## Performance Considerations
 
@@ -382,13 +420,33 @@ class DatabaseManager:
 - Data integrity checks
 - Migration rollback capability
 
+## Key Implementation Principles
+
+### Thread Isolation
+- **CRITICAL**: All data must stay within thread boundaries
+- No cross-thread data sharing or caching
+- Each thread's images, messages, and analyses are isolated
+- URL image analyses are stored per-thread, not globally
+
+### Storage Guidelines
+- **NEVER store base64 image data in DB** - memory intensive
+- Store only URLs, metadata, prompts, and analyses
+- Full prompts and analyses (not truncated)
+- Message history without limits
+
+### Phase 1 Scope (Current Implementation)
+- Database backend for existing functionality only
+- No new user-facing commands
+- Config support in backend without /config or /defaults commands
+- Focus on persistence and performance improvements
+
 ## Conclusion
 
 The SQLite integration provides significant benefits:
 - **Persistence**: Survive restarts without losing context
-- **Performance**: Faster thread recovery, better caching
-- **Features**: Enable new user-facing capabilities
-- **Analytics**: Track usage and optimize
+- **Performance**: Faster thread recovery, reduced API calls
+- **Unlimited Context**: No message limits, full image analyses
+- **Clean UI**: Rich metadata without polluting Slack display
 - **Reliability**: Consistent experience across sessions
 
 The implementation is designed to be incremental, maintaining backwards compatibility while gradually enhancing the system's capabilities. The database acts as a complement to the stateless architecture, not a replacement for Slack/Discord as the source of truth.
