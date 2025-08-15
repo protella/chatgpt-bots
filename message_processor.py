@@ -44,10 +44,12 @@ class MessageProcessor(LoggerMixin):
         
         # Log request start with clear markers
         username = message.metadata.get("username", message.user_id) if message.metadata else message.user_id
+        self.log_info("")
         self.log_info("="*80)
         self.log_info(f"REQUEST START | Thread: {thread_key} | User: {username}")
         self.log_info(f"Message: {message.text[:100] if message.text else 'No text'}{'...' if message.text and len(message.text) > 100 else ''}")
         self.log_info("="*80)
+        self.log_info("")
         
         request_start_time = time.time()
         
@@ -58,9 +60,11 @@ class MessageProcessor(LoggerMixin):
             timeout=0  # Don't wait, return immediately if busy
         ):
             elapsed = time.time() - request_start_time
+            self.log_info("")
             self.log_info("="*80)
             self.log_info(f"REQUEST END | Thread: {thread_key} | Status: BUSY | Time: {elapsed:.2f}s")
             self.log_info("="*80)
+            self.log_info("")
             return Response(
                 type="busy",
                 content="Thread is currently processing another request"
@@ -89,7 +93,8 @@ class MessageProcessor(LoggerMixin):
             # Always regenerate system prompt to get current time
             user_timezone = message.metadata.get("user_timezone", "UTC") if message.metadata else "UTC"
             user_tz_label = message.metadata.get("user_tz_label", None) if message.metadata else None
-            thread_state.system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label)
+            user_real_name = message.metadata.get("user_real_name", None) if message.metadata else None
+            thread_state.system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name)
             
             # Process any attachments (images and other files)
             image_inputs, unsupported_files = self._process_attachments(message, client)
@@ -118,18 +123,22 @@ class MessageProcessor(LoggerMixin):
                     unsupported_msg += "\n\nI'll process your text/image request now."
                     # Add the unsupported files warning to conversation
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-                    thread_state.add_message("user", f"[Uploaded unsupported file(s): {files_str}]", db=self.db, thread_key=thread_key)
+                    message_ts = message.metadata.get("ts") if message.metadata else None
+                    thread_state.add_message("user", f"[Uploaded unsupported file(s): {files_str}]", db=self.db, thread_key=thread_key, message_ts=message_ts)
                     thread_state.add_message("assistant", unsupported_msg, db=self.db, thread_key=thread_key)
                     # Continue processing if we have text or images
                 else:
                     # Only unsupported files were uploaded, nothing else to process
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-                    thread_state.add_message("user", f"[Uploaded unsupported file(s): {files_str}]", db=self.db, thread_key=thread_key)
+                    message_ts = message.metadata.get("ts") if message.metadata else None
+                    thread_state.add_message("user", f"[Uploaded unsupported file(s): {files_str}]", db=self.db, thread_key=thread_key, message_ts=message_ts)
                     thread_state.add_message("assistant", unsupported_msg, db=self.db, thread_key=thread_key)
                     elapsed = time.time() - request_start_time
+                    self.log_info("")
                     self.log_info("="*80)
                     self.log_info(f"REQUEST END | Thread: {thread_key} | Status: UNSUPPORTED_FILE | Time: {elapsed:.2f}s")
                     self.log_info("="*80)
+                    self.log_info("")
                     return Response(
                         type="text",
                         content=unsupported_msg
@@ -217,7 +226,8 @@ class MessageProcessor(LoggerMixin):
                     
                     # Add clarification to thread history
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-                    thread_state.add_message("user", message.text, db=self.db, thread_key=thread_key)
+                    message_ts = message.metadata.get("ts") if message.metadata else None
+                    thread_state.add_message("user", message.text, db=self.db, thread_key=thread_key, message_ts=message_ts)
                     
                     # Check if it's an uploaded image or generated one
                     has_uploaded = any("files.slack.com" in msg.get("content", "") 
@@ -232,9 +242,11 @@ class MessageProcessor(LoggerMixin):
                     thread_state.add_message("assistant", clarification_msg, db=self.db, thread_key=thread_key)
                     
                     elapsed = time.time() - request_start_time
+                    self.log_info("")
                     self.log_info("="*80)
                     self.log_info(f"REQUEST END | Thread: {thread_key} | Status: CLARIFICATION | Time: {elapsed:.2f}s")
                     self.log_info("="*80)
+                    self.log_info("")
                     return Response(
                         type="text",
                         content=clarification_msg
@@ -250,7 +262,7 @@ class MessageProcessor(LoggerMixin):
             
             # Generate response based on intent
             if intent == "new_image":
-                response = self._handle_image_generation(message.text, thread_state, client, message.channel_id, thinking_id)
+                response = self._handle_image_generation(message.text, thread_state, client, message.channel_id, thinking_id, message)
             elif intent == "edit_image":
                 # Check if we have uploaded images or need to find recent ones
                 if image_inputs:
@@ -264,7 +276,8 @@ class MessageProcessor(LoggerMixin):
                         client,
                         message.channel_id,
                         thinking_id,
-                        attachment_urls
+                        attachment_urls,
+                        message
                     )
                 else:
                     # Try to find and edit recent image
@@ -274,7 +287,8 @@ class MessageProcessor(LoggerMixin):
                         message.thread_id,
                         client,
                         message.channel_id,
-                        thinking_id
+                        thinking_id,
+                        message
                     )
             elif intent == "vision":
                 # Update status to show we're analyzing images (handle plural)
@@ -316,17 +330,21 @@ class MessageProcessor(LoggerMixin):
             
             elapsed = time.time() - request_start_time
             response_type = response.type if response else "None"
+            self.log_info("")
             self.log_info("="*80)
             self.log_info(f"REQUEST END | Thread: {thread_key} | Status: {response_type.upper()} | Time: {elapsed:.2f}s")
             self.log_info("="*80)
+            self.log_info("")
             return response
             
         except Exception as e:
             self.log_error(f"Error processing message: {e}", exc_info=True)
             elapsed = time.time() - request_start_time
+            self.log_info("")
             self.log_info("="*80)
             self.log_info(f"REQUEST END | Thread: {thread_key} | Status: ERROR | Time: {elapsed:.2f}s")
             self.log_info("="*80)
+            self.log_info("")
             
             # Check if this is a timeout error
             error_str = str(e)
@@ -362,39 +380,38 @@ class MessageProcessor(LoggerMixin):
             return messages
             
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+        
+        # Get all messages from DB with their timestamps
+        cached_messages = self.db.get_cached_messages(thread_key)
+        
         enhanced_messages = []
         
-        for msg in messages:
+        # Match messages by position and content to get timestamps
+        for i, msg in enumerate(messages):
             # Add the original message
             enhanced_messages.append(msg)
             
-            # Check if this is a user message with image URLs
-            if msg.get("role") == "user" and msg.get("content"):
-                content = str(msg["content"])
-                
-                # Look for URLs in the content
-                import re
-                # Match URLs in angle brackets or plain URLs
-                url_pattern = r'(?:<(https?://[^\s>]+)>|(https?://[^\s<>]+))'
-                matches = re.findall(url_pattern, content)
-                urls = [url[0] if url[0] else url[1] for url in matches]
-                
-                # For each URL, check if we have stored analysis
-                analyses_added = []
-                for url in urls:
-                    # Skip if we already added analysis for this URL
-                    if url in analyses_added:
-                        continue
+            # Only inject after user messages
+            if msg.get("role") == "user":
+                # Find corresponding cached message to get timestamp
+                # Match by position and content (messages are in order)
+                if i < len(cached_messages):
+                    cached_msg = cached_messages[i]
+                    msg_ts = cached_msg.get("message_ts")
+                    
+                    if msg_ts:
+                        # Get images associated with this specific message
+                        images_for_message = self.db.get_images_by_message(thread_key, msg_ts)
                         
-                    img_data = self.db.get_image_analysis_by_url(thread_key, url)
-                    if img_data and img_data.get("analysis"):
-                        # Add comprehensive analysis as developer/system context
-                        enhanced_messages.append({
-                            "role": "developer",
-                            "content": f"[Comprehensive Visual Analysis of image at {url}]:\n{img_data['analysis']}\n[End of visual analysis - use this context to answer questions about the image]"
-                        })
-                        analyses_added.append(url)
-                        self.log_debug(f"Injected stored analysis for image: {url}")
+                        for img_data in images_for_message:
+                            analysis = img_data.get("analysis")
+                            if analysis:
+                                # Inject the analysis right after the user message
+                                enhanced_messages.append({
+                                    "role": "developer",
+                                    "content": f"[Visual context for {img_data.get('image_type', 'image')}]:\n{analysis}\n[End of visual context]"
+                                })
+                                self.log_debug(f"Injected analysis for message at position {i}")
         
         if len(enhanced_messages) > len(messages):
             self.log_info(f"Enhanced conversation with {len(enhanced_messages) - len(messages)} stored image analyses")
@@ -438,29 +455,50 @@ class MessageProcessor(LoggerMixin):
                 # Build content with attachment info
                 content = hist_msg.text
                 
-                # Track image URLs for bot messages
+                # Store bot image metadata in DB
                 if is_bot and hist_msg.attachments:
                     for attachment in hist_msg.attachments:
                         if attachment.get("type") == "image":
                             url = attachment.get("url")
-                            # Check for both generated and edited image markers
-                            if url and content and ("Generated image:" in content or "Edited image:" in content):
-                                # Append URL to the breadcrumb if not already present
-                                if "<" not in content:  # Don't add if URL already there
-                                    content += f" <{url}>"
-                                break  # Only add first image URL
+                            if url and self.db:
+                                # Determine image type from content
+                                image_type = "generated" if "Generated image:" in content else "edited" if "Edited image:" in content else "assistant"
+                                try:
+                                    self.db.save_image_metadata(
+                                        thread_id=f"{thread_state.channel_id}:{thread_state.thread_ts}",
+                                        url=url,
+                                        image_type=image_type,
+                                        prompt=content,  # Store the generation/edit prompt
+                                        analysis=None,
+                                        metadata={"file_id": attachment.get("id")},
+                                        message_ts=hist_msg.metadata.get("ts") if hist_msg.metadata else None
+                                    )
+                                except Exception as e:
+                                    self.log_warning(f"Failed to save bot image metadata: {e}")
+                                break  # Only process first image
                 
-                # Add user upload breadcrumbs with URLs
+                # Store attachment metadata in DB instead of content
                 if not is_bot and hist_msg.attachments:
-                    att_count = len(hist_msg.attachments)
-                    content += f" [Uploaded {att_count} file(s)]"
-                    # Add URLs for uploaded images
+                    # Save image metadata to DB for each attachment
                     for attachment in hist_msg.attachments:
                         if attachment.get("type") == "image" and attachment.get("url"):
-                            content += f" <{attachment['url']}>"
+                            if self.db:
+                                try:
+                                    self.db.save_image_metadata(
+                                        thread_id=f"{thread_state.channel_id}:{thread_state.thread_ts}",
+                                        url=attachment.get("url"),
+                                        image_type="uploaded",
+                                        prompt=None,
+                                        analysis=None,
+                                        metadata={"file_id": attachment.get("id")},
+                                        message_ts=hist_msg.metadata.get("ts") if hist_msg.metadata else None
+                                    )
+                                except Exception as e:
+                                    self.log_warning(f"Failed to save image metadata during rebuild: {e}")
                 
                 thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-                thread_state.add_message(role, content, db=self.db, thread_key=thread_key)
+                message_ts = hist_msg.metadata.get("ts") if hist_msg.metadata else None
+                thread_state.add_message(role, content, db=self.db, thread_key=thread_key, message_ts=message_ts)
             
             self.log_info(f"Rebuilt thread with {len(thread_state.messages)} messages")
         
@@ -548,8 +586,27 @@ class MessageProcessor(LoggerMixin):
                             "type": "input_image",
                             "image_url": f"data:{mimetype};base64,{base64_data}",
                             "source": "attachment",
-                            "filename": file_name
+                            "filename": file_name,
+                            "url": attachment.get("url"),  # Keep URL for DB storage
+                            "file_id": file_id
                         })
+                        
+                        # Store metadata in DB immediately
+                        if self.db and attachment.get("url"):
+                            thread_key = f"{message.channel_id}:{message.thread_id}"
+                            try:
+                                self.db.save_image_metadata(
+                                    thread_id=thread_key,
+                                    url=attachment.get("url"),
+                                    image_type="uploaded",
+                                    prompt=None,
+                                    analysis=None,  # Will be added after vision analysis
+                                    metadata={"file_id": file_id, "filename": file_name},
+                                    message_ts=message.metadata.get("ts") if message.metadata else None
+                                )
+                                self.log_debug(f"Saved attachment metadata to DB: {file_name}")
+                            except Exception as e:
+                                self.log_warning(f"Failed to save attachment metadata: {e}")
                         
                         image_count += 1
                         self.log_debug(f"Processed image {image_count}/{max_images}: {file_name}")
@@ -747,8 +804,9 @@ class MessageProcessor(LoggerMixin):
         
         return False
     
-    def _get_system_prompt(self, client: BaseClient, user_timezone: str = "UTC", user_tz_label: Optional[str] = None) -> str:
-        """Get the appropriate system prompt based on the client platform with user's timezone"""
+    def _get_system_prompt(self, client: BaseClient, user_timezone: str = "UTC", 
+                          user_tz_label: Optional[str] = None, user_real_name: Optional[str] = None) -> str:
+        """Get the appropriate system prompt based on the client platform with user's timezone and name"""
         client_name = client.name.lower()
         
         # Get base prompt for the platform
@@ -779,10 +837,16 @@ class MessageProcessor(LoggerMixin):
             current_time = datetime.datetime.now(pytz.UTC)
             timezone_display = "UTC"
         
-        # Format time context
+        # Format time and user context
         time_context = f"\n\nCurrent date and time: {current_time.strftime('%A, %B %d, %Y at %I:%M %p')} ({timezone_display})"
         
-        return base_prompt + time_context
+        # Add user's name if available
+        if user_real_name:
+            user_context = f"\nSpeaking with: {user_real_name}"
+        else:
+            user_context = ""
+        
+        return base_prompt + time_context + user_context
     
     def _update_status(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], message: str, emoji: Optional[str] = None):
         """Update the thinking indicator with a status message"""
@@ -826,25 +890,21 @@ class MessageProcessor(LoggerMixin):
                 elif item.get("type") == "input_image":
                     image_count += 1
             
-            # Create breadcrumb text for thread history
+            # Create clean text for thread history (no URLs or counts)
             breadcrumb_text = " ".join(text_parts).strip()
-            if image_count > 0:
-                breadcrumb_text += f" [Uploaded {image_count} file(s)]"
-                # Add URLs if we have them
-                if attachment_urls:
-                    for url in attachment_urls:
-                        breadcrumb_text += f" <{url}>"
             
             # Add simplified breadcrumb to thread state (no base64 data)
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-            thread_state.add_message("user", breadcrumb_text, db=self.db, thread_key=thread_key)
+            message_ts = message.metadata.get("ts") if message.metadata else None
+            thread_state.add_message("user", breadcrumb_text, db=self.db, thread_key=thread_key, message_ts=message_ts)
             
             # Use the full content with images for the actual API call
             messages_for_api = thread_state.messages[:-1] + [{"role": "user", "content": user_content}]
         else:
             # Simple text content - add as-is
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-            thread_state.add_message("user", user_content, db=self.db, thread_key=thread_key)
+            message_ts = message.metadata.get("ts") if message.metadata else None
+            thread_state.add_message("user", user_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
             messages_for_api = thread_state.messages
         
         # Inject stored image analyses into the conversation for full context
@@ -857,7 +917,8 @@ class MessageProcessor(LoggerMixin):
         # Always regenerate to get current time
         user_timezone = message.metadata.get("user_timezone", "UTC") if message.metadata else "UTC"
         user_tz_label = message.metadata.get("user_tz_label", None) if message.metadata else None
-        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label)
+        user_real_name = message.metadata.get("user_real_name", None) if message.metadata else None
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name)
         
         # Update status before generating
         self._update_status(client, message.channel_id, thinking_id, "Generating response...")
@@ -947,25 +1008,21 @@ class MessageProcessor(LoggerMixin):
                 elif item.get("type") == "input_image":
                     image_count += 1
             
-            # Create breadcrumb text for thread history
+            # Create clean text for thread history (no URLs or counts)
             breadcrumb_text = " ".join(text_parts).strip()
-            if image_count > 0:
-                breadcrumb_text += f" [Uploaded {image_count} file(s)]"
-                # Add URLs if we have them
-                if attachment_urls:
-                    for url in attachment_urls:
-                        breadcrumb_text += f" <{url}>"
             
             # Add simplified breadcrumb to thread state (no base64 data)
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-            thread_state.add_message("user", breadcrumb_text, db=self.db, thread_key=thread_key)
+            message_ts = message.metadata.get("ts") if message.metadata else None
+            thread_state.add_message("user", breadcrumb_text, db=self.db, thread_key=thread_key, message_ts=message_ts)
             
             # Use the full content with images for the actual API call
             messages_for_api = thread_state.messages[:-1] + [{"role": "user", "content": user_content}]
         else:
             # Simple text content - add as-is
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-            thread_state.add_message("user", user_content, db=self.db, thread_key=thread_key)
+            message_ts = message.metadata.get("ts") if message.metadata else None
+            thread_state.add_message("user", user_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
             messages_for_api = thread_state.messages
         
         # Inject stored image analyses into the conversation for full context
@@ -978,7 +1035,8 @@ class MessageProcessor(LoggerMixin):
         # Always regenerate to get current time
         user_timezone = message.metadata.get("user_timezone", "UTC") if message.metadata else "UTC"
         user_tz_label = message.metadata.get("user_tz_label", None) if message.metadata else None
-        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label)
+        user_real_name = message.metadata.get("user_real_name", None) if message.metadata else None
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name)
         
         # Post an initial message to get the message ID for streaming updates
         # For streaming with potential tools, start with "Working on it" 
@@ -1340,7 +1398,8 @@ class MessageProcessor(LoggerMixin):
             # Get platform system prompt for consistent personality/formatting
             user_timezone = message.metadata.get("user_timezone", "UTC") if message.metadata else "UTC"
             user_tz_label = message.metadata.get("user_tz_label", None) if message.metadata else None
-            system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label)
+            user_real_name = message.metadata.get("user_real_name", None) if message.metadata else None
+            system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name)
             
             # Use the user's question directly - it will be enhanced for natural conversation
             # If no text provided with image, let the model infer from full conversation context
@@ -1403,7 +1462,8 @@ class MessageProcessor(LoggerMixin):
                             image_type="url",
                             prompt=user_text if user_text else "Vision analysis",
                             analysis=analysis_result,  # Store the vision analysis result
-                            metadata={"timestamp": time.time()}
+                            metadata={"timestamp": time.time()},
+                            message_ts=message.metadata.get("ts") if message.metadata else None
                         )
                         self.log_debug(f"Saved comprehensive vision analysis for URL image: {url_img['original_url']}")
             
@@ -1418,7 +1478,8 @@ class MessageProcessor(LoggerMixin):
                             image_type="uploaded",
                             prompt=user_text if user_text else "Vision analysis",
                             analysis=analysis_result,  # Store the vision analysis result
-                            metadata={"timestamp": time.time()}
+                            metadata={"timestamp": time.time()},
+                            message_ts=message.metadata.get("ts") if message.metadata else None
                         )
                         self.log_debug(f"Saved comprehensive vision analysis for uploaded image: {att['url']}")
                         
@@ -1426,32 +1487,16 @@ class MessageProcessor(LoggerMixin):
             self.log_error(f"Failed to save image metadata to database: {e}", exc_info=True)
             # Continue anyway - don't fail the whole request due to DB issues
         
-        # Create breadcrumb for thread state with URLs
-        breadcrumb_text = user_text if user_text else "Analyze image"
-        
-        # Count images by source
-        attachment_count = sum(1 for img in image_inputs if img.get("source") == "attachment")
-        url_count = sum(1 for img in image_inputs if img.get("source") == "url")
-        
-        if attachment_count > 0:
-            breadcrumb_text += f" [Uploaded {attachment_count} file(s)]"
-        if url_count > 0:
-            breadcrumb_text += f" [Found {url_count} image(s) from URL(s)]"
-        
-        # Add URLs from attachments if available
-        for att in attachments:
-            if att.get("url"):
-                breadcrumb_text += f" <{att['url']}>"
-        
-        # Add URLs from URL-sourced images
-        for img_input in image_inputs:
-            if img_input.get("source") == "url" and img_input.get("original_url"):
-                breadcrumb_text += f" <{img_input['original_url']}>"
+        # Create clean breadcrumb for thread state (no URLs or counts)
+        breadcrumb_text = user_text if user_text else ""
+        if img_input.get("source") == "url" and img_input.get("original_url"):
+            breadcrumb_text += f" <{img_input['original_url']}>"
         
         # Add to thread state with error handling
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
         try:
-            thread_state.add_message("user", breadcrumb_text, db=self.db, thread_key=thread_key)
+            message_ts = message.metadata.get("ts") if message.metadata else None
+            thread_state.add_message("user", breadcrumb_text, db=self.db, thread_key=thread_key, message_ts=message_ts)
             thread_state.add_message("assistant", analysis_result, db=self.db, thread_key=thread_key)
         except Exception as e:
             self.log_error(f"Failed to save messages to database: {e}", exc_info=True)
@@ -1463,7 +1508,7 @@ class MessageProcessor(LoggerMixin):
         )
     
     def _handle_image_generation(self, prompt: str, thread_state, client: BaseClient, 
-                                channel_id: str, thinking_id: Optional[str]) -> Response:
+                                channel_id: str, thinking_id: Optional[str], message: Message) -> Response:
         """Handle image generation request"""
         self.log_info(f"Generating image for prompt: {prompt[:100]}...")
         
@@ -1499,7 +1544,8 @@ class MessageProcessor(LoggerMixin):
         
         # Add breadcrumb to thread state with the enhanced prompt used
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-        thread_state.add_message("user", prompt, db=self.db, thread_key=thread_key)
+        message_ts = message.metadata.get("ts") if message.metadata else None
+        thread_state.add_message("user", prompt, db=self.db, thread_key=thread_key, message_ts=message_ts)
         # URL will be added after upload, for now just the prompt
         thread_state.add_message("assistant", f"Generated image: {image_data.prompt}", db=self.db, thread_key=thread_key)
         
@@ -1509,38 +1555,31 @@ class MessageProcessor(LoggerMixin):
         )
     
     def _find_target_image(self, user_text: str, thread_state, client: BaseClient) -> Optional[str]:
-        """Find the target image URL based on user's reference"""
-        # First try to find generated images
-        image_registry = self._extract_image_registry(thread_state)
+        """Find the target image URL based on user's reference using DB"""
+        thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
         
-        # Also check for uploaded images in user messages
-        uploaded_image_urls = []
-        for msg in thread_state.messages:
-            if msg.get("role") == "user":
-                content = msg.get("content", "")
-                if isinstance(content, str) and "[Uploaded" in content and "<" in content:
-                    # Extract URLs from upload breadcrumbs
-                    urls = re.findall(r'<([^>]+)>', content)
-                    uploaded_image_urls.extend(urls)
-        
-        # Combine both sources
+        # Get all images from DB for this thread
         all_available_images = []
+        if self.db:
+            db_images = self.db.find_thread_images(thread_key)
+            for img in db_images:
+                all_available_images.append({
+                    "url": img.get("url"),
+                    "description": img.get("prompt", "") or "uploaded image",
+                    "type": img.get("image_type", "uploaded"),
+                    "analysis": img.get("analysis", "")  # Include analysis for natural language matching
+                })
         
-        # Add generated images with descriptions
-        for img in image_registry:
-            all_available_images.append({
-                "url": img["url"],
-                "description": img["description"],
-                "type": "generated"
-            })
-        
-        # Add uploaded images (most recent first)
-        for url in reversed(uploaded_image_urls):
-            all_available_images.append({
-                "url": url,
-                "description": "uploaded image",
-                "type": "uploaded"
-            })
+        # Fallback to asset ledger if no DB or no images found
+        if not all_available_images:
+            image_registry = self._extract_image_registry(thread_state)
+            for img in image_registry:
+                all_available_images.append({
+                    "url": img["url"],
+                    "description": img["description"],
+                    "type": "generated",
+                    "analysis": ""
+                })
         
         if not all_available_images:
             return None
@@ -1571,39 +1610,19 @@ class MessageProcessor(LoggerMixin):
         
         # If ambiguous and multiple images, use utility model to match
         if len(all_available_images) > 1:
-            # Build context for matching
+            # Build context for matching using DB analyses
             context = "Available images:\n"
             for i, img in enumerate(all_available_images, 1):
-                if img["type"] == "uploaded":
-                    context += f"{i}. Uploaded image\n"
-                else:
-                    context += f"{i}. Generated: {img['description'][:100]}...\n"
-            
-            # Include vision analysis if available for better context
-            # Search backwards for analysis that mentions these specific images
-            for msg in reversed(thread_state.messages):
-                if msg.get("role") == "assistant":
-                    content = msg.get("content", "")
-                    if isinstance(content, str):
-                        # Check if this message contains analysis of our current images
-                        # Either by checking for URLs or for "Image X:" pattern with multiple images
-                        has_current_images = False
-                        
-                        # Check if any of our current image URLs are mentioned
-                        if uploaded_image_urls:
-                            has_current_images = any(url in content for url in uploaded_image_urls)
-                        
-                        # Or check if it's analyzing multiple images (likely our batch)
-                        if not has_current_images and len(all_available_images) > 1:
-                            has_current_images = ("Image 1:" in content and "Image 2:" in content)
-                        
-                        if has_current_images:
-                            context += "\nAnalysis of these images:\n"
-                            # Extract the first part of analysis that likely contains image descriptions
-                            # Limit to reasonable length to avoid token overflow
-                            analysis_excerpt = content[:1500]
-                            context += analysis_excerpt + "\n"
-                            break
+                context += f"{i}. {img['type'].capitalize()} image"
+                if img['description']:
+                    context += f": {img['description'][:100]}..."
+                context += "\n"
+                
+                # Include analysis if available for natural language matching
+                if img.get('analysis'):
+                    # Include key visual elements from analysis for better matching
+                    analysis_snippet = img['analysis'][:200]
+                    context += f"   Visual details: {analysis_snippet}...\n"
             
             context += f"\nUser reference: '{user_text}'\n"
             context += "Which image number best matches the user's reference? Respond with just the number."
@@ -1643,7 +1662,8 @@ class MessageProcessor(LoggerMixin):
         thread_id: str,
         client: BaseClient,
         channel_id: str,
-        thinking_id: Optional[str]
+        thinking_id: Optional[str],
+        message: Message
     ) -> Response:
         """Handle image modification request by finding and editing the target image"""
         self._update_status(client, channel_id, thinking_id, "Finding the image to edit...", emoji=config.web_search_emoji)
@@ -1703,7 +1723,8 @@ class MessageProcessor(LoggerMixin):
                     
                     # Add breadcrumbs
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-                    thread_state.add_message("user", text, db=self.db, thread_key=thread_key)
+                    message_ts = message.metadata.get("ts") if message.metadata else None
+                    thread_state.add_message("user", text, db=self.db, thread_key=thread_key, message_ts=message_ts)
                     thread_state.add_message("assistant", f"Edited image: {edited_image.prompt}", db=self.db, thread_key=thread_key)
                     
                     return Response(
@@ -1725,10 +1746,10 @@ class MessageProcessor(LoggerMixin):
             # Use the most recent image description
             previous_prompt = image_registry[-1]["description"]
             context_prompt = f"Previous image: {previous_prompt}\nModification request: {text}"
-            return self._handle_image_generation(context_prompt, thread_state, client, channel_id, thinking_id)
+            return self._handle_image_generation(context_prompt, thread_state, client, channel_id, thinking_id, message)
         else:
             # No previous images, treat as new generation
-            return self._handle_image_generation(text, thread_state, client, channel_id, thinking_id)
+            return self._handle_image_generation(text, thread_state, client, channel_id, thinking_id, message)
     
     def _handle_vision_without_upload(
         self,
@@ -1763,7 +1784,8 @@ class MessageProcessor(LoggerMixin):
         client: BaseClient,
         channel_id: str,
         thinking_id: Optional[str],
-        attachment_urls: Optional[List[str]] = None
+        attachment_urls: Optional[List[str]] = None,
+        message: Message = None
     ) -> Response:
         """Handle image editing with uploaded images"""
         self._update_status(client, channel_id, thinking_id, "Processing uploaded images...")
@@ -1794,7 +1816,7 @@ class MessageProcessor(LoggerMixin):
         
         if not input_images:
             # Shouldn't happen but fallback to generation
-            return self._handle_image_generation(text, thread_state, client, channel_id, thinking_id)
+            return self._handle_image_generation(text, thread_state, client, channel_id, thinking_id, message)
         
         self.log_info(f"Editing {len(input_images)} uploaded image(s)")
         
@@ -1877,14 +1899,11 @@ class MessageProcessor(LoggerMixin):
                 content=f"Failed to edit image: {str(e)}"
             )
         
-        # Add breadcrumb to thread state with URLs for consistency with rebuild
-        user_breadcrumb = text or "Edit uploaded image"
-        if attachment_urls:
-            user_breadcrumb += f" [Uploaded {len(attachment_urls)} file(s)]"
-            for url in attachment_urls:
-                user_breadcrumb += f" <{url}>"
+        # Add clean message to thread state (no URLs or counts)
+        user_breadcrumb = text or ""
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-        thread_state.add_message("user", user_breadcrumb, db=self.db, thread_key=thread_key)
+        message_ts = message.metadata.get("ts") if message.metadata else None
+        thread_state.add_message("user", user_breadcrumb, db=self.db, thread_key=thread_key, message_ts=message_ts)
         
         # Store edited image in asset ledger
         asset_ledger = self.thread_manager.get_or_create_asset_ledger(thread_state.thread_ts)
