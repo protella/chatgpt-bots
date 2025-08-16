@@ -5,6 +5,7 @@ Handles all interactions with OpenAI's GPT and image generation models
 import base64
 import signal
 import time
+import functools
 from contextlib import contextmanager
 from io import BytesIO
 from typing import Optional, List, Dict, Any, Tuple, Callable
@@ -15,18 +16,44 @@ from logger import LoggerMixin
 from prompts import IMAGE_INTENT_SYSTEM_PROMPT, IMAGE_GEN_SYSTEM_PROMPT, IMAGE_EDIT_SYSTEM_PROMPT, VISION_ENHANCEMENT_PROMPT
 
 
-@contextmanager
-def timeout(seconds):
-    """Context manager for enforcing timeouts using threading"""
-    import threading
-    
-    def timeout_handler():
-        raise TimeoutError(f"Operation timed out after {seconds} seconds")
-    
-    # For now, just yield without timeout enforcement
-    # The OpenAI client already has its own timeout handling
-    # TODO: Implement proper threading-based timeout if needed
-    yield
+def timeout_wrapper(timeout_seconds: float):
+    """
+    Decorator to add timeout handling to OpenAI API calls.
+    Uses threading-based timeout since Slack bot runs in worker threads.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            import threading
+            
+            # Always use threading-based timeout since we're in worker threads
+            result = [None]
+            exception = [None]
+            
+            def target():
+                try:
+                    result[0] = func(*args, **kwargs)
+                except Exception as e:
+                    exception[0] = e
+            
+            thread = threading.Thread(target=target)
+            thread.daemon = True
+            thread.start()
+            thread.join(timeout_seconds)
+            
+            if thread.is_alive():
+                # Thread is still running, timeout occurred
+                # Note: The thread will continue running in background
+                # but we return control to avoid blocking
+                raise TimeoutError(f"OpenAI API call timed out after {timeout_seconds} seconds")
+            
+            if exception[0]:
+                raise exception[0]
+            
+            return result[0]
+        
+        return wrapper
+    return decorator
 
 
 @dataclass
@@ -61,6 +88,49 @@ class OpenAIClient(LoggerMixin):
         self.log_info(f"OpenAI client initialized with timeout: {config.api_timeout_read}s, "
                      f"streaming_chunk: {self.stream_timeout_seconds}s, max_retries: 0")
         self.log_debug(f"Client timeout object: {self.client.timeout}, type: {type(self.client.timeout)}")
+    
+    def _safe_api_call(self, api_method: Callable, *args, timeout_seconds: Optional[float] = None, operation_type: str = "general", **kwargs):
+        """
+        Wrapper for OpenAI API calls with enforced timeout.
+        Falls back to SDK timeout if our wrapper fails.
+        
+        Args:
+            api_method: The API method to call
+            timeout_seconds: Override timeout in seconds (uses .env values by default)
+            operation_type: Type of operation for timeout selection:
+                - "intent": Quick intent classification (30s)
+                - "streaming": Streaming operations (uses streaming chunk timeout)
+                - "general": General API calls (uses API_TIMEOUT_READ from .env)
+        """
+        # Determine timeout based on operation type and .env settings
+        if timeout_seconds:
+            timeout = timeout_seconds
+        elif operation_type == "intent":
+            # Intent classification should be fast
+            timeout = min(30.0, config.api_timeout_read)
+        elif operation_type == "streaming":
+            # Use streaming chunk timeout from .env
+            timeout = config.api_timeout_streaming_chunk
+        else:
+            # Use general timeout from .env (API_TIMEOUT_READ)
+            timeout = config.api_timeout_read
+        
+        self.log_debug(f"Using timeout: {timeout}s for {operation_type} operation (from .env: read={config.api_timeout_read}s, chunk={config.api_timeout_streaming_chunk}s)")
+        
+        @timeout_wrapper(timeout)
+        def make_call():
+            return api_method(*args, **kwargs)
+        
+        try:
+            return make_call()
+        except TimeoutError as e:
+            self.log_error(f"API call ({operation_type}) timed out after {timeout}s: {e}")
+            raise
+        except Exception as e:
+            # If it's already a timeout error from the SDK, re-raise as our TimeoutError
+            if "timeout" in str(e).lower() or "timed out" in str(e).lower():
+                raise TimeoutError(f"OpenAI API call timed out: {e}")
+            raise
     
     def create_text_response(
         self,
@@ -142,8 +212,12 @@ class OpenAIClient(LoggerMixin):
         self.log_debug(f"Creating text response with model {model}, temp {temperature}")
         
         try:
-            # API call with built-in timeout (configured in client initialization)
-            response = self.client.responses.create(**request_params)
+            # API call with enforced timeout wrapper
+            response = self._safe_api_call(
+                self.client.responses.create,
+                operation_type="general",
+                **request_params
+            )
             
             # Extract text from response
             output_text = ""
@@ -234,8 +308,12 @@ class OpenAIClient(LoggerMixin):
         self.log_debug(f"Creating text response with tools using model {model}, tools: {tools}")
         
         try:
-            # API call with built-in timeout (configured in client initialization)
-            response = self.client.responses.create(**request_params)
+            # API call with enforced timeout wrapper
+            response = self._safe_api_call(
+                self.client.responses.create,
+                operation_type="general",
+                **request_params
+            )
             
             # Extract text from response
             output_text = ""
@@ -338,7 +416,11 @@ class OpenAIClient(LoggerMixin):
         self.log_debug(f"Creating streaming response with model {model}, temp {temperature}")
         
         try:
-            response = self.client.responses.create(**request_params)
+            response = self._safe_api_call(
+                self.client.responses.create,
+                operation_type="general",
+                **request_params
+            )
             
             complete_text = ""
             last_chunk_time = None  # Don't start timer until first event
@@ -529,7 +611,11 @@ class OpenAIClient(LoggerMixin):
         self.log_debug(f"Creating streaming response with tools using model {model}, tools: {tools}")
         
         try:
-            response = self.client.responses.create(**request_params)
+            response = self._safe_api_call(
+                self.client.responses.create,
+                operation_type="general",
+                **request_params
+            )
             
             complete_text = ""
             last_chunk_time = None  # Don't start timer until first event
@@ -737,7 +823,12 @@ class OpenAIClient(LoggerMixin):
             self.log_debug(f"About to call responses.create for intent classification at {time.strftime('%H:%M:%S')}")
             self.log_debug(f"Using model: {config.utility_model}, timeout: {self.client.timeout}s")
             
-            response = self.client.responses.create(**request_params)
+            # Use safe API call wrapper with intent-specific timeout
+            response = self._safe_api_call(
+                self.client.responses.create,
+                operation_type="intent",  # Uses min(30s, API_TIMEOUT_READ from .env)
+                **request_params
+            )
             
             self.log_debug(f"Response received from API at {time.strftime('%H:%M:%S')}")
             
@@ -955,8 +1046,13 @@ class OpenAIClient(LoggerMixin):
             
             # Check if streaming callback provided
             if stream_callback:
-                # Create streaming response
-                stream = self.client.responses.create(stream=True, **request_params)
+                # Create streaming response with timeout wrapper
+                stream = self._safe_api_call(
+                    self.client.responses.create,
+                    operation_type="streaming",
+                    stream=True,
+                    **request_params
+                )
                 enhanced = ""
                 
                 for event in stream:
@@ -983,7 +1079,11 @@ class OpenAIClient(LoggerMixin):
                                 stream_callback(text_chunk)
             else:
                 # Non-streaming fallback
-                response = self.client.responses.create(**request_params)
+                response = self._safe_api_call(
+                    self.client.responses.create,
+                    operation_type="general",
+                    **request_params
+                )
                 
                 enhanced = ""
                 if response.output:
@@ -1092,7 +1192,11 @@ class OpenAIClient(LoggerMixin):
                     # GPT-4 or other models - use standard parameters
                     request_params["temperature"] = 0.7  # Moderate temperature for creative prompts
                 
-                response = self.client.responses.create(**request_params)
+                response = self._safe_api_call(
+                    self.client.responses.create,
+                    operation_type="general",
+                    **request_params
+                )
                 
                 enhanced = ""
                 if response.output:
@@ -1155,7 +1259,11 @@ class OpenAIClient(LoggerMixin):
             else:
                 request_params["temperature"] = 0.7
             
-            response = self.client.responses.create(**request_params)
+            response = self._safe_api_call(
+                self.client.responses.create,
+                operation_type="general",
+                **request_params
+            )
             
             enhanced = ""
             if response.output:
@@ -1255,9 +1363,13 @@ class OpenAIClient(LoggerMixin):
                 request_params["reasoning"] = {"effort": config.analysis_reasoning_effort}  # Use analysis config
                 request_params["text"] = {"verbosity": config.analysis_verbosity}  # Use analysis config
             
-            # API call with built-in timeout (configured in client initialization)
+            # API call with enforced timeout wrapper
             self.log_debug(f"Calling analyze_images API with {config.api_timeout_read}s timeout")
-            response = self.client.responses.create(**request_params)
+            response = self._safe_api_call(
+                self.client.responses.create,
+                operation_type="general",
+                **request_params
+            )
             
             # Extract response text
             output_text = ""
