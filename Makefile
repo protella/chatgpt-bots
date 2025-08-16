@@ -21,9 +21,9 @@ help:
 install:
 	python3 -m pip install -U -r requirements.txt
 
-# Basic test run with coverage
+# Basic test run with coverage (unit tests only by default)
 test:
-	python3 -m pytest --cov=. --cov-report=term-missing --cov-report=html --cov-config=.coveragerc -v
+	python3 -m pytest tests/unit --cov=. --cov-report=term-missing --cov-report=html --cov-config=.coveragerc -v
 
 # Verbose test output
 test-verbose:
@@ -41,6 +41,10 @@ test-unit:
 # Run only integration tests
 test-integration:
 	python3 -m pytest tests/integration --cov=. --cov-report=term-missing --cov-config=.coveragerc -v
+
+# Run ALL tests (unit + integration with real API)
+test-all:
+	python3 -m pytest --cov=. --cov-report=term-missing --cov-report=html --cov-config=.coveragerc -v
 
 # Fast test run without coverage
 test-fast:

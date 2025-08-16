@@ -34,6 +34,8 @@ def mock_env(monkeypatch):
         'DEFAULT_TEMPERATURE': '0.7',
         'STREAMING_UPDATE_INTERVAL': '2.0',
         'STREAMING_CIRCUIT_BREAKER_THRESHOLD': '5',
+        'API_TIMEOUT_READ': '180',
+        'API_TIMEOUT_STREAMING_CHUNK': '30',
         'LOG_LEVEL': 'DEBUG'
     }
     for key, value in test_env.items():

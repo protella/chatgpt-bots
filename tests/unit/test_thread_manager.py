@@ -335,3 +335,169 @@ class TestThreadStateManager:
         stats = manager.get_stats()
         assert stats["active_threads"] == 2
         assert stats["processing_threads"] == 1
+    
+    @pytest.mark.critical
+    @patch('thread_manager.threading.Thread')
+    def test_critical_thread_isolation(self, mock_thread):
+        """Critical path test: Ensure thread isolation works correctly"""
+        manager = ThreadStateManager()
+        
+        # Create two separate threads
+        thread1 = manager.get_or_create_thread("123.456", "C123")
+        thread2 = manager.get_or_create_thread("789.012", "C456")
+        
+        # Add messages to each
+        thread1.add_message("user", "Thread 1 message")
+        thread2.add_message("user", "Thread 2 message")
+        
+        # Verify isolation
+        assert len(thread1.messages) == 1
+        assert len(thread2.messages) == 1
+        assert thread1.messages[0]["content"] == "Thread 1 message"
+        assert thread2.messages[0]["content"] == "Thread 2 message"
+        
+        # Verify thread keys are different
+        assert manager.get_thread("123.456", "C123") is thread1
+        assert manager.get_thread("789.012", "C456") is thread2
+        assert thread1 is not thread2
+    
+    @pytest.mark.smoke
+    @patch('thread_manager.threading.Thread')  
+    def test_smoke_basic_thread_operations(self, mock_thread):
+        """Smoke test: Verify basic thread operations work"""
+        try:
+            manager = ThreadStateManager()
+            
+            # Can create thread
+            thread = manager.get_or_create_thread("123.456", "C123")
+            assert thread is not None
+            
+            # Can add message
+            thread.add_message("user", "Test message")
+            assert len(thread.messages) == 1
+            
+            # Can acquire/release lock
+            acquired = manager.acquire_thread_lock("123.456", "C123", timeout=0)
+            assert acquired is True
+            manager.release_thread_lock("123.456", "C123")
+            
+        except Exception as e:
+            pytest.fail(f"Basic thread operations failed: {e}")
+    
+    @patch('thread_manager.threading.Thread')
+    def test_contract_thread_state_interface(self, mock_thread):
+        """Contract test: Ensure ThreadState provides expected interface"""
+        thread = ThreadState(thread_ts="123.456", channel_id="C123")
+        
+        # Verify required attributes
+        assert hasattr(thread, 'thread_ts')
+        assert hasattr(thread, 'channel_id')
+        assert hasattr(thread, 'messages')
+        assert hasattr(thread, 'config_overrides')
+        assert hasattr(thread, 'system_prompt')
+        assert hasattr(thread, 'is_processing')
+        assert hasattr(thread, 'had_timeout')
+        
+        # Verify required methods
+        assert callable(thread.add_message)
+        assert callable(thread.get_recent_messages)
+        assert callable(thread.clear_old_messages)
+        
+        # Test method signatures
+        thread.add_message("user", "test")  # Should not raise
+        recent = thread.get_recent_messages(count=5)  # Should accept count param
+        assert isinstance(recent, list)
+    
+    @patch('thread_manager.threading.Thread')
+    def test_state_persistence_with_db(self, mock_thread):
+        """State test: Verify thread state persists with database"""
+        mock_db = MagicMock()
+        mock_db.get_or_create_thread.return_value = {"id": 1}
+        mock_db.get_thread_config.return_value = {"model": "gpt-5"}
+        mock_db.get_cached_messages.return_value = []
+        
+        manager = ThreadStateManager(db=mock_db)
+        
+        # Create thread and add messages
+        thread = manager.get_or_create_thread("123.456", "C123", "U123")
+        thread.add_message("user", "Message 1", db=mock_db, thread_key="C123:123.456")
+        thread.add_message("assistant", "Response 1", db=mock_db, thread_key="C123:123.456")
+        
+        # Verify DB was called
+        assert mock_db.cache_message.call_count == 2
+        mock_db.cache_message.assert_any_call("C123:123.456", "user", "Message 1", None)
+        mock_db.cache_message.assert_any_call("C123:123.456", "assistant", "Response 1", None)
+    
+    @patch('thread_manager.threading.Thread')
+    def test_regression_message_limit(self, mock_thread):
+        """Regression test: Ensure message history is not limited with DB"""
+        manager = ThreadStateManager()
+        thread = manager.get_or_create_thread("123.456", "C123")
+        
+        # Add many messages
+        for i in range(100):
+            thread.add_message("user", f"Message {i}")
+        
+        # Should keep all messages (no 20 message limit)
+        assert len(thread.messages) == 100
+        
+        # clear_old_messages should be no-op
+        thread.clear_old_messages(keep_last=5)
+        assert len(thread.messages) == 100  # Still 100, not limited
+    
+    @patch('thread_manager.threading.Thread')
+    def test_diagnostic_thread_state(self, mock_thread):
+        """Diagnostic test: Log thread state for debugging"""
+        manager = ThreadStateManager()
+        thread = manager.get_or_create_thread("123.456", "C123")
+        
+        # Set up some state
+        thread.add_message("user", "Hello")
+        thread.add_message("assistant", "Hi there")
+        thread.config_overrides = {"model": "gpt-5-nano"}
+        thread.is_processing = True
+        
+        # Diagnostic info
+        diagnostic_info = {
+            "thread_key": f"{thread.channel_id}:{thread.thread_ts}",
+            "message_count": len(thread.messages),
+            "config_overrides": thread.config_overrides,
+            "is_processing": thread.is_processing,
+            "has_system_prompt": thread.system_prompt is not None,
+            "last_message": thread.messages[-1] if thread.messages else None
+        }
+        
+        print(f"\nDiagnostic Thread Info: {diagnostic_info}")
+        
+        # Verify state
+        assert diagnostic_info["message_count"] == 2
+        assert diagnostic_info["is_processing"] is True
+        assert diagnostic_info["config_overrides"]["model"] == "gpt-5-nano"
+    
+    @patch('thread_manager.threading.Thread')
+    def test_scenario_concurrent_thread_access(self, mock_thread):
+        """Scenario test: Multiple users accessing different threads concurrently"""
+        manager = ThreadStateManager()
+        
+        # User 1 in thread 1
+        thread1_acquired = manager.acquire_thread_lock("123.456", "C123", timeout=0)
+        assert thread1_acquired is True
+        
+        # User 2 in thread 2 (different thread, should succeed)
+        thread2_acquired = manager.acquire_thread_lock("789.012", "C456", timeout=0)
+        assert thread2_acquired is True
+        
+        # User 3 trying to access thread 1 (should fail - busy)
+        thread1_again = manager.acquire_thread_lock("123.456", "C123", timeout=0)
+        assert thread1_again is False
+        
+        # Release thread 1
+        manager.release_thread_lock("123.456", "C123")
+        
+        # Now user 3 can access thread 1
+        thread1_retry = manager.acquire_thread_lock("123.456", "C123", timeout=0)
+        assert thread1_retry is True
+        
+        # Clean up
+        manager.release_thread_lock("123.456", "C123")
+        manager.release_thread_lock("789.012", "C456")
