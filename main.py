@@ -97,6 +97,29 @@ class ChatBotV2:
                             formatted_text
                         )
                 elif response.type == "image":
+                    # Show uploading status 
+                    upload_status_id = None
+                    # Use the client's name (e.g., "SlackBot") or extract platform name
+                    platform_name = client.name.replace("Bot", "") if hasattr(client, 'name') else "system"
+                    upload_status = f"{config.circle_loader_emoji} Uploading image to {platform_name}..."
+                    
+                    if response.metadata.get("streamed"):
+                        # For streamed cases, we have a separate status message - update that, NOT the prompt!
+                        status_msg_id = response.metadata.get("status_message_id")
+                        if status_msg_id and hasattr(client, 'update_message'):
+                            client.update_message(message.channel_id, status_msg_id, upload_status)
+                            upload_status_id = status_msg_id
+                        else:
+                            # Fallback: create new status message if not provided
+                            upload_status_id = client.send_thinking_indicator(message.channel_id, message.thread_id)
+                            if upload_status_id and hasattr(client, 'update_message'):
+                                client.update_message(message.channel_id, upload_status_id, upload_status)
+                    else:
+                        # Non-streaming case - create new status message
+                        upload_status_id = client.send_thinking_indicator(message.channel_id, message.thread_id)
+                        if upload_status_id and hasattr(client, 'update_message'):
+                            client.update_message(message.channel_id, upload_status_id, upload_status)
+                    
                     # Send image
                     image_data = response.content
                     file_url = client.send_image(
@@ -104,7 +127,7 @@ class ChatBotV2:
                         message.thread_id,
                         image_data.to_bytes(),
                         f"generated_image.{image_data.format}",
-                        f"Generated image: {image_data.prompt}"
+                        ""  # No caption - prompt already displayed via streaming
                     )
                     
                     # Update thread state with the URL
@@ -114,6 +137,14 @@ class ChatBotV2:
                             message.thread_id,
                             file_url
                         )
+                    
+                    # Wait 4 seconds then handle cleanup
+                    if upload_status_id:
+                        import time
+                        time.sleep(4)
+                        
+                        # Delete the status message - the enhanced prompt message remains untouched
+                        client.delete_message(message.channel_id, upload_status_id)
                 elif response.type == "error":
                     # Send error message
                     client.handle_error(

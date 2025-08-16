@@ -24,12 +24,16 @@ class ThreadState:
     pending_clarification: Optional[Dict[str, Any]] = None
     had_timeout: bool = False  # Track if this thread had a timeout for user notification
     
-    def add_message(self, role: str, content: Any, db = None, thread_key: str = None, message_ts: str = None):
-        """Add a message to the thread history"""
+    def add_message(self, role: str, content: Any, db = None, thread_key: str = None, message_ts: str = None, metadata: Dict[str, Any] = None):
+        """Add a message to the thread history with optional metadata"""
         msg = {
             "role": role,
             "content": content
         }
+        
+        # Add metadata if provided
+        if metadata:
+            msg["metadata"] = metadata
         
         self.messages.append(msg)
         self.last_activity = time.time()
