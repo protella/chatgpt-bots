@@ -160,3 +160,105 @@ class TestBotConfig:
         """Test handling of invalid int values"""
         with pytest.raises(ValueError):
             BotConfig()
+    
+    @pytest.mark.critical
+    def test_config_contract_interface(self, mock_env):
+        """Contract test: Ensure BotConfig provides expected interface for other components"""
+        config = BotConfig()
+        
+        # Verify all required attributes exist for OpenAIClient
+        assert hasattr(config, 'openai_api_key')
+        assert hasattr(config, 'gpt_model')
+        assert hasattr(config, 'default_temperature')
+        assert hasattr(config, 'default_max_tokens')
+        assert hasattr(config, 'api_timeout_read')
+        assert hasattr(config, 'api_timeout_streaming_chunk')
+        
+        # Verify all required attributes exist for SlackClient
+        assert hasattr(config, 'slack_bot_token')
+        assert hasattr(config, 'slack_app_token')
+        
+        # Verify all required attributes exist for ThreadStateManager
+        assert hasattr(config, 'default_reasoning_effort')
+        assert hasattr(config, 'default_verbosity')
+        
+        # Verify get_thread_config method signature hasn't changed
+        assert callable(config.get_thread_config)
+        # Test it accepts optional overrides
+        result = config.get_thread_config()
+        assert isinstance(result, dict)
+        result_with_overrides = config.get_thread_config({"test": "value"})
+        assert isinstance(result_with_overrides, dict)
+    
+    def test_timeout_configuration(self, mock_env):
+        """Test timeout configuration values are properly loaded"""
+        config = BotConfig()
+        
+        # Check timeout values are floats and reasonable
+        assert isinstance(config.api_timeout_read, float)
+        assert isinstance(config.api_timeout_streaming_chunk, float)
+        
+        assert config.api_timeout_read == 180.0
+        assert config.api_timeout_streaming_chunk == 30.0
+        
+        # Ensure read timeout is greater than streaming chunk timeout
+        assert config.api_timeout_read > config.api_timeout_streaming_chunk
+    
+    def test_config_persistence_state(self, mock_env):
+        """State test: Verify config values remain consistent across multiple instantiations"""
+        config1 = BotConfig()
+        initial_model = config1.gpt_model
+        initial_temp = config1.default_temperature
+        
+        # Create new instance
+        config2 = BotConfig()
+        
+        # Values should be identical (loaded from same env)
+        assert config2.gpt_model == initial_model
+        assert config2.default_temperature == initial_temp
+        
+        # Overrides should not affect base config
+        overridden = config1.get_thread_config({"model": "different-model"})
+        assert overridden["model"] == "different-model"
+        assert config1.gpt_model == initial_model  # Original unchanged
+    
+    @pytest.mark.smoke
+    def test_smoke_basic_config_load(self, mock_env):
+        """Smoke test: Verify config can be instantiated and validated"""
+        try:
+            config = BotConfig()
+            assert config.validate() is True
+            assert config.openai_api_key is not None
+            assert config.slack_bot_token is not None
+        except Exception as e:
+            pytest.fail(f"Basic config loading failed: {e}")
+    
+    def test_diagnostic_config_values(self, mock_env):
+        """Diagnostic test: Log all config values for debugging"""
+        config = BotConfig()
+        
+        # Capture important values for debugging
+        diagnostic_info = {
+            "model": config.gpt_model,
+            "temperature": config.default_temperature,
+            "max_tokens": config.default_max_tokens,
+            "reasoning_effort": config.default_reasoning_effort,
+            "verbosity": config.default_verbosity,
+            "timeouts": {
+                "read": config.api_timeout_read,
+                "streaming_chunk": config.api_timeout_streaming_chunk
+            },
+            "features": {
+                "web_search": config.enable_web_search,
+                "streaming": config.enable_streaming,
+                "debug": config.debug_mode
+            }
+        }
+        
+        # This would help diagnose config issues
+        print(f"\nDiagnostic Config Info: {diagnostic_info}")
+        
+        # Verify critical values are present
+        assert diagnostic_info["model"] is not None
+        assert diagnostic_info["temperature"] > 0
+        assert diagnostic_info["max_tokens"] > 0
