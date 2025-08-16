@@ -465,13 +465,13 @@ class DatabaseManager(LoggerMixin):
             cursor = self.conn.execute("""
                 SELECT * FROM images 
                 WHERE thread_id = ? AND image_type = ?
-                ORDER BY created_at DESC
+                ORDER BY created_at ASC
             """, (thread_id, image_type))
         else:
             cursor = self.conn.execute("""
                 SELECT * FROM images 
                 WHERE thread_id = ?
-                ORDER BY created_at DESC
+                ORDER BY created_at ASC
             """, (thread_id,))
         
         images = []
