@@ -348,7 +348,8 @@ class SlackBot(BaseClient):
             self.app.client.chat_update(
                 channel=channel_id,
                 ts=message_id,
-                text=text
+                text=text,
+                mrkdwn=True  # Enable markdown parsing for italics/bold
             )
             return True
         except SlackApiError as e:
@@ -615,8 +616,14 @@ class SlackBot(BaseClient):
     def update_message_streaming(self, channel_id: str, message_id: str, text: str) -> Dict:
         """Updates a message with rate limit awareness"""
         try:
-            # Format text for Slack using markdown conversion
-            formatted_text = self.format_text(text)
+            # For messages that already contain Slack mrkdwn (like enhanced prompts with _italics_),
+            # skip the markdown conversion to avoid double-processing
+            if text.startswith("✨") or text.startswith("*Enhanced Prompt:*") or text.startswith("Enhancing your prompt:"):
+                # This is an enhanced prompt - it already has proper Slack formatting
+                formatted_text = text
+            else:
+                # Format text for Slack using markdown conversion
+                formatted_text = self.format_text(text)
             
             # Truncate if too long during streaming
             if len(formatted_text) > self.MAX_MESSAGE_LENGTH:
@@ -626,7 +633,8 @@ class SlackBot(BaseClient):
             result = self.app.client.chat_update(
                 channel=channel_id,
                 ts=message_id,
-                text=formatted_text
+                text=formatted_text,
+                mrkdwn=True  # Enable markdown parsing for italics/bold
             )
             
             # Return success status
@@ -648,7 +656,7 @@ class SlackBot(BaseClient):
                     except (ValueError, KeyError):
                         retry_after = None
                 
-                self.log_debug(f"Rate limited updating message in channel {channel_id}. Retry after: {retry_after}")
+                self.log_warning(f"🚨🚨🚨 HIT RATE LIMIT 429 🚨🚨🚨")
                 
                 return {
                     "success": False,
@@ -687,7 +695,7 @@ class SlackBot(BaseClient):
                 thread_id,
                 image_data.to_bytes(),
                 f"generated_image.{image_data.format}",
-                f"Generated image: {image_data.prompt}"
+                ""  # No caption - prompt already displayed via streaming
             )
             
             # Store the URL in the image data for tracking

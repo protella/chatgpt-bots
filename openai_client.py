@@ -200,7 +200,7 @@ class OpenAIClient(LoggerMixin):
         # Build request parameters
         request_params = {
             "model": model,
-            "input": messages,
+            "input": [{"role": msg["role"], "content": msg["content"]} for msg in messages],
             "tools": tools,
             "temperature": temperature,
             "max_output_tokens": max_tokens,
@@ -493,7 +493,7 @@ class OpenAIClient(LoggerMixin):
         # Build request parameters
         request_params = {
             "model": model,
-            "input": messages,
+            "input": [{"role": msg["role"], "content": msg["content"]} for msg in messages],
             "tools": tools,
             "temperature": temperature,
             "max_output_tokens": max_tokens,
@@ -889,7 +889,8 @@ class OpenAIClient(LoggerMixin):
         self,
         user_request: str,
         image_description: str,
-        conversation_history: Optional[List[Dict[str, Any]]] = None
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        stream_callback: Optional[Callable[[str], None]] = None
     ) -> str:
         """
         Enhance an image editing prompt using the analyzed image description
@@ -908,7 +909,7 @@ class OpenAIClient(LoggerMixin):
         # Add conversation history if it exists and has messages
         if conversation_history and len(conversation_history) > 0:
             context = "Previous Conversation:\n"
-            for msg in conversation_history[-6:]:  # Last 6 messages for context
+            for msg in conversation_history:  # Full conversation history per CLAUDE.md
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
                 
@@ -917,10 +918,7 @@ class OpenAIClient(LoggerMixin):
                     text_parts = [c.get("text", "") for c in content if c.get("type") == "input_text"]
                     content = " ".join(text_parts)
                 
-                # Truncate long messages
-                if len(content) > 150:
-                    content = content[:150] + "..."
-                
+                # Include full message content per CLAUDE.md - no truncation
                 context += f"{role}: {content}\n"
             
             context += f"\nImage Description:\n{image_description}\n\nUser Edit Request:\n{user_request}"
@@ -955,15 +953,45 @@ class OpenAIClient(LoggerMixin):
             else:
                 request_params["temperature"] = 0.7
             
-            response = self.client.responses.create(**request_params)
-            
-            enhanced = ""
-            if response.output:
-                for item in response.output:
-                    if hasattr(item, "content") and item.content:
-                        for content in item.content:
-                            if hasattr(content, "text"):
-                                enhanced += content.text
+            # Check if streaming callback provided
+            if stream_callback:
+                # Create streaming response
+                stream = self.client.responses.create(stream=True, **request_params)
+                enhanced = ""
+                
+                for event in stream:
+                    event_type = event.type if hasattr(event, 'type') else None
+                    
+                    if event_type in ["response.output_item.delta", "response.output_text.delta"]:
+                        # Extract text from delta event (same as in create_streaming_text_response)
+                        text_chunk = None
+                        
+                        # For response.output_text.delta, the text is directly in event.delta
+                        if event_type == "response.output_text.delta" and hasattr(event, 'delta'):
+                            text_chunk = event.delta
+                        # For response.output_item.delta, need to dig deeper
+                        elif hasattr(event, 'delta') and event.delta:
+                            if hasattr(event.delta, 'content') and event.delta.content:
+                                for content in event.delta.content:
+                                    if hasattr(content, 'text') and content.text:
+                                        text_chunk = content.text
+                                        break
+                        
+                        if text_chunk:
+                            enhanced += text_chunk
+                            if stream_callback:
+                                stream_callback(text_chunk)
+            else:
+                # Non-streaming fallback
+                response = self.client.responses.create(**request_params)
+                
+                enhanced = ""
+                if response.output:
+                    for item in response.output:
+                        if hasattr(item, "content") and item.content:
+                            for content in item.content:
+                                if hasattr(content, "text"):
+                                    enhanced += content.text
             
             enhanced = enhanced.strip()
             
@@ -978,19 +1006,23 @@ class OpenAIClient(LoggerMixin):
                 return enhanced
             else:
                 # Fallback to simple combination
-                return f"Edit the image: {image_description}. Change: {user_request}"
+                # Return just the enhanced description without prefix
+                return f"{image_description}. Change: {user_request}"
             
         except Exception as e:
             self.log_warning(f"Failed to enhance edit prompt: {e}")
-            return f"Edit the image: {image_description}. Change: {user_request}"
+            # Return just the enhanced description without prefix
+            return f"{image_description}. Change: {user_request}"
     
-    def _enhance_image_prompt(self, prompt: str, conversation_history: Optional[List[Dict[str, Any]]] = None) -> str:
+    def _enhance_image_prompt(self, prompt: str, conversation_history: Optional[List[Dict[str, Any]]] = None, 
+                             stream_callback: Optional[Callable[[str], None]] = None) -> str:
         """
         Enhance an image generation prompt for better results
         
         Args:
             prompt: Original user prompt
             conversation_history: Recent conversation messages for context
+            stream_callback: Optional callback for streaming the enhancement
         
         Returns:
             Enhanced prompt
@@ -999,8 +1031,8 @@ class OpenAIClient(LoggerMixin):
         context = "Conversation History:\n"
         
         if conversation_history:
-            # Include recent messages for context (last 6-8 messages)
-            for msg in conversation_history[-8:]:
+            # Include full conversation history per CLAUDE.md
+            for msg in conversation_history:
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
                 
@@ -1009,10 +1041,7 @@ class OpenAIClient(LoggerMixin):
                     text_parts = [c.get("text", "") for c in content if c.get("type") == "input_text"]
                     content = " ".join(text_parts)
                 
-                # Truncate long messages
-                if len(content) > 200:
-                    content = content[:200] + "..."
-                
+                # Include full message content per CLAUDE.md - no truncation
                 context += f"{role}: {content}\n"
         
         context += f"\nCurrent User Request: {prompt}"
@@ -1026,38 +1055,54 @@ class OpenAIClient(LoggerMixin):
         print("="*80)
         
         try:
-            # Build request parameters
-            request_params = {
-                "model": config.utility_model,
-                "input": [
-                    {"role": "developer", "content": IMAGE_GEN_SYSTEM_PROMPT},
-                    {"role": "user", "content": context}
-                ],
-                "max_output_tokens": 500,  # Increased for detailed image prompts
-                "store": False,
-            }
-            
-            # Check if we're using a GPT-5 reasoning model
-            if config.utility_model.startswith("gpt-5") and "chat" not in config.utility_model.lower():
-                # GPT-5 reasoning model - use fixed temperature and reasoning parameters
-                request_params["temperature"] = 1.0  # Fixed for reasoning models
-                request_params["reasoning"] = {"effort": config.utility_reasoning_effort}  # Use utility config
-                request_params["text"] = {"verbosity": config.utility_verbosity}  # Use utility config
+            # If streaming callback provided, use streaming response
+            if stream_callback:
+                # Use streaming version for real-time feedback
+                enhanced = self.create_streaming_response(
+                    messages=[{"role": "user", "content": context}],
+                    stream_callback=stream_callback,
+                    model=config.utility_model,
+                    temperature=0.7 if "chat" in config.utility_model.lower() or not config.utility_model.startswith("gpt-5") else 1.0,
+                    max_tokens=500,
+                    system_prompt=IMAGE_GEN_SYSTEM_PROMPT,
+                    reasoning_effort=config.utility_reasoning_effort if config.utility_model.startswith("gpt-5") and "chat" not in config.utility_model.lower() else None,
+                    verbosity=config.utility_verbosity if config.utility_model.startswith("gpt-5") and "chat" not in config.utility_model.lower() else None,
+                    store=False
+                )
             else:
-                # GPT-4 or other models - use standard parameters
-                request_params["temperature"] = 0.7  # Moderate temperature for creative prompts
-            
-            response = self.client.responses.create(**request_params)
-            
-            enhanced = ""
-            if response.output:
-                for item in response.output:
-                    if hasattr(item, "content") and item.content:
-                        for content in item.content:
-                            if hasattr(content, "text"):
-                                enhanced += content.text
-            
-            enhanced = enhanced.strip()
+                # Use non-streaming version
+                # Build request parameters
+                request_params = {
+                    "model": config.utility_model,
+                    "input": [
+                        {"role": "developer", "content": IMAGE_GEN_SYSTEM_PROMPT},
+                        {"role": "user", "content": context}
+                    ],
+                    "max_output_tokens": 500,  # Increased for detailed image prompts
+                    "store": False,
+                }
+                
+                # Check if we're using a GPT-5 reasoning model
+                if config.utility_model.startswith("gpt-5") and "chat" not in config.utility_model.lower():
+                    # GPT-5 reasoning model - use fixed temperature and reasoning parameters
+                    request_params["temperature"] = 1.0  # Fixed for reasoning models
+                    request_params["reasoning"] = {"effort": config.utility_reasoning_effort}  # Use utility config
+                    request_params["text"] = {"verbosity": config.utility_verbosity}  # Use utility config
+                else:
+                    # GPT-4 or other models - use standard parameters
+                    request_params["temperature"] = 0.7  # Moderate temperature for creative prompts
+                
+                response = self.client.responses.create(**request_params)
+                
+                enhanced = ""
+                if response.output:
+                    for item in response.output:
+                        if hasattr(item, "content") and item.content:
+                            for content in item.content:
+                                if hasattr(content, "text"):
+                                    enhanced += content.text
+                
+                enhanced = enhanced.strip()
             
             # Log the enhanced prompt result
             print("\n" + "="*80)

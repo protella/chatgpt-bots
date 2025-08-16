@@ -256,9 +256,11 @@ class MessageProcessor(LoggerMixin):
                     intent = "new_image"
                     self.log_debug("No recent images found, treating ambiguous as new generation")
             
-            # Update thinking indicator if generating/editing image
+            # Update thinking indicator if generating/editing image (only for non-streaming)
             if intent in ["new_image", "edit_image"] and thinking_id:
-                self._update_thinking_for_image(client, message.channel_id, thinking_id)
+                # Only show the image thinking message if we're not streaming
+                if not (hasattr(client, 'supports_streaming') and client.supports_streaming() and config.enable_streaming):
+                    self._update_thinking_for_image(client, message.channel_id, thinking_id)
             
             # Generate response based on intent
             if intent == "new_image":
@@ -291,17 +293,8 @@ class MessageProcessor(LoggerMixin):
                         message
                     )
             elif intent == "vision":
-                # Update status to show we're analyzing images (handle plural)
-                if image_inputs:
-                    image_count = len(image_inputs)
-                    if image_count == 1:
-                        status_msg = f"{config.analyze_emoji} Analyzing image..."
-                    else:
-                        status_msg = f"{config.analyze_emoji} Analyzing {image_count} images..."
-                else:
-                    status_msg = f"{config.analyze_emoji} Looking for images to analyze..."
-                self._update_status(client, message.channel_id, thinking_id, status_msg)
                 # Vision analysis - but check if we actually have images
+                # Don't update status here, let _handle_vision_analysis manage the status flow
                 if image_inputs:
                     # User uploaded images for vision analysis
                     response = self._handle_vision_analysis(message.text, image_inputs, thread_state, message.attachments, 
@@ -430,7 +423,22 @@ class MessageProcessor(LoggerMixin):
         )
         
         # If thread has no messages, rebuild from platform
-        if not thread_state.messages:
+        # Also rebuild if we have messages but no images in DB (to extract image URLs)
+        should_rebuild = not thread_state.messages
+        if not should_rebuild and self.db:
+            thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+            db_images = self.db.find_thread_images(thread_key)
+            if not db_images and thread_state.messages:
+                # We have messages but no images - check if there should be images
+                for msg in thread_state.messages:
+                    if msg.get("role") == "assistant":
+                        metadata = msg.get("metadata", {})
+                        if metadata.get("type") in ["image_generation", "image_edit"]:
+                            should_rebuild = True
+                            self.log_info("Found image generation messages without DB images - rebuilding to extract URLs")
+                            break
+        
+        if should_rebuild:
             self.log_info(f"Rebuilding thread state for {message.thread_id}")
             
             # Get history from platform
@@ -735,8 +743,22 @@ class MessageProcessor(LoggerMixin):
         
         for msg in thread_state.messages:
             if msg.get("role") == "assistant":
+                metadata = msg.get("metadata", {})
                 content = msg.get("content", "")
-                if isinstance(content, str):
+                
+                # First check metadata (new approach)
+                if metadata.get("type") in ["image_generation", "image_edit", "image_analysis"]:
+                    url = metadata.get("url")
+                    prompt = metadata.get("prompt", content)
+                    image_type = metadata.get("type", "").replace("_", " ")
+                    
+                    image_registry.append({
+                        "url": url if url else "[Pending upload]",
+                        "description": prompt,
+                        "type": image_type
+                    })
+                # Fallback to string matching for backward compatibility
+                elif isinstance(content, str):
                     # Check for any image markers
                     image_markers = ["Generated image:", "Edited image:", "Analyzed uploaded image:"]
                     for marker in image_markers:
@@ -773,10 +795,23 @@ class MessageProcessor(LoggerMixin):
     
     def _has_recent_image(self, thread_state) -> bool:
         """Check if there are recent images in the conversation"""
-        # Check last few messages for image generation breadcrumbs or uploaded images
+        # First check the database for ALL images in this thread (no limit)
+        if self.db:
+            thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+            thread_images = self.db.find_thread_images(thread_key)
+            if thread_images:
+                self.log_debug(f"Found {len(thread_images)} images in DB for thread {thread_key}")
+                return True
+        
+        # Fallback: Check last few messages for image generation breadcrumbs or uploaded images
         for msg in thread_state.messages[-5:]:  # Check last 5 messages
             if msg.get("role") == "assistant":
                 content = msg.get("content", "")
+                # Check metadata for image generation
+                metadata = msg.get("metadata", {})
+                if metadata.get("type") == "image_generation":
+                    return True
+                # Fallback to text markers
                 if isinstance(content, str):
                     # Look for image generation markers
                     if any(marker in content.lower() for marker in [
@@ -1103,7 +1138,7 @@ class MessageProcessor(LoggerMixin):
                         self.log_error(f"Error updating file search status: {e}")
                 elif tool_type == "image_generation" and not tool_states["image_generation"]:
                     tool_states["image_generation"] = True
-                    status_msg = f"{config.circle_loader_emoji} Generating image..."
+                    status_msg = f"{config.circle_loader_emoji} Generating image. This may take up to a minute..."
                     try:
                         result = client.update_message_streaming(message.channel_id, message_id, status_msg)
                         if result["success"]:
@@ -1334,8 +1369,11 @@ class MessageProcessor(LoggerMixin):
             # Try to remove the loading indicator if we had a message_id
             if message_id and hasattr(client, 'update_message_streaming'):
                 try:
-                    # Send whatever text we have without the loading indicator
-                    error_text = buffer.get_complete_text() if buffer.has_content() else "An error occurred during streaming."
+                    # Send whatever text we have without the loading indicator, or a formatted error message
+                    if buffer.has_content():
+                        error_text = buffer.get_complete_text()
+                    else:
+                        error_text = f"{config.error_emoji} *Streaming interrupted*\n\nThe response was interrupted. I'll try again without streaming..."
                     client.update_message_streaming(message.channel_id, message_id, error_text)
                 except Exception as cleanup_error:
                     self.log_debug(f"Could not remove loading indicator: {cleanup_error}")
@@ -1382,13 +1420,6 @@ class MessageProcessor(LoggerMixin):
         
         self.log_info(f"Analyzing {len(images_to_analyze)} image(s) with prompt: {user_text[:100]}...")
         
-        # Update status with proper pluralization
-        if len(images_to_analyze) == 1:
-            status_msg = "Analyzing your image..."
-        else:
-            status_msg = f"Analyzing {len(images_to_analyze)} images..."
-        self._update_status(client, channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
-        
         # Single vision API call with both analysis context and user question
         analysis_result = None
         
@@ -1413,11 +1444,28 @@ class MessageProcessor(LoggerMixin):
             # Inject stored image analyses for better context
             enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state)
             
+            # Update status to show we're preparing the analysis
+            self._update_status(client, channel_id, thinking_id, "Preparing analysis...", emoji=config.analyze_emoji)
+            
+            # Enhance the vision prompt first
+            enhanced_question = user_question
+            if user_question:  # Only enhance if there's actually a question
+                enhanced_question = self.openai_client._enhance_vision_prompt(user_question)
+                self.log_debug(f"Enhanced vision prompt: {enhanced_question[:100]}...")
+            
+            # Update status to show we're analyzing the image(s)
+            if len(images_to_analyze) == 1:
+                status_msg = "Analyzing your image..."
+            else:
+                status_msg = f"Analyzing {len(images_to_analyze)} images..."
+            self._update_status(client, channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
+            
+            # Now call analyze_images with the pre-enhanced prompt
             analysis_result = self.openai_client.analyze_images(
                 images=images_to_analyze,
-                question=user_question,
+                question=enhanced_question,
                 detail="high",
-                enhance_prompt=True,  # Use vision enhancement for natural responses
+                enhance_prompt=False,  # Already enhanced
                 conversation_history=enhanced_messages,  # Pass enhanced conversation with image analyses
                 system_prompt=system_prompt  # Pass platform system prompt
             )
@@ -1509,10 +1557,11 @@ class MessageProcessor(LoggerMixin):
     
     def _handle_image_generation(self, prompt: str, thread_state, client: BaseClient, 
                                 channel_id: str, thinking_id: Optional[str], message: Message) -> Response:
-        """Handle image generation request"""
+        """Handle image generation request with streaming enhancement"""
         self.log_info(f"Generating image for prompt: {prompt[:100]}...")
         
-        self._update_status(client, channel_id, thinking_id, "Enhancing your prompt...")
+        # Initialize response metadata
+        response_metadata = {}
         
         # Get thread config
         thread_config = config.get_thread_config(thread_state.config_overrides)
@@ -1520,16 +1569,103 @@ class MessageProcessor(LoggerMixin):
         # Inject stored image analyses for style consistency
         enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state)
         
-        # Generate image with conversation context for better prompt enhancement
-        self._update_status(client, channel_id, thinking_id, "Creating your image...", emoji=config.circle_loader_emoji)
-        
-        image_data = self.openai_client.generate_image(
-            prompt=prompt,
-            size=thread_config.get("image_size"),
-            quality=thread_config.get("image_quality"),
-            enhance_prompt=True,
-            conversation_history=enhanced_messages  # Use enhanced conversation with image analyses
-        )
+        # Check if streaming is supported
+        if hasattr(client, 'supports_streaming') and client.supports_streaming() and config.enable_streaming:
+            # Stream the enhancement to user with proper rate limiting
+            streaming_config = client.get_streaming_config() if hasattr(client, 'get_streaming_config') else {}
+            buffer = StreamingBuffer(
+                update_interval=streaming_config.get("update_interval", 2.0),
+                buffer_size_threshold=streaming_config.get("buffer_size", 500),
+                min_update_interval=streaming_config.get("min_interval", 1.0)
+            )
+            
+            rate_limiter = RateLimitManager(
+                base_interval=streaming_config.get("update_interval", 2.0),
+                failure_threshold=streaming_config.get("circuit_breaker_threshold", 5),
+                cooldown_seconds=streaming_config.get("circuit_breaker_cooldown", 60)
+            )
+            
+            
+            def enhancement_callback(chunk: str):
+                buffer.add_chunk(chunk)
+                # Only update if both buffer says it's time AND rate limiter allows it
+                if buffer.should_update() and rate_limiter.can_make_request():
+                    rate_limiter.record_request_attempt()
+                    display_text = f"*Enhanced Prompt:* ✨ _{buffer.get_complete_text()}_ {config.loading_ellipse_emoji}"
+                    
+                    result = client.update_message_streaming(channel_id, thinking_id, display_text)
+                    
+                    if result["success"]:
+                        rate_limiter.record_success()
+                        buffer.mark_updated()
+                        buffer.update_interval_setting(rate_limiter.get_current_interval())
+                    else:
+                        if result["rate_limited"]:
+                            if result["retry_after"]:
+                                rate_limiter.set_retry_after(result["retry_after"])
+                            rate_limiter.record_failure(is_rate_limit=True)
+                            
+                            # Check if circuit breaker opened
+                            if not rate_limiter.is_streaming_enabled():
+                                self.log_warning("Image enhancement rate limited - circuit breaker opened")
+                        else:
+                            rate_limiter.record_failure(is_rate_limit=False)
+            
+            # Enhance prompt with streaming (returns the complete enhanced text)
+            enhanced_prompt = self.openai_client._enhance_image_prompt(
+                prompt=prompt,
+                conversation_history=enhanced_messages,
+                stream_callback=enhancement_callback
+            )
+            
+            # Show the final enhanced prompt
+            if enhanced_prompt and thinking_id:
+                enhanced_text = f"*Enhanced Prompt:* ✨ _{enhanced_prompt}_"
+                client.update_message_streaming(channel_id, thinking_id, enhanced_text)
+                # Mark that we should NOT touch this message again
+                response_metadata["prompt_message_id"] = thinking_id
+            
+            # Create a NEW message for generating status - don't touch the enhanced prompt!
+            generating_id = client.send_thinking_indicator(channel_id, thread_state.thread_ts)
+            self._update_status(client, channel_id, generating_id, 
+                              "Generating image. This may take up to a minute...", 
+                              emoji=config.circle_loader_emoji)
+            # Track the status message ID
+            response_metadata["status_message_id"] = generating_id
+            
+            # Generate image with already-enhanced prompt
+            image_data = self.openai_client.generate_image(
+                prompt=enhanced_prompt,
+                size=thread_config.get("image_size"),
+                quality=thread_config.get("image_quality"),
+                enhance_prompt=False,  # Already enhanced!
+                conversation_history=None  # Not needed since we enhanced already
+            )
+            
+            # After image is generated, update message to show just the enhanced prompt
+            # (remove the "Generating image..." status) - but respect rate limits
+            if enhanced_prompt and thinking_id and rate_limiter.can_make_request():
+                result = client.update_message_streaming(channel_id, thinking_id, f"*Enhanced Prompt:* ✨ _{enhanced_prompt}_")
+                if result["success"]:
+                    rate_limiter.record_success()
+                else:
+                    if result["rate_limited"]:
+                        rate_limiter.record_failure(is_rate_limit=True)
+                        self.log_debug("Couldn't clean up image gen status due to rate limit")
+        else:
+            # Non-streaming fallback
+            self._update_status(client, channel_id, thinking_id, "Enhancing your prompt...")
+            
+            # Generate image with conversation context for better prompt enhancement
+            self._update_status(client, channel_id, thinking_id, "Creating your image. This may take up to a minute...", emoji=config.circle_loader_emoji)
+            
+            image_data = self.openai_client.generate_image(
+                prompt=prompt,
+                size=thread_config.get("image_size"),
+                quality=thread_config.get("image_quality"),
+                enhance_prompt=True,
+                conversation_history=enhanced_messages  # Use enhanced conversation with image analyses
+            )
         
         # Store in asset ledger
         asset_ledger = self.thread_manager.get_or_create_asset_ledger(thread_state.thread_ts)
@@ -1542,16 +1678,32 @@ class MessageProcessor(LoggerMixin):
             thread_id=thread_key
         )
         
-        # Add breadcrumb to thread state with the enhanced prompt used
+        # Add breadcrumb to thread state with metadata
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
         message_ts = message.metadata.get("ts") if message.metadata else None
         thread_state.add_message("user", prompt, db=self.db, thread_key=thread_key, message_ts=message_ts)
-        # URL will be added after upload, for now just the prompt
-        thread_state.add_message("assistant", f"Generated image: {image_data.prompt}", db=self.db, thread_key=thread_key)
+        # Store enhanced prompt with metadata for new image tracking
+        thread_state.add_message(
+            "assistant", 
+            image_data.prompt,  # Just the enhanced prompt, no "Generated image:" prefix
+            db=self.db, 
+            thread_key=thread_key,
+            metadata={
+                "type": "image_generation",
+                "prompt": image_data.prompt,
+                "url": None  # Will be updated after upload
+            }
+        )
         
+        # Mark as streamed if we used streaming for the enhancement
+        # Note: response_metadata already initialized and populated above
+        if hasattr(client, 'supports_streaming') and client.supports_streaming() and config.enable_streaming:
+            response_metadata["streamed"] = True
+            
         return Response(
             type="image",
-            content=image_data
+            content=image_data,
+            metadata=response_metadata
         )
     
     def _find_target_image(self, user_text: str, thread_state, client: BaseClient) -> Optional[str]:
@@ -1589,40 +1741,21 @@ class MessageProcessor(LoggerMixin):
             self.log_debug(f"Only one image found, using it: {all_available_images[0]['url']}")
             return all_available_images[0]["url"]
         
-        # Check for explicit references
-        user_text_lower = user_text.lower()
-        
-        # Try ordinal references
-        ordinals = {
-            "first": 0, "1st": 0, "second": 1, "2nd": 1, 
-            "third": 2, "3rd": 2, "last": -1, "latest": -1,
-            "previous": -2, "recent": -1
-        }
-        
-        for word, index in ordinals.items():
-            if word in user_text_lower:
-                try:
-                    url = all_available_images[index]["url"]
-                    self.log_debug(f"Found ordinal reference '{word}', using image: {url}")
-                    return url
-                except IndexError:
-                    pass
-        
         # If ambiguous and multiple images, use utility model to match
+        # Let natural language processing handle ALL references including ordinals
         if len(all_available_images) > 1:
-            # Build context for matching using DB analyses
+            # Build context for matching using DB analyses - FULL context per CLAUDE.md
             context = "Available images:\n"
             for i, img in enumerate(all_available_images, 1):
                 context += f"{i}. {img['type'].capitalize()} image"
                 if img['description']:
-                    context += f": {img['description'][:100]}..."
+                    context += f": {img['description']}"  # Full description, no truncation
                 context += "\n"
                 
                 # Include analysis if available for natural language matching
                 if img.get('analysis'):
-                    # Include key visual elements from analysis for better matching
-                    analysis_snippet = img['analysis'][:200]
-                    context += f"   Visual details: {analysis_snippet}...\n"
+                    # Include FULL visual analysis for better matching - no truncation per CLAUDE.md
+                    context += f"   Visual details: {img['analysis']}\n"
             
             context += f"\nUser reference: '{user_text}'\n"
             context += "Which image number best matches the user's reference? Respond with just the number."
@@ -1666,12 +1799,15 @@ class MessageProcessor(LoggerMixin):
         message: Message
     ) -> Response:
         """Handle image modification request by finding and editing the target image"""
-        self._update_status(client, channel_id, thinking_id, "Finding the image to edit...", emoji=config.web_search_emoji)
+        # Don't update status yet - we might fall back to generation
         
         # Try to find target image URL from conversation
         target_url = self._find_target_image(text, thread_state, client)
         
         if target_url:
+            # Found an image to edit - update status
+            self._update_status(client, channel_id, thinking_id, "Finding the image to edit...", emoji=config.web_search_emoji)
+            
             # Download the image from Slack
             self.log_info(f"Found target image URL: {target_url}")
             self._update_status(client, channel_id, thinking_id, "Downloading the image...")
@@ -1697,7 +1833,6 @@ class MessageProcessor(LoggerMixin):
                     
                     # Prepare for edit
                     self.log_info(f"Editing existing image with request: {text}")
-                    self._update_status(client, channel_id, thinking_id, "Enhancing your edit request...")
                     
                     # Get thread config
                     thread_config = config.get_thread_config(thread_state.config_overrides)
@@ -1705,31 +1840,128 @@ class MessageProcessor(LoggerMixin):
                     # Inject stored image analyses for style matching
                     enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state)
                     
-                    # Edit the image
-                    self._update_status(client, channel_id, thinking_id, "Editing your image...", emoji=config.circle_loader_emoji)
+                    # Check if streaming is supported for enhancement
+                    response_metadata = {}
+                    if hasattr(client, 'supports_streaming') and client.supports_streaming() and config.enable_streaming:
+                        # Stream the enhancement to user with proper rate limiting
+                        from streaming.buffer import StreamingBuffer
+                        from streaming import RateLimitManager
+                        
+                        streaming_config = client.get_streaming_config() if hasattr(client, 'get_streaming_config') else {}
+                        buffer = StreamingBuffer(
+                            update_interval=streaming_config.get("update_interval", 2.0),
+                            buffer_size_threshold=streaming_config.get("buffer_size", 500),
+                            min_update_interval=streaming_config.get("min_interval", 1.0)
+                        )
+                        
+                        rate_limiter = RateLimitManager(
+                            base_interval=streaming_config.get("update_interval", 2.0),
+                            failure_threshold=streaming_config.get("circuit_breaker_threshold", 5),
+                            cooldown_seconds=streaming_config.get("circuit_breaker_cooldown", 60)
+                        )
+                        
+                        def enhancement_callback(chunk: str):
+                            buffer.add_chunk(chunk)
+                            # Only update if both buffer says it's time AND rate limiter allows it
+                            if buffer.should_update() and rate_limiter.can_make_request():
+                                rate_limiter.record_request_attempt()
+                                display_text = f"*Enhanced Prompt:* ✨ _{buffer.get_complete_text()}_ {config.loading_ellipse_emoji}"
+                                
+                                result = client.update_message_streaming(channel_id, thinking_id, display_text)
+                                
+                                if result["success"]:
+                                    rate_limiter.record_success()
+                                    buffer.mark_updated()
+                                    buffer.update_interval_setting(rate_limiter.get_current_interval())
+                                else:
+                                    if result["rate_limited"]:
+                                        if result["retry_after"]:
+                                            rate_limiter.set_retry_after(result["retry_after"])
+                                        rate_limiter.record_failure(is_rate_limit=True)
+                                        
+                                        # Check if circuit breaker opened
+                                        if not rate_limiter.is_streaming_enabled():
+                                            self.log_warning("Image edit enhancement rate limited - circuit breaker opened")
+                                    else:
+                                        rate_limiter.record_failure(is_rate_limit=False)
+                        
+                        # First enhance the prompt with streaming
+                        enhanced_edit_prompt = self.openai_client._enhance_image_edit_prompt(
+                            user_request=text,
+                            image_description=image_description,
+                            conversation_history=enhanced_messages,
+                            stream_callback=enhancement_callback
+                        )
+                        
+                        # Show the final enhanced prompt
+                        if enhanced_edit_prompt and thinking_id:
+                            enhanced_text = f"*Enhanced Prompt:* ✨ _{enhanced_edit_prompt}_"
+                            client.update_message_streaming(channel_id, thinking_id, enhanced_text)
+                            # Mark that we should NOT touch this message again
+                            response_metadata["prompt_message_id"] = thinking_id
+                        
+                        # Create a NEW message for editing status - don't touch the enhanced prompt!
+                        editing_id = client.send_thinking_indicator(channel_id, thread_state.thread_ts)
+                        self._update_status(client, channel_id, editing_id, 
+                                          "Editing your image. This may take up to a minute...", 
+                                          emoji=config.circle_loader_emoji)
+                        # Track the status message ID
+                        response_metadata["status_message_id"] = editing_id
+                        
+                        # Mark as streamed for main.py
+                        response_metadata["streamed"] = True
+                        
+                        # Use the edit_image API with the pre-enhanced prompt
+                        edited_image = self.openai_client.edit_image(
+                            input_images=[base64_data],
+                            prompt=enhanced_edit_prompt,
+                            image_description=None,  # Already used for enhancement
+                            input_mimetypes=["image/png"],
+                            input_fidelity=thread_config.get("input_fidelity", "high"),
+                            background=thread_config.get("image_background", "auto"),
+                            output_format=thread_config.get("image_format", "png"),
+                            output_compression=thread_config.get("image_compression", 100),
+                            enhance_prompt=False,  # Already enhanced!
+                            conversation_history=None  # Not needed since we enhanced already
+                        )
+                    else:
+                        # Non-streaming fallback
+                        self._update_status(client, channel_id, thinking_id, "Enhancing your edit request...")
+                        self._update_status(client, channel_id, thinking_id, "Editing your image. This may take up to a minute...", emoji=config.circle_loader_emoji)
+                        
+                        edited_image = self.openai_client.edit_image(
+                            input_images=[base64_data],
+                            prompt=text,
+                            image_description=image_description,
+                            input_mimetypes=["image/png"],
+                            input_fidelity=thread_config.get("input_fidelity", "high"),
+                            background=thread_config.get("image_background", "auto"),
+                            output_format=thread_config.get("image_format", "png"),
+                            output_compression=thread_config.get("image_compression", 100),
+                            enhance_prompt=True,
+                            conversation_history=enhanced_messages  # Pass enhanced conversation with image analyses
+                        )
                     
-                    edited_image = self.openai_client.edit_image(
-                        input_images=[base64_data],
-                        prompt=text,
-                        image_description=image_description,
-                        input_mimetypes=["image/png"],
-                        input_fidelity=thread_config.get("input_fidelity", "high"),
-                        background=thread_config.get("image_background", "auto"),
-                        output_format=thread_config.get("image_format", "png"),
-                        output_compression=thread_config.get("image_compression", 100),
-                        enhance_prompt=True,
-                        conversation_history=enhanced_messages  # Pass enhanced conversation with image analyses
-                    )
-                    
-                    # Add breadcrumbs
+                    # Add breadcrumbs with metadata
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                     message_ts = message.metadata.get("ts") if message.metadata else None
                     thread_state.add_message("user", text, db=self.db, thread_key=thread_key, message_ts=message_ts)
-                    thread_state.add_message("assistant", f"Edited image: {edited_image.prompt}", db=self.db, thread_key=thread_key)
+                    thread_state.add_message(
+                        "assistant", 
+                        edited_image.prompt,
+                        db=self.db, 
+                        thread_key=thread_key,
+                        metadata={
+                            "type": "image_edit",
+                            "prompt": edited_image.prompt,
+                            "url": None  # Will be updated after upload
+                        }
+                    )
                     
                     return Response(
                         type="image",
-                        content=edited_image
+                        content=edited_image,
+                        metadata=response_metadata
                     )
                 else:
                     self.log_warning(f"Failed to download image from URL: {target_url}")
@@ -1854,7 +2086,7 @@ class MessageProcessor(LoggerMixin):
             # Don't show the analysis - just update status to show we're editing
             # The analysis is only used internally for better edit quality
             if thinking_id:
-                self._update_status(client, channel_id, thinking_id, "Editing your image...", emoji=config.circle_loader_emoji)
+                self._update_status(client, channel_id, thinking_id, "Editing your image. This may take up to a minute...", emoji=config.circle_loader_emoji)
             
             # Store the description and user request separately for clean enhancement
             image_analysis = image_description
@@ -1877,27 +2109,132 @@ class MessageProcessor(LoggerMixin):
         # Inject stored image analyses for style matching
         enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state) if thread_state.messages else None
         
-        # Use the edit_image API with separated inputs
-        try:
+        # Check if streaming is supported for enhancement
+        response_metadata = {}
+        if hasattr(client, 'supports_streaming') and client.supports_streaming() and config.enable_streaming:
+            # Stream the enhancement to user with proper rate limiting
+            from streaming.buffer import StreamingBuffer
+            from streaming import RateLimitManager
             
-            image_data = self.openai_client.edit_image(
-                input_images=input_images,
-                input_mimetypes=input_mimetypes,
-                prompt=user_edit_request,  # Just the user's request
-                image_description=image_analysis,  # The analyzed description
-                input_fidelity=thread_config.get("input_fidelity", "high"),
-                background=thread_config.get("image_background", "auto"),
-                output_format=thread_config.get("image_format", "png"),
-                output_compression=thread_config.get("image_compression", 100),
-                enhance_prompt=True,
-                conversation_history=enhanced_messages  # Pass enhanced conversation with image analyses
+            streaming_config = client.get_streaming_config() if hasattr(client, 'get_streaming_config') else {}
+            buffer = StreamingBuffer(
+                update_interval=streaming_config.get("update_interval", 2.0),
+                buffer_size_threshold=streaming_config.get("buffer_size", 500),
+                min_update_interval=streaming_config.get("min_interval", 1.0)
             )
-        except Exception as e:
-            self.log_error(f"Error editing image: {e}")
-            return Response(
-                type="error",
-                content=f"Failed to edit image: {str(e)}"
+            
+            rate_limiter = RateLimitManager(
+                base_interval=streaming_config.get("update_interval", 2.0),
+                failure_threshold=streaming_config.get("circuit_breaker_threshold", 5),
+                cooldown_seconds=streaming_config.get("circuit_breaker_cooldown", 60)
             )
+            
+            
+            def enhancement_callback(chunk: str):
+                buffer.add_chunk(chunk)
+                # Only update if both buffer says it's time AND rate limiter allows it
+                if buffer.should_update() and rate_limiter.can_make_request():
+                    rate_limiter.record_request_attempt()
+                    display_text = f"*Enhanced Prompt:* ✨ _{buffer.get_complete_text()}_ {config.loading_ellipse_emoji}"
+                    
+                    result = client.update_message_streaming(channel_id, thinking_id, display_text)
+                    
+                    if result["success"]:
+                        rate_limiter.record_success()
+                        buffer.mark_updated()
+                        buffer.update_interval_setting(rate_limiter.get_current_interval())
+                    else:
+                        if result["rate_limited"]:
+                            if result["retry_after"]:
+                                rate_limiter.set_retry_after(result["retry_after"])
+                            rate_limiter.record_failure(is_rate_limit=True)
+                            
+                            # Check if circuit breaker opened
+                            if not rate_limiter.is_streaming_enabled():
+                                self.log_warning("Image edit enhancement rate limited - circuit breaker opened")
+                        else:
+                            rate_limiter.record_failure(is_rate_limit=False)
+            
+            # First enhance the prompt with streaming
+            enhanced_edit_prompt = self.openai_client._enhance_image_edit_prompt(
+                user_request=user_edit_request,
+                image_description=image_analysis,
+                conversation_history=enhanced_messages,
+                stream_callback=enhancement_callback
+            )
+            
+            # Show the final enhanced prompt
+            if enhanced_edit_prompt and thinking_id:
+                enhanced_text = f"Enhanced Prompt: ✨ _{enhanced_edit_prompt}_"
+                client.update_message_streaming(channel_id, thinking_id, enhanced_text)
+                # Mark that we should NOT touch this message again
+                response_metadata["prompt_message_id"] = thinking_id
+            
+            # Create a NEW message for editing status - don't touch the enhanced prompt!
+            editing_id = client.send_thinking_indicator(channel_id, thread_state.thread_ts)
+            self._update_status(client, channel_id, editing_id, 
+                              "Generating edited image. This may take up to a minute...", 
+                              emoji=config.circle_loader_emoji)
+            # Track the status message ID
+            response_metadata["status_message_id"] = editing_id
+            
+            # Mark as streamed for main.py
+            response_metadata["streamed"] = True
+            
+            # Use the edit_image API with the pre-enhanced prompt
+            try:
+                image_data = self.openai_client.edit_image(
+                    input_images=input_images,
+                    input_mimetypes=input_mimetypes,
+                    prompt=enhanced_edit_prompt,  # Use the pre-enhanced prompt
+                    image_description=None,  # Don't pass description since we already enhanced
+                    input_fidelity=thread_config.get("input_fidelity", "high"),
+                    background=thread_config.get("image_background", "auto"),
+                    output_format=thread_config.get("image_format", "png"),
+                    output_compression=thread_config.get("image_compression", 100),
+                    enhance_prompt=False,  # Already enhanced!
+                    conversation_history=None  # Not needed since already enhanced
+                )
+                
+                # After edit is complete, update message to show just the enhanced prompt
+                # (remove the "Generating edited image..." status) - but respect rate limits
+                if enhanced_edit_prompt and thinking_id and rate_limiter.can_make_request():
+                    result = client.update_message_streaming(channel_id, thinking_id, f"*Enhanced Prompt:* ✨ _{enhanced_edit_prompt}_")
+                    if result["success"]:
+                        rate_limiter.record_success()
+                    else:
+                        if result["rate_limited"]:
+                            rate_limiter.record_failure(is_rate_limit=True)
+                            self.log_debug("Couldn't clean up image edit status due to rate limit")
+                    
+            except Exception as e:
+                self.log_error(f"Error editing image: {e}")
+                return Response(
+                    type="error",
+                    content=f"Failed to edit image: {str(e)}"
+                )
+        else:
+            # Non-streaming fallback
+            # Use the edit_image API with separated inputs
+            try:
+                image_data = self.openai_client.edit_image(
+                    input_images=input_images,
+                    input_mimetypes=input_mimetypes,
+                    prompt=user_edit_request,  # Just the user's request
+                    image_description=image_analysis,  # The analyzed description
+                    input_fidelity=thread_config.get("input_fidelity", "high"),
+                    background=thread_config.get("image_background", "auto"),
+                    output_format=thread_config.get("image_format", "png"),
+                    output_compression=thread_config.get("image_compression", 100),
+                    enhance_prompt=True,
+                    conversation_history=enhanced_messages  # Pass enhanced conversation with image analyses
+                )
+            except Exception as e:
+                self.log_error(f"Error editing image: {e}")
+                return Response(
+                    type="error",
+                    content=f"Failed to edit image: {str(e)}"
+                )
         
         # Add clean message to thread state (no URLs or counts)
         user_breadcrumb = text or ""
@@ -1918,33 +2255,76 @@ class MessageProcessor(LoggerMixin):
             analysis=image_analysis  # Store the full analysis
         )
         
-        # Include full context about what was uploaded and edited for future vision questions
-        # This helps the model answer follow-up questions without re-analysis
+        # Store the edit prompt with metadata for tracking
+        # Include the original analysis as part of the content for context
         if image_analysis:
-            # Include the full analysis - no truncation
-            assistant_breadcrumb = f"Edited image: {image_data.prompt} [Original: {image_analysis}]"
+            # Include analysis for future vision questions
+            content = f"{image_data.prompt}\n\n[Original: {image_analysis}]"
         else:
-            assistant_breadcrumb = f"Edited image: {image_data.prompt}"
-        thread_state.add_message("assistant", assistant_breadcrumb, db=self.db, thread_key=thread_key)
+            content = image_data.prompt
+            
+        thread_state.add_message(
+            "assistant", 
+            content,
+            db=self.db, 
+            thread_key=thread_key,
+            metadata={
+                "type": "image_edit",
+                "prompt": image_data.prompt,
+                "original_analysis": image_analysis if image_analysis else None,
+                "url": None  # Will be updated after upload
+            }
+        )
         
         return Response(
             type="image",
-            content=image_data
+            content=image_data,
+            metadata=response_metadata
         )
     
     def update_last_image_url(self, channel_id: str, thread_id: str, url: str):
         """Update the last assistant message with the image URL"""
         thread_state = self.thread_manager.get_or_create_thread(thread_id, channel_id)
         
-        # Find the last assistant message with "Generated image:"
+        # Find the last assistant message with image metadata or legacy format
         for i in range(len(thread_state.messages) - 1, -1, -1):
             msg = thread_state.messages[i]
-            if msg.get("role") == "assistant" and "Generated image:" in msg.get("content", ""):
-                # Add URL if not already present
-                if "<" not in msg["content"]:
-                    msg["content"] += f" <{url}>"
-                    self.log_debug(f"Updated message with URL: {url}")
-                break
+            if msg.get("role") == "assistant":
+                metadata = msg.get("metadata", {})
+                
+                # Check metadata first (new approach)
+                if metadata.get("type") in ["image_generation", "image_edit"]:
+                    # Update metadata with URL
+                    if "metadata" not in msg:
+                        msg["metadata"] = {}
+                    msg["metadata"]["url"] = url
+                    self.log_debug(f"Updated message metadata with URL: {url}")
+                    
+                    # Save to database for persistence across restarts
+                    if self.db:
+                        thread_key = f"{channel_id}:{thread_id}"
+                        image_type = "generated" if metadata.get("type") == "image_generation" else "edited"
+                        prompt = metadata.get("prompt", "")
+                        
+                        # Save the image metadata to DB
+                        self.db.save_image_metadata(
+                            thread_id=thread_key,
+                            url=url,
+                            image_type=image_type,
+                            prompt=prompt,
+                            analysis="",  # No analysis for generated images
+                            original_analysis=""
+                        )
+                        self.log_info(f"Saved {image_type} image to DB: {url}")
+                    break
+                    
+                # Fallback to string matching for backward compatibility
+                elif "Generated image:" in msg.get("content", "") or "Edited image:" in msg.get("content", ""):
+                    # Add URL if not already present
+                    if "<" not in msg["content"]:
+                        msg["content"] += f" <{url}>"
+                        self.log_debug(f"Updated message content with URL: {url}")
+                    break
     
     def update_thread_config(
         self,
