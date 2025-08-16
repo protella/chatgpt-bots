@@ -43,9 +43,10 @@ class MarkdownConverter(LoggerMixin):
         text = self._extract_code_blocks(text, code_blocks)
         
         # Convert various Markdown elements for Slack
-        text = self._convert_headers_slack(text)
-        text = self._convert_bold_slack(text)
+        # Important: Convert italic before headers/bold to avoid conflicts
         text = self._convert_italic_slack(text)
+        text = self._convert_bold_slack(text)
+        text = self._convert_headers_slack(text)
         text = self._convert_strikethrough_slack(text)
         text = self._convert_links_slack(text)
         text = self._convert_lists_slack(text)
