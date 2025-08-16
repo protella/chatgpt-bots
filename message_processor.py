@@ -178,11 +178,17 @@ class MessageProcessor(LoggerMixin):
                     # Has text with images - classify if it's edit or vision
                     self._update_status(client, message.channel_id, thinking_id, 
                                       "Understanding your request...")
-                    intent = self.openai_client.classify_intent(
-                        thread_state.messages,  # Use full conversation history
-                        message.text,
-                        has_attached_images=len(image_inputs) > 0
-                    )
+                    try:
+                        intent = self.openai_client.classify_intent(
+                            thread_state.messages,  # Use full conversation history
+                            message.text,
+                            has_attached_images=len(image_inputs) > 0
+                        )
+                    except TimeoutError as e:
+                        self.log_error(f"Intent classification timed out: {e}")
+                        # Default to vision for uploaded images on timeout
+                        intent = "vision"
+                        self.log_info("Defaulting to vision analysis due to timeout")
                     # Handle classification based on uploaded images
                     if intent == "vision":
                         # Already correctly classified as vision/analysis
@@ -204,11 +210,17 @@ class MessageProcessor(LoggerMixin):
                 # No images uploaded - standard classification
                 self._update_status(client, message.channel_id, thinking_id, 
                                   "Understanding your request...")
-                intent = self.openai_client.classify_intent(
-                    thread_state.messages,  # Use full conversation history
-                    message.text if message.text else "",
-                    has_attached_images=False  # Already checked - no images here
-                )
+                try:
+                    intent = self.openai_client.classify_intent(
+                        thread_state.messages,  # Use full conversation history
+                        message.text if message.text else "",
+                        has_attached_images=False  # Already checked - no images here
+                    )
+                except TimeoutError as e:
+                    self.log_error(f"Intent classification timed out: {e}")
+                    # Default to text-only on timeout
+                    intent = "text_only"
+                    self.log_info("Defaulting to text response due to timeout")
             
             self.log_debug(f"Classified intent: {intent}")
             
