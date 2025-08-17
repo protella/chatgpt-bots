@@ -273,9 +273,8 @@ class DocumentHandler(LoggerMixin):
         # Limit consecutive newlines
         sanitized = re.sub(r'\n{4,}', '\n\n\n', sanitized)
         
-        # Size limit per document (1MB of text)
-        if len(sanitized) > 1_000_000:
-            sanitized = sanitized[:1_000_000] + '\n[Content truncated due to size]'
+        # No size limit - let the model's token limit handle it
+        # Previously limited to 1MB
         
         return sanitized
     
@@ -777,7 +776,7 @@ class DocumentHandler(LoggerMixin):
                 # Clean up the text
                 text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
                 if text.strip():
-                    return f"[Raw text extraction from {filename}]\n{text[:50000]}"
+                    return f"[Raw text extraction from {filename}]\n{text}"
             except:
                 continue
         
