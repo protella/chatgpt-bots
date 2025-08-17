@@ -60,6 +60,51 @@ class MessageProcessor(LoggerMixin):
         content_preview = str(content)[:50] + "..." if len(str(content)) > 50 else str(content)
         self.log_debug(f"MESSAGE ADDED | Role: {role} | Tokens: {msg_tokens} | Total: {total_tokens}/{self.thread_manager._max_tokens}")
     
+    def _pre_trim_messages_for_api(self, messages: List[Dict[str, Any]], new_message_tokens: int = 0) -> List[Dict[str, Any]]:
+        """Pre-trim messages to fit within context window before sending to API
+        
+        Args:
+            messages: List of messages to potentially trim
+            new_message_tokens: Tokens that will be added (for pre-checks)
+            
+        Returns:
+            Trimmed list of messages that fits within context
+        """
+        max_tokens = self.thread_manager._max_tokens
+        current_tokens = self.thread_manager._token_counter.count_thread_tokens(messages) + new_message_tokens
+        
+        if current_tokens <= max_tokens:
+            return messages
+        
+        self.log_info(f"Pre-trimming messages: {current_tokens} tokens exceeds {max_tokens} limit")
+        
+        # Find first non-system message index
+        start_index = 0
+        for i, msg in enumerate(messages):
+            if msg.get("role") not in ["system", "developer"]:
+                start_index = i
+                break
+        
+        # Create a copy to work with
+        trimmed_messages = messages.copy()
+        removed_count = 0
+        
+        # Remove messages from the beginning (after system messages)
+        while current_tokens > max_tokens and len(trimmed_messages) > start_index + 1:
+            if start_index < len(trimmed_messages) - 1:
+                removed_msg = trimmed_messages.pop(start_index)
+                removed_count += 1
+                current_tokens = self.thread_manager._token_counter.count_thread_tokens(trimmed_messages) + new_message_tokens
+                self.log_debug(f"Pre-trimmed message {removed_count}, tokens now: {current_tokens}")
+            else:
+                self.log_warning(f"Cannot trim further - would remove current message")
+                break
+        
+        if removed_count > 0:
+            self.log_info(f"Pre-trimmed {removed_count} messages to fit within context limit")
+        
+        return trimmed_messages
+    
     def process_message(self, message: Message, client: BaseClient, thinking_id: Optional[str] = None) -> Optional[Response]:
         """
         Process a message and return a response
@@ -185,6 +230,37 @@ class MessageProcessor(LoggerMixin):
             
             user_content = self._build_user_content(enhanced_text, image_inputs)
             
+            # Check if the message is too large for the model
+            message_tokens = self.thread_manager._token_counter.count_message_tokens({"role": "user", "content": user_content})
+            max_model_tokens = config.thread_max_token_count  # Model's context limit
+            
+            # Check if this single message exceeds the model's context window
+            if message_tokens > max_model_tokens:
+                error_msg = (
+                    f"❌ Your message is too large for the model to process.\n\n"
+                    f"• Message size: {message_tokens:,} tokens\n"
+                    f"• Model limit: {max_model_tokens:,} tokens\n\n"
+                    f"Please reduce the size of your documents or split them into smaller requests."
+                )
+                
+                # Log the issue
+                self.log_error(f"Message exceeds context window: {message_tokens} > {max_model_tokens}")
+                
+                # Add minimal breadcrumb to history
+                thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+                message_ts = message.metadata.get("ts") if message.metadata else None
+                self._add_message_with_token_management(
+                    thread_state, "user", 
+                    f"[Attempted to upload {len(document_inputs)} document(s) - exceeded context limit]",
+                    db=self.db, thread_key=thread_key, message_ts=message_ts
+                )
+                self._add_message_with_token_management(
+                    thread_state, "assistant", error_msg,
+                    db=self.db, thread_key=thread_key
+                )
+                
+                return Response(type="error", content=error_msg)
+            
             # Check if we're handling a clarification response
             if thread_state.pending_clarification:
                 self.log_debug("Processing clarification response")
@@ -192,8 +268,10 @@ class MessageProcessor(LoggerMixin):
                 original_request = thread_state.pending_clarification.get("original_request", "")
                 combined_context = f"{original_request} - Clarification: {message.text}"
                 
+                # Pre-trim messages if needed for intent classification
+                trimmed_messages = self._pre_trim_messages_for_api(thread_state.messages)
                 intent = self.openai_client.classify_intent(
-                    thread_state.messages,  # Use full conversation history
+                    trimmed_messages,  # Use trimmed conversation history
                     combined_context,
                     has_attached_images=len(image_inputs) > 0 or len(document_inputs) > 0
                 )
@@ -216,8 +294,10 @@ class MessageProcessor(LoggerMixin):
                     # Has text with images - classify if it's edit or vision
                     self._update_status(client, message.channel_id, thinking_id, 
                                       "Understanding your request...")
+                    # Pre-trim messages if needed for intent classification
+                    trimmed_messages = self._pre_trim_messages_for_api(thread_state.messages)
                     intent = self.openai_client.classify_intent(
-                        thread_state.messages,  # Use full conversation history
+                        trimmed_messages,  # Use trimmed conversation history
                         enhanced_text,  # Use enhanced text that includes document content
                         has_attached_images=len(image_inputs) > 0 or len(document_inputs) > 0
                     )
@@ -247,8 +327,10 @@ class MessageProcessor(LoggerMixin):
                 # No images uploaded - standard classification
                 self._update_status(client, message.channel_id, thinking_id, 
                                   "Understanding your request...")
+                # Pre-trim messages if needed for intent classification
+                trimmed_messages = self._pre_trim_messages_for_api(thread_state.messages)
                 intent = self.openai_client.classify_intent(
-                    thread_state.messages,  # Use full conversation history
+                    trimmed_messages,  # Use trimmed conversation history
                     enhanced_text if enhanced_text else "",
                     has_attached_images=len(document_inputs) > 0  # Documents present
                 )
@@ -1213,6 +1295,9 @@ class MessageProcessor(LoggerMixin):
         # Inject stored image analyses into the conversation for full context
         messages_for_api = self._inject_image_analyses(messages_for_api, thread_state)
         
+        # Pre-trim messages to fit within context window
+        messages_for_api = self._pre_trim_messages_for_api(messages_for_api)
+        
         # Get thread config
         thread_config = config.get_thread_config(thread_state.config_overrides)
         
@@ -1330,6 +1415,9 @@ class MessageProcessor(LoggerMixin):
         
         # Inject stored image analyses into the conversation for full context
         messages_for_api = self._inject_image_analyses(messages_for_api, thread_state)
+        
+        # Pre-trim messages to fit within context window
+        messages_for_api = self._pre_trim_messages_for_api(messages_for_api)
         
         # Get thread config
         thread_config = config.get_thread_config(thread_state.config_overrides)
@@ -1752,6 +1840,9 @@ class MessageProcessor(LoggerMixin):
             # Inject stored image analyses for better context
             enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state)
             
+            # Pre-trim messages to fit within context window
+            enhanced_messages = self._pre_trim_messages_for_api(enhanced_messages)
+            
             # Update status to show we're preparing the analysis
             self._update_status(client, channel_id, thinking_id, "Preparing analysis...", emoji=config.analyze_emoji)
             
@@ -2004,6 +2095,9 @@ class MessageProcessor(LoggerMixin):
         
         # Inject stored image analyses for style consistency
         enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state)
+        
+        # Pre-trim messages to fit within context window
+        enhanced_messages = self._pre_trim_messages_for_api(enhanced_messages)
         
         # Check if streaming is supported
         if hasattr(client, 'supports_streaming') and client.supports_streaming() and config.enable_streaming:
@@ -2277,6 +2371,9 @@ class MessageProcessor(LoggerMixin):
                     
                     # Inject stored image analyses for style matching
                     enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state)
+                    
+                    # Pre-trim messages to fit within context window
+                    enhanced_messages = self._pre_trim_messages_for_api(enhanced_messages)
                     
                     # Check if streaming is supported for enhancement
                     response_metadata = {}
@@ -2702,6 +2799,10 @@ class MessageProcessor(LoggerMixin):
         
         # Inject stored image analyses for style matching
         enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state) if thread_state.messages else None
+        
+        # Pre-trim messages to fit within context window if we have messages
+        if enhanced_messages:
+            enhanced_messages = self._pre_trim_messages_for_api(enhanced_messages)
         
         # Check if streaming is supported for enhancement
         response_metadata = {}
