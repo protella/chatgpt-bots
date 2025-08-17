@@ -231,7 +231,15 @@ class MessageProcessor(LoggerMixin):
             user_content = self._build_user_content(enhanced_text, image_inputs)
             
             # Check if the message is too large for the model
-            message_tokens = self.thread_manager._token_counter.count_message_tokens({"role": "user", "content": user_content})
+            # For vision requests, only count the text portion that goes into history
+            # Images are processed separately via analyze_images API
+            if image_inputs:
+                # Only count the text breadcrumb that will be saved to history
+                breadcrumb_text = enhanced_text if enhanced_text else "[User uploaded image(s) for analysis]"
+                message_tokens = self.thread_manager._token_counter.count_message_tokens({"role": "user", "content": breadcrumb_text})
+            else:
+                # For non-image messages, count the full content
+                message_tokens = self.thread_manager._token_counter.count_message_tokens({"role": "user", "content": user_content})
             max_model_tokens = config.thread_max_token_count  # Model's context limit
             
             # Check if this single message exceeds the model's context window
