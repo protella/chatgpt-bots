@@ -871,6 +871,10 @@ class OpenAIClient(LoggerMixin):
             self.log_debug(f"Classified intent: {intent}")
             return intent
             
+        except TimeoutError as e:
+            # Timeout is somewhat expected - log as warning, not error
+            self.log_warning(f"Intent classification timed out after {30 if 'intent' in str(e) else self.client.timeout}s - defaulting to text_only")
+            return 'text_only'  # Default to text on timeout
         except Exception as e:
             self.log_error(f"Error classifying intent: {e}")
             self.log_error(f"Exception type: {type(e).__name__}")

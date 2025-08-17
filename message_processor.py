@@ -14,7 +14,7 @@ from openai_client import OpenAIClient, ImageData
 from config import config
 from logger import LoggerMixin
 from prompts import SLACK_SYSTEM_PROMPT, DISCORD_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, IMAGE_ANALYSIS_PROMPT
-from streaming import StreamingBuffer, RateLimitManager
+from streaming import StreamingBuffer, RateLimitManager, FenceHandler
 from image_url_handler import ImageURLHandler
 try:
     from document_handler import DocumentHandler
@@ -193,17 +193,16 @@ class MessageProcessor(LoggerMixin):
                     # Has text with images - classify if it's edit or vision
                     self._update_status(client, message.channel_id, thinking_id, 
                                       "Understanding your request...")
-                    try:
-                        intent = self.openai_client.classify_intent(
-                            thread_state.messages,  # Use full conversation history
-                            enhanced_text,  # Use enhanced text that includes document content
-                            has_attached_images=len(image_inputs) > 0 or len(document_inputs) > 0
-                        )
-                    except TimeoutError as e:
-                        self.log_error(f"Intent classification timed out: {e}")
-                        # Default to vision for uploaded images on timeout
+                    intent = self.openai_client.classify_intent(
+                        thread_state.messages,  # Use full conversation history
+                        enhanced_text,  # Use enhanced text that includes document content
+                        has_attached_images=len(image_inputs) > 0 or len(document_inputs) > 0
+                    )
+                    # If intent classification times out, it returns 'text_only' by default
+                    # For uploaded images, override to vision if we got text_only (likely from timeout)
+                    if intent == "text_only":
+                        self.log_info("Intent unclear with uploaded images - defaulting to vision analysis")
                         intent = "vision"
-                        self.log_info("Defaulting to vision analysis due to timeout")
                     # Handle classification based on uploaded images
                     if intent == "vision":
                         # Already correctly classified as vision/analysis
@@ -225,17 +224,11 @@ class MessageProcessor(LoggerMixin):
                 # No images uploaded - standard classification
                 self._update_status(client, message.channel_id, thinking_id, 
                                   "Understanding your request...")
-                try:
-                    intent = self.openai_client.classify_intent(
-                        thread_state.messages,  # Use full conversation history
-                        enhanced_text if enhanced_text else "",
-                        has_attached_images=len(document_inputs) > 0  # Documents present
-                    )
-                except TimeoutError as e:
-                    self.log_error(f"Intent classification timed out: {e}")
-                    # Default to text-only on timeout
-                    intent = "text_only"
-                    self.log_info("Defaulting to text response due to timeout")
+                intent = self.openai_client.classify_intent(
+                    thread_state.messages,  # Use full conversation history
+                    enhanced_text if enhanced_text else "",
+                    has_attached_images=len(document_inputs) > 0  # Documents present
+                )
             
             self.log_debug(f"Classified intent: {intent}")
             
@@ -1415,37 +1408,77 @@ class MessageProcessor(LoggerMixin):
             if buffer.should_update() and rate_limiter.can_make_request():
                 rate_limiter.record_request_attempt()
                 
-                # Get display-safe text with closed fences
-                display_text = buffer.get_display_text()
+                # Check if we need to overflow based on RAW text (not display text)
+                raw_text = buffer.get_complete_text()
                 
-                # Check if we need to overflow to a new message
-                if len(display_text) > message_char_limit:
-                    # Split at the limit
-                    first_part = display_text[:message_char_limit]
-                    overflow_buffer = display_text[message_char_limit:]
+                if len(raw_text) > message_char_limit:
+                    # Find a good split point - preferably at a line break
+                    split_point = message_char_limit
+                    
+                    # Look backwards for the last newline before the limit
+                    last_newline = raw_text.rfind('\n', 0, message_char_limit)
+                    
+                    # If we found a newline within reasonable distance (not too far back)
+                    # Use it as the split point to avoid breaking lines
+                    if last_newline > message_char_limit - 500 and last_newline > 0:
+                        split_point = last_newline + 1  # Include the newline in first part
+                    else:
+                        # No good newline found, try to at least avoid splitting words
+                        # Look for last space before the limit
+                        last_space = raw_text.rfind(' ', max(0, message_char_limit - 100), message_char_limit)
+                        if last_space > 0:
+                            split_point = last_space + 1
+                    
+                    # Split the RAW text at the chosen point
+                    first_part_raw = raw_text[:split_point]
+                    overflow_raw = raw_text[split_point:]
+                    
+                    # Check if we're splitting inside a code block
+                    fence_handler_temp = FenceHandler()
+                    fence_handler_temp.update_text(first_part_raw)
+                    was_in_code_block = fence_handler_temp.is_in_code_block()
+                    language_hint = fence_handler_temp.get_current_language_hint()
+                    
+                    # Get display-safe version of first part (with closed fences if needed)
+                    first_part_display = fence_handler_temp.get_display_safe_text()
                     
                     # Update current message with continuation indicator
-                    final_first_part = f"{first_part}\n\n*Continued in next message...*"
+                    final_first_part = f"{first_part_display}\n\n*Continued in next message...*"
                     try:
                         result = client.update_message_streaming(message.channel_id, current_message_id, final_first_part)
                         if result["success"]:
+                            # Prepare overflow text with proper fence opening if needed
+                            if was_in_code_block:
+                                # Re-open the code block on the new page
+                                lang_str = language_hint if language_hint else ""
+                                overflow_with_fence = f"```{lang_str}\n{overflow_raw}"
+                            else:
+                                overflow_with_fence = overflow_raw
+                            
                             # Post a new message for overflow
                             current_part += 1
-                            continuation_text = f"*Part {current_part} (continued)*\n\n{overflow_buffer} {config.loading_ellipse_emoji}"
+                            
+                            # Create new fence handler for the continuation
+                            fence_handler_continuation = FenceHandler()
+                            fence_handler_continuation.update_text(overflow_with_fence)
+                            continuation_display = fence_handler_continuation.get_display_safe_text()
+                            
+                            continuation_text = f"*Part {current_part} (continued)*\n\n{continuation_display} {config.loading_ellipse_emoji}"
                             
                             # Send new message and get its ID
                             new_msg_result = client.send_message_get_ts(message.channel_id, thinking_id, continuation_text)
                             if new_msg_result and "ts" in new_msg_result:
                                 current_message_id = new_msg_result["ts"]
-                                # Reset buffer with overflow content
+                                # Reset buffer with the properly fenced overflow content
                                 buffer.reset()
-                                buffer.add_chunk(overflow_buffer)
+                                buffer.add_chunk(overflow_with_fence)
                                 buffer.mark_updated()
-                                self.log_info(f"Created overflow message part {current_part}")
+                                self.log_info(f"Created overflow message part {current_part}, reopened code block: {was_in_code_block}")
                     except Exception as e:
                         self.log_error(f"Error handling message overflow: {e}")
                 else:
-                    # Normal update with loading indicator
+                    # Normal update - get display-safe text with closed fences
+                    display_text = buffer.get_display_text()
                     display_text_with_indicator = f"{display_text} {config.loading_ellipse_emoji}"
                     
                     # Call client.update_message_streaming with indicator

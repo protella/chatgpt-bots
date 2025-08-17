@@ -79,8 +79,8 @@ class BaseClient(ABC, LoggerMixin):
         return False
     
     @abstractmethod
-    def get_thread_history(self, channel_id: str, thread_id: str, limit: int = 50) -> List[Message]:
-        """Get message history for a thread"""
+    def get_thread_history(self, channel_id: str, thread_id: str, limit: int = None) -> List[Message]:
+        """Get message history for a thread - fetches ALL messages by default"""
         pass
     
     @abstractmethod
