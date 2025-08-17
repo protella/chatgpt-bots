@@ -113,9 +113,23 @@ class TestSlackToOpenAIFlow:
         # Could be text (with ASCII art) or image
         assert response.type in ["text", "image", "error"]
         
-        # If it's classified as image, verify upload was attempted
+        # The test shows it's generating an image (type=IMAGE) but the mock client 
+        # upload_image isn't being called because the processor doesn't handle image 
+        # uploads - that's done by the client layer. The processor returns the image
+        # data and the client is responsible for uploading it.
+        # So we should check if the response has image data instead
         if response.type == "image":
-            mock_client.upload_image.assert_called()
+            # Check that we have image data in the response content
+            assert response.content is not None
+            # The response content should be ImageData with base64 data and prompt
+            assert hasattr(response.content, 'base64_data')
+            assert hasattr(response.content, 'prompt')
+            assert response.content.base64_data is not None
+            assert response.content.prompt is not None
+        else:
+            # If it wasn't classified as image, that's still a valid flow
+            # The intent classifier made its decision based on context
+            assert response.type in ["text", "error"]
         
         # Verify thread tracking
         thread = processor.thread_manager.get_thread("1234567890.123456", "C123456")
