@@ -389,6 +389,32 @@ class DatabaseManager(LoggerMixin):
         )
         logger.debug(f"Cleared messages for thread {thread_id}")
     
+    def delete_oldest_messages(self, thread_id: str, count: int):
+        """
+        Delete the oldest N messages from a thread, preserving system messages.
+        
+        Args:
+            thread_id: Thread identifier
+            count: Number of messages to delete
+        """
+        # First get the IDs of non-system messages ordered by timestamp
+        cursor = self.conn.execute("""
+            SELECT id FROM messages 
+            WHERE thread_id = ? AND role NOT IN ('system', 'developer')
+            ORDER BY timestamp ASC
+            LIMIT ?
+        """, (thread_id, count))
+        
+        ids_to_delete = [row['id'] for row in cursor]
+        
+        if ids_to_delete:
+            placeholders = ','.join(['?' for _ in ids_to_delete])
+            self.conn.execute(
+                f"DELETE FROM messages WHERE id IN ({placeholders})",
+                ids_to_delete
+            )
+            logger.debug(f"Deleted {len(ids_to_delete)} oldest messages from thread {thread_id}")
+    
     # Image operations
     
     def save_image_metadata(self, thread_id: str, url: str, image_type: str,

@@ -9,8 +9,6 @@
 
 
 SLACK_SYSTEM_PROMPT = """You are a helpful chatbot running in a corporate Slack workspace. 
-The company's name is acmedata. 
-The company's website is https://www.acmedata.com. 
 
 Respond with accurate, informative, and concise answers in a professional tone.  
 
