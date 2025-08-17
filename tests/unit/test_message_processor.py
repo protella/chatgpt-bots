@@ -264,7 +264,7 @@ class TestMessageProcessor:
             channel_id="C456",
             thread_id="T789",
             attachments=[
-                {"type": "file", "mimetype": "application/pdf", "name": "document.pdf"}
+                {"type": "file", "mimetype": "application/octet-stream", "name": "binary.exe"}
             ]
         )
         
@@ -283,7 +283,7 @@ class TestMessageProcessor:
         # Should return unsupported file message
         assert response.type == "text"
         assert "Unsupported File Type" in response.content
-        assert "application/pdf" in response.content
+        assert "application/octet-stream" in response.content
     
     @pytest.mark.critical
     def test_critical_message_flow(self, processor, mock_client):

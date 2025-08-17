@@ -696,27 +696,27 @@ def needs_vision_model(pdf_data):
 
 ## Implementation Steps
 
-### Phase 1: Core Infrastructure (Week 1)
+### Phase 1: Core Infrastructure
 1. Create `document_handler.py` module
 2. Add DocumentLedger to `thread_manager.py`
 3. Create documents table in `database.py`
 4. Add document parser dependencies to `requirements.txt`
 
-### Phase 2: Parser Implementation (Week 1)
+### Phase 2: Parser Implementation
 1. Implement PDF parser with page boundary preservation
 2. Implement Word document parser with page break detection
 3. Implement Excel/CSV parser with sheet structure
 4. Implement plain text parser
 5. Add MIME type detection and routing
 
-### Phase 3: Integration (Week 2)
+### Phase 3: Integration
 1. Extend `_process_attachments()` in `message_processor.py`
 2. Update intent classification to include document intents
 3. Modify OpenAI client to handle document content
 4. Update thread state management for documents
 5. Implement comprehensive error handling and sanitization
 
-### Phase 4: Testing & Refinement (Week 2)
+### Phase 4: Testing & Refinement
 1. Write unit tests for document parsers
 2. Write integration tests for document flow
 3. Test with various document types and sizes
