@@ -53,6 +53,89 @@ class ThreadState:
         pass
 
 
+@dataclass
+class DocumentLedger:
+    """Ledger for tracking documents per thread"""
+    thread_ts: str
+    documents: List[Dict[str, Any]] = field(default_factory=list)
+    
+    def add_document(self, content: str, filename: str, mime_type: str, 
+                    page_structure: Optional[Dict[str, Any]] = None, 
+                    total_pages: Optional[int] = None, 
+                    summary: Optional[str] = None,
+                    metadata: Optional[Dict[str, Any]] = None, 
+                    timestamp: float = None,
+                    db = None, thread_id: Optional[str] = None, 
+                    message_ts: Optional[str] = None):
+        """Add a document to the ledger
+        
+        Args:
+            content: Full document text content
+            filename: Original filename
+            mime_type: Document MIME type
+            page_structure: Optional page/sheet structure info as dict
+            total_pages: Total page/sheet count
+            summary: Optional AI-generated summary
+            metadata: Additional metadata (size, author, etc.)
+            timestamp: When the document was added
+            db: Optional database manager for persistence
+            thread_id: Optional thread ID for database storage
+            message_ts: Message timestamp to link document to specific message
+        """
+        if timestamp is None:
+            timestamp = time.time()
+            
+        # Store in memory (metadata only when DB available)
+        if db:
+            # Don't store full content in memory when DB is available
+            self.documents.append({
+                "filename": filename,
+                "mime_type": mime_type,
+                "content": None,  # No full content in memory when using DB
+                "page_structure": page_structure,
+                "total_pages": total_pages,
+                "summary": summary,
+                "timestamp": timestamp,
+                "metadata": metadata
+            })
+            
+            # Store full content in database
+            if thread_id:
+                db.save_document(
+                    thread_id=thread_id,
+                    filename=filename,
+                    mime_type=mime_type,
+                    content=content,  # Full content to DB
+                    page_structure=page_structure,
+                    total_pages=total_pages,
+                    summary=summary,
+                    metadata=metadata,
+                    message_ts=message_ts
+                )
+        else:
+            # Legacy behavior when no DB - store limited content in memory
+            self.documents.append({
+                "filename": filename,
+                "mime_type": mime_type,
+                "content": content[:1000] if content else None,  # Truncated without DB
+                "page_structure": page_structure,
+                "total_pages": total_pages,
+                "summary": summary[:200] if summary else None,  # Truncated without DB
+                "timestamp": timestamp,
+                "metadata": metadata
+            })
+    
+    def get_recent_documents(self, count: int = 5) -> List[Dict[str, Any]]:
+        """Get the most recent documents"""
+        return self.documents[-count:] if self.documents else []
+    
+    def clear_old_documents(self, keep_last: int = 10):
+        """Keep only the most recent documents to manage memory"""
+        # With database, we don't need to limit documents
+        # This method is kept for backward compatibility but does nothing
+        pass
+
+
 @dataclass 
 class AssetLedger:
     """Ledger for tracking generated images per thread"""
@@ -211,6 +294,7 @@ class ThreadStateManager(LoggerMixin):
     def __init__(self, db = None):
         self._threads: Dict[str, ThreadState] = {}
         self._assets: Dict[str, AssetLedger] = {}
+        self._documents: Dict[str, DocumentLedger] = {}
         self._lock_manager = ThreadLockManager()
         self._state_lock = Lock()
         self.db = db  # Optional database manager
@@ -317,6 +401,18 @@ class ThreadStateManager(LoggerMixin):
         """Get asset ledger if it exists"""
         return self._assets.get(thread_ts)
     
+    def get_or_create_document_ledger(self, thread_ts: str) -> DocumentLedger:
+        """Get or create document ledger for a thread"""
+        with self._state_lock:
+            if thread_ts not in self._documents:
+                self._documents[thread_ts] = DocumentLedger(thread_ts=thread_ts)
+                self.log_debug(f"Created new document ledger for thread {thread_ts}")
+            return self._documents[thread_ts]
+    
+    def get_document_ledger(self, thread_ts: str) -> Optional[DocumentLedger]:
+        """Get document ledger if it exists"""
+        return self._documents.get(thread_ts)
+    
     def acquire_thread_lock(self, thread_ts: str, channel_id: str, timeout: float = 0, user_id: Optional[str] = None) -> bool:
         """
         Try to acquire lock for thread processing
@@ -374,6 +470,49 @@ class ThreadStateManager(LoggerMixin):
         thread_key = f"{channel_id}:{thread_ts}"
         return self._lock_manager.is_busy(thread_key)
     
+    def update_thread_documents(self, thread_ts: str, channel_id: str, documents: List[Dict[str, Any]]):
+        """Update documents for a specific thread"""
+        thread_key = f"{channel_id}:{thread_ts}"
+        document_ledger = self.get_or_create_document_ledger(thread_ts)
+        
+        # Add documents to ledger
+        for doc in documents:
+            document_ledger.add_document(
+                content=doc.get('content', ''),
+                filename=doc.get('filename', 'unknown'),
+                mime_type=doc.get('mime_type', 'text/plain'),
+                page_structure=doc.get('page_structure'),
+                total_pages=doc.get('total_pages'),
+                summary=doc.get('summary'),
+                metadata=doc.get('metadata'),
+                timestamp=doc.get('timestamp'),
+                db=self.db,
+                thread_id=thread_key,
+                message_ts=doc.get('message_ts')
+            )
+        
+        self.log_info(f"Updated documents for thread {thread_ts}: {len(documents)} documents")
+    
+    def get_thread_documents(self, thread_ts: str, channel_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Get documents for a specific thread"""
+        thread_key = f"{channel_id}:{thread_ts}"
+        
+        # Try to get from database first
+        if self.db:
+            documents = self.db.get_thread_documents(thread_key, limit=limit)
+            if documents:
+                self.log_debug(f"Retrieved {len(documents)} documents from database for {thread_key}")
+                return documents
+        
+        # Fallback to in-memory ledger
+        document_ledger = self.get_document_ledger(thread_ts)
+        if document_ledger:
+            recent_docs = document_ledger.get_recent_documents(count=limit or 10)
+            self.log_debug(f"Retrieved {len(recent_docs)} documents from memory for {thread_ts}")
+            return recent_docs
+        
+        return []
+    
     def update_thread_config(self, thread_ts: str, channel_id: str, config_overrides: Dict[str, Any]):
         """Update configuration for a specific thread"""
         thread = self.get_or_create_thread(thread_ts, channel_id)
@@ -398,10 +537,12 @@ class ThreadStateManager(LoggerMixin):
             
             for key in threads_to_remove:
                 del self._threads[key]
-                # Also clean up associated asset ledger
+                # Also clean up associated asset and document ledgers
                 thread_ts = key.split(":")[1]
                 if thread_ts in self._assets:
                     del self._assets[thread_ts]
+                if thread_ts in self._documents:
+                    del self._documents[thread_ts]
                 self.log_debug(f"Cleaned up old thread state: {key}")
         
         if threads_to_remove:
@@ -412,5 +553,6 @@ class ThreadStateManager(LoggerMixin):
         return {
             "active_threads": len(self._threads),
             "asset_ledgers": len(self._assets),
+            "document_ledgers": len(self._documents),
             "processing_threads": sum(1 for t in self._threads.values() if t.is_processing)
         }

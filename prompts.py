@@ -82,7 +82,7 @@ Your current GPT model is GPT-5 and your knowledge cutoff is September, 2024."""
 
 # Becareful editing these. The intent classifier needs to be deterministic
 
-IMAGE_INTENT_SYSTEM_PROMPT = """You are an intent classifier for a chatbot. You will see a conversation history followed by the user's latest message.
+IMAGE_INTENT_SYSTEM_PROMPT = """You are an intent classifier for a chatbot that handles both images and documents. You will see a conversation history followed by the user's latest message.
 Your task is to classify ONLY the user's LATEST message into one of five categories based on their intent.
 
 IMPORTANT: Focus on the PATTERN of the conversation. If the conversation has been primarily text-based responses, assume ambiguous requests like "again" or "another" mean text, not images.
@@ -100,11 +100,11 @@ Classify the LATEST user message into one of these categories:
    - Direct modification language referring to existing image elements
    - Words like: adjust, fix, change, modify, edit, correct, enhance (when referring to existing)
 
-3. **"vision"** - User wants to analyze, describe, compare, or get information about UPLOADED/ATTACHED images
-   - REQUIRES: Actual image files attached to the message (photos, screenshots, pictures)
-   - Examples WITH images: "describe this image", "what's in this photo", "analyze this screenshot", "tell me about this picture"
-   - NOT vision: General questions like "what is X?" or "explain Y" without attached images
-   - Information extraction from uploaded visual content only
+3. **"vision"** - User wants to analyze, describe, compare, or get information about UPLOADED/ATTACHED files (images OR documents)
+   - REQUIRES: Actual files attached to the message (photos, screenshots, PDFs, Word docs, Excel sheets, etc.)
+   - Examples WITH attachments: "describe this image", "analyze this document", "review this contract", "summarize this PDF", "what's in this spreadsheet"
+   - NOT vision: General questions like "what is X?" or "explain Y" without attached files
+   - Information extraction from uploaded visual content or document content
 
 4. **"ambiguous"** - Image-related request but unclear intent
    - Examples: "I need a sharper image", "something with better lighting", "how about with a sunset"
@@ -121,7 +121,7 @@ Consider the conversation context and PATTERN:
 - Look at what the LAST assistant response was - that sets expectation for "again" or "another"
 - If the last response was text/data, "again" means more text/data → classify as "none"
 - If the last response was an image, "again" means another image → classify as "new"
-- Vision classification REQUIRES actual image attachments mentioned in the message metadata
+- Vision classification REQUIRES actual file attachments (images or documents) mentioned in the message metadata
 - URLs/links are NOT images - classify questions about websites as "none"
 - Data/information requests ("pull", "fetch", "get", "show", "update") are contextual:
   - With image keywords → "new" (e.g., "show me an image of...")
