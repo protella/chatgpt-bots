@@ -104,14 +104,37 @@ class TestLogSessionStart:
         mock_logger.info.assert_called()
         # Just verify it was called, don't check specific args
     
-    @pytest.mark.skip(reason="Caplog not capturing patched logger output")
-    def test_log_session_start_with_info(self, caplog):
+    def test_log_session_start_with_info(self):
         """Test session start logs appropriate info"""
-        with caplog.at_level(logging.INFO):
-            log_session_start()
+        # Create a fresh logger for this test to avoid interference
+        import logger
+        from unittest.mock import MagicMock
         
-        # Should log session start
-        assert len(caplog.records) > 0
+        # Save the original logger
+        original_logger = logger.main_logger
+        
+        try:
+            # Create a mock logger with proper info method
+            mock_logger = MagicMock()
+            logger.main_logger = mock_logger
+            
+            # Call the function
+            log_session_start()
+            
+            # Verify info was called multiple times
+            assert mock_logger.info.call_count >= 3
+            
+            # Get all the logged messages
+            all_calls = [call[0][0] for call in mock_logger.info.call_args_list]
+            all_text = ' '.join(all_calls)
+            
+            # Check that session start info is logged
+            assert "Session started" in all_text or "started at" in all_text
+            assert any("=" * 60 == call for call in all_calls)  # Check for separator
+            
+        finally:
+            # Restore the original logger
+            logger.main_logger = original_logger
 
 
 class TestLogSessionEnd:
@@ -125,14 +148,37 @@ class TestLogSessionEnd:
         mock_logger.info.assert_called()
         # Just verify it was called
     
-    @pytest.mark.skip(reason="Caplog not capturing patched logger output")
-    def test_log_session_end_with_info(self, caplog):
+    def test_log_session_end_with_info(self):
         """Test session end logs appropriate info"""
-        with caplog.at_level(logging.INFO):
-            log_session_end()
+        # Create a fresh logger for this test to avoid interference
+        import logger
+        from unittest.mock import MagicMock
         
-        # Should log session end
-        assert len(caplog.records) > 0
+        # Save the original logger
+        original_logger = logger.main_logger
+        
+        try:
+            # Create a mock logger with proper info method
+            mock_logger = MagicMock()
+            logger.main_logger = mock_logger
+            
+            # Call the function
+            log_session_end()
+            
+            # Verify info was called multiple times
+            assert mock_logger.info.call_count >= 3
+            
+            # Get all the logged messages
+            all_calls = [call[0][0] for call in mock_logger.info.call_args_list]
+            all_text = ' '.join(all_calls)
+            
+            # Check that session end info is logged
+            assert "Session ended" in all_text or "ended at" in all_text
+            assert any("=" * 60 == call for call in all_calls)  # Check for separator
+            
+        finally:
+            # Restore the original logger
+            logger.main_logger = original_logger
 
 
 class TestLoggerIntegration:
