@@ -23,6 +23,8 @@ class TestChatBotV2Initialization:
         assert bot.processor is None
         assert bot.cleanup_thread is None
         assert bot.running is False
+        assert bot.sigint_count == 0
+        assert bot.last_sigint_time == 0
     
     def test_init_with_discord_platform(self):
         """Test initialization with Discord platform"""
@@ -425,13 +427,153 @@ class TestChatBotV2Lifecycle:
         # Should not do anything if not running
         mock_exit.assert_not_called()
     
-    def test_signal_handler(self, bot):
-        """Test signal handler calls shutdown"""
+    def test_shutdown_with_client_error(self, bot):
+        """Test shutdown handles client.stop() errors gracefully"""
+        bot.running = True
+        bot.client = Mock()
+        bot.client.stop.side_effect = Exception("Failed to stop client")
+        bot.processor = Mock()
+        bot.processor.get_stats.return_value = {"threads": 5}
+        
+        with patch('main.sys.exit') as mock_exit:
+            bot.shutdown()
+        
+        # Should continue despite error
+        assert bot.running is False
+        bot.processor.get_stats.assert_called_once()
+        mock_exit.assert_called_once_with(0)
+    
+    def test_shutdown_with_stats_error(self, bot):
+        """Test shutdown handles get_stats() errors gracefully"""
+        bot.running = True
+        bot.client = Mock()
+        bot.processor = Mock()
+        bot.processor.get_stats.side_effect = Exception("Failed to get stats")
+        
+        with patch('main.sys.exit') as mock_exit:
+            bot.shutdown()
+        
+        # Should continue despite error
+        assert bot.running is False
+        bot.client.stop.assert_called_once()
+        mock_exit.assert_called_once_with(0)
+    
+    def test_shutdown_with_all_errors(self, bot):
+        """Test shutdown handles multiple errors gracefully"""
+        bot.running = True
+        bot.client = Mock()
+        bot.client.stop.side_effect = Exception("Client error")
+        bot.processor = Mock()
+        bot.processor.get_stats.side_effect = Exception("Stats error")
+        
+        with patch('main.sys.exit') as mock_exit:
+            bot.shutdown()
+        
+        # Should still complete shutdown
+        assert bot.running is False
+        mock_exit.assert_called_once_with(0)
+    
+    def test_signal_handler_sigterm(self, bot):
+        """Test SIGTERM handler calls shutdown"""
+        bot.shutdown = Mock()
+        
+        bot._signal_handler(signal.SIGTERM, None)
+        
+        bot.shutdown.assert_called_once()
+    
+    @patch('main.time.time')
+    def test_signal_handler_first_sigint(self, mock_time, bot):
+        """Test first SIGINT attempts graceful shutdown"""
+        mock_time.return_value = 1000.0
+        bot.shutdown = Mock()
+        bot.sigint_count = 0
+        bot.last_sigint_time = 0
+        
+        bot._signal_handler(signal.SIGINT, None)
+        
+        # Should increment count and attempt shutdown
+        assert bot.sigint_count == 1
+        assert bot.last_sigint_time == 1000.0
+        bot.shutdown.assert_called_once()
+    
+    @patch('main.time.time')
+    def test_signal_handler_second_sigint_after_delay(self, mock_time, bot):
+        """Test second SIGINT after delay attempts another graceful shutdown"""
+        # First SIGINT at time 1000
+        bot.sigint_count = 1
+        bot.last_sigint_time = 1000.0
+        
+        # Second SIGINT at time 1003 (3 seconds later - outside 2 second window)
+        mock_time.return_value = 1003.0
         bot.shutdown = Mock()
         
         bot._signal_handler(signal.SIGINT, None)
         
-        bot.shutdown.assert_called_once()
+        # Should NOT force exit, but warn about shutdown in progress
+        assert bot.sigint_count == 2
+        assert bot.last_sigint_time == 1003.0
+        # shutdown not called again since count > 1
+        bot.shutdown.assert_not_called()
+    
+    @patch('os._exit')
+    @patch('threading.enumerate')
+    @patch('main.time.time')
+    def test_signal_handler_double_sigint_force_exit(self, mock_time, mock_enumerate, mock_exit, bot):
+        """Test double SIGINT within 2 seconds forces exit"""
+        # First SIGINT at time 1000
+        bot.sigint_count = 1
+        bot.last_sigint_time = 1000.0
+        
+        # Second SIGINT at time 1001 (1 second later - within 2 second window)
+        mock_time.return_value = 1001.0
+        
+        # Mock active threads
+        main_thread = Mock()
+        main_thread.name = "MainThread"
+        main_thread.daemon = False
+        
+        worker_thread = Mock()
+        worker_thread.name = "WorkerThread"
+        worker_thread.daemon = True
+        
+        mock_enumerate.return_value = [main_thread, worker_thread]
+        
+        bot._signal_handler(signal.SIGINT, None)
+        
+        # Should force exit with code 1
+        mock_exit.assert_called_once_with(1)
+    
+    @patch('os._exit')
+    @patch('threading.enumerate')
+    @patch('main.time.time')
+    def test_signal_handler_double_sigint_no_extra_threads(self, mock_time, mock_enumerate, mock_exit, bot):
+        """Test double SIGINT with only main thread"""
+        bot.sigint_count = 1
+        bot.last_sigint_time = 1000.0
+        mock_time.return_value = 1001.0
+        
+        # Only main thread active
+        main_thread = Mock()
+        main_thread.name = "MainThread"
+        mock_enumerate.return_value = [main_thread]
+        
+        bot._signal_handler(signal.SIGINT, None)
+        
+        # Should still force exit
+        mock_exit.assert_called_once_with(1)
+    
+    def test_signal_handler_shutdown_in_progress(self, bot):
+        """Test SIGINT when shutdown already in progress"""
+        bot.sigint_count = 2  # Already pressed twice
+        bot.last_sigint_time = 1000.0
+        bot.shutdown = Mock()
+        
+        with patch('main.time.time', return_value=1005.0):
+            bot._signal_handler(signal.SIGINT, None)
+        
+        # Should not call shutdown again
+        bot.shutdown.assert_not_called()
+        assert bot.sigint_count == 3
 
 
 class TestMainFunction:
