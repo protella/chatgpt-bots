@@ -100,23 +100,21 @@ class TokenCounter(LoggerMixin):
         # Count content tokens
         content = message.get("content", "")
         if content:
-            # Check if content contains image data (base64 URLs)
+            # Important: We do NOT count base64 image data for token limits
+            # Images are sent to separate vision API (analyze_images), not to text completion API
+            # The conversation history only contains text breadcrumbs like "[Uploaded: photo.jpg]"
             if isinstance(content, str):
-                # Look for base64 image data URLs
-                if "data:image" in content and ";base64," in content:
-                    # Extract and count image tokens
-                    # For simplicity, use high detail estimate: 170 base + 170 per tile
-                    # Assuming average image is ~1024x1024 = 4 tiles
-                    image_tokens = 170 + (4 * 170)  # ~850 tokens per image
-                    tokens += image_tokens
-                    
-                    # Also count any text around the image
-                    text_parts = content.split("data:image")
-                    for part in text_parts:
-                        if ";base64," not in part:
-                            tokens += self.count_tokens(part)
-                else:
-                    tokens += self.count_tokens(str(content))
+                tokens += self.count_tokens(str(content))
+            elif isinstance(content, list):
+                # Handle multi-part content (used temporarily for vision API calls)
+                # Only count the text parts, not image data
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get("type") == "input_text":
+                            tokens += self.count_tokens(part.get("text", ""))
+                        # Skip input_image parts - they're not sent to text API
+                    else:
+                        tokens += self.count_tokens(str(part))
             else:
                 tokens += self.count_tokens(str(content))
         
@@ -127,18 +125,11 @@ class TokenCounter(LoggerMixin):
         
         # Check for metadata that indicates images
         metadata = message.get("metadata", {})
-        if metadata:
-            # Check if this is an image generation or vision message
-            msg_type = metadata.get("type", "")
-            if msg_type in ["image_generation", "image_edit", "vision_analysis"]:
-                # Add estimated tokens for image processing
-                # These messages often involve images but don't store the base64 in content
-                if msg_type == "vision_analysis":
-                    # Vision analysis typically processes 1+ images
-                    image_count = metadata.get("image_count", 1)
-                    tokens += 850 * image_count  # High detail estimate per image
-            
-            # Don't count other metadata as it's not sent to API
+        # Note: We do NOT add tokens for vision_analysis metadata
+        # Images are processed in a separate API call (analyze_images)
+        # and are not part of the conversation history sent to the text API.
+        # The conversation only contains the text breadcrumb and response.
+        # Metadata is for internal tracking only and not sent to the API.
         
         return tokens
     
