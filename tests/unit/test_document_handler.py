@@ -212,12 +212,12 @@ class TestDocumentHandler:
         result = handler.sanitize_content(text)
         assert result == "line1\n\n\nline2"
     
-    def test_sanitize_content_size_limit(self, handler):
-        """Test content size limiting"""
+    def test_sanitize_content_no_size_limit(self, handler):
+        """Test that content is no longer size limited"""
         large_text = "a" * 1_500_000  # 1.5MB
         result = handler.sanitize_content(large_text)
-        assert len(result) <= 1_000_000 + 50  # Account for truncation message
-        assert '[Content truncated due to size]' in result
+        assert len(result) == 1_500_000  # Full text should be returned
+        assert '[Content truncated due to size]' not in result
     
     def test_sanitize_content_empty_input(self, handler):
         """Test sanitization of empty/None input"""
@@ -786,8 +786,8 @@ class TestDocumentHandlerErrorHandling:
         
         result = handler.force_text_extraction(data, 'text/plain', 'large.txt')
         
-        # Should be limited to 50000 characters
-        assert len(result) <= 50100  # Account for prefix text
+        # No longer limited - should return full text
+        assert len(result) > 60000  # Should have full 60k chars plus prefix
     
     def test_detect_text_structure(self, handler):
         """Test text structure detection"""

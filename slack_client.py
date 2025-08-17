@@ -356,63 +356,98 @@ class SlackBot(BaseClient):
             self.log_error(f"Could not update message: {e}")
             return False
     
-    def get_thread_history(self, channel_id: str, thread_id: str, limit: int = 50) -> List[Message]:
-        """Get thread history from Slack"""
+    def get_thread_history(self, channel_id: str, thread_id: str, limit: int = None) -> List[Message]:
+        """Get COMPLETE thread history from Slack - fetches ALL messages by default"""
         messages = []
         
         try:
-            result = self.app.client.conversations_replies(
-                channel=channel_id,
-                ts=thread_id,
-                limit=limit
-            )
+            # Fetch ALL messages using pagination
+            cursor = None
+            total_fetched = 0
             
-            slack_messages = result.get("messages", [])
-            
-            for msg in slack_messages:
-                # Skip loading indicators and system messages
-                text = msg.get("text", "")
-                if "Thinking" in text:
-                    continue
-                # Skip busy/processing messages
-                if ":warning:" in text and "currently processing" in text:
-                    continue
+            while True:
+                # Slack's max per request is 1000
+                per_request_limit = 1000
+                if limit and limit - total_fetched < 1000:
+                    per_request_limit = limit - total_fetched
                 
-                # Determine role
-                is_bot = bool(msg.get("bot_id"))
+                kwargs = {
+                    "channel": channel_id,
+                    "ts": thread_id,
+                    "limit": per_request_limit
+                }
+                if cursor:
+                    kwargs["cursor"] = cursor
                 
-                # Clean text
-                text = msg.get("text", "")
-                if not is_bot:
-                    text = self._clean_mentions(text)
+                result = self.app.client.conversations_replies(**kwargs)
+                slack_messages = result.get("messages", [])
                 
-                # Check for files
-                attachments = []
-                files = msg.get("files", [])
-                for file in files:
-                    # Determine file type based on mimetype
-                    mimetype = file.get("mimetype", "")
-                    file_type = "image" if mimetype.startswith("image/") else "file"
+                if not slack_messages:
+                    break
                     
-                    attachments.append({
-                        "type": file_type,
-                        "name": file.get("name"),
-                        "mimetype": mimetype,
-                        "url": file.get("url_private", file.get("permalink"))
-                    })
+                # Process messages from this batch
+                for msg in slack_messages:
+                    # Skip loading indicators and system messages
+                    text = msg.get("text", "")
+                    if "Thinking" in text:
+                        continue
+                    # Skip busy/processing messages
+                    if ":warning:" in text and "currently processing" in text:
+                        continue
+                    
+                    # Determine role
+                    is_bot = bool(msg.get("bot_id"))
+                    
+                    # Clean text
+                    text = msg.get("text", "")
+                    if not is_bot:
+                        text = self._clean_mentions(text)
+                    
+                    # Check for files
+                    attachments = []
+                    files = msg.get("files", [])
+                    for file in files:
+                        # Determine file type based on mimetype
+                        mimetype = file.get("mimetype", "")
+                        file_type = "image" if mimetype.startswith("image/") else "file"
+                        
+                        attachments.append({
+                            "type": file_type,
+                            "name": file.get("name"),
+                            "mimetype": mimetype,
+                            "url": file.get("url_private", file.get("permalink"))
+                        })
+                    
+                    messages.append(Message(
+                        text=text,
+                        user_id=msg.get("user", "bot" if is_bot else "unknown"),
+                        channel_id=channel_id,
+                        thread_id=thread_id,
+                        attachments=attachments,
+                        metadata={
+                            "ts": msg.get("ts"),
+                            "is_bot": is_bot
+                        }
+                    ))
                 
-                messages.append(Message(
-                    text=text,
-                    user_id=msg.get("user", "bot" if is_bot else "unknown"),
-                    channel_id=channel_id,
-                    thread_id=thread_id,
-                    attachments=attachments,
-                    metadata={
-                        "ts": msg.get("ts"),
-                        "is_bot": is_bot
-                    }
-                ))
+                total_fetched += len(slack_messages)
+                
+                # Check if we've hit our limit
+                if limit and total_fetched >= limit:
+                    break
+                
+                # Check for pagination
+                response_metadata = result.get("response_metadata", {})
+                next_cursor = response_metadata.get("next_cursor")
+                
+                if not next_cursor:
+                    # No more messages
+                    break
+                    
+                cursor = next_cursor
+                # Continue to next iteration
             
+            self.log_info(f"Fetched {len(messages)} messages from thread {thread_id}")
             return messages
             
         except SlackApiError as e:
