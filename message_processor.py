@@ -336,14 +336,22 @@ class MessageProcessor(LoggerMixin):
                         # Documents are already in enhanced_text, just process as text with vision intent
                         response = self._handle_text_response(user_content, thread_state, client, message, thinking_id)
                     elif image_inputs and document_inputs:
-                        # Both images and documents
+                        # Both images and documents - use two-call approach
                         total_files = len(image_inputs) + len(document_inputs)
                         status_msg = f"Analyzing {len(image_inputs)} image{'s' if len(image_inputs) > 1 else ''} and {len(document_inputs)} document{'s' if len(document_inputs) > 1 else ''}..."
                         self._update_status(client, message.channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
                         
-                        # Process with vision handler for images, documents are in context
-                        response = self._handle_vision_analysis(message.text, image_inputs, thread_state, message.attachments, 
-                                                               client, message.channel_id, thinking_id, message)
+                        # Use new two-call approach for mixed content
+                        response = self._handle_mixed_content_analysis(
+                            user_text=message.text,
+                            image_inputs=image_inputs,
+                            document_inputs=document_inputs,
+                            thread_state=thread_state,
+                            client=client,
+                            channel_id=message.channel_id,
+                            thinking_id=thinking_id,
+                            message=message
+                        )
                     else:
                         # Images only - use existing vision handler
                         response = self._handle_vision_analysis(message.text, image_inputs, thread_state, message.attachments, 
@@ -886,6 +894,11 @@ class MessageProcessor(LoggerMixin):
         if not document_inputs:
             return text
             
+        # Ensure text is a string
+        if not isinstance(text, str):
+            self.log_warning(f"text parameter is not a string: {type(text)}")
+            text = str(text) if text else ""
+            
         # Start with the original message
         message_parts = [text] if text and text.strip() else []
         
@@ -893,7 +906,12 @@ class MessageProcessor(LoggerMixin):
         for doc in document_inputs:
             filename = doc.get("filename", "unknown_document")
             mimetype = doc.get("mimetype", "unknown")
-            content = doc.get("content", "")
+            content = doc.get("content")
+            # Ensure content is never None
+            if content is None:
+                content = "[Document content not available]"
+            elif not content:
+                content = "[Empty document]"
             page_structure = doc.get("page_structure")
             total_pages = doc.get("total_pages")
             
@@ -919,12 +937,28 @@ class MessageProcessor(LoggerMixin):
             
             doc_header += "=== CONTENT START ===\n"
             
-            # Add the document content
+            # Add the document content (ensure all parts are strings)
+            if not isinstance(doc_header, str):
+                self.log_warning(f"doc_header is not a string: {type(doc_header)}")
+                doc_header = str(doc_header)
+            if not isinstance(content, str):
+                self.log_warning(f"content is not a string: {type(content)}")
+                content = str(content)
+                
             message_parts.append(doc_header)
             message_parts.append(content)
             message_parts.append(f"\n=== DOCUMENT END: {filename} ===")
         
-        return "\n".join(message_parts)
+        # Ensure all parts are strings before joining
+        str_parts = []
+        for i, part in enumerate(message_parts):
+            if not isinstance(part, str):
+                self.log_warning(f"message_parts[{i}] is not a string: {type(part)}")
+                str_parts.append(str(part))
+            else:
+                str_parts.append(part)
+        
+        return "\n".join(str_parts)
     
     def _extract_image_registry(self, thread_state) -> List[Dict[str, str]]:
         """Extract all image URLs and descriptions from thread state"""
@@ -1704,10 +1738,11 @@ class MessageProcessor(LoggerMixin):
                         )
                         self.log_debug(f"Saved comprehensive vision analysis for URL image: {url_img['original_url']}")
             
-            # Save analysis for all attachments (Slack uploaded images)
+            # Save analysis for image attachments only (not documents)
             if attachments and self.db:
                 for att in attachments:
-                    if att.get("url"):
+                    # Only save actual images, not PDFs or other documents
+                    if att.get("url") and att.get("type") == "image":
                         # Save the comprehensive vision analysis to database
                         self.db.save_image_metadata(
                             thread_id=thread_key,
@@ -2172,6 +2207,95 @@ class MessageProcessor(LoggerMixin):
             # No previous images, treat as new generation
             return self._handle_image_generation(text, thread_state, client, channel_id, thinking_id, message)
     
+    def _handle_mixed_content_analysis(
+        self,
+        user_text: str,
+        image_inputs: List[Dict],
+        document_inputs: List[Dict],
+        thread_state,
+        client: BaseClient,
+        channel_id: str,
+        thinking_id: Optional[str],
+        message: Message
+    ) -> Response:
+        """Handle mixed content (images + documents) with two-call approach
+        
+        1. First call: Analyze images with vision model using technical prompt
+        2. Second call: Combine image analysis + document content for final answer
+        """
+        try:
+            # Step 1: Analyze images with vision model using IMAGE_ANALYSIS_PROMPT
+            self._update_status(client, channel_id, thinking_id, "Analyzing images...", emoji=config.analyze_emoji)
+            
+            # Extract base64 data from image inputs
+            images_to_analyze = []
+            for img_input in image_inputs:
+                if img_input.get("type") == "input_image":
+                    image_url = img_input.get("image_url", "")
+                    if image_url.startswith("data:"):
+                        parts = image_url.split(",", 1)
+                        if len(parts) == 2:
+                            _, base64_data = parts
+                            images_to_analyze.append(base64_data)
+            
+            # Analyze images with technical prompt (no enhancement needed)
+            from prompts import IMAGE_ANALYSIS_PROMPT
+            image_analysis = self.openai_client.analyze_images(
+                images=images_to_analyze,
+                question=IMAGE_ANALYSIS_PROMPT,
+                detail="high",
+                enhance_prompt=False  # Use technical prompt as-is
+            )
+            
+            self.log_info(f"Image analysis completed: {len(image_analysis)} chars")
+            
+            # Step 2: Build comprehensive context with image analysis and documents
+            self._update_status(client, channel_id, thinking_id, "Combining analysis with documents...", emoji=config.analyze_emoji)
+            
+            # Build enhanced message with all context
+            context_parts = []
+            
+            # Add image analysis results
+            if image_analysis:
+                context_parts.append("=== IMAGE ANALYSIS ===")
+                context_parts.append(image_analysis)
+                context_parts.append("")
+            
+            # Add document content
+            if document_inputs:
+                doc_text = self._build_message_with_documents("", document_inputs)
+                if doc_text and isinstance(doc_text, str):  # Ensure it's a string
+                    context_parts.append(doc_text)
+            
+            # Add user question
+            context_parts.append("")  # Empty line before question
+            context_parts.append("USER QUESTION:")
+            context_parts.append(user_text if user_text else "Please analyze the relationship between these files.")
+            
+            # Ensure all parts are strings before joining
+            str_context_parts = []
+            for i, part in enumerate(context_parts):
+                if not isinstance(part, str):
+                    self.log_warning(f"context_parts[{i}] is not a string: {type(part)}, value: {part}")
+                    str_context_parts.append(str(part) if part is not None else "")
+                else:
+                    str_context_parts.append(part)
+            
+            combined_context = "\n".join(str_context_parts)
+            
+            # Step 3: Send to text model for final analysis
+            self._update_status(client, channel_id, thinking_id, "Generating comprehensive response...", emoji=config.thinking_emoji)
+            
+            # Use text response handler with the combined context
+            return self._handle_text_response(combined_context, thread_state, client, message, thinking_id)
+            
+        except Exception as e:
+            self.log_error(f"Mixed content analysis failed: {e}", exc_info=True)
+            return Response(
+                type="error",
+                content=f"Failed to analyze mixed content: {str(e)}"
+            )
+    
     def _handle_vision_without_upload(
         self,
         text: str,
@@ -2187,15 +2311,82 @@ class MessageProcessor(LoggerMixin):
         image_registry = self._extract_image_registry(thread_state)
         has_images = bool(image_registry) or self._has_recent_image(thread_state)
         
-        if has_images:
-            # We have image context in the conversation - let the model use that
-            self.log_info("Vision intent with image context in history - using text response with context")
-        else:
-            self.log_info("Vision intent but no images found in conversation")
+        # Check if we have documents in the conversation
+        document_ledger = self.thread_manager.get_document_ledger(thread_state.thread_ts)
+        has_documents = document_ledger and len(document_ledger.documents) > 0
         
-        # Always use text response - the model will have context from the thread history
-        # This avoids re-analysis and keeps responses concise
-        return self._handle_text_response(text, thread_state, client, message, thinking_id)
+        # Build enhanced text with document content if available
+        enhanced_text = text
+        if has_documents:
+            self.log_info(f"Found {len(document_ledger.documents)} document(s) in thread history")
+            # Reconstruct document inputs from ledger
+            document_inputs = []
+            thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+            
+            # Try to retrieve documents from database if available
+            stored_documents = []
+            if self.db:
+                try:
+                    stored_documents = self.db.get_thread_documents(thread_key)
+                    self.log_debug(f"Retrieved {len(stored_documents)} document(s) from database")
+                except Exception as e:
+                    self.log_warning(f"Failed to retrieve documents from DB: {e}")
+            
+            # Build document list from DB or ledger
+            if stored_documents:
+                # Use database content (has full text)
+                for doc in stored_documents:
+                    # Ensure content is never None
+                    doc_content = doc.get("content")
+                    if doc_content is None or doc_content == "":
+                        doc_content = "[Document content not available]"
+                    document_inputs.append({
+                        "filename": doc.get("filename", "unknown"),
+                        "content": doc_content,
+                        "mimetype": doc.get("mime_type", "unknown"),
+                        "page_structure": doc.get("page_structure"),
+                        "total_pages": doc.get("total_pages")
+                    })
+            else:
+                # Fallback to ledger (might not have content if DB is used)
+                for doc in document_ledger.documents:
+                    # Ensure content is never None
+                    doc_content = doc.get("content")
+                    if doc_content is None or doc_content == "":
+                        # Try to get from DB if we have one
+                        if self.db and thread_key:
+                            try:
+                                db_docs = self.db.get_thread_documents(thread_key)
+                                matching_doc = next((d for d in db_docs if d.get("filename") == doc.get("filename")), None)
+                                if matching_doc:
+                                    doc_content = matching_doc.get("content")
+                            except Exception as e:
+                                self.log_debug(f"Could not retrieve document from DB: {e}")
+                        
+                        # Final fallback
+                        if doc_content is None or doc_content == "":
+                            doc_content = "[Document content not available]"
+                    
+                    document_inputs.append({
+                        "filename": doc.get("filename", "unknown"),
+                        "content": doc_content,
+                        "mimetype": doc.get("mime_type", "unknown"),
+                        "page_structure": doc.get("page_structure"),
+                        "total_pages": doc.get("total_pages")
+                    })
+            
+            enhanced_text = self._build_message_with_documents(text, document_inputs)
+            self.log_debug(f"Enhanced text with {len(document_inputs)} document(s) for vision follow-up")
+        
+        if has_images or has_documents:
+            # We have image/document context in the conversation - let the model use that
+            self.log_info(f"Vision intent with {'image' if has_images else ''}{' and ' if has_images and has_documents else ''}{'document' if has_documents else ''} context in history - using text response with context")
+        else:
+            self.log_info("Vision intent but no images or documents found in conversation")
+        
+        # Use enhanced text if we have documents, otherwise use original text
+        # The model will have context from the thread history
+        return self._handle_text_response(enhanced_text, thread_state, client, message, thinking_id)
     
     def _handle_image_edit(
         self,
