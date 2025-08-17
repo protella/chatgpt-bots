@@ -3,6 +3,7 @@ Shared Message Processor
 Client-agnostic message processing logic
 """
 import base64
+import os
 import re
 import time
 import datetime
@@ -37,6 +38,28 @@ class MessageProcessor(LoggerMixin):
             self.log_warning("DocumentHandler not available - document processing will be disabled")
         self.log_info(f"MessageProcessor initialized {'with' if db else 'without'} database")
     
+    def _add_message_with_token_management(self, thread_state, role: str, content: Any, db=None, thread_key: str = None, message_ts: str = None, metadata: Dict[str, Any] = None):
+        """Helper method to add messages with token management"""
+        # Count tokens for this message
+        msg_tokens = self.thread_manager._token_counter.count_message_tokens({"role": role, "content": content})
+        
+        # Add the message
+        thread_state.add_message(
+            role=role,
+            content=content,
+            db=db,
+            thread_key=thread_key,
+            message_ts=message_ts,
+            metadata=metadata,
+            token_counter=self.thread_manager._token_counter,
+            max_tokens=self.thread_manager._max_tokens
+        )
+        
+        # Log token info in debug mode
+        total_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+        content_preview = str(content)[:50] + "..." if len(str(content)) > 50 else str(content)
+        self.log_debug(f"MESSAGE ADDED | Role: {role} | Tokens: {msg_tokens} | Total: {total_tokens}/{self.thread_manager._max_tokens}")
+    
     def process_message(self, message: Message, client: BaseClient, thinking_id: Optional[str] = None) -> Optional[Response]:
         """
         Process a message and return a response
@@ -54,10 +77,10 @@ class MessageProcessor(LoggerMixin):
         # Log request start with clear markers
         username = message.metadata.get("username", message.user_id) if message.metadata else message.user_id
         self.log_info("")
-        self.log_info("="*80)
+        self.log_info("="*100)
         self.log_info(f"REQUEST START | Thread: {thread_key} | User: {username}")
         self.log_info(f"Message: {message.text[:100] if message.text else 'No text'}{'...' if message.text and len(message.text) > 100 else ''}")
-        self.log_info("="*80)
+        self.log_info("="*100)
         self.log_info("")
         
         request_start_time = time.time()
@@ -70,9 +93,9 @@ class MessageProcessor(LoggerMixin):
         ):
             elapsed = time.time() - request_start_time
             self.log_info("")
-            self.log_info("="*80)
+            self.log_info("="*100)
             self.log_info(f"REQUEST END | Thread: {thread_key} | Status: BUSY | Time: {elapsed:.2f}s")
-            self.log_info("="*80)
+            self.log_info("="*100)
             self.log_info("")
             return Response(
                 type="busy",
@@ -134,20 +157,20 @@ class MessageProcessor(LoggerMixin):
                     # Add the unsupported files warning to conversation
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                     message_ts = message.metadata.get("ts") if message.metadata else None
-                    thread_state.add_message("user", f"[Uploaded unsupported file(s): {files_str}]", db=self.db, thread_key=thread_key, message_ts=message_ts)
-                    thread_state.add_message("assistant", unsupported_msg, db=self.db, thread_key=thread_key)
+                    self._add_message_with_token_management(thread_state, "user", f"[Uploaded unsupported file(s): {files_str}]", db=self.db, thread_key=thread_key, message_ts=message_ts)
+                    self._add_message_with_token_management(thread_state, "assistant", unsupported_msg, db=self.db, thread_key=thread_key)
                     # Continue processing if we have text or images
                 else:
                     # Only unsupported files were uploaded, nothing else to process
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                     message_ts = message.metadata.get("ts") if message.metadata else None
-                    thread_state.add_message("user", f"[Uploaded unsupported file(s): {files_str}]", db=self.db, thread_key=thread_key, message_ts=message_ts)
-                    thread_state.add_message("assistant", unsupported_msg, db=self.db, thread_key=thread_key)
+                    self._add_message_with_token_management(thread_state, "user", f"[Uploaded unsupported file(s): {files_str}]", db=self.db, thread_key=thread_key, message_ts=message_ts)
+                    self._add_message_with_token_management(thread_state, "assistant", unsupported_msg, db=self.db, thread_key=thread_key)
                     elapsed = time.time() - request_start_time
                     self.log_info("")
-                    self.log_info("="*80)
+                    self.log_info("="*100)
                     self.log_info(f"REQUEST END | Thread: {thread_key} | Status: UNSUPPORTED_FILE | Time: {elapsed:.2f}s")
-                    self.log_info("="*80)
+                    self.log_info("="*100)
                     self.log_info("")
                     return Response(
                         type="text",
@@ -247,7 +270,7 @@ class MessageProcessor(LoggerMixin):
                     # Add clarification to thread history
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                     message_ts = message.metadata.get("ts") if message.metadata else None
-                    thread_state.add_message("user", message.text, db=self.db, thread_key=thread_key, message_ts=message_ts)
+                    self._add_message_with_token_management(thread_state, "user", message.text, db=self.db, thread_key=thread_key, message_ts=message_ts)
                     
                     # Check if it's an uploaded image or generated one
                     has_uploaded = any("files.slack.com" in msg.get("content", "") 
@@ -259,13 +282,13 @@ class MessageProcessor(LoggerMixin):
                     else:
                         clarification_msg = "Would you like me to modify the image I just created, or generate a completely new one?"
                     
-                    thread_state.add_message("assistant", clarification_msg, db=self.db, thread_key=thread_key)
+                    self._add_message_with_token_management(thread_state, "assistant", clarification_msg, db=self.db, thread_key=thread_key)
                     
                     elapsed = time.time() - request_start_time
                     self.log_info("")
-                    self.log_info("="*80)
+                    self.log_info("="*100)
                     self.log_info(f"REQUEST END | Thread: {thread_key} | Status: CLARIFICATION | Time: {elapsed:.2f}s")
-                    self.log_info("="*80)
+                    self.log_info("="*100)
                     self.log_info("")
                     return Response(
                         type="text",
@@ -365,28 +388,39 @@ class MessageProcessor(LoggerMixin):
             
             # DEBUG: Print conversation history after processing
             import json
-            print("\n" + "="*80)
+            print("\n" + "="*100)
             print("DEBUG: CONVERSATION HISTORY (RAW JSON)")
-            print("="*80)
+            print("="*100)
             print(json.dumps(thread_state.messages, indent=2))
-            print("="*80 + "\n")
+            print("="*100 + "\n")
             
             elapsed = time.time() - request_start_time
             response_type = response.type if response else "None"
+            
+            # Calculate final token count
+            final_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+            
             self.log_info("")
-            self.log_info("="*80)
-            self.log_info(f"REQUEST END | Thread: {thread_key} | Status: {response_type.upper()} | Time: {elapsed:.2f}s")
-            self.log_info("="*80)
+            self.log_info("="*100)
+            self.log_info(f"REQUEST END | Thread: {thread_key} | Status: {response_type.upper()} | Time: {elapsed:.2f}s | Tokens: {final_tokens}")
+            self.log_info("="*100)
             self.log_info("")
             return response
             
         except Exception as e:
             self.log_error(f"Error processing message: {e}", exc_info=True)
             elapsed = time.time() - request_start_time
+            # Try to get token count even on error
+            try:
+                error_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages) if 'thread_state' in locals() else 0
+                token_info = f" | Tokens: {error_tokens}" if error_tokens > 0 else ""
+            except:
+                token_info = ""
+            
             self.log_info("")
-            self.log_info("="*80)
-            self.log_info(f"REQUEST END | Thread: {thread_key} | Status: ERROR | Time: {elapsed:.2f}s")
-            self.log_info("="*80)
+            self.log_info("="*100)
+            self.log_info(f"REQUEST END | Thread: {thread_key} | Status: ERROR | Time: {elapsed:.2f}s{token_info}")
+            self.log_info("="*100)
             self.log_info("")
             
             # Check if this is a timeout error
@@ -556,9 +590,15 @@ class MessageProcessor(LoggerMixin):
                 
                 thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                 message_ts = hist_msg.metadata.get("ts") if hist_msg.metadata else None
-                thread_state.add_message(role, content, db=self.db, thread_key=thread_key, message_ts=message_ts)
+                self._add_message_with_token_management(thread_state, role, content, db=self.db, thread_key=thread_key, message_ts=message_ts)
             
             self.log_info(f"Rebuilt thread with {len(thread_state.messages)} messages")
+        
+        # Log initial token count
+        initial_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+        self.log_info("="*100)
+        self.log_info(f"THREAD STATE | Messages: {len(thread_state.messages)} | Tokens: {initial_tokens}/{self.thread_manager._max_tokens}")
+        self.log_info("="*100)
         
         return thread_state
     
@@ -1063,6 +1103,18 @@ class MessageProcessor(LoggerMixin):
         # Get base prompt for the platform
         if "slack" in client_name:
             base_prompt = SLACK_SYSTEM_PROMPT
+            
+            # Add company info for Slack if configured
+            company_name = os.getenv("SLACK_COMPANY_NAME", "").strip()
+            company_website = os.getenv("SLACK_COMPANY_WEBSITE", "").strip()
+            
+            if company_name and company_website:
+                base_prompt += f"\n\nThe company's name is {company_name}."
+                base_prompt += f"\nThe company's website is {company_website}."
+            elif company_name:
+                base_prompt += f"\n\nThe company's name is {company_name}."
+            elif company_website:
+                base_prompt += f"\n\nThe company's website is {company_website}."
         elif "discord" in client_name:
             base_prompt = DISCORD_SYSTEM_PROMPT
         else:
@@ -1147,7 +1199,7 @@ class MessageProcessor(LoggerMixin):
             # Add simplified breadcrumb to thread state (no base64 data)
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
             message_ts = message.metadata.get("ts") if message.metadata else None
-            thread_state.add_message("user", breadcrumb_text, db=self.db, thread_key=thread_key, message_ts=message_ts)
+            self._add_message_with_token_management(thread_state, "user", breadcrumb_text, db=self.db, thread_key=thread_key, message_ts=message_ts)
             
             # Use the full content with images for the actual API call
             messages_for_api = thread_state.messages[:-1] + [{"role": "user", "content": user_content}]
@@ -1155,7 +1207,7 @@ class MessageProcessor(LoggerMixin):
             # Simple text content - add as-is
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
             message_ts = message.metadata.get("ts") if message.metadata else None
-            thread_state.add_message("user", user_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
+            self._add_message_with_token_management(thread_state, "user", user_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
             messages_for_api = thread_state.messages
         
         # Inject stored image analyses into the conversation for full context
@@ -1212,7 +1264,7 @@ class MessageProcessor(LoggerMixin):
         
         # Add assistant response to thread state
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-        thread_state.add_message("assistant", response_text, db=self.db, thread_key=thread_key)
+        self._add_message_with_token_management(thread_state, "assistant", response_text, db=self.db, thread_key=thread_key)
         
         return Response(
             type="text",
@@ -1265,7 +1317,7 @@ class MessageProcessor(LoggerMixin):
             # Add simplified breadcrumb to thread state (no base64 data)
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
             message_ts = message.metadata.get("ts") if message.metadata else None
-            thread_state.add_message("user", breadcrumb_text, db=self.db, thread_key=thread_key, message_ts=message_ts)
+            self._add_message_with_token_management(thread_state, "user", breadcrumb_text, db=self.db, thread_key=thread_key, message_ts=message_ts)
             
             # Use the full content with images for the actual API call
             messages_for_api = thread_state.messages[:-1] + [{"role": "user", "content": user_content}]
@@ -1273,7 +1325,7 @@ class MessageProcessor(LoggerMixin):
             # Simple text content - add as-is
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
             message_ts = message.metadata.get("ts") if message.metadata else None
-            thread_state.add_message("user", user_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
+            self._add_message_with_token_management(thread_state, "user", user_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
             messages_for_api = thread_state.messages
         
         # Inject stored image analyses into the conversation for full context
@@ -1605,7 +1657,7 @@ class MessageProcessor(LoggerMixin):
             
             # Add assistant response to thread state
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-            thread_state.add_message("assistant", response_text, db=self.db, thread_key=thread_key)
+            self._add_message_with_token_management(thread_state, "assistant", response_text, db=self.db, thread_key=thread_key)
             
             # Log streaming stats
             stats = rate_limiter.get_stats()
@@ -1661,8 +1713,8 @@ class MessageProcessor(LoggerMixin):
                         _, base64_data = parts
                         images_to_analyze.append(base64_data)
                         
-                        # Track URL-sourced images in AssetLedger
-                        if img_input.get("source") == "url":
+                        # Track URL-sourced images in AssetLedger (including Slack URLs)
+                        if img_input.get("source") in ["url", "slack_url"]:
                             url_images.append({
                                 "base64_data": base64_data,
                                 "original_url": img_input.get("original_url", "")
@@ -1703,11 +1755,25 @@ class MessageProcessor(LoggerMixin):
             # Update status to show we're preparing the analysis
             self._update_status(client, channel_id, thinking_id, "Preparing analysis...", emoji=config.analyze_emoji)
             
+            # Extract filenames from attachments for context
+            filenames = []
+            if attachments and len(images_to_analyze) > 0:
+                # Get filenames for images that were actually processed
+                for i, img in enumerate(images_to_analyze[:len(attachments)]):
+                    if i < len(attachments):
+                        filenames.append(attachments[i].get("name", f"image{i+1}"))
+            
             # Enhance the vision prompt first
             enhanced_question = user_question
             if user_question:  # Only enhance if there's actually a question
                 enhanced_question = self.openai_client._enhance_vision_prompt(user_question)
                 self.log_debug(f"Enhanced vision prompt: {enhanced_question[:100]}...")
+            
+            # Add filename context to the enhanced question for the API
+            if filenames:
+                filename_context = f"[Image files: {', '.join(filenames)}]\n"
+                enhanced_question = filename_context + enhanced_question
+                self.log_debug(f"Added filename context for {len(filenames)} images")
             
             # Update status to show we're analyzing the image(s)
             if len(images_to_analyze) == 1:
@@ -1716,16 +1782,100 @@ class MessageProcessor(LoggerMixin):
                 status_msg = f"Analyzing {len(images_to_analyze)} images..."
             self._update_status(client, channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
             
-            # Now call analyze_images with the pre-enhanced prompt
-            analysis_result = self.openai_client.analyze_images(
-                images=images_to_analyze,
-                question=enhanced_question,
-                detail="high",
-                enhance_prompt=False,  # Already enhanced
-                conversation_history=enhanced_messages,  # Pass enhanced conversation with image analyses
-                system_prompt=system_prompt  # Pass platform system prompt
-            )
-            self.log_debug(f"Vision analysis completed: {len(analysis_result)} chars")
+            # Check if streaming is supported and enabled
+            if (hasattr(client, 'supports_streaming') and client.supports_streaming() and 
+                config.enable_streaming and thinking_id is not None):
+                # Stream the vision analysis response
+                from streaming.buffer import StreamingBuffer
+                from streaming import RateLimitManager
+                
+                streaming_config = client.get_streaming_config() if hasattr(client, 'get_streaming_config') else {}
+                buffer = StreamingBuffer(
+                    update_interval=streaming_config.get("update_interval", 2.0),
+                    buffer_size_threshold=streaming_config.get("buffer_size", 500),
+                    min_update_interval=streaming_config.get("min_interval", 1.0)
+                )
+                
+                rate_limiter = RateLimitManager(
+                    base_interval=streaming_config.get("update_interval", 2.0),
+                    min_interval=streaming_config.get("min_interval", 1.0),
+                    max_interval=streaming_config.get("max_interval", 30.0),
+                    failure_threshold=streaming_config.get("circuit_breaker_threshold", 5),
+                    cooldown_seconds=streaming_config.get("circuit_breaker_cooldown", 300)
+                )
+                
+                message_id = thinking_id  # Start with the thinking message
+                
+                def stream_callback(chunk: str):
+                    nonlocal message_id
+                    # Handle completion signal (None chunk)
+                    if chunk is None:
+                        # Final update without loading indicator
+                        if message_id:
+                            final_text = buffer.get_complete_text()
+                            client.update_message_streaming(channel_id, message_id, final_text)
+                        return
+                    
+                    buffer.add_chunk(chunk)
+                    
+                    # Only update if both buffer says it's time AND rate limiter allows it
+                    if buffer.should_update() and rate_limiter.can_make_request():
+                        rate_limiter.record_request_attempt()
+                        
+                        # Build display text with loading indicator
+                        display_text = buffer.get_complete_text() + " " + config.loading_ellipse_emoji
+                        
+                        # Try to update the message
+                        result = client.update_message_streaming(channel_id, message_id, display_text)
+                        
+                        if result["success"]:
+                            rate_limiter.record_success()
+                            buffer.mark_updated()
+                            buffer.update_interval_setting(rate_limiter.get_current_interval())
+                        else:
+                            if result["rate_limited"]:
+                                # Handle rate limit response
+                                if result["retry_after"]:
+                                    rate_limiter.set_retry_after(result["retry_after"])
+                                rate_limiter.record_failure(is_rate_limit=True)
+                                
+                                # Check if we should fall back to non-streaming
+                                if not rate_limiter.is_streaming_enabled():
+                                    self.log_warning("Vision streaming circuit breaker opened")
+                            else:
+                                rate_limiter.record_failure(is_rate_limit=False)
+                            self.log_debug(f"Failed to update message: {result.get('error', 'unknown error')}")
+                
+                # Call analyze_images with streaming callback
+                self.log_info("Streaming vision analysis")
+                analysis_result = self.openai_client.analyze_images(
+                    images=images_to_analyze,
+                    question=enhanced_question,
+                    detail="high",
+                    enhance_prompt=False,  # Already enhanced
+                    conversation_history=enhanced_messages,  # Pass enhanced conversation with image analyses
+                    system_prompt=system_prompt,  # Pass platform system prompt
+                    stream_callback=stream_callback
+                )
+                
+                # Log streaming stats
+                stats = rate_limiter.get_stats()
+                buffer_stats = buffer.get_stats()
+                self.log_info(f"Vision streaming completed: {stats['successful_requests']}/{stats['total_requests']} updates, "
+                             f"final length: {buffer_stats['text_length']} chars")
+                
+                self.log_debug(f"Vision analysis completed: {len(analysis_result)} chars")
+            else:
+                # Non-streaming version
+                analysis_result = self.openai_client.analyze_images(
+                    images=images_to_analyze,
+                    question=enhanced_question,
+                    detail="high",
+                    enhance_prompt=False,  # Already enhanced
+                    conversation_history=enhanced_messages,  # Pass enhanced conversation with image analyses
+                    system_prompt=system_prompt  # Pass platform system prompt
+                )
+                self.log_debug(f"Vision analysis completed: {len(analysis_result)} chars")
             
             
         except TimeoutError as e:
@@ -1792,8 +1942,16 @@ class MessageProcessor(LoggerMixin):
             self.log_error(f"Failed to save image metadata to database: {e}", exc_info=True)
             # Continue anyway - don't fail the whole request due to DB issues
         
-        # Create clean breadcrumb for thread state (no URLs or counts)
-        breadcrumb_text = user_text if user_text else ""
+        # Create breadcrumb with filenames for backend history
+        if filenames:
+            if user_text:
+                breadcrumb_text = f"[Uploaded: {', '.join(filenames)}] {user_text}"
+            else:
+                breadcrumb_text = f"[Uploaded: {', '.join(filenames)}]"
+        else:
+            breadcrumb_text = user_text if user_text else "[User uploaded image(s) for analysis]"
+        
+        # Add URL if it was a URL-based image
         if img_input.get("source") == "url" and img_input.get("original_url"):
             breadcrumb_text += f" <{img_input['original_url']}>"
         
@@ -1801,15 +1959,36 @@ class MessageProcessor(LoggerMixin):
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
         try:
             message_ts = message.metadata.get("ts") if message.metadata else None
-            thread_state.add_message("user", breadcrumb_text, db=self.db, thread_key=thread_key, message_ts=message_ts)
-            thread_state.add_message("assistant", analysis_result, db=self.db, thread_key=thread_key)
+            # Count total images for token estimation
+            total_images = len(image_inputs)
+            # Build metadata with filenames
+            metadata = {
+                "type": "vision_analysis", 
+                "image_count": total_images
+            }
+            if filenames:
+                metadata["filenames"] = filenames
+            
+            self._add_message_with_token_management(
+                thread_state, "user", breadcrumb_text, 
+                db=self.db, thread_key=thread_key, message_ts=message_ts,
+                metadata=metadata
+            )
+            self._add_message_with_token_management(thread_state, "assistant", analysis_result, db=self.db, thread_key=thread_key)
         except Exception as e:
             self.log_error(f"Failed to save messages to database: {e}", exc_info=True)
             # Continue anyway - messages are in memory at least
         
+        # Check if we streamed the response
+        response_metadata = {}
+        if (hasattr(client, 'supports_streaming') and client.supports_streaming() and 
+            config.enable_streaming and thinking_id is not None):
+            response_metadata["streamed"] = True
+        
         return Response(
             type="text",
-            content=analysis_result
+            content=analysis_result,
+            metadata=response_metadata
         )
     
     def _handle_image_generation(self, prompt: str, thread_state, client: BaseClient, 
@@ -1838,8 +2017,10 @@ class MessageProcessor(LoggerMixin):
             
             rate_limiter = RateLimitManager(
                 base_interval=streaming_config.get("update_interval", 2.0),
+                min_interval=streaming_config.get("min_interval", 1.0),
+                max_interval=streaming_config.get("max_interval", 30.0),
                 failure_threshold=streaming_config.get("circuit_breaker_threshold", 5),
-                cooldown_seconds=streaming_config.get("circuit_breaker_cooldown", 60)
+                cooldown_seconds=streaming_config.get("circuit_breaker_cooldown", 300)
             )
             
             
@@ -1938,9 +2119,9 @@ class MessageProcessor(LoggerMixin):
         # Add breadcrumb to thread state with metadata
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
         message_ts = message.metadata.get("ts") if message.metadata else None
-        thread_state.add_message("user", prompt, db=self.db, thread_key=thread_key, message_ts=message_ts)
+        self._add_message_with_token_management(thread_state, "user", prompt, db=self.db, thread_key=thread_key, message_ts=message_ts)
         # Store enhanced prompt with metadata for new image tracking
-        thread_state.add_message(
+        self._add_message_with_token_management(thread_state, 
             "assistant", 
             image_data.prompt,  # Just the enhanced prompt, no "Generated image:" prefix
             db=self.db, 
@@ -2202,8 +2383,8 @@ class MessageProcessor(LoggerMixin):
                     # Add breadcrumbs with metadata
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                     message_ts = message.metadata.get("ts") if message.metadata else None
-                    thread_state.add_message("user", text, db=self.db, thread_key=thread_key, message_ts=message_ts)
-                    thread_state.add_message(
+                    self._add_message_with_token_management(thread_state, "user", text, db=self.db, thread_key=thread_key, message_ts=message_ts)
+                    self._add_message_with_token_management(thread_state, 
                         "assistant", 
                         edited_image.prompt,
                         db=self.db, 
@@ -2475,11 +2656,11 @@ class MessageProcessor(LoggerMixin):
         self._update_status(client, channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
         
         # Log the analysis prompt
-        print("\n" + "="*80)
+        print("\n" + "="*100)
         print("DEBUG: IMAGE EDIT FLOW - STEP 1: ANALYZE IMAGE")
-        print("="*80)
+        print("="*100)
         print(f"Analysis Question: {IMAGE_ANALYSIS_PROMPT}")
-        print("="*80)
+        print("="*100)
         
         try:
             # Analyze the images to understand what's in them
@@ -2490,11 +2671,11 @@ class MessageProcessor(LoggerMixin):
             )
             
             # Log the full analysis result
-            print("\n" + "="*80)
+            print("\n" + "="*100)
             print("DEBUG: IMAGE EDIT FLOW - STEP 2: ANALYSIS RESULT")
-            print("="*80)
+            print("="*100)
             print(f"Image Description (Full):\n{image_description}")
-            print("="*80)
+            print("="*100)
             
             # Don't show the analysis - just update status to show we're editing
             # The analysis is only used internally for better edit quality
@@ -2509,12 +2690,12 @@ class MessageProcessor(LoggerMixin):
             self.log_warning(f"Failed to analyze images, continuing without context: {e}")
             image_analysis = None
             user_edit_request = text
-            print("\n" + "="*80)
+            print("\n" + "="*100)
             print("DEBUG: IMAGE EDIT FLOW - ANALYSIS FAILED")
-            print("="*80)
+            print("="*100)
             print(f"Error: {e}")
             print(f"Falling back to user prompt only: {text}")
-            print("="*80)
+            print("="*100)
         
         # Get thread config for settings
         thread_config = config.get_thread_config(thread_state.config_overrides)
@@ -2538,8 +2719,10 @@ class MessageProcessor(LoggerMixin):
             
             rate_limiter = RateLimitManager(
                 base_interval=streaming_config.get("update_interval", 2.0),
+                min_interval=streaming_config.get("min_interval", 1.0),
+                max_interval=streaming_config.get("max_interval", 30.0),
                 failure_threshold=streaming_config.get("circuit_breaker_threshold", 5),
-                cooldown_seconds=streaming_config.get("circuit_breaker_cooldown", 60)
+                cooldown_seconds=streaming_config.get("circuit_breaker_cooldown", 300)
             )
             
             
@@ -2653,7 +2836,7 @@ class MessageProcessor(LoggerMixin):
         user_breadcrumb = text or ""
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
         message_ts = message.metadata.get("ts") if message.metadata else None
-        thread_state.add_message("user", user_breadcrumb, db=self.db, thread_key=thread_key, message_ts=message_ts)
+        self._add_message_with_token_management(thread_state, "user", user_breadcrumb, db=self.db, thread_key=thread_key, message_ts=message_ts)
         
         # Store edited image in asset ledger
         asset_ledger = self.thread_manager.get_or_create_asset_ledger(thread_state.thread_ts)
@@ -2676,7 +2859,7 @@ class MessageProcessor(LoggerMixin):
         else:
             content = image_data.prompt
             
-        thread_state.add_message(
+        self._add_message_with_token_management(thread_state, 
             "assistant", 
             content,
             db=self.db, 

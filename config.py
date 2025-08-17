@@ -100,6 +100,9 @@ class BotConfig:
     api_timeout_read: float = field(default_factory=lambda: float(os.getenv("API_TIMEOUT_READ", "180")))  # Overall timeout for API requests
     api_timeout_streaming_chunk: float = field(default_factory=lambda: float(os.getenv("API_TIMEOUT_STREAMING_CHUNK", "30")))  # Max time between streaming chunks
     
+    # Thread token management
+    thread_max_token_count: int = field(default_factory=lambda: int(os.getenv("THREAD_MAX_TOKEN_COUNT", "120000")))
+    
     # Streaming configuration
     enable_streaming: bool = field(default_factory=lambda: os.getenv("ENABLE_STREAMING", "true").lower() == "true")
     slack_streaming: bool = field(default_factory=lambda: os.getenv("SLACK_STREAMING", "true").lower() == "true")

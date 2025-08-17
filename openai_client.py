@@ -176,8 +176,11 @@ class OpenAIClient(LoggerMixin):
                 "content": system_prompt
             })
         
-        # Add conversation messages
-        input_messages.extend(messages)
+        # Add conversation messages (filter out metadata - Responses API rejects unknown fields)
+        for msg in messages:
+            # Only include role and content for API
+            api_msg = {"role": msg["role"], "content": msg["content"]}
+            input_messages.append(api_msg)
         
         # Build request parameters
         request_params = {
@@ -379,8 +382,11 @@ class OpenAIClient(LoggerMixin):
                 "content": system_prompt
             })
         
-        # Add conversation messages
-        input_messages.extend(messages)
+        # Add conversation messages (filter out metadata - Responses API rejects unknown fields)
+        for msg in messages:
+            # Only include role and content for API
+            api_msg = {"role": msg["role"], "content": msg["content"]}
+            input_messages.append(api_msg)
         
         # Build request parameters
         request_params = {
@@ -1296,7 +1302,8 @@ class OpenAIClient(LoggerMixin):
         detail: Optional[str] = None,
         enhance_prompt: bool = True,
         conversation_history: Optional[List[Dict[str, Any]]] = None,
-        system_prompt: Optional[str] = None
+        system_prompt: Optional[str] = None,
+        stream_callback: Optional[Callable[[str], None]] = None
     ) -> str:
         """
         Analyze one or more images with a question
@@ -1306,6 +1313,7 @@ class OpenAIClient(LoggerMixin):
             question: Question about the image(s)
             detail: Analysis detail level (auto, low, high)
             enhance_prompt: Whether to enhance the question for better analysis
+            stream_callback: Optional callback for streaming the response
         
         Returns:
             Analysis response
@@ -1345,8 +1353,12 @@ class OpenAIClient(LoggerMixin):
                 })
             
             # Include FULL conversation history if provided (including all developer messages)
+            # Filter out metadata to avoid API errors
             if conversation_history:
-                input_messages.extend(conversation_history)
+                for msg in conversation_history:
+                    # Only include role and content for API
+                    api_msg = {"role": msg["role"], "content": msg["content"]}
+                    input_messages.append(api_msg)
             
             # Add the current vision request
             input_messages.append({
@@ -1354,53 +1366,124 @@ class OpenAIClient(LoggerMixin):
                 "content": content
             })
             
-            request_params = {
-                "model": config.gpt_model,
-                "input": input_messages,
-                "max_output_tokens": config.vision_max_tokens,  # Use higher limit for vision with reasoning
-                "store": False  # Don't store vision analysis calls
-            }
-            
-            # Add GPT-5 reasoning parameters if using a reasoning model
-            if config.gpt_model.startswith("gpt-5") and "chat" not in config.gpt_model.lower():
-                request_params["temperature"] = 1.0  # Fixed for reasoning models
-                request_params["reasoning"] = {"effort": config.analysis_reasoning_effort}  # Use analysis config
-                request_params["text"] = {"verbosity": config.analysis_verbosity}  # Use analysis config
-            
-            # API call with enforced timeout wrapper
-            self.log_debug(f"Calling analyze_images API with {config.api_timeout_read}s timeout")
-            response = self._safe_api_call(
-                self.client.responses.create,
-                operation_type="general",
-                **request_params
-            )
-            
-            # Extract response text
-            output_text = ""
-            if response.output:
-                for item in response.output:
-                    # Handle message/text type items
-                    if hasattr(item, "content") and item.content:
-                        for content in item.content:
-                            # Handle output_text type for GPT-5 responses
-                            if hasattr(content, "text"):
-                                output_text += content.text
-                            # Also check for type attribute
-                            elif hasattr(content, "type") and content.type == "output_text" and hasattr(content, "text"):
-                                output_text += content.text
-            
-            if not output_text:
-                # Log the full response structure to debug
-                self.log_warning(f"analyze_images returned empty response")
-                self.log_debug(f"Response output structure: {response.output if response.output else 'No output'}")
+            # Check if streaming is requested
+            if stream_callback:
+                # Use streaming for vision analysis
+                self.log_debug(f"Streaming vision analysis with {config.api_timeout_read}s timeout")
                 
-                # Check if we only got reasoning tokens
-                if response.usage and hasattr(response.usage, "output_tokens_details"):
-                    details = response.usage.output_tokens_details
-                    if hasattr(details, "reasoning_tokens") and details.reasoning_tokens > 0:
-                        self.log_warning(f"Response contained {details.reasoning_tokens} reasoning tokens but no text output")
-            
-            return output_text
+                request_params = {
+                    "model": config.gpt_model,
+                    "input": input_messages,
+                    "max_output_tokens": config.vision_max_tokens,
+                    "store": False,
+                    "stream": True
+                }
+                
+                # Add GPT-5 reasoning parameters if using a reasoning model
+                if config.gpt_model.startswith("gpt-5") and "chat" not in config.gpt_model.lower():
+                    request_params["temperature"] = 1.0
+                    request_params["reasoning"] = {"effort": config.analysis_reasoning_effort}
+                    request_params["text"] = {"verbosity": config.analysis_verbosity}
+                
+                # Stream the response
+                output_text = ""
+                stream = self._safe_api_call(
+                    self.client.responses.create,
+                    operation_type="general",
+                    **request_params
+                )
+                
+                # Process stream events (similar to create_streaming_response)
+                for event in stream:
+                    try:
+                        # Get event type
+                        event_type = getattr(event, 'type', 'unknown')
+                        
+                        if event_type == "response.created":
+                            self.log_debug("Vision stream started")
+                            continue
+                        elif event_type in ["response.output_item.delta", "response.output_text.delta"]:
+                            # Extract text from delta event
+                            text_chunk = None
+                            
+                            # For response.output_text.delta, the text is directly in event.delta
+                            if event_type == "response.output_text.delta" and hasattr(event, 'delta'):
+                                text_chunk = event.delta
+                            # For response.output_item.delta, need to dig deeper
+                            elif hasattr(event, 'delta') and event.delta:
+                                if hasattr(event.delta, 'content') and event.delta.content:
+                                    for content in event.delta.content:
+                                        if hasattr(content, 'text') and content.text:
+                                            text_chunk = content.text
+                                            break
+                            
+                            # If we found text, process it
+                            if text_chunk:
+                                output_text += text_chunk
+                                stream_callback(text_chunk)
+                            continue
+                        elif event_type in ["response.done", "response.completed"]:
+                            self.log_debug("Vision stream completed")
+                            # Signal completion to callback
+                            try:
+                                stream_callback(None)
+                            except Exception as callback_error:
+                                self.log_warning(f"Stream completion callback error: {callback_error}")
+                            break
+                    except Exception as event_error:
+                        self.log_warning(f"Error processing vision stream event: {event_error}")
+                        continue
+                
+                return output_text
+            else:
+                # Non-streaming version
+                request_params = {
+                    "model": config.gpt_model,
+                    "input": input_messages,
+                    "max_output_tokens": config.vision_max_tokens,  # Use higher limit for vision with reasoning
+                    "store": False  # Don't store vision analysis calls
+                }
+                
+                # Add GPT-5 reasoning parameters if using a reasoning model
+                if config.gpt_model.startswith("gpt-5") and "chat" not in config.gpt_model.lower():
+                    request_params["temperature"] = 1.0  # Fixed for reasoning models
+                    request_params["reasoning"] = {"effort": config.analysis_reasoning_effort}  # Use analysis config
+                    request_params["text"] = {"verbosity": config.analysis_verbosity}  # Use analysis config
+                
+                # API call with enforced timeout wrapper
+                self.log_debug(f"Calling analyze_images API with {config.api_timeout_read}s timeout")
+                response = self._safe_api_call(
+                    self.client.responses.create,
+                    operation_type="general",
+                    **request_params
+                )
+                
+                # Extract response text
+                output_text = ""
+                if response.output:
+                    for item in response.output:
+                        # Handle message/text type items
+                        if hasattr(item, "content") and item.content:
+                            for content in item.content:
+                                # Handle output_text type for GPT-5 responses
+                                if hasattr(content, "text"):
+                                    output_text += content.text
+                                # Also check for type attribute
+                                elif hasattr(content, "type") and content.type == "output_text" and hasattr(content, "text"):
+                                    output_text += content.text
+                
+                if not output_text:
+                    # Log the full response structure to debug
+                    self.log_warning(f"analyze_images returned empty response")
+                    self.log_debug(f"Response output structure: {response.output if response.output else 'No output'}")
+                    
+                    # Check if we only got reasoning tokens
+                    if response.usage and hasattr(response.usage, "output_tokens_details"):
+                        details = response.usage.output_tokens_details
+                        if hasattr(details, "reasoning_tokens") and details.reasoning_tokens > 0:
+                            self.log_warning(f"Response contained {details.reasoning_tokens} reasoning tokens but no text output")
+                
+                return output_text
             
         except Exception as e:
             self.log_error(f"Error analyzing images: {e}", exc_info=True)

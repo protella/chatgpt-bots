@@ -4,11 +4,12 @@ Manages conversation state, locks, and memory for each Slack thread
 """
 import time
 import threading
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 from threading import Lock
 from logger import LoggerMixin
 from config import config
+from token_counter import TokenCounter
 
 
 @dataclass
@@ -24,8 +25,8 @@ class ThreadState:
     pending_clarification: Optional[Dict[str, Any]] = None
     had_timeout: bool = False  # Track if this thread had a timeout for user notification
     
-    def add_message(self, role: str, content: Any, db = None, thread_key: str = None, message_ts: str = None, metadata: Dict[str, Any] = None):
-        """Add a message to the thread history with optional metadata"""
+    def add_message(self, role: str, content: Any, db = None, thread_key: str = None, message_ts: str = None, metadata: Dict[str, Any] = None, token_counter: Optional[TokenCounter] = None, max_tokens: int = None):
+        """Add a message to the thread history with optional metadata and token management"""
         msg = {
             "role": role,
             "content": content
@@ -38,9 +39,57 @@ class ThreadState:
         self.messages.append(msg)
         self.last_activity = time.time()
         
+        # Check token limit and trim if necessary
+        if token_counter and max_tokens:
+            self._trim_to_token_limit(token_counter, max_tokens, db, thread_key)
+        
         # Save to database if available (message_ts is only stored in DB for linking)
         if db and thread_key:
-            db.cache_message(thread_key, role, content, message_ts)
+            db.cache_message(thread_key, role, content, message_ts, metadata)
+    
+    def _trim_to_token_limit(self, token_counter: TokenCounter, max_tokens: int, db = None, thread_key: str = None):
+        """Trim messages to fit within token limit"""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        current_tokens = token_counter.count_thread_tokens(self.messages)
+        
+        if current_tokens <= max_tokens:
+            return
+        
+        logger.info(f"Thread exceeds token limit ({current_tokens} > {max_tokens}), trimming oldest messages")
+        
+        # Find first non-system message index
+        start_index = 0
+        for i, msg in enumerate(self.messages):
+            if msg.get("role") not in ["system", "developer"]:
+                start_index = i
+                break
+        
+        # Remove messages from the beginning (after system message)
+        removed_count = 0
+        messages_to_remove = []
+        
+        while current_tokens > max_tokens and len(self.messages) > start_index + 1:
+            if start_index < len(self.messages) - 1:
+                removed_msg = self.messages.pop(start_index)
+                messages_to_remove.append(removed_msg)
+                removed_count += 1
+                
+                current_tokens = token_counter.count_thread_tokens(self.messages)
+                logger.debug(f"Removed message {removed_count}, tokens now: {current_tokens}")
+            else:
+                logger.warning(f"Cannot trim further - would remove current message")
+                break
+        
+        # Delete from database if available
+        if removed_count > 0:
+            if db and thread_key:
+                # Delete the oldest N non-system messages from database
+                db.delete_oldest_messages(thread_key, removed_count)
+                logger.debug(f"Deleted {removed_count} oldest messages from database for thread {thread_key}")
+            
+            logger.info(f"Trimmed {removed_count} messages to fit token limit")
     
     def get_recent_messages(self, count: int = 6) -> List[Dict[str, Any]]:
         """Get the most recent messages for context"""
@@ -297,6 +346,8 @@ class ThreadStateManager(LoggerMixin):
         self._documents: Dict[str, DocumentLedger] = {}
         self._lock_manager = ThreadLockManager()
         self._state_lock = Lock()
+        self._token_counter = TokenCounter(config.gpt_model)
+        self._max_tokens = config.thread_max_token_count
         self.db = db  # Optional database manager
         self._watchdog_thread = None
         self._start_watchdog()
@@ -366,10 +417,14 @@ class ThreadStateManager(LoggerMixin):
                     if cached_messages:
                         # Convert DB format to thread format
                         for msg in cached_messages:
-                            thread_state.messages.append({
+                            message_dict = {
                                 "role": msg["role"],
                                 "content": msg["content"]
-                            })
+                            }
+                            # Include metadata if present
+                            if msg.get("metadata"):
+                                message_dict["metadata"] = msg["metadata"]
+                            thread_state.messages.append(message_dict)
                         self.log_debug(f"Loaded {len(cached_messages)} cached messages for {thread_key}")
                 
                 self._threads[thread_key] = thread_state
