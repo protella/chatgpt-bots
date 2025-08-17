@@ -24,6 +24,8 @@ class ChatBotV2:
         self.processor = None  # Will be initialized after client
         self.cleanup_thread = None
         self.running = False
+        self.sigint_count = 0  # Track number of SIGINT received
+        self.last_sigint_time = 0  # Track time of last SIGINT
         
     def initialize(self):
         """Initialize the bot components"""
@@ -168,9 +170,42 @@ class ChatBotV2:
             )
     
     def _signal_handler(self, signum, frame):
-        """Handle shutdown signals"""
-        main_logger.info(f"Received signal {signum}, shutting down...")
-        self.shutdown()
+        """Handle shutdown signals - double Ctrl-C for force exit"""
+        import os
+        
+        # Handle SIGINT (Ctrl-C) with double-press for force exit
+        if signum == signal.SIGINT:
+            current_time = time.time()
+            
+            # If second Ctrl-C within 2 seconds, force exit
+            if self.sigint_count > 0 and (current_time - self.last_sigint_time) < 2.0:
+                main_logger.warning("Force exit requested (double Ctrl-C) - terminating immediately!")
+                
+                # Show active threads for debugging
+                import threading
+                active_threads = threading.enumerate()
+                if len(active_threads) > 1:
+                    main_logger.warning(f"Active threads at force exit: {len(active_threads)}")
+                    for thread in active_threads:
+                        if thread.name != "MainThread":
+                            main_logger.warning(f"  - {thread.name} (daemon={thread.daemon})")
+                
+                # Force exit without cleanup
+                os._exit(1)
+            
+            self.sigint_count += 1
+            self.last_sigint_time = current_time
+            
+            if self.sigint_count == 1:
+                main_logger.info(f"Received signal {signum}, attempting graceful shutdown...")
+                main_logger.info("Press Ctrl-C again within 2 seconds to force exit")
+                self.shutdown()
+            else:
+                main_logger.warning("Shutdown already in progress... Press Ctrl-C again to force exit")
+        else:
+            # Handle other signals normally
+            main_logger.info(f"Received signal {signum}, shutting down...")
+            self.shutdown()
     
     def start_cleanup_thread(self):
         """Start background thread for periodic cleanup"""
@@ -251,13 +286,20 @@ class ChatBotV2:
         self.running = False
         main_logger.info(f"Shutting down {self.platform} bot...")
         
-        # Stop the client
+        # Stop the client (this should interrupt any stuck operations)
         if self.client:
-            self.client.stop()
+            try:
+                self.client.stop()
+            except Exception as e:
+                main_logger.warning(f"Error stopping client: {e}")
         
         # Clean up resources
-        stats = self.processor.get_stats()
-        main_logger.info(f"Final stats: {stats}")
+        try:
+            if self.processor:
+                stats = self.processor.get_stats()
+                main_logger.info(f"Final stats: {stats}")
+        except Exception as e:
+            main_logger.warning(f"Error getting final stats: {e}")
         
         log_session_end()
         sys.exit(0)
