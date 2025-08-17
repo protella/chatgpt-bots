@@ -16,6 +16,12 @@ from logger import LoggerMixin
 from prompts import SLACK_SYSTEM_PROMPT, DISCORD_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, IMAGE_ANALYSIS_PROMPT
 from streaming import StreamingBuffer, RateLimitManager
 from image_url_handler import ImageURLHandler
+try:
+    from document_handler import DocumentHandler
+    DOCUMENT_HANDLER_AVAILABLE = True
+except ImportError as e:
+    DocumentHandler = None
+    DOCUMENT_HANDLER_AVAILABLE = False
 
 
 class MessageProcessor(LoggerMixin):
@@ -25,7 +31,10 @@ class MessageProcessor(LoggerMixin):
         self.thread_manager = ThreadStateManager(db=db)
         self.openai_client = OpenAIClient()
         self.image_url_handler = ImageURLHandler()
+        self.document_handler = DocumentHandler() if DOCUMENT_HANDLER_AVAILABLE else None
         self.db = db  # Database manager
+        if not DOCUMENT_HANDLER_AVAILABLE:
+            self.log_warning("DocumentHandler not available - document processing will be disabled")
         self.log_info(f"MessageProcessor initialized {'with' if db else 'without'} database")
     
     def process_message(self, message: Message, client: BaseClient, thinking_id: Optional[str] = None) -> Optional[Response]:
@@ -96,8 +105,8 @@ class MessageProcessor(LoggerMixin):
             user_real_name = message.metadata.get("user_real_name", None) if message.metadata else None
             thread_state.system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name)
             
-            # Process any attachments (images and other files)
-            image_inputs, unsupported_files = self._process_attachments(message, client)
+            # Process any attachments (images, documents, and other files)
+            image_inputs, document_inputs, unsupported_files = self._process_attachments(message, client, thinking_id)
             
             # Check for unsupported files and notify user
             if unsupported_files:
@@ -115,12 +124,13 @@ class MessageProcessor(LoggerMixin):
                 unsupported_msg += f"*File type(s):* `{types_str}`\n\n"
                 unsupported_msg += "───────────────\n"
                 unsupported_msg += "*Currently supported:*\n"
-                unsupported_msg += "• Images (JPEG, PNG, GIF, WebP)\n\n"
+                unsupported_msg += "• Images (JPEG, PNG, GIF, WebP)\n"
+                unsupported_msg += "• Documents (PDF, DOCX, XLSX, CSV, TXT, etc.)\n\n"
                 unsupported_msg += "_Support for additional file types may be added in the future._"
                 
-                # If there's also text or images, continue processing those
-                if (message.text and message.text.strip()) or image_inputs:
-                    unsupported_msg += "\n\nI'll process your text/image request now."
+                # If there's also text, images, or documents, continue processing those
+                if (message.text and message.text.strip()) or image_inputs or document_inputs:
+                    unsupported_msg += "\n\nI'll process your text/image/document request now."
                     # Add the unsupported files warning to conversation
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                     message_ts = message.metadata.get("ts") if message.metadata else None
@@ -145,7 +155,12 @@ class MessageProcessor(LoggerMixin):
                     )
             
             # Build user content
-            user_content = self._build_user_content(message.text, image_inputs)
+            # If we have documents, enhance the text with document content
+            enhanced_text = message.text
+            if document_inputs:
+                enhanced_text = self._build_message_with_documents(message.text, document_inputs)
+            
+            user_content = self._build_user_content(enhanced_text, image_inputs)
             
             # Check if we're handling a clarification response
             if thread_state.pending_clarification:
@@ -157,7 +172,7 @@ class MessageProcessor(LoggerMixin):
                 intent = self.openai_client.classify_intent(
                     thread_state.messages,  # Use full conversation history
                     combined_context,
-                    has_attached_images=len(image_inputs) > 0
+                    has_attached_images=len(image_inputs) > 0 or len(document_inputs) > 0
                 )
                 
                 # Clear the pending clarification
@@ -181,8 +196,8 @@ class MessageProcessor(LoggerMixin):
                     try:
                         intent = self.openai_client.classify_intent(
                             thread_state.messages,  # Use full conversation history
-                            message.text,
-                            has_attached_images=len(image_inputs) > 0
+                            enhanced_text,  # Use enhanced text that includes document content
+                            has_attached_images=len(image_inputs) > 0 or len(document_inputs) > 0
                         )
                     except TimeoutError as e:
                         self.log_error(f"Intent classification timed out: {e}")
@@ -213,8 +228,8 @@ class MessageProcessor(LoggerMixin):
                 try:
                     intent = self.openai_client.classify_intent(
                         thread_state.messages,  # Use full conversation history
-                        message.text if message.text else "",
-                        has_attached_images=False  # Already checked - no images here
+                        enhanced_text if enhanced_text else "",
+                        has_attached_images=len(document_inputs) > 0  # Documents present
                     )
                 except TimeoutError as e:
                     self.log_error(f"Intent classification timed out: {e}")
@@ -305,15 +320,37 @@ class MessageProcessor(LoggerMixin):
                         message
                     )
             elif intent == "vision":
-                # Vision analysis - but check if we actually have images
+                # Vision analysis - but check if we actually have images or documents
                 # Don't update status here, let _handle_vision_analysis manage the status flow
-                if image_inputs:
-                    # User uploaded images for vision analysis
-                    response = self._handle_vision_analysis(message.text, image_inputs, thread_state, message.attachments, 
-                                                           client, message.channel_id, thinking_id, message)
+                if image_inputs or document_inputs:
+                    # User uploaded images or documents for analysis
+                    if document_inputs and not image_inputs:
+                        # Documents only - show document-specific status
+                        doc_count = len(document_inputs)
+                        doc_names = ", ".join([d["filename"] for d in document_inputs[:3]])
+                        if doc_count > 3:
+                            doc_names += f" and {doc_count - 3} more"
+                        status_msg = f"Analyzing {doc_count} document{'s' if doc_count > 1 else ''}: {doc_names}..."
+                        self._update_status(client, message.channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
+                        
+                        # Documents are already in enhanced_text, just process as text with vision intent
+                        response = self._handle_text_response(user_content, thread_state, client, message, thinking_id)
+                    elif image_inputs and document_inputs:
+                        # Both images and documents
+                        total_files = len(image_inputs) + len(document_inputs)
+                        status_msg = f"Analyzing {len(image_inputs)} image{'s' if len(image_inputs) > 1 else ''} and {len(document_inputs)} document{'s' if len(document_inputs) > 1 else ''}..."
+                        self._update_status(client, message.channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
+                        
+                        # Process with vision handler for images, documents are in context
+                        response = self._handle_vision_analysis(message.text, image_inputs, thread_state, message.attachments, 
+                                                               client, message.channel_id, thinking_id, message)
+                    else:
+                        # Images only - use existing vision handler
+                        response = self._handle_vision_analysis(message.text, image_inputs, thread_state, message.attachments, 
+                                                               client, message.channel_id, thinking_id, message)
                 else:
-                    # Vision-related question but no images - try to find previous images
-                    self.log_debug("Vision intent detected but no images attached - searching for previous images")
+                    # Vision-related question but no images or documents - try to find previous images
+                    self.log_debug("Vision intent detected but no files attached - searching for previous images")
                     response = self._handle_vision_without_upload(
                         message.text, 
                         thread_state, 
@@ -560,14 +597,16 @@ class MessageProcessor(LoggerMixin):
     def _process_attachments(
         self,
         message: Message,
-        client: BaseClient
-    ) -> Tuple[List[Dict], List[Dict]]:
-        """Process message attachments and extract images from URLs in text
+        client: BaseClient,
+        thinking_id: Optional[str] = None
+    ) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+        """Process message attachments and extract images/documents from URLs in text
         
         Returns:
-            Tuple of (image_inputs, unsupported_files)
+            Tuple of (image_inputs, document_inputs, unsupported_files)
         """
         image_inputs = []
+        document_inputs = []
         unsupported_files = []
         image_count = 0
         max_images = 10
@@ -633,6 +672,92 @@ class MessageProcessor(LoggerMixin):
                 
                 except Exception as e:
                     self.log_error(f"Error processing attachment: {e}")
+            elif self.document_handler and self.document_handler.is_document_file(file_name, attachment.get("mimetype")):
+                # Process document file
+                mimetype = attachment.get("mimetype", "application/octet-stream")
+                try:
+                    # Track this file ID to avoid reprocessing
+                    file_id = attachment.get("id")
+                    if file_id:
+                        processed_file_ids.add(file_id)
+                    
+                    # Update status to show we're processing the document
+                    if thinking_id:
+                        self._update_status(client, message.channel_id, thinking_id, 
+                                          f"Processing {file_name}...", 
+                                          emoji=config.analyze_emoji)
+                    
+                    # Download the document
+                    document_data = client.download_file(
+                        attachment.get("url"),
+                        file_id
+                    )
+                    
+                    if document_data:
+                        # Update status to show we're extracting content
+                        if thinking_id:
+                            self._update_status(client, message.channel_id, thinking_id, 
+                                              f"Extracting content from {file_name}...", 
+                                              emoji=config.analyze_emoji)
+                        
+                        # Extract document content using DocumentHandler
+                        extracted_content = self.document_handler.safe_extract_content(
+                            document_data, mimetype, file_name
+                        )
+                        
+                        if extracted_content and extracted_content.get("content"):
+                            document_inputs.append({
+                                "filename": file_name,
+                                "mimetype": mimetype,
+                                "content": extracted_content["content"],
+                                "page_structure": extracted_content.get("page_structure"),
+                                "total_pages": extracted_content.get("total_pages"),
+                                "summary": extracted_content.get("summary"),
+                                "metadata": extracted_content.get("metadata", {}),
+                                "url": attachment.get("url"),
+                                "file_id": file_id,
+                                "source": "attachment"
+                            })
+                            
+                            # Store document in thread's DocumentLedger
+                            thread_key = f"{message.channel_id}:{message.thread_id}"
+                            document_ledger = self.thread_manager.get_or_create_document_ledger(message.thread_id)
+                            document_ledger.add_document(
+                                content=extracted_content["content"],
+                                filename=file_name,
+                                mime_type=mimetype,
+                                page_structure=extracted_content.get("page_structure"),
+                                total_pages=extracted_content.get("total_pages"),
+                                summary=extracted_content.get("summary"),
+                                metadata=extracted_content.get("metadata", {}),
+                                db=self.db,
+                                thread_id=thread_key,
+                                message_ts=message.metadata.get("ts") if message.metadata else None
+                            )
+                            
+                            self.log_info(f"Processed document: {file_name} ({extracted_content.get('total_pages', 'unknown')} pages)")
+                        else:
+                            self.log_warning(f"Failed to extract content from document: {file_name}")
+                            # Update status to show extraction failed
+                            if thinking_id:
+                                error_msg = extracted_content.get("error", "Unable to extract content")
+                                self._update_status(client, message.channel_id, thinking_id, 
+                                                  f"⚠️ {file_name}: {error_msg}")
+                            # Add to unsupported if extraction failed
+                            unsupported_files.append({
+                                "name": file_name,
+                                "type": "file",
+                                "mimetype": mimetype
+                            })
+                
+                except Exception as e:
+                    self.log_error(f"Error processing document attachment: {e}")
+                    # Add to unsupported if processing failed
+                    unsupported_files.append({
+                        "name": file_name,
+                        "type": "file",
+                        "mimetype": mimetype
+                    })
             else:
                 # Track unsupported file types
                 mimetype = attachment.get("mimetype", "unknown")
@@ -705,7 +830,6 @@ class MessageProcessor(LoggerMixin):
             # Get Slack token if this is a Slack client (for non-Slack URLs that might need auth)
             auth_token = None
             if hasattr(client, '__class__') and client.__class__.__name__ == 'SlackBot':
-                from config import config
                 auth_token = config.slack_bot_token
             
             downloaded_images, failed_urls = self.image_url_handler.process_urls_from_text(text_for_url_processing, auth_token)
@@ -736,7 +860,7 @@ class MessageProcessor(LoggerMixin):
             if failed_urls:
                 self.log_warning(f"Failed to download images from URLs: {', '.join(failed_urls)}")
         
-        return image_inputs, unsupported_files
+        return image_inputs, document_inputs, unsupported_files
     
     def _build_user_content(self, text: str, image_inputs: List[Dict]) -> Any:
         """Build user message content"""
@@ -748,6 +872,59 @@ class MessageProcessor(LoggerMixin):
         else:
             # Simple text content
             return text
+    
+    def _build_message_with_documents(self, text: str, document_inputs: List[Dict]) -> str:
+        """Format documents with page/sheet structure for OpenAI context
+        
+        Args:
+            text: Original user message text
+            document_inputs: List of processed document dictionaries
+            
+        Returns:
+            Formatted message text with document content and boundaries
+        """
+        if not document_inputs:
+            return text
+            
+        # Start with the original message
+        message_parts = [text] if text and text.strip() else []
+        
+        # Add document boundaries and content
+        for doc in document_inputs:
+            filename = doc.get("filename", "unknown_document")
+            mimetype = doc.get("mimetype", "unknown")
+            content = doc.get("content", "")
+            page_structure = doc.get("page_structure")
+            total_pages = doc.get("total_pages")
+            
+            # Build document header
+            doc_header = f"\n\n=== DOCUMENT: {filename} ==="
+            if total_pages:
+                doc_header += f" ({total_pages} pages)"
+            doc_header += f"\nMIME Type: {mimetype}\n"
+            
+            # Add page/sheet structure info if available
+            if page_structure:
+                if isinstance(page_structure, dict):
+                    if "sheets" in page_structure:
+                        # Excel/CSV with multiple sheets
+                        sheet_names = list(page_structure["sheets"].keys())
+                        doc_header += f"Sheets: {', '.join(sheet_names[:5])}"  # Limit displayed sheet names
+                        if len(sheet_names) > 5:
+                            doc_header += f" (and {len(sheet_names) - 5} more)"
+                        doc_header += "\n"
+                    elif "pages" in page_structure:
+                        # PDF with page info
+                        doc_header += f"Pages: {len(page_structure['pages'])}\n"
+            
+            doc_header += "=== CONTENT START ===\n"
+            
+            # Add the document content
+            message_parts.append(doc_header)
+            message_parts.append(content)
+            message_parts.append(f"\n=== DOCUMENT END: {filename} ===")
+        
+        return "\n".join(message_parts)
     
     def _extract_image_registry(self, thread_state) -> List[Dict[str, str]]:
         """Extract all image URLs and descriptions from thread state"""

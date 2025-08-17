@@ -1,6 +1,6 @@
 """
 SQLite Database Manager for ChatGPT Bots
-Provides persistent storage for threads, messages, images, and user preferences
+Provides persistent storage for threads, messages, images, documents, and user preferences
 """
 
 import sqlite3
@@ -122,6 +122,38 @@ class DatabaseManager(LoggerMixin):
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_url 
             ON images(url)
+        """)
+        
+        # Documents table
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                page_structure TEXT,
+                total_pages INTEGER,
+                summary TEXT,
+                metadata_json TEXT,
+                message_ts TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (thread_id) REFERENCES threads(thread_id) ON DELETE CASCADE
+            )
+        """)
+        
+        # Create indexes for documents
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_thread_documents 
+            ON documents(thread_id, created_at)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_document_filename 
+            ON documents(filename)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_document_message 
+            ON documents(message_ts)
         """)
         
         # Users table with timezone support
@@ -510,6 +542,130 @@ class DatabaseManager(LoggerMixin):
             return img
         
         return None
+    
+    # Document operations
+    
+    def save_document(self, thread_id: str, filename: str, mime_type: str,
+                     content: str, page_structure: Optional[Dict] = None,
+                     total_pages: Optional[int] = None, summary: Optional[str] = None,
+                     metadata: Optional[Dict] = None, message_ts: Optional[str] = None):
+        """
+        Save document content and metadata.
+        
+        Args:
+            thread_id: Thread identifier
+            filename: Original filename
+            mime_type: Document MIME type
+            content: Full document text content
+            page_structure: Optional page/sheet structure info as dict
+            total_pages: Total page/sheet count
+            summary: Optional AI-generated summary
+            metadata: Additional metadata (size, author, etc.)
+            message_ts: Message timestamp to link document to specific message
+        """
+        self.log_debug(f"DB: Saving document - thread={thread_id}, filename={filename}, "
+                      f"content_len={len(content) if content else 0}, pages={total_pages}")
+        
+        try:
+            self.conn.execute("""
+                INSERT INTO documents 
+                (thread_id, filename, mime_type, content, page_structure, total_pages, 
+                 summary, metadata_json, message_ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (thread_id, filename, mime_type, content,
+                  json.dumps(page_structure) if page_structure else None,
+                  total_pages, summary,
+                  json.dumps(metadata) if metadata else None, message_ts))
+            
+            # Update thread activity
+            self.update_thread_activity(thread_id)
+            
+            self.log_info(f"DB: Successfully saved document {filename} for thread {thread_id}")
+            
+        except Exception as e:
+            self.log_error(f"DB: Failed to save document {filename} - {e}", exc_info=True)
+            raise
+    
+    def get_thread_documents(self, thread_id: str, limit: Optional[int] = None) -> List[Dict]:
+        """
+        Get all documents for a thread.
+        
+        Args:
+            thread_id: Thread identifier
+            limit: Optional limit on number of documents returned
+            
+        Returns:
+            List of document dictionaries
+        """
+        query = """
+            SELECT * FROM documents 
+            WHERE thread_id = ? 
+            ORDER BY created_at ASC
+        """
+        
+        if limit:
+            query += f" LIMIT {limit}"
+        
+        cursor = self.conn.execute(query, (thread_id,))
+        documents = []
+        
+        for row in cursor:
+            doc = dict(row)
+            if doc.get("page_structure"):
+                doc["page_structure"] = json.loads(doc["page_structure"])
+            if doc.get("metadata_json"):
+                doc["metadata"] = json.loads(doc["metadata_json"])
+                del doc["metadata_json"]
+            documents.append(doc)
+        
+        return documents
+    
+    def get_document_by_filename(self, thread_id: str, filename: str) -> Optional[Dict]:
+        """
+        Get a specific document by filename within a thread.
+        
+        Args:
+            thread_id: Thread identifier
+            filename: Document filename
+            
+        Returns:
+            Document dictionary or None
+        """
+        cursor = self.conn.execute("""
+            SELECT * FROM documents 
+            WHERE thread_id = ? AND filename = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (thread_id, filename))
+        
+        row = cursor.fetchone()
+        if row:
+            doc = dict(row)
+            if doc.get("page_structure"):
+                doc["page_structure"] = json.loads(doc["page_structure"])
+            if doc.get("metadata_json"):
+                doc["metadata"] = json.loads(doc["metadata_json"])
+                del doc["metadata_json"]
+            return doc
+        
+        return None
+    
+    def delete_old_documents(self, days: int = 90):
+        """
+        Delete documents older than specified days.
+        
+        Args:
+            days: Number of days to retain documents (default 90)
+        """
+        cutoff = datetime.now() - timedelta(days=days)
+        
+        cursor = self.conn.execute("""
+            DELETE FROM documents 
+            WHERE created_at < ?
+        """, (cutoff,))
+        
+        if cursor.rowcount > 0:
+            self.log_info(f"DB: Cleaned up {cursor.rowcount} documents older than {days} days")
     
     # User operations
     
