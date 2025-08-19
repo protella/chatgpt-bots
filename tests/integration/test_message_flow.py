@@ -47,7 +47,7 @@ class TestSlackToOpenAIFlow:
         # Create a mock client for Slack operations
         mock_client = MagicMock()
         mock_client.platform = "slack"
-        mock_client.fetch_thread_history.return_value = []
+        mock_client.get_thread_history.return_value = []
         mock_client.post_message.return_value = "msg_123"
         
         # Create test message
@@ -92,7 +92,7 @@ class TestSlackToOpenAIFlow:
         # Mock client for Slack operations
         mock_client = MagicMock()
         mock_client.platform = "slack"
-        mock_client.fetch_thread_history.return_value = []
+        mock_client.get_thread_history.return_value = []
         mock_client.upload_image.return_value = "https://slack.com/image.png"
         
         # Create image request message
@@ -160,7 +160,7 @@ class TestSlackToOpenAIFlow:
         
         mock_client = MagicMock()
         mock_client.platform = "slack"
-        mock_client.fetch_thread_history.return_value = []
+        mock_client.get_thread_history.return_value = []
         
         # First message - using REAL API
         message1 = Message(
@@ -220,7 +220,7 @@ class TestSlackToOpenAIFlow:
                 mock_client = MagicMock()
                 mock_client.platform = "slack"
                 mock_client.name = "SlackBot"
-                mock_client.fetch_thread_history.return_value = []
+                mock_client.get_thread_history.return_value = []
                 mock_client.send_thinking_indicator.return_value = "thinking_123"
                 
                 message = Message(
@@ -340,7 +340,7 @@ class TestEndToEndScenarios:
             mock_client = MagicMock()
             mock_client.platform = "slack"
             mock_client.name = "SlackBot"
-            mock_client.fetch_thread_history.return_value = []
+            mock_client.get_thread_history.return_value = []
             mock_client.send_thinking_indicator.return_value = "thinking_123"
             
             import uuid
@@ -387,7 +387,7 @@ class TestEndToEndScenarios:
             mock_client = MagicMock()
             mock_client.platform = "slack"
             mock_client.name = "SlackBot"
-            mock_client.fetch_thread_history.return_value = []
+            mock_client.get_thread_history.return_value = []
             mock_client.send_thinking_indicator.return_value = "thinking_123"
             
             # Create messages for different threads with unique IDs
@@ -439,7 +439,7 @@ class TestRegressionScenarios:
             mock_client = MagicMock()
             mock_client.platform = "slack"
             mock_client.name = "SlackBot"
-            mock_client.fetch_thread_history.return_value = []
+            mock_client.get_thread_history.return_value = []
             mock_client.send_thinking_indicator.return_value = "thinking_123"
             
             message = Message("What is Python?", "U123", "C123", "T123")
@@ -492,7 +492,7 @@ class TestSmokeSuite:
                 mock_client = MagicMock()
                 mock_client.platform = "slack"
                 mock_client.name = "SlackBot"
-                mock_client.fetch_thread_history.return_value = []
+                mock_client.get_thread_history.return_value = []
                 mock_client.send_thinking_indicator.return_value = "thinking_123"
                 
                 message = Message("Test", "U1", "C1", "T1")

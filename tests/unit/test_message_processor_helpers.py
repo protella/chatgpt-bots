@@ -69,7 +69,7 @@ class TestMessageProcessorHelpers:
         assert len(urls) == 0
     
     def test_extract_slack_file_urls_non_image_files(self, processor):
-        """Test _extract_slack_file_urls filters out non-image files"""
+        """Test _extract_slack_file_urls now returns ALL files including non-images"""
         text = """
         Document: <https://files.slack.com/files-pri/T123/F456/document.pdf>
         Spreadsheet: https://files.slack.com/files-tmb/T123/F789/data.xlsx
@@ -77,7 +77,10 @@ class TestMessageProcessorHelpers:
         
         urls = processor._extract_slack_file_urls(text)
         
-        assert len(urls) == 0  # PDF and XLSX are not images
+        # Now returns ALL file types, not just images
+        assert len(urls) == 2
+        assert "https://files.slack.com/files-pri/T123/F456/document.pdf" in urls
+        assert "https://files.slack.com/files-tmb/T123/F789/data.xlsx" in urls
     
     def test_build_user_content_text_only(self, processor):
         """Test _build_user_content with text only"""

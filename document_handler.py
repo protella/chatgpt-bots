@@ -13,9 +13,14 @@ from typing import Dict, List, Optional, Any, Union, Tuple
 from urllib.parse import unquote
 import logging
 
-from logger import LoggerMixin
+import pdfplumber
+import PyPDF2
+from pdf2image import convert_from_bytes
+from docx import Document
+import openpyxl
+import pandas as pd
 
-# pandas will be imported dynamically when needed
+from logger import LoggerMixin
 
 # Supported document MIME types
 SUPPORTED_DOCUMENT_MIMETYPES = {
@@ -93,51 +98,6 @@ class DocumentHandler(LoggerMixin):
             max_document_size: Maximum document size in bytes (default 50MB)
         """
         self.max_document_size = max_document_size
-        self._dependencies_checked = False
-        self._available_parsers = {}
-        
-    def _check_dependencies(self):
-        """Check which parsing libraries are available"""
-        if self._dependencies_checked:
-            return
-            
-        try:
-            import pdfplumber
-            self._available_parsers['pdfplumber'] = pdfplumber
-            self.log_debug("pdfplumber library available")
-        except ImportError:
-            self.log_warning("pdfplumber not available - PDF parsing will use fallback")
-            
-        try:
-            import PyPDF2
-            self._available_parsers['PyPDF2'] = PyPDF2
-            self.log_debug("PyPDF2 library available")
-        except ImportError:
-            self.log_warning("PyPDF2 not available - PDF fallback disabled")
-            
-        try:
-            from docx import Document
-            self._available_parsers['python-docx'] = Document
-            self.log_debug("python-docx library available")
-        except ImportError:
-            self.log_warning("python-docx not available - Word document parsing disabled")
-            
-        try:
-            import openpyxl
-            self._available_parsers['openpyxl'] = openpyxl
-            self.log_debug("openpyxl library available")
-        except ImportError:
-            self.log_warning("openpyxl not available - Excel parsing will use pandas only")
-            
-        # pandas should be available from requirements
-        try:
-            import pandas as pd
-            self._available_parsers['pandas'] = pd
-            self.log_debug("pandas library available")
-        except ImportError:
-            self.log_error("pandas not available - spreadsheet parsing severely limited")
-            
-        self._dependencies_checked = True
     
     def is_document_file(self, filename: str, mimetype: Optional[str] = None) -> bool:
         """
@@ -169,7 +129,6 @@ class DocumentHandler(LoggerMixin):
         Returns:
             Dict with extracted content, structure info, and any errors
         """
-        self._check_dependencies()
         
         # Validate file size
         if len(file_data) > self.max_document_size:
@@ -289,16 +248,56 @@ class DocumentHandler(LoggerMixin):
         Returns:
             Dict with pages, content, and structure info
         """
-        if 'pdfplumber' in self._available_parsers:
-            return self._parse_pdf_with_pdfplumber(file_data, filename)
-        elif 'PyPDF2' in self._available_parsers:
-            return self._parse_pdf_with_pypdf2(file_data, filename)
-        else:
-            raise ImportError("No PDF parsing libraries available")
+        # Try pdfplumber first, then PyPDF2 as fallback
+        try:
+            result = self._parse_pdf_with_pdfplumber(file_data, filename)
+        except Exception as e:
+            self.log_warning(f"pdfplumber failed, trying PyPDF2: {e}")
+            result = self._parse_pdf_with_pypdf2(file_data, filename)
+        
+        # Check if PDF is likely image-based (scanned document)
+        if result and self._is_image_based_pdf(result):
+            result['is_image_based'] = True
+            result['requires_ocr'] = True
+            
+            # Convert PDF pages to images for vision processing
+            self.log_info(f"Converting image-based PDF {filename} to images for OCR")
+            page_images = self.convert_pdf_to_images(file_data, max_pages=10)
+            
+            if page_images:
+                result['page_images'] = page_images
+                result['ocr_available'] = True
+                self.log_info(f"Successfully converted {len(page_images)} PDF pages to images")
+                
+                # Update content to indicate OCR is available
+                total_pages = result.get('total_pages', 0)
+                if total_pages > len(page_images):
+                    result['content'] = (
+                        f"[Note: This PDF appears to be a scanned document with {total_pages} total pages. "
+                        f"Due to API limits, converted first {len(page_images)} pages to images for vision/OCR analysis. "
+                        f"Remaining {total_pages - len(page_images)} pages were not processed.]\n\n"
+                        f"{result.get('content', '[No text extracted from PDF]')}"
+                    )
+                else:
+                    result['content'] = (
+                        f"[Note: This PDF appears to be a scanned document. "
+                        f"Converted all {len(page_images)} page(s) to images for vision analysis. "
+                        f"The bot will use vision/OCR to extract content.]\n\n"
+                        f"{result.get('content', '[No text extracted from PDF]')}"
+                    )
+            else:
+                # Conversion failed, use original note
+                result['content'] = (
+                    f"[Note: This PDF appears to be a scanned document or contains primarily images. "
+                    f"Text extraction found minimal or no text content. "
+                    f"PDF to image conversion failed - OCR not available.]\n\n"
+                    f"{result.get('content', '[No text extracted from PDF]')}"
+                )
+        
+        return result
     
     def _parse_pdf_with_pdfplumber(self, file_data: bytes, filename: str) -> Dict[str, Any]:
         """Parse PDF using pdfplumber for advanced structure extraction"""
-        pdfplumber = self._available_parsers['pdfplumber']
         
         pages = []
         total_pages = 0
@@ -367,7 +366,6 @@ class DocumentHandler(LoggerMixin):
     
     def _parse_pdf_with_pypdf2(self, file_data: bytes, filename: str) -> Dict[str, Any]:
         """Parse PDF using PyPDF2 as fallback"""
-        PyPDF2 = self._available_parsers['PyPDF2']
         
         try:
             reader = PyPDF2.PdfReader(BytesIO(file_data))
@@ -422,11 +420,6 @@ class DocumentHandler(LoggerMixin):
         Returns:
             Dict with content, pages/sections, and structure info
         """
-        if 'python-docx' not in self._available_parsers:
-            # Fallback to text extraction
-            return self.parse_text(file_data, filename)
-        
-        Document = self._available_parsers['python-docx']
         
         try:
             doc = Document(BytesIO(file_data))
@@ -474,7 +467,198 @@ class DocumentHandler(LoggerMixin):
             }
             
         except Exception as e:
-            raise Exception(f"Word document parsing failed: {e}")
+            # Try alternative extraction method for problematic DOCX files
+            self.log_warning(f"Standard DOCX parsing failed, trying alternative method: {e}")
+            return self.parse_docx_alternative(file_data, filename)
+    
+    def parse_docx_alternative(self, file_data: bytes, filename: str) -> Dict[str, Any]:
+        """
+        Alternative DOCX parsing using ZIP extraction for problematic files
+        """
+        import zipfile
+        import xml.etree.ElementTree as ET
+        
+        try:
+            # First check if this is actually a ZIP file
+            if not file_data.startswith(b'PK'):  # ZIP files start with 'PK'
+                self.log_error(f"File {filename} does not appear to be a ZIP/DOCX file. First bytes: {file_data[:4]}")
+                # Could be an old .doc format
+                return self.parse_doc_legacy(file_data, filename)
+            
+            # DOCX files are ZIP archives
+            with zipfile.ZipFile(BytesIO(file_data)) as zip_file:
+                # Debug: log what's in the ZIP file
+                file_list = zip_file.namelist()
+                self.log_info(f"DOCX ZIP contents for {filename}: {file_list[:10]}...")  # First 10 files
+                
+                # Check if it's a valid DOCX structure - try different possible paths
+                # Handle both forward and backslash separators
+                doc_path = None
+                for possible_path in ['word/document.xml', 'word\\document.xml', 'Word/document.xml', 'document.xml']:
+                    if possible_path in file_list:
+                        doc_path = possible_path
+                        break
+                
+                if not doc_path:
+                    # Log more details about what we found
+                    self.log_error(f"No document.xml found. ZIP contains: {file_list}")
+                    raise ValueError(f"Not a valid DOCX file structure. Files in archive: {len(file_list)}")
+                
+                # Extract the main document XML
+                with zip_file.open(doc_path) as xml_file:
+                    tree = ET.parse(xml_file)
+                    root = tree.getroot()
+                    
+                    # Define namespaces
+                    namespaces = {
+                        'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+                    }
+                    
+                    # Extract all text from paragraphs
+                    content_parts = []
+                    for paragraph in root.findall('.//w:p', namespaces):
+                        texts = []
+                        for text_elem in paragraph.findall('.//w:t', namespaces):
+                            if text_elem.text:
+                                texts.append(text_elem.text)
+                        
+                        if texts:
+                            para_text = ''.join(texts).strip()
+                            if para_text:
+                                content_parts.append(para_text)
+                    
+                    # Try to extract tables
+                    for table in root.findall('.//w:tbl', namespaces):
+                        table_rows = []
+                        for row in table.findall('.//w:tr', namespaces):
+                            cells = []
+                            for cell in row.findall('.//w:tc', namespaces):
+                                cell_texts = []
+                                for text_elem in cell.findall('.//w:t', namespaces):
+                                    if text_elem.text:
+                                        cell_texts.append(text_elem.text)
+                                cells.append(' '.join(cell_texts))
+                            if cells:
+                                table_rows.append(' | '.join(cells))
+                        
+                        if table_rows:
+                            content_parts.append('\n[Table]\n' + '\n'.join(table_rows))
+                    
+                    content = '\n\n'.join(content_parts)
+                    
+                    return {
+                        'content': content or '[No text content extracted]',
+                        'format': 'docx',
+                        'extraction_method': 'xml_parsing',
+                        'warning': 'Document was parsed using alternative method - formatting may be simplified'
+                    }
+                    
+        except Exception as e:
+            self.log_error(f"Alternative DOCX parsing also failed: {e}")
+            # Final fallback - try to extract any text using textract or similar
+            return self.parse_docx_textract_fallback(file_data, filename)
+    
+    def parse_doc_legacy(self, file_data: bytes, filename: str) -> Dict[str, Any]:
+        """
+        Parse legacy .doc files (pre-2007 Word format)
+        """
+        try:
+            # Check if it's actually a .doc file (OLE2 format)
+            if file_data.startswith(b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1'):
+                self.log_info(f"Detected legacy .doc format for {filename}")
+                
+                # Try using python-docx2txt or other libraries
+                try:
+                    import docx2txt
+                    # Save to temp file since docx2txt needs a file path
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix='.doc', delete=False) as tmp:
+                        tmp.write(file_data)
+                        tmp_path = tmp.name
+                    
+                    try:
+                        text = docx2txt.process(tmp_path)
+                        return {
+                            'content': text or '[No text content found]',
+                            'format': 'doc',
+                            'extraction_method': 'docx2txt',
+                            'warning': 'Legacy .doc format - formatting simplified'
+                        }
+                    finally:
+                        import os
+                        os.unlink(tmp_path)
+                        
+                except ImportError:
+                    self.log_warning("docx2txt not available for .doc parsing")
+                
+                # Fallback to basic text extraction
+                return {
+                    'content': '[Legacy .doc format detected - cannot extract content without additional tools]',
+                    'format': 'doc',
+                    'extraction_method': 'none',
+                    'error': 'Legacy Word format requires additional tools like docx2txt or antiword'
+                }
+            else:
+                # Not a recognized format
+                return {
+                    'content': f'[Unrecognized file format for {filename}]',
+                    'format': 'unknown',
+                    'error': f'File does not appear to be a valid Word document. First bytes: {file_data[:4].hex()}'
+                }
+                
+        except Exception as e:
+            self.log_error(f"Legacy doc parsing failed: {e}")
+            return {
+                'content': f'[Unable to parse {filename}]',
+                'format': 'doc',
+                'error': str(e)
+            }
+    
+    def parse_docx_textract_fallback(self, file_data: bytes, filename: str) -> Dict[str, Any]:
+        """
+        Final fallback using system tools or basic extraction
+        """
+        try:
+            # Save temporarily and use pandoc or other system tools if available
+            import tempfile
+            import subprocess
+            
+            with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp:
+                tmp.write(file_data)
+                tmp_path = tmp.name
+            
+            try:
+                # Try pandoc if available
+                result = subprocess.run(
+                    ['pandoc', '-f', 'docx', '-t', 'plain', tmp_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                
+                if result.returncode == 0 and result.stdout:
+                    return {
+                        'content': result.stdout,
+                        'format': 'docx',
+                        'extraction_method': 'pandoc',
+                        'warning': 'Document extracted using pandoc - formatting simplified'
+                    }
+            except (subprocess.SubprocessError, FileNotFoundError):
+                pass
+            finally:
+                import os
+                os.unlink(tmp_path)
+                
+        except Exception as e:
+            self.log_error(f"Textract fallback failed: {e}")
+        
+        # Absolute final fallback
+        return {
+            'content': f'[Unable to extract content from {filename} - document format is not supported or file is corrupted]',
+            'format': 'docx',
+            'extraction_method': 'failed',
+            'error': 'All extraction methods failed'
+        }
     
     def parse_excel_adaptive(self, file_data: bytes, filename: str) -> Dict[str, Any]:
         """
@@ -487,10 +671,6 @@ class DocumentHandler(LoggerMixin):
         Returns:
             Dict with sheets, content, and structure info
         """
-        if 'pandas' not in self._available_parsers:
-            raise ImportError("pandas not available for spreadsheet parsing")
-        
-        pd = self._available_parsers['pandas']
         
         try:
             # Determine if this is CSV or Excel
@@ -767,7 +947,13 @@ class DocumentHandler(LoggerMixin):
         Returns:
             Extracted text content
         """
-        # Try direct text decoding
+        # Don't try to decode binary formats as text
+        binary_extensions = ('.docx', '.doc', '.xlsx', '.xls', '.pptx', '.ppt', '.pdf', '.zip', '.rar')
+        if filename.lower().endswith(binary_extensions):
+            # These are binary formats that shouldn't be decoded as text
+            return f"[Unable to extract text from corrupted {filename} - binary format]"
+        
+        # Try direct text decoding for text-based formats
         encodings = ['utf-8', 'latin-1', 'cp1252']
         
         for encoding in encodings:
@@ -775,7 +961,8 @@ class DocumentHandler(LoggerMixin):
                 text = file_data.decode(encoding, errors='ignore')
                 # Clean up the text
                 text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
-                if text.strip():
+                # Check if we got mostly readable text (not binary garbage)
+                if text.strip() and len([c for c in text[:100] if c.isprintable()]) > 80:
                     return f"[Raw text extraction from {filename}]\n{text}"
             except:
                 continue
@@ -976,3 +1163,115 @@ class DocumentHandler(LoggerMixin):
             return '| ' + ' | '.join(parts) + ' |'
         except:
             return row
+    
+    def convert_pdf_to_images(self, file_data: bytes, max_pages: int = 10) -> List[Dict[str, Any]]:
+        """
+        Convert PDF pages to images for vision/OCR processing
+        
+        Args:
+            file_data: PDF file data as bytes
+            max_pages: Maximum number of pages to convert (default 10 - OpenAI limit)
+            
+        Returns:
+            List of dicts with page images as base64 and metadata
+        """
+        
+        try:
+            # Convert PDF pages to PIL images
+            # Note: This requires poppler-utils to be installed on the system
+            images = convert_from_bytes(file_data, dpi=150, fmt='png')
+            
+            converted_pages = []
+            pages_to_process = min(len(images), max_pages)
+            
+            for i, image in enumerate(images[:pages_to_process]):
+                try:
+                    # Convert PIL image to base64
+                    buffer = BytesIO()
+                    image.save(buffer, format='PNG')
+                    image_data = buffer.getvalue()
+                    base64_data = base64.b64encode(image_data).decode('utf-8')
+                    
+                    converted_pages.append({
+                        'page': i + 1,
+                        'base64_data': base64_data,
+                        'mimetype': 'image/png',
+                        'width': image.width,
+                        'height': image.height
+                    })
+                    
+                    self.log_debug(f"Converted PDF page {i+1} to image ({image.width}x{image.height})")
+                    
+                except Exception as e:
+                    self.log_warning(f"Failed to convert page {i+1} to image: {e}")
+                    continue
+            
+            if len(images) > max_pages:
+                self.log_info(f"Converted first {max_pages} of {len(images)} PDF pages to images")
+            else:
+                self.log_info(f"Converted all {len(images)} PDF pages to images")
+            
+            return converted_pages
+            
+        except Exception as e:
+            self.log_error(f"Failed to convert PDF to images: {e}")
+            # Check if it's a poppler issue
+            if "poppler" in str(e).lower():
+                self.log_error("poppler-utils may not be installed. Install with: apt-get install poppler-utils (Linux) or brew install poppler (Mac)")
+            return []
+    
+    def _is_image_based_pdf(self, pdf_result: Dict[str, Any]) -> bool:
+        """
+        Detect if a PDF is likely image-based (scanned document)
+        
+        Args:
+            pdf_result: Result from PDF parsing
+            
+        Returns:
+            True if PDF appears to be image-based/scanned
+        """
+        # Check if we have pages data
+        pages = pdf_result.get('pages', [])
+        if not pages:
+            return False
+        
+        # Count pages with meaningful text content
+        pages_with_text = 0
+        total_text_length = 0
+        
+        for page in pages:
+            content = page.get('content', '')
+            # Remove whitespace and check length
+            clean_content = content.strip()
+            
+            # Skip page markers and extraction failure messages
+            if clean_content and not clean_content.startswith('[') and len(clean_content) > 50:
+                pages_with_text += 1
+                total_text_length += len(clean_content)
+        
+        # Heuristics to determine if PDF is image-based:
+        # 1. Less than 20% of pages have meaningful text
+        # 2. Average text per page is very low (< 100 chars)
+        total_pages = pdf_result.get('total_pages', len(pages))
+        
+        if total_pages == 0:
+            return False
+        
+        text_page_ratio = pages_with_text / total_pages
+        avg_text_per_page = total_text_length / total_pages if total_pages > 0 else 0
+        
+        # Consider it image-based if:
+        # - Very few pages have text (< 20%)
+        # - OR average text per page is very low (< 100 chars)
+        # - OR the entire content is very short relative to page count
+        is_likely_image_based = (
+            text_page_ratio < 0.2 or 
+            avg_text_per_page < 100 or
+            (total_pages > 1 and total_text_length < 200)
+        )
+        
+        if is_likely_image_based:
+            self.log_info(f"PDF appears to be image-based: {pages_with_text}/{total_pages} pages with text, "
+                         f"avg {avg_text_per_page:.0f} chars/page")
+        
+        return is_likely_image_based

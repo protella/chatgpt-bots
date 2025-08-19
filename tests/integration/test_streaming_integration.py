@@ -99,7 +99,7 @@ class TestStreamingIntegration:
         mock_client = Mock()
         mock_client.platform = "slack"
         mock_client.name = "SlackBot"
-        mock_client.fetch_thread_history = Mock(return_value=[])
+        mock_client.get_thread_history = Mock(return_value=[])
         mock_client.send_thinking_indicator = Mock(return_value="thinking_123")
         mock_client.supports_streaming = Mock(return_value=True)
         mock_client.get_streaming_config = Mock(return_value={
@@ -279,7 +279,7 @@ class TestStreamingIntegration:
             mock_client = Mock()
             mock_client.platform = "slack"
             mock_client.name = "SlackBot"
-            mock_client.fetch_thread_history = Mock(return_value=[])
+            mock_client.get_thread_history = Mock(return_value=[])
             mock_client.send_thinking_indicator = Mock(return_value=f"thinking_{thread_id}")
             mock_client.supports_streaming = Mock(return_value=False)  # Simpler for concurrent test
             
