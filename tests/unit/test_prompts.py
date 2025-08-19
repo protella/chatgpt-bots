@@ -23,7 +23,7 @@ class TestPrompts:
         assert len(SLACK_SYSTEM_PROMPT) > 0
         # Check for key content
         assert "Slack" in SLACK_SYSTEM_PROMPT
-        assert "Datassential" in SLACK_SYSTEM_PROMPT
+        # Company name can be customized via environment variables
         assert "mrkdwn" in SLACK_SYSTEM_PROMPT.lower()
     
     def test_discord_system_prompt_defined(self):

@@ -46,7 +46,7 @@ class TestThreadState:
         thread = ThreadState(thread_ts="123.456", channel_id="C123")
         thread.add_message("user", "Hello", db=mock_db, thread_key="C123:123.456", message_ts="789.012")
         
-        mock_db.cache_message.assert_called_once_with("C123:123.456", "user", "Hello", "789.012")
+        mock_db.cache_message.assert_called_once_with("C123:123.456", "user", "Hello", "789.012", None)
     
     def test_get_recent_messages(self):
         """Test getting recent messages"""
@@ -425,8 +425,8 @@ class TestThreadStateManager:
         
         # Verify DB was called
         assert mock_db.cache_message.call_count == 2
-        mock_db.cache_message.assert_any_call("C123:123.456", "user", "Message 1", None)
-        mock_db.cache_message.assert_any_call("C123:123.456", "assistant", "Response 1", None)
+        mock_db.cache_message.assert_any_call("C123:123.456", "user", "Message 1", None, None)
+        mock_db.cache_message.assert_any_call("C123:123.456", "assistant", "Response 1", None, None)
     
     @patch('thread_manager.threading.Thread')
     def test_regression_message_limit(self, mock_thread):

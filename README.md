@@ -70,6 +70,8 @@ source chatbots/bin/activate
 ```python3 -m pip install -U -r requirements.txt```
 
 - _Note: The included `requirements.txt` file includes all of the dependencies for all 3 clients in this repo._
+- _For OCR support on scanned PDFs, install `poppler-utils`: `apt-get install poppler-utils` (Linux) or `brew install poppler` (Mac)_
+- _For better DOCX support, optionally install `pandoc`: `apt-get install pandoc` (Linux) or `brew install pandoc` (Mac)_
 
 ### Setup `.env` file
 - Aquire the necessary keys or tokens from the integration you're using. 

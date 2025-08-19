@@ -704,26 +704,24 @@ class MessageProcessor(LoggerMixin):
         import re
         
         # Slack wraps URLs in angle brackets <URL>
-        # Pattern to match Slack file URLs (files.slack.com format)
-        pattern = r'<(https?://files\.slack\.com/[^>]+)>'
+        # Pattern to match Slack file URLs (both files.slack.com and workspace-specific URLs)
+        # Examples:
+        # - https://files.slack.com/files/...
+        # - https://datassential.slack.com/files/...
+        pattern = r'<(https?://(?:files\.slack\.com|[^/]+\.slack\.com/files)/[^>]+)>'
         
         urls = re.findall(pattern, text)
         
         # Also check for unwrapped Slack file URLs (but avoid capturing trailing >)
-        pattern2 = r'(https?://files\.slack\.com/[^\s>]+)'
+        pattern2 = r'(https?://(?:files\.slack\.com|[^/\s]+\.slack\.com/files)/[^\s>]+)'
         urls2 = re.findall(pattern2, text)
         
         # Combine and dedupe
         all_urls = list(set(urls + urls2))
         
-        # Filter to only image files
-        image_urls = []
-        for url in all_urls:
-            # Check if URL looks like it points to an image
-            if any(ext in url.lower() for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp', 'image']):
-                image_urls.append(url)
-        
-        return image_urls
+        # Return ALL Slack file URLs, not just images
+        # We'll determine the file type when processing them
+        return all_urls
     
     def _process_attachments(
         self,
@@ -837,6 +835,39 @@ class MessageProcessor(LoggerMixin):
                         )
                         
                         if extracted_content and extracted_content.get("content"):
+                            # Check if this is an image-based PDF that needs OCR
+                            if extracted_content.get("is_image_based") and mimetype == "application/pdf":
+                                self.log_info(f"PDF {file_name} appears to be image-based (scanned document)")
+                                
+                                # Check if we have page images for OCR
+                                if extracted_content.get("page_images"):
+                                    self.log_info(f"PDF has {len(extracted_content['page_images'])} page images for OCR")
+                                    # Add page images to image_inputs for vision processing
+                                    for page_img in extracted_content['page_images']:
+                                        if image_count >= max_images:
+                                            self.log_warning(f"Reached image limit, only processing first {image_count} PDF pages")
+                                            break
+                                        
+                                        image_inputs.append({
+                                            "type": "input_image",
+                                            "image_url": f"data:{page_img['mimetype']};base64,{page_img['base64_data']}",
+                                            "source": "pdf_page",
+                                            "page_number": page_img['page'],
+                                            "filename": file_name
+                                        })
+                                        image_count += 1
+                                    
+                                    # Update the document content to indicate OCR will be used
+                                    extracted_content["content"] = (
+                                        f"[PDF {file_name}: {extracted_content.get('total_pages', 'unknown')} pages total. "
+                                        f"This appears to be a scanned document. "
+                                        f"Using vision/OCR on {len(extracted_content['page_images'])} page(s) for text extraction.]"
+                                    )
+                                    extracted_content["ocr_processed"] = True
+                                else:
+                                    # No page images available
+                                    extracted_content["warning"] = "This PDF appears to be a scanned document with minimal extractable text"
+                            
                             document_inputs.append({
                                 "filename": file_name,
                                 "mimetype": mimetype,
@@ -847,7 +878,11 @@ class MessageProcessor(LoggerMixin):
                                 "metadata": extracted_content.get("metadata", {}),
                                 "url": attachment.get("url"),
                                 "file_id": file_id,
-                                "source": "attachment"
+                                "source": "attachment",
+                                "is_image_based": extracted_content.get("is_image_based", False),
+                                "requires_ocr": extracted_content.get("requires_ocr", False),
+                                "ocr_processed": extracted_content.get("ocr_processed", False),
+                                "warning": extracted_content.get("warning")
                             })
                             
                             # Store document in thread's DocumentLedger
@@ -866,7 +901,10 @@ class MessageProcessor(LoggerMixin):
                                 message_ts=message.metadata.get("ts") if message.metadata else None
                             )
                             
-                            self.log_info(f"Processed document: {file_name} ({extracted_content.get('total_pages', 'unknown')} pages)")
+                            if extracted_content.get("is_image_based"):
+                                self.log_info(f"Processed image-based PDF: {file_name} ({extracted_content.get('total_pages', 'unknown')} pages)")
+                            else:
+                                self.log_info(f"Processed document: {file_name} ({extracted_content.get('total_pages', 'unknown')} pages)")
                         else:
                             self.log_warning(f"Failed to extract content from document: {file_name}")
                             # Update status to show extraction failed
@@ -908,9 +946,6 @@ class MessageProcessor(LoggerMixin):
                 self.log_debug(f"Found {len(slack_file_urls)} Slack file URL(s) to process")
                 
                 for url in slack_file_urls:
-                    if image_count >= max_images:
-                        break
-                    
                     # Extract file ID from URL to check if already processed
                     file_id = None
                     if hasattr(client, 'extract_file_id_from_url'):
@@ -921,32 +956,137 @@ class MessageProcessor(LoggerMixin):
                         self.log_debug(f"Skipping duplicate Slack file {file_id} from URL")
                         continue
                     
+                    # Determine file type from URL
+                    url_lower = url.lower()
+                    is_pdf = '.pdf' in url_lower
+                    is_doc = any(ext in url_lower for ext in ['.docx', '.doc', '.xlsx', '.xls', '.csv', '.txt'])
+                    is_image = any(ext in url_lower for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', 'image'])
+                    
                     # Download the Slack file using the client's download_file method
                     self.log_info(f"Downloading Slack file from URL: {url}")
                     file_data = client.download_file(url)
                     
                     if file_data:
-                        # Convert to base64
-                        base64_data = base64.b64encode(file_data).decode('utf-8')
-                        
-                        # Determine mimetype from URL or default to PNG
-                        mimetype = "image/png"
-                        if '.jpg' in url.lower() or '.jpeg' in url.lower():
-                            mimetype = "image/jpeg"
-                        elif '.gif' in url.lower():
-                            mimetype = "image/gif"
-                        elif '.webp' in url.lower():
-                            mimetype = "image/webp"
-                        
-                        image_inputs.append({
-                            "type": "input_image",
-                            "image_url": f"data:{mimetype};base64,{base64_data}",
-                            "source": "slack_url",
-                            "original_url": url
-                        })
-                        
-                        image_count += 1
-                        self.log_info(f"Added Slack file image {image_count}/{max_images}: {url}")
+                        if is_pdf or is_doc:
+                            # Process as document
+                            # Extract filename from URL
+                            import re
+                            filename_match = re.search(r'/([^/]+\.(pdf|docx?|xlsx?|csv|txt))(\?|$)', url, re.IGNORECASE)
+                            file_name = filename_match.group(1) if filename_match else "document"
+                            
+                            # Determine mimetype
+                            if is_pdf:
+                                mimetype = "application/pdf"
+                            elif '.docx' in url_lower:
+                                mimetype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                            elif '.doc' in url_lower:
+                                mimetype = "application/msword"
+                            elif '.xlsx' in url_lower:
+                                mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            elif '.xls' in url_lower:
+                                mimetype = "application/vnd.ms-excel"
+                            elif '.csv' in url_lower:
+                                mimetype = "text/csv"
+                            else:
+                                mimetype = "text/plain"
+                            
+                            # Process document
+                            if self.document_handler:
+                                self.log_info(f"Processing Slack file URL as document: {file_name}")
+                                
+                                # Update status
+                                if thinking_id:
+                                    self._update_status(client, message.channel_id, thinking_id,
+                                                      f"Extracting content from {file_name}...",
+                                                      emoji=config.analyze_emoji)
+                                
+                                # Extract content
+                                extracted_content = self.document_handler.safe_extract_content(
+                                    file_data, mimetype, file_name
+                                )
+                                
+                                if extracted_content and extracted_content.get("content"):
+                                    # Check if this is an image-based PDF
+                                    if extracted_content.get("is_image_based") and mimetype == "application/pdf":
+                                        self.log_info(f"PDF {file_name} from URL appears to be image-based")
+                                        
+                                        # Check if we have page images for OCR
+                                        if extracted_content.get("page_images"):
+                                            self.log_info(f"PDF from URL has {len(extracted_content['page_images'])} page images for OCR")
+                                            # Add page images to image_inputs for vision processing
+                                            for page_img in extracted_content['page_images']:
+                                                if image_count >= max_images:
+                                                    self.log_warning(f"Reached image limit, only processing first {image_count} PDF pages")
+                                                    break
+                                                
+                                                image_inputs.append({
+                                                    "type": "input_image",
+                                                    "image_url": f"data:{page_img['mimetype']};base64,{page_img['base64_data']}",
+                                                    "source": "pdf_page_url",
+                                                    "page_number": page_img['page'],
+                                                    "filename": file_name
+                                                })
+                                                image_count += 1
+                                            
+                                            # Update content to indicate OCR will be used
+                                            extracted_content["content"] = (
+                                                f"[PDF {file_name} from URL: {extracted_content.get('total_pages', 'unknown')} pages. "
+                                                f"Scanned document - using vision/OCR on {len(extracted_content['page_images'])} page(s).]"
+                                            )
+                                            extracted_content["ocr_processed"] = True
+                                        else:
+                                            extracted_content["warning"] = "This PDF appears to be a scanned document"
+                                    
+                                    document_inputs.append({
+                                        "filename": file_name,
+                                        "mimetype": mimetype,
+                                        "content": extracted_content["content"],
+                                        "page_structure": extracted_content.get("page_structure"),
+                                        "total_pages": extracted_content.get("total_pages"),
+                                        "url": url,
+                                        "file_id": file_id,
+                                        "source": "slack_url",
+                                        "is_image_based": extracted_content.get("is_image_based", False),
+                                        "requires_ocr": extracted_content.get("requires_ocr", False),
+                                        "ocr_processed": extracted_content.get("ocr_processed", False),
+                                        "warning": extracted_content.get("warning")
+                                    })
+                                    self.log_info(f"Successfully processed document from Slack URL: {file_name}")
+                                else:
+                                    self.log_warning(f"Failed to extract content from Slack file URL: {url}")
+                                    unsupported_files.append({
+                                        "name": file_name,
+                                        "type": "document",
+                                        "mimetype": mimetype,
+                                        "error": "Content extraction failed"
+                                    })
+                            else:
+                                self.log_warning("Document handler not available for Slack file URL")
+                        elif is_image and image_count < max_images:
+                            # Process as image
+                            # Convert to base64
+                            base64_data = base64.b64encode(file_data).decode('utf-8')
+                            
+                            # Determine mimetype from URL or default to PNG
+                            mimetype = "image/png"
+                            if '.jpg' in url_lower or '.jpeg' in url_lower:
+                                mimetype = "image/jpeg"
+                            elif '.gif' in url_lower:
+                                mimetype = "image/gif"
+                            elif '.webp' in url_lower:
+                                mimetype = "image/webp"
+                            
+                            image_inputs.append({
+                                "type": "input_image",
+                                "image_url": f"data:{mimetype};base64,{base64_data}",
+                                "source": "slack_url",
+                                "original_url": url
+                            })
+                            
+                            image_count += 1
+                            self.log_info(f"Added Slack file image {image_count}/{max_images}: {url}")
+                        else:
+                            self.log_warning(f"Unknown file type or image limit reached for Slack URL: {url}")
                     else:
                         self.log_warning(f"Failed to download Slack file from URL: {url}")
             
@@ -1784,6 +1924,13 @@ class MessageProcessor(LoggerMixin):
             
             # Fall back to non-streaming on error
             self.log_info("Falling back to non-streaming due to error")
+            
+            # Remove the message that was just added by streaming attempt
+            # to prevent duplicates when fallback adds it again
+            if thread_state.messages and thread_state.messages[-1].get("role") == "user":
+                removed_msg = thread_state.messages.pop()
+                self.log_debug("Removed duplicate user message before fallback")
+            
             return self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls)
 
     def _handle_vision_analysis(self, user_text: str, image_inputs: List[Dict], thread_state, attachments: List[Dict],

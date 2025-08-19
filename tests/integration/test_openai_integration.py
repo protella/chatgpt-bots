@@ -190,10 +190,13 @@ class TestMessageProcessorIntegration:
         mock_client = Mock()
         mock_client.platform = "slack"
         mock_client.name = "SlackBot"
-        mock_client.fetch_thread_history = Mock(return_value=[])
+        # Make sure get_thread_history returns empty list (not fetch_thread_history)
+        def get_history(channel_id, thread_ts):
+            return []
+        mock_client.get_thread_history = get_history
         mock_client.send_thinking_indicator = Mock(return_value="thinking_123")
         mock_client.post_message = Mock(return_value="msg_123")
-        mock_client.post_message = Mock(return_value="msg_123")
+        mock_client.update_message = Mock(return_value={"success": True})
         
         message = Message(
             text="What is machine learning in one sentence?",
@@ -206,7 +209,10 @@ class TestMessageProcessorIntegration:
         response = processor.process_message(message, mock_client)
         
         assert response is not None
-        assert response.type == "text"
+        # Print error if we got one
+        if response.type == "error":
+            print(f"Error response: {response.content}")
+        assert response.type == "text", f"Expected text response, got {response.type}: {response.content}"
         assert "machine learning" in response.content.lower() or "learn" in response.content.lower()
         assert len(response.content) > 10  # Should have actual content
     
@@ -223,10 +229,11 @@ class TestMessageProcessorIntegration:
         mock_client = Mock()
         mock_client.platform = "slack"
         mock_client.name = "SlackBot"
-        mock_client.fetch_thread_history = Mock(return_value=[])
+        mock_client.get_thread_history = Mock(return_value=[])
         mock_client.send_thinking_indicator = Mock(return_value="thinking_123")
         mock_client.post_message = Mock(return_value="msg_123")
         mock_client.upload_image = Mock(return_value="https://example.com/image.png")
+        mock_client.update_message = Mock(return_value={"success": True})
         
         message = Message(
             text="Generate an image of a blue square",
@@ -263,7 +270,7 @@ class TestMessageProcessorIntegration:
         mock_client = Mock()
         mock_client.platform = "slack"
         mock_client.name = "SlackBot"
-        mock_client.fetch_thread_history = Mock(return_value=[])
+        mock_client.get_thread_history = Mock(return_value=[])
         mock_client.send_thinking_indicator = Mock(return_value="thinking_123")
         mock_client.post_message = Mock(return_value="msg_123")
         
@@ -308,9 +315,10 @@ class TestMessageProcessorIntegration:
         mock_client = Mock()
         mock_client.platform = "slack"
         mock_client.name = "SlackBot"
-        mock_client.fetch_thread_history = Mock(return_value=[])
+        mock_client.get_thread_history = Mock(return_value=[])
         mock_client.send_thinking_indicator = Mock(return_value="thinking_123")
         mock_client.post_message = Mock(return_value="msg_123")
+        mock_client.update_message = Mock(return_value={"success": True})
         mock_client.supports_streaming = Mock(return_value=True)
         mock_client.update_message_streaming = Mock(return_value={"success": True})
         mock_client.get_streaming_config = Mock(return_value={"update_interval": 0.5})
@@ -347,7 +355,7 @@ class TestComplexScenarios:
         mock_client = Mock()
         mock_client.platform = "slack"
         mock_client.name = "SlackBot"
-        mock_client.fetch_thread_history = Mock(return_value=[])
+        mock_client.get_thread_history = Mock(return_value=[])
         mock_client.send_thinking_indicator = Mock(return_value="thinking_123")
         mock_client.post_message = Mock(return_value="msg_123")
         
@@ -401,7 +409,7 @@ class TestComplexScenarios:
             mock_client = Mock()
             mock_client.platform = "slack"
             mock_client.name = "SlackBot"
-            mock_client.fetch_thread_history = Mock(return_value=[])
+            mock_client.get_thread_history = Mock(return_value=[])
             
             message = Message(
                 text="Test message",
@@ -434,7 +442,7 @@ class TestComplexScenarios:
         mock_client = Mock()
         mock_client.platform = "slack"
         mock_client.name = "SlackBot"
-        mock_client.fetch_thread_history = Mock(return_value=[])
+        mock_client.get_thread_history = Mock(return_value=[])
         mock_client.send_thinking_indicator = Mock(return_value="thinking_123")
         mock_client.post_message = Mock(return_value="msg_123")
         

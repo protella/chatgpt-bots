@@ -74,7 +74,7 @@ class TestMixedContentAnalysis:
         mock.post_message.return_value = "msg_123"
         mock.upload_image.return_value = "https://slack.com/image.png"
         mock.download_file.return_value = b"fake_file_data"
-        mock.fetch_thread_history.return_value = []
+        mock.get_thread_history = Mock(return_value=[])
         mock.send_thinking_indicator.return_value = "thinking_123"
         mock.update_message.return_value = None
         mock.delete_message.return_value = None
@@ -89,6 +89,12 @@ class TestMixedContentAnalysis:
                 processor.thread_manager = mock_thread_manager
                 processor.openai_client = mock_openai_client
                 processor.document_handler = mock_document_handler
+                # Setup token counting
+                processor.thread_manager._token_counter = MagicMock()
+                processor.thread_manager._token_counter.count_thread_tokens.return_value = 100
+                processor.thread_manager._token_counter.count_message_tokens.return_value = 10
+                processor.thread_manager._max_tokens = 100000
+                processor.openai_client.count_tokens.return_value = 10
                 return processor
     
     def test_mixed_content_detection(self, processor, mock_client):
@@ -354,6 +360,12 @@ class TestMixedContentEdgeCases:
                     "content": "Test content",
                     "total_pages": 1
                 }
+                # Setup token counting
+                processor.thread_manager._token_counter = MagicMock()
+                processor.thread_manager._token_counter.count_thread_tokens.return_value = 100
+                processor.thread_manager._token_counter.count_message_tokens.return_value = 10
+                processor.thread_manager._max_tokens = 100000
+                processor.openai_client.count_tokens.return_value = 10
                 return processor
     
     def test_multiple_documents_with_image(self, processor):
@@ -474,6 +486,12 @@ class TestVisionWithoutUploadEnhancements:
                 processor = MessageProcessor()
                 processor.openai_client.create_text_response.return_value = "Analysis result"
                 processor.openai_client.create_text_response_with_tools.return_value = "Analysis result"
+                # Setup token counting
+                processor.thread_manager._token_counter = MagicMock()
+                processor.thread_manager._token_counter.count_thread_tokens.return_value = 100
+                processor.thread_manager._token_counter.count_message_tokens.return_value = 10
+                processor.thread_manager._max_tokens = 100000
+                processor.openai_client.count_tokens.return_value = 10
                 return processor
     
     def test_check_again_retrieves_documents(self, processor):
