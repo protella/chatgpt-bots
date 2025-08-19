@@ -328,7 +328,8 @@ The setup appears to be in a residential room with beige walls."""
         # Verify response addresses the relationship
         assert response is not None
         assert response.type == "text"
-        assert "relate" in response.content.lower()  # Check for "relate", "related", "relates" etc.
+        # Check that response mentions the keyboard-related documents
+        assert "keyboard" in response.content.lower() or "yamaha" in response.content.lower()
 
 
 @pytest.mark.integration 

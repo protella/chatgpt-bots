@@ -19,9 +19,16 @@ class TestMessageProcessorStreaming:
     @pytest.fixture
     def processor(self):
         """Create a MessageProcessor instance"""
-        with patch('message_processor.ThreadStateManager'), \
-             patch('message_processor.OpenAIClient'):
+        with patch('message_processor.ThreadStateManager') as mock_thread, \
+             patch('message_processor.OpenAIClient') as mock_openai:
             processor = MessageProcessor()
+            # Setup token counting
+            processor.thread_manager._token_counter = Mock()
+            processor.thread_manager._token_counter.count_thread_tokens.return_value = 100
+            processor.thread_manager._token_counter.count_message_tokens.return_value = 10
+            processor.thread_manager._max_tokens = 100000
+            # Setup OpenAI token counting
+            processor.openai_client.count_tokens.return_value = 10
             # Logger is a property, can't mock directly
             return processor
     
@@ -34,7 +41,7 @@ class TestMessageProcessorStreaming:
         client.update_message = Mock(return_value=True)
         client.send_thinking_indicator = Mock(return_value="msg_123")
         client.post_message = Mock(return_value="msg_456")
-        client.fetch_thread_history = Mock(return_value=[])
+        client.get_thread_history = Mock(return_value=[])
         return client
     
     @patch('message_processor.StreamingBuffer')
@@ -154,6 +161,12 @@ class TestMessageProcessorImageOperations:
             processor = MessageProcessor()
             processor.openai_client = Mock()
             processor.thread_manager = Mock()
+            # Setup token counting
+            processor.thread_manager._token_counter = Mock()
+            processor.thread_manager._token_counter.count_thread_tokens.return_value = 100
+            processor.thread_manager._token_counter.count_message_tokens.return_value = 10
+            processor.thread_manager._max_tokens = 100000
+            processor.openai_client.count_tokens.return_value = 10
             return processor
     
     @pytest.fixture
@@ -439,6 +452,12 @@ class TestMessageProcessorErrorHandling:
         with patch('message_processor.ThreadStateManager'), \
              patch('message_processor.OpenAIClient'):
             processor = MessageProcessor()
+            # Setup token counting
+            processor.thread_manager._token_counter = Mock()
+            processor.thread_manager._token_counter.count_thread_tokens.return_value = 100
+            processor.thread_manager._token_counter.count_message_tokens.return_value = 10
+            processor.thread_manager._max_tokens = 100000
+            processor.openai_client.count_tokens.return_value = 10
             return processor
     
     def test_process_message_thread_busy(self, processor):
@@ -553,9 +572,10 @@ class TestMessageProcessorErrorHandling:
         
         urls = processor._extract_slack_file_urls(text)
         
-        # Only image URLs are returned, not PDFs
-        assert len(urls) == 1
+        # Now returns ALL Slack file URLs, not just images
+        assert len(urls) == 2
         assert "https://files.slack.com/files-pri/T123/F456/image.png" in urls
+        assert "https://files.slack.com/files-tmb/T123/F789/doc.pdf" in urls
     
     def test_build_user_content_with_images(self, processor):
         """Test building user content with multiple images"""
@@ -777,7 +797,14 @@ class TestMessageProcessorHelpers:
     def processor(self):
         with patch('message_processor.ThreadStateManager'), \
              patch('message_processor.OpenAIClient'):
-            return MessageProcessor()
+            processor = MessageProcessor()
+            # Setup token counting
+            processor.thread_manager._token_counter = Mock()
+            processor.thread_manager._token_counter.count_thread_tokens.return_value = 100
+            processor.thread_manager._token_counter.count_message_tokens.return_value = 10
+            processor.thread_manager._max_tokens = 100000
+            processor.openai_client.count_tokens.return_value = 10
+            return processor
     
     def test_extract_image_registry(self, processor):
         """Test extracting image registry from thread state"""
@@ -871,7 +898,7 @@ class TestMessageProcessorHelpers:
         client.platform = "slack"
         client.name = "SlackBot"
         client.bot_token = "xoxb-123"
-        client.fetch_thread_history = Mock(return_value=[])
+        client.get_thread_history = Mock(return_value=[])
         
         processor.openai_client.classify_intent = Mock(return_value="vision")
         processor.openai_client.analyze_images = Mock(return_value="Analysis result")

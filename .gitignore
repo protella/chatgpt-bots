@@ -159,7 +159,11 @@ logs/
 *.log
 
 # SQLite databases
-data/
+data/*
+!data/.gitkeep
+!data/backups/
+data/backups/*
+!data/backups/.gitkeep
 *.db
 *.db-wal
 *.db-shm
