@@ -38,6 +38,28 @@ class MessageProcessor(LoggerMixin):
             self.log_warning("DocumentHandler not available - document processing will be disabled")
         self.log_info(f"MessageProcessor initialized {'with' if db else 'without'} database")
     
+    def _format_user_content_with_username(self, content: str, message: Message) -> str:
+        """Format user content with username prefix for multi-user context
+        
+        Args:
+            content: The message content to format
+            message: The Message object containing metadata
+            
+        Returns:
+            Content prefixed with username (e.g., "Alice: Hello")
+        """
+        username = message.metadata.get("username", "User") if message.metadata else "User"
+        
+        # Handle special content formats
+        if not content or content.strip() == "":
+            return f"{username}:"
+        elif content.startswith("[") and content.endswith("]"):
+            # Special bracketed content (e.g., "[uploaded image]")
+            return f"{username}: {content}"
+        else:
+            # Normal text content
+            return f"{username}: {content}"
+    
     def _add_message_with_token_management(self, thread_state, role: str, content: Any, db=None, thread_key: str = None, message_ts: str = None, metadata: Dict[str, Any] = None):
         """Helper method to add messages with token management"""
         # Count tokens for this message
@@ -202,14 +224,16 @@ class MessageProcessor(LoggerMixin):
                     # Add the unsupported files warning to conversation
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                     message_ts = message.metadata.get("ts") if message.metadata else None
-                    self._add_message_with_token_management(thread_state, "user", f"[Uploaded unsupported file(s): {files_str}]", db=self.db, thread_key=thread_key, message_ts=message_ts)
+                    formatted_content = self._format_user_content_with_username(f"[Uploaded unsupported file(s): {files_str}]", message)
+                    self._add_message_with_token_management(thread_state, "user", formatted_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
                     self._add_message_with_token_management(thread_state, "assistant", unsupported_msg, db=self.db, thread_key=thread_key)
                     # Continue processing if we have text or images
                 else:
                     # Only unsupported files were uploaded, nothing else to process
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                     message_ts = message.metadata.get("ts") if message.metadata else None
-                    self._add_message_with_token_management(thread_state, "user", f"[Uploaded unsupported file(s): {files_str}]", db=self.db, thread_key=thread_key, message_ts=message_ts)
+                    formatted_content = self._format_user_content_with_username(f"[Uploaded unsupported file(s): {files_str}]", message)
+                    self._add_message_with_token_management(thread_state, "user", formatted_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
                     self._add_message_with_token_management(thread_state, "assistant", unsupported_msg, db=self.db, thread_key=thread_key)
                     elapsed = time.time() - request_start_time
                     self.log_info("")
@@ -223,10 +247,14 @@ class MessageProcessor(LoggerMixin):
                     )
             
             # Build user content
+            # First, format the base text with username
+            username = message.metadata.get("username", "User") if message.metadata else "User"
+            base_text_with_username = f"{username}: {message.text}" if message.text else f"{username}:"
+            
             # If we have documents, enhance the text with document content
-            enhanced_text = message.text
+            enhanced_text = base_text_with_username
             if document_inputs:
-                enhanced_text = self._build_message_with_documents(message.text, document_inputs)
+                enhanced_text = self._build_message_with_documents(base_text_with_username, document_inputs)
             
             user_content = self._build_user_content(enhanced_text, image_inputs)
             
@@ -235,7 +263,7 @@ class MessageProcessor(LoggerMixin):
             # Images are processed separately via analyze_images API
             if image_inputs:
                 # Only count the text breadcrumb that will be saved to history
-                breadcrumb_text = enhanced_text if enhanced_text else "[User uploaded image(s) for analysis]"
+                breadcrumb_text = enhanced_text if enhanced_text else f"{username}: [uploaded image(s) for analysis]"
                 message_tokens = self.thread_manager._token_counter.count_message_tokens({"role": "user", "content": breadcrumb_text})
             else:
                 # For non-image messages, count the full content
@@ -257,9 +285,13 @@ class MessageProcessor(LoggerMixin):
                 # Add minimal breadcrumb to history
                 thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                 message_ts = message.metadata.get("ts") if message.metadata else None
+                formatted_error_breadcrumb = self._format_user_content_with_username(
+                    f"[Attempted to upload {len(document_inputs)} document(s) - exceeded context limit]", 
+                    message
+                )
                 self._add_message_with_token_management(
                     thread_state, "user", 
-                    f"[Attempted to upload {len(document_inputs)} document(s) - exceeded context limit]",
+                    formatted_error_breadcrumb,
                     db=self.db, thread_key=thread_key, message_ts=message_ts
                 )
                 self._add_message_with_token_management(
@@ -360,7 +392,8 @@ class MessageProcessor(LoggerMixin):
                     # Add clarification to thread history
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                     message_ts = message.metadata.get("ts") if message.metadata else None
-                    self._add_message_with_token_management(thread_state, "user", message.text, db=self.db, thread_key=thread_key, message_ts=message_ts)
+                    formatted_text = self._format_user_content_with_username(message.text, message)
+                    self._add_message_with_token_management(thread_state, "user", formatted_text, db=self.db, thread_key=thread_key, message_ts=message_ts)
                     
                     # Check if it's an uploaded image or generated one
                     has_uploaded = any("files.slack.com" in msg.get("content", "") 
@@ -636,6 +669,32 @@ class MessageProcessor(LoggerMixin):
                 
                 # Build content with attachment info
                 content = hist_msg.text
+                
+                # For user messages, prefix with username
+                if not is_bot:
+                    # Get username from metadata (should be populated by client)
+                    username = hist_msg.metadata.get("username") if hist_msg.metadata else None
+                    
+                    # If no username in metadata, fetch it from user_id
+                    if not username and hist_msg.user_id:
+                        # Use client's get_username method if available
+                        if hasattr(client, 'get_username'):
+                            # Get the slack_client from metadata if available
+                            slack_client = hist_msg.metadata.get("slack_client") if hist_msg.metadata else None
+                            if slack_client:
+                                username = client.get_username(hist_msg.user_id, slack_client)
+                            else:
+                                # Try without slack_client
+                                username = hist_msg.user_id  # Fallback to user_id
+                        else:
+                            username = hist_msg.user_id  # Fallback to user_id
+                    
+                    # Default to "User" if still no username
+                    if not username:
+                        username = "User"
+                    
+                    # Format content with username
+                    content = f"{username}: {content}" if content else f"{username}:"
                 
                 # Store bot image metadata in DB
                 if is_bot and hist_msg.attachments:
@@ -2368,7 +2427,8 @@ class MessageProcessor(LoggerMixin):
         # Add breadcrumb to thread state with metadata
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
         message_ts = message.metadata.get("ts") if message.metadata else None
-        self._add_message_with_token_management(thread_state, "user", prompt, db=self.db, thread_key=thread_key, message_ts=message_ts)
+        formatted_prompt = self._format_user_content_with_username(prompt, message)
+        self._add_message_with_token_management(thread_state, "user", formatted_prompt, db=self.db, thread_key=thread_key, message_ts=message_ts)
         # Store enhanced prompt with metadata for new image tracking
         self._add_message_with_token_management(thread_state, 
             "assistant", 
@@ -2635,7 +2695,8 @@ class MessageProcessor(LoggerMixin):
                     # Add breadcrumbs with metadata
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                     message_ts = message.metadata.get("ts") if message.metadata else None
-                    self._add_message_with_token_management(thread_state, "user", text, db=self.db, thread_key=thread_key, message_ts=message_ts)
+                    formatted_text = self._format_user_content_with_username(text, message)
+                    self._add_message_with_token_management(thread_state, "user", formatted_text, db=self.db, thread_key=thread_key, message_ts=message_ts)
                     self._add_message_with_token_management(thread_state, 
                         "assistant", 
                         edited_image.prompt,
@@ -3092,7 +3153,8 @@ class MessageProcessor(LoggerMixin):
         user_breadcrumb = text or ""
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
         message_ts = message.metadata.get("ts") if message.metadata else None
-        self._add_message_with_token_management(thread_state, "user", user_breadcrumb, db=self.db, thread_key=thread_key, message_ts=message_ts)
+        formatted_breadcrumb = self._format_user_content_with_username(user_breadcrumb, message)
+        self._add_message_with_token_management(thread_state, "user", formatted_breadcrumb, db=self.db, thread_key=thread_key, message_ts=message_ts)
         
         # Store edited image in asset ledger
         asset_ledger = self.thread_manager.get_or_create_asset_ledger(thread_state.thread_ts)
