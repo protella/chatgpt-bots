@@ -46,7 +46,6 @@ class SlackBot(BaseClient):
             # Only process DMs and non-bot messages
             if event.get("channel_type") == "im" and not event.get("bot_id"):
                 self._handle_slack_message(event, client)
-    
     def get_username(self, user_id: str, client) -> str:
         """Get username from user ID, with caching"""
         # Check memory cache first
@@ -75,13 +74,18 @@ class SlackBot(BaseClient):
                 # Get both display name and real name
                 display_name = user_info.get("profile", {}).get("display_name")
                 real_name = user_info.get("profile", {}).get("real_name")
+                email = user_info.get("profile", {}).get("email")
                 # Prefer display name, fall back to real name, then just the ID
                 username = display_name or real_name or user_info.get("name") or user_id
+                
+                # Debug log for email
+                self.log_debug(f"Fetched user info for {user_id}: email={email}, real_name={real_name}")
                 
                 # Cache both username and timezone info in memory
                 self.user_cache[user_id] = {
                     'username': username,
                     'real_name': real_name,
+                    'email': email,
                     'timezone': user_info.get('tz', 'UTC'),
                     'tz_label': user_info.get('tz_label', 'UTC'),
                     'tz_offset': user_info.get('tz_offset', 0)
@@ -93,6 +97,7 @@ class SlackBot(BaseClient):
                     user_id,
                     username=username,
                     real_name=real_name,
+                    email=email,
                     timezone=user_info.get('tz', 'UTC'),
                     tz_label=user_info.get('tz_label', 'UTC'),
                     tz_offset=user_info.get('tz_offset', 0)
@@ -163,12 +168,23 @@ class SlackBot(BaseClient):
         username = self.get_username(user_id, client) if user_id else "unknown"
         user_timezone = self.get_user_timezone(user_id, client) if user_id else "UTC"
         
-        # Get timezone label (EST, PST, etc.) and real name if available
+        # Get timezone label (EST, PST, etc.), real name, and email if available
         user_tz_label = None
         user_real_name = None
+        user_email = None
         if user_id in self.user_cache:
             user_tz_label = self.user_cache[user_id].get('tz_label')
             user_real_name = self.user_cache[user_id].get('real_name')
+            user_email = self.user_cache[user_id].get('email')
+            self.log_debug(f"User cache for {user_id}: email={user_email}, real_name={user_real_name}")
+        else:
+            # Try to get from database if not in cache
+            user_info = self.db.get_user_info(user_id)
+            if user_info:
+                user_real_name = user_info.get('real_name')
+                user_email = user_info.get('email')
+                user_tz_label = user_info.get('tz_label')
+                self.log_debug(f"User from DB for {user_id}: email={user_email}, real_name={user_real_name}")
         
         # Create universal message
         message = Message(
@@ -182,6 +198,7 @@ class SlackBot(BaseClient):
                 "slack_client": client,
                 "username": username,  # Add username to metadata
                 "user_real_name": user_real_name,  # Add real name to metadata
+                "user_email": user_email,  # Add email to metadata
                 "user_timezone": user_timezone,  # Add timezone to metadata
                 "user_tz_label": user_tz_label  # Add timezone label (EST, PST, etc.)
             }
@@ -206,7 +223,6 @@ class SlackBot(BaseClient):
         if self.handler:
             self.log_info("Stopping Slack bot...")
             self.handler.close()
-    
     def send_message(self, channel_id: str, thread_id: str, text: str) -> bool:
         """Send a text message to Slack, splitting if needed"""
         try:
@@ -341,7 +357,6 @@ class SlackBot(BaseClient):
         except SlackApiError as e:
             self.log_debug(f"Could not delete message: {e}")
             return False
-    
     def update_message(self, channel_id: str, message_id: str, text: str) -> bool:
         """Update a message in Slack"""
         try:
@@ -479,7 +494,6 @@ class SlackBot(BaseClient):
                 return file_id
         
         return None
-    
     def download_file(self, file_url: str, file_id: Optional[str] = None) -> Optional[bytes]:
         """Download a file from Slack
         

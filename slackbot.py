@@ -5,7 +5,6 @@ Simple launcher for running the Slack bot directly
 Usage: python slackbot.py
 """
 
-import sys
 from main import ChatBotV2
 
 
