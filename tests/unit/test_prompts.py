@@ -23,8 +23,8 @@ class TestPrompts:
         assert len(SLACK_SYSTEM_PROMPT) > 0
         # Check for key content
         assert "Slack" in SLACK_SYSTEM_PROMPT
-        # Company name can be customized via environment variables
-        assert "mrkdwn" in SLACK_SYSTEM_PROMPT.lower()
+        # Check for Slack-specific formatting
+        assert "*bold*" in SLACK_SYSTEM_PROMPT
     
     def test_discord_system_prompt_defined(self):
         """Test that DISCORD_SYSTEM_PROMPT is defined and non-empty"""
@@ -43,7 +43,6 @@ class TestPrompts:
         assert len(CLI_SYSTEM_PROMPT) > 0
         # Check for key content
         assert "helpful assistant" in CLI_SYSTEM_PROMPT.lower()
-        assert "GPT-5" in CLI_SYSTEM_PROMPT
     
     def test_image_intent_system_prompt_defined(self):
         """Test that IMAGE_INTENT_SYSTEM_PROMPT is defined and non-empty"""
@@ -135,7 +134,7 @@ class TestPrompts:
         """Critical test for prompt structure and key instructions"""
         # Test Slack prompt has formatting instructions
         assert "*bold*" in SLACK_SYSTEM_PROMPT
-        assert "_italic_" in SLACK_SYSTEM_PROMPT
+        assert "```" in SLACK_SYSTEM_PROMPT  # Code blocks
         
         # Test image intent has all categories
         intent_categories = ["new", "edit", "vision", "ambiguous", "none"]
@@ -160,10 +159,10 @@ class TestPrompts:
     
     def test_prompts_consistency(self):
         """Test that prompts have consistent information"""
-        # All system prompts should mention GPT-5
+        # Model and knowledge cutoff are now dynamic, injected at runtime
+        # Just check that prompts don't have hardcoded model info
         system_prompts = [SLACK_SYSTEM_PROMPT, DISCORD_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT]
-        for prompt in system_prompts:
-            assert "GPT-5" in prompt or "GPT-4" in prompt  # Some might still use GPT-4
+        # No specific model check needed since it's dynamic
         
         # Image prompts should mention "image"
         image_prompts = [

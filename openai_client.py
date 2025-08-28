@@ -131,7 +131,6 @@ class OpenAIClient(LoggerMixin):
             if "timeout" in str(e).lower() or "timed out" in str(e).lower():
                 raise TimeoutError(f"OpenAI API call timed out: {e}")
             raise
-    
     def create_text_response(
         self,
         messages: List[Dict[str, Any]],
@@ -237,7 +236,6 @@ class OpenAIClient(LoggerMixin):
         except Exception as e:
             self.log_error(f"Error creating text response: {e}", exc_info=True)
             raise
-    
     def create_text_response_with_tools(
         self,
         messages: List[Dict[str, Any]],
@@ -333,7 +331,6 @@ class OpenAIClient(LoggerMixin):
         except Exception as e:
             self.log_error(f"Error creating response with tools: {e}", exc_info=True)
             raise
-    
     def create_streaming_response(
         self,
         messages: List[Dict[str, Any]],
@@ -537,7 +534,6 @@ class OpenAIClient(LoggerMixin):
         except Exception as e:
             self.log_error(f"Error creating streaming response: {e}", exc_info=True)
             raise
-    
     def create_streaming_response_with_tools(
         self,
         messages: List[Dict[str, Any]],
@@ -732,7 +728,6 @@ class OpenAIClient(LoggerMixin):
         except Exception as e:
             self.log_error(f"Error creating streaming response with tools: {e}", exc_info=True)
             raise
-    
     def classify_intent(
         self,
         messages: List[Dict[str, Any]],
@@ -888,7 +883,6 @@ class OpenAIClient(LoggerMixin):
             import traceback
             self.log_error(f"Traceback: {traceback.format_exc()}")
             return 'text_only'  # Default to text on error
-    
     def generate_image(
         self,
         prompt: str,

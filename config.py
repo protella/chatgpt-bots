@@ -9,6 +9,22 @@ from dataclasses import dataclass, field
 
 load_dotenv()
 
+# Model knowledge cutoff dates
+MODEL_KNOWLEDGE_CUTOFFS = {
+    # GPT-5 series
+    "gpt-5": "September 30, 2024",
+    "gpt-5-mini": "September 30, 2024",
+    "gpt-5-nano": "September 30, 2024",
+    "gpt-5-chat-latest": "September 30, 2024",
+    
+    # GPT-4 series
+    "gpt-4.1": "June 1, 2024",
+    "gpt-4o": "October 1, 2023",
+    "gpt-4o-mini": "October 1, 2023",
+    
+    # Add more as needed
+}
+
 
 @dataclass
 class BotConfig:
