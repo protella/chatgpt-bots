@@ -126,7 +126,6 @@ class MessageProcessor(LoggerMixin):
             self.log_info(f"Pre-trimmed {removed_count} messages to fit within context limit")
         
         return trimmed_messages
-    
     def process_message(self, message: Message, client: BaseClient, thinking_id: Optional[str] = None) -> Optional[Response]:
         """
         Process a message and return a response
@@ -189,11 +188,15 @@ class MessageProcessor(LoggerMixin):
                 thread_state.had_timeout = False
                 self.log_info(f"Notified user about previous timeout in thread {thread_key}")
             
+            # Get thread config to determine model
+            thread_config = config.get_thread_config(thread_state.config_overrides)
+            
             # Always regenerate system prompt to get current time
             user_timezone = message.metadata.get("user_timezone", "UTC") if message.metadata else "UTC"
             user_tz_label = message.metadata.get("user_tz_label", None) if message.metadata else None
             user_real_name = message.metadata.get("user_real_name", None) if message.metadata else None
-            thread_state.system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name)
+            user_email = message.metadata.get("user_email", None) if message.metadata else None
+            thread_state.system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"])
             
             # Process any attachments (images, documents, and other files)
             image_inputs, document_inputs, unsupported_files = self._process_attachments(message, client, thinking_id)
@@ -617,7 +620,6 @@ class MessageProcessor(LoggerMixin):
             self.log_info(f"Enhanced conversation with {len(enhanced_messages) - len(messages)} stored image analyses")
         
         return enhanced_messages
-    
     def _get_or_rebuild_thread_state(
         self,
         message: Message,
@@ -781,7 +783,6 @@ class MessageProcessor(LoggerMixin):
         # Return ALL Slack file URLs, not just images
         # We'll determine the file type when processing them
         return all_urls
-    
     def _process_attachments(
         self,
         message: Message,
@@ -1385,8 +1386,9 @@ class MessageProcessor(LoggerMixin):
         return False
     
     def _get_system_prompt(self, client: BaseClient, user_timezone: str = "UTC", 
-                          user_tz_label: Optional[str] = None, user_real_name: Optional[str] = None) -> str:
-        """Get the appropriate system prompt based on the client platform with user's timezone and name"""
+                          user_tz_label: Optional[str] = None, user_real_name: Optional[str] = None,
+                          user_email: Optional[str] = None, model: Optional[str] = None) -> str:
+        """Get the appropriate system prompt based on the client platform with user's timezone, name, email, and model"""
         client_name = client.name.lower()
         
         # Get base prompt for the platform
@@ -1432,13 +1434,27 @@ class MessageProcessor(LoggerMixin):
         # Format time and user context
         time_context = f"\n\nCurrent date and time: {current_time.strftime('%A, %B %d, %Y at %I:%M %p')} ({timezone_display})"
         
-        # Add user's name if available
-        if user_real_name:
-            user_context = f"\nSpeaking with: {user_real_name}"
-        else:
-            user_context = ""
+        # Add user's name and email if available
+        user_context = ""
+        if user_real_name and user_email:
+            user_context = f"\nYou're speaking with {user_real_name} (email: {user_email})"
+        elif user_real_name:
+            user_context = f"\nYou're speaking with {user_real_name}"
+        elif user_email:
+            user_context = f"\nYou're speaking with user (email: {user_email})"
         
-        return base_prompt + time_context + user_context
+        # Add model and knowledge cutoff info
+        model_context = ""
+        if model:
+            from config import MODEL_KNOWLEDGE_CUTOFFS
+            cutoff_date = MODEL_KNOWLEDGE_CUTOFFS.get(model)
+            if cutoff_date:
+                model_context = f"\n\nYour current model is {model} and your knowledge cutoff is {cutoff_date}."
+            else:
+                # Fallback for unknown models
+                model_context = f"\n\nYour current model is {model}."
+        
+        return base_prompt + time_context + user_context + model_context
     
     def _update_status(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], message: str, emoji: Optional[str] = None):
         """Update the thinking indicator with a status message"""
@@ -1458,9 +1474,8 @@ class MessageProcessor(LoggerMixin):
     def _update_thinking_for_image(self, client: BaseClient, channel_id: str, thinking_id: str):
         """Update the thinking indicator to show image generation message"""
         self._update_status(client, channel_id, thinking_id, 
-                          "Generating image. This could take up to a minute, please wait...",
+                          "Generating image. This may take a minute, please wait...",
                           emoji=config.circle_loader_emoji)
-    
     def _handle_text_response(self, user_content: Any, thread_state, client: BaseClient, 
                               message: Message, thinking_id: Optional[str] = None,
                               attachment_urls: Optional[List[str]] = None) -> Response:
@@ -1513,7 +1528,10 @@ class MessageProcessor(LoggerMixin):
         user_timezone = message.metadata.get("user_timezone", "UTC") if message.metadata else "UTC"
         user_tz_label = message.metadata.get("user_tz_label", None) if message.metadata else None
         user_real_name = message.metadata.get("user_real_name", None) if message.metadata else None
-        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name)
+        user_email = message.metadata.get("user_email", None) if message.metadata else None
+        # Pass the model for dynamic knowledge cutoff
+        model = config.web_search_model or thread_config["model"] if config.enable_web_search else thread_config["model"]
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model)
         
         # Update status before generating
         self._update_status(client, message.channel_id, thinking_id, "Generating response...")
@@ -1562,7 +1580,6 @@ class MessageProcessor(LoggerMixin):
             type="text",
             content=response_text
         )
-    
     def _handle_streaming_text_response(self, user_content: Any, thread_state, client: BaseClient, 
                                       message: Message, thinking_id: Optional[str] = None,
                                       attachment_urls: Optional[List[str]] = None) -> Response:
@@ -1634,7 +1651,10 @@ class MessageProcessor(LoggerMixin):
         user_timezone = message.metadata.get("user_timezone", "UTC") if message.metadata else "UTC"
         user_tz_label = message.metadata.get("user_tz_label", None) if message.metadata else None
         user_real_name = message.metadata.get("user_real_name", None) if message.metadata else None
-        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name)
+        user_email = message.metadata.get("user_email", None) if message.metadata else None
+        # Pass the model for dynamic knowledge cutoff
+        model = config.web_search_model or thread_config["model"] if config.enable_web_search else thread_config["model"]
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model)
         
         # Post an initial message to get the message ID for streaming updates
         # For streaming with potential tools, start with "Working on it" 
@@ -1701,7 +1721,7 @@ class MessageProcessor(LoggerMixin):
                         self.log_error(f"Error updating file search status: {e}")
                 elif tool_type == "image_generation" and not tool_states["image_generation"]:
                     tool_states["image_generation"] = True
-                    status_msg = f"{config.circle_loader_emoji} Generating image. This may take up to a minute..."
+                    status_msg = f"{config.circle_loader_emoji} Generating image. This may take a minute..."
                     try:
                         result = client.update_message_streaming(message.channel_id, message_id, status_msg)
                         if result["success"]:
@@ -2040,7 +2060,10 @@ class MessageProcessor(LoggerMixin):
             user_timezone = message.metadata.get("user_timezone", "UTC") if message.metadata else "UTC"
             user_tz_label = message.metadata.get("user_tz_label", None) if message.metadata else None
             user_real_name = message.metadata.get("user_real_name", None) if message.metadata else None
-            system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name)
+            user_email = message.metadata.get("user_email", None) if message.metadata else None
+            # Use thread config model for vision analysis
+            thread_config = config.get_thread_config(thread_state.config_overrides)
+            system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"])
             
             # Use the user's question directly - it will be enhanced for natural conversation
             # If no text provided with image, let the model infer from full conversation context
@@ -2374,7 +2397,7 @@ class MessageProcessor(LoggerMixin):
             # Create a NEW message for generating status - don't touch the enhanced prompt!
             generating_id = client.send_thinking_indicator(channel_id, thread_state.thread_ts)
             self._update_status(client, channel_id, generating_id, 
-                              "Generating image. This may take up to a minute...", 
+                              "Generating image. This may take a minute...", 
                               emoji=config.circle_loader_emoji)
             # Track the status message ID
             response_metadata["status_message_id"] = generating_id
@@ -2403,7 +2426,7 @@ class MessageProcessor(LoggerMixin):
             self._update_status(client, channel_id, thinking_id, "Enhancing your prompt...")
             
             # Generate image with conversation context for better prompt enhancement
-            self._update_status(client, channel_id, thinking_id, "Creating your image. This may take up to a minute...", emoji=config.circle_loader_emoji)
+            self._update_status(client, channel_id, thinking_id, "Creating your image. This may take a minute...", emoji=config.circle_loader_emoji)
             
             image_data = self.openai_client.generate_image(
                 prompt=prompt,
@@ -2653,7 +2676,7 @@ class MessageProcessor(LoggerMixin):
                         # Create a NEW message for editing status - don't touch the enhanced prompt!
                         editing_id = client.send_thinking_indicator(channel_id, thread_state.thread_ts)
                         self._update_status(client, channel_id, editing_id, 
-                                          "Editing your image. This may take up to a minute...", 
+                                          "Editing your image. This may take a minute...", 
                                           emoji=config.circle_loader_emoji)
                         # Track the status message ID
                         response_metadata["status_message_id"] = editing_id
@@ -2677,7 +2700,7 @@ class MessageProcessor(LoggerMixin):
                     else:
                         # Non-streaming fallback
                         self._update_status(client, channel_id, thinking_id, "Enhancing your edit request...")
-                        self._update_status(client, channel_id, thinking_id, "Editing your image. This may take up to a minute...", emoji=config.circle_loader_emoji)
+                        self._update_status(client, channel_id, thinking_id, "Editing your image. This may take a minute...", emoji=config.circle_loader_emoji)
                         
                         edited_image = self.openai_client.edit_image(
                             input_images=[base64_data],
@@ -2993,7 +3016,7 @@ class MessageProcessor(LoggerMixin):
             # Don't show the analysis - just update status to show we're editing
             # The analysis is only used internally for better edit quality
             if thinking_id:
-                self._update_status(client, channel_id, thinking_id, "Editing your image. This may take up to a minute...", emoji=config.circle_loader_emoji)
+                self._update_status(client, channel_id, thinking_id, "Editing your image. This may take a minute...", emoji=config.circle_loader_emoji)
             
             # Store the description and user request separately for clean enhancement
             image_analysis = image_description
@@ -3086,7 +3109,7 @@ class MessageProcessor(LoggerMixin):
             # Create a NEW message for editing status - don't touch the enhanced prompt!
             editing_id = client.send_thinking_indicator(channel_id, thread_state.thread_ts)
             self._update_status(client, channel_id, editing_id, 
-                              "Generating edited image. This may take up to a minute...", 
+                              "Generating edited image. This may take a minute...", 
                               emoji=config.circle_loader_emoji)
             # Track the status message ID
             response_metadata["status_message_id"] = editing_id

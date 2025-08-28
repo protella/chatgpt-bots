@@ -317,8 +317,11 @@ class ThreadLockManager(LoggerMixin):
                         self.clear_acquisition(thread_key)
                         return True
                     except RuntimeError:
-                        self.log_error(f"Failed to force-release lock for {thread_key}")
-                        return False
+                        # If normal release fails, create a new lock to replace the stuck one
+                        self.log_warning(f"Normal release failed, replacing lock for {thread_key}")
+                        self._locks[thread_key] = threading.Lock()
+                        self.clear_acquisition(thread_key)
+                        return True
         return False
     
     def is_busy(self, thread_key: str) -> bool:
@@ -379,10 +382,16 @@ class ThreadStateManager(LoggerMixin):
                         # Force release the lock
                         if self._lock_manager.force_release(thread_key):
                             self.log_warning(f"Successfully force-released stuck thread: {thread_key}")
+                            # Ensure thread is marked as not processing
+                            if thread_key in self._threads:
+                                self._threads[thread_key].is_processing = False
                             # Note: We don't add a system message here
                             # The MessageProcessor will handle sending a timeout message to the user
                         else:
                             self.log_error(f"Failed to force-release stuck thread: {thread_key}")
+                            # Still mark as not processing even if force release failed
+                            if thread_key in self._threads:
+                                self._threads[thread_key].is_processing = False
                             
                 except Exception as e:
                     self.log_error(f"Watchdog error: {e}", exc_info=True)

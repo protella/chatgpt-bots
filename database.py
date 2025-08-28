@@ -162,6 +162,7 @@ class DatabaseManager(LoggerMixin):
                 user_id TEXT PRIMARY KEY,
                 username TEXT,
                 real_name TEXT,
+                email TEXT,
                 config_json TEXT,
                 timezone TEXT DEFAULT 'UTC',
                 tz_label TEXT,
@@ -204,11 +205,23 @@ class DatabaseManager(LoggerMixin):
                 """)
                 self.conn.commit()
                 self.log_info("DB: Successfully added real_name column")
+            
+            # Check if email column exists in users table
+            cursor = self.conn.execute("PRAGMA table_info(users)")
+            columns = [col[1] for col in cursor.fetchall()]
+            
+            if 'email' not in columns:
+                self.log_info("DB: Adding email column to users table")
+                self.conn.execute("""
+                    ALTER TABLE users 
+                    ADD COLUMN email TEXT
+                """)
+                self.conn.commit()
+                self.log_info("DB: Successfully added email column")
         except Exception as e:
             self.log_error(f"DB: Migration error: {e}", exc_info=True)
     
     # Thread operations
-    
     def get_or_create_thread(self, thread_id: str, channel_id: str, user_id: Optional[str] = None) -> Dict:
         """
         Get existing thread or create new one with user defaults.
@@ -260,7 +273,6 @@ class DatabaseManager(LoggerMixin):
             raise
         
         return self.get_or_create_thread(thread_id, channel_id)
-    
     def save_thread_config(self, thread_id: str, config: Dict):
         """
         Save thread configuration.
@@ -343,7 +355,6 @@ class DatabaseManager(LoggerMixin):
         except Exception as e:
             self.log_error(f"DB: Failed to cache message - {e}", exc_info=True)
             raise
-    
     def get_cached_messages(self, thread_id: str, limit: Optional[int] = None) -> List[Dict]:
         """
         Get cached messages for a thread.
@@ -416,7 +427,6 @@ class DatabaseManager(LoggerMixin):
             logger.debug(f"Deleted {len(ids_to_delete)} oldest messages from thread {thread_id}")
     
     # Image operations
-    
     def save_image_metadata(self, thread_id: str, url: str, image_type: str,
                            prompt: Optional[str] = None, analysis: Optional[str] = None,
                            original_analysis: Optional[str] = None, metadata: Optional[Dict] = None,
@@ -454,7 +464,6 @@ class DatabaseManager(LoggerMixin):
         except Exception as e:
             self.log_error(f"DB: Failed to save image metadata - {e}", exc_info=True)
             raise
-    
     def get_image_analysis_by_url(self, thread_id: str, url: str) -> Optional[Dict]:
         """
         Get image analysis by URL (thread-isolated).
@@ -783,7 +792,7 @@ class DatabaseManager(LoggerMixin):
         return None
     
     def save_user_info(self, user_id: str, username: str = None, real_name: str = None,
-                       timezone: str = None, tz_label: str = None, tz_offset: int = None):
+                       email: str = None, timezone: str = None, tz_label: str = None, tz_offset: int = None):
         """
         Save comprehensive user information.
         
@@ -791,6 +800,7 @@ class DatabaseManager(LoggerMixin):
             user_id: User identifier
             username: Display/username
             real_name: User's real name
+            email: User's email address
             timezone: Timezone string
             tz_label: Timezone label
             tz_offset: Offset in seconds from UTC
@@ -805,6 +815,10 @@ class DatabaseManager(LoggerMixin):
         if real_name is not None:
             updates.append("real_name = ?")
             params.append(real_name)
+        
+        if email is not None:
+            updates.append("email = ?")
+            params.append(email)
         if timezone is not None:
             updates.append("timezone = ?")
             params.append(timezone)
@@ -859,6 +873,34 @@ class DatabaseManager(LoggerMixin):
         
         if row:
             return (row["timezone"], row["tz_label"], row["tz_offset"])
+        
+        return None
+    
+    def get_user_info(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get comprehensive user information including email.
+        
+        Args:
+            user_id: User identifier
+            
+        Returns:
+            Dict with user info or None
+        """
+        cursor = self.conn.execute(
+            "SELECT username, real_name, email, timezone, tz_label, tz_offset FROM users WHERE user_id = ?",
+            (user_id,)
+        )
+        row = cursor.fetchone()
+        
+        if row:
+            return {
+                'username': row["username"],
+                'real_name': row["real_name"],
+                'email': row["email"],
+                'timezone': row["timezone"],
+                'tz_label': row["tz_label"],
+                'tz_offset': row["tz_offset"]
+            }
         
         return None
     
