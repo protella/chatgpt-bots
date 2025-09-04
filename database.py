@@ -172,6 +172,43 @@ class DatabaseManager(LoggerMixin):
             )
         """)
         
+        # User preferences table for settings modal
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                slack_user_id TEXT PRIMARY KEY,
+                slack_email TEXT,
+                
+                -- Model settings
+                model TEXT DEFAULT 'gpt-5',
+                reasoning_effort TEXT DEFAULT 'medium',
+                verbosity TEXT DEFAULT 'medium',
+                temperature REAL DEFAULT 0.8,
+                top_p REAL DEFAULT 1.0,
+                
+                -- Feature toggles
+                enable_web_search BOOLEAN DEFAULT 1,
+                enable_streaming BOOLEAN DEFAULT 1,
+                
+                -- Image settings
+                image_size TEXT DEFAULT '1024x1024',
+                input_fidelity TEXT DEFAULT 'high',
+                vision_detail TEXT DEFAULT 'auto',
+                
+                -- Metadata
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+                settings_completed BOOLEAN DEFAULT 0,
+                
+                FOREIGN KEY (slack_user_id) REFERENCES users(user_id)
+            )
+        """)
+        
+        # Create index for email lookups
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_user_prefs_email 
+            ON user_preferences(slack_email)
+        """)
+        
         self.conn.commit()
         
         # Run migrations for existing databases
@@ -218,6 +255,49 @@ class DatabaseManager(LoggerMixin):
                 """)
                 self.conn.commit()
                 self.log_info("DB: Successfully added email column")
+            
+            # Check if user_preferences table exists
+            cursor = self.conn.execute("""
+                SELECT name FROM sqlite_master 
+                WHERE type='table' AND name='user_preferences'
+            """)
+            if not cursor.fetchone():
+                self.log_info("DB: Creating user_preferences table")
+                self.conn.execute("""
+                    CREATE TABLE user_preferences (
+                        slack_user_id TEXT PRIMARY KEY,
+                        slack_email TEXT,
+                        
+                        -- Model settings
+                        model TEXT DEFAULT 'gpt-5',
+                        reasoning_effort TEXT DEFAULT 'medium',
+                        verbosity TEXT DEFAULT 'medium',
+                        temperature REAL DEFAULT 0.8,
+                        top_p REAL DEFAULT 1.0,
+                        
+                        -- Feature toggles
+                        enable_web_search BOOLEAN DEFAULT 1,
+                        enable_streaming BOOLEAN DEFAULT 1,
+                        
+                        -- Image settings
+                        image_size TEXT DEFAULT '1024x1024',
+                        input_fidelity TEXT DEFAULT 'high',
+                        vision_detail TEXT DEFAULT 'auto',
+                        
+                        -- Metadata
+                        created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                        updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+                        settings_completed BOOLEAN DEFAULT 0,
+                        
+                        FOREIGN KEY (slack_user_id) REFERENCES users(user_id)
+                    )
+                """)
+                self.conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_user_prefs_email 
+                    ON user_preferences(slack_email)
+                """)
+                self.conn.commit()
+                self.log_info("DB: Successfully created user_preferences table")
         except Exception as e:
             self.log_error(f"DB: Migration error: {e}", exc_info=True)
     
@@ -577,6 +657,137 @@ class DatabaseManager(LoggerMixin):
             return img
         
         return None
+    
+    # User preferences operations
+    
+    def get_user_preferences(self, user_id: str) -> Optional[Dict]:
+        """
+        Get user preferences for settings modal.
+        
+        Args:
+            user_id: Slack user ID
+            
+        Returns:
+            User preferences dictionary or None if not found
+        """
+        cursor = self.conn.execute(
+            "SELECT * FROM user_preferences WHERE slack_user_id = ?",
+            (user_id,)
+        )
+        row = cursor.fetchone()
+        
+        if row:
+            prefs = dict(row)
+            # Convert SQLite boolean (0/1) to Python boolean
+            prefs['enable_web_search'] = bool(prefs.get('enable_web_search', 1))
+            prefs['enable_streaming'] = bool(prefs.get('enable_streaming', 1))
+            prefs['settings_completed'] = bool(prefs.get('settings_completed', 0))
+            return prefs
+        
+        return None
+    
+    def create_default_user_preferences(self, user_id: str, email: Optional[str] = None) -> Dict:
+        """
+        Create default user preferences based on environment variables.
+        
+        Args:
+            user_id: Slack user ID
+            email: Optional user email
+            
+        Returns:
+            Dictionary of default preferences
+        """
+        from config import config
+        
+        defaults = {
+            'slack_user_id': user_id,
+            'slack_email': email,
+            'model': config.gpt_model,
+            'reasoning_effort': config.default_reasoning_effort,
+            'verbosity': config.default_verbosity,
+            'temperature': config.default_temperature,
+            'top_p': config.default_top_p,
+            'enable_web_search': config.enable_web_search,
+            'enable_streaming': config.enable_streaming,
+            'image_size': config.default_image_size,
+            'input_fidelity': config.default_input_fidelity,
+            'vision_detail': config.default_detail_level,
+            'settings_completed': False
+        }
+        
+        try:
+            # Insert with defaults
+            self.conn.execute("""
+                INSERT INTO user_preferences 
+                (slack_user_id, slack_email, model, reasoning_effort, verbosity,
+                 temperature, top_p, enable_web_search, enable_streaming,
+                 image_size, input_fidelity, vision_detail, settings_completed)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                user_id, email, defaults['model'],
+                defaults['reasoning_effort'], defaults['verbosity'],
+                defaults['temperature'], defaults['top_p'],
+                1 if defaults['enable_web_search'] else 0,
+                1 if defaults['enable_streaming'] else 0,
+                defaults['image_size'], defaults['input_fidelity'],
+                defaults['vision_detail'], 0
+            ))
+            
+            self.log_info(f"DB: Created default preferences for user {user_id}")
+            
+        except Exception as e:
+            self.log_error(f"DB: Failed to create default preferences for {user_id} - {e}")
+            
+        return defaults
+    
+    def update_user_preferences(self, user_id: str, preferences: Dict) -> bool:
+        """
+        Update user preferences.
+        
+        Args:
+            user_id: Slack user ID
+            preferences: Dictionary of preferences to update
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Build dynamic UPDATE query based on provided fields
+            updates = []
+            values = []
+            
+            for field in ['model', 'reasoning_effort', 'verbosity', 'temperature',
+                         'top_p', 'image_size', 'input_fidelity', 'vision_detail',
+                         'slack_email', 'settings_completed']:
+                if field in preferences:
+                    updates.append(f"{field} = ?")
+                    values.append(preferences[field])
+            
+            # Handle boolean fields
+            for field in ['enable_web_search', 'enable_streaming']:
+                if field in preferences:
+                    updates.append(f"{field} = ?")
+                    values.append(1 if preferences[field] else 0)
+            
+            # Always update timestamp
+            updates.append("updated_at = strftime('%s', 'now')")
+            
+            # Add user_id for WHERE clause
+            values.append(user_id)
+            
+            query = f"""
+                UPDATE user_preferences 
+                SET {', '.join(updates)}
+                WHERE slack_user_id = ?
+            """
+            
+            self.conn.execute(query, values)
+            self.log_info(f"DB: Updated preferences for user {user_id}")
+            return True
+            
+        except Exception as e:
+            self.log_error(f"DB: Failed to update preferences for {user_id} - {e}")
+            return False
     
     # Document operations
     
