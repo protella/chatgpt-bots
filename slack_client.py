@@ -12,6 +12,7 @@ from base_client import BaseClient, Message, Response
 from config import config
 from markdown_converter import MarkdownConverter
 from database import DatabaseManager
+from settings_modal import SettingsModal
 
 
 class SlackBot(BaseClient):
@@ -31,6 +32,9 @@ class SlackBot(BaseClient):
         # Initialize database manager
         self.db = DatabaseManager(platform="slack")
         
+        # Initialize settings modal handler
+        self.settings_modal = SettingsModal(self.db)
+        
         # Register Slack event handlers
         self._register_handlers()
     
@@ -46,6 +50,187 @@ class SlackBot(BaseClient):
             # Only process DMs and non-bot messages
             if event.get("channel_type") == "im" and not event.get("bot_id"):
                 self._handle_slack_message(event, client)
+        
+        # Register slash command handler
+        @self.app.command(config.settings_slash_command)
+        def handle_settings_command(ack, body, client):
+            """Handle the settings slash command"""
+            ack()  # Acknowledge command receipt immediately
+            
+            user_id = body.get('user_id')
+            trigger_id = body.get('trigger_id')
+            
+            self.log_info(f"Settings command invoked by user {user_id}")
+            
+            # Get current settings or create defaults
+            current_settings = self.db.get_user_preferences(user_id)
+            is_new_user = current_settings is None
+            
+            if is_new_user:
+                # Get user's email for preferences
+                user_data = self.db.get_or_create_user(user_id)
+                email = user_data.get('email') if user_data else None
+                current_settings = self.db.create_default_user_preferences(user_id, email)
+            
+            # Build and open modal
+            try:
+                modal = self.settings_modal.build_settings_modal(
+                    user_id=user_id,
+                    trigger_id=trigger_id,
+                    current_settings=current_settings,
+                    is_new_user=is_new_user
+                )
+                
+                # Open the modal
+                response = client.views_open(
+                    trigger_id=trigger_id,
+                    view=modal
+                )
+                
+                if response.get('ok'):
+                    self.log_info(f"Settings modal opened for user {user_id}")
+                else:
+                    self.log_error(f"Failed to open modal: {response.get('error')}")
+                    
+            except SlackApiError as e:
+                self.log_error(f"Error opening settings modal: {e}")
+                # Fallback to ephemeral message
+                try:
+                    client.chat_postEphemeral(
+                        channel=body.get('channel_id'),
+                        user=user_id,
+                        text="❌ Sorry, I couldn't open the settings modal. Please try again."
+                    )
+                except:
+                    pass
+        
+        # Register modal submission handlers
+        @self.app.view("settings_modal")
+        @self.app.view("welcome_settings_modal")
+        def handle_settings_submission(ack, body, view, client):
+            """Handle settings modal submission"""
+            ack()
+            
+            user_id = body['user']['id']
+            
+            # Extract form values
+            form_values = self.settings_modal.extract_form_values(view['state'])
+            
+            # Validate settings
+            validated_settings = self.settings_modal.validate_settings(form_values)
+            
+            # Check for temperature/top_p warning
+            warning_message = ""
+            if validated_settings.get('model') not in ['gpt-5', 'gpt-5-mini', 'gpt-5-nano']:
+                temp_changed = validated_settings.get('temperature', config.default_temperature) != config.default_temperature
+                top_p_changed = validated_settings.get('top_p', config.default_top_p) != config.default_top_p
+                
+                if temp_changed and top_p_changed:
+                    warning_message = "\n⚠️ Note: You've changed both Temperature and Top P. OpenAI recommends using only one for best results."
+            
+            # Mark settings as completed
+            validated_settings['settings_completed'] = True
+            
+            # Update database
+            success = self.db.update_user_preferences(user_id, validated_settings)
+            
+            if success:
+                self.log_info(f"Settings saved for user {user_id}: {validated_settings}")
+                
+                # Send confirmation message
+                try:
+                    # Get the channel from the original command or use user's DM
+                    channel = body.get('view', {}).get('private_metadata', user_id)
+                    
+                    client.chat_postMessage(
+                        channel=user_id,  # Send to user's DM
+                        text=f"✅ Your settings have been saved successfully!{warning_message}"
+                    )
+                except SlackApiError as e:
+                    self.log_error(f"Error sending confirmation: {e}")
+            else:
+                self.log_error(f"Failed to save settings for user {user_id}")
+                try:
+                    client.chat_postMessage(
+                        channel=user_id,
+                        text="❌ Sorry, there was an error saving your settings. Please try again."
+                    )
+                except:
+                    pass
+        
+        # Register modal action handlers (for dynamic updates)
+        @self.app.action("model_select")
+        def handle_model_change(ack, body, client):
+            """Handle model selection changes for dynamic modal updates"""
+            ack()
+            
+            user_id = body['user']['id']
+            selected_model = body['actions'][0]['selected_option']['value']
+            
+            self.log_info(f"Model selection changed to {selected_model} for user {user_id}")
+            
+            # Try to get stored settings from private_metadata first (preserves unsaved changes)
+            stored_settings = {}
+            try:
+                import json
+                private_metadata = body.get('view', {}).get('private_metadata')
+                if private_metadata:
+                    stored_settings = json.loads(private_metadata)
+            except:
+                pass
+            
+            # If no stored settings, get user's saved preferences
+            if not stored_settings:
+                saved_settings = self.db.get_user_preferences(user_id)
+                if not saved_settings:
+                    # If no saved settings, get defaults
+                    user_data = self.db.get_or_create_user(user_id)
+                    email = user_data.get('email') if user_data else None
+                    saved_settings = self.db.create_default_user_preferences(user_id, email)
+                stored_settings = saved_settings
+            
+            # Extract current form values (only gets visible fields)
+            current_values = self.settings_modal.extract_form_values(body['view']['state'])
+            
+            # Merge: stored settings as base, current values override what's visible
+            # This preserves all field values when switching models
+            merged_settings = stored_settings.copy()
+            merged_settings.update(current_values)
+            
+            # Build updated modal with new model selection
+            is_new_user = body['view']['callback_id'] == 'welcome_settings_modal'
+            updated_modal = self.settings_modal.build_settings_modal(
+                user_id=user_id,
+                trigger_id=None,  # Not needed for update
+                current_settings=merged_settings,
+                is_new_user=is_new_user
+            )
+            
+            # Update the modal view
+            try:
+                response = client.views_update(
+                    view_id=body['view']['id'],
+                    view=updated_modal
+                )
+                
+                if response.get('ok'):
+                    self.log_debug(f"Modal updated for model change: {selected_model}")
+                else:
+                    self.log_error(f"Failed to update modal: {response.get('error')}")
+                    
+            except SlackApiError as e:
+                self.log_error(f"Error updating modal for model change: {e}")
+        
+        # Register action handlers for other interactive components (just acknowledge)
+        @self.app.action("features")
+        @self.app.action("reasoning_level")
+        @self.app.action("verbosity")
+        @self.app.action("input_fidelity")
+        @self.app.action("vision_detail")
+        def handle_modal_actions(ack):
+            """Acknowledge modal actions that don't need processing"""
+            ack()  # Just acknowledge - values are captured on submission
+    
     def get_username(self, user_id: str, client) -> str:
         """Get username from user ID, with caching"""
         # Check memory cache first
@@ -203,6 +388,59 @@ class SlackBot(BaseClient):
                 "user_tz_label": user_tz_label  # Add timezone label (EST, PST, etc.)
             }
         )
+        
+        # Check if this is a new user (for auto-modal trigger)
+        user_prefs = self.db.get_user_preferences(user_id)
+        
+        if not user_prefs:
+            # New user detected - check if we have a trigger_id for modal
+            trigger_id = event.get('trigger_id')
+            
+            if trigger_id:
+                # Create default preferences
+                user_data = self.db.get_or_create_user(user_id)
+                email = user_data.get('email') if user_data else None
+                default_prefs = self.db.create_default_user_preferences(user_id, email)
+                
+                # Open welcome modal
+                try:
+                    modal = self.settings_modal.build_settings_modal(
+                        user_id=user_id,
+                        trigger_id=trigger_id,
+                        current_settings=default_prefs,
+                        is_new_user=True
+                    )
+                    
+                    response = client.views_open(
+                        trigger_id=trigger_id,
+                        view=modal
+                    )
+                    
+                    if response.get('ok'):
+                        self.log_info(f"Welcome modal opened for new user {user_id}")
+                        
+                        # Send welcome message
+                        client.chat_postMessage(
+                            channel=channel_id,
+                            thread_ts=thread_ts,
+                            text="👋 Welcome! I've opened your settings panel. Please configure your preferences and I'll be ready to help!"
+                        )
+                        return  # Don't process the message until settings are saved
+                    
+                except SlackApiError as e:
+                    self.log_error(f"Error opening welcome modal for new user: {e}")
+                    # Continue with processing using defaults
+            else:
+                # No trigger_id available, send instructions
+                try:
+                    client.chat_postMessage(
+                        channel=channel_id,
+                        thread_ts=thread_ts, 
+                        text=f"👋 Welcome! Please configure your settings by typing `{config.settings_slash_command}` to get started."
+                    )
+                    return  # Don't process until settings are configured
+                except SlackApiError as e:
+                    self.log_error(f"Error sending welcome message: {e}")
         
         # Call the message handler if set
         if self.message_handler:

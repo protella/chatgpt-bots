@@ -96,6 +96,9 @@ class BotConfig:
     enable_web_search: bool = field(default_factory=lambda: os.getenv("ENABLE_WEB_SEARCH", "true").lower() == "true")
     web_search_model: str = field(default_factory=lambda: os.getenv("WEB_SEARCH_MODEL", ""))  # Empty = use default model
     
+    # Slack settings configuration
+    settings_slash_command: str = field(default_factory=lambda: os.getenv("SETTINGS_SLASH_COMMAND", "/chatgpt-settings"))
+    
     # Logging configuration
     log_level: str = field(default_factory=lambda: os.getenv("BOT_LOG_LEVEL", "INFO"))
     slack_log_level: str = field(default_factory=lambda: os.getenv("SLACK_LOG_LEVEL", "INFO"))
