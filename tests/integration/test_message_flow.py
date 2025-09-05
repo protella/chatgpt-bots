@@ -263,7 +263,7 @@ class TestDatabaseIntegration:
         thread_key = f"C123:{thread_ts}"
         thread1.add_message("user", "Message 1", db=db1, thread_key=thread_key)
         thread1.add_message("assistant", "Response 1", db=db1, thread_key=thread_key)
-        thread1.config_overrides = {"model": "gpt-5-nano"}
+        thread1.config_overrides = {"model": "gpt-5-mini"}
         
         # Save config
         db1.save_thread_config(thread_key, thread1.config_overrides)
@@ -283,7 +283,7 @@ class TestDatabaseIntegration:
         assert len(thread2.messages) == 2
         assert thread2.messages[0]["content"] == "Message 1"
         assert thread2.messages[1]["content"] == "Response 1"
-        assert thread2.config_overrides["model"] == "gpt-5-nano"
+        assert thread2.config_overrides["model"] == "gpt-5-mini"
     
     @pytest.mark.integration
     def test_image_metadata_persistence(self, tmp_path, mock_env):

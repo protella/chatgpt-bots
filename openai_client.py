@@ -945,7 +945,11 @@ class OpenAIClient(LoggerMixin):
             
             # Use the images.generate API for image generation
             self.log_debug(f"Calling generate_image API with {config.api_timeout_read}s timeout")
-            response = self.client.images.generate(**params)
+            response = self._safe_api_call(
+                self.client.images.generate,
+                operation_type="general",
+                **params
+            )
             
             # Extract image data from response
             if response.data and len(response.data) > 0:
@@ -1586,7 +1590,11 @@ class OpenAIClient(LoggerMixin):
             
             # Use the images.edit API
             self.log_debug(f"Calling edit_image API with {config.api_timeout_read}s timeout")
-            response = self.client.images.edit(**params)
+            response = self._safe_api_call(
+                self.client.images.edit,
+                operation_type="general",
+                **params
+            )
             
             # Extract image data from response
             if response.data and len(response.data) > 0:

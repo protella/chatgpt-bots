@@ -19,15 +19,19 @@ class SettingsModal(LoggerMixin):
     
     def build_settings_modal(self, user_id: str, trigger_id: str, 
                             current_settings: Optional[Dict] = None,
-                            is_new_user: bool = False) -> Dict:
+                            is_new_user: bool = False,
+                            thread_id: Optional[str] = None,
+                            in_thread: bool = False) -> Dict:
         """
         Build the complete settings modal.
         
         Args:
             user_id: Slack user ID
             trigger_id: Slack trigger ID for modal
-            current_settings: Current user preferences
+            current_settings: Current user settings
             is_new_user: Whether this is a new user's first setup
+            thread_id: Thread ID if opened from within a thread
+            in_thread: Whether modal was opened from within a thread
             
         Returns:
             Modal view dictionary for Slack API
@@ -44,7 +48,7 @@ class SettingsModal(LoggerMixin):
         selected_model = current_settings.get('model', config.gpt_model)
         
         # Build modal blocks
-        blocks = self._build_modal_blocks(current_settings, selected_model, is_new_user)
+        blocks = self._build_modal_blocks(current_settings, selected_model, is_new_user, in_thread)
         
         # Determine callback ID based on user status
         callback_id = "welcome_settings_modal" if is_new_user else "settings_modal"
@@ -61,12 +65,23 @@ class SettingsModal(LoggerMixin):
             "submit": {"type": "plain_text", "text": "Save Settings"},
             "close": {"type": "plain_text", "text": "Cancel"},
             "blocks": blocks,
-            "private_metadata": json.dumps(current_settings)  # Store full settings for model switching
+            "private_metadata": json.dumps({
+                "settings": current_settings,
+                "thread_id": thread_id,
+                "in_thread": in_thread
+            })  # Store settings and context
         }
     
     def _build_modal_blocks(self, settings: Dict, selected_model: str, 
-                           is_new_user: bool = False) -> List[Dict]:
-        """Build the modal blocks based on current settings and model selection"""
+                           is_new_user: bool = False, in_thread: bool = False) -> List[Dict]:
+        """Build the modal blocks based on current settings and model selection
+        
+        Args:
+            settings: Current settings dictionary
+            selected_model: Currently selected model
+            is_new_user: Whether this is a new user
+            in_thread: Whether modal was opened from within a thread
+        """
         blocks = []
         
         # Welcome message for new users
@@ -76,15 +91,38 @@ class SettingsModal(LoggerMixin):
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": "*Welcome to the AI Assistant!* 👋\nLet's configure your preferences. You can accept the defaults or customize them."
+                        "text": "*Welcome to the AI Assistant!* 👋\nLet's configure your settings. You can accept the defaults or customize them."
                     }
                 },
                 {"type": "divider"}
             ])
         else:
+            # Determine header text based on scope
+            if in_thread:
+                header_text = "Configure Settings for This Thread"
+            else:
+                header_text = "Configure Your Global Settings"
+            
             blocks.append({
                 "type": "header",
-                "text": {"type": "plain_text", "text": "Configure Your Preferences"}
+                "text": {"type": "plain_text", "text": header_text}
+            })
+            
+            # Add tip right after header for better visibility
+            blocks.append({
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"💡 *Tip:* For global settings, type:\n"
+                            f"`{config.settings_slash_command}` in the main channel/DM (not in a thread)"
+                            if in_thread else
+                            f"💡 *Tip:* You can change these settings anytime by typing:\n`{config.settings_slash_command}` in the main channel/DM (not in a thread)\n\n"
+                            f"For thread-specific settings:\n Hover over any bot message → Click ••• → Thread Settings"
+                        )
+                    }
+                ]
             })
         
         # Model selection (always shown)
@@ -104,10 +142,10 @@ class SettingsModal(LoggerMixin):
                     "value": selected_model
                 },
                 "options": [
-                    {"text": {"type": "plain_text", "text": "GPT-4o"}, "value": "gpt-4o"},
                     {"text": {"type": "plain_text", "text": "GPT-5"}, "value": "gpt-5"},
                     {"text": {"type": "plain_text", "text": "GPT-5 Mini"}, "value": "gpt-5-mini"},
-                    {"text": {"type": "plain_text", "text": "GPT-5 Nano"}, "value": "gpt-5-nano"}
+                    {"text": {"type": "plain_text", "text": "GPT-4.1"}, "value": "gpt-4.1"},
+                    {"text": {"type": "plain_text", "text": "GPT-4o"}, "value": "gpt-4o"}
                 ]
             }
         })
@@ -115,27 +153,13 @@ class SettingsModal(LoggerMixin):
         blocks.append({"type": "divider"})
         
         # Add model-specific settings
-        if selected_model in ['gpt-5', 'gpt-5-mini', 'gpt-5-nano']:
+        if selected_model in ['gpt-5', 'gpt-5-mini']:
             blocks.extend(self._add_gpt5_settings(settings))
-        else:  # gpt-4o and similar
+        else:  # gpt-4.1, gpt-4o
             blocks.extend(self._add_gpt4_settings(settings))
         
         # Add common settings (features and image settings)
         blocks.extend(self._add_common_settings(settings))
-        
-        # Add footer
-        blocks.extend([
-            {"type": "divider"},
-            {
-                "type": "context",
-                "elements": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"💡 *Tip:* You can change these settings anytime by typing:\n`{config.settings_slash_command}`"
-                    }
-                ]
-            }
-        ])
         
         return blocks
     
@@ -143,8 +167,55 @@ class SettingsModal(LoggerMixin):
         """Add GPT-5 specific settings blocks"""
         blocks = []
         
+        # Check if web search is enabled - explicitly check for False vs None/missing
+        # Default to True only if the key is missing
+        if 'enable_web_search' in settings:
+            web_search_enabled = bool(settings['enable_web_search'])
+        else:
+            web_search_enabled = True
+        self.log_debug(f"Settings passed to _add_gpt5_settings: enable_web_search={settings.get('enable_web_search')}, evaluated as {web_search_enabled}")
+        
         # Reasoning Level
-        blocks.append({
+        # Ensure initial option is valid for the current options list
+        current_reasoning = settings.get('reasoning_effort', 'medium')
+        self.log_debug(f"Building reasoning options - web_search: {web_search_enabled}, current: {current_reasoning}")
+        
+        # Force-validate the reasoning level for web search compatibility
+        if web_search_enabled and current_reasoning == 'minimal':
+            # If web search is on but reasoning is minimal, use low
+            current_reasoning = 'low'
+            self.log_debug(f"Adjusted reasoning from minimal to low for display")
+        elif not current_reasoning or current_reasoning not in ['minimal', 'low', 'medium', 'high']:
+            # Fallback if no valid reasoning is set
+            current_reasoning = 'low' if web_search_enabled else 'medium'
+            self.log_debug(f"No valid reasoning, defaulting to {current_reasoning}")
+        
+        # Build options list - use the _get_reasoning_display function for consistency
+        reasoning_options = []
+        if not web_search_enabled:
+            reasoning_options.append({"text": {"type": "plain_text", "text": self._get_reasoning_display('minimal')}, "value": "minimal"})
+        reasoning_options.extend([
+            {"text": {"type": "plain_text", "text": self._get_reasoning_display('low')}, "value": "low"},
+            {"text": {"type": "plain_text", "text": self._get_reasoning_display('medium')}, "value": "medium"},
+            {"text": {"type": "plain_text", "text": self._get_reasoning_display('high')}, "value": "high"}
+        ])
+        
+        # Log available options
+        available_values = [opt['value'] for opt in reasoning_options]
+        self.log_debug(f"Reasoning options available: {available_values}, initial: {current_reasoning}")
+        
+        # Final validation - ensure current_reasoning is in available options
+        if current_reasoning not in available_values:
+            # This shouldn't happen with our logic above, but let's be safe
+            current_reasoning = 'low' if web_search_enabled else 'medium'
+            self.log_warning(f"Current reasoning {current_reasoning} not in available options, using fallback")
+        
+        # Build the reasoning block
+        # Use a different action_id based on whether minimal is available
+        # This works around a Slack bug where selections are lost when options change
+        action_id = "reasoning_level" if not web_search_enabled else "reasoning_level_no_minimal"
+        
+        reasoning_block = {
             "type": "section",
             "block_id": "reasoning_block",
             "text": {
@@ -153,18 +224,43 @@ class SettingsModal(LoggerMixin):
             },
             "accessory": {
                 "type": "radio_buttons",
-                "action_id": "reasoning_level",
-                "initial_option": {
-                    "text": {"type": "plain_text", "text": self._get_reasoning_display(settings.get('reasoning_effort', 'medium'))},
-                    "value": settings.get('reasoning_effort', 'medium')
-                },
-                "options": [
-                    {"text": {"type": "plain_text", "text": "⚡ Low (Faster)"}, "value": "low"},
-                    {"text": {"type": "plain_text", "text": "⚖️ Medium (Balanced)"}, "value": "medium"},
-                    {"text": {"type": "plain_text", "text": "🧠 High (Thorough, Slowest)"}, "value": "high"}
-                ]
+                "action_id": action_id,
+                "options": reasoning_options
             }
-        })
+        }
+        
+        # Add initial_option only if we have a valid selection
+        if current_reasoning and current_reasoning != 'None':
+            reasoning_block["accessory"]["initial_option"] = {
+                "text": {"type": "plain_text", "text": self._get_reasoning_display(current_reasoning)},
+                "value": current_reasoning
+            }
+        else:
+            # If no selection (can happen due to Slack bug when options change)
+            # We'll add a note for the user
+            self.log_debug("No reasoning selection - likely due to Slack option change bug")
+        
+        blocks.append(reasoning_block)
+        
+        # Add a warning if we detected the Slack bug (minimal was removed and no selection)
+        if web_search_enabled and settings.get('reasoning_effort') == 'low' and not current_reasoning:
+            blocks.append({
+                "type": "context",
+                "elements": [{
+                    "type": "mrkdwn", 
+                    "text": "⚠️ _Please select a reasoning level (Low is recommended)_"
+                }]
+            })
+        
+        # Add note about minimal restriction only if minimal is shown
+        if not web_search_enabled:
+            blocks.append({
+                "type": "context",
+                "elements": [{
+                    "type": "mrkdwn",
+                    "text": "_Note: Minimal reasoning will be unavailable if Web Search is enabled_"
+                }]
+            })
         
         # Response Detail
         blocks.append({
@@ -201,7 +297,7 @@ class SettingsModal(LoggerMixin):
             "type": "context",
             "elements": [{
                 "type": "mrkdwn",
-                "text": "⚠️ *Important:* Use either Temperature OR Top P, not both. OpenAI recommends changing only one."
+                "text": "⚠️ *Important:* Modify either Temperature OR Top P, not both. OpenAI recommends changing only one."
             }]
         })
         
@@ -256,7 +352,7 @@ class SettingsModal(LoggerMixin):
         
         # Web search
         feature_options.append({
-            "text": {"type": "mrkdwn", "text": "🌐 *Web Search*\nAllow searching the web for current information"},
+            "text": {"type": "mrkdwn", "text": "🌐 *Web Search*\nAllow searching the web for current information\n_(Disables the \"Minimal\" reasoning option above when enabled)_"},
             "value": "web_search"
         })
         if settings.get('enable_web_search', True):
@@ -264,23 +360,29 @@ class SettingsModal(LoggerMixin):
         
         # Streaming
         feature_options.append({
-            "text": {"type": "mrkdwn", "text": "⚡ *Streaming*\nShow responses as they're generated"},
+            "text": {"type": "mrkdwn", "text": "🌊 *Streaming*\nShow responses as they're generated"},
             "value": "streaming"
         })
         if settings.get('enable_streaming', True):
             initial_options.append(feature_options[-1])
         
-        blocks.append({
+        # Build the features block
+        features_block = {
             "type": "section",
             "block_id": "features_block",
             "text": {"type": "mrkdwn", "text": "Enable features:"},
             "accessory": {
                 "type": "checkboxes",
                 "action_id": "features",
-                "options": feature_options,
-                "initial_options": initial_options if initial_options else None
+                "options": feature_options
             }
-        })
+        }
+        
+        # Only add initial_options if we have some (Slack requires array or omitted entirely)
+        if initial_options:
+            features_block["accessory"]["initial_options"] = initial_options
+        
+        blocks.append(features_block)
         
         blocks.append({"type": "divider"})
         
@@ -304,9 +406,10 @@ class SettingsModal(LoggerMixin):
                     "value": settings.get('image_size', '1024x1024')
                 },
                 "options": [
-                    {"text": {"type": "plain_text", "text": "Square (1024x1024)"}, "value": "1024x1024"},
-                    {"text": {"type": "plain_text", "text": "Portrait (1024x1792)"}, "value": "1024x1792"},
-                    {"text": {"type": "plain_text", "text": "Landscape (1792x1024)"}, "value": "1792x1024"}
+                    {"text": {"type": "plain_text", "text": "Square 1:1"}, "value": "1024x1024"},
+                    {"text": {"type": "plain_text", "text": "Portrait 2:3"}, "value": "1024x1536"},
+                    {"text": {"type": "plain_text", "text": "Landscape 3:2"}, "value": "1536x1024"},
+                    {"text": {"type": "plain_text", "text": "Auto"}, "value": "auto"}
                 ]
             }
         })
@@ -366,10 +469,20 @@ class SettingsModal(LoggerMixin):
         
         # GPT-5 settings
         reasoning_block = values.get('reasoning_block', {})
+        # Check both possible action_ids (we use different ones based on web search state)
         if 'reasoning_level' in reasoning_block:
             selected = reasoning_block['reasoning_level'].get('selected_option')
             if selected:
                 extracted['reasoning_effort'] = selected['value']
+            else:
+                # No selection - might happen during modal updates
+                self.log_debug("No reasoning_level selected_option found")
+        elif 'reasoning_level_no_minimal' in reasoning_block:
+            selected = reasoning_block['reasoning_level_no_minimal'].get('selected_option')
+            if selected:
+                extracted['reasoning_effort'] = selected['value']
+            else:
+                self.log_debug("No reasoning_level_no_minimal selected_option found")
         
         verbosity_block = values.get('verbosity_block', {})
         if 'verbosity' in verbosity_block:
@@ -426,7 +539,7 @@ class SettingsModal(LoggerMixin):
         
         # Check if both temperature and top_p are changed for GPT-4 models
         model = validated.get('model', 'gpt-5')
-        if model not in ['gpt-5', 'gpt-5-mini', 'gpt-5-nano']:
+        if model not in ['gpt-5', 'gpt-5-mini']:
             # For GPT-4 models, warn if both temperature and top_p are changed from defaults
             default_temp = config.default_temperature
             default_top_p = config.default_top_p
@@ -440,7 +553,7 @@ class SettingsModal(LoggerMixin):
                 # Note: We don't reset either value, just warn - let user decide
         
         # Remove invalid parameters for model type
-        if model in ['gpt-5', 'gpt-5-mini', 'gpt-5-nano']:
+        if model in ['gpt-5', 'gpt-5-mini']:
             # Remove GPT-4 specific params
             validated.pop('temperature', None)
             validated.pop('top_p', None)
@@ -455,17 +568,18 @@ class SettingsModal(LoggerMixin):
     def _get_model_display_name(self, model: str) -> str:
         """Get user-friendly model name"""
         display_names = {
-            'gpt-4o': 'GPT-4o',
             'gpt-5': 'GPT-5',
             'gpt-5-mini': 'GPT-5 Mini',
-            'gpt-5-nano': 'GPT-5 Nano'
+            'gpt-4.1': 'GPT-4.1',
+            'gpt-4o': 'GPT-4o'
         }
         return display_names.get(model, model)
     
     def _get_reasoning_display(self, level: str) -> str:
         """Get display name for reasoning level"""
         displays = {
-            'low': '⚡ Low (Faster)',
+            'minimal': '⚡ Minimal (Fastest, Chat-like)',
+            'low': '🚀 Low (Fast)',
             'medium': '⚖️ Medium (Balanced)',
             'high': '🧠 High (Thorough, Slowest)'
         }
@@ -483,11 +597,12 @@ class SettingsModal(LoggerMixin):
     def _get_image_size_display(self, size: str) -> str:
         """Get display name for image size"""
         displays = {
-            '1024x1024': 'Square (1024x1024)',
-            '1024x1792': 'Portrait (1024x1792)',
-            '1792x1024': 'Landscape (1792x1024)'
+            '1024x1024': 'Square 1:1',
+            '1024x1536': 'Portrait 2:3',
+            '1536x1024': 'Landscape 3:2',
+            'auto': 'Auto'
         }
-        return displays.get(size, 'Square (1024x1024)')
+        return displays.get(size, 'Square 1:1')
     
     def _get_fidelity_display(self, fidelity: str) -> str:
         """Get display name for input fidelity"""

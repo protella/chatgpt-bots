@@ -10,19 +10,18 @@ from dataclasses import dataclass, field
 load_dotenv()
 
 # Model knowledge cutoff dates
+# Supported models: gpt-5, gpt-5-mini, gpt-4.1, gpt-4o
 MODEL_KNOWLEDGE_CUTOFFS = {
     # GPT-5 series
     "gpt-5": "September 30, 2024",
     "gpt-5-mini": "September 30, 2024",
-    "gpt-5-nano": "September 30, 2024",
-    "gpt-5-chat-latest": "September 30, 2024",
     
     # GPT-4 series
     "gpt-4.1": "June 1, 2024",
     "gpt-4o": "October 1, 2023",
-    "gpt-4o-mini": "October 1, 2023",
     
-    # Add more as needed
+    # Default fallback
+    "default": "January 1, 2024"
 }
 
 
@@ -43,9 +42,8 @@ class BotConfig:
     
     # Model configuration
     gpt_model: str = field(default_factory=lambda: os.getenv("GPT_MODEL", "gpt-5"))
-    utility_model: str = field(default_factory=lambda: os.getenv("UTILITY_MODEL", "gpt-5-nano"))
+    utility_model: str = field(default_factory=lambda: os.getenv("UTILITY_MODEL", "gpt-5-mini"))
     image_model: str = field(default_factory=lambda: os.getenv("GPT_IMAGE_MODEL", "gpt-image-1"))
-    dalle_model: str = field(default_factory=lambda: os.getenv("DALLE_MODEL", "dall-e-3"))
     
     # Default parameters for text generation
     default_temperature: float = field(default_factory=lambda: float(os.getenv("DEFAULT_TEMPERATURE", "0.8")))
@@ -69,7 +67,7 @@ class BotConfig:
     default_image_size: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_SIZE", "1024x1024"))
     default_image_quality: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_QUALITY", "hd"))  # standard or hd
     default_image_style: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_STYLE", "natural"))  # natural or vivid
-    default_image_number: int = field(default_factory=lambda: int(os.getenv("DEFAULT_IMAGE_NUMBER", "1")))  # Number of images (1 for DALL-E 3)
+    default_image_number: int = field(default_factory=lambda: int(os.getenv("DEFAULT_IMAGE_NUMBER", "1")))  # Number of images
     default_image_background: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_BACKGROUND", "auto"))
     default_image_format: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_FORMAT", "png"))
     default_image_compression: int = field(default_factory=lambda: int(os.getenv("DEFAULT_IMAGE_COMPRESSION", "100")))  # 100 for PNG, can be less for JPEG/WebP
@@ -143,8 +141,18 @@ class BotConfig:
             raise ValueError("OPENAI_KEY is required")
         return True
     
-    def get_thread_config(self, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Get configuration for a specific thread with optional overrides"""
+    def get_thread_config(self, overrides: Optional[Dict[str, Any]] = None, user_id: Optional[str] = None, db = None) -> Dict[str, Any]:
+        """Get configuration for a specific thread with settings hierarchy:
+        1. System defaults (from .env)
+        2. User preferences (from database)
+        3. Thread overrides (passed as parameter)
+        
+        Args:
+            overrides: Thread-specific overrides
+            user_id: User ID to fetch preferences for
+            db: Database connection to fetch user preferences
+        """
+        # Start with system defaults
         config = {
             # Text generation
             "model": self.gpt_model,
@@ -158,7 +166,6 @@ class BotConfig:
             "verbosity": self.default_verbosity,
             
             # Image generation
-            "dalle_model": self.dalle_model,
             "image_model": self.image_model,
             "image_size": self.default_image_size,
             "image_quality": self.default_image_quality,
@@ -183,6 +190,48 @@ class BotConfig:
             "streaming_circuit_breaker_cooldown": self.streaming_circuit_breaker_cooldown,
         }
         
+        # Apply user preferences if available
+        if user_id and db:
+            try:
+                user_prefs = db.get_user_preferences(user_id)
+                if user_prefs:
+                    # Map database fields to config keys
+                    user_config = {}
+                    
+                    # Model and generation settings
+                    if user_prefs.get('model'):
+                        user_config['model'] = user_prefs['model']
+                    if user_prefs.get('reasoning_effort'):
+                        user_config['reasoning_effort'] = user_prefs['reasoning_effort']
+                    if user_prefs.get('verbosity'):
+                        user_config['verbosity'] = user_prefs['verbosity']
+                    if user_prefs.get('temperature') is not None:
+                        user_config['temperature'] = user_prefs['temperature']
+                    if user_prefs.get('top_p') is not None:
+                        user_config['top_p'] = user_prefs['top_p']
+                    
+                    # Feature toggles
+                    if user_prefs.get('enable_web_search') is not None:
+                        user_config['enable_web_search'] = bool(user_prefs['enable_web_search'])
+                    if user_prefs.get('enable_streaming') is not None:
+                        user_config['enable_streaming'] = bool(user_prefs['enable_streaming'])
+                        user_config['slack_streaming'] = bool(user_prefs['enable_streaming'])
+                    
+                    # Image settings
+                    if user_prefs.get('image_size'):
+                        user_config['image_size'] = user_prefs['image_size']
+                    if user_prefs.get('input_fidelity'):
+                        user_config['input_fidelity'] = user_prefs['input_fidelity']
+                    if user_prefs.get('vision_detail'):
+                        user_config['detail_level'] = user_prefs['vision_detail']
+                    
+                    # Apply user config over system defaults
+                    config.update(user_config)
+            except Exception as e:
+                # Log error but continue with defaults
+                print(f"Error fetching user preferences: {e}")
+        
+        # Finally apply thread overrides (highest priority)
         if overrides:
             config.update(overrides)
         
