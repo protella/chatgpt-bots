@@ -44,6 +44,8 @@ class ChatBotV2:
             self.client = SlackBot(message_handler=self.handle_message)
             # Initialize processor with database from client
             self.processor = MessageProcessor(db=self.client.db)
+            # Give the client a reference to the processor for thread state updates
+            self.client.processor = self.processor
         elif self.platform == "discord":
             # Future: from discordbot import DiscordBot
             # self.client = DiscordBot(message_handler=self.handle_message)

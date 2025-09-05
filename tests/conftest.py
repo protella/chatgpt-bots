@@ -23,7 +23,7 @@ def mock_env(monkeypatch):
         'SLACK_APP_TOKEN': 'xapp-test-token',
         'DISCORD_TOKEN': 'discord-test-token',
         'OPENAI_KEY': 'sk-test-key',
-        'GPT_MODEL': 'gpt-5-chat-latest',
+        'GPT_MODEL': 'gpt-5',
         'DEFAULT_REASONING_EFFORT': 'medium',
         'DEFAULT_VERBOSITY': '2',
         'UTILITY_REASONING_EFFORT': 'low',

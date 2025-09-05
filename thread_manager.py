@@ -399,6 +399,11 @@ class ThreadStateManager(LoggerMixin):
         self._watchdog_thread = threading.Thread(target=watchdog, daemon=True, name="ThreadLockWatchdog")
         self._watchdog_thread.start()
     
+    def get_thread_if_exists(self, thread_key: str) -> Optional[ThreadState]:
+        """Get thread state if it exists, without creating a new one"""
+        with self._state_lock:
+            return self._threads.get(thread_key)
+    
     def get_or_create_thread(self, thread_ts: str, channel_id: str, user_id: Optional[str] = None) -> ThreadState:
         """Get existing thread state or create new one"""
         thread_key = f"{channel_id}:{thread_ts}"
