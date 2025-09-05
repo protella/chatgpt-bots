@@ -188,15 +188,20 @@ class MessageProcessor(LoggerMixin):
                 thread_state.had_timeout = False
                 self.log_info(f"Notified user about previous timeout in thread {thread_key}")
             
-            # Get thread config to determine model
-            thread_config = config.get_thread_config(thread_state.config_overrides)
+            # Get thread config to determine model (with user preferences)
+            thread_config = config.get_thread_config(
+                overrides=thread_state.config_overrides,
+                user_id=message.user_id,
+                db=self.db
+            )
             
             # Always regenerate system prompt to get current time
             user_timezone = message.metadata.get("user_timezone", "UTC") if message.metadata else "UTC"
             user_tz_label = message.metadata.get("user_tz_label", None) if message.metadata else None
             user_real_name = message.metadata.get("user_real_name", None) if message.metadata else None
             user_email = message.metadata.get("user_email", None) if message.metadata else None
-            thread_state.system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"])
+            web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
+            thread_state.system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"], web_search_enabled)
             
             # Process any attachments (images, documents, and other files)
             image_inputs, document_inputs, unsupported_files = self._process_attachments(message, client, thinking_id)
@@ -428,6 +433,7 @@ class MessageProcessor(LoggerMixin):
             # Update thinking indicator if generating/editing image (only for non-streaming)
             if intent in ["new_image", "edit_image"] and thinking_id:
                 # Only show the image thinking message if we're not streaming
+                # Note: We check global streaming here since we don't have thread_config yet
                 if not (hasattr(client, 'supports_streaming') and client.supports_streaming() and config.enable_streaming):
                     self._update_thinking_for_image(client, message.channel_id, thinking_id)
             
@@ -1387,8 +1393,9 @@ class MessageProcessor(LoggerMixin):
     
     def _get_system_prompt(self, client: BaseClient, user_timezone: str = "UTC", 
                           user_tz_label: Optional[str] = None, user_real_name: Optional[str] = None,
-                          user_email: Optional[str] = None, model: Optional[str] = None) -> str:
-        """Get the appropriate system prompt based on the client platform with user's timezone, name, email, and model"""
+                          user_email: Optional[str] = None, model: Optional[str] = None,
+                          web_search_enabled: bool = True) -> str:
+        """Get the appropriate system prompt based on the client platform with user's timezone, name, email, model, and web search capability"""
         client_name = client.name.lower()
         
         # Get base prompt for the platform
@@ -1431,8 +1438,8 @@ class MessageProcessor(LoggerMixin):
             current_time = datetime.datetime.now(pytz.UTC)
             timezone_display = "UTC"
         
-        # Format time and user context
-        time_context = f"\n\nCurrent date and time: {current_time.strftime('%A, %B %d, %Y at %I:%M %p')} ({timezone_display})"
+        # Format time and user context - emphasize "today's date" for clarity
+        time_context = f"\n\nToday's date and current time: {current_time.strftime('%A, %B %d, %Y at %I:%M %p')} ({timezone_display})\nIMPORTANT: Always consider the current date and time (w/ timezone offset) and adjust your responses accordingly."
         
         # Add user's name and email if available
         user_context = ""
@@ -1454,7 +1461,16 @@ class MessageProcessor(LoggerMixin):
                 # Fallback for unknown models
                 model_context = f"\n\nYour current model is {model}."
         
-        return base_prompt + time_context + user_context + model_context
+        # Add web search capability context
+        web_search_context = ""
+        if web_search_enabled:
+            web_search_context = "\n\nAdditional capability enabled: Web Search. You can search the web for current information when needed to provide up-to-date answers.  "
+        else:
+            # Get the settings command dynamically
+            settings_command = config.settings_slash_command if hasattr(config, 'settings_slash_command') else '/chatgpt-settings'
+            web_search_context = f"\n\nWeb search is currently disabled. If a user asks for current information or recent events beyond your knowledge cutoff, provide what you know but mention that web search is disabled in their user settings. They can enable it using `{settings_command}`."
+        
+        return base_prompt + time_context + user_context + model_context + web_search_context
     
     def _update_status(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], message: str, emoji: Optional[str] = None):
         """Update the thinking indicator with a status message"""
@@ -1480,9 +1496,17 @@ class MessageProcessor(LoggerMixin):
                               message: Message, thinking_id: Optional[str] = None,
                               attachment_urls: Optional[List[str]] = None) -> Response:
         """Handle text-only response generation"""
-        # Check if streaming is enabled and supported
+        # Get thread config (with user preferences)
+        thread_config = config.get_thread_config(
+            overrides=thread_state.config_overrides,
+            user_id=message.user_id,
+            db=self.db
+        )
+        
+        # Check if streaming is enabled and supported (respecting user prefs)
+        streaming_enabled = thread_config.get('enable_streaming', config.enable_streaming)
         if (hasattr(client, 'supports_streaming') and client.supports_streaming() and 
-            thinking_id is not None):  # Streaming requires a message ID to update
+            streaming_enabled and thinking_id is not None):  # Streaming requires a message ID to update
             return self._handle_streaming_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls)
         
         # Fall back to non-streaming logic
@@ -1520,8 +1544,12 @@ class MessageProcessor(LoggerMixin):
         # Pre-trim messages to fit within context window
         messages_for_api = self._pre_trim_messages_for_api(messages_for_api)
         
-        # Get thread config
-        thread_config = config.get_thread_config(thread_state.config_overrides)
+        # Get thread config (with user preferences)
+        thread_config = config.get_thread_config(
+            overrides=thread_state.config_overrides,
+            user_id=message.user_id,
+            db=self.db
+        )
         
         # Use thread's system prompt (which is now platform-specific)
         # Always regenerate to get current time
@@ -1529,15 +1557,17 @@ class MessageProcessor(LoggerMixin):
         user_tz_label = message.metadata.get("user_tz_label", None) if message.metadata else None
         user_real_name = message.metadata.get("user_real_name", None) if message.metadata else None
         user_email = message.metadata.get("user_email", None) if message.metadata else None
-        # Pass the model for dynamic knowledge cutoff
-        model = config.web_search_model or thread_config["model"] if config.enable_web_search else thread_config["model"]
-        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model)
+        # Pass the model for dynamic knowledge cutoff (respecting user prefs)
+        web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
+        model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled)
         
         # Update status before generating
         self._update_status(client, message.channel_id, thinking_id, "Generating response...")
         
-        # Check if web search should be available
-        if config.enable_web_search:
+        # Check if web search should be available (respecting user prefs)
+        web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
+        if web_search_enabled:
             # Use web search model if specified, otherwise use thread config model
             model = config.web_search_model or thread_config["model"]
             
@@ -1566,7 +1596,7 @@ class MessageProcessor(LoggerMixin):
             )
         
         # Check if response used web search and add citation note
-        if config.enable_web_search:
+        if web_search_enabled:
             # Look for indicators that web search was used
             # OpenAI typically includes numbered citations [1], [2] or URLs when web search is used
             if any(marker in response_text for marker in ["[1]", "[2]", "[3]", "http://", "https://"]):
@@ -1643,8 +1673,12 @@ class MessageProcessor(LoggerMixin):
         # Pre-trim messages to fit within context window
         messages_for_api = self._pre_trim_messages_for_api(messages_for_api)
         
-        # Get thread config
-        thread_config = config.get_thread_config(thread_state.config_overrides)
+        # Get thread config (with user preferences)
+        thread_config = config.get_thread_config(
+            overrides=thread_state.config_overrides,
+            user_id=message.user_id,
+            db=self.db
+        )
         
         # Use thread's system prompt (which is now platform-specific)
         # Always regenerate to get current time
@@ -1652,9 +1686,10 @@ class MessageProcessor(LoggerMixin):
         user_tz_label = message.metadata.get("user_tz_label", None) if message.metadata else None
         user_real_name = message.metadata.get("user_real_name", None) if message.metadata else None
         user_email = message.metadata.get("user_email", None) if message.metadata else None
-        # Pass the model for dynamic knowledge cutoff
-        model = config.web_search_model or thread_config["model"] if config.enable_web_search else thread_config["model"]
-        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model)
+        # Pass the model for dynamic knowledge cutoff (respecting user prefs)
+        web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
+        model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled)
         
         # Post an initial message to get the message ID for streaming updates
         # For streaming with potential tools, start with "Working on it" 
@@ -1884,7 +1919,8 @@ class MessageProcessor(LoggerMixin):
         
         # Start streaming from OpenAI with the callback
         try:
-            if config.enable_web_search:
+            web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
+            if web_search_enabled:
                 # Use web search model if specified, otherwise use thread config model
                 model = config.web_search_model or thread_config["model"]
                 
@@ -2061,9 +2097,14 @@ class MessageProcessor(LoggerMixin):
             user_tz_label = message.metadata.get("user_tz_label", None) if message.metadata else None
             user_real_name = message.metadata.get("user_real_name", None) if message.metadata else None
             user_email = message.metadata.get("user_email", None) if message.metadata else None
-            # Use thread config model for vision analysis
-            thread_config = config.get_thread_config(thread_state.config_overrides)
-            system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"])
+            # Use thread config model for vision analysis (with user preferences)
+            thread_config = config.get_thread_config(
+                overrides=thread_state.config_overrides,
+                user_id=message.user_id,
+                db=self.db
+            )
+            web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
+            system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"], web_search_enabled)
             
             # Use the user's question directly - it will be enhanced for natural conversation
             # If no text provided with image, let the model infer from full conversation context
@@ -2110,9 +2151,10 @@ class MessageProcessor(LoggerMixin):
                 status_msg = f"Analyzing {len(images_to_analyze)} images..."
             self._update_status(client, channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
             
-            # Check if streaming is supported and enabled
+            # Check if streaming is supported and enabled (respecting user prefs)
+            streaming_enabled = thread_config.get('enable_streaming', config.enable_streaming)
             if (hasattr(client, 'supports_streaming') and client.supports_streaming() and 
-                config.enable_streaming and thinking_id is not None):
+                streaming_enabled and thinking_id is not None):
                 # Stream the vision analysis response
                 from streaming.buffer import StreamingBuffer
                 from streaming import RateLimitManager
@@ -2309,8 +2351,9 @@ class MessageProcessor(LoggerMixin):
         
         # Check if we streamed the response
         response_metadata = {}
+        streaming_enabled = thread_config.get('enable_streaming', config.enable_streaming)
         if (hasattr(client, 'supports_streaming') and client.supports_streaming() and 
-            config.enable_streaming and thinking_id is not None):
+            streaming_enabled and thinking_id is not None):
             response_metadata["streamed"] = True
         
         return Response(
@@ -2320,15 +2363,24 @@ class MessageProcessor(LoggerMixin):
         )
     
     def _handle_image_generation(self, prompt: str, thread_state, client: BaseClient, 
-                                channel_id: str, thinking_id: Optional[str], message: Message) -> Response:
-        """Handle image generation request with streaming enhancement"""
+                                channel_id: str, thinking_id: Optional[str], message: Message, 
+                                skip_enhancement: bool = False) -> Response:
+        """Handle image generation request with streaming enhancement
+        
+        Args:
+            skip_enhancement: If True, skip prompt enhancement (used when falling back from failed edit)
+        """
         self.log_info(f"Generating image for prompt: {prompt[:100]}...")
         
         # Initialize response metadata
         response_metadata = {}
         
-        # Get thread config
-        thread_config = config.get_thread_config(thread_state.config_overrides)
+        # Get thread config (with user preferences)
+        thread_config = config.get_thread_config(
+            overrides=thread_state.config_overrides,
+            user_id=message.user_id,
+            db=self.db
+        )
         
         # Inject stored image analyses for style consistency
         enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state)
@@ -2336,8 +2388,9 @@ class MessageProcessor(LoggerMixin):
         # Pre-trim messages to fit within context window
         enhanced_messages = self._pre_trim_messages_for_api(enhanced_messages)
         
-        # Check if streaming is supported
-        if hasattr(client, 'supports_streaming') and client.supports_streaming() and config.enable_streaming:
+        # Check if streaming is supported (respecting user prefs) and enhancement is needed
+        streaming_enabled = thread_config.get('enable_streaming', config.enable_streaming)
+        if hasattr(client, 'supports_streaming') and client.supports_streaming() and streaming_enabled and not skip_enhancement:
             # Stream the enhancement to user with proper rate limiting
             streaming_config = client.get_streaming_config() if hasattr(client, 'get_streaming_config') else {}
             buffer = StreamingBuffer(
@@ -2403,13 +2456,43 @@ class MessageProcessor(LoggerMixin):
             response_metadata["status_message_id"] = generating_id
             
             # Generate image with already-enhanced prompt
-            image_data = self.openai_client.generate_image(
-                prompt=enhanced_prompt,
-                size=thread_config.get("image_size"),
-                quality=thread_config.get("image_quality"),
-                enhance_prompt=False,  # Already enhanced!
-                conversation_history=None  # Not needed since we enhanced already
-            )
+            try:
+                image_data = self.openai_client.generate_image(
+                    prompt=enhanced_prompt,
+                    size=thread_config.get("image_size"),
+                    quality=thread_config.get("image_quality"),
+                    enhance_prompt=False,  # Already enhanced!
+                    conversation_history=None  # Not needed since we enhanced already
+                )
+            except Exception as e:
+                error_str = str(e)
+                if "moderation_blocked" in error_str or "safety system" in error_str or "content policy" in error_str.lower():
+                    # Clean up status message
+                    if "status_message_id" in response_metadata:
+                        if hasattr(client, 'delete_message'):
+                            client.delete_message(channel_id, response_metadata["status_message_id"])
+                    
+                    # Provide friendly message
+                    moderation_msg = (
+                        "I couldn't generate that image as it was flagged by content safety filters. "
+                        "This can happen with certain brand names, people, or other protected content. "
+                        "Try rephrasing your request or describing what you want without using specific names."
+                    )
+                    
+                    # Add to thread for context
+                    thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+                    message_ts = message.metadata.get("ts") if message.metadata else None
+                    formatted_prompt = self._format_user_content_with_username(prompt, message)
+                    self._add_message_with_token_management(thread_state, "user", formatted_prompt, db=self.db, thread_key=thread_key, message_ts=message_ts)
+                    self._add_message_with_token_management(thread_state, "assistant", moderation_msg, db=self.db, thread_key=thread_key)
+                    
+                    return Response(
+                        type="text",
+                        content=moderation_msg
+                    )
+                else:
+                    # Re-raise other errors
+                    raise
             
             # After image is generated, update message to show just the enhanced prompt
             # (remove the "Generating image..." status) - but respect rate limits
@@ -2422,19 +2505,45 @@ class MessageProcessor(LoggerMixin):
                         rate_limiter.record_failure(is_rate_limit=True)
                         self.log_debug("Couldn't clean up image gen status due to rate limit")
         else:
-            # Non-streaming fallback
-            self._update_status(client, channel_id, thinking_id, "Enhancing your prompt...")
+            # Non-streaming fallback or skip enhancement
+            if not skip_enhancement:
+                self._update_status(client, channel_id, thinking_id, "Enhancing your prompt...")
             
-            # Generate image with conversation context for better prompt enhancement
+            # Generate image with or without enhancement
             self._update_status(client, channel_id, thinking_id, "Creating your image. This may take a minute...", emoji=config.circle_loader_emoji)
             
-            image_data = self.openai_client.generate_image(
-                prompt=prompt,
-                size=thread_config.get("image_size"),
-                quality=thread_config.get("image_quality"),
-                enhance_prompt=True,
-                conversation_history=enhanced_messages  # Use enhanced conversation with image analyses
-            )
+            try:
+                image_data = self.openai_client.generate_image(
+                    prompt=prompt,
+                    size=thread_config.get("image_size"),
+                    quality=thread_config.get("image_quality"),
+                    enhance_prompt=not skip_enhancement,  # Skip if fallback from failed edit
+                    conversation_history=enhanced_messages if not skip_enhancement else None  # Only pass if enhancing
+                )
+            except Exception as e:
+                error_str = str(e)
+                if "moderation_blocked" in error_str or "safety system" in error_str or "content policy" in error_str.lower():
+                    # Provide friendly message
+                    moderation_msg = (
+                        "I couldn't generate that image as it was flagged by content safety filters. "
+                        "This can happen with certain brand names, people, or other protected content. "
+                        "Try rephrasing your request or describing what you want without using specific names."
+                    )
+                    
+                    # Add to thread for context
+                    thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+                    message_ts = message.metadata.get("ts") if message.metadata else None
+                    formatted_prompt = self._format_user_content_with_username(prompt, message)
+                    self._add_message_with_token_management(thread_state, "user", formatted_prompt, db=self.db, thread_key=thread_key, message_ts=message_ts)
+                    self._add_message_with_token_management(thread_state, "assistant", moderation_msg, db=self.db, thread_key=thread_key)
+                    
+                    return Response(
+                        type="text",
+                        content=moderation_msg
+                    )
+                else:
+                    # Re-raise other errors
+                    raise
         
         # Store in asset ledger
         asset_ledger = self.thread_manager.get_or_create_asset_ledger(thread_state.thread_ts)
@@ -2467,7 +2576,7 @@ class MessageProcessor(LoggerMixin):
         
         # Mark as streamed if we used streaming for the enhancement
         # Note: response_metadata already initialized and populated above
-        if hasattr(client, 'supports_streaming') and client.supports_streaming() and config.enable_streaming:
+        if hasattr(client, 'supports_streaming') and client.supports_streaming() and streaming_enabled:
             response_metadata["streamed"] = True
             
         return Response(
@@ -2571,6 +2680,9 @@ class MessageProcessor(LoggerMixin):
         """Handle image modification request by finding and editing the target image"""
         # Don't update status yet - we might fall back to generation
         
+        # Initialize response metadata early to track status messages
+        response_metadata = {}
+        
         # Try to find target image URL from conversation
         target_url = self._find_target_image(text, thread_state, client)
         
@@ -2604,8 +2716,12 @@ class MessageProcessor(LoggerMixin):
                     # Prepare for edit
                     self.log_info(f"Editing existing image with request: {text}")
                     
-                    # Get thread config
-                    thread_config = config.get_thread_config(thread_state.config_overrides)
+                    # Get thread config (with user preferences)
+                    thread_config = config.get_thread_config(
+                        overrides=thread_state.config_overrides,
+                        user_id=message.user_id,
+                        db=self.db
+                    )
                     
                     # Inject stored image analyses for style matching
                     enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state)
@@ -2614,8 +2730,8 @@ class MessageProcessor(LoggerMixin):
                     enhanced_messages = self._pre_trim_messages_for_api(enhanced_messages)
                     
                     # Check if streaming is supported for enhancement
-                    response_metadata = {}
-                    if hasattr(client, 'supports_streaming') and client.supports_streaming() and config.enable_streaming:
+                    streaming_enabled = thread_config.get('enable_streaming', config.enable_streaming)
+                    if hasattr(client, 'supports_streaming') and client.supports_streaming() and streaming_enabled:
                         # Stream the enhancement to user with proper rate limiting
                         from streaming.buffer import StreamingBuffer
                         from streaming import RateLimitManager
@@ -2742,17 +2858,58 @@ class MessageProcessor(LoggerMixin):
                     
             except Exception as e:
                 self.log_error(f"Error editing image from URL: {e}")
+                
+                # Check if this is a moderation block
+                error_str = str(e)
+                if "moderation_blocked" in error_str or "safety system" in error_str or "content policy" in error_str.lower():
+                    # Moderation block - provide friendly message and don't fall back
+                    self.log_warning(f"Edit blocked by moderation: {text}")
+                    
+                    # Clean up any status messages
+                    if "status_message_id" in response_metadata:
+                        if hasattr(client, 'delete_message'):
+                            client.delete_message(channel_id, response_metadata["status_message_id"])
+                    
+                    # Add user-friendly explanation to thread
+                    moderation_msg = (
+                        "I couldn't complete that edit request as it was flagged by content safety filters. "
+                        "This can happen with certain brand names, people, or other protected content. "
+                        "Try rephrasing your request or describing what you want without using specific names."
+                    )
+                    
+                    # Add messages to thread for context
+                    thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+                    message_ts = message.metadata.get("ts") if message.metadata else None
+                    formatted_text = self._format_user_content_with_username(text, message)
+                    self._add_message_with_token_management(thread_state, "user", formatted_text, db=self.db, thread_key=thread_key, message_ts=message_ts)
+                    self._add_message_with_token_management(thread_state, "assistant", moderation_msg, db=self.db, thread_key=thread_key)
+                    
+                    return Response(
+                        type="text",
+                        content=moderation_msg
+                    )
+                
+                # Other errors - clean up and fall back to generation
+                if "status_message_id" in response_metadata:
+                    # Delete the "Editing your image..." message
+                    if hasattr(client, 'delete_message'):
+                        client.delete_message(channel_id, response_metadata["status_message_id"])
+                elif thinking_id and not response_metadata.get("prompt_message_id"):
+                    # Update the thinking message to show we're generating instead
+                    self._update_status(client, channel_id, thinking_id, 
+                                      "Edit failed, generating new image instead...", 
+                                      emoji=config.error_emoji)
         
-        # Fallback to old behavior if no URL found
-        self.log_info("No image URL found, falling back to generation based on description")
+        # Fallback to generation if edit failed or no URL found
+        self.log_info("No image URL found or edit failed, falling back to generation based on description")
         
         # Look for image descriptions in history
         image_registry = self._extract_image_registry(thread_state)
         if image_registry:
-            # Use the most recent image description
-            previous_prompt = image_registry[-1]["description"]
-            context_prompt = f"Previous image: {previous_prompt}\nModification request: {text}"
-            return self._handle_image_generation(context_prompt, thread_state, client, channel_id, thinking_id, message)
+            # Use the most recent image description without re-enhancement
+            # The prompt already contains the edit request, just generate based on it
+            return self._handle_image_generation(text, thread_state, client, channel_id, thinking_id, message, 
+                                                skip_enhancement=True)
         else:
             # No previous images, treat as new generation
             return self._handle_image_generation(text, thread_state, client, channel_id, thinking_id, message)
@@ -3033,8 +3190,12 @@ class MessageProcessor(LoggerMixin):
             print(f"Falling back to user prompt only: {text}")
             print("="*100)
         
-        # Get thread config for settings
-        thread_config = config.get_thread_config(thread_state.config_overrides)
+        # Get thread config for settings (with user preferences)
+        thread_config = config.get_thread_config(
+            overrides=thread_state.config_overrides,
+            user_id=message.user_id,
+                db=self.db
+        )
         
         # Inject stored image analyses for style matching
         enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state) if thread_state.messages else None
@@ -3045,7 +3206,8 @@ class MessageProcessor(LoggerMixin):
         
         # Check if streaming is supported for enhancement
         response_metadata = {}
-        if hasattr(client, 'supports_streaming') and client.supports_streaming() and config.enable_streaming:
+        streaming_enabled = thread_config.get('enable_streaming', config.enable_streaming)
+        if hasattr(client, 'supports_streaming') and client.supports_streaming() and streaming_enabled:
             # Stream the enhancement to user with proper rate limiting
             from streaming.buffer import StreamingBuffer
             from streaming import RateLimitManager
