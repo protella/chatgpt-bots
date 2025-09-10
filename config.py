@@ -118,8 +118,17 @@ class BotConfig:
     api_timeout_read: float = field(default_factory=lambda: float(os.getenv("API_TIMEOUT_READ", "180")))  # Overall timeout for API requests
     api_timeout_streaming_chunk: float = field(default_factory=lambda: float(os.getenv("API_TIMEOUT_STREAMING_CHUNK", "30")))  # Max time between streaming chunks
     
-    # Thread token management
-    thread_max_token_count: int = field(default_factory=lambda: int(os.getenv("THREAD_MAX_TOKEN_COUNT", "120000")))
+    # Model token limits
+    gpt5_max_tokens: int = field(default_factory=lambda: int(os.getenv("GPT5_MAX_TOKENS", "400000")))
+    gpt4_max_tokens: int = field(default_factory=lambda: int(os.getenv("GPT4_MAX_TOKENS", "128000")))
+    
+    # Token management configuration
+    token_buffer_percentage: float = field(default_factory=lambda: float(os.getenv("TOKEN_BUFFER_PERCENTAGE", "0.875")))
+    token_cleanup_threshold: float = field(default_factory=lambda: float(os.getenv("TOKEN_CLEANUP_THRESHOLD", "0.8")))
+    token_trim_message_count: int = field(default_factory=lambda: int(os.getenv("TOKEN_TRIM_MESSAGE_COUNT", "5")))
+    
+    # Legacy - kept for backward compatibility, will be calculated dynamically
+    thread_max_token_count: int = field(default_factory=lambda: int(os.getenv("THREAD_MAX_TOKEN_COUNT", "350000")))
     
     # Streaming configuration
     enable_streaming: bool = field(default_factory=lambda: os.getenv("ENABLE_STREAMING", "true").lower() == "true")
@@ -130,6 +139,27 @@ class BotConfig:
     streaming_buffer_size: int = field(default_factory=lambda: int(os.getenv("STREAMING_BUFFER_SIZE", "500")))
     streaming_circuit_breaker_threshold: int = field(default_factory=lambda: int(os.getenv("STREAMING_CIRCUIT_BREAKER_THRESHOLD", "5")))
     streaming_circuit_breaker_cooldown: int = field(default_factory=lambda: int(os.getenv("STREAMING_CIRCUIT_BREAKER_COOLDOWN", "300")))
+    
+    def get_model_token_limit(self, model: str) -> int:
+        """Get the token limit for a specific model
+        
+        Args:
+            model: Model name (e.g., 'gpt-5', 'gpt-4.1', 'gpt-4o')
+            
+        Returns:
+            Buffered token limit for the model
+        """
+        # Determine base limit based on model family
+        if model.startswith('gpt-5'):
+            base_limit = self.gpt5_max_tokens
+        elif model.startswith('gpt-4'):
+            base_limit = self.gpt4_max_tokens
+        else:
+            # Default to GPT-4 limit for unknown models
+            base_limit = self.gpt4_max_tokens
+        
+        # Apply buffer percentage
+        return int(base_limit * self.token_buffer_percentage)
     
     def validate(self) -> bool:
         """Validate required configuration"""

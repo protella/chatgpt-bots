@@ -104,9 +104,12 @@ Classify the LATEST user message into one of these categories:
 
 1. **"new"** - User wants a brand new image generated from scratch. 
    - Clear image generation language: "create an image", "generate", "draw", "make a picture", "visualize"
+   - Requests for visual representations of logos, icons, diagrams, or graphics (e.g., "show me the AWS logo", "display the company icon")
+   - Questions about what logos/icons/visual things look like (e.g., "what does the X logo look like", "what's the Y icon")
    - OR continuation requests ("again", "another", "one more") IF the previous response was an image generation
    - Context matters: "again" after an image = new image; "again" after text data = more text data
    - Clear generation intent based on conversation pattern
+   - IMPORTANT: ANY request about logos, icons, or visual representations should be "new" NOT "none" (even if phrased as a question)
 
 2. **"edit"** - User clearly wants to modify an existing image (recently generated or mentioned)
    - Examples: "make it sharper", "adjust the colors", "fix the lighting", "change the blue to red"
@@ -129,6 +132,8 @@ Classify the LATEST user message into one of these categories:
    - General questions not about images
    - URLs or links (even if formatted like <http://example.com|example.com>)
    - Questions about websites or web content
+   - Code generation requests (including SVG, HTML, CSS) UNLESS user explicitly asks for an image/picture
+   - Technical descriptions or explanations about visual things (unless asking for actual visual output)
 
 Consider the conversation context and PATTERN:
 - Look at what the LAST assistant response was - that sets expectation for "again" or "another"
@@ -223,3 +228,17 @@ Format your response as a straightforward generative art prompt WITHOUT any intr
 Do NOT include phrases like "Here's a prompt:" or "Image prompt:".
 Do NOT include any disclaimers, notes, or additional commentary.
 Simply output the prompt text that should be sent directly to the image generation model."""
+
+# Document Summarization Prompt
+DOCUMENT_SUMMARIZATION_PROMPT = """Summarize the document content below into 2-3 concise paragraphs.
+
+Requirements:
+- Preserve all key information, data points, and findings
+- Maintain factual accuracy
+- Include important details that might be referenced later
+- Use clear, professional language
+- Do NOT add commentary, insights, or follow-up questions
+- Do NOT include phrases like "This document discusses" or "In summary"
+- Just provide the factual summary
+
+Document content to summarize:"""

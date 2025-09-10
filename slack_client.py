@@ -138,6 +138,29 @@ class SlackBot(BaseClient):
             # Validate settings
             validated_settings = self.settings_modal.validate_settings(form_values)
             
+            # Check for model switch warning (GPT-5 -> GPT-4)
+            model_switch_warning = ""
+            if in_thread and thread_id:
+                # Get current thread state to check existing model
+                thread_key = f"{thread_id.split(':')[0]}:{thread_id.split(':')[1]}" if ':' in thread_id else thread_id
+                thread_state = self.thread_manager.get_state(thread_key)
+                if thread_state and hasattr(thread_state, 'current_model'):
+                    old_model = thread_state.current_model
+                    new_model = validated_settings.get('model')
+                    
+                    # Check if switching from GPT-5 family to GPT-4 family
+                    if old_model and new_model:
+                        if old_model.startswith('gpt-5') and new_model.startswith('gpt-4'):
+                            model_switch_warning = "\n\n⚠️ **Important:** Switching to GPT-4 may require removing some older messages from long conversations due to its smaller context window (128k vs 400k tokens). Recent messages and important content like images will be preserved."
+            else:
+                # For global settings, check current default
+                old_model = self.db.get_user_preferences(user_id).get('model') if self.db else config.gpt_model
+                new_model = validated_settings.get('model')
+                
+                if old_model and new_model:
+                    if old_model.startswith('gpt-5') and new_model.startswith('gpt-4'):
+                        model_switch_warning = "\n\n⚠️ **Note:** You're switching to GPT-4 which has a smaller context window than GPT-5 (128k vs 400k tokens). Long conversations may have older messages automatically removed to fit within the limit."
+            
             # Check for temperature/top_p warning
             warning_message = ""
             if validated_settings.get('model') not in ['gpt-5', 'gpt-5-mini', 'gpt-5-nano']:
@@ -146,6 +169,9 @@ class SlackBot(BaseClient):
                 
                 if temp_changed and top_p_changed:
                     warning_message = "\n⚠️ Note: You've changed both Temperature and Top P. OpenAI recommends using only one for best results."
+            
+            # Combine warnings
+            warning_message = warning_message + model_switch_warning
             
             # Save to appropriate location based on modal context
             if in_thread and thread_id:
@@ -807,9 +833,29 @@ class SlackBot(BaseClient):
                         "ts": event.get("ts")  # Include timestamp for proper threading
                     })
                     
+                    # Check if we're in a channel/thread vs DM
+                    is_dm = message.channel_id.startswith('D')
+                    
+                    if is_dm:
+                        # For DMs, send the button in the same conversation
+                        target_channel = message.channel_id
+                        target_thread = message.thread_id
+                    else:
+                        # For channels/threads, send as a DM to the user
+                        target_channel = user_id  # Send to user's DM
+                        target_thread = None  # No thread in DM
+                        
+                        # Also send a brief message in the thread to acknowledge
+                        client.chat_postMessage(
+                            channel=message.channel_id,
+                            thread_ts=message.thread_id,
+                            text="👋 Welcome! I've sent you a direct message to configure your settings."
+                        )
+                    
+                    # Send the settings button (either in DM or in the same DM conversation)
                     client.chat_postMessage(
-                        channel=message.channel_id,
-                        thread_ts=message.thread_id,
+                        channel=target_channel,
+                        thread_ts=target_thread,
                         text="👋 Welcome! Please configure your settings to get started.",
                         blocks=[
                             {

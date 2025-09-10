@@ -231,6 +231,60 @@ class TestLoggerIntegration:
             log_session_end()
         except Exception as e:
             pytest.fail(f"Session lifecycle logging failed: {e}")
+    
+    def test_custom_log_file_handler(self, tmp_path):
+        """Test adding custom file handler"""
+        custom_log = tmp_path / "custom.log"
+        
+        test_logger = setup_logger("test_custom", log_file=str(custom_log))
+        
+        # Log a message
+        test_logger.info("Custom log message")
+        
+        # Verify file was created and contains the message
+        assert custom_log.exists()
+        log_content = custom_log.read_text()
+        assert "Custom log message" in log_content
+    
+    def test_logger_critical_method(self):
+        """Test LoggerMixin critical logging"""
+        from logger import LoggerMixin
+        from unittest.mock import patch
+        
+        class TestClass(LoggerMixin):
+            pass
+        
+        obj = TestClass()
+        
+        with patch.object(obj.logger, 'critical') as mock_critical:
+            obj.log_critical("Critical error occurred", exc_info=True)
+            mock_critical.assert_called_once_with(
+                "Critical error occurred", 
+                exc_info=True, 
+                extra={}
+            )
+    
+    def test_logger_with_exception_info(self):
+        """Test logging with exception information"""
+        from logger import LoggerMixin
+        from unittest.mock import patch
+        
+        class TestClass(LoggerMixin):
+            pass
+        
+        obj = TestClass()
+        
+        with patch.object(obj.logger, 'error') as mock_error:
+            try:
+                raise ValueError("Test exception")
+            except ValueError:
+                obj.log_error("Error with traceback", exc_info=True, user_id="U123")
+                
+            mock_error.assert_called_once()
+            call_args = mock_error.call_args
+            assert call_args[0][0] == "Error with traceback"
+            assert call_args[1]['exc_info'] is True
+            assert call_args[1]['extra'] == {'user_id': 'U123'}
         
         # These functions should execute without raising exceptions
         assert True  # If we get here, lifecycle worked

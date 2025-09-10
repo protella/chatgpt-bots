@@ -24,21 +24,17 @@ class TokenCounter(LoggerMixin):
     def _init_encoder(self):
         """Initialize the tiktoken encoder for the model"""
         try:
-            # Try to get encoder for the specific model
-            if self.model.startswith("gpt-5"):
-                # GPT-5 models likely use the same encoding as GPT-4
-                # Fallback to cl100k_base which is used by GPT-4
+            # All our models use o200k_base encoding:
+            # - GPT-4o and GPT-4.1 use o200k_base
+            # - GPT-5 models use o200k_base
+            # This provides better tokenization for code and multilingual text
+            try:
+                self._encoder = tiktoken.get_encoding("o200k_base")
+                self.log_debug(f"Using o200k_base encoding for {self.model}")
+            except KeyError:
+                # Fallback if o200k_base isn't available (older tiktoken version)
                 self._encoder = tiktoken.get_encoding("cl100k_base")
-                self.log_debug(f"Using cl100k_base encoding for {self.model}")
-            else:
-                # Try to get model-specific encoding
-                try:
-                    self._encoder = tiktoken.encoding_for_model(self.model)
-                    self.log_debug(f"Using model-specific encoding for {self.model}")
-                except KeyError:
-                    # Fallback to cl100k_base for unknown models
-                    self._encoder = tiktoken.get_encoding("cl100k_base")
-                    self.log_debug(f"Model {self.model} not found, using cl100k_base encoding")
+                self.log_warning(f"o200k_base not available, falling back to cl100k_base for {self.model}")
         except Exception as e:
             self.log_error(f"Failed to initialize tiktoken encoder: {e}")
             # Create a simple fallback that estimates tokens

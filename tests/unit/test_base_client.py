@@ -376,3 +376,34 @@ class TestBaseClientContract:
             
         except Exception as e:
             pytest.fail(f"Basic client operations failed: {e}")
+    
+    def test_handle_error_method(self):
+        """Test the handle_error method calls correct methods"""
+        client = TestBaseClient.MockClient()
+        
+        # Mock the send_message method
+        with patch.object(client, 'send_message') as mock_send:
+            client.handle_error("C123", "T456", "Something went wrong")
+            
+            # Verify send_message was called with formatted error
+            mock_send.assert_called_once_with("C123", "T456", "Error: Something went wrong")
+    
+    def test_format_error_message_default(self):
+        """Test default error message formatting"""
+        client = TestBaseClient.MockClient()
+        
+        # Test basic error formatting
+        formatted = client.format_error_message("Connection timeout")
+        assert formatted == "Error: Connection timeout"
+        
+        # Test with complex error
+        formatted = client.format_error_message("Failed to process: Invalid JSON")
+        assert formatted == "Error: Failed to process: Invalid JSON"
+    
+    def test_update_message_default_implementation(self):
+        """Test update_message returns False by default"""
+        client = TestBaseClient.MockClient()
+        
+        # Default implementation should return False
+        result = client.update_message("C123", "M456", "Updated text")
+        assert result is False
