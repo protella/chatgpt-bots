@@ -60,39 +60,64 @@ class MessageProcessor(LoggerMixin):
             # Normal text content
             return f"{username}: {content}"
     
-    def _add_message_with_token_management(self, thread_state, role: str, content: Any, db=None, thread_key: str = None, message_ts: str = None, metadata: Dict[str, Any] = None):
-        """Helper method to add messages with token management"""
+    def _add_message_with_token_management(self, thread_state, role: str, content: Any, db=None, thread_key: str = None, message_ts: str = None, metadata: Dict[str, Any] = None, skip_auto_trim: bool = False):
+        """Helper method to add messages with token management
+        
+        Args:
+            skip_auto_trim: If True, skip the automatic simple trimming (used during rebuild to allow smart trimming later)
+        """
+        # Get dynamic token limit based on current model
+        model = thread_state.current_model or config.gpt_model
+        max_tokens = config.get_model_token_limit(model)
+        
         # Count tokens for this message
         msg_tokens = self.thread_manager._token_counter.count_message_tokens({"role": role, "content": content})
         
         # Add the message
-        thread_state.add_message(
-            role=role,
-            content=content,
-            db=db,
-            thread_key=thread_key,
-            message_ts=message_ts,
-            metadata=metadata,
-            token_counter=self.thread_manager._token_counter,
-            max_tokens=self.thread_manager._max_tokens
-        )
+        # During rebuild, we skip auto-trim to allow smart trimming with summarization
+        if skip_auto_trim:
+            thread_state.add_message(
+                role=role,
+                content=content,
+                db=db,
+                thread_key=thread_key,
+                message_ts=message_ts,
+                metadata=metadata,
+                token_counter=None,  # Skip automatic trimming
+                max_tokens=None
+            )
+        else:
+            thread_state.add_message(
+                role=role,
+                content=content,
+                db=db,
+                thread_key=thread_key,
+                message_ts=message_ts,
+                metadata=metadata,
+                token_counter=self.thread_manager._token_counter,
+                max_tokens=max_tokens
+            )
         
         # Log token info in debug mode
         total_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
         content_preview = str(content)[:50] + "..." if len(str(content)) > 50 else str(content)
-        self.log_debug(f"MESSAGE ADDED | Role: {role} | Tokens: {msg_tokens} | Total: {total_tokens}/{self.thread_manager._max_tokens}")
+        self.log_debug(f"MESSAGE ADDED | Role: {role} | Tokens: {msg_tokens} | Total: {total_tokens}/{max_tokens}")
     
-    def _pre_trim_messages_for_api(self, messages: List[Dict[str, Any]], new_message_tokens: int = 0) -> List[Dict[str, Any]]:
+    def _pre_trim_messages_for_api(self, messages: List[Dict[str, Any]], new_message_tokens: int = 0, model: str = None, thread_state=None) -> List[Dict[str, Any]]:
         """Pre-trim messages to fit within context window before sending to API
         
         Args:
             messages: List of messages to potentially trim
             new_message_tokens: Tokens that will be added (for pre-checks)
+            model: Model name to get appropriate token limit
+            thread_state: Optional thread state for smart trimming
             
         Returns:
             Trimmed list of messages that fits within context
         """
-        max_tokens = self.thread_manager._max_tokens
+        # Get dynamic token limit based on model
+        model = model or config.gpt_model
+        max_tokens = config.get_model_token_limit(model)
         current_tokens = self.thread_manager._token_counter.count_thread_tokens(messages) + new_message_tokens
         
         if current_tokens <= max_tokens:
@@ -100,6 +125,16 @@ class MessageProcessor(LoggerMixin):
         
         self.log_info(f"Pre-trimming messages: {current_tokens} tokens exceeds {max_tokens} limit")
         
+        # If we have thread_state, use smart trimming
+        if thread_state:
+            # Apply smart trimming with document summarization
+            trimmed_count = self._smart_trim_with_summarization(thread_state)
+            if trimmed_count > 0:
+                new_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+                self.log_info(f"Smart trim complete: {current_tokens} → {new_tokens} tokens ({trimmed_count} messages processed)")
+            return thread_state.messages
+        
+        # Fallback to basic trimming if no thread_state
         # Find first non-system message index
         start_index = 0
         for i, msg in enumerate(messages):
@@ -126,6 +161,299 @@ class MessageProcessor(LoggerMixin):
             self.log_info(f"Pre-trimmed {removed_count} messages to fit within context limit")
         
         return trimmed_messages
+    
+    def _should_preserve_message(self, msg: Dict[str, Any]) -> bool:
+        """Determine if a message should be preserved during trimming
+        
+        Args:
+            msg: Message dictionary to evaluate
+            
+        Returns:
+            True if message should be preserved, False otherwise
+        """
+        # Never trim system messages
+        if msg.get("role") in ["system", "developer"]:
+            return True
+        
+        # Check metadata for special message types
+        metadata = msg.get("metadata", {})
+        # Note: document_upload is NOT preserved - documents can be summarized
+        if metadata.get("type") in ["image_generation", "image_edit", "image_upload", "vision_analysis", "image_analysis"]:
+            return True
+        
+        # Preserve summarized documents (they're already compressed)
+        if metadata.get("summarized"):
+            return True
+        
+        content = str(msg.get("content", ""))
+        
+        # Check for IMAGE URLs that might be needed for edits
+        # Only preserve if it has image URLs (not document URLs)
+        import re
+        url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+        urls = re.findall(url_pattern, content)
+        for url in urls:
+            # Only preserve if it's an image URL
+            if any(ext in url.lower() for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg']):
+                return True
+            # Also preserve OpenAI generated image URLs
+            if 'oaidalleapi' in url.lower() or 'dall-e' in url.lower():
+                return True
+        
+        # Check for SUMMARIZED document markers - these are preserved
+        # But full/unsummarized documents are NOT preserved (they can be trimmed/summarized)
+        if "[SUMMARIZED" in content:
+            return True
+        
+        # Check for injected analysis markers
+        if "[Image Analysis:" in content or "[Vision Context:" in content:
+            return True
+        
+        return False
+    
+    def _summarize_document_content(self, content: str) -> str:
+        """Summarize document content to reduce token usage
+        
+        Args:
+            content: Full document content with === DOCUMENT: markers
+            
+        Returns:
+            Summarized version of the document content
+        """
+        try:
+            # Extract document metadata
+            import re
+            doc_match = re.search(r'=== DOCUMENT: (.*?) ===.*?MIME Type: (.*?)\n', content, re.DOTALL)
+            if not doc_match:
+                return content  # Can't parse, return as-is
+            
+            filename = doc_match.group(1).strip()
+            mimetype = doc_match.group(2).strip()
+            
+            # Extract page count if available
+            pages_match = re.search(r'\((\d+) pages?\)', content)
+            page_count = pages_match.group(1) if pages_match else "unknown"
+            
+            # Use OpenAI to summarize the document content
+            # Extract just the document text (between headers)
+            doc_text_match = re.search(r'=== DOCUMENT:.*?===\n(.*?)\n=== DOCUMENT END:', content, re.DOTALL)
+            if not doc_text_match:
+                return content
+            
+            doc_text = doc_text_match.group(1).strip()
+            
+            # Import the summarization prompt
+            from prompts import DOCUMENT_SUMMARIZATION_PROMPT
+            
+            # Use proper role separation for document summarization
+            # Developer message contains the instruction, user message contains the document
+            summary = self.openai_client.create_text_response(
+                messages=[
+                    {"role": "developer", "content": DOCUMENT_SUMMARIZATION_PROMPT},
+                    {"role": "user", "content": doc_text}  # Full document, no truncation
+                ],
+                model=config.utility_model,
+                temperature=0.3,
+                max_tokens=800,  # Increased for better summaries
+                system_prompt=None  # Already using developer message above
+            )
+            
+            # Format the summarized version
+            summarized = f"""=== DOCUMENT: {filename} === ({page_count} pages)
+MIME Type: {mimetype}
+[SUMMARIZED - Original content reduced for context management]
+
+{summary}
+
+=== DOCUMENT END: {filename} ==="""
+            
+            self.log_info(f"Summarized document {filename}: {len(doc_text)} chars -> {len(summary)} chars")
+            return summarized
+            
+        except Exception as e:
+            self.log_error(f"Error summarizing document: {e}")
+            return content  # Return original if summarization fails
+    
+    def _smart_trim_with_summarization(self, thread_state, trim_count: int = None) -> int:
+        """Intelligently trim messages, summarizing documents only when they're in the trim list
+        
+        This method identifies the oldest N messages to be trimmed. If any contain
+        unsummarized documents, it summarizes them in place (making them preserved).
+        Then it trims any remaining non-preserved messages from the list.
+        
+        Args:
+            thread_state: Thread state object to trim
+            trim_count: Number of messages to trim (default from config)
+            
+        Returns:
+            Number of messages actually trimmed or summarized
+        """
+        trim_count = trim_count or config.token_trim_message_count
+        
+        # Build list of ALL non-preserved message indices
+        trimmable_indices = []
+        for i, msg in enumerate(thread_state.messages):
+            if not self._should_preserve_message(msg):
+                trimmable_indices.append(i)
+                # Debug: log if this is a document
+                content = str(msg.get("content", ""))
+                if "=== DOCUMENT:" in content and "[SUMMARIZED" not in content:
+                    self.log_debug(f"Found unsummarized document at index {i} (trimmable)")
+        
+        self.log_debug(f"Found {len(trimmable_indices)} trimmable messages out of {len(thread_state.messages)} total")
+        
+        # Get the oldest N messages that would be trimmed
+        indices_to_process = sorted(trimmable_indices)[:trim_count]
+        self.log_debug(f"Processing oldest {len(indices_to_process)} messages: indices {indices_to_process}")
+        
+        if not indices_to_process:
+            # No trimmable messages at all
+            return 0
+        
+        # FIRST PASS: Check if any messages in the trim list contain unsummarized documents
+        # If so, summarize them IN PLACE (they become preserved)
+        documents_summarized = 0
+        for idx in indices_to_process:
+            if idx < len(thread_state.messages):
+                msg = thread_state.messages[idx]
+                content = str(msg.get("content", ""))
+                
+                # Check if this is an unsummarized document
+                if "=== DOCUMENT:" in content and "[SUMMARIZED" not in content:
+                    original_content = msg.get("content", "")
+                    
+                    self.log_info(f"Summarizing document at index {idx} (in trim list of {len(indices_to_process)} messages)")
+                    
+                    # Summarize the document
+                    summarized_content = self._summarize_document_content(original_content)
+                    
+                    # Update the message IN PLACE with summarized content
+                    thread_state.messages[idx]["content"] = summarized_content
+                    
+                    # Update metadata to indicate summarization
+                    if "metadata" not in thread_state.messages[idx]:
+                        thread_state.messages[idx]["metadata"] = {}
+                    thread_state.messages[idx]["metadata"]["summarized"] = True
+                    # Don't set type to document_upload - that would preserve it
+                    thread_state.messages[idx]["metadata"]["original_length"] = len(original_content)
+                    thread_state.messages[idx]["metadata"]["summarized_length"] = len(summarized_content)
+                    
+                    self.log_info(f"Summarized document: {len(original_content)} → {len(summarized_content)} chars")
+                    documents_summarized += 1
+        
+        # If we summarized any documents, that's progress - return to recheck token count
+        if documents_summarized > 0:
+            return documents_summarized
+        
+        # SECOND PASS: No documents were summarized, so actually trim non-preserved messages
+        # Re-check which messages are still trimmable (documents we just summarized are now preserved)
+        messages_trimmed = 0
+        still_trimmable = []
+        
+        for idx in indices_to_process:
+            if idx < len(thread_state.messages):
+                if not self._should_preserve_message(thread_state.messages[idx]):
+                    still_trimmable.append(idx)
+        
+        # Remove messages in reverse order to maintain indices
+        for idx in reversed(still_trimmable):
+            if idx < len(thread_state.messages):
+                removed_msg = thread_state.messages.pop(idx)
+                messages_trimmed += 1
+                self.log_debug(f"Trimmed message at index {idx}: {str(removed_msg.get('content', ''))[:50]}...")
+        
+        if messages_trimmed > 0:
+            thread_state.has_trimmed_messages = True
+            self.log_info(f"Smart-trimmed {messages_trimmed} messages from thread")
+        
+        return messages_trimmed
+    
+    def _smart_trim_oldest(self, thread_state, trim_count: int = None) -> int:
+        """Intelligently trim oldest non-preserved messages from thread
+        
+        Args:
+            thread_state: Thread state object to trim
+            trim_count: Number of messages to trim (default from config)
+            
+        Returns:
+            Number of messages actually trimmed
+        """
+        trim_count = trim_count or config.token_trim_message_count
+        trimmed = 0
+        
+        # Build list of trimmable message indices
+        trimmable_indices = []
+        for i, msg in enumerate(thread_state.messages):
+            if not self._should_preserve_message(msg):
+                trimmable_indices.append(i)
+        
+        # Trim from oldest (lowest indices) first
+        for i in sorted(trimmable_indices)[:trim_count]:
+            # Adjust index for previously removed messages
+            adjusted_index = i - trimmed
+            if adjusted_index < len(thread_state.messages):
+                removed_msg = thread_state.messages.pop(adjusted_index)
+                trimmed += 1
+                self.log_debug(f"Trimmed message at index {i}: {str(removed_msg.get('content', ''))[:50]}...")
+        
+        if trimmed > 0:
+            thread_state.has_trimmed_messages = True
+            self.log_info(f"Smart-trimmed {trimmed} messages from thread")
+        
+        return trimmed
+    
+    def _async_post_response_cleanup(self, thread_state, thread_key: str):
+        """Asynchronously clean up thread after response is sent
+        
+        This runs after the response has been sent to Slack to proactively
+        trim old messages before the next request. Will summarize documents
+        before trimming them to preserve context.
+        
+        Args:
+            thread_state: Thread state to potentially clean up
+            thread_key: Thread identifier for database operations
+        """
+        try:
+            # Get current model's token limit
+            model = thread_state.current_model or config.gpt_model
+            max_tokens = config.get_model_token_limit(model)
+            cleanup_threshold = int(max_tokens * config.token_cleanup_threshold)
+            
+            # Check current token usage
+            current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+            
+            if current_tokens > cleanup_threshold:
+                self.log_info(f"Thread at {current_tokens}/{max_tokens} tokens ({current_tokens/max_tokens:.1%}), triggering cleanup")
+                
+                # Use smart trim with summarization for documents
+                trimmed = self._smart_trim_with_summarization(thread_state)
+                
+                if trimmed > 0:
+                    # Update token count after trimming
+                    new_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+                    self.log_info(f"Cleanup complete: {current_tokens} → {new_tokens} tokens ({trimmed} messages removed)")
+                    
+                    # Always update database to maintain sync
+                    if self.db:
+                        # Clear and rebuild cache with current state
+                        # This ensures DB reflects summarizations and removals
+                        self.db.clear_thread_messages(thread_key)
+                        for msg in thread_state.messages:
+                            self.db.cache_message(
+                                thread_key, 
+                                msg.get("role"), 
+                                msg.get("content"),
+                                message_ts=None,  # Timestamp not needed for cache rebuild
+                                metadata=msg.get("metadata")
+                            )
+                        self.log_debug(f"Database cache rebuilt for thread {thread_key} with {len(thread_state.messages)} messages")
+                else:
+                    self.log_warning("Cleanup triggered but no trimmable messages found")
+            
+        except Exception as e:
+            self.log_error(f"Error during async cleanup: {e}")
+            # Don't let cleanup errors affect the main flow
+    
     def process_message(self, message: Message, client: BaseClient, thinking_id: Optional[str] = None) -> Optional[Response]:
         """
         Process a message and return a response
@@ -172,7 +500,8 @@ class MessageProcessor(LoggerMixin):
             # Get or rebuild thread state
             thread_state = self._get_or_rebuild_thread_state(
                 message,
-                client
+                client,
+                thinking_id
             )
             
             # Check if this thread had a previous timeout
@@ -188,6 +517,8 @@ class MessageProcessor(LoggerMixin):
                 thread_state.had_timeout = False
                 self.log_info(f"Notified user about previous timeout in thread {thread_key}")
             
+            # Note: 80% context warning moved to after response generation
+            
             # Get thread config to determine model (with user preferences)
             thread_config = config.get_thread_config(
                 overrides=thread_state.config_overrides,
@@ -195,13 +526,16 @@ class MessageProcessor(LoggerMixin):
                 db=self.db
             )
             
+            # Update thread state with current model for token limit calculations
+            thread_state.current_model = thread_config["model"]
+            
             # Always regenerate system prompt to get current time
             user_timezone = message.metadata.get("user_timezone", "UTC") if message.metadata else "UTC"
             user_tz_label = message.metadata.get("user_tz_label", None) if message.metadata else None
             user_real_name = message.metadata.get("user_real_name", None) if message.metadata else None
             user_email = message.metadata.get("user_email", None) if message.metadata else None
             web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
-            thread_state.system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"], web_search_enabled)
+            thread_state.system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"], web_search_enabled, thread_state.has_trimmed_messages)
             
             # Process any attachments (images, documents, and other files)
             image_inputs, document_inputs, unsupported_files = self._process_attachments(message, client, thinking_id)
@@ -266,16 +600,52 @@ class MessageProcessor(LoggerMixin):
             
             user_content = self._build_user_content(enhanced_text, image_inputs)
             
-            # Check if the message is too large for the model
-            # For vision requests, only count the text portion that goes into history
-            # Images are processed separately via analyze_images API
-            if image_inputs:
-                # Only count the text breadcrumb that will be saved to history
-                breadcrumb_text = enhanced_text if enhanced_text else f"{username}: [uploaded image(s) for analysis]"
-                message_tokens = self.thread_manager._token_counter.count_message_tokens({"role": "user", "content": breadcrumb_text})
-            else:
-                # For non-image messages, count the full content
-                message_tokens = self.thread_manager._token_counter.count_message_tokens({"role": "user", "content": user_content})
+            # Check if adding this message would exceed limits and trim if needed
+            # We temporarily add the message to check, then remove it
+            thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+            message_ts = message.metadata.get("ts") if message.metadata else None
+            
+            # Determine what content to use for checking
+            content_to_check = enhanced_text if not image_inputs else (enhanced_text if enhanced_text else f"{username}: [uploaded image(s) for analysis]")
+            
+            # Temporarily add message to check total tokens
+            temp_message = {"role": "user", "content": content_to_check}
+            thread_state.messages.append(temp_message)
+            
+            # Check token count with the new message
+            model = thread_state.current_model or config.gpt_model
+            max_tokens = config.get_model_token_limit(model)
+            current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+            
+            # Apply smart trimming if needed - keep trimming until under limit
+            if current_tokens > max_tokens:
+                self.log_info(f"Thread would exceed limit with new message ({current_tokens}/{max_tokens} tokens), applying smart trim")
+                total_trimmed = 0
+                
+                # Keep trimming until we're under the limit
+                while current_tokens > max_tokens:
+                    # Smart trim will work on all messages including the temp one
+                    trimmed_count = self._smart_trim_with_summarization(thread_state)
+                    total_trimmed += trimmed_count
+                    
+                    if trimmed_count == 0:
+                        # No more messages to trim, we've done all we can
+                        self.log_warning(f"Cannot trim further - still at {current_tokens} tokens")
+                        break
+                    
+                    # Recalculate tokens after trimming
+                    current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+                    self.log_debug(f"After trimming {trimmed_count} messages, now at {current_tokens}/{max_tokens} tokens")
+                
+                if total_trimmed > 0:
+                    self.log_info(f"Smart trim complete: {total_trimmed} total messages processed, final: {current_tokens}/{max_tokens} tokens")
+            
+            # Remove the temporary message - handlers will add it properly
+            if thread_state.messages and thread_state.messages[-1] == temp_message:
+                thread_state.messages.pop()
+            
+            # Check if this single message alone exceeds the model's context window
+            message_tokens = self.thread_manager._token_counter.count_message_tokens(temp_message)
             max_model_tokens = config.thread_max_token_count  # Model's context limit
             
             # Check if this single message exceeds the model's context window
@@ -316,12 +686,22 @@ class MessageProcessor(LoggerMixin):
                 original_request = thread_state.pending_clarification.get("original_request", "")
                 combined_context = f"{original_request} - Clarification: {message.text}"
                 
-                # Pre-trim messages if needed for intent classification
-                trimmed_messages = self._pre_trim_messages_for_api(thread_state.messages)
+                # Truncate documents in history for intent classification
+                trimmed_history_for_intent = []
+                for msg in thread_state.messages:
+                    msg_copy = msg.copy()
+                    content = str(msg_copy.get("content", ""))
+                    if "=== DOCUMENT:" in content and len(content) > 500:
+                        # Truncate document content
+                        msg_copy["content"] = content[:200] + "...[document content truncated for classification]..."
+                    trimmed_history_for_intent.append(msg_copy)
+                
+                # Use already-trimmed thread state for intent classification
+                # Only mark as having attachments if there are actual image uploads
                 intent = self.openai_client.classify_intent(
-                    trimmed_messages,  # Use trimmed conversation history
+                    trimmed_history_for_intent,  # Documents truncated for classification
                     combined_context,
-                    has_attached_images=len(image_inputs) > 0 or len(document_inputs) > 0
+                    has_attached_images=len(image_inputs) > 0
                 )
                 
                 # Clear the pending clarification
@@ -342,12 +722,53 @@ class MessageProcessor(LoggerMixin):
                     # Has text with images - classify if it's edit or vision
                     self._update_status(client, message.channel_id, thinking_id, 
                                       "Understanding your request...")
-                    # Pre-trim messages if needed for intent classification
-                    trimmed_messages = self._pre_trim_messages_for_api(thread_state.messages)
+                    # For intent classification, include the current message in trimming
+                    # Temporarily add the current message
+                    temp_intent_msg = {"role": "user", "content": enhanced_text}
+                    thread_state.messages.append(temp_intent_msg)
+                    
+                    # Pre-trim messages INCLUDING the current message
+                    trimmed_messages = self._pre_trim_messages_for_api(thread_state.messages, model=thread_state.current_model, thread_state=thread_state)
+                    
+                    # Remove the temp message
+                    if thread_state.messages and thread_state.messages[-1] == temp_intent_msg:
+                        thread_state.messages.pop()
+                    
+                    # Use the actual current message (enhanced_text) for classification
+                    intent_text = enhanced_text if enhanced_text else ""
+                    
+                    # Truncate document content for intent classification to avoid confusion
+                    # Intent classifier should focus on the user's request, not document content
+                    if "=== DOCUMENT:" in intent_text and len(intent_text) > 500:
+                        # Keep just the document header and user's actual message
+                        parts = intent_text.split("\n\n\n=== DOCUMENT:")
+                        if len(parts) > 1:
+                            user_msg = parts[0]  # User's actual message before document
+                            # Add truncated document indicator
+                            intent_text = user_msg + "\n[Document content truncated for classification]"
+                        else:
+                            # Document is at the start, truncate it
+                            intent_text = intent_text[:200] + "...[document truncated]..."
+                    
+                    # Now pass the trimmed history WITHOUT the current message (since classify_intent expects it separately)
+                    trimmed_history = [msg for msg in trimmed_messages if msg != trimmed_messages[-1]] if trimmed_messages else []
+                    
+                    # Also truncate documents in history for intent classification
+                    trimmed_history_for_intent = []
+                    for msg in trimmed_history:
+                        msg_copy = msg.copy()
+                        content = str(msg_copy.get("content", ""))
+                        if "=== DOCUMENT:" in content and len(content) > 500:
+                            # Truncate document content
+                            msg_copy["content"] = content[:200] + "...[document content truncated for classification]..."
+                        trimmed_history_for_intent.append(msg_copy)
+                    
+                    # Only mark as having attachments if there are actual image uploads
+                    # Documents shouldn't affect image intent classification
                     intent = self.openai_client.classify_intent(
-                        trimmed_messages,  # Use trimmed conversation history
-                        enhanced_text,  # Use enhanced text that includes document content
-                        has_attached_images=len(image_inputs) > 0 or len(document_inputs) > 0
+                        trimmed_history_for_intent,  # Trimmed conversation history (without current)
+                        intent_text,  # Current message (potentially trimmed/summarized)
+                        has_attached_images=len(image_inputs) > 0
                     )
                     # If intent classification times out, it returns 'text_only' by default
                     # For uploaded images, override to vision if we got text_only (likely from timeout)
@@ -375,12 +796,52 @@ class MessageProcessor(LoggerMixin):
                 # No images uploaded - standard classification
                 self._update_status(client, message.channel_id, thinking_id, 
                                   "Understanding your request...")
-                # Pre-trim messages if needed for intent classification
-                trimmed_messages = self._pre_trim_messages_for_api(thread_state.messages)
+                # For intent classification, include the current message in trimming
+                # Temporarily add the current message
+                temp_intent_msg = {"role": "user", "content": enhanced_text if enhanced_text else ""}
+                thread_state.messages.append(temp_intent_msg)
+                
+                # Pre-trim messages INCLUDING the current message
+                trimmed_messages = self._pre_trim_messages_for_api(thread_state.messages, model=thread_state.current_model, thread_state=thread_state)
+                
+                # Remove the temp message
+                if thread_state.messages and thread_state.messages[-1] == temp_intent_msg:
+                    thread_state.messages.pop()
+                
+                # Use the actual current message (enhanced_text) for classification
+                intent_text = enhanced_text if enhanced_text else ""
+                
+                # Truncate document content for intent classification to avoid confusion
+                # Intent classifier should focus on the user's request, not document content
+                if "=== DOCUMENT:" in intent_text and len(intent_text) > 500:
+                    # Keep just the document header and user's actual message
+                    parts = intent_text.split("\n\n\n=== DOCUMENT:")
+                    if len(parts) > 1:
+                        user_msg = parts[0]  # User's actual message before document
+                        # Add truncated document indicator
+                        intent_text = user_msg + "\n[Document content truncated for classification]"
+                    else:
+                        # Document is at the start, truncate it
+                        intent_text = intent_text[:200] + "...[document truncated]..."
+                
+                # Now pass the trimmed history WITHOUT the current message (since classify_intent expects it separately)
+                trimmed_history = [msg for msg in trimmed_messages if msg != trimmed_messages[-1]] if trimmed_messages else []
+                
+                # Also truncate documents in history for intent classification
+                trimmed_history_for_intent = []
+                for msg in trimmed_history:
+                    msg_copy = msg.copy()
+                    content = str(msg_copy.get("content", ""))
+                    if "=== DOCUMENT:" in content and len(content) > 500:
+                        # Truncate document content
+                        msg_copy["content"] = content[:200] + "...[document content truncated for classification]..."
+                    trimmed_history_for_intent.append(msg_copy)
+                
+                # Only mark as having attachments if there are actual image uploads
                 intent = self.openai_client.classify_intent(
-                    trimmed_messages,  # Use trimmed conversation history
-                    enhanced_text if enhanced_text else "",
-                    has_attached_images=len(document_inputs) > 0  # Documents present
+                    trimmed_history_for_intent,  # Trimmed conversation history (without current)
+                    intent_text,  # Current message (potentially trimmed/summarized)
+                    has_attached_images=False  # Documents alone don't count as image attachments
                 )
             
             self.log_debug(f"Classified intent: {intent}")
@@ -518,12 +979,22 @@ class MessageProcessor(LoggerMixin):
             else:
                 response = self._handle_text_response(user_content, thread_state, client, message, thinking_id)
             
-            # DEBUG: Print conversation history after processing
+            # DEBUG: Print conversation history after processing (with truncated content)
             import json
             print("\n" + "="*100)
-            print("DEBUG: CONVERSATION HISTORY (RAW JSON)")
+            print("DEBUG: CONVERSATION HISTORY (TRUNCATED)")
             print("="*100)
-            print(json.dumps(thread_state.messages, indent=2))
+            
+            # Create a truncated version for debugging
+            truncated_messages = []
+            for msg in thread_state.messages:
+                truncated_msg = msg.copy()
+                content = str(truncated_msg.get("content", ""))
+                if len(content) > 100:
+                    truncated_msg["content"] = content[:100] + f"... [truncated {len(content) - 100} chars]"
+                truncated_messages.append(truncated_msg)
+            
+            print(json.dumps(truncated_messages, indent=2))
             print("="*100 + "\n")
             
             elapsed = time.time() - request_start_time
@@ -531,6 +1002,45 @@ class MessageProcessor(LoggerMixin):
             
             # Calculate final token count
             final_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+            
+            # Check if we should show the 80% context warning AFTER the response
+            if not thread_state.has_shown_80_percent_warning and response and response.type not in ["error", "busy"]:
+                # Get current model's token limit and check usage
+                model = thread_state.current_model or config.gpt_model
+                max_tokens = config.get_model_token_limit(model)
+                eighty_percent_threshold = int(max_tokens * config.token_cleanup_threshold)  # Using same threshold from .env
+                
+                if final_tokens > eighty_percent_threshold:
+                    # Send one-time warning about context usage as a stylized message
+                    warning_msg = (
+                        f"```\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📊 CONTEXT USAGE NOTIFICATION\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"\n"
+                        f"Current Usage: {final_tokens:,} / {max_tokens:,} tokens\n"
+                        f"({final_tokens/max_tokens:.0%} of available context)\n"
+                        f"\n"
+                        f"💡 Tips for optimal performance:\n"
+                        f"   • Start new threads for unrelated topics\n"
+                        f"   • Older messages may be auto-summarized\n"
+                        f"   • Important context is always preserved\n"
+                        f"\n"
+                        f"✅ You can continue chatting normally\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"```"
+                    )
+                    
+                    # Send as regular message so everyone in channel threads can see it
+                    client.post_message(
+                        channel_id=message.channel_id,
+                        text=warning_msg,
+                        thread_ts=message.thread_id
+                    )
+                    
+                    # Mark that we've shown the warning
+                    thread_state.has_shown_80_percent_warning = True
+                    self.log_info(f"Sent 80% context warning for thread {thread_key}: {final_tokens}/{max_tokens} tokens")
             
             self.log_info("")
             self.log_info("="*100)
@@ -614,22 +1124,57 @@ class MessageProcessor(LoggerMixin):
                         
                         for img_data in images_for_message:
                             analysis = img_data.get("analysis")
+                            url = img_data.get("url")
+                            image_type = img_data.get("image_type", "image")
+                            
+                            # Inject image context - either analysis or just URL info
                             if analysis:
-                                # Inject the analysis right after the user message
+                                # Full analysis available
                                 enhanced_messages.append({
                                     "role": "developer",
-                                    "content": f"[Visual context for {img_data.get('image_type', 'image')}]:\n{analysis}\n[End of visual context]"
+                                    "content": f"[Visual context for {image_type}]:\n{analysis}\n[End of visual context]"
                                 })
                                 self.log_debug(f"Injected analysis for message at position {i}")
+                            elif url:
+                                # No analysis but we have the URL - inject basic info
+                                context_msg = f"[Image context: {image_type} at {url}]"
+                                if image_type == "generated":
+                                    context_msg = f"[Bot generated an image and posted it at: {url}]"
+                                elif image_type == "uploaded":
+                                    context_msg = f"[User uploaded an image at: {url}]"
+                                elif image_type == "edited":
+                                    context_msg = f"[Bot edited an image and posted it at: {url}]"
+                                    
+                                enhanced_messages.append({
+                                    "role": "developer",
+                                    "content": context_msg
+                                })
+                                self.log_debug(f"Injected URL context for {image_type} at position {i}")
         
         if len(enhanced_messages) > len(messages):
-            self.log_info(f"Enhanced conversation with {len(enhanced_messages) - len(messages)} stored image analyses")
+            self.log_info(f"Enhanced conversation with {len(enhanced_messages) - len(messages)} image context entries")
         
         return enhanced_messages
+    def _is_error_or_busy_response(self, message_text: str) -> bool:
+        """Check if a message is an error or busy response using consistent markers"""
+        if not message_text:
+            return False
+            
+        # Use the consistent error emoji marker
+        if ":warning:" in message_text:
+            return True
+            
+        # Also check config in case emoji was customized
+        if config.error_emoji in message_text:
+            return True
+            
+        return False
+    
     def _get_or_rebuild_thread_state(
         self,
         message: Message,
-        client: BaseClient
+        client: BaseClient,
+        thinking_id: Optional[str] = None
     ) -> Any:
         """Get existing thread state or rebuild from platform history"""
         thread_state = self.thread_manager.get_or_create_thread(
@@ -656,6 +1201,16 @@ class MessageProcessor(LoggerMixin):
         if should_rebuild:
             self.log_info(f"Rebuilding thread state for {message.thread_id}")
             
+            # Update status to show we're rebuilding
+            if thinking_id:
+                self._update_status(
+                    client, 
+                    message.channel_id, 
+                    thinking_id,
+                    "Rebuilding thread history from Slack...",
+                    emoji=config.circle_loader_emoji
+                )
+            
             # Get history from platform
             history = client.get_thread_history(
                 message.channel_id,
@@ -664,6 +1219,10 @@ class MessageProcessor(LoggerMixin):
             
             # Get current message timestamp to exclude it
             current_ts = message.metadata.get("ts")
+            
+            # Track pending image URLs for vision analysis association
+            pending_image_urls = []
+            pending_image_metadata = {}  # Store additional metadata per URL
             
             # Convert to thread state messages
             for hist_msg in history:
@@ -704,57 +1263,240 @@ class MessageProcessor(LoggerMixin):
                     # Format content with username
                     content = f"{username}: {content}" if content else f"{username}:"
                 
+                # Track message metadata for preservation
+                message_metadata = {}
+                
                 # Store bot image metadata in DB
                 if is_bot and hist_msg.attachments:
                     for attachment in hist_msg.attachments:
                         if attachment.get("type") == "image":
                             url = attachment.get("url")
-                            if url and self.db:
-                                # Determine image type from content
-                                image_type = "generated" if "Generated image:" in content else "edited" if "Edited image:" in content else "assistant"
-                                try:
-                                    self.db.save_image_metadata(
-                                        thread_id=f"{thread_state.channel_id}:{thread_state.thread_ts}",
-                                        url=url,
-                                        image_type=image_type,
-                                        prompt=content,  # Store the generation/edit prompt
-                                        analysis=None,
-                                        metadata={"file_id": attachment.get("id")},
-                                        message_ts=hist_msg.metadata.get("ts") if hist_msg.metadata else None
-                                    )
-                                except Exception as e:
-                                    self.log_warning(f"Failed to save bot image metadata: {e}")
+                            if url:
+                                # Mark this message as containing an image for preservation
+                                message_metadata["type"] = "image_generation"
+                                message_metadata["url"] = url
+                                
+                                if self.db:
+                                    # Determine image type from content
+                                    image_type = "generated" if "Generated image:" in content else "edited" if "Edited image:" in content else "assistant"
+                                    try:
+                                        self.db.save_image_metadata(
+                                            thread_id=f"{thread_state.channel_id}:{thread_state.thread_ts}",
+                                            url=url,
+                                            image_type=image_type,
+                                            prompt=content,  # Store the generation/edit prompt
+                                            analysis=None,
+                                            metadata={"file_id": attachment.get("id")},
+                                            message_ts=hist_msg.metadata.get("ts") if hist_msg.metadata else None
+                                        )
+                                    except Exception as e:
+                                        self.log_warning(f"Failed to save bot image metadata: {e}")
                                 break  # Only process first image
                 
                 # Store attachment metadata in DB instead of content
                 if not is_bot and hist_msg.attachments:
-                    # Save image metadata to DB for each attachment
+                    # Track image URLs for potential vision analysis association
                     for attachment in hist_msg.attachments:
-                        if attachment.get("type") == "image" and attachment.get("url"):
-                            if self.db:
+                        att_type = attachment.get("type")
+                        att_url = attachment.get("url")
+                        
+                        # Handle both images and documents (files)
+                        if att_url and (att_type == "image" or att_type == "file"):
+                            # Check if this is actually a document based on mimetype
+                            mimetype = attachment.get("mimetype", "")
+                            filename = attachment.get("name", "")
+                            
+                            # Determine if it's an image or document
+                            is_image = att_type == "image" or mimetype.startswith("image/")
+                            is_document = (att_type == "file" and 
+                                         self.document_handler and 
+                                         self.document_handler.is_document_file(filename, mimetype))
+                            
+                            if is_image:
+                                # Mark user messages with uploaded images
+                                message_metadata["type"] = "image_upload"
+                                message_metadata["url"] = att_url
+                                
+                                # Add to pending for vision analysis association
+                                pending_image_urls.append(att_url)
+                                pending_image_metadata[att_url] = {
+                                    "file_id": attachment.get("id"),
+                                    "message_ts": hist_msg.metadata.get("ts") if hist_msg.metadata else None,
+                                    "user_text": hist_msg.text
+                                }
+                                
+                                if self.db:
+                                    try:
+                                        self.db.save_image_metadata(
+                                            thread_id=f"{thread_state.channel_id}:{thread_state.thread_ts}",
+                                            url=att_url,
+                                            image_type="uploaded",
+                                            prompt=None,
+                                            analysis=None,  # Will be updated when we find the vision analysis
+                                            metadata={"file_id": attachment.get("id")},
+                                            message_ts=hist_msg.metadata.get("ts") if hist_msg.metadata else None
+                                        )
+                                    except Exception as e:
+                                        self.log_warning(f"Failed to save image metadata during rebuild: {e}")
+                            
+                            elif is_document:
+                                # Handle document attachments during rebuild
+                                self.log_info(f"Found document attachment during rebuild: {filename} ({mimetype})")
+                                
+                                # Store document metadata (but don't mark as preserved type)
+                                # Documents should be trimmable/summarizable
+                                message_metadata["filename"] = filename
+                                message_metadata["mimetype"] = mimetype
+                                
+                                # Try to download and process the document
                                 try:
+                                    # Download the document using the client
+                                    document_data = client.download_file(att_url, attachment.get("id"))
+                                    
+                                    if document_data and self.document_handler:
+                                        # Extract document content
+                                        extracted_content = self.document_handler.safe_extract_content(
+                                            document_data, mimetype, filename
+                                        )
+                                        
+                                        if extracted_content and extracted_content.get("content"):
+                                            # Add document content to the message
+                                            doc_content = self._build_message_with_documents(
+                                                content,  # Original message content
+                                                [{
+                                                    "filename": filename,
+                                                    "mimetype": mimetype,
+                                                    "content": extracted_content["content"],
+                                                    "metadata": extracted_content
+                                                }]
+                                            )
+                                            content = doc_content
+                                            self.log_info(f"Successfully extracted document content during rebuild: {filename}")
+                                            
+                                            # Store in document ledger
+                                            thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+                                            document_ledger = self.thread_manager.get_or_create_document_ledger(thread_state.thread_ts)
+                                            document_ledger.add_document(
+                                                content=extracted_content["content"],
+                                                filename=filename,
+                                                mime_type=mimetype,
+                                                metadata=extracted_content
+                                            )
+                                        else:
+                                            self.log_warning(f"Failed to extract content from document during rebuild: {filename}")
+                                    else:
+                                        self.log_warning(f"Failed to download document during rebuild: {filename}")
+                                        
+                                except Exception as e:
+                                    self.log_error(f"Error processing document during rebuild: {e}")
+                                    # Continue without the document content
+                
+                # Check if this is an assistant message that might be a vision analysis
+                if is_bot and pending_image_urls:
+                    self.log_debug(f"Assistant message with {len(pending_image_urls)} pending images")
+                    self.log_debug(f"Content preview: {content[:100]}...")
+                    
+                    # Check if this is an error/busy response
+                    if self._is_error_or_busy_response(content):
+                        # Error response - clear pending as analysis failed
+                        self.log_debug(f"Found error/busy response, clearing {len(pending_image_urls)} pending images")
+                        pending_image_urls.clear()
+                        pending_image_metadata.clear()
+                    else:
+                        # This is likely the vision analysis for the pending images
+                        self.log_info(f"Found vision analysis for {len(pending_image_urls)} images")
+                        self.log_debug(f"Pending URLs: {pending_image_urls}")
+                        
+                        # Store the analysis for all pending images
+                        if self.db:
+                            for image_url in pending_image_urls:
+                                try:
+                                    # Update the existing image metadata with the analysis
+                                    self.log_debug(f"Storing analysis for: {image_url}")
                                     self.db.save_image_metadata(
                                         thread_id=f"{thread_state.channel_id}:{thread_state.thread_ts}",
-                                        url=attachment.get("url"),
+                                        url=image_url,
                                         image_type="uploaded",
-                                        prompt=None,
-                                        analysis=None,
-                                        metadata={"file_id": attachment.get("id")},
-                                        message_ts=hist_msg.metadata.get("ts") if hist_msg.metadata else None
+                                        prompt=pending_image_metadata.get(image_url, {}).get("user_text"),
+                                        analysis=content,  # Store the full bot response as analysis
+                                        metadata={
+                                            "file_id": pending_image_metadata.get(image_url, {}).get("file_id"),
+                                            "has_analysis": True
+                                        },
+                                        message_ts=pending_image_metadata.get(image_url, {}).get("message_ts")
                                     )
+                                    self.log_info(f"Successfully stored vision analysis for image: {image_url[:60]}...")
                                 except Exception as e:
-                                    self.log_warning(f"Failed to save image metadata during rebuild: {e}")
+                                    self.log_error(f"Failed to store vision analysis: {e}", exc_info=True)
+                        else:
+                            self.log_warning("No database available to store vision analysis")
+                        
+                        # Clear pending images after storing
+                        pending_image_urls.clear()
+                        pending_image_metadata.clear()
                 
                 thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                 message_ts = hist_msg.metadata.get("ts") if hist_msg.metadata else None
-                self._add_message_with_token_management(thread_state, role, content, db=self.db, thread_key=thread_key, message_ts=message_ts)
+                # During rebuild, skip auto-trim to allow smart trimming with document summarization later
+                self._add_message_with_token_management(thread_state, role, content, db=self.db, thread_key=thread_key, message_ts=message_ts, metadata=message_metadata, skip_auto_trim=True)
             
             self.log_info(f"Rebuilt thread with {len(thread_state.messages)} messages")
         
-        # Log initial token count
-        initial_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+        # Apply smart trimming recursively if needed after rebuild
+        model = thread_state.current_model or config.gpt_model
+        max_tokens = config.get_model_token_limit(model)
+        current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+        
+        if current_tokens > max_tokens:
+            self.log_info(f"Thread rebuilt over limit ({current_tokens}/{max_tokens} tokens), applying smart trim")
+            
+            # Update status to show we're trimming
+            if thinking_id:
+                self._update_status(
+                    client,
+                    message.channel_id,
+                    thinking_id,
+                    f"Optimizing conversation history ({current_tokens:,}/{max_tokens:,} tokens)...",
+                    emoji=config.thinking_emoji
+                )
+            
+            total_trimmed = 0
+            
+            # Keep trimming until we're under the limit
+            while current_tokens > max_tokens:
+                trimmed_count = self._smart_trim_with_summarization(thread_state)
+                total_trimmed += trimmed_count
+                
+                if trimmed_count == 0:
+                    # No more messages to trim
+                    self.log_warning(f"Cannot trim further during rebuild - still at {current_tokens} tokens")
+                    break
+                
+                # Recalculate tokens after trimming
+                current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+                self.log_debug(f"After trimming {trimmed_count} messages during rebuild, now at {current_tokens}/{max_tokens} tokens")
+            
+            if total_trimmed > 0:
+                self.log_info(f"Smart trim during rebuild complete: {total_trimmed} total messages processed, final: {current_tokens}/{max_tokens} tokens")
+                
+                # Update database with trimmed state
+                if self.db:
+                    thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+                    self.db.clear_thread_messages(thread_key)
+                    for msg in thread_state.messages:
+                        self.db.cache_message(
+                            thread_id=thread_key,
+                            role=msg.get("role"),
+                            content=msg.get("content"),
+                            metadata=msg.get("metadata"),
+                            message_ts=msg.get("metadata", {}).get("ts")
+                        )
+                    self.log_info(f"Updated database with {len(thread_state.messages)} trimmed messages")
+        
+        # Log final token count
+        final_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
         self.log_info("="*100)
-        self.log_info(f"THREAD STATE | Messages: {len(thread_state.messages)} | Tokens: {initial_tokens}/{self.thread_manager._max_tokens}")
+        self.log_info(f"THREAD STATE | Messages: {len(thread_state.messages)} | Tokens: {final_tokens}/{max_tokens}")
         self.log_info("="*100)
         
         return thread_state
@@ -1394,8 +2136,8 @@ class MessageProcessor(LoggerMixin):
     def _get_system_prompt(self, client: BaseClient, user_timezone: str = "UTC", 
                           user_tz_label: Optional[str] = None, user_real_name: Optional[str] = None,
                           user_email: Optional[str] = None, model: Optional[str] = None,
-                          web_search_enabled: bool = True) -> str:
-        """Get the appropriate system prompt based on the client platform with user's timezone, name, email, model, and web search capability"""
+                          web_search_enabled: bool = True, has_trimmed_messages: bool = False) -> str:
+        """Get the appropriate system prompt based on the client platform with user's timezone, name, email, model, web search capability, and trimming status"""
         client_name = client.name.lower()
         
         # Get base prompt for the platform
@@ -1470,7 +2212,12 @@ class MessageProcessor(LoggerMixin):
             settings_command = config.settings_slash_command if hasattr(config, 'settings_slash_command') else '/chatgpt-settings'
             web_search_context = f"\n\nWeb search is currently disabled. If a user asks for current information or recent events beyond your knowledge cutoff, provide what you know but mention that web search is disabled in their user settings. They can enable it using `{settings_command}`."
         
-        return base_prompt + time_context + user_context + model_context + web_search_context
+        # Add trimming notification if messages have been removed
+        trimming_context = ""
+        if has_trimmed_messages:
+            trimming_context = "\n\nNote: Some older messages have been removed from this conversation to manage context length."
+        
+        return base_prompt + time_context + user_context + model_context + web_search_context + trimming_context
     
     def _update_status(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], message: str, emoji: Optional[str] = None):
         """Update the thinking indicator with a status message"""
@@ -1535,14 +2282,21 @@ class MessageProcessor(LoggerMixin):
             # Simple text content - add as-is
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
             message_ts = message.metadata.get("ts") if message.metadata else None
-            self._add_message_with_token_management(thread_state, "user", user_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
+            
+            # Check if this content contains documents and add metadata
+            message_metadata = None
+            if isinstance(user_content, str) and "=== DOCUMENT:" in user_content:
+                # Don't mark as document_upload type - documents should be trimmable
+                message_metadata = {"contains_document": True}
+            
+            self._add_message_with_token_management(thread_state, "user", user_content, db=self.db, thread_key=thread_key, message_ts=message_ts, metadata=message_metadata)
             messages_for_api = thread_state.messages
         
         # Inject stored image analyses into the conversation for full context
         messages_for_api = self._inject_image_analyses(messages_for_api, thread_state)
         
         # Pre-trim messages to fit within context window
-        messages_for_api = self._pre_trim_messages_for_api(messages_for_api)
+        messages_for_api = self._pre_trim_messages_for_api(messages_for_api, model=thread_state.current_model)
         
         # Get thread config (with user preferences)
         thread_config = config.get_thread_config(
@@ -1560,7 +2314,7 @@ class MessageProcessor(LoggerMixin):
         # Pass the model for dynamic knowledge cutoff (respecting user prefs)
         web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
         model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
-        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled)
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, thread_state.has_trimmed_messages)
         
         # Update status before generating
         self._update_status(client, message.channel_id, thinking_id, "Generating response...")
@@ -1605,6 +2359,15 @@ class MessageProcessor(LoggerMixin):
         # Add assistant response to thread state
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
         self._add_message_with_token_management(thread_state, "assistant", response_text, db=self.db, thread_key=thread_key)
+        
+        # Schedule async cleanup after response
+        import threading
+        cleanup_thread = threading.Thread(
+            target=self._async_post_response_cleanup,
+            args=(thread_state, thread_key),
+            daemon=True
+        )
+        cleanup_thread.start()
         
         return Response(
             type="text",
@@ -1664,14 +2427,21 @@ class MessageProcessor(LoggerMixin):
             # Simple text content - add as-is
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
             message_ts = message.metadata.get("ts") if message.metadata else None
-            self._add_message_with_token_management(thread_state, "user", user_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
+            
+            # Check if this content contains documents and add metadata
+            message_metadata = None
+            if isinstance(user_content, str) and "=== DOCUMENT:" in user_content:
+                # Don't mark as document_upload type - documents should be trimmable
+                message_metadata = {"contains_document": True}
+            
+            self._add_message_with_token_management(thread_state, "user", user_content, db=self.db, thread_key=thread_key, message_ts=message_ts, metadata=message_metadata)
             messages_for_api = thread_state.messages
         
         # Inject stored image analyses into the conversation for full context
         messages_for_api = self._inject_image_analyses(messages_for_api, thread_state)
         
         # Pre-trim messages to fit within context window
-        messages_for_api = self._pre_trim_messages_for_api(messages_for_api)
+        messages_for_api = self._pre_trim_messages_for_api(messages_for_api, model=thread_state.current_model)
         
         # Get thread config (with user preferences)
         thread_config = config.get_thread_config(
@@ -1689,7 +2459,7 @@ class MessageProcessor(LoggerMixin):
         # Pass the model for dynamic knowledge cutoff (respecting user prefs)
         web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
         model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
-        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled)
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, thread_state.has_trimmed_messages)
         
         # Post an initial message to get the message ID for streaming updates
         # For streaming with potential tools, start with "Working on it" 
@@ -2010,6 +2780,15 @@ class MessageProcessor(LoggerMixin):
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
             self._add_message_with_token_management(thread_state, "assistant", response_text, db=self.db, thread_key=thread_key)
             
+            # Schedule async cleanup after response
+            import threading
+            cleanup_thread = threading.Thread(
+                target=self._async_post_response_cleanup,
+                args=(thread_state, thread_key),
+                daemon=True
+            )
+            cleanup_thread.start()
+            
             # Log streaming stats
             stats = rate_limiter.get_stats()
             buffer_stats = buffer.get_stats()
@@ -2104,7 +2883,7 @@ class MessageProcessor(LoggerMixin):
                 db=self.db
             )
             web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
-            system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"], web_search_enabled)
+            system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"], web_search_enabled, thread_state.has_trimmed_messages)
             
             # Use the user's question directly - it will be enhanced for natural conversation
             # If no text provided with image, let the model infer from full conversation context
@@ -2119,7 +2898,7 @@ class MessageProcessor(LoggerMixin):
             enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state)
             
             # Pre-trim messages to fit within context window
-            enhanced_messages = self._pre_trim_messages_for_api(enhanced_messages)
+            enhanced_messages = self._pre_trim_messages_for_api(enhanced_messages, model=thread_state.current_model)
             
             # Update status to show we're preparing the analysis
             self._update_status(client, channel_id, thinking_id, "Preparing analysis...", emoji=config.analyze_emoji)
@@ -2727,7 +3506,7 @@ class MessageProcessor(LoggerMixin):
                     enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state)
                     
                     # Pre-trim messages to fit within context window
-                    enhanced_messages = self._pre_trim_messages_for_api(enhanced_messages)
+                    enhanced_messages = self._pre_trim_messages_for_api(enhanced_messages, model=thread_state.current_model)
                     
                     # Check if streaming is supported for enhancement
                     streaming_enabled = thread_config.get('enable_streaming', config.enable_streaming)
@@ -3022,78 +3801,15 @@ class MessageProcessor(LoggerMixin):
         document_ledger = self.thread_manager.get_document_ledger(thread_state.thread_ts)
         has_documents = document_ledger and len(document_ledger.documents) > 0
         
-        # Build enhanced text with document content if available
-        enhanced_text = text
-        if has_documents:
-            self.log_info(f"Found {len(document_ledger.documents)} document(s) in thread history")
-            # Reconstruct document inputs from ledger
-            document_inputs = []
-            thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-            
-            # Try to retrieve documents from database if available
-            stored_documents = []
-            if self.db:
-                try:
-                    stored_documents = self.db.get_thread_documents(thread_key)
-                    self.log_debug(f"Retrieved {len(stored_documents)} document(s) from database")
-                except Exception as e:
-                    self.log_warning(f"Failed to retrieve documents from DB: {e}")
-            
-            # Build document list from DB or ledger
-            if stored_documents:
-                # Use database content (has full text)
-                for doc in stored_documents:
-                    # Ensure content is never None
-                    doc_content = doc.get("content")
-                    if doc_content is None or doc_content == "":
-                        doc_content = "[Document content not available]"
-                    document_inputs.append({
-                        "filename": doc.get("filename", "unknown"),
-                        "content": doc_content,
-                        "mimetype": doc.get("mime_type", "unknown"),
-                        "page_structure": doc.get("page_structure"),
-                        "total_pages": doc.get("total_pages")
-                    })
-            else:
-                # Fallback to ledger (might not have content if DB is used)
-                for doc in document_ledger.documents:
-                    # Ensure content is never None
-                    doc_content = doc.get("content")
-                    if doc_content is None or doc_content == "":
-                        # Try to get from DB if we have one
-                        if self.db and thread_key:
-                            try:
-                                db_docs = self.db.get_thread_documents(thread_key)
-                                matching_doc = next((d for d in db_docs if d.get("filename") == doc.get("filename")), None)
-                                if matching_doc:
-                                    doc_content = matching_doc.get("content")
-                            except Exception as e:
-                                self.log_debug(f"Could not retrieve document from DB: {e}")
-                        
-                        # Final fallback
-                        if doc_content is None or doc_content == "":
-                            doc_content = "[Document content not available]"
-                    
-                    document_inputs.append({
-                        "filename": doc.get("filename", "unknown"),
-                        "content": doc_content,
-                        "mimetype": doc.get("mime_type", "unknown"),
-                        "page_structure": doc.get("page_structure"),
-                        "total_pages": doc.get("total_pages")
-                    })
-            
-            enhanced_text = self._build_message_with_documents(text, document_inputs)
-            self.log_debug(f"Enhanced text with {len(document_inputs)} document(s) for vision follow-up")
-        
         if has_images or has_documents:
             # We have image/document context in the conversation - let the model use that
             self.log_info(f"Vision intent with {'image' if has_images else ''}{' and ' if has_images and has_documents else ''}{'document' if has_documents else ''} context in history - using text response with context")
         else:
             self.log_info("Vision intent but no images or documents found in conversation")
         
-        # Use enhanced text if we have documents, otherwise use original text
-        # The model will have context from the thread history
-        return self._handle_text_response(enhanced_text, thread_state, client, message, thinking_id)
+        # Don't attach documents to the message - they're already in the thread history
+        # The model will have access to them from the conversation context
+        return self._handle_text_response(text, thread_state, client, message, thinking_id)
     
     def _handle_image_edit(
         self,
@@ -3202,7 +3918,7 @@ class MessageProcessor(LoggerMixin):
         
         # Pre-trim messages to fit within context window if we have messages
         if enhanced_messages:
-            enhanced_messages = self._pre_trim_messages_for_api(enhanced_messages)
+            enhanced_messages = self._pre_trim_messages_for_api(enhanced_messages, model=thread_state.current_model)
         
         # Check if streaming is supported for enhancement
         response_metadata = {}

@@ -199,3 +199,4 @@ Directories:
 - Don't break existing bot code - if fixes are needed, consult user first
 - Always use absolute paths for file operations
 - Full context must be included in all API calls - no message limits
+- TEST FILES GO IN THE TESTS FOLDER, NOT THE WORKSPACE ROOT!
