@@ -25,7 +25,7 @@ class TestBotConfig:
         assert config.openai_api_key == 'sk-test-key'
         
         # Check model configuration
-        assert config.gpt_model == 'gpt-5-chat-latest'
+        assert config.gpt_model == 'gpt-5'
         assert config.default_reasoning_effort == 'medium'
         assert config.default_verbosity == '2'
     
@@ -82,7 +82,7 @@ class TestBotConfig:
         config = BotConfig()
         thread_config = config.get_thread_config()
         
-        assert thread_config["model"] == 'gpt-5-chat-latest'
+        assert thread_config["model"] == 'gpt-5'
         assert thread_config["temperature"] == 0.7
         assert thread_config["max_tokens"] == 4096
         assert thread_config["reasoning_effort"] == 'medium'
@@ -233,6 +233,95 @@ class TestBotConfig:
         except Exception as e:
             pytest.fail(f"Basic config loading failed: {e}")
     
+    def test_get_thread_config_with_user_preferences(self, mock_env):
+        """Test get_thread_config with user preferences from database"""
+        from unittest.mock import Mock
+        
+        config = BotConfig()
+        mock_db = Mock()
+        
+        # Mock user preferences from database
+        mock_db.get_user_preferences.return_value = {
+            'model': 'gpt-5-nano',
+            'reasoning_effort': 'maximal',
+            'verbosity': 'high',
+            'temperature': 0.5,
+            'top_p': 0.9,
+            'enable_web_search': 0,  # False in DB
+            'enable_streaming': 1,   # True in DB
+            'image_size': '512x512',
+            'input_fidelity': 'low',
+            'vision_detail': 'low'
+        }
+        
+        thread_config = config.get_thread_config(
+            overrides={},
+            db=mock_db,
+            user_id='U123'
+        )
+        
+        # Verify user preferences are applied
+        assert thread_config["model"] == 'gpt-5-nano'
+        assert thread_config["reasoning_effort"] == 'maximal'
+        assert thread_config["verbosity"] == 'high'
+        assert thread_config["temperature"] == 0.5
+        assert thread_config["top_p"] == 0.9
+        assert thread_config["enable_web_search"] is False
+        assert thread_config["enable_streaming"] is True
+        assert thread_config["slack_streaming"] is True
+        assert thread_config["image_size"] == '512x512'
+        assert thread_config["input_fidelity"] == 'low'
+        assert thread_config["detail_level"] == 'low'
+        
+        # Verify database was queried with correct user ID
+        mock_db.get_user_preferences.assert_called_once_with('U123')
+    
+    def test_get_thread_config_with_user_preferences_error(self, mock_env):
+        """Test get_thread_config handles database errors gracefully"""
+        from unittest.mock import Mock
+        
+        config = BotConfig()
+        mock_db = Mock()
+        
+        # Mock database error
+        mock_db.get_user_preferences.side_effect = Exception("Database error")
+        
+        # Should not raise, but use defaults
+        thread_config = config.get_thread_config(
+            overrides={},
+            db=mock_db,
+            user_id='U123'
+        )
+        
+        # Verify defaults are used
+        assert thread_config["model"] == 'gpt-5'
+        assert thread_config["reasoning_effort"] == 'medium'
+        assert thread_config["verbosity"] == '2'
+        
+    def test_get_thread_config_priority_order(self, mock_env):
+        """Test that override priority is: thread > user > system"""
+        from unittest.mock import Mock
+        
+        config = BotConfig()
+        mock_db = Mock()
+        
+        # Mock user preferences
+        mock_db.get_user_preferences.return_value = {
+            'model': 'gpt-5-nano',
+            'temperature': 0.5
+        }
+        
+        # Thread overrides should take precedence
+        thread_config = config.get_thread_config(
+            overrides={'model': 'gpt-5-mini', 'temperature': 0.3},
+            db=mock_db,
+            user_id='U123'
+        )
+        
+        assert thread_config["model"] == 'gpt-5-mini'  # Thread override wins
+        assert thread_config["temperature"] == 0.3  # Thread override wins
+        assert thread_config["reasoning_effort"] == 'medium'  # System default
+
     def test_diagnostic_config_values(self, mock_env):
         """Diagnostic test: Log all config values for debugging"""
         config = BotConfig()

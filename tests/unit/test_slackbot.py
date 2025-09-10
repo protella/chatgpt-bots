@@ -41,20 +41,22 @@ class TestSlackBotLauncher:
         # Verify bot was created
         mock_chatbot_class.assert_called_once_with(platform="slack")
     
-    @patch('slackbot.sys')
     @patch('slackbot.ChatBotV2')
-    def test_script_execution(self, mock_chatbot_class, mock_sys):
+    def test_script_execution(self, mock_chatbot_class):
         """Test script execution via __main__"""
-        # Mock sys.modules to simulate script execution
-        mock_sys.modules = {'__main__': Mock(__name__='__main__')}
+        # Setup mock bot
+        mock_instance = Mock()
+        mock_chatbot_class.return_value = mock_instance
         
-        # Import and check if main would be called
+        # Import the module
         import slackbot
         
-        # When imported as main module, it should create and run bot
-        if slackbot.__name__ == "__main__":
-            slackbot.main()
-            mock_chatbot_class.assert_called_with(platform="slack")
+        # Call main directly to test it
+        slackbot.main()
+        
+        # Verify bot was created and run
+        mock_chatbot_class.assert_called_with(platform="slack")
+        mock_instance.run.assert_called_once()
     
     def test_module_imports(self):
         """Test that slackbot module imports correctly"""

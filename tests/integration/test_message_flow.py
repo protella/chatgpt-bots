@@ -415,8 +415,8 @@ class TestEndToEndScenarios:
             
             assert len(thread1.messages) == 4  # 2 exchanges
             assert len(thread2.messages) == 2  # 1 exchange
-            assert thread1.messages[0]["content"] == "Hello from thread 1"
-            assert thread2.messages[0]["content"] == "Hello from thread 2"
+            assert thread1.messages[0]["content"] == "User: Hello from thread 1"
+            assert thread2.messages[0]["content"] == "User: Hello from thread 2"
 
 
 class TestRegressionScenarios:
