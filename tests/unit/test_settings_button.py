@@ -132,7 +132,7 @@ def test_settings_button_posted_for_new_thread(slack_client):
     
     # Check that it's a compact message for completed users
     assert "Quick Settings Access" in str(call_args)
-    assert "accessory" in str(call_args)  # Compact format uses accessory button
+    assert "actions" in str(call_args)  # Compact format uses actions block
 
 def test_welcome_message_for_new_users(slack_client):
     """Test that new users get full welcome message"""
