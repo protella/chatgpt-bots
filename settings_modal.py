@@ -21,7 +21,8 @@ class SettingsModal(LoggerMixin):
                             current_settings: Optional[Dict] = None,
                             is_new_user: bool = False,
                             thread_id: Optional[str] = None,
-                            in_thread: bool = False) -> Dict:
+                            in_thread: bool = False,
+                            scope: str = None) -> Dict:
         """
         Build the complete settings modal.
         
@@ -32,6 +33,7 @@ class SettingsModal(LoggerMixin):
             is_new_user: Whether this is a new user's first setup
             thread_id: Thread ID if opened from within a thread
             in_thread: Whether modal was opened from within a thread
+            scope: Selected scope ('thread' or 'global')
             
         Returns:
             Modal view dictionary for Slack API
@@ -47,8 +49,16 @@ class SettingsModal(LoggerMixin):
         # Determine which model is selected
         selected_model = current_settings.get('model', config.gpt_model)
         
+        # Determine default scope if not provided
+        if scope is None:
+            # New users should always default to global settings
+            if is_new_user:
+                scope = 'global'
+            else:
+                scope = 'thread' if in_thread else 'global'
+        
         # Build modal blocks
-        blocks = self._build_modal_blocks(current_settings, selected_model, is_new_user, in_thread)
+        blocks = self._build_modal_blocks(current_settings, selected_model, is_new_user, in_thread, scope)
         
         # Determine callback ID based on user status
         callback_id = "welcome_settings_modal" if is_new_user else "settings_modal"
@@ -68,12 +78,14 @@ class SettingsModal(LoggerMixin):
             "private_metadata": json.dumps({
                 "settings": current_settings,
                 "thread_id": thread_id,
-                "in_thread": in_thread
-            })  # Store settings and context
+                "in_thread": in_thread,
+                "scope": scope
+            })  # Store settings and context including selected scope
         }
     
     def _build_modal_blocks(self, settings: Dict, selected_model: str, 
-                           is_new_user: bool = False, in_thread: bool = False) -> List[Dict]:
+                           is_new_user: bool = False, in_thread: bool = False,
+                           scope: str = None) -> List[Dict]:
         """Build the modal blocks based on current settings and model selection
         
         Args:
@@ -81,8 +93,17 @@ class SettingsModal(LoggerMixin):
             selected_model: Currently selected model
             is_new_user: Whether this is a new user
             in_thread: Whether modal was opened from within a thread
+            scope: The selected scope ('thread' or 'global')
         """
         blocks = []
+        
+        # Determine default scope if not provided
+        if scope is None:
+            # New users should always default to global settings
+            if is_new_user:
+                scope = 'global'
+            else:
+                scope = 'thread' if in_thread else 'global'
         
         # Welcome message for new users
         if is_new_user:
@@ -96,35 +117,94 @@ class SettingsModal(LoggerMixin):
                 },
                 {"type": "divider"}
             ])
-        else:
-            # Determine header text based on scope
+        
+        # Add scope selector for existing users only (new users must configure global first)
+        scope_options = []
+        
+        # New users must configure global settings first
+        if is_new_user:
+            # For new users, don't show scope selector - they must configure global first
             if in_thread:
-                header_text = "Configure Settings for This Thread"
-            else:
-                header_text = "Configure Your Global Settings"
+                blocks.append({
+                    "type": "context",
+                    "elements": [{"type": "mrkdwn", "text": "📌 _Setting up your global preferences (applies to all conversations). You can customize thread-specific settings later._"}]
+                })
+                blocks.append({"type": "divider"})
+        else:
+            # Add thread option if in a thread
+            if in_thread:
+                scope_options.append({
+                    "text": {"type": "plain_text", "text": "💬 This Thread Only"},
+                    "value": "thread",
+                    "description": {"type": "plain_text", "text": "Settings apply only to this conversation"}
+                })
             
+            # Always add global option
+            scope_options.append({
+                "text": {"type": "plain_text", "text": "🌐 Global Settings"},
+                "value": "global",
+                "description": {"type": "plain_text", "text": "Settings apply to all conversations"}
+            })
+        
+        # Only add scope selector if there are multiple options
+        if len(scope_options) > 1:
+            self.log_debug(f"Building scope selector - in_thread: {in_thread}, scope: {scope}, options: {[o['value'] for o in scope_options]}")
+            
+            # Find the matching option for initial selection
+            initial_option = None
+            for option in scope_options:
+                if option['value'] == scope:
+                    initial_option = option
+                    break
+            
+            # If no match found, default to first option
+            if not initial_option:
+                self.log_warning(f"Scope '{scope}' not found in options, defaulting to first option")
+                initial_option = scope_options[0]
+            
+            self.log_debug(f"Selected initial_option value: {initial_option['value']}")
+            
+            blocks.append({
+                "type": "section",
+                "block_id": "scope_selector",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*Settings Scope*\nChoose where to save these settings:"
+                },
+                "accessory": {
+                    "type": "radio_buttons",
+                    "action_id": "settings_scope",
+                    "options": scope_options,
+                    "initial_option": initial_option
+                }
+            })
+            
+            blocks.append({"type": "divider"})
+            
+            # Add tip about accessing settings
+            blocks.append({
+                "type": "context",
+                "elements": [{
+                    "type": "mrkdwn",
+                    "text": f"💡 *Tip:* For global settings, type `{config.settings_slash_command}` in any channel/DM (not in a thread)"
+                }]
+            })
+        elif not is_new_user:
+            # Single scope available - show header indicating which one
+            header_text = "Configure Your Global Settings"
             blocks.append({
                 "type": "header",
                 "text": {"type": "plain_text", "text": header_text}
             })
             
-            # Add tip right after header for better visibility
+            # Add tip about accessing settings when only global is available
             blocks.append({
                 "type": "context",
-                "elements": [
-                    {
-                        "type": "mrkdwn",
-                        "text": (
-                            f"💡 *Tip:* For global settings, type:\n"
-                            f"`{config.settings_slash_command}` in the main channel/DM (not in a thread)"
-                            if in_thread else
-                            f"💡 *Tip:* You can change these settings anytime by typing:\n`{config.settings_slash_command}` in the main channel/DM (not in a thread)\n\n"
-                            f"For thread-specific settings:\n Hover over any bot message → Click ••• → Thread Settings"
-                        )
-                    }
-                ]
+                "elements": [{
+                    "type": "mrkdwn",
+                    "text": f"💡 *Tip:* You can change these settings anytime by typing:\n`{config.settings_slash_command}` in any channel/DM (not in a thread)"
+                }]
             })
-        
         # Model selection (always shown)
         blocks.append({
             "type": "section",

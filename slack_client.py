@@ -129,8 +129,19 @@ class SlackBot(BaseClient):
             in_thread = metadata.get('in_thread', False)
             pending_message = metadata.get('pending_message')  # Get any pending message to process
             
+            # Determine if this is a new user
+            is_new_user = view.get('callback_id') == 'welcome_settings_modal'
+            
+            # For new users, always save to global regardless of scope selection
+            if is_new_user:
+                selected_scope = 'global'
+                self.log_info(f"New user setup - forcing save to global settings")
+            else:
+                selected_scope = metadata.get('scope', 'thread' if in_thread else 'global')  # Get selected scope
+            
             # Debug logging
             self.log_debug(f"Modal submission metadata: {metadata}")
+            self.log_debug(f"Selected scope for save: {selected_scope} (is_new_user: {is_new_user})")
             if pending_message:
                 self.log_info(f"Found pending message in metadata: {pending_message}")
             
@@ -142,18 +153,20 @@ class SlackBot(BaseClient):
             
             # Check for model switch warning (GPT-5 -> GPT-4)
             model_switch_warning = ""
-            if in_thread and thread_id:
-                # Get current thread state to check existing model
-                thread_key = f"{thread_id.split(':')[0]}:{thread_id.split(':')[1]}" if ':' in thread_id else thread_id
-                thread_state = self.thread_manager.get_state(thread_key)
-                if thread_state and hasattr(thread_state, 'current_model'):
-                    old_model = thread_state.current_model
-                    new_model = validated_settings.get('model')
-                    
-                    # Check if switching from GPT-5 family to GPT-4 family
-                    if old_model and new_model:
-                        if old_model.startswith('gpt-5') and new_model.startswith('gpt-4'):
-                            model_switch_warning = "\n\n⚠️ **Important:** Switching to GPT-4 may require removing some older messages from long conversations due to its smaller context window (128k vs 400k tokens). Recent messages and important content like images will be preserved."
+            if selected_scope == 'thread' and thread_id:
+                # For thread settings, get the current thread config from DB to check for model switch
+                try:
+                    current_thread_config = self.db.get_thread_config(thread_id)
+                    if current_thread_config:
+                        old_model = current_thread_config.get('model')
+                        new_model = validated_settings.get('model')
+                        
+                        # Check if switching from GPT-5 family to GPT-4 family
+                        if old_model and new_model:
+                            if old_model.startswith('gpt-5') and new_model.startswith('gpt-4'):
+                                model_switch_warning = "\n\n⚠️ **Important:** Switching to GPT-4 may require removing some older messages from long conversations due to its smaller context window (128k vs 400k tokens). Recent messages and important content like images will be preserved."
+                except Exception as e:
+                    self.log_debug(f"Could not check for model switch: {e}")
             else:
                 # For global settings, check current default
                 old_model = self.db.get_user_preferences(user_id).get('model') if self.db else config.gpt_model
@@ -175,8 +188,8 @@ class SlackBot(BaseClient):
             # Combine warnings
             warning_message = warning_message + model_switch_warning
             
-            # Save to appropriate location based on modal context
-            if in_thread and thread_id:
+            # Save to appropriate location based on selected scope
+            if selected_scope == 'thread' and thread_id:
                 # Save as thread config (don't include settings_completed flag for thread configs)
                 thread_settings = {k: v for k, v in validated_settings.items() if k != 'settings_completed'}
                 # Ensure thread exists
@@ -184,16 +197,8 @@ class SlackBot(BaseClient):
                 self.db.get_or_create_thread(thread_id, channel_id)
                 self.db.save_thread_config(thread_id, thread_settings)
                 
-                # Update in-memory thread state if it exists
-                # The processor with thread_manager will be set later by main.py
-                if hasattr(self, 'processor') and self.processor and hasattr(self.processor, 'thread_manager'):
-                    thread_state = self.processor.thread_manager.get_thread_if_exists(thread_id)
-                    if thread_state:
-                        thread_state.config_overrides = thread_settings
-                        self.log_debug(f"Updated in-memory thread config for {thread_id}")
-                else:
-                    # If we can't update in-memory, it will be loaded from DB next time
-                    self.log_debug(f"Could not update in-memory thread config for {thread_id} - will be loaded from DB on next message")
+                # The thread state will be loaded from DB on next message
+                self.log_debug(f"Thread config saved to DB for {thread_id} - will be loaded on next message")
                 
                 success = True
                 save_location = "thread"
@@ -214,18 +219,44 @@ class SlackBot(BaseClient):
                     
                     # Determine message based on save location
                     if save_location == "thread" and thread_id:
-                        # Send confirmation in the thread
+                        # Send ephemeral confirmation in the thread
                         channel_id, thread_ts = thread_id.split(':')
-                        client.chat_postMessage(
+                        client.chat_postEphemeral(
                             channel=channel_id,
                             thread_ts=thread_ts,
+                            user=user_id,
                             text=f"✅ Thread settings updated successfully!{warning_message}\n_These settings will only apply to this conversation thread._"
                         )
                     else:
-                        # Send DM for global settings
+                        # Send DM for global settings with settings button
+                        blocks = [
+                            {
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": f"✅ Your global settings have been saved successfully!{warning_message}"
+                                }
+                            },
+                            {
+                                "type": "actions",
+                                "elements": [
+                                    {
+                                        "type": "button",
+                                        "text": {
+                                            "type": "plain_text",
+                                            "text": "Open Settings"
+                                        },
+                                        "style": "primary",
+                                        "action_id": "open_global_settings_dm"
+                                    }
+                                ]
+                            }
+                        ]
+                        
                         client.chat_postMessage(
                             channel=user_id,  # Send to user's DM
-                            text=f"✅ Your global settings have been saved successfully!{warning_message}"
+                            text=f"✅ Your global settings have been saved successfully!{warning_message}",
+                            blocks=blocks
                         )
                 except SlackApiError as e:
                     self.log_error(f"Error sending confirmation: {e}")
@@ -367,7 +398,8 @@ class SlackBot(BaseClient):
                         stored_settings = metadata['settings']
                         metadata_context = {
                             'thread_id': metadata.get('thread_id'),
-                            'in_thread': metadata.get('in_thread', False)
+                            'in_thread': metadata.get('in_thread', False),
+                            'scope': metadata.get('scope')  # Extract scope
                         }
                     else:
                         # Old format - just settings
@@ -404,7 +436,8 @@ class SlackBot(BaseClient):
                 current_settings=merged_settings,
                 is_new_user=is_new_user,
                 thread_id=metadata_context.get('thread_id'),
-                in_thread=metadata_context.get('in_thread', False)
+                in_thread=metadata_context.get('in_thread', False),
+                scope=metadata_context.get('scope')  # Preserve selected scope
             )
             
             # Update the modal view
@@ -441,7 +474,8 @@ class SlackBot(BaseClient):
                         stored_settings = metadata['settings']
                         metadata_context = {
                             'thread_id': metadata.get('thread_id'),
-                            'in_thread': metadata.get('in_thread', False)
+                            'in_thread': metadata.get('in_thread', False),
+                            'scope': metadata.get('scope')  # Extract scope
                         }
                     else:
                         stored_settings = metadata
@@ -506,14 +540,16 @@ class SlackBot(BaseClient):
                 current_settings=merged_settings,
                 is_new_user=is_new_user,
                 thread_id=metadata_context.get('thread_id'),
-                in_thread=metadata_context.get('in_thread', False)
+                in_thread=metadata_context.get('in_thread', False),
+                scope=metadata_context.get('scope')  # Preserve selected scope
             )
             
             # Update private metadata
             updated_modal["private_metadata"] = json.dumps({
                 "settings": merged_settings,
                 "thread_id": metadata_context.get('thread_id'),
-                "in_thread": metadata_context.get('in_thread', False)
+                "in_thread": metadata_context.get('in_thread', False),
+                "scope": metadata_context.get('scope')  # Preserve selected scope
             })
             
             # Validate the modal before sending (debug)
@@ -540,7 +576,8 @@ class SlackBot(BaseClient):
                     updated_modal["private_metadata"] = json.dumps({
                         "settings": {**merged_settings, 'reasoning_effort': 'low'},  # Force low
                         "thread_id": metadata_context.get('thread_id'),
-                        "in_thread": metadata_context.get('in_thread', False)
+                        "in_thread": metadata_context.get('in_thread', False),
+                        "scope": metadata_context.get('scope')  # Preserve selected scope
                     })
                 
                 response = client.views_update(
@@ -555,6 +592,64 @@ class SlackBot(BaseClient):
             except SlackApiError as e:
                 self.log_error(f"Error updating modal for features change: {e}")
         
+        # Register handler for settings scope toggle
+        @self.app.action("settings_scope")
+        def handle_scope_change(ack, body, client):
+            """Handle scope toggle between thread and global settings"""
+            ack()
+            
+            user_id = body['user']['id']
+            selected_scope = body['actions'][0]['selected_option']['value']
+            
+            self.log_info(f"Settings scope changed to {selected_scope} for user {user_id}")
+            
+            # Get current metadata context
+            metadata_context = {}
+            stored_settings = {}
+            try:
+                private_metadata = body.get('view', {}).get('private_metadata')
+                if private_metadata:
+                    metadata = json.loads(private_metadata)
+                    if isinstance(metadata, dict):
+                        stored_settings = metadata.get('settings', {})
+                        metadata_context = {
+                            'thread_id': metadata.get('thread_id'),
+                            'in_thread': metadata.get('in_thread', False),
+                            'scope': selected_scope  # Update the scope
+                        }
+            except:
+                pass
+            
+            # Extract current form values to preserve user's changes
+            current_values = self.settings_modal.extract_form_values(body['view']['state'])
+            
+            # Merge settings
+            merged_settings = stored_settings.copy() if stored_settings else {}
+            merged_settings.update(current_values)
+            
+            # Rebuild modal with new scope
+            is_new_user = body['view']['callback_id'] == 'welcome_settings_modal'
+            updated_modal = self.settings_modal.build_settings_modal(
+                user_id=user_id,
+                trigger_id=None,
+                current_settings=merged_settings,
+                is_new_user=is_new_user,
+                thread_id=metadata_context.get('thread_id'),
+                in_thread=metadata_context.get('in_thread', False),
+                scope=selected_scope  # Pass the new scope
+            )
+            
+            # Update the modal
+            try:
+                response = client.views_update(
+                    view_id=body['view']['id'],
+                    view=updated_modal
+                )
+                if response.get('ok'):
+                    self.log_debug(f"Modal updated for scope change to: {selected_scope}")
+            except SlackApiError as e:
+                self.log_error(f"Error updating modal for scope change: {e}")
+        
         # Register action handlers for other interactive components (just acknowledge)
         @self.app.action("reasoning_level")
         @self.app.action("reasoning_level_no_minimal")  # Alternative action_id when minimal is hidden
@@ -565,6 +660,45 @@ class SlackBot(BaseClient):
         def handle_modal_actions(ack):
             """Acknowledge modal actions that don't need processing"""
             ack()  # Just acknowledge - values are captured on submission
+        
+        # Handler for global settings button in DM
+        @self.app.action("open_global_settings_dm")
+        def handle_open_global_settings_dm(ack, body, client):
+            """Handle button click to open global settings from DM"""
+            ack()
+            
+            user_id = body['user']['id']
+            trigger_id = body['trigger_id']
+            
+            # Get user preferences
+            user_prefs = self.db.get_user_preferences(user_id)
+            if not user_prefs:
+                user_data = self.db.get_or_create_user(user_id)
+                email = user_data.get('email') if user_data else None
+                user_prefs = self.db.create_default_user_preferences(user_id, email)
+            
+            # Open the settings modal for global settings
+            try:
+                modal = self.settings_modal.build_settings_modal(
+                    user_id=user_id,
+                    trigger_id=trigger_id,
+                    current_settings=user_prefs,
+                    is_new_user=False,  # Not a new user if they're clicking this
+                    thread_id=None,
+                    in_thread=False,  # Always global from DM button
+                    scope='global'
+                )
+                
+                response = client.views_open(
+                    trigger_id=trigger_id,
+                    view=modal
+                )
+                
+                if response.get('ok'):
+                    self.log_info(f"Global settings modal opened from DM for user {user_id}")
+                    
+            except SlackApiError as e:
+                self.log_error(f"Error opening global settings modal from DM: {e}")
         
         # Handler for welcome settings button
         @self.app.action("open_welcome_settings")
@@ -587,21 +721,55 @@ class SlackBot(BaseClient):
             email = user_data.get('email') if user_data else None
             user_prefs = self.db.get_user_preferences(user_id)
             
-            # Track if this is a new user before creating defaults
-            is_new_user = (user_prefs is None)
-            
             if not user_prefs:
                 # Create default preferences if they don't exist
                 user_prefs = self.db.create_default_user_preferences(user_id, email)
             
+            # Track if this is a new user based on settings_completed flag
+            is_new_user = not user_prefs.get('settings_completed', False)
+            
             # Open the settings modal
             try:
+                # Determine if we're in a thread based on the button context
+                thread_id = original_context.get('thread_id')
+                channel_id = original_context.get('channel_id')
+                
+                # Check if this is actually a thread (not just a main channel message)
+                in_thread = False
+                if thread_id and channel_id:
+                    # In channels, if thread_id exists and is different from the channel, it's a thread
+                    # In DMs, every message has a thread_id, so we always consider it a thread context
+                    is_dm = channel_id.startswith('D')
+                    in_thread = is_dm or (thread_id != channel_id)
+                    
+                    # Format thread_id properly if in thread
+                    if in_thread and ':' not in thread_id:
+                        thread_id = f"{channel_id}:{thread_id}"
+                
+                self.log_debug(f"Opening modal from button - thread_id: {thread_id}, channel_id: {channel_id}, in_thread: {in_thread}")
+                
+                # If we're in a thread, check for thread-specific settings
+                thread_settings = None
+                if in_thread and thread_id:
+                    thread_config = self.db.get_thread_config(thread_id)
+                    if thread_config:
+                        # Merge thread config with user prefs (thread overrides)
+                        thread_settings = user_prefs.copy()
+                        thread_settings.update(thread_config)
+                        self.log_debug(f"Loaded thread config for {thread_id}: {thread_config}")
+                    else:
+                        self.log_debug(f"No thread config found for {thread_id}, using user prefs")
+                
+                # Use thread settings if available when in thread, otherwise user prefs
+                current_settings = thread_settings if thread_settings else user_prefs
                 
                 modal = self.settings_modal.build_settings_modal(
                     user_id=user_id,
                     trigger_id=trigger_id,
-                    current_settings=user_prefs,
-                    is_new_user=is_new_user
+                    current_settings=current_settings,
+                    is_new_user=is_new_user,
+                    thread_id=thread_id if in_thread else None,
+                    in_thread=in_thread
                 )
                 
                 # Add the original message context to the modal's private_metadata
@@ -1035,37 +1203,71 @@ class SlackBot(BaseClient):
             self.log_info(f"New thread check result: is_new_thread={is_new_thread}")
             
             if is_new_thread:
-                # For existing users, always show the compact settings button
-                # (This method is only called for users with preferences)
-                blocks = [
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": "⚙️ *Quick Settings Access*"
-                        }
-                    },
-                    {
-                        "type": "actions",
-                        "elements": [
-                            {
-                                "type": "button",
-                                "text": {
-                                    "type": "plain_text",
-                                    "text": "Settings"
-                                },
-                                "style": "primary",
-                                "action_id": "open_welcome_settings",
-                                "value": json.dumps({
-                                    "original_message": message.text,
-                                    "channel_id": message.channel_id,
-                                    "thread_id": message.thread_id,
-                                    "attachments": message.attachments
-                                })
+                # Check if this is a new user who hasn't completed settings
+                is_new_user = not user_prefs.get('settings_completed', False)
+                
+                if is_new_user:
+                    # Full welcome message for new users
+                    blocks = [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "*Welcome to the AI Assistant!* :wave:\n\nI need you to configure your preferences before we can start. You can accept the defaults or customize them."
                             }
-                        ]
-                    }
-                ]
+                        },
+                        {
+                            "type": "actions",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "text": {
+                                        "type": "plain_text",
+                                        "text": "Configure Settings"
+                                    },
+                                    "style": "primary",
+                                    "action_id": "open_welcome_settings",
+                                    "value": json.dumps({
+                                        "original_message": message.text,
+                                        "channel_id": message.channel_id,
+                                        "thread_id": message.thread_id,
+                                        "attachments": message.attachments
+                                    })
+                                }
+                            ]
+                        }
+                    ]
+                else:
+                    # Compact settings button for existing users
+                    blocks = [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "⚙️ *Quick Settings Access*"
+                            }
+                        },
+                        {
+                            "type": "actions",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "text": {
+                                        "type": "plain_text",
+                                        "text": "Settings"
+                                    },
+                                    "style": "primary",
+                                    "action_id": "open_welcome_settings",
+                                    "value": json.dumps({
+                                        "original_message": message.text,
+                                        "channel_id": message.channel_id,
+                                        "thread_id": message.thread_id,
+                                        "attachments": message.attachments
+                                    })
+                                }
+                            ]
+                        }
+                    ]
                 
                 # Post the settings button as the first message in the thread
                 client.chat_postMessage(
