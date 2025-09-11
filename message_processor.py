@@ -1199,26 +1199,29 @@ MIME Type: {mimetype}
                             break
         
         if should_rebuild:
-            self.log_info(f"Rebuilding thread state for {message.thread_id}")
+            self.log_info(f"Checking thread history for {message.thread_id}")
             
-            # Update status to show we're rebuilding
-            if thinking_id:
-                self._update_status(
-                    client, 
-                    message.channel_id, 
-                    thinking_id,
-                    "Rebuilding thread history from Slack...",
-                    emoji=config.circle_loader_emoji
-                )
-            
-            # Get history from platform
+            # Get history from platform first to see if there's anything to rebuild
             history = client.get_thread_history(
                 message.channel_id,
                 message.thread_id
             )
             
-            # Get current message timestamp to exclude it
+            # Only show rebuilding status if there's actual history (excluding current message)
             current_ts = message.metadata.get("ts")
+            has_history = any(msg.metadata.get("ts") != current_ts for msg in history)
+            
+            if has_history:
+                # Update status to show we're rebuilding
+                if thinking_id:
+                    self._update_status(
+                        client, 
+                        message.channel_id, 
+                        thinking_id,
+                        "Rebuilding thread history from Slack...",
+                        emoji=config.circle_loader_emoji
+                    )
+                self.log_info(f"Rebuilding thread state for {message.thread_id} with {len(history)} messages")
             
             # Track pending image URLs for vision analysis association
             pending_image_urls = []
