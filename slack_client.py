@@ -716,6 +716,54 @@ class SlackBot(BaseClient):
             except:
                 original_context = {}
             
+            # Check if this was a truncated message that needs to be fetched
+            if original_context.get('truncated'):
+                # Fetch the original message from Slack using the timestamp
+                channel_id = original_context.get('channel_id')
+                ts = original_context.get('ts')
+                self.log_info(f"Fetching truncated message from Slack: channel={channel_id}, ts={ts}")
+                
+                try:
+                    # Get the original message from Slack
+                    result = client.conversations_history(
+                        channel=channel_id,
+                        latest=ts,
+                        oldest=ts,
+                        inclusive=True,
+                        limit=1
+                    )
+                    
+                    if result.get('ok') and result.get('messages'):
+                        msg = result['messages'][0]
+                        # Reconstruct the full context from the fetched message
+                        original_context = {
+                            "original_message": msg.get('text', ''),
+                            "channel_id": channel_id,
+                            "thread_id": original_context.get('thread_id'),
+                            "attachments": []  # We'll process files if they exist
+                        }
+                        
+                        # Process any file attachments
+                        files = msg.get('files', [])
+                        for file in files:
+                            mimetype = file.get("mimetype", "")
+                            file_type = "image" if mimetype.startswith("image/") else "file"
+                            original_context['attachments'].append({
+                                "type": file_type,
+                                "url": file.get("url_private"),
+                                "id": file.get("id"),
+                                "name": file.get("name"),
+                                "mimetype": mimetype
+                            })
+                        
+                        self.log_info(f"Successfully fetched truncated message with {len(original_context['attachments'])} attachments")
+                    else:
+                        self.log_warning(f"Could not fetch truncated message: {result.get('error', 'Unknown error')}")
+                        # Keep the truncated context as-is
+                except Exception as e:
+                    self.log_error(f"Error fetching truncated message: {e}")
+                    # Keep the truncated context as-is
+            
             # Get or create user preferences
             user_data = self.db.get_or_create_user(user_id)
             email = user_data.get('email') if user_data else None
@@ -1071,14 +1119,32 @@ class SlackBot(BaseClient):
             elif is_first_message:
                 # No trigger_id available, first message - send interactive message with button
                 try:
-                    # Store the complete message details including attachments in the button value
-                    button_value = json.dumps({
+                    # Prepare button value with size check
+                    full_context = {
                         "original_message": message.text,
                         "channel_id": message.channel_id,
                         "thread_id": message.thread_id,
                         "attachments": message.attachments,  # Include file attachments
                         "ts": event.get("ts")  # Include timestamp for proper threading
-                    })
+                    }
+                    
+                    # Check if button value would exceed Slack's 2000 char limit (with buffer)
+                    full_value = json.dumps(full_context)
+                    if len(full_value) > 1900:  # Leave 100 char buffer
+                        # Fallback: only store reference data
+                        button_value = json.dumps({
+                            "channel_id": message.channel_id,
+                            "thread_id": message.thread_id,
+                            "ts": event.get("ts"),  # Add timestamp to fetch message later
+                            "has_attachments": bool(message.attachments),
+                            "attachment_count": len(message.attachments),
+                            "truncated": True
+                        })
+                        truncated = True
+                        self.log_info(f"Welcome button value too large ({len(full_value)} chars), using truncated version")
+                    else:
+                        button_value = full_value
+                        truncated = False
                     
                     # Check if we're in a channel/thread vs DM
                     is_dm = message.channel_id.startswith('D')
@@ -1101,34 +1167,40 @@ class SlackBot(BaseClient):
                     
                     # Send welcome button on first interaction
                     # On subsequent messages, the ephemeral will be sent from the outer check
-                    response = client.chat_postMessage(
-                            channel=target_channel,
-                            thread_ts=target_thread,
-                            text="👋 Welcome! Please configure your settings to get started.",
-                            blocks=[
-                            {
-                                "type": "section",
-                                "text": {
-                                    "type": "mrkdwn",
-                                    "text": "👋 *Welcome to the AI Assistant!*\n\nI need you to configure your preferences before we begin. Click the button below to open your settings:"
-                                }
-                            },
-                            {
-                                "type": "actions",
-                                "elements": [
-                                    {
-                                        "type": "button",
-                                        "text": {
-                                            "type": "plain_text",
-                                            "text": "⚙️ Configure Settings"
-                                        },
-                                        "style": "primary",
-                                        "action_id": "open_welcome_settings",
-                                        "value": button_value
-                                    }
-                                ]
+                    
+                    # Build blocks for welcome message
+                    blocks = [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "👋 *Welcome to the AI Assistant!*\n\nI need you to configure your preferences before we begin. Click the button below to open your settings:"
                             }
-                        ]
+                        },
+                        {
+                            "type": "actions",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "text": {
+                                        "type": "plain_text",
+                                        "text": "⚙️ Configure Settings"
+                                    },
+                                    "style": "primary",
+                                    "action_id": "open_welcome_settings",
+                                    "value": button_value
+                                }
+                            ]
+                        }
+                    ]
+                    
+                    # No need to warn user - we handle truncation transparently
+                    
+                    response = client.chat_postMessage(
+                        channel=target_channel,
+                        thread_ts=target_thread,
+                        text="👋 Welcome! Please configure your settings to get started.",
+                        blocks=blocks
                     )
                     
                     # Track welcome message for updating after settings saved
@@ -1207,6 +1279,33 @@ class SlackBot(BaseClient):
                 is_new_user = not user_prefs.get('settings_completed', False)
                 
                 if is_new_user:
+                    # New user - need to store message for later processing
+                    # Prepare button value with size check
+                    full_context = {
+                        "original_message": message.text,
+                        "channel_id": message.channel_id,
+                        "thread_id": message.thread_id,
+                        "attachments": message.attachments
+                    }
+                    
+                    # Check if button value would exceed Slack's 2000 char limit (with buffer)
+                    full_value = json.dumps(full_context)
+                    if len(full_value) > 1900:  # Leave 100 char buffer
+                        # Fallback: only store reference data
+                        button_value = json.dumps({
+                            "channel_id": message.channel_id,
+                            "thread_id": message.thread_id,
+                            "ts": message.metadata.get('ts'),  # Add timestamp to fetch message later
+                            "has_attachments": bool(message.attachments),
+                            "attachment_count": len(message.attachments),
+                            "truncated": True
+                        })
+                        truncated = True
+                        self.log_info(f"Button value too large ({len(full_value)} chars), using truncated version")
+                    else:
+                        button_value = full_value
+                        truncated = False
+                    
                     # Full welcome message for new users
                     blocks = [
                         {
@@ -1227,17 +1326,21 @@ class SlackBot(BaseClient):
                                     },
                                     "style": "primary",
                                     "action_id": "open_welcome_settings",
-                                    "value": json.dumps({
-                                        "original_message": message.text,
-                                        "channel_id": message.channel_id,
-                                        "thread_id": message.thread_id,
-                                        "attachments": message.attachments
-                                    })
+                                    "value": button_value
                                 }
                             ]
                         }
                     ]
+                    
+                    # No need to warn user - we handle truncation transparently
                 else:
+                    # Existing user - message is already being processed, just provide settings access
+                    # Only store minimal context needed for settings modal
+                    button_value = json.dumps({
+                        "channel_id": message.channel_id,
+                        "thread_id": message.thread_id
+                    })
+                    
                     # Compact settings button for existing users
                     blocks = [
                         {
@@ -1258,12 +1361,7 @@ class SlackBot(BaseClient):
                                     },
                                     "style": "primary",
                                     "action_id": "open_welcome_settings",
-                                    "value": json.dumps({
-                                        "original_message": message.text,
-                                        "channel_id": message.channel_id,
-                                        "thread_id": message.thread_id,
-                                        "attachments": message.attachments
-                                    })
+                                    "value": button_value
                                 }
                             ]
                         }
@@ -1481,6 +1579,9 @@ class SlackBot(BaseClient):
                         continue
                     # Skip busy/processing messages
                     if ":warning:" in text and "currently processing" in text:
+                        continue
+                    # Skip settings button messages
+                    if text == "Settings available":
                         continue
                     
                     # Determine role
