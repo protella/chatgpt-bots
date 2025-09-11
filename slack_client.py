@@ -45,12 +45,14 @@ class SlackBot(BaseClient):
         
         @self.app.event("app_mention")
         def handle_app_mention(event, say, client):
+            self.log_debug(f"App mention event: channel={event.get('channel')}, ts={event.get('ts')}")
             self._handle_slack_message(event, client)
         
         @self.app.event("message")
         def handle_message(event, say, client):
             # Only process DMs and non-bot messages
             if event.get("channel_type") == "im" and not event.get("bot_id"):
+                self.log_debug(f"DM message event: channel={event.get('channel')}, ts={event.get('ts')}")
                 self._handle_slack_message(event, client)
         
         # Register slash command handler
@@ -227,6 +229,66 @@ class SlackBot(BaseClient):
                         )
                 except SlackApiError as e:
                     self.log_error(f"Error sending confirmation: {e}")
+                
+                # Clean up reminder messages
+                if hasattr(self, '_reminder_messages') and user_id in self._reminder_messages:
+                    for msg_info in self._reminder_messages[user_id]:
+                        try:
+                            client.chat_delete(
+                                channel=msg_info['channel'],
+                                ts=msg_info['ts']
+                            )
+                        except:
+                            pass  # Best effort
+                    del self._reminder_messages[user_id]
+                    self.log_debug(f"Cleaned up reminder messages for user {user_id}")
+                
+                # Update welcome message to compact settings button
+                if hasattr(self, '_welcome_messages') and user_id in self._welcome_messages:
+                    welcome_info = self._welcome_messages[user_id]
+                    try:
+                        # Update to compact settings button
+                        client.chat_update(
+                            channel=welcome_info['channel'],
+                            ts=welcome_info['ts'],
+                            text="Settings available",
+                            blocks=[
+                                {
+                                    "type": "section",
+                                    "text": {
+                                        "type": "mrkdwn",
+                                        "text": "⚙️ *Quick Settings Access*"
+                                    }
+                                },
+                                {
+                                    "type": "actions",
+                                    "elements": [
+                                        {
+                                            "type": "button",
+                                            "text": {
+                                                "type": "plain_text",
+                                                "text": "Settings"
+                                            },
+                                            "style": "primary",
+                                            "action_id": "open_welcome_settings",
+                                            "value": json.dumps({
+                                                "channel_id": welcome_info['channel'],
+                                                "thread_id": welcome_info['thread_ts']
+                                            })
+                                        }
+                                    ]
+                                }
+                            ]
+                        )
+                        self.log_debug(f"Updated welcome message to compact settings button for user {user_id}")
+                    except:
+                        pass  # Best effort
+                    del self._welcome_messages[user_id]
+                
+                # Remove from welcomed users set once they've configured settings
+                # This ensures they won't get welcome messages anymore
+                if hasattr(self, '_welcomed_users') and user_id in self._welcomed_users:
+                    self._welcomed_users.remove(user_id)
                     
                 # Process pending message if this was from welcome flow (only for global settings)
                 if save_location == "global" and pending_message and pending_message.get('original_message'):
@@ -525,17 +587,21 @@ class SlackBot(BaseClient):
             email = user_data.get('email') if user_data else None
             user_prefs = self.db.get_user_preferences(user_id)
             
+            # Track if this is a new user before creating defaults
+            is_new_user = (user_prefs is None)
+            
             if not user_prefs:
                 # Create default preferences if they don't exist
                 user_prefs = self.db.create_default_user_preferences(user_id, email)
             
-            # Open the welcome modal
+            # Open the settings modal
             try:
+                
                 modal = self.settings_modal.build_settings_modal(
                     user_id=user_id,
                     trigger_id=trigger_id,
                     current_settings=user_prefs,
-                    is_new_user=True
+                    is_new_user=is_new_user
                 )
                 
                 # Add the original message context to the modal's private_metadata
@@ -551,14 +617,8 @@ class SlackBot(BaseClient):
                 if response.get('ok'):
                     self.log_info(f"Welcome modal opened via button for user {user_id}")
                     
-                    # Delete the button message
-                    try:
-                        client.chat_delete(
-                            channel=body['channel']['id'],
-                            ts=body['message']['ts']
-                        )
-                    except:
-                        pass  # If we can't delete, that's okay
+                    # Keep the button message for future access
+                    # (removed deletion to allow persistent settings access)
                         
             except SlackApiError as e:
                 self.log_error(f"Error opening welcome modal via button: {e}")
@@ -784,10 +844,29 @@ class SlackBot(BaseClient):
         user_prefs = self.db.get_user_preferences(user_id)
         
         if not user_prefs:
-            # New user detected - check if we have a trigger_id for modal
+            # Create default preferences for new user
+            user_data = self.db.get_or_create_user(user_id)
+            email = user_data.get('email') if user_data else None
+            user_prefs = self.db.create_default_user_preferences(user_id, email)
+            self.log_info(f"Created default preferences for new user {user_id}")
+        
+        # Check if user has completed settings
+        if not user_prefs.get('settings_completed', False):
+            # User hasn't completed settings - check if we've already sent welcome
+            if not hasattr(self, '_welcomed_users'):
+                self._welcomed_users = set()
+            
+            # Check if this is their first message this session
+            is_first_message = user_id not in self._welcomed_users
+            
+            if is_first_message:
+                # Mark as welcomed and send welcome button
+                self._welcomed_users.add(user_id)
+                
+            # Check if we have a trigger_id for modal
             trigger_id = event.get('trigger_id')
             
-            if trigger_id:
+            if trigger_id and is_first_message:
                 # Create default preferences
                 user_data = self.db.get_or_create_user(user_id)
                 email = user_data.get('email') if user_data else None
@@ -821,8 +900,8 @@ class SlackBot(BaseClient):
                 except SlackApiError as e:
                     self.log_error(f"Error opening welcome modal for new user: {e}")
                     # Continue with processing using defaults
-            else:
-                # No trigger_id available, send interactive message with button
+            elif is_first_message:
+                # No trigger_id available, first message - send interactive message with button
                 try:
                     # Store the complete message details including attachments in the button value
                     button_value = json.dumps({
@@ -852,12 +931,13 @@ class SlackBot(BaseClient):
                             text="👋 Welcome! I've sent you a direct message to configure your settings."
                         )
                     
-                    # Send the settings button (either in DM or in the same DM conversation)
-                    client.chat_postMessage(
-                        channel=target_channel,
-                        thread_ts=target_thread,
-                        text="👋 Welcome! Please configure your settings to get started.",
-                        blocks=[
+                    # Send welcome button on first interaction
+                    # On subsequent messages, the ephemeral will be sent from the outer check
+                    response = client.chat_postMessage(
+                            channel=target_channel,
+                            thread_ts=target_thread,
+                            text="👋 Welcome! Please configure your settings to get started.",
+                            blocks=[
                             {
                                 "type": "section",
                                 "text": {
@@ -882,13 +962,122 @@ class SlackBot(BaseClient):
                             }
                         ]
                     )
+                    
+                    # Track welcome message for updating after settings saved
+                    if response.get('ok'):
+                        if not hasattr(self, '_welcome_messages'):
+                            self._welcome_messages = {}
+                        self._welcome_messages[user_id] = {
+                            'channel': target_channel,
+                            'ts': response.get('ts'),
+                            'thread_ts': target_thread
+                        }
+                    
                     return  # Don't process until settings are configured
                 except SlackApiError as e:
                     self.log_error(f"Error sending welcome message: {e}")
+            else:
+                # Not first message - send regular reminder that we can delete later
+                try:
+                    response = client.chat_postMessage(
+                        channel=message.channel_id,
+                        thread_ts=message.thread_id,
+                        text="⚠️ Please configure your settings before I can help you. Click the *Configure Settings* button above to get started."
+                    )
+                    # Track reminder message for cleanup
+                    if response.get('ok'):
+                        if not hasattr(self, '_reminder_messages'):
+                            self._reminder_messages = {}
+                        if user_id not in self._reminder_messages:
+                            self._reminder_messages[user_id] = []
+                        self._reminder_messages[user_id].append({
+                            'channel': message.channel_id,
+                            'ts': response.get('ts')
+                        })
+                except Exception as e:
+                    self.log_debug(f"Could not send reminder: {e}")
+                return  # Don't process until settings are configured
+        else:
+            # Existing user with preferences - check if this is a new thread that needs a settings button
+            self._post_settings_button_if_new_thread(message, client, user_prefs)
         
         # Call the message handler if set
         if self.message_handler:
             self.message_handler(message, self)
+    
+    def _post_settings_button_if_new_thread(self, message: Message, client, user_prefs: dict):
+        """Post a settings button at the start of a new thread"""
+        try:
+            # Check if this is the start of a new thread
+            # For channels: thread_id != ts means it's a reply in a thread
+            # For DMs: we want to check if there's any history
+            
+            is_dm = message.channel_id.startswith('D')
+            self.log_debug(f"Checking for new thread: is_dm={is_dm}, channel={message.channel_id}, thread={message.thread_id}")
+            
+            # Get thread history to check if this is a new conversation
+            if is_dm:
+                # In DMs, every message is technically a new "thread" (unique timestamp)
+                # Check if this specific thread already has messages
+                history = client.conversations_replies(
+                    channel=message.channel_id,
+                    ts=message.thread_id
+                )
+                self.log_debug(f"DM thread history check: found {len(history.get('messages', []))} messages in thread {message.thread_id}")
+                
+                # If there's only 1 message (the current one), it's a new thread
+                is_new_thread = len(history.get('messages', [])) <= 1
+            else:
+                # For channels, check if this is creating a new thread
+                # When thread_id == ts, it's a new thread (first message)
+                is_new_thread = (message.thread_id == message.metadata.get('ts'))
+            
+            self.log_info(f"New thread check result: is_new_thread={is_new_thread}")
+            
+            if is_new_thread:
+                # For existing users, always show the compact settings button
+                # (This method is only called for users with preferences)
+                blocks = [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "⚙️ *Quick Settings Access*"
+                        }
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": {
+                                    "type": "plain_text",
+                                    "text": "Settings"
+                                },
+                                "style": "primary",
+                                "action_id": "open_welcome_settings",
+                                "value": json.dumps({
+                                    "original_message": message.text,
+                                    "channel_id": message.channel_id,
+                                    "thread_id": message.thread_id,
+                                    "attachments": message.attachments
+                                })
+                            }
+                        ]
+                    }
+                ]
+                
+                # Post the settings button as the first message in the thread
+                client.chat_postMessage(
+                    channel=message.channel_id,
+                    thread_ts=message.thread_id,  # Always use thread_ts to post in the thread
+                    text="Settings available",
+                    blocks=blocks
+                )
+                
+        except Exception as e:
+            self.log_debug(f"Could not post settings button: {e}")
+            # Don't block message processing if button posting fails
     
     def _clean_mentions(self, text: str) -> str:
         """Remove Slack user mentions from text"""
