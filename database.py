@@ -243,6 +243,19 @@ class DatabaseManager(LoggerMixin):
                 self.conn.commit()
                 self.log_info("DB: Successfully added real_name column")
             
+            # Check if custom_instructions column exists in user_preferences table
+            cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
+            columns = [col[1] for col in cursor.fetchall()]
+            
+            if 'custom_instructions' not in columns:
+                self.log_info("DB: Adding custom_instructions column to user_preferences table")
+                self.conn.execute("""
+                    ALTER TABLE user_preferences 
+                    ADD COLUMN custom_instructions TEXT
+                """)
+                self.conn.commit()
+                self.log_info("DB: Successfully added custom_instructions column")
+            
             # Check if email column exists in users table
             cursor = self.conn.execute("PRAGMA table_info(users)")
             columns = [col[1] for col in cursor.fetchall()]
@@ -758,7 +771,7 @@ class DatabaseManager(LoggerMixin):
             
             for field in ['model', 'reasoning_effort', 'verbosity', 'temperature',
                          'top_p', 'image_size', 'input_fidelity', 'vision_detail',
-                         'slack_email', 'settings_completed']:
+                         'slack_email', 'settings_completed', 'custom_instructions']:
                 if field in preferences:
                     updates.append(f"{field} = ?")
                     values.append(preferences[field])

@@ -255,6 +255,10 @@ class BotConfig:
                     if user_prefs.get('vision_detail'):
                         user_config['detail_level'] = user_prefs['vision_detail']
                     
+                    # Custom instructions
+                    if user_prefs.get('custom_instructions'):
+                        user_config['custom_instructions'] = user_prefs['custom_instructions']
+                    
                     # Apply user config over system defaults
                     config.update(user_config)
             except Exception as e:
