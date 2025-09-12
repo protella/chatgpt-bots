@@ -365,6 +365,44 @@ class SettingsModal(LoggerMixin):
             }
         })
         
+        # Custom Instructions section
+        blocks.append({"type": "divider"})
+        
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "*Custom Instructions*"}
+        })
+        
+        # Ensure initial_value is always a string
+        custom_instructions_value = settings.get('custom_instructions', '')
+        if custom_instructions_value is None:
+            custom_instructions_value = ''
+        
+        blocks.append({
+            "type": "input",
+            "block_id": "custom_instructions_block",
+            "element": {
+                "type": "plain_text_input",
+                "action_id": "custom_instructions",
+                "multiline": True,
+                "initial_value": custom_instructions_value,
+                "placeholder": {
+                    "type": "plain_text",
+                    "text": "- Be concise and use bullet points\n- Explain technical topics simply\n- Include code examples\n- Use professional tone"
+                },
+                "max_length": 3000
+            },
+            "label": {
+                "type": "plain_text",
+                "text": "How would you like the AI to respond? (Custom GPT Instructions)"
+            },
+            "hint": {
+                "type": "plain_text",
+                "text": "Tell the AI your preferences for tone, format, or style"
+            },
+            "optional": True
+        })
+        
         blocks.append({"type": "divider"})
         return blocks
     
@@ -586,6 +624,17 @@ class SettingsModal(LoggerMixin):
             selected_values = [opt['value'] for opt in selected_options]
             extracted['enable_web_search'] = 'web_search' in selected_values
             extracted['enable_streaming'] = 'streaming' in selected_values
+        
+        # Custom Instructions
+        custom_instructions_block = values.get('custom_instructions_block', {})
+        if 'custom_instructions' in custom_instructions_block:
+            custom_value = custom_instructions_block['custom_instructions'].get('value')
+            # Handle None (cleared field) or empty string
+            if custom_value:
+                custom_text = custom_value.strip()
+                extracted['custom_instructions'] = custom_text if custom_text else None
+            else:
+                extracted['custom_instructions'] = None
         
         # Image settings
         image_size_block = values.get('image_size_block', {})

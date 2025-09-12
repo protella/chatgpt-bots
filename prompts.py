@@ -103,7 +103,8 @@ IMPORTANT: Focus on the PATTERN of the conversation. If the conversation has bee
 Classify the LATEST user message into one of these categories:
 
 1. **"new"** - User wants a brand new image generated from scratch. 
-   - Clear image generation language: "create an image", "generate", "draw", "make a picture", "visualize"
+   - Clear image generation language: "create an image", "generate", "draw", "make a picture", "visualize", "show me", etc.
+   - Visual requests: "show me something [descriptive]", "I want to see", "display", "illustrate", etc.
    - Requests for visual representations of logos, icons, diagrams, or graphics (e.g., "show me the AWS logo", "display the company icon")
    - Questions about what logos/icons/visual things look like (e.g., "what does the X logo look like", "what's the Y icon")
    - OR continuation requests ("again", "another", "one more") IF the previous response was an image generation

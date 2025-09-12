@@ -535,7 +535,7 @@ MIME Type: {mimetype}
             user_real_name = message.metadata.get("user_real_name", None) if message.metadata else None
             user_email = message.metadata.get("user_email", None) if message.metadata else None
             web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
-            thread_state.system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"], web_search_enabled, thread_state.has_trimmed_messages)
+            thread_state.system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"], web_search_enabled, thread_state.has_trimmed_messages, thread_config.get('custom_instructions'))
             
             # Process any attachments (images, documents, and other files)
             image_inputs, document_inputs, unsupported_files = self._process_attachments(message, client, thinking_id)
@@ -2139,8 +2139,9 @@ MIME Type: {mimetype}
     def _get_system_prompt(self, client: BaseClient, user_timezone: str = "UTC", 
                           user_tz_label: Optional[str] = None, user_real_name: Optional[str] = None,
                           user_email: Optional[str] = None, model: Optional[str] = None,
-                          web_search_enabled: bool = True, has_trimmed_messages: bool = False) -> str:
-        """Get the appropriate system prompt based on the client platform with user's timezone, name, email, model, web search capability, and trimming status"""
+                          web_search_enabled: bool = True, has_trimmed_messages: bool = False,
+                          custom_instructions: Optional[str] = None) -> str:
+        """Get the appropriate system prompt based on the client platform with user's timezone, name, email, model, web search capability, trimming status, and custom instructions"""
         client_name = client.name.lower()
         
         # Get base prompt for the platform
@@ -2220,7 +2221,12 @@ MIME Type: {mimetype}
         if has_trimmed_messages:
             trimming_context = "\n\nNote: Some older messages have been removed from this conversation to manage context length."
         
-        return base_prompt + time_context + user_context + model_context + web_search_context + trimming_context
+        # Add custom instructions if provided
+        custom_instructions_context = ""
+        if custom_instructions:
+            custom_instructions_context = f"\n\n--- USER CUSTOM INSTRUCTIONS ---\nThe following are custom instructions provided by the user. These should be followed and may supersede any conflicting default instructions (within legal and ethical boundaries):\n\n{custom_instructions}\n\n--- END OF USER CUSTOM INSTRUCTIONS ---"
+        
+        return base_prompt + time_context + user_context + model_context + web_search_context + trimming_context + custom_instructions_context
     
     def _update_status(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], message: str, emoji: Optional[str] = None):
         """Update the thinking indicator with a status message"""
@@ -2317,7 +2323,7 @@ MIME Type: {mimetype}
         # Pass the model for dynamic knowledge cutoff (respecting user prefs)
         web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
         model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
-        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, thread_state.has_trimmed_messages)
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, thread_state.has_trimmed_messages, thread_config.get('custom_instructions'))
         
         # Update status before generating
         self._update_status(client, message.channel_id, thinking_id, "Generating response...")
@@ -2462,7 +2468,7 @@ MIME Type: {mimetype}
         # Pass the model for dynamic knowledge cutoff (respecting user prefs)
         web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
         model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
-        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, thread_state.has_trimmed_messages)
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, thread_state.has_trimmed_messages, thread_config.get('custom_instructions'))
         
         # Post an initial message to get the message ID for streaming updates
         # For streaming with potential tools, start with "Working on it" 
@@ -2886,7 +2892,7 @@ MIME Type: {mimetype}
                 db=self.db
             )
             web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
-            system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"], web_search_enabled, thread_state.has_trimmed_messages)
+            system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"], web_search_enabled, thread_state.has_trimmed_messages, thread_config.get('custom_instructions'))
             
             # Use the user's question directly - it will be enhanced for natural conversation
             # If no text provided with image, let the model infer from full conversation context

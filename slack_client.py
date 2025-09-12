@@ -119,7 +119,6 @@ class SlackBot(BaseClient):
         @self.app.view("welcome_settings_modal")
         def handle_settings_submission(ack, body, view, client):
             """Handle settings modal submission"""
-            ack()
             
             user_id = body['user']['id']
             
@@ -147,6 +146,51 @@ class SlackBot(BaseClient):
             
             # Extract form values
             form_values = self.settings_modal.extract_form_values(view['state'])
+            
+            # Check if we need confirmation for global custom instructions from thread
+            needs_confirmation = False
+            if (in_thread and selected_scope == 'global' and 
+                form_values.get('custom_instructions') and 
+                not metadata.get('confirmed')):
+                
+                # Check if there are existing global custom instructions
+                existing_prefs = self.db.get_user_preferences(user_id)
+                existing_custom = existing_prefs.get('custom_instructions', '') if existing_prefs else ''
+                
+                if existing_custom:
+                    needs_confirmation = True
+                    self.log_debug(f"Confirmation needed: saving thread custom instructions to global with existing global instructions")
+            
+            if needs_confirmation:
+                # Push confirmation modal on top of settings modal (preserves settings modal underneath)
+                confirmation_modal = {
+                    "type": "modal",
+                    "callback_id": "confirm_global_custom_instructions",
+                    "title": {"type": "plain_text", "text": "Confirm Changes"},
+                    "submit": {"type": "plain_text", "text": "Yes, Continue"},
+                    "close": {"type": "plain_text", "text": "Go Back"},
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "⚠️ *You have existing global custom instructions*\n\nSaving these settings globally will replace your current global custom instructions with the ones from this thread.\n\nThis will affect all your future conversations."
+                            }
+                        }
+                    ],
+                    "private_metadata": json.dumps({
+                        **metadata,
+                        "confirmed": True,
+                        "form_values": form_values
+                    })
+                }
+                
+                # Use 'push' to stack this modal on top, preserving the settings modal
+                ack(response_action="push", view=confirmation_modal)
+                return
+            
+            # Normal flow - acknowledge immediately
+            ack()
             
             # Validate settings
             validated_settings = self.settings_modal.validate_settings(form_values)
@@ -374,6 +418,68 @@ class SlackBot(BaseClient):
                     )
                 except:
                     pass
+        
+        # Handler for custom instructions confirmation modal submission
+        @self.app.view("confirm_global_custom_instructions")
+        def handle_custom_instructions_confirmation(ack, body, view, client):
+            """Handle confirmation for overwriting global custom instructions"""
+            # Clear all modals when confirmed
+            ack(response_action="clear")
+            
+            user_id = body['user']['id']
+            
+            # Extract metadata with confirmed flag and form values
+            metadata = json.loads(view.get('private_metadata', '{}'))
+            form_values = metadata.get('form_values', {})
+            
+            # Now proceed with the normal save flow using the form values
+            # This essentially continues the original submission with confirmed=True
+            validated_settings = self.settings_modal.validate_settings(form_values)
+            
+            # Mark settings as completed for user preferences
+            validated_settings['settings_completed'] = True
+            
+            # Update user preferences with the confirmed custom instructions
+            success = self.db.update_user_preferences(user_id, validated_settings)
+            
+            if success:
+                self.log_info(f"Global settings saved after confirmation for user {user_id}: {validated_settings}")
+                
+                # Send confirmation message
+                try:
+                    blocks = [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "✅ Your global settings have been saved successfully!\n_Your custom instructions have been updated and will apply to all conversations._"
+                            }
+                        },
+                        {
+                            "type": "actions",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "text": {
+                                        "type": "plain_text",
+                                        "text": "Open Settings"
+                                    },
+                                    "style": "primary",
+                                    "action_id": "open_global_settings_dm"
+                                }
+                            ]
+                        }
+                    ]
+                    
+                    client.chat_postMessage(
+                        channel=user_id,
+                        text="✅ Your global settings have been saved successfully!",
+                        blocks=blocks
+                    )
+                except SlackApiError as e:
+                    self.log_error(f"Error sending confirmation after custom instructions update: {e}")
+            else:
+                self.log_error(f"Failed to save settings after confirmation for user {user_id}")
         
         # Register modal action handlers (for dynamic updates)
         @self.app.action("model_select")
@@ -665,20 +771,21 @@ class SlackBot(BaseClient):
         @self.app.action("open_global_settings_dm")
         def handle_open_global_settings_dm(ack, body, client):
             """Handle button click to open global settings from DM"""
+            # ALWAYS acknowledge first, no matter what
             ack()
             
-            user_id = body['user']['id']
-            trigger_id = body['trigger_id']
-            
-            # Get user preferences
-            user_prefs = self.db.get_user_preferences(user_id)
-            if not user_prefs:
-                user_data = self.db.get_or_create_user(user_id)
-                email = user_data.get('email') if user_data else None
-                user_prefs = self.db.create_default_user_preferences(user_id, email)
-            
-            # Open the settings modal for global settings
             try:
+                user_id = body['user']['id']
+                trigger_id = body['trigger_id']
+                
+                # Get user preferences
+                user_prefs = self.db.get_user_preferences(user_id)
+                if not user_prefs:
+                    user_data = self.db.get_or_create_user(user_id)
+                    email = user_data.get('email') if user_data else None
+                    user_prefs = self.db.create_default_user_preferences(user_id, email)
+                
+                # Open the settings modal for global settings
                 modal = self.settings_modal.build_settings_modal(
                     user_id=user_id,
                     trigger_id=trigger_id,
@@ -696,14 +803,17 @@ class SlackBot(BaseClient):
                 
                 if response.get('ok'):
                     self.log_info(f"Global settings modal opened from DM for user {user_id}")
+                else:
+                    self.log_warning(f"Failed to open global settings modal: {response}")
                     
-            except SlackApiError as e:
-                self.log_error(f"Error opening global settings modal from DM: {e}")
+            except Exception as e:
+                self.log_error(f"Error in handle_open_global_settings_dm: {e}", exc_info=True)
         
         # Handler for welcome settings button
         @self.app.action("open_welcome_settings")
         def handle_open_welcome_settings(ack, body, client):
             """Handle button click to open welcome settings modal"""
+            # ALWAYS acknowledge first, no matter what
             ack()
             
             user_id = body['user']['id']
@@ -761,7 +871,7 @@ class SlackBot(BaseClient):
                         self.log_warning(f"Could not fetch truncated message: {result.get('error', 'Unknown error')}")
                         # Keep the truncated context as-is
                 except Exception as e:
-                    self.log_error(f"Error fetching truncated message: {e}")
+                    self.log_error(f"Error fetching truncated message: {e}", exc_info=True)
                     # Keep the truncated context as-is
             
             # Get or create user preferences
@@ -836,14 +946,15 @@ class SlackBot(BaseClient):
                     # Keep the button message for future access
                     # (removed deletion to allow persistent settings access)
                         
-            except SlackApiError as e:
-                self.log_error(f"Error opening welcome modal via button: {e}")
+            except Exception as e:
+                self.log_error(f"Error in handle_open_welcome_settings: {e}", exc_info=True)
         
         # Register message shortcut for thread-specific settings
         @self.app.shortcut("configure_thread_settings_dev")  # Dev callback ID
         @self.app.shortcut("configure_thread_settings")  # Prod callback ID (when configured)
         def handle_thread_settings_shortcut(ack, shortcut, client):
             """Handle the thread settings message shortcut"""
+            # ALWAYS acknowledge first, no matter what
             ack()
             
             # Get thread context from the shortcut - this is reliable!
@@ -896,7 +1007,7 @@ class SlackBot(BaseClient):
                     self.log_error(f"Failed to open thread modal: {response.get('error')}")
                     
             except Exception as e:
-                self.log_error(f"Error opening thread settings modal: {e}")
+                self.log_error(f"Error in handle_thread_settings_shortcut: {e}", exc_info=True)
     
     def get_username(self, user_id: str, client) -> str:
         """Get username from user ID, with caching"""
@@ -1463,9 +1574,10 @@ class SlackBot(BaseClient):
             # Format text for Slack
             formatted_text = self.format_text(text)
             
-            # Ensure it fits in one message for streaming continuation
+            # Safety check - this should never happen for continuation messages
+            # but if somehow the text is too long, truncate it
             if len(formatted_text) > self.MAX_MESSAGE_LENGTH:
-                formatted_text = formatted_text[:self.MAX_MESSAGE_LENGTH - 50] + "\n\n*...truncated*"
+                formatted_text = formatted_text[:self.MAX_MESSAGE_LENGTH - 80] + "\n\n*[Message exceeded Slack limit]*"
             
             result = self.app.client.chat_postMessage(
                 channel=channel_id,
@@ -1848,9 +1960,18 @@ class SlackBot(BaseClient):
                 # Format text for Slack using markdown conversion
                 formatted_text = self.format_text(text)
             
-            # Truncate if too long during streaming
-            if len(formatted_text) > self.MAX_MESSAGE_LENGTH:
-                formatted_text = formatted_text[:self.MAX_MESSAGE_LENGTH - 100] + "\n\n*...continuing...*"
+            # More aggressive truncation for streaming to avoid msg_too_long errors
+            # Account for Slack's markdown expansion and special characters
+            safe_length = self.MAX_MESSAGE_LENGTH - 200  # More buffer for safety
+            if len(formatted_text) > safe_length:
+                # Try to truncate at a reasonable boundary (code block or paragraph)
+                truncated = formatted_text[:safe_length]
+                
+                # If we're in the middle of a code block, close it
+                if truncated.count('```') % 2 == 1:
+                    truncated += '\n```'
+                
+                formatted_text = truncated + "\n\n*...continued in next message...*"
             
             # Call Slack API's chat_update method
             result = self.app.client.chat_update(
@@ -1869,8 +1990,34 @@ class SlackBot(BaseClient):
             }
             
         except SlackApiError as e:
+            # Handle msg_too_long error specifically
+            if e.response.get('error') == 'msg_too_long':
+                self.log_warning(f"Message too long for Slack, truncating more aggressively")
+                # Try with much shorter message
+                very_short = formatted_text[:2000] + "\n\n*...continued in next message...*"
+                if very_short.count('```') % 2 == 1:
+                    very_short += '\n```'
+                
+                try:
+                    result = self.app.client.chat_update(
+                        channel=channel_id,
+                        ts=message_id,
+                        text=very_short,
+                        mrkdwn=True
+                    )
+                    return {
+                        "success": True,
+                        "rate_limited": False,
+                        "retry_after": None,
+                        "result": result
+                    }
+                except:
+                    # If even the short version fails, just acknowledge the error
+                    self.log_error("Even truncated message failed to send")
+                    raise
+            
             # Handle 429 rate limit responses
-            if e.response.status_code == 429:
+            elif e.response.status_code == 429:
                 # Extract retry-after header
                 retry_after = None
                 if hasattr(e.response, 'headers') and 'Retry-After' in e.response.headers:
