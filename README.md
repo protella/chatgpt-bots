@@ -1,8 +1,10 @@
-# ChatGPT Bots
-Python based ChatGPT bot integrations
+# ChatGPT Bots V2
+Python-based AI assistant for Slack using OpenAI's Responses API
 
 ## Description
-ChatBot Integrations for Slack and Discord using Python and OpenAI's Responses API. This bot V2 is designed for GPT-5 models and supports image generation with gpt-image-1 (DALL-E 3 coming soon). The bot uses intelligent intent classification to determine when to generate images vs text responses. Conversations are stateless with Slack/Discord as the source of truth, rebuilding context from platform history on demand. Discord client V2 is under development.
+A production-ready Slack bot built with Python and OpenAI's Responses API (not Chat Completions). Features intelligent intent classification, image generation/editing, vision analysis, document processing, and user-specific settings with thread-level customization. The architecture is stateless with Slack as the source of truth, rebuilding context from platform history on demand.
+
+**Note:** Discord support is temporarily unavailable while V2 development focuses on Slack. Discord V2 will be released in a future update.
 
 ## Recent Changes
 
@@ -10,16 +12,20 @@ For a detailed list of recent changes and improvements, please see the [CHANGELO
 
 ## Getting Started
 
-Requires `Python 3.10+` as the script takes advantage of the new structural pattern matching (match/case) in this version.
+### Requirements
+- `Python 3.10+` for structural pattern matching (match/case) support
+- `SQLite 3.35+` for JSON support and WAL mode (usually included with Python)
 
 ### Model Support
-**V2 Architecture**: Uses OpenAI's Responses API (not Chat Completions)
+**V2 Architecture**: Uses OpenAI's Responses API exclusively
 
 **Supported Models:**
-- GPT-5 reasoning models (`gpt-5-mini`, `gpt-5-nano`) - Fixed `temperature=1.0`, no `top_p`
-- GPT-5 chat models (`gpt-5-chat-latest`) - Standard temperature/top_p support
-- Image generation: `gpt-image-1` (default), DALL-E 3 (coming soon)
-- Utility model for intent classification: `gpt-5-mini` or `gpt-5-nano`  
+- **GPT-5** (`gpt-5`) - Reasoning model with web search capability
+- **GPT-5 Mini** (`gpt-5-mini`) - Faster reasoning model
+- **GPT-4.1** (`gpt-4.1`) - Latest GPT-4 variant
+- **GPT-4o** (`gpt-4o`) - Optimized GPT-4 model
+- **Image Generation**: `gpt-image-1`
+- **Utility Model**: `gpt-5-mini` or `gpt-5-nano` for intent classification  
 
 The setup of a Slack or Discord App is out of scope of this README. There's plenty of documentation online detailing these processes.
   
@@ -31,20 +37,30 @@ The setup of a Slack or Discord App is out of scope of this README. There's plen
 | app_mention 	| Subscribe to only the message events that mention your app or bot 	| app_mentions:read 	|
 | message.im  	| A message was posted in a direct message channel                  	| im:history        	|    
     
-#### Slack OAuth & Permissions (Scopes):
-| Scope                	|
-|----------------------	|
-| app_mentions:read    	|
-| channels:history     	|
-| channels:join        	|
-| chat:write           	|
-| chat:write.customize 	|
-| commands             	|
-| files:read           	|
-| files:write          	|
-| im:history           	|
-| im:read              	|
-| im:write             	|
+#### Slack Bot Token Scopes:
+| Scope                	| Description |
+|----------------------	|------------- |
+| app_mentions:read    	| Read messages that mention the bot |
+| channels:history     	| View messages in public channels |
+| channels:join        	| Join public channels |
+| chat:write           	| Send messages as the bot |
+| chat:write.customize 	| Send messages with custom username/avatar |
+| commands             	| Add and respond to slash commands |
+| files:read           	| Access files shared in channels |
+| files:write          	| Upload and modify files |
+| groups:history       	| View messages in private channels |
+| im:history           	| View direct message history |
+| im:read              	| View direct messages |
+| im:write             	| Send direct messages |
+| users:read           	| View people in workspace |
+| users:read.email     	| View email addresses |
+
+#### Slack User Token Scopes:
+| Scope                	| Description |
+|----------------------	|------------- |
+| chat:write           	| Send messages on user's behalf |
+| users:read           	| View people in workspace |
+| users:read.email     	| View email addresses |
 
 ---
 
@@ -81,59 +97,34 @@ The only required token is the OPENAI_KEY. The others depend on which integratio
 - Create a `.env` file in the root of your venv folder and populate it with your keys, tokens, other vars as follows:
 
 ```
-# Required
-SLACK_BOT_TOKEN = 'YOURTOKENHERE'
-SLACK_APP_TOKEN = 'YOURTOKENHERE'
-OPENAI_KEY = 'YOURTOKENHERE'
-
-# Model Configuration
-GPT_MODEL = 'gpt-5-chat-latest'
-GPT_IMAGE_MODEL = 'gpt-image-1'
-UTILITY_MODEL = 'gpt-5-mini-2025-08-07'
-DALLE_MODEL = 'dall-e-3'
-
-# Default Generation Parameters
-DEFAULT_TEMPERATURE = '0.8'  # 0.0-2.0
-DEFAULT_MAX_TOKENS = '4096'
-DEFAULT_TOP_P = '1.0'  # 0.0-1.0
-DEFAULT_REASONING_EFFORT = 'medium'  # minimal/low/medium/high
-DEFAULT_VERBOSITY = 'medium'  # low/medium/high
-
-# Image Generation Defaults  
-DEFAULT_IMAGE_SIZE = '1024x1024'  # 1024x1024/1024x1792/1792x1024
-DEFAULT_IMAGE_QUALITY = 'hd'  # standard/hd
-DEFAULT_IMAGE_STYLE = 'natural'  # natural/vivid
-DEFAULT_IMAGE_NUMBER = '1'
-DEFAULT_INPUT_FIDELITY = 'high'  # high/low - high preserves original
-
-# Vision Defaults
-DEFAULT_DETAIL_LEVEL = 'auto'  # auto/low/high
-
-# UI Configuration  
-THINKING_EMOJI = ':hourglass_flowing_sand:'
-
-# Discord (V2 under development)
-DISCORD_TOKEN = 'YOURTOKENHERE'
-DISCORD_ALLOWED_CHANNEL_IDS = '1234567890, 1234567890'
-
-# Logging Configuration
-SLACK_LOG_LEVEL = "WARNING"
-DISCORD_LOG_LEVEL = "WARNING"
-BOT_LOG_LEVEL = "WARNING"
-UTILS_LOG_LEVEL = "WARNING"
-CONSOLE_LOGGING_ENABLED = "TRUE"
-LOG_DIRECTORY = "logs"
-
-# Cleanup Configuration (cron format)
-CLEANUP_SCHEDULE = "0 0 * * *"  # Daily at midnight
-CLEANUP_MAX_AGE_HOURS = "24"
+See `.env.example` for a complete configuration template with all available settings.
 ```
 
-### Logging Configuration
-The bots support a comprehensive logging system that can be configured through the environment variables shown above. Logs are stored in the `logs` directory with automatic rotation when they reach 10MB in size.
+### Key Configuration Options
 
-### Configuration - Bot Prompt Tuning
-The `prompts.py` file contains the various system prompts the script will use to set the tone for how the bot will respond. Telling it that it is a chatbot and with any specific style of responses will help with more appropriate responses.
+- **Models**: Configure GPT-5, GPT-5 Mini, GPT-4.1, or GPT-4o as your primary model
+- **User Settings**: Users can customize their experience via `/chatgpt-settings` command
+- **Thread Settings**: Different settings per conversation thread
+- **Web Search**: Available with GPT-5 models (requires reasoning_effort >= low)
+- **Streaming**: Real-time response streaming with configurable update intervals
+- **Logging**: Comprehensive logging with rotation at 10MB, configurable levels per component
+
+### Features
+
+#### Core Capabilities
+- **Intelligent Intent Classification**: Automatically determines whether to generate images, analyze uploads, or provide text responses
+- **Image Generation & Editing**: Create and modify images with natural language
+- **Vision Analysis**: Analyze uploaded images and compare multiple images
+- **Document Processing**: Extract and analyze text from PDFs, Office files, and code
+- **Web Search**: Current information retrieval (GPT-5 models only)
+- **Streaming Responses**: Real-time message updates as responses generate
+
+#### User Experience
+- **Settings Modal**: Interactive configuration UI with `/chatgpt-settings`
+- **Thread-Specific Settings**: Different configurations per conversation
+- **Custom Instructions**: Personalized response styles per user
+- **Multi-User Context**: Maintains separate contexts in shared conversations
+- **Persistent Settings**: User preferences saved to SQLite database
 
 ### Configuration - Memory Cleanup
 Thread cleanup runs on a schedule (cron format):
@@ -144,8 +135,8 @@ Thread cleanup runs on a schedule (cron format):
 Run the py file for your chosen interface, e.g.:
 
 - `python3 slackbot.py` - Run Slack bot
-- `python3 discordbot.py` - (V2 under development)
 - `python3 main.py --platform slack` - Alternative with platform parameter
+- Discord support temporarily unavailable in V2
 
 ### Running as a service/daemon
 - You can run the script in the background with NOHUP on Linux so you can close the terminal and it will continue to run:
@@ -156,24 +147,21 @@ Run the py file for your chosen interface, e.g.:
   - `pm2 start /path/to/venv/chatgpt-bots/slackbot.py --name "SlackBot" --interpreter=/path/to/venv/chatgpt-bots/bin/python3 --output=/path/to/venv/chatgpt-bots/slackbot.log --error=/path/to/venv/chatgpt-bots/slackbot.err`
 - You could also build a systemd service definition for it.
 
-## V2 Implementation Status:
+## Testing
 
-### Completed ✅
-- Client-based architecture with abstract base class
-- Stateless design with platform as source of truth
-- Thread state rebuilding from Slack history
-- Intent classification for image vs text responses
-- Image generation and editing with context awareness
-- Vision analysis for uploaded images
-- Thread locking for concurrent request handling
-- Configurable cleanup with cron scheduling
-- Error formatting with emojis and code blocks
-- Markdown to Slack mrkdwn conversion
-- Unsupported file type notifications
+Run the test suite:
+```bash
+make test           # Run unit tests with coverage
+make test-all       # Run all tests including integration
+make lint           # Run code quality checks
+make format         # Auto-format code
+```
 
-### Pending Implementation 🚧
-- Response streaming (experimental)
-- Discord V2 client
-- Rate limiting - auto retry/falloff
+## Performance
+
+- Thread-safe with proper lock management
+- Automatic token management with smart trimming
+- SQLite WAL mode for concurrent database access
+- Streaming responses with circuit breaker protection
 
 
