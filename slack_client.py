@@ -241,8 +241,16 @@ class SlackBot(BaseClient):
                 self.db.get_or_create_thread(thread_id, channel_id)
                 self.db.save_thread_config(thread_id, thread_settings)
                 
-                # The thread state will be loaded from DB on next message
-                self.log_debug(f"Thread config saved to DB for {thread_id} - will be loaded on next message")
+                # Update memory cache immediately if processor is available
+                if hasattr(self, 'processor') and self.processor:
+                    try:
+                        # Update the thread state's config_overrides in memory
+                        thread_state = self.processor.thread_manager.get_thread_state(channel_id, thread_ts)
+                        if thread_state:
+                            thread_state.config_overrides = thread_settings
+                            self.log_debug(f"Thread config updated in memory for {thread_id}")
+                    except Exception as e:
+                        self.log_debug(f"Could not update thread config in memory: {e}")
                 
                 success = True
                 save_location = "thread"

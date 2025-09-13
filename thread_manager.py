@@ -450,14 +450,25 @@ class ThreadStateManager(LoggerMixin):
             thread = self._threads[thread_key]
             thread.last_activity = time.time()
             
-            # Update database activity if available
+            # Always refresh config from database to ensure we have latest settings
             if self.db:
+                thread_config = self.db.get_thread_config(thread_key)
+                if thread_config:
+                    thread.config_overrides = thread_config
+                    self.log_debug(f"Refreshed thread config from database for {thread_key}")
+                
+                # Update database activity
                 self.db.update_thread_activity(thread_key)
             
             return thread
     
     def get_thread(self, thread_ts: str, channel_id: str) -> Optional[ThreadState]:
         """Get thread state if it exists"""
+        thread_key = f"{channel_id}:{thread_ts}"
+        return self._threads.get(thread_key)
+    
+    def get_thread_state(self, channel_id: str, thread_ts: str) -> Optional[ThreadState]:
+        """Get thread state if it exists (alternative method signature)"""
         thread_key = f"{channel_id}:{thread_ts}"
         return self._threads.get(thread_key)
     
