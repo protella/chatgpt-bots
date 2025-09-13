@@ -2920,10 +2920,13 @@ MIME Type: {mimetype}
                     if i < len(attachments):
                         filenames.append(attachments[i].get("name", f"image{i+1}"))
             
-            # Enhance the vision prompt first
+            # Enhance the vision prompt with conversation context
             enhanced_question = user_question
             if user_question:  # Only enhance if there's actually a question
-                enhanced_question = self.openai_client._enhance_vision_prompt(user_question)
+                enhanced_question = self.openai_client._enhance_vision_prompt(
+                    user_question,
+                    conversation_history=enhanced_messages  # Pass the full conversation context
+                )
                 self.log_debug(f"Enhanced vision prompt: {enhanced_question[:100]}...")
             
             # Add filename context to the enhanced question for the API
