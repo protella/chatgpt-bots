@@ -957,22 +957,39 @@ class SlackBot(BaseClient):
             except Exception as e:
                 self.log_error(f"Error in handle_open_welcome_settings: {e}", exc_info=True)
         
+        # Debug handler to catch ALL shortcuts (register this first)
+        @self.app.shortcut(re.compile(".*"))
+        def handle_any_shortcut_debug(ack, shortcut, client):
+            """Debug handler to log ALL shortcuts"""
+            callback_id = shortcut.get("callback_id", "unknown")
+            self.log_info(f"=== ANY SHORTCUT RECEIVED: {callback_id} ===")
+            # Don't ack here - let the specific handler do it
+            # Just pass through to the next handler
+            pass
+        
         # Register message shortcut for thread-specific settings
         @self.app.shortcut("configure_thread_settings_dev")  # Dev callback ID
         @self.app.shortcut("configure_thread_settings")  # Prod callback ID (when configured)
         def handle_thread_settings_shortcut(ack, shortcut, client):
             """Handle the thread settings message shortcut"""
+            # Log immediately to see if we're even receiving the event
+            self.log_info(f"=== SHORTCUT RECEIVED: {shortcut.get('callback_id', 'unknown')} ===")
+            
             # ALWAYS acknowledge first, no matter what
             ack()
             
-            # Get thread context from the shortcut - this is reliable!
-            channel_id = shortcut["channel"]["id"]
-            message = shortcut["message"]
-            thread_ts = message.get("thread_ts") or message["ts"]  # Use thread_ts if in thread, else message ts
-            thread_id = f"{channel_id}:{thread_ts}"
-            user_id = shortcut["user"]["id"]
-            
-            self.log_info(f"Thread settings shortcut invoked for thread {thread_id} by user {user_id}")
+            try:
+                # Get thread context from the shortcut - this is reliable!
+                channel_id = shortcut["channel"]["id"]
+                message = shortcut["message"]
+                thread_ts = message.get("thread_ts") or message["ts"]  # Use thread_ts if in thread, else message ts
+                thread_id = f"{channel_id}:{thread_ts}"
+                user_id = shortcut["user"]["id"]
+                
+                self.log_info(f"Thread settings shortcut invoked for thread {thread_id} by user {user_id}")
+            except Exception as e:
+                self.log_error(f"Error extracting shortcut data: {e}", exc_info=True)
+                return
             
             # Load existing thread config if it exists
             thread_config = self.db.get_thread_config(thread_id)
