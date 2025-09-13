@@ -161,18 +161,32 @@ IMAGE_ANALYSIS_PROMPT = """Describe this image focusing on:
 Subject identification, specific colors and their locations, placement of objects in the scene, artistic style, lighting conditions, composition, and any distinctive visual elements. 
 Be concise and technical. Do not add questions, interpretations, or conversational elements."""
 
-VISION_ENHANCEMENT_PROMPT = """You will enhance a user's question about an image to ensure a helpful and natural vision analysis.
+VISION_ENHANCEMENT_PROMPT = """You will enhance a user's question about an image based on conversation context.
 
-Given the user's question or request, create an enhanced prompt that:
-- For vague requests ("describe this", "what is this"): Ask for an engaging, conversational description that covers what's in the image, key visual details, and the overall scene or mood
-- For specific questions: Keep the user's question as-is, but add "Please answer in a natural, conversational tone"
-- Avoids dry technical language, bullet points, or overly structured responses (unless specifically requested)
-- Avoids unnecessary warnings, alternative descriptions, or follow-up questions
-- If analyzing multiple images: Request clear labeling as "Image 1:", "Image 2:", etc. at the start of each image's description
+IMPORTANT: Analyze the conversation history to understand the user's intent:
 
-The goal is informative yet conversational responses, like explaining the image to a friend.
+1. **CONTEXTUAL SCREENSHOTS** (user is providing evidence/proof):
+   - Look for ongoing problem/issue discussions followed by screenshots
+   - Common phrases: "I only see this", "here's what I get", "this is the error", "look at this", "it shows"
+   - Enhancement approach: Frame as problem-solving continuation
+   - Example: "The user is showing you [context]. Analyze this screenshot and provide specific guidance to resolve their issue."
 
-Output only the enhanced prompt text, no explanations or formatting."""
+2. **STANDALONE IMAGE ANALYSIS** (user wants image described/analyzed):
+   - Either: No relevant conversation context, OR user explicitly requests analysis/description
+   - For vague requests ("describe this", "what is this"): Ask for an engaging, conversational description that covers what's in the image, key visual details, and the overall scene or mood
+   - For specific questions: Keep the user's question as-is, but add "Please answer in a natural, conversational tone"
+   - Avoid dry technical language, bullet points, or overly structured responses (unless specifically requested)
+   - If analyzing multiple images: Request clear labeling as "Image 1:", "Image 2:", etc. at the start of each image's description
+
+3. **DECISION FACTORS**:
+   - If the last assistant message was a question and user responds with an image + minimal text → contextual
+   - If user explicitly asks for analysis/description → standalone
+   - If conversation has been troubleshooting → contextual
+   - When in doubt, check if the user's message makes sense as a response to the previous message
+
+The goal is to produce the right type of enhancement based on context, not force description when problem-solving is needed.
+
+OUTPUT ONLY THE ENHANCED PROMPT TEXT. Do not include any preamble, explanations, formatting, quotes, labels, or commentary. Just the raw enhanced prompt text that will be used for image analysis."""
 
 IMAGE_EDIT_SYSTEM_PROMPT = """You will be provided with a description of an existing image and a user's edit request for modifying that image.
 

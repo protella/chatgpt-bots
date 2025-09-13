@@ -1237,24 +1237,50 @@ class OpenAIClient(LoggerMixin):
             self.log_warning(f"Failed to enhance prompt: {e}")
             return prompt  # Return original on error
     
-    def _enhance_vision_prompt(self, user_question: str) -> str:
+    def _enhance_vision_prompt(self, user_question: str, conversation_history: List[Dict] = None) -> str:
         """
-        Enhance a vision analysis prompt for more detailed responses
+        Enhance a vision analysis prompt based on conversation context
         
         Args:
             user_question: Original user question about the image
+            conversation_history: Optional conversation history for context-aware enhancement
         
         Returns:
             Enhanced prompt for better vision analysis
         """
         try:
+            # Build enhancement messages with full context
+            enhancement_messages = [
+                {"role": "developer", "content": VISION_ENHANCEMENT_PROMPT}
+            ]
+            
+            # Include conversation history if provided (text only, no images)
+            if conversation_history:
+                for msg in conversation_history:
+                    # Only include text content, skip any image data
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        enhancement_messages.append({
+                            "role": msg["role"],
+                            "content": content
+                        })
+            
+            # Add the current user message with image indicator
+            enhancement_messages.append({
+                "role": "user",
+                "content": f"[User has attached an image with this message]: {user_question}"
+            })
+            
+            # Ask for enhancement based on context
+            enhancement_messages.append({
+                "role": "user",
+                "content": "Based on the conversation above, create an appropriate prompt for analyzing the attached image."
+            })
+            
             # Build request parameters
             request_params = {
                 "model": config.utility_model,
-                "input": [
-                    {"role": "developer", "content": VISION_ENHANCEMENT_PROMPT},
-                    {"role": "user", "content": user_question}
-                ],
+                "input": enhancement_messages,
                 "max_output_tokens": 200,
                 "store": False,
             }
@@ -1326,7 +1352,7 @@ class OpenAIClient(LoggerMixin):
         # Enhance the question if requested
         enhanced_question = question
         if enhance_prompt:
-            enhanced_question = self._enhance_vision_prompt(question)
+            enhanced_question = self._enhance_vision_prompt(question, conversation_history)
             self.log_info(f"Vision analysis with enhanced prompt: {enhanced_question[:100]}...")
         
         # Build content array with text and images
