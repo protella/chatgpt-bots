@@ -30,6 +30,14 @@ For a detailed list of recent changes and improvements, please see the [CHANGELO
 The setup of a Slack or Discord App is out of scope of this README. There's plenty of documentation online detailing these processes.
   
 ### Slack quickstart guide: https://api.slack.com/start/quickstart
+
+You can use the included `slack_app_manifest.yml` file to quickly configure your Slack app with all required settings. Simply:
+1. Create a new Slack app at https://api.slack.com/apps
+2. Choose "From an app manifest" 
+3. Select your workspace
+4. Paste the contents of `slack_app_manifest.yml`
+5. Review and create the app
+6. Install to your workspace and copy the tokens to your `.env` file
 #### The Slack event subscriptions and scope are as follows:
 
 | Event Name  	| Description                                                       	| Required Scope    	|
@@ -54,6 +62,21 @@ The setup of a Slack or Discord App is out of scope of this README. There's plen
 | im:write             	| Send direct messages |
 | users:read           	| View people in workspace |
 | users:read.email     	| View email addresses |
+
+#### Slack Slash Commands:
+Configure the following slash command in your Slack app:
+- **Command**: `/chatgpt-settings` (production) or `/chatgpt-settings-dev` (development)
+- **Request URL**: Your bot's URL endpoint
+- **Short Description**: "Configure ChatGPT settings"
+- **Usage Hint**: "Opens the settings modal"
+- **Set in .env**: `SETTINGS_SLASH_COMMAND=/chatgpt-settings` (or `/chatgpt-settings-dev` for dev)
+
+#### Slack App Shortcuts:
+The bot includes a message shortcut for thread-specific settings:
+- **Callback ID**: `configure_thread_settings` (production) or `configure_thread_settings_dev` (development)
+- **Name**: "Configure Thread Settings" (or similar)
+- **Description**: "Configure AI settings for this thread"
+- **Where**: Messages -> Message shortcuts menu (three dots on any message)
 
 #### Slack User Token Scopes:
 | Scope                	| Description |
