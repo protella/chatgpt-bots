@@ -365,44 +365,6 @@ class SettingsModal(LoggerMixin):
             }
         })
         
-        # Custom Instructions section
-        blocks.append({"type": "divider"})
-        
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": "*Custom Instructions*"}
-        })
-        
-        # Ensure initial_value is always a string
-        custom_instructions_value = settings.get('custom_instructions', '')
-        if custom_instructions_value is None:
-            custom_instructions_value = ''
-        
-        blocks.append({
-            "type": "input",
-            "block_id": "custom_instructions_block",
-            "element": {
-                "type": "plain_text_input",
-                "action_id": "custom_instructions",
-                "multiline": True,
-                "initial_value": custom_instructions_value,
-                "placeholder": {
-                    "type": "plain_text",
-                    "text": "- Be concise and use bullet points\n- Explain technical topics simply\n- Include code examples\n- Use professional tone"
-                },
-                "max_length": 3000
-            },
-            "label": {
-                "type": "plain_text",
-                "text": "How would you like the AI to respond? (Custom GPT Instructions)"
-            },
-            "hint": {
-                "type": "plain_text",
-                "text": "Tell the AI your preferences for tone, format, or style"
-            },
-            "optional": True
-        })
-        
         blocks.append({"type": "divider"})
         return blocks
     
@@ -457,6 +419,44 @@ class SettingsModal(LoggerMixin):
     def _add_common_settings(self, settings: Dict) -> List[Dict]:
         """Add settings common to all models"""
         blocks = []
+        
+        # Custom Instructions section (available for all models)
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "*Custom Instructions*"}
+        })
+        
+        # Ensure initial_value is always a string
+        custom_instructions_value = settings.get('custom_instructions', '')
+        if custom_instructions_value is None:
+            custom_instructions_value = ''
+        
+        blocks.append({
+            "type": "input",
+            "block_id": "custom_instructions_block",
+            "element": {
+                "type": "plain_text_input",
+                "action_id": "custom_instructions",
+                "multiline": True,
+                "initial_value": custom_instructions_value,
+                "placeholder": {
+                    "type": "plain_text",
+                    "text": "- Be concise and use bullet points\n- Explain technical topics simply\n- Include code examples\n- Use professional tone"
+                },
+                "max_length": 3000
+            },
+            "label": {
+                "type": "plain_text",
+                "text": "How would you like the AI to respond? (Custom GPT Instructions)"
+            },
+            "hint": {
+                "type": "plain_text",
+                "text": "Tell the AI your preferences for tone, format, or style"
+            },
+            "optional": True
+        })
+        
+        blocks.append({"type": "divider"})
         
         # Feature toggles
         blocks.append({
