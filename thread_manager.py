@@ -294,7 +294,7 @@ class ThreadLockManager(LoggerMixin):
         with self._global_lock:
             if thread_key in self._lock_acquisition_times:
                 del self._lock_acquisition_times[thread_key]
-                self.log_debug(f"Lock released for thread {thread_key}")
+                # Don't log here - the caller already logs
     
     def get_stuck_threads(self, max_duration: int = 300) -> List[str]:
         """Get list of threads that have been locked too long"""
@@ -362,9 +362,12 @@ class ThreadStateManager(LoggerMixin):
     def _start_watchdog(self):
         """Start the background thread that monitors for stuck locks"""
         def watchdog():
-            # Use same timeout as API calls for consistency
-            max_lock_duration = int(config.api_timeout_read)
-            self.log_info(f"Thread lock watchdog started with {max_lock_duration}s timeout")
+            # Watchdog timeout should be LONGER than API timeout
+            # This gives the API call time to timeout naturally and release the lock
+            # Only force-release if the lock is still held after the API should have timed out
+            api_timeout = int(config.api_timeout_read)
+            max_lock_duration = api_timeout + 30  # Give 30s buffer after API timeout
+            self.log_info(f"Thread lock watchdog started with {max_lock_duration}s timeout (API timeout: {api_timeout}s)")
             
             while True:
                 try:

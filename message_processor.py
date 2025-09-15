@@ -943,7 +943,7 @@ MIME Type: {mimetype}
                         self._update_status(client, message.channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
                         
                         # Documents are already in enhanced_text, just process as text with vision intent
-                        response = self._handle_text_response(user_content, thread_state, client, message, thinking_id)
+                        response = self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0)
                     elif image_inputs and document_inputs:
                         # Both images and documents - use two-call approach
                         total_files = len(image_inputs) + len(document_inputs)
@@ -977,7 +977,7 @@ MIME Type: {mimetype}
                         message
                     )
             else:
-                response = self._handle_text_response(user_content, thread_state, client, message, thinking_id)
+                response = self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0)
             
             # DEBUG: Print conversation history after processing (with truncated content)
             import json
@@ -2248,9 +2248,10 @@ MIME Type: {mimetype}
         self._update_status(client, channel_id, thinking_id, 
                           "Generating image. This may take a minute, please wait...",
                           emoji=config.circle_loader_emoji)
-    def _handle_text_response(self, user_content: Any, thread_state, client: BaseClient, 
+    def _handle_text_response(self, user_content: Any, thread_state, client: BaseClient,
                               message: Message, thinking_id: Optional[str] = None,
-                              attachment_urls: Optional[List[str]] = None) -> Response:
+                              attachment_urls: Optional[List[str]] = None,
+                              retry_count: int = 0) -> Response:
         """Handle text-only response generation"""
         # Get thread config (with user preferences)
         thread_config = config.get_thread_config(
@@ -2260,9 +2261,10 @@ MIME Type: {mimetype}
         )
         
         # Check if streaming is enabled and supported (respecting user prefs)
+        # CRITICAL: Don't retry streaming if we've already failed once
         streaming_enabled = thread_config.get('enable_streaming', config.enable_streaming)
-        if (hasattr(client, 'supports_streaming') and client.supports_streaming() and 
-            streaming_enabled and thinking_id is not None):  # Streaming requires a message ID to update
+        if (hasattr(client, 'supports_streaming') and client.supports_streaming() and
+            streaming_enabled and thinking_id is not None and retry_count == 0):  # Streaming requires a message ID to update
             return self._handle_streaming_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls)
         
         # Fall back to non-streaming logic
@@ -2389,7 +2391,7 @@ MIME Type: {mimetype}
         # Check if client supports streaming
         if not hasattr(client, 'supports_streaming') or not client.supports_streaming():
             self.log_debug("Client doesn't support streaming, falling back to non-streaming")
-            return self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls)
+            return self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls, retry_count=0)
         
         # Get streaming configuration from client
         streaming_config = client.get_streaming_config() if hasattr(client, 'get_streaming_config') else {}
@@ -2481,7 +2483,7 @@ MIME Type: {mimetype}
         else:
             # We need a way to post a message and get its ID - this would depend on client implementation
             self.log_warning("No thinking_id provided for streaming - falling back to non-streaming")
-            return self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls)
+            return self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls, retry_count=0)
         
         # Track tool states for status updates
         tool_states = {
@@ -2827,14 +2829,15 @@ MIME Type: {mimetype}
             
             # Fall back to non-streaming on error
             self.log_info("Falling back to non-streaming due to error")
-            
+
             # Remove the message that was just added by streaming attempt
             # to prevent duplicates when fallback adds it again
             if thread_state.messages and thread_state.messages[-1].get("role") == "user":
                 removed_msg = thread_state.messages.pop()
                 self.log_debug("Removed duplicate user message before fallback")
-            
-            return self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls)
+
+            # Pass retry_count=1 to prevent re-entering streaming after timeout
+            return self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls, retry_count=1)
 
     def _handle_vision_analysis(self, user_text: str, image_inputs: List[Dict], thread_state, attachments: List[Dict],
                                client: BaseClient, channel_id: str, thinking_id: Optional[str], message: Message) -> Response:
@@ -3785,7 +3788,7 @@ MIME Type: {mimetype}
             self._update_status(client, channel_id, thinking_id, "Generating comprehensive response...", emoji=config.thinking_emoji)
             
             # Use text response handler with the combined context
-            return self._handle_text_response(combined_context, thread_state, client, message, thinking_id)
+            return self._handle_text_response(combined_context, thread_state, client, message, thinking_id, retry_count=0)
             
         except Exception as e:
             self.log_error(f"Mixed content analysis failed: {e}", exc_info=True)
@@ -3821,7 +3824,7 @@ MIME Type: {mimetype}
         
         # Don't attach documents to the message - they're already in the thread history
         # The model will have access to them from the conversation context
-        return self._handle_text_response(text, thread_state, client, message, thinking_id)
+        return self._handle_text_response(text, thread_state, client, message, thinking_id, retry_count=0)
     
     def _handle_image_edit(
         self,
