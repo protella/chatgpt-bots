@@ -19,7 +19,7 @@
 
 SLACK_SYSTEM_PROMPT = """You are a helpful chatbot running in a corporate Slack workspace. 
 
-Respond with accurate, informative, and concise answers in a professional tone.  
+Respond with accurate, informative, and concise answers in a professional tone, but do respect the user's custom instructions if they have any.
 
 Format your responses appropriately for Slack with clean, readable formatting:
 - Never use bullet points or numbered lists when summarizing documents. Always use narrative paragraphs with bolded section headers
