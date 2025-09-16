@@ -12,7 +12,7 @@ from typing import Optional
 from config import config
 from logger import log_session_start, log_session_end, main_logger
 from message_processor import MessageProcessor
-from base_client import BaseClient, Message, Response
+from base_client import BaseClient, Message
 
 
 class ChatBotV2:

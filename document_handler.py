@@ -9,15 +9,12 @@ Designed to maintain full document context without truncation and store complete
 import re
 import base64
 from io import BytesIO
-from typing import Dict, List, Optional, Any, Union, Tuple
-from urllib.parse import unquote
-import logging
+from typing import Dict, List, Optional, Any
 
 import pdfplumber
 import PyPDF2
 from pdf2image import convert_from_bytes
 from docx import Document
-import openpyxl
 import pandas as pd
 
 from logger import LoggerMixin
@@ -692,7 +689,7 @@ class DocumentHandler(LoggerMixin):
         # Read all sheets
         try:
             all_sheets = pd.read_excel(BytesIO(file_data), sheet_name=None, engine='openpyxl')
-        except:
+        except Exception:
             # Try without specifying engine
             all_sheets = pd.read_excel(BytesIO(file_data), sheet_name=None)
         
@@ -759,7 +756,7 @@ class DocumentHandler(LoggerMixin):
                                sep=sep, on_bad_lines='skip', nrows=10000)
                 if len(df.columns) > 1:  # Found good separator
                     break
-            except:
+            except Exception:
                 continue
         else:
             # Fallback: assume comma separation
@@ -964,7 +961,7 @@ class DocumentHandler(LoggerMixin):
                 # Check if we got mostly readable text (not binary garbage)
                 if text.strip() and len([c for c in text[:100] if c.isprintable()]) > 80:
                     return f"[Raw text extraction from {filename}]\n{text}"
-            except:
+            except Exception:
                 continue
         
         return f"[Unable to extract readable text from {filename}]"
@@ -1161,7 +1158,7 @@ class DocumentHandler(LoggerMixin):
                 parts = parts[:target_cols]
             
             return '| ' + ' | '.join(parts) + ' |'
-        except:
+        except Exception:
             return row
     
     def convert_pdf_to_images(self, file_data: bytes, max_pages: int = 10) -> List[Dict[str, Any]]:
