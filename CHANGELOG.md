@@ -2,6 +2,52 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.3] - 2024-12-15
+
+### 🔧 Code Quality & Reliability Improvements
+
+#### Changed
+- Refactored codebase to improve maintainability and reliability
+- Cleaned up unused imports across all modules
+- Fixed unused variables (`channel`, `truncated`, `content_preview`, `removed_msg`, etc.)
+- Replaced bare except clauses with specific `Exception` handling
+- Cleaned up f-string placeholders without variables
+- Improved custom instructions handling in main prompt
+
+#### Added
+- Comprehensive timeout error handling test suite (`test_timeout_error_handling.py`)
+- 586 new test cases covering various error scenarios
+- Better error context and recovery strategies
+
+#### Fixed
+- All linting issues identified by ruff and pyright diagnostics
+- Improved exception propagation throughout the codebase
+
+## [2.0.2] - 2024-12-14
+
+### 🐛 Bug Fixes
+
+#### Fixed
+- Prevented infinite retry loop on OpenAI timeout errors
+- Reduced duplicate logging in error scenarios
+- Improved timeout handling with proper circuit breaker implementation
+
+## [2.0.1] - 2024-12-13
+
+### ✨ Features & Documentation
+
+#### Added
+- Context-aware vision enhancement for better screenshot handling
+- Slack app manifest file for easy app configuration
+- Slack app commands documentation in README
+
+#### Changed
+- Made vision prompt enhancement more intelligent based on image context
+- Improved handling of screenshot analysis
+
+#### Developer
+- Added debugging capabilities for Slack shortcut handlers (later reverted)
+
 ## [2.0.0] - 2024-09-12
 
 ### 🎉 Major Release - Complete V2 Rewrite
