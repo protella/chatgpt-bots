@@ -5,7 +5,6 @@ All Slack-specific functionality
 import re
 import json
 import time
-import base64
 from typing import Optional, List, Dict, Any
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -111,7 +110,7 @@ class SlackBot(BaseClient):
                         user=user_id,
                         text="❌ Sorry, I couldn't open the settings modal. Please try again."
                     )
-                except:
+                except Exception:
                     pass
         
         # Register modal submission handlers
@@ -134,7 +133,7 @@ class SlackBot(BaseClient):
             # For new users, always save to global regardless of scope selection
             if is_new_user:
                 selected_scope = 'global'
-                self.log_info(f"New user setup - forcing save to global settings")
+                self.log_info("New user setup - forcing save to global settings")
             else:
                 selected_scope = metadata.get('scope', 'thread' if in_thread else 'global')  # Get selected scope
             
@@ -159,7 +158,7 @@ class SlackBot(BaseClient):
                 
                 if existing_custom:
                     needs_confirmation = True
-                    self.log_debug(f"Confirmation needed: saving thread custom instructions to global with existing global instructions")
+                    self.log_debug("Confirmation needed: saving thread custom instructions to global with existing global instructions")
             
             if needs_confirmation:
                 # Push confirmation modal on top of settings modal (preserves settings modal underneath)
@@ -266,9 +265,6 @@ class SlackBot(BaseClient):
             if success:
                 # Send confirmation message
                 try:
-                    # Get the channel from the original command or use user's DM
-                    channel = body.get('view', {}).get('private_metadata', user_id)
-                    
                     # Determine message based on save location
                     if save_location == "thread" and thread_id:
                         # Send ephemeral confirmation in the thread
@@ -321,7 +317,7 @@ class SlackBot(BaseClient):
                                 channel=msg_info['channel'],
                                 ts=msg_info['ts']
                             )
-                        except:
+                        except Exception:
                             pass  # Best effort
                     del self._reminder_messages[user_id]
                     self.log_debug(f"Cleaned up reminder messages for user {user_id}")
@@ -364,7 +360,7 @@ class SlackBot(BaseClient):
                             ]
                         )
                         self.log_debug(f"Updated welcome message to compact settings button for user {user_id}")
-                    except:
+                    except Exception:
                         pass  # Best effort
                     del self._welcome_messages[user_id]
                 
@@ -374,48 +370,61 @@ class SlackBot(BaseClient):
                     self._welcomed_users.remove(user_id)
                     
                 # Process pending message if this was from welcome flow (only for global settings)
-                if save_location == "global" and pending_message and pending_message.get('original_message'):
-                    self.log_info(f"Processing pending message for new user {user_id}: {pending_message['original_message']}")
-                    if pending_message.get('attachments'):
-                        self.log_info(f"Found {len(pending_message['attachments'])} attachments in pending message")
-                    try:
-                        # Create a synthetic Slack event for the original message
-                        synthetic_event = {
-                            'type': 'message',
-                            'text': pending_message['original_message'],
-                            'user': user_id,
-                            'channel': pending_message['channel_id'],
-                            'thread_ts': pending_message.get('thread_id'),
-                            'ts': pending_message.get('ts') or pending_message.get('thread_id') or str(time.time())
-                        }
-                        
-                        # Add file attachments if they were present in original message
-                        if pending_message.get('attachments'):
-                            # Convert our internal format back to Slack format
-                            files = []
-                            for attachment in pending_message['attachments']:
-                                files.append({
-                                    'id': attachment.get('id'),
-                                    'name': attachment.get('name'),
-                                    'mimetype': attachment.get('mimetype'),
-                                    'url_private': attachment.get('url')
-                                })
-                            synthetic_event['files'] = files
-                        
-                        # Process the original message now that settings are configured
-                        self._handle_slack_message(synthetic_event, client)
-                        
-                    except Exception as e:
-                        self.log_error(f"Error processing pending message: {e}")
-                        # Send error message to user
+                if save_location == "global" and pending_message:
+                    # Check if message was too long to store
+                    if pending_message.get('too_long'):
+                        self.log_info(f"Original message was too long for new user {user_id}")
+                        # Notify the user to resend their message IN THE THREAD
                         try:
                             client.chat_postMessage(
-                                channel=pending_message['channel_id'],
-                                thread_ts=pending_message.get('thread_id'),
-                                text="I'm ready now! Could you please repeat your question?"
+                                channel=pending_message.get('channel_id', user_id),
+                                thread_ts=pending_message.get('thread_id'),  # Send to thread if it exists
+                                text="✅ Settings saved! I couldn't save your initial message during setup (too long). Please send it again and I'll process it normally."
                             )
-                        except:
+                        except Exception:
                             pass
+                    elif pending_message.get('original_message'):
+                        self.log_info(f"Processing pending message for new user {user_id}: {pending_message['original_message']}")
+                        if pending_message.get('attachments'):
+                            self.log_info(f"Found {len(pending_message['attachments'])} attachments in pending message")
+                        try:
+                            # Create a synthetic Slack event for the original message
+                            synthetic_event = {
+                                'type': 'message',
+                                'text': pending_message['original_message'],
+                                'user': user_id,
+                                'channel': pending_message['channel_id'],
+                                'thread_ts': pending_message.get('thread_id'),
+                                'ts': pending_message.get('ts') or pending_message.get('thread_id') or str(time.time())
+                            }
+                        
+                            # Add file attachments if they were present in original message
+                            if pending_message.get('attachments'):
+                                # Convert our internal format back to Slack format
+                                files = []
+                                for attachment in pending_message['attachments']:
+                                    files.append({
+                                        'id': attachment.get('id'),
+                                        'name': attachment.get('name'),
+                                        'mimetype': attachment.get('mimetype'),
+                                        'url_private': attachment.get('url')
+                                    })
+                                synthetic_event['files'] = files
+
+                            # Process the original message now that settings are configured
+                            self._handle_slack_message(synthetic_event, client)
+
+                        except Exception as e:
+                            self.log_error(f"Error processing pending message: {e}")
+                            # Send error message to user
+                            try:
+                                client.chat_postMessage(
+                                    channel=pending_message['channel_id'],
+                                    thread_ts=pending_message.get('thread_id'),
+                                    text="I'm ready now! Could you please repeat your question?"
+                                )
+                            except Exception:
+                                pass
                             
             else:
                 self.log_error(f"Failed to save settings for user {user_id}")
@@ -424,7 +433,7 @@ class SlackBot(BaseClient):
                         channel=user_id,
                         text="❌ Sorry, there was an error saving your settings. Please try again."
                     )
-                except:
+                except Exception:
                     pass
         
         # Handler for custom instructions confirmation modal submission
@@ -518,7 +527,7 @@ class SlackBot(BaseClient):
                     else:
                         # Old format - just settings
                         stored_settings = metadata
-            except:
+            except Exception:
                 pass
             
             # If no stored settings, get user's saved preferences
@@ -593,7 +602,7 @@ class SlackBot(BaseClient):
                         }
                     else:
                         stored_settings = metadata
-            except:
+            except Exception:
                 pass
             
             # Get current form values
@@ -731,7 +740,7 @@ class SlackBot(BaseClient):
                             'in_thread': metadata.get('in_thread', False),
                             'scope': selected_scope  # Update the scope
                         }
-            except:
+            except Exception:
                 pass
             
             # Extract current form values to preserve user's changes
@@ -831,7 +840,7 @@ class SlackBot(BaseClient):
             button_value = body['actions'][0].get('value', '{}')
             try:
                 original_context = json.loads(button_value)
-            except:
+            except Exception:
                 original_context = {}
             
             # Check if this was a truncated message that needs to be fetched
@@ -938,10 +947,30 @@ class SlackBot(BaseClient):
                     in_thread=in_thread
                 )
                 
-                # Add the original message context to the modal's private_metadata
-                existing_metadata = json.loads(modal.get('private_metadata', '{}'))
-                existing_metadata['pending_message'] = original_context
-                modal['private_metadata'] = json.dumps(existing_metadata)
+                # Only add the original message context for new users who need to reprocess their message
+                if is_new_user and original_context and original_context.get('original_message'):
+                    existing_metadata = json.loads(modal.get('private_metadata', '{}'))
+                    # Check if adding the message would exceed Slack's limit
+                    test_metadata = existing_metadata.copy()
+                    test_metadata['pending_message'] = original_context
+
+                    if len(json.dumps(test_metadata)) > 3000:
+                        # Message too long - skip storing it and notify user later
+                        self.log_info(f"Pending message too long for metadata ({len(json.dumps(test_metadata))} chars), will ask user to resend")
+                        # Store a flag that we need to ask them to resend
+                        existing_metadata['pending_message'] = {
+                            'too_long': True,
+                            'channel_id': original_context.get('channel_id'),
+                            'thread_id': original_context.get('thread_id')
+                        }
+                    else:
+                        # Message fits, store it normally
+                        existing_metadata['pending_message'] = original_context
+
+                    modal['private_metadata'] = json.dumps(existing_metadata)
+                    self.log_debug(f"Metadata size for new user: {len(json.dumps(existing_metadata))} chars")
+                else:
+                    self.log_debug(f"Not adding pending message - is_new_user: {is_new_user}, has_message: {bool(original_context and original_context.get('original_message'))}")
                 
                 response = client.views_open(
                     trigger_id=trigger_id,
@@ -1259,11 +1288,9 @@ class SlackBot(BaseClient):
                             "attachment_count": len(message.attachments),
                             "truncated": True
                         })
-                        truncated = True
                         self.log_info(f"Welcome button value too large ({len(full_value)} chars), using truncated version")
                     else:
                         button_value = full_value
-                        truncated = False
                     
                     # Check if we're in a channel/thread vs DM
                     is_dm = message.channel_id.startswith('D')
@@ -1419,11 +1446,9 @@ class SlackBot(BaseClient):
                             "attachment_count": len(message.attachments),
                             "truncated": True
                         })
-                        truncated = True
                         self.log_info(f"Button value too large ({len(full_value)} chars), using truncated version")
                     else:
                         button_value = full_value
-                        truncated = False
                     
                     # Full welcome message for new users
                     blocks = [
@@ -1857,7 +1882,7 @@ class SlackBot(BaseClient):
                 # Check if we got actual image data
                 content_type = response.headers.get('content-type', '').lower()
                 if 'text/html' in content_type:
-                    self.log_error(f"Got HTML instead of image data from private URL")
+                    self.log_error("Got HTML instead of image data from private URL")
                     self.log_debug(f"Response preview: {response.text[:200]}")
                     return None
                 return response.content
@@ -1901,7 +1926,7 @@ class SlackBot(BaseClient):
                 error_dict = json.loads(error_dict_str)
                 error_message = error_dict.get('error', {}).get('message', error)
                 error_type = error_dict.get('error', {}).get('type', 'unknown_error')
-            except:
+            except Exception:
                 # Fallback to simpler extraction
                 if "'message':" in error:
                     msg_start = error.find("'message': '") + len("'message': '")
@@ -1918,11 +1943,11 @@ class SlackBot(BaseClient):
             error_type = "general_error"
         
         # Format the error message for Slack
-        formatted = f":warning: *Oops! Something went wrong*\n\n"
+        formatted = ":warning: *Oops! Something went wrong*\n\n"
         formatted += f"*Error Code:* `{error_code}`\n"
         formatted += f"*Type:* `{error_type}`\n\n"
         formatted += f"*Details:*\n```{error_message}```\n\n"
-        formatted += f":bulb: *What you can do:*\n"
+        formatted += ":bulb: *What you can do:*\n"
         
         # Add helpful suggestions based on error type
         if "rate_limit" in error_type.lower():
@@ -2000,7 +2025,7 @@ class SlackBot(BaseClient):
         except SlackApiError as e:
             # Handle msg_too_long error specifically
             if e.response.get('error') == 'msg_too_long':
-                self.log_warning(f"Message too long for Slack, truncating more aggressively")
+                self.log_warning("Message too long for Slack, truncating more aggressively")
                 # Try with much shorter message
                 very_short = formatted_text[:2000] + "\n\n*...continued in next message...*"
                 if very_short.count('```') % 2 == 1:
@@ -2019,7 +2044,7 @@ class SlackBot(BaseClient):
                         "retry_after": None,
                         "result": result
                     }
-                except:
+                except Exception:
                     # If even the short version fails, just acknowledge the error
                     self.log_error("Even truncated message failed to send")
                     raise
@@ -2034,7 +2059,7 @@ class SlackBot(BaseClient):
                     except (ValueError, KeyError):
                         retry_after = None
                 
-                self.log_warning(f"🚨🚨🚨 HIT RATE LIMIT 429 🚨🚨🚨")
+                self.log_warning("🚨🚨🚨 HIT RATE LIMIT 429 🚨🚨🚨")
                 
                 return {
                     "success": False,

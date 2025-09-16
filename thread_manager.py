@@ -4,7 +4,7 @@ Manages conversation state, locks, and memory for each Slack thread
 """
 import time
 import threading
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from threading import Lock
 from logger import LoggerMixin
@@ -82,7 +82,7 @@ class ThreadState:
                 current_tokens = token_counter.count_thread_tokens(self.messages)
                 logger.debug(f"Removed message {removed_count}, tokens now: {current_tokens}")
             else:
-                logger.warning(f"Cannot trim further - would remove current message")
+                logger.warning("Cannot trim further - would remove current message")
                 break
         
         # Delete from database if available
@@ -362,29 +362,29 @@ class ThreadStateManager(LoggerMixin):
     def _start_watchdog(self):
         """Start the background thread that monitors for stuck locks"""
         def watchdog():
-            # Watchdog timeout should be LONGER than API timeout
-            # This gives the API call time to timeout naturally and release the lock
-            # Only force-release if the lock is still held after the API should have timed out
+            # Watchdog should be MUCH more aggressive to prevent 630s double timeouts
+            # Check frequently and release locks that are stuck after API timeout
             api_timeout = int(config.api_timeout_read)
-            max_lock_duration = api_timeout + 30  # Give 30s buffer after API timeout
+            # Use a SHORTER timeout - don't add extra time, just detect stuck threads
+            max_lock_duration = api_timeout + 5  # Only 5s buffer after API timeout
             self.log_info(f"Thread lock watchdog started with {max_lock_duration}s timeout (API timeout: {api_timeout}s)")
-            
+
             while True:
                 try:
-                    time.sleep(30)  # Check every 30 seconds
-                    
+                    time.sleep(10)  # Check every 10 seconds instead of 30
+
                     # Get stuck threads (locked for more than API timeout duration)
                     stuck_threads = self._lock_manager.get_stuck_threads(max_duration=max_lock_duration)
-                    
+
                     for thread_key in stuck_threads:
                         self.log_error(f"Detected stuck thread: {thread_key} - attempting force release after {max_lock_duration}s")
-                        
+
                         # Mark thread as no longer processing
                         if thread_key in self._threads:
                             self._threads[thread_key].is_processing = False
                             # Store that this thread had a timeout for notification
                             self._threads[thread_key].had_timeout = True
-                        
+
                         # Force release the lock
                         if self._lock_manager.force_release(thread_key):
                             self.log_warning(f"Successfully force-released stuck thread: {thread_key}")
@@ -425,8 +425,8 @@ class ThreadStateManager(LoggerMixin):
                 # If database available, check for persisted state
                 if self.db:
                     # Get or create in database
-                    db_thread = self.db.get_or_create_thread(thread_key, channel_id, user_id)
-                    
+                    self.db.get_or_create_thread(thread_key, channel_id, user_id)
+
                     # Load config from database if exists
                     thread_config = self.db.get_thread_config(thread_key)
                     if thread_config:

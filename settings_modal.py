@@ -2,10 +2,9 @@
 User Settings Modal for Slack Bot
 Handles the interactive settings configuration interface
 """
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, List
 from config import config
 from logger import LoggerMixin
-import time
 import json
 
 
@@ -264,7 +263,7 @@ class SettingsModal(LoggerMixin):
         if web_search_enabled and current_reasoning == 'minimal':
             # If web search is on but reasoning is minimal, use low
             current_reasoning = 'low'
-            self.log_debug(f"Adjusted reasoning from minimal to low for display")
+            self.log_debug("Adjusted reasoning from minimal to low for display")
         elif not current_reasoning or current_reasoning not in ['minimal', 'low', 'medium', 'high']:
             # Fallback if no valid reasoning is set
             current_reasoning = 'low' if web_search_enabled else 'medium'

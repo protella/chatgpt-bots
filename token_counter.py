@@ -3,7 +3,7 @@ Token counting utility for managing thread context sizes
 Uses tiktoken to count tokens and manage context windows
 """
 import tiktoken
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Tuple
 from logger import LoggerMixin
 
 
@@ -119,8 +119,6 @@ class TokenCounter(LoggerMixin):
         if role:
             tokens += self.count_tokens(role)
         
-        # Check for metadata that indicates images
-        metadata = message.get("metadata", {})
         # Note: We do NOT add tokens for vision_analysis metadata
         # Images are processed in a separate API call (analyze_images)
         # and are not part of the conversation history sent to the text API.

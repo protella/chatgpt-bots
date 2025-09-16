@@ -3,12 +3,10 @@ OpenAI Client wrapper for Responses API
 Handles all interactions with OpenAI's GPT and image generation models
 """
 import base64
-import signal
 import time
 import functools
-from contextlib import contextmanager
 from io import BytesIO
-from typing import Optional, List, Dict, Any, Tuple, Callable
+from typing import Optional, List, Dict, Any, Callable
 from dataclasses import dataclass
 from openai import OpenAI
 from config import config
@@ -732,18 +730,21 @@ class OpenAIClient(LoggerMixin):
         self,
         messages: List[Dict[str, Any]],
         last_user_message: str,
-        has_attached_images: bool = False
+        has_attached_images: bool = False,
+        max_retries: int = 2
     ) -> str:
         """
-        Classify user intent using a lightweight model
-        
+        Classify user intent using a lightweight model with retry logic
+
         Args:
             messages: Recent conversation context (last 6-8 exchanges)
             last_user_message: The latest user message to classify
             has_attached_images: Whether the current message has images attached
-        
+            max_retries: Number of retry attempts on timeout (default: 2)
+
         Returns:
             Intent classification: 'new_image', 'modify_image', or 'text_only'
+            Returns 'error' if classification fails after retries
         """
         # Build properly structured conversation
         conversation_messages = []
@@ -872,17 +873,70 @@ class OpenAIClient(LoggerMixin):
             self.log_debug(f"Classified intent: {intent}")
             return intent
             
-        except TimeoutError as e:
-            # Timeout is somewhat expected - log as warning, not error
-            self.log_warning(f"Intent classification timed out after {30 if 'intent' in str(e) else self.client.timeout}s - defaulting to text_only")
-            return 'text_only'  # Default to text on timeout
+        except TimeoutError:
+            # On timeout, retry with exponential backoff
+            for retry in range(1, max_retries + 1):
+                wait_time = 2 ** (retry - 1)  # 1s, 2s, 4s...
+                self.log_warning(f"Intent classification timeout (attempt {retry}/{max_retries}), retrying in {wait_time}s...")
+                time.sleep(wait_time)
+
+                try:
+                    # Retry the classification
+                    response = self._safe_api_call(
+                        self.client.responses.create,
+                        operation_type="intent",
+                        timeout_seconds=15,  # Shorter timeout for retries
+                        **request_params
+                    )
+
+                    # Process response (same as above)
+                    result = ""
+                    if response.output:
+                        for item in response.output:
+                            if hasattr(item, "content") and item.content:
+                                for content in item.content:
+                                    if hasattr(content, "text"):
+                                        result += content.text
+
+                    result = result.strip().lower()
+
+                    # Validate and map result
+                    if ' ' in result or len(result) > 20:
+                        result = "none"
+
+                    # Map to intent
+                    if result == "new":
+                        intent = "new_image"
+                    elif result == "edit":
+                        intent = "edit_image"
+                    elif result == "ambiguous":
+                        intent = "ambiguous_image"
+                    elif result == "vision":
+                        intent = "vision"
+                    else:
+                        intent = "text_only"
+
+                    self.log_info(f"Intent classification succeeded on retry {retry}: {intent}")
+                    return intent
+
+                except TimeoutError:
+                    if retry == max_retries:
+                        self.log_error(f"Intent classification failed after {max_retries} retries")
+                        return 'error'  # Return error to trigger proper error handling
+                    continue
+                except Exception as retry_error:
+                    self.log_error(f"Retry {retry} failed with error: {retry_error}")
+                    if retry == max_retries:
+                        return 'error'
+                    continue
+
+            # Should not reach here, but failsafe
+            return 'error'
+
         except Exception as e:
             self.log_error(f"Error classifying intent: {e}")
             self.log_error(f"Exception type: {type(e).__name__}")
-            self.log_error(f"Occurred at: {time.strftime('%H:%M:%S')}")
-            import traceback
-            self.log_error(f"Traceback: {traceback.format_exc()}")
-            return 'text_only'  # Default to text on error
+            return 'error'  # Return error instead of defaulting to text
     def generate_image(
         self,
         prompt: str,
@@ -1498,7 +1552,7 @@ class OpenAIClient(LoggerMixin):
                 
                 if not output_text:
                     # Log the full response structure to debug
-                    self.log_warning(f"analyze_images returned empty response")
+                    self.log_warning("analyze_images returned empty response")
                     self.log_debug(f"Response output structure: {response.output if response.output else 'No output'}")
                     
                     # Check if we only got reasoning tokens

@@ -8,10 +8,11 @@ import re
 import time
 import datetime
 import pytz
+import threading
 from typing import Dict, Any, List, Optional, Tuple
 from base_client import BaseClient, Message, Response
 from thread_manager import ThreadStateManager
-from openai_client import OpenAIClient, ImageData
+from openai_client import OpenAIClient
 from config import config
 from logger import LoggerMixin
 from prompts import SLACK_SYSTEM_PROMPT, DISCORD_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, IMAGE_ANALYSIS_PROMPT
@@ -20,7 +21,7 @@ from image_url_handler import ImageURLHandler
 try:
     from document_handler import DocumentHandler
     DOCUMENT_HANDLER_AVAILABLE = True
-except ImportError as e:
+except ImportError:
     DocumentHandler = None
     DOCUMENT_HANDLER_AVAILABLE = False
 
@@ -100,7 +101,6 @@ class MessageProcessor(LoggerMixin):
         
         # Log token info in debug mode
         total_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-        content_preview = str(content)[:50] + "..." if len(str(content)) > 50 else str(content)
         self.log_debug(f"MESSAGE ADDED | Role: {role} | Tokens: {msg_tokens} | Total: {total_tokens}/{max_tokens}")
     
     def _pre_trim_messages_for_api(self, messages: List[Dict[str, Any]], new_message_tokens: int = 0, model: str = None, thread_state=None) -> List[Dict[str, Any]]:
@@ -149,12 +149,12 @@ class MessageProcessor(LoggerMixin):
         # Remove messages from the beginning (after system messages)
         while current_tokens > max_tokens and len(trimmed_messages) > start_index + 1:
             if start_index < len(trimmed_messages) - 1:
-                removed_msg = trimmed_messages.pop(start_index)
+                trimmed_messages.pop(start_index)
                 removed_count += 1
                 current_tokens = self.thread_manager._token_counter.count_thread_tokens(trimmed_messages) + new_message_tokens
                 self.log_debug(f"Pre-trimmed message {removed_count}, tokens now: {current_tokens}")
             else:
-                self.log_warning(f"Cannot trim further - would remove current message")
+                self.log_warning("Cannot trim further - would remove current message")
                 break
         
         if removed_count > 0:
@@ -703,10 +703,32 @@ MIME Type: {mimetype}
                     combined_context,
                     has_attached_images=len(image_inputs) > 0
                 )
-                
+
+                # Check if intent classification failed
+                if intent == 'error':
+                    # Update thinking message
+                    if thinking_id:
+                        self._update_status(client, message.channel_id, thinking_id,
+                                          "Service temporarily unavailable.",
+                                          emoji=config.error_emoji)
+
+                    elapsed = time.time() - request_start_time
+                    self.log_info("")
+                    self.log_info("="*100)
+                    self.log_info(f"REQUEST END | Thread: {thread_key} | Status: INTENT_ERROR | Time: {elapsed:.2f}s")
+                    self.log_info("="*100)
+                    self.log_info("")
+
+                    return Response(
+                        type="error",
+                        content="⚠️ **Service Temporarily Unavailable**\n\n"
+                                "OpenAI is experiencing issues right now.\n\n"
+                                "Please try again in a few moments."
+                    )
+
                 # Clear the pending clarification
                 thread_state.pending_clarification = None
-                
+
                 # Use the original request text for processing
                 message.text = original_request
                 self.log_debug(f"Clarified intent: {intent}")
@@ -1049,49 +1071,129 @@ MIME Type: {mimetype}
             self.log_info("")
             return response
             
+        except TimeoutError as e:
+            # Handle timeout errors gracefully without stack trace
+            elapsed = time.time() - request_start_time
+            # Try to get token count even on error
+            try:
+                error_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages) if 'thread_state' in locals() else 0
+                token_info = f" | Tokens: {error_tokens}" if error_tokens > 0 else ""
+            except Exception:
+                token_info = ""
+
+            self.log_warning(f"Request timeout after {elapsed:.2f} seconds for thread {thread_key}: {e}")
+
+            self.log_info("")
+            self.log_info("="*100)
+            self.log_info(f"REQUEST END | Thread: {thread_key} | Status: TIMEOUT | Time: {elapsed:.2f}s{token_info}")
+            self.log_info("="*100)
+            self.log_info("")
+
+            # Update thinking message to show timeout
+            if thinking_id and hasattr(client, 'update_message'):
+                timeout_msg = f"{config.error_emoji} Service is slow right now. Try again shortly."
+                try:
+                    client.update_message(message.channel_id, thinking_id, timeout_msg)
+                    self.log_debug("Updated thinking message to show timeout")
+                except Exception as update_error:
+                    self.log_error(f"Failed to update thinking message: {update_error}")
+
+            # Mark thread as having a timeout for recovery
+            if 'thread_state' in locals() and thread_state:
+                thread_state.had_timeout = True
+
+            error_message = (
+                "⏱️ **Taking Too Long**\n\n"
+                "OpenAI is being slow right now.\n\n"
+                "Please try again in a moment."
+            )
+
+            return Response(
+                type="error",
+                content=error_message
+            )
         except Exception as e:
+            # Log full error details for non-timeout exceptions
             self.log_error(f"Error processing message: {e}", exc_info=True)
             elapsed = time.time() - request_start_time
             # Try to get token count even on error
             try:
                 error_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages) if 'thread_state' in locals() else 0
                 token_info = f" | Tokens: {error_tokens}" if error_tokens > 0 else ""
-            except:
+            except Exception:
                 token_info = ""
-            
+
             self.log_info("")
             self.log_info("="*100)
             self.log_info(f"REQUEST END | Thread: {thread_key} | Status: ERROR | Time: {elapsed:.2f}s{token_info}")
             self.log_info("="*100)
             self.log_info("")
-            
-            # Check if this is a timeout error
+
+            # Check if this is a timeout error that wasn't caught as TimeoutError
             error_str = str(e)
             error_type = type(e).__name__
-            
-            # Check for various timeout error types
-            if any(timeout_indicator in error_str.lower() or timeout_indicator in error_type.lower() 
-                   for timeout_indicator in ['timeout', 'readtimeout', 'connecttimeout', 'timeouterror']):
+
+            # Check for various timeout error types that weren't caught as TimeoutError
+            if any(timeout_indicator in error_str.lower() or timeout_indicator in error_type.lower()
+                   for timeout_indicator in ['timeout', 'readtimeout', 'connecttimeout']):
+                # Update thinking message to show timeout
+                if thinking_id and hasattr(client, 'update_message'):
+                    timeout_msg = f"{config.error_emoji} Service is slow right now. Try again shortly."
+                    try:
+                        client.update_message(message.channel_id, thinking_id, timeout_msg)
+                    except Exception:
+                        pass  # Don't let update failure affect error handling
+
+                # Mark as timeout for recovery
+                if 'thread_state' in locals() and thread_state:
+                    thread_state.had_timeout = True
+
                 # Timeout-specific error message
                 error_message = (
-                    "The request timed out while waiting for a response. "
-                    "This can happen with complex requests or when the service is busy. "
+                    "⏱️ **Taking Too Long**\n\n"
+                    "OpenAI is being slow right now.\n\n"
                     "Please try again in a moment."
                 )
-                self.log_warning(f"Request timeout after {elapsed:.2f} seconds for thread {thread_key}")
+                self.log_warning(f"Request timeout (via string match) after {elapsed:.2f} seconds for thread {thread_key}")
             else:
-                # Generic error message with details
-                error_message = str(e)
-            
+                # Update thinking message to show error
+                if thinking_id and hasattr(client, 'update_message'):
+                    error_msg = f"{config.error_emoji} Something went wrong. Try again."
+                    try:
+                        client.update_message(message.channel_id, thinking_id, error_msg)
+                    except Exception:
+                        pass  # Don't let update failure affect error handling
+
+                # Generic error message - keep it simple for users
+                # Log the actual error for debugging, but don't show technical details to user
+                error_details = str(e)
+
+                # Check for common error types and provide user-friendly messages
+                if "rate" in error_details.lower() or "limit" in error_details.lower():
+                    error_message = f"{config.error_emoji} **Too Many Requests**\n\nOpenAI is busy. Please wait a minute and try again."
+                elif "context" in error_details.lower() or "token" in error_details.lower():
+                    error_message = f"{config.error_emoji} **Message Too Long**\n\nYour message is too long. Please try a shorter request."
+                elif "api" in error_details.lower() or "openai" in error_details.lower():
+                    error_message = f"{config.error_emoji} **Service Issue**\n\nOpenAI is having problems. Please try again shortly."
+                else:
+                    # Generic fallback
+                    error_message = f"{config.error_emoji} **Something Went Wrong**\n\nPlease try again. If this keeps happening, try later."
+
             return Response(
                 type="error",
                 content=error_message
             )
         finally:
-            self.thread_manager.release_thread_lock(
-                message.thread_id,
-                message.channel_id
-            )
+            # Always release the thread lock, even on timeout
+            try:
+                self.thread_manager.release_thread_lock(
+                    message.thread_id,
+                    message.channel_id
+                )
+                self.log_debug(f"Thread lock released for {thread_key}")
+            except Exception as lock_error:
+                # Even if release fails, log it but don't crash
+                self.log_error(f"Error releasing thread lock for {thread_key}: {lock_error}")
     
     def _inject_image_analyses(self, messages: List[Dict], thread_state) -> List[Dict]:
         """Inject stored image analyses into conversation for context"""
@@ -2179,7 +2281,7 @@ MIME Type: {mimetype}
                 if not timezone_display or timezone_display == user_tz.zone:
                     # If strftime doesn't give us an abbreviation, use the full zone name
                     timezone_display = user_tz.zone
-        except:
+        except Exception:
             # Fallback to UTC if timezone is invalid
             current_time = datetime.datetime.now(pytz.UTC)
             timezone_display = "UTC"
@@ -2242,6 +2344,67 @@ MIME Type: {mimetype}
             self.log_debug("No thinking_id provided for status update")
         else:
             self.log_debug("Client doesn't support message updates")
+
+    def _start_progress_updater(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], operation: str = "request") -> threading.Thread:
+        """Start a background thread that updates thinking message periodically"""
+        if not thinking_id or not hasattr(client, 'update_message'):
+            return None
+
+        stop_event = threading.Event()
+        start_time = time.time()
+
+        def update_progress():
+            messages = [
+                f"Processing your {operation}...",
+                f"Still working on your {operation}...",
+                "This is taking longer than expected...",
+                "Thank you for your patience...",
+                f"Still processing your {operation}..."
+            ]
+
+            intervals = [10, 20, 30, 45, 60]  # Seconds before each message
+            message_index = 0
+
+            while not stop_event.is_set() and message_index < len(messages):
+                elapsed = int(time.time() - start_time)
+
+                # Wait for the next interval
+                if message_index < len(intervals):
+                    wait_time = intervals[message_index] - elapsed
+                    if wait_time > 0:
+                        stop_event.wait(wait_time)
+                        if stop_event.is_set():
+                            break
+
+                # Update message
+                elapsed = int(time.time() - start_time)
+                progress_msg = f"{messages[message_index]} ({elapsed}s)"
+                try:
+                    self._update_status(client, channel_id, thinking_id, progress_msg, emoji=config.thinking_emoji)
+                except Exception as e:
+                    self.log_error(f"Failed to update progress: {e}")
+                    break
+
+                message_index += 1
+
+                # After all messages, just update the time every 30s
+                if message_index >= len(messages):
+                    while not stop_event.is_set():
+                        stop_event.wait(30)
+                        if stop_event.is_set():
+                            break
+                        elapsed = int(time.time() - start_time)
+                        try:
+                            self._update_status(client, channel_id, thinking_id,
+                                             f"Still processing... ({elapsed}s)",
+                                             emoji=config.thinking_emoji)
+                        except Exception:
+                            break
+
+        thread = threading.Thread(target=update_progress, daemon=True)
+        thread.stop_event = stop_event  # Attach stop event to thread for later access
+        thread.start()
+        return thread
     
     def _update_thinking_for_image(self, client: BaseClient, channel_id: str, thinking_id: str):
         """Update the thinking indicator to show image generation message"""
@@ -2497,10 +2660,7 @@ MIME Type: {mimetype}
             "web_search": 0,
             "file_search": 0
         }
-        
-        # Track if we've started streaming text yet
-        text_streaming_started = False
-        
+
         # Define tool event callback
         def tool_callback(tool_type: str, status: str):
             """Handle tool events for status updates"""
@@ -2541,7 +2701,7 @@ MIME Type: {mimetype}
                     try:
                         result = client.update_message_streaming(message.channel_id, message_id, status_msg)
                         if result["success"]:
-                            self.log_info(f"Image generation started - updated status")
+                            self.log_info("Image generation started - updated status")
                         else:
                             self.log_warning(f"Failed to update image gen status: {result.get('error', 'Unknown error')}")
                     except Exception as e:
@@ -2833,7 +2993,7 @@ MIME Type: {mimetype}
             # Remove the message that was just added by streaming attempt
             # to prevent duplicates when fallback adds it again
             if thread_state.messages and thread_state.messages[-1].get("role") == "user":
-                removed_msg = thread_state.messages.pop()
+                thread_state.messages.pop()
                 self.log_debug("Removed duplicate user message before fallback")
 
             # Pass retry_count=1 to prevent re-entering streaming after timeout
