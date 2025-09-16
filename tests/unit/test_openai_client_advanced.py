@@ -6,7 +6,7 @@ import time
 from io import BytesIO
 from openai import OpenAI
 
-from openai_client import OpenAIClient, ImageData, timeout_wrapper
+from openai_client import OpenAIClient, ImageData
 
 
 class TestOpenAIClientStreaming:
@@ -376,38 +376,8 @@ class TestOpenAIClientImageOperations:
             )
 
 
-class TestTimeoutWrapper:
-    """Test the timeout wrapper decorator"""
-    
-    def test_timeout_wrapper_success(self):
-        """Test timeout wrapper with successful execution"""
-        @timeout_wrapper(timeout_seconds=2.0)
-        def fast_function():
-            return "success"
-        
-        result = fast_function()
-        assert result == "success"
-    
-    def test_timeout_wrapper_timeout(self):
-        """Test timeout wrapper with timeout"""
-        from concurrent.futures import TimeoutError
-        
-        @timeout_wrapper(timeout_seconds=0.1)
-        def slow_function():
-            time.sleep(1.0)
-            return "too slow"
-        
-        with pytest.raises(TimeoutError):
-            slow_function()
-    
-    def test_timeout_wrapper_with_exception(self):
-        """Test timeout wrapper preserving exceptions"""
-        @timeout_wrapper(timeout_seconds=2.0)
-        def failing_function():
-            raise ValueError("Test error")
-        
-        with pytest.raises(ValueError, match="Test error"):
-            failing_function()
+# TestTimeoutWrapper removed - timeout_wrapper was causing zombie threads and has been removed
+# The OpenAI SDK now handles timeouts natively via httpx
 
 
 class TestOpenAIClientErrorHandling:
