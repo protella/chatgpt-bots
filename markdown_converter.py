@@ -3,7 +3,7 @@ Markdown Converter for Multiple Platforms
 Converts standard Markdown to platform-specific formats
 """
 import re
-from typing import List, Optional
+from typing import List
 from logger import LoggerMixin
 
 
@@ -106,7 +106,6 @@ class MarkdownConverter(LoggerMixin):
                 # Convert to Slack code block format
                 lang_match = re.match(r'```(\w+)?\n?([\s\S]*?)```', block)
                 if lang_match:
-                    lang = lang_match.group(1) or ""
                     code = lang_match.group(2)
                     # Slack doesn't support language hints in the same way
                     # Just use triple backticks
