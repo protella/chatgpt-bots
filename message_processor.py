@@ -507,7 +507,7 @@ MIME Type: {mimetype}
             # Check if this thread had a previous timeout
             if hasattr(thread_state, 'had_timeout') and thread_state.had_timeout:
                 # Send timeout notification to user
-                timeout_msg = f"⚠️ Your previous request timed out after {int(config.api_timeout_read)} seconds. Please try again."
+                timeout_msg = f"⚠️ Your previous request timed out - OpenAI's API didn't respond within {int(config.api_timeout_read)} seconds."
                 client.post_message(
                     channel_id=message.channel_id,
                     text=timeout_msg,
@@ -721,9 +721,9 @@ MIME Type: {mimetype}
 
                     return Response(
                         type="error",
-                        content="⚠️ **Service Temporarily Unavailable**\n\n"
-                                "OpenAI is experiencing issues right now.\n\n"
-                                "Please try again in a few moments."
+                        content="⚠️ **OpenAI Not Responding**\n\n"
+                                "OpenAI's API failed to respond after multiple attempts.\n\n"
+                                "This is an OpenAI service issue. Please try again in a few moments."
                     )
 
                 # Clear the pending clarification
@@ -1091,7 +1091,7 @@ MIME Type: {mimetype}
 
             # Update thinking message to show timeout
             if thinking_id and hasattr(client, 'update_message'):
-                timeout_msg = f"{config.error_emoji} Service is slow right now. Try again shortly."
+                timeout_msg = f"{config.error_emoji} OpenAI is not responding. Try again shortly."
                 try:
                     client.update_message(message.channel_id, thinking_id, timeout_msg)
                     self.log_debug("Updated thinking message to show timeout")
@@ -1103,9 +1103,9 @@ MIME Type: {mimetype}
                 thread_state.had_timeout = True
 
             error_message = (
-                "⏱️ **Taking Too Long**\n\n"
-                "OpenAI is being slow right now.\n\n"
-                "Please try again in a moment."
+                "⏱️ **OpenAI Timeout**\n\n"
+                "OpenAI's API is not responding (timed out after 5 minutes).\n\n"
+                "This is an issue on OpenAI's end. Please try again in a moment."
             )
 
             return Response(
@@ -1138,7 +1138,7 @@ MIME Type: {mimetype}
                    for timeout_indicator in ['timeout', 'readtimeout', 'connecttimeout']):
                 # Update thinking message to show timeout
                 if thinking_id and hasattr(client, 'update_message'):
-                    timeout_msg = f"{config.error_emoji} Service is slow right now. Try again shortly."
+                    timeout_msg = f"{config.error_emoji} OpenAI is not responding. Try again shortly."
                     try:
                         client.update_message(message.channel_id, thinking_id, timeout_msg)
                     except Exception:
@@ -2982,7 +2982,7 @@ MIME Type: {mimetype}
                     if buffer.has_content():
                         error_text = buffer.get_complete_text()
                     else:
-                        error_text = f"{config.error_emoji} *Streaming interrupted*\n\nThe response was interrupted. I'll try again without streaming..."
+                        error_text = f"{config.error_emoji} *OpenAI Stream Interrupted*\n\nOpenAI's streaming response was interrupted. I'll try again without streaming..."
                     client.update_message_streaming(message.channel_id, message_id, error_text)
                 except Exception as cleanup_error:
                     self.log_debug(f"Could not remove loading indicator: {cleanup_error}")
@@ -3206,7 +3206,7 @@ MIME Type: {mimetype}
             self.log_error(f"Vision analysis timed out: {e}")
             return Response(
                 type="error",
-                content=f"Image analysis timed out after {int(config.api_timeout_read)} seconds. Please try again."
+                content=f"OpenAI's vision API timed out after {int(config.api_timeout_read)} seconds.\n\nThis is an OpenAI service issue. Please try again."
             )
             
         except Exception as e:
