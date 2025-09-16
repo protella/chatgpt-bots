@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.4] - 2025-09-16
+
+### 🐛 Critical Bug Fix - Bot Hanging Resolution
+
+#### Fixed
+- **Removed problematic `timeout_wrapper` that was causing zombie threads and bot hanging**
+  - The wrapper was creating daemon threads that continued running after timeouts
+  - These threads held HTTP connections, eventually exhausting the connection pool
+  - Bot would become unresponsive after multiple timeouts, requiring manual restart
+- Now using OpenAI SDK's native timeout handling via httpx
+- Bot no longer hangs after consecutive timeout errors
+
+#### Changed
+- Improved timeout error messages to clearly indicate OpenAI as the source
+  - "OpenAI Timeout" instead of generic "Taking Too Long"
+  - "OpenAI's API is not responding" with specific timeout duration
+  - All user-facing messages now explicitly mention OpenAI service issues
+- Updated tests to remove references to deleted `timeout_wrapper`
+
+#### Added
+- Integration tests for intent classification model comparison
+- Better timeout tracking and logging for diagnostics
+
 ## [2.0.3] - 2024-12-15
 
 ### 🔧 Code Quality & Reliability Improvements
