@@ -478,13 +478,22 @@ MIME Type: {mimetype}
         self.log_info("")
         
         request_start_time = time.time()
-        
+
         # Check if thread is busy
-        if not self.thread_manager.acquire_thread_lock(
+        self.log_debug(f"[HANG_DEBUG] About to acquire thread lock for {thread_key}")
+        lock_acquired = False
+        try:
+            lock_acquired = self.thread_manager.acquire_thread_lock(
             message.thread_id, 
             message.channel_id,
-            timeout=0  # Don't wait, return immediately if busy
-        ):
+                timeout=0  # Don't wait, return immediately if busy
+            )
+            self.log_debug(f"[HANG_DEBUG] Lock acquisition result: {lock_acquired}")
+        except Exception as lock_error:
+            self.log_error(f"[HANG_DEBUG] Lock acquisition failed with error: {lock_error}", exc_info=True)
+            raise
+
+        if not lock_acquired:
             elapsed = time.time() - request_start_time
             self.log_info("")
             self.log_info("="*100)
@@ -498,6 +507,7 @@ MIME Type: {mimetype}
         
         try:
             # Get or rebuild thread state
+            self.log_debug(f"[HANG_DEBUG] Lock acquired, getting thread state for {thread_key}")
             thread_state = self._get_or_rebuild_thread_state(
                 message,
                 client,
@@ -1186,14 +1196,15 @@ MIME Type: {mimetype}
         finally:
             # Always release the thread lock, even on timeout
             try:
+                self.log_debug(f"[HANG_DEBUG] About to release thread lock for {thread_key}")
                 self.thread_manager.release_thread_lock(
                     message.thread_id,
                     message.channel_id
                 )
-                self.log_debug(f"Thread lock released for {thread_key}")
+                self.log_debug(f"[HANG_DEBUG] Thread lock successfully released for {thread_key}")
             except Exception as lock_error:
                 # Even if release fails, log it but don't crash
-                self.log_error(f"Error releasing thread lock for {thread_key}: {lock_error}")
+                self.log_error(f"[HANG_DEBUG] Error releasing thread lock for {thread_key}: {lock_error}", exc_info=True)
     
     def _inject_image_analyses(self, messages: List[Dict], thread_state) -> List[Dict]:
         """Inject stored image analyses into conversation for context"""

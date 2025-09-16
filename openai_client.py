@@ -55,7 +55,7 @@ class OpenAIClient(LoggerMixin):
         """
         Wrapper for OpenAI API calls with enforced timeout.
         Falls back to SDK timeout if our wrapper fails.
-        
+
         Args:
             api_method: The API method to call
             timeout_seconds: Override timeout in seconds (uses .env values by default)
@@ -76,13 +76,37 @@ class OpenAIClient(LoggerMixin):
         else:
             # Use general timeout from .env (API_TIMEOUT_READ)
             timeout = config.api_timeout_read
-        
+
         self.log_debug(f"Using timeout: {timeout}s for {operation_type} operation (from .env: read={config.api_timeout_read}s, chunk={config.api_timeout_streaming_chunk}s)")
-        
-        # Let the OpenAI SDK handle timeouts natively - it already configures httpx properly
+
+        # Log httpx client state if available
         try:
-            return api_method(*args, **kwargs)
+            if hasattr(self.client, '_client') and hasattr(self.client._client, '_transport'):
+                transport = self.client._client._transport
+                if hasattr(transport, '_pool'):
+                    pool = transport._pool
+                    self.log_debug(f"[HANG_DEBUG] httpx connection pool state - connections: {len(pool._connections) if hasattr(pool, '_connections') else 'unknown'}")
+                else:
+                    self.log_debug("[HANG_DEBUG] httpx transport has no pool attribute")
+            else:
+                self.log_debug("[HANG_DEBUG] Unable to inspect httpx client state")
         except Exception as e:
+            self.log_debug(f"[HANG_DEBUG] Error inspecting httpx state: {e}")
+
+        # Let the OpenAI SDK handle timeouts natively - it already configures httpx properly
+        import time
+        api_name = getattr(api_method, '__name__', str(api_method))
+        self.log_debug(f"[HANG_DEBUG] About to call OpenAI API: {api_name} with timeout={timeout}s")
+
+        call_start = time.time()
+        try:
+            result = api_method(*args, **kwargs)
+            call_duration = time.time() - call_start
+            self.log_debug(f"[HANG_DEBUG] API call {api_name} completed in {call_duration:.2f}s")
+            return result
+        except Exception as e:
+            call_duration = time.time() - call_start
+            self.log_debug(f"[HANG_DEBUG] API call {api_name} failed after {call_duration:.2f}s with error: {e}")
             error_msg = str(e).lower()
             # Check if this is a timeout error from httpx/OpenAI SDK
             if "timeout" in error_msg or "timed out" in error_msg or "read timeout" in error_msg:
@@ -172,9 +196,10 @@ class OpenAIClient(LoggerMixin):
             request_params["top_p"] = top_p
         
         self.log_debug(f"Creating text response with model {model}, temp {temperature}")
-        
+
         try:
             # API call with enforced timeout wrapper
+            self.log_debug(f"[HANG_DEBUG] About to create text response with {len(input_messages)} messages")
             response = self._safe_api_call(
                 self.client.responses.create,
                 operation_type="general",
@@ -788,12 +813,14 @@ class OpenAIClient(LoggerMixin):
             self.log_debug(f"Using model: {config.utility_model}, timeout: {self.client.timeout}s")
             
             # Use safe API call wrapper with intent-specific timeout
+            self.log_debug(f"[HANG_DEBUG] Starting intent classification API call")
             response = self._safe_api_call(
                 self.client.responses.create,
                 operation_type="intent",  # Uses min(30s, API_TIMEOUT_READ from .env)
                 **request_params
             )
-            
+            self.log_debug(f"[HANG_DEBUG] Intent classification completed")
+
             self.log_debug(f"Response received from API at {time.strftime('%H:%M:%S')}")
             
             # Extract True/False response
