@@ -14,44 +14,8 @@ from logger import LoggerMixin
 from prompts import IMAGE_INTENT_SYSTEM_PROMPT, IMAGE_GEN_SYSTEM_PROMPT, IMAGE_EDIT_SYSTEM_PROMPT, VISION_ENHANCEMENT_PROMPT
 
 
-def timeout_wrapper(timeout_seconds: float):
-    """
-    Decorator to add timeout handling to OpenAI API calls.
-    Uses threading-based timeout since Slack bot runs in worker threads.
-    """
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            import threading
-            
-            # Always use threading-based timeout since we're in worker threads
-            result = [None]
-            exception = [None]
-            
-            def target():
-                try:
-                    result[0] = func(*args, **kwargs)
-                except Exception as e:
-                    exception[0] = e
-            
-            thread = threading.Thread(target=target)
-            thread.daemon = True
-            thread.start()
-            thread.join(timeout_seconds)
-            
-            if thread.is_alive():
-                # Thread is still running, timeout occurred
-                # Note: The thread will continue running in background
-                # but we return control to avoid blocking
-                raise TimeoutError(f"OpenAI API call timed out after {timeout_seconds} seconds")
-            
-            if exception[0]:
-                raise exception[0]
-            
-            return result[0]
-        
-        return wrapper
-    return decorator
+# REMOVED: timeout_wrapper was causing zombie threads and resource leaks
+# The OpenAI SDK already handles timeouts properly via httpx
 
 
 @dataclass
@@ -115,19 +79,17 @@ class OpenAIClient(LoggerMixin):
         
         self.log_debug(f"Using timeout: {timeout}s for {operation_type} operation (from .env: read={config.api_timeout_read}s, chunk={config.api_timeout_streaming_chunk}s)")
         
-        @timeout_wrapper(timeout)
-        def make_call():
-            return api_method(*args, **kwargs)
-        
+        # Let the OpenAI SDK handle timeouts natively - it already configures httpx properly
         try:
-            return make_call()
-        except TimeoutError as e:
-            self.log_error(f"API call ({operation_type}) timed out after {timeout}s: {e}")
-            raise
+            return api_method(*args, **kwargs)
         except Exception as e:
-            # If it's already a timeout error from the SDK, re-raise as our TimeoutError
-            if "timeout" in str(e).lower() or "timed out" in str(e).lower():
-                raise TimeoutError(f"OpenAI API call timed out: {e}")
+            error_msg = str(e).lower()
+            # Check if this is a timeout error from httpx/OpenAI SDK
+            if "timeout" in error_msg or "timed out" in error_msg or "read timeout" in error_msg:
+                self.log_error(f"API call ({operation_type}) timed out after {timeout}s: {e}")
+                # Re-raise as TimeoutError for consistent handling
+                raise TimeoutError(f"OpenAI API call timed out after {timeout} seconds")
+            # For other errors, just re-raise
             raise
     def create_text_response(
         self,
