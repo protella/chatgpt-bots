@@ -1,3 +1,40 @@
+# Repository Guidelines
+
+## Project Structure & Module Organization
+- `main.py` orchestrates bot services; interface-specific runners live in `slackbot.py`, `discordbot.py`, and `settings_modal.py` for modal UX.
+- Core functionality lives in focused modules: `message_processor.py`, `document_handler.py`, `thread_manager.py`, and `openai_client.py`. Shared utilities (logging, token math) sit alongside them in the root for easy reuse.
+- Persistent assets reside in `data/` and `Docs/`; generated artifacts such as logs and coverage reports land in `logs/` and `htmlcov/`.
+- Tests are split by scope under `tests/unit/` and `tests/integration/`, with fixtures configured in `tests/conftest.py`.
+
+## Build, Test, and Development Commands
+- `make install` — install runtime and test dependencies from `requirements.txt`.
+- `make test` — run unit suite with coverage HTML+terminal reports.
+- `make test-integration` — execute slower integration scenarios against live services or mocks.
+- `make lint` / `make format` — run `ruff`, `mypy`, `black`, and `isort` when available.
+- `python3 slackbot.py` — launch the Slack bot after configuring environment variables.
+
+## Coding Style & Naming Conventions
+- Target Python 3.10+; use four-space indentation and `snake_case` for modules, functions, and variables. Classes stay in `PascalCase`.
+- Prefer lean, single-responsibility modules; extract helpers into adjacent files rather than enlarging runners.
+- Format with `black` and `isort`, lint with `ruff`, and keep type hints passing `mypy`. Run formatters before committing.
+
+## Testing Guidelines
+- Name test files `test_*.py` (see `pytest.ini`). Use markers `@pytest.mark.unit` and `@pytest.mark.integration` to gate coverage.
+- Write focused unit tests in `tests/unit/` with fixture reuse; reserve external-service or workflow checks for `tests/integration/`.
+- Maintain fast feedback: ensure `make test` stays under a few minutes and keep HTML coverage (`htmlcov/index.html`) above existing thresholds.
+
+## Commit & Pull Request Guidelines
+- Follow the conventional prefix style seen in history (`feat:`, `refactor:`, `docs:`). Keep messages imperative and ≤72 characters on the subject line.
+- Every PR should describe intent, list validation steps (`make test`, `make lint`), and link related issues or tickets. Include screenshots or transcripts when UI/interaction flows change.
+- Request at least one review, ensure CI passes, and note any follow-up tasks or feature flags in the PR description.
+
+## Configuration & Secrets
+- Copy `.env.example` when onboarding; never commit secrets. Required keys include `OPENAI_API_KEY` plus platform tokens for Slack or Discord.
+- Use the provided `slack_app_manifest.yml` and README quickstart to sync scopes and slash commands across environments.
+
+---
+
+<!-- Legacy agent reference retained below for Codex CLI integration. -->
 # Project Agents
 
 This file provides guidance and memory for Codex CLI.
