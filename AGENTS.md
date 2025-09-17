@@ -31,6 +31,7 @@
 ## Configuration & Secrets
 - Copy `.env.example` when onboarding; never commit secrets. Required keys include `OPENAI_API_KEY` plus platform tokens for Slack or Discord.
 - Use the provided `slack_app_manifest.yml` and README quickstart to sync scopes and slash commands across environments.
+- If a local virtual environment exists (e.g., `.venv/`), activate it before running Python commands: `source .venv/bin/activate`.
 
 ---
 
