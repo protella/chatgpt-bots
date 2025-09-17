@@ -54,20 +54,20 @@ Slack Event → Event Loop → Async OpenAI Call → Response
 
 ### Phase 1: Core Infrastructure Changes
 
-#### 1. Update Slack Client (`slack_client/`)
-- [ ] Import `AsyncApp` and `AsyncSocketModeHandler` from slack_bolt
-- [ ] Change class inheritance to use `AsyncApp`
-- [ ] Convert `__init__` to async-compatible setup
-- [ ] Update all event handlers to async:
-  - [ ] `@app.event("app_mention")` → async def
-  - [ ] `@app.event("message")` → async def
-  - [ ] `@app.command()` handlers → async def
-  - [ ] `@app.action()` handlers → async def
-  - [ ] `@app.view_submission()` handlers → async def
-- [ ] Convert `_handle_slack_message()` to async
-- [ ] Update `start()` to use `AsyncSocketModeHandler`
-- [ ] Convert all Slack API calls to async (`.chat_postMessage` → await)
-- [ ] Update thread history rebuilding to async
+#### 1. Update Slack Client (`slack_client/` package)
+- [ ] Import `AsyncApp` / `AsyncSocketModeHandler` in `slack_client/base.py`
+- [ ] Update `SlackBot` to inherit async mixins and store `AsyncApp`
+- [ ] Convert mixins to async:
+  - [ ] `slack_client/event_handlers/registration.py` → async Slack registration (delegate settings hook to async)
+  - [ ] `slack_client/event_handlers/settings.py` → async slash-command, modal, action handlers
+  - [ ] `slack_client/event_handlers/message_events.py` → async message ingestion and welcome flow
+- [ ] Update supporting mixins:
+  - [ ] `slack_client/messaging.py` → async send/update/delete/history methods using `await self.app.client.*`
+  - [ ] `slack_client/utilities.py` → async user/file helpers (use `await client.users_info` etc.)
+  - [ ] `slack_client/formatting/text.py` remains sync (pure string ops)
+- [ ] Update `SlackBot.start/stop` to use async socket mode handler
+- [ ] Ensure all Slack API calls across mixins await the async WebClient methods
+- [ ] Update any remaining direct Slack client usage in other modules (e.g., settings modal) to async equivalents
 
 #### 2. Update Main Entry Point (`main.py`)
 - [ ] Convert `handle_message()` to `async def handle_message()`
@@ -76,20 +76,15 @@ Slack Event → Event Loop → Async OpenAI Call → Response
 - [ ] Update cleanup thread to use asyncio tasks instead of threading
 - [ ] Convert signal handlers to async-safe operations
 
-#### 3. Update Message Processor (`message_processor/`)
-- [ ] Convert `process_message()` to `async def process_message()`
-- [ ] Update thread lock acquisition to use await
-- [ ] Convert all OpenAI client calls to await
-- [ ] Update all database operations to await
-- [ ] Convert helper methods that do I/O to async:
-  - [ ] `_handle_text_response()` → async
-  - [ ] `_handle_streaming_text_response()` → async
-  - [ ] `_handle_image_generation()` → async
-  - [ ] `_handle_image_edit()` → async
-  - [ ] `_handle_vision_analysis()` → async
-  - [ ] `_handle_mixed_content_analysis()` → async
-  - [ ] `_get_or_rebuild_thread_state()` → async
-- [ ] Update progress indicators to use asyncio tasks
+#### 3. Update Message Processor (`message_processor/` package)
+- [ ] Convert `message_processor/base.py::process_message` to async and update caller contract
+- [ ] Update mixins to async:
+  - [ ] `thread_management.py` (locks, cleanup)
+  - [ ] `utilities.py` (attachment processing, prompt building, Slack status updates)
+  - [ ] `handlers/text.py`, `handlers/vision.py`, `handlers/image_gen.py`, `handlers/image_edit.py`
+- [ ] Ensure all OpenAI / DB calls inside mixins use awaitables
+- [ ] Replace threading-based progress/updater logic with asyncio tasks
+- [ ] Propagate async signatures to any helper methods invoked externally
 
 #### 4. Update OpenAI Client (`openai_client/`)
 - [ ] Change to use async OpenAI client:
