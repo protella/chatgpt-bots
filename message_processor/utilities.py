@@ -9,6 +9,7 @@ import pytz
 
 from base_client import BaseClient, Message, Response
 from config import config
+from prompts import SLACK_SYSTEM_PROMPT, DISCORD_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT
 
 
 class MessageUtilitiesMixin:
