@@ -21,7 +21,6 @@ from .handlers.vision import VisionHandlerMixin
 from .handlers.image_gen import ImageGenerationMixin
 from .handlers.image_edit import ImageEditMixin
 from .utilities import MessageUtilitiesMixin
-from prompts import SLACK_SYSTEM_PROMPT, DISCORD_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, IMAGE_ANALYSIS_PROMPT
 from image_url_handler import ImageURLHandler
 try:
     from document_handler import DocumentHandler
@@ -810,7 +809,6 @@ class MessageProcessor(ThreadManagementMixin,
                 # Even if release fails, log it but don't crash
                 self.log_error(f"[HANG_DEBUG] Error releasing thread lock for {thread_key}: {lock_error}", exc_info=True)
     
-
 
 
 

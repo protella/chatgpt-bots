@@ -4,6 +4,7 @@ from typing import Dict, List, Optional
 
 from base_client import BaseClient, Message, Response
 from config import config
+from prompts import IMAGE_ANALYSIS_PROMPT
 
 
 class ImageEditMixin:
