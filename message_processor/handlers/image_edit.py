@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
+import re
+import time
+
 from base_client import BaseClient, Message, Response
 from config import config
 from prompts import IMAGE_ANALYSIS_PROMPT

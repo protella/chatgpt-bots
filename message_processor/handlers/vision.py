@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
+
+import time
 
 from base_client import BaseClient, Message, Response
 from config import config
+from prompts import IMAGE_ANALYSIS_PROMPT
 
 
 class VisionHandlerMixin:
@@ -419,7 +422,6 @@ class VisionHandlerMixin:
                             images_to_analyze.append(base64_data)
             
             # Analyze images with technical prompt (no enhancement needed)
-            from prompts import IMAGE_ANALYSIS_PROMPT
             image_analysis = self.openai_client.analyze_images(
                 images=images_to_analyze,
                 question=IMAGE_ANALYSIS_PROMPT,
