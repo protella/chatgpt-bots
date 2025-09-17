@@ -708,13 +708,13 @@ def classify_intent(
         self.log_debug(f"Using model: {config.utility_model}, timeout: {self.client.timeout}s")
         
         # Use safe API call wrapper with intent-specific timeout
-        self.log_debug(f"[HANG_DEBUG] Starting intent classification API call")
+        self.log_debug("[HANG_DEBUG] Starting intent classification API call")
         response = self._safe_api_call(
             self.client.responses.create,
             operation_type="intent",  # Uses min(30s, API_TIMEOUT_READ from .env)
             **request_params
         )
-        self.log_debug(f"[HANG_DEBUG] Intent classification completed")
+        self.log_debug("[HANG_DEBUG] Intent classification completed")
 
         self.log_debug(f"Response received from API at {time.strftime('%H:%M:%S')}")
         
