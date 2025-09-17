@@ -52,6 +52,12 @@ Slack Event → Event Loop → Async OpenAI Call → Response
 
 ## Implementation Plan
 
+### Pre-Work: Inventory Synchronous Touchpoints
+
+- Catalog every Slack handler, mixin, and shared utility that currently performs blocking work (Slack WebClient calls, database/file operations, OpenAI requests).
+- Map call graphs to understand which functions and helpers will require signature changes before converting to async.
+- Flag thread-based helpers, watchdog behaviors, or other concurrency constructs slated for removal in the async migration.
+
 ### Phase 1: Core Infrastructure Changes
 
 #### 1. Update Slack Client (`slack_client/` package)
