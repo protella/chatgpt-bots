@@ -167,3 +167,6 @@ data/backups/*
 *.db
 *.db-wal
 *.db-shm
+# BMAD (local only)
+.bmad-core/
+.bmad-*/
