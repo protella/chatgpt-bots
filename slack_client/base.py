@@ -8,13 +8,19 @@ from config import config
 from markdown_converter import MarkdownConverter
 from database import DatabaseManager
 from settings_modal import SettingsModal
-from .event_handlers.core import SlackEventHandlersMixin
+from .event_handlers import (
+    SlackMessageEventsMixin,
+    SlackRegistrationMixin,
+    SlackSettingsHandlersMixin,
+)
 from .utilities import SlackUtilitiesMixin
 from .formatting.text import SlackFormattingMixin
 from .messaging import SlackMessagingMixin
 
 
-class SlackBot(SlackEventHandlersMixin,
+class SlackBot(SlackMessageEventsMixin,
+               SlackSettingsHandlersMixin,
+               SlackRegistrationMixin,
                SlackUtilitiesMixin,
                SlackFormattingMixin,
                SlackMessagingMixin,
@@ -41,7 +47,6 @@ class SlackBot(SlackEventHandlersMixin,
         # Register Slack event handlers
         self._register_handlers()
     
-
 
 
 
