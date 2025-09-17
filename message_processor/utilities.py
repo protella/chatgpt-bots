@@ -5,9 +5,12 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+import base64
+import os
+import re
 import pytz
 
-from base_client import BaseClient, Message, Response
+from base_client import BaseClient, Message
 from config import config
 from prompts import SLACK_SYSTEM_PROMPT, DISCORD_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT
 
@@ -134,8 +137,6 @@ class MessageUtilitiesMixin:
         Returns:
             List of Slack file URLs found
         """
-        import re
-        
         # Slack wraps URLs in angle brackets <URL>
         # Pattern to match Slack file URLs (both files.slack.com and workspace-specific URLs)
         # Examples:
@@ -403,7 +404,6 @@ class MessageUtilitiesMixin:
                         if is_pdf or is_doc:
                             # Process as document
                             # Extract filename from URL
-                            import re
                             filename_match = re.search(r'/([^/]+\.(pdf|docx?|xlsx?|csv|txt))(\?|$)', url, re.IGNORECASE)
                             file_name = filename_match.group(1) if filename_match else "document"
                             

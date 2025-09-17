@@ -2,14 +2,8 @@
 Shared Message Processor
 Client-agnostic message processing logic
 """
-import base64
-import os
-import re
 import time
-import datetime
-import pytz
-import threading
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Optional
 from base_client import BaseClient, Message, Response
 from thread_manager import ThreadStateManager
 from openai_client import OpenAIClient
@@ -809,7 +803,6 @@ class MessageProcessor(ThreadManagementMixin,
                 # Even if release fails, log it but don't crash
                 self.log_error(f"[HANG_DEBUG] Error releasing thread lock for {thread_key}: {lock_error}", exc_info=True)
     
-
 
 
 
