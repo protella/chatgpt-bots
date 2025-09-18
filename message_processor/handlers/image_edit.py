@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Dict, List, Optional
 
 import re
@@ -11,7 +12,7 @@ from prompts import IMAGE_ANALYSIS_PROMPT
 
 
 class ImageEditMixin:
-    def _find_target_image(self, user_text: str, thread_state, client: BaseClient) -> Optional[str]:
+    async def _find_target_image(self, user_text: str, thread_state, client: BaseClient) -> Optional[str]:
         """Find the target image URL based on user's reference using DB"""
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
         
@@ -67,7 +68,7 @@ class ImageEditMixin:
             
             try:
                 # Use utility model to find best match
-                match_response = self.openai_client.create_text_response(
+                match_response = await self.openai_client.create_text_response(
                     messages=[{"role": "user", "content": context}],
                     model=config.utility_model,
                     temperature=0.1,
@@ -93,7 +94,7 @@ class ImageEditMixin:
         self.log_debug(f"Using most recent {image_type} image by default: {url}")
         return url
 
-    def _handle_image_modification(
+    async def _handle_image_modification(
         self,
         text: str,
         thread_state,
@@ -110,7 +111,7 @@ class ImageEditMixin:
         response_metadata = {}
         
         # Try to find target image URL from conversation
-        target_url = self._find_target_image(text, thread_state, client)
+        target_url = await self._find_target_image(text, thread_state, client)
         
         if target_url:
             # Found an image to edit - update status
@@ -122,7 +123,7 @@ class ImageEditMixin:
             
             try:
                 # Download the image
-                image_data = client.download_file(target_url, None)
+                image_data = await client.download_file(target_url, None)
                 
                 if image_data:
                     # Convert to base64 for editing
@@ -133,7 +134,7 @@ class ImageEditMixin:
                     self.log_debug("Analyzing image for context")
                     self._update_status(client, channel_id, thinking_id, "Analyzing the image...", emoji=config.analyze_emoji)
                     
-                    image_description = self.openai_client.analyze_images(
+                    image_description = await self.openai_client.analyze_images(
                         images=[base64_data],
                         question=IMAGE_ANALYSIS_PROMPT,
                         detail="high"
@@ -153,7 +154,7 @@ class ImageEditMixin:
                     enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state)
                     
                     # Pre-trim messages to fit within context window
-                    enhanced_messages = self._pre_trim_messages_for_api(enhanced_messages, model=thread_state.current_model)
+                    enhanced_messages = await self._pre_trim_messages_for_api(enhanced_messages, model=thread_state.current_model)
                     
                     # Check if streaming is supported for enhancement
                     streaming_enabled = thread_config.get('enable_streaming', config.enable_streaming)
@@ -181,8 +182,8 @@ class ImageEditMixin:
                             if buffer.should_update() and rate_limiter.can_make_request():
                                 rate_limiter.record_request_attempt()
                                 display_text = f"*Enhanced Prompt:* ✨ _{buffer.get_complete_text()}_ {config.loading_ellipse_emoji}"
-                                
-                                result = client.update_message_streaming(channel_id, thinking_id, display_text)
+
+                                result = self._update_message_streaming_sync(client, channel_id, thinking_id, display_text)
                                 
                                 if result["success"]:
                                     rate_limiter.record_success()
@@ -201,7 +202,7 @@ class ImageEditMixin:
                                         rate_limiter.record_failure(is_rate_limit=False)
                         
                         # First enhance the prompt with streaming
-                        enhanced_edit_prompt = self.openai_client._enhance_image_edit_prompt(
+                        enhanced_edit_prompt = await self.openai_client._enhance_image_edit_prompt(
                             user_request=text,
                             image_description=image_description,
                             conversation_history=enhanced_messages,
@@ -211,12 +212,12 @@ class ImageEditMixin:
                         # Show the final enhanced prompt
                         if enhanced_edit_prompt and thinking_id:
                             enhanced_text = f"*Enhanced Prompt:* ✨ _{enhanced_edit_prompt}_"
-                            client.update_message_streaming(channel_id, thinking_id, enhanced_text)
+                            self._update_message_streaming_sync(client, channel_id, thinking_id, enhanced_text)
                             # Mark that we should NOT touch this message again
                             response_metadata["prompt_message_id"] = thinking_id
                         
                         # Create a NEW message for editing status - don't touch the enhanced prompt!
-                        editing_id = client.send_thinking_indicator(channel_id, thread_state.thread_ts)
+                        editing_id = await client.send_thinking_indicator(channel_id, thread_state.thread_ts)
                         self._update_status(client, channel_id, editing_id, 
                                           "Editing your image. This may take a minute...", 
                                           emoji=config.circle_loader_emoji)
@@ -227,7 +228,7 @@ class ImageEditMixin:
                         response_metadata["streamed"] = True
                         
                         # Use the edit_image API with the pre-enhanced prompt
-                        edited_image = self.openai_client.edit_image(
+                        edited_image = await self.openai_client.edit_image(
                             input_images=[base64_data],
                             prompt=enhanced_edit_prompt,
                             image_description=None,  # Already used for enhancement
@@ -244,7 +245,7 @@ class ImageEditMixin:
                         self._update_status(client, channel_id, thinking_id, "Enhancing your edit request...")
                         self._update_status(client, channel_id, thinking_id, "Editing your image. This may take a minute...", emoji=config.circle_loader_emoji)
                         
-                        edited_image = self.openai_client.edit_image(
+                        edited_image = await self.openai_client.edit_image(
                             input_images=[base64_data],
                             prompt=text,
                             image_description=image_description,
@@ -334,13 +335,13 @@ class ImageEditMixin:
         if image_registry:
             # Use the most recent image description without re-enhancement
             # The prompt already contains the edit request, just generate based on it
-            return self._handle_image_generation(text, thread_state, client, channel_id, thinking_id, message, 
+            return await self._handle_image_generation(text, thread_state, client, channel_id, thinking_id, message, 
                                                 skip_enhancement=True)
         else:
             # No previous images, treat as new generation
-            return self._handle_image_generation(text, thread_state, client, channel_id, thinking_id, message)
+            return await self._handle_image_generation(text, thread_state, client, channel_id, thinking_id, message)
 
-    def _handle_image_edit(
+    async def _handle_image_edit(
         self,
         text: str,
         image_inputs: List[Dict],
@@ -380,7 +381,7 @@ class ImageEditMixin:
         
         if not input_images:
             # Shouldn't happen but fallback to generation
-            return self._handle_image_generation(text, thread_state, client, channel_id, thinking_id, message)
+            return await self._handle_image_generation(text, thread_state, client, channel_id, thinking_id, message)
         
         self.log_info(f"Editing {len(input_images)} uploaded image(s)")
         
@@ -402,7 +403,7 @@ class ImageEditMixin:
         
         try:
             # Analyze the images to understand what's in them
-            image_description = self.openai_client.analyze_images(
+            image_description = await self.openai_client.analyze_images(
                 images=input_images,
                 question=IMAGE_ANALYSIS_PROMPT,
                 detail="high"
@@ -447,7 +448,7 @@ class ImageEditMixin:
         
         # Pre-trim messages to fit within context window if we have messages
         if enhanced_messages:
-            enhanced_messages = self._pre_trim_messages_for_api(enhanced_messages, model=thread_state.current_model)
+            enhanced_messages = await self._pre_trim_messages_for_api(enhanced_messages, model=thread_state.current_model)
         
         # Check if streaming is supported for enhancement
         response_metadata = {}
@@ -479,8 +480,8 @@ class ImageEditMixin:
                 if buffer.should_update() and rate_limiter.can_make_request():
                     rate_limiter.record_request_attempt()
                     display_text = f"*Enhanced Prompt:* ✨ _{buffer.get_complete_text()}_ {config.loading_ellipse_emoji}"
-                    
-                    result = client.update_message_streaming(channel_id, thinking_id, display_text)
+
+                    result = self._update_message_streaming_sync(client, channel_id, thinking_id, display_text)
                     
                     if result["success"]:
                         rate_limiter.record_success()
@@ -499,7 +500,7 @@ class ImageEditMixin:
                             rate_limiter.record_failure(is_rate_limit=False)
             
             # First enhance the prompt with streaming
-            enhanced_edit_prompt = self.openai_client._enhance_image_edit_prompt(
+            enhanced_edit_prompt = await self.openai_client._enhance_image_edit_prompt(
                 user_request=user_edit_request,
                 image_description=image_analysis,
                 conversation_history=enhanced_messages,
@@ -509,12 +510,12 @@ class ImageEditMixin:
             # Show the final enhanced prompt
             if enhanced_edit_prompt and thinking_id:
                 enhanced_text = f"Enhanced Prompt: ✨ _{enhanced_edit_prompt}_"
-                client.update_message_streaming(channel_id, thinking_id, enhanced_text)
+                self._update_message_streaming_sync(client, channel_id, thinking_id, enhanced_text)
                 # Mark that we should NOT touch this message again
                 response_metadata["prompt_message_id"] = thinking_id
             
             # Create a NEW message for editing status - don't touch the enhanced prompt!
-            editing_id = client.send_thinking_indicator(channel_id, thread_state.thread_ts)
+            editing_id = await client.send_thinking_indicator(channel_id, thread_state.thread_ts)
             self._update_status(client, channel_id, editing_id, 
                               "Generating edited image. This may take a minute...", 
                               emoji=config.circle_loader_emoji)
@@ -526,7 +527,7 @@ class ImageEditMixin:
             
             # Use the edit_image API with the pre-enhanced prompt
             try:
-                image_data = self.openai_client.edit_image(
+                image_data = await self.openai_client.edit_image(
                     input_images=input_images,
                     input_mimetypes=input_mimetypes,
                     prompt=enhanced_edit_prompt,  # Use the pre-enhanced prompt
@@ -542,7 +543,7 @@ class ImageEditMixin:
                 # After edit is complete, update message to show just the enhanced prompt
                 # (remove the "Generating edited image..." status) - but respect rate limits
                 if enhanced_edit_prompt and thinking_id and rate_limiter.can_make_request():
-                    result = client.update_message_streaming(channel_id, thinking_id, f"*Enhanced Prompt:* ✨ _{enhanced_edit_prompt}_")
+                    result = self._update_message_streaming_sync(client, channel_id, thinking_id, f"*Enhanced Prompt:* ✨ _{enhanced_edit_prompt}_")
                     if result["success"]:
                         rate_limiter.record_success()
                     else:
@@ -560,7 +561,7 @@ class ImageEditMixin:
             # Non-streaming fallback
             # Use the edit_image API with separated inputs
             try:
-                image_data = self.openai_client.edit_image(
+                image_data = await self.openai_client.edit_image(
                     input_images=input_images,
                     input_mimetypes=input_mimetypes,
                     prompt=user_edit_request,  # Just the user's request

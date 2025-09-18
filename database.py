@@ -4,11 +4,13 @@ Provides persistent storage for threads, messages, images, documents, and user p
 """
 
 import sqlite3
+import aiosqlite
 import json
 import os
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any, Tuple
 import logging
+import asyncio
 from logger import LoggerMixin
 
 logger = logging.getLogger(__name__)
@@ -50,6 +52,9 @@ class DatabaseManager(LoggerMixin):
         self.init_schema()
         
         logger.info(f"Database initialized for {platform} at {self.db_path}")
+
+        # For async operations, we'll create connections as needed
+        self._async_db_semaphore = asyncio.Semaphore(10)  # Limit concurrent async connections
     
     def init_schema(self):
         """Create database tables if they don't exist."""
@@ -1224,6 +1229,489 @@ class DatabaseManager(LoggerMixin):
         if cursor.rowcount > 0:
             logger.info(f"Cleaned up {cursor.rowcount} threads older than 3 months")
     
+    # =============================
+    # ASYNC VERSIONS OF CORE METHODS
+    # =============================
+
+    async def _get_async_connection(self):
+        """Get an async database connection with semaphore control."""
+        await self._async_db_semaphore.acquire()
+        try:
+            conn = await aiosqlite.connect(
+                self.db_path,
+                isolation_level=None  # Autocommit mode
+            )
+            conn.row_factory = aiosqlite.Row  # Enable column access by name
+
+            # Enable WAL mode for better concurrency
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA busy_timeout=5000")  # 5 second timeout
+
+            return conn
+        finally:
+            self._async_db_semaphore.release()
+
+    async def cache_message_async(self, thread_id: str, role: str, content: str,
+                                 message_ts: Optional[str] = None, metadata: Optional[Dict] = None):
+        """
+        Async version of cache_message.
+
+        Args:
+            thread_id: Thread identifier
+            role: Message role (user/assistant/developer)
+            content: Message content
+            message_ts: Optional message timestamp
+            metadata: Optional metadata dictionary
+        """
+        self.log_debug(f"DB: Async caching message - thread={thread_id}, role={role}, "
+                      f"content_len={len(content) if content else 0}, has_ts={bool(message_ts)}")
+
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                await db.execute("PRAGMA journal_mode=WAL")
+
+                await db.execute("""
+                    INSERT INTO messages (thread_id, role, content, message_ts, metadata_json)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (thread_id, role, content, message_ts,
+                      json.dumps(metadata) if metadata else None))
+
+                # Update thread activity
+                await self.update_thread_activity_async(thread_id)
+
+                self.log_info(f"DB: Successfully cached {role} message for thread {thread_id}")
+
+        except Exception as e:
+            self.log_error(f"DB: Failed to cache message async - {e}", exc_info=True)
+            raise
+
+    async def get_cached_messages_async(self, thread_id: str, limit: Optional[int] = None) -> List[Dict]:
+        """
+        Async version of get_cached_messages.
+
+        Args:
+            thread_id: Thread identifier
+            limit: Optional limit on number of messages (None = all)
+
+        Returns:
+            List of message dictionaries
+        """
+        query = """
+            SELECT * FROM messages
+            WHERE thread_id = ?
+            ORDER BY timestamp ASC
+        """
+
+        if limit:
+            query += f" LIMIT {limit}"
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+
+            async with db.execute(query, (thread_id,)) as cursor:
+                messages = []
+                async for row in cursor:
+                    msg = dict(row)
+                    if msg.get("metadata_json"):
+                        msg["metadata"] = json.loads(msg["metadata_json"])
+                        del msg["metadata_json"]
+                    messages.append(msg)
+
+        return messages
+
+    async def update_thread_activity_async(self, thread_id: str):
+        """
+        Async version of update_thread_activity.
+
+        Args:
+            thread_id: Thread identifier
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+
+            await db.execute("""
+                UPDATE threads
+                SET last_activity = CURRENT_TIMESTAMP
+                WHERE thread_id = ?
+            """, (thread_id,))
+
+    async def save_image_metadata_async(self, thread_id: str, url: str, image_type: str,
+                                       prompt: Optional[str] = None, analysis: Optional[str] = None,
+                                       original_analysis: Optional[str] = None, metadata: Optional[Dict] = None,
+                                       message_ts: Optional[str] = None):
+        """
+        Async version of save_image_metadata (NO base64 data).
+
+        Args:
+            thread_id: Thread identifier
+            url: Image URL
+            image_type: Type of image (uploaded/generated/edited)
+            prompt: Full generation/edit prompt
+            analysis: Full vision analysis
+            original_analysis: For edited images, the pre-edit analysis
+            metadata: Additional metadata
+            message_ts: Message timestamp to link image to specific message
+        """
+        self.log_debug(f"DB: Async saving image - thread={thread_id}, url={url[:100]}, "
+                      f"type={image_type}, has_analysis={bool(analysis)}, "
+                      f"analysis_len={len(analysis) if analysis else 0}, "
+                      f"prompt_len={len(prompt) if prompt else 0}")
+
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                await db.execute("PRAGMA journal_mode=WAL")
+
+                await db.execute("""
+                    INSERT OR REPLACE INTO images
+                    (thread_id, url, image_type, prompt, analysis, original_analysis, metadata_json, message_ts)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (thread_id, url, image_type, prompt, analysis, original_analysis,
+                      json.dumps(metadata) if metadata else None, message_ts))
+
+                self.log_info(f"DB: Successfully saved image metadata for {url[:50]}... in thread {thread_id}")
+
+        except Exception as e:
+            self.log_error(f"DB: Failed to save image metadata async - {e}", exc_info=True)
+            raise
+
+    async def get_thread_config_async(self, thread_id: str) -> Optional[Dict]:
+        """
+        Async version of get_thread_config.
+
+        Args:
+            thread_id: Thread identifier
+
+        Returns:
+            Configuration dictionary or None
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+
+            async with db.execute(
+                "SELECT config_json FROM threads WHERE thread_id = ?",
+                (thread_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+
+                if row and row["config_json"]:
+                    return json.loads(row["config_json"])
+
+                return None
+
+    async def save_thread_config_async(self, thread_id: str, config: Dict):
+        """
+        Async version of save_thread_config.
+
+        Args:
+            thread_id: Thread identifier
+            config: Configuration dictionary
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+
+            await db.execute("""
+                UPDATE threads
+                SET config_json = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE thread_id = ?
+            """, (json.dumps(config), thread_id))
+
+            logger.debug(f"Saved config for thread {thread_id} (async)")
+
+    async def get_or_create_user_async(self, user_id: str, username: Optional[str] = None) -> Dict:
+        """
+        Async version of get_or_create_user.
+
+        Args:
+            user_id: User identifier
+            username: Optional username
+
+        Returns:
+            User data dictionary
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+
+            # Try to get existing user
+            async with db.execute(
+                "SELECT * FROM users WHERE user_id = ?",
+                (user_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+
+            if row:
+                # Update last seen
+                await db.execute("""
+                    UPDATE users SET last_seen = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
+                """, (user_id,))
+                await db.commit()
+                return dict(row)
+
+            # Create new user with defaults from config
+            from config import BotConfig
+            config = BotConfig()
+
+            await db.execute("""
+                INSERT INTO users (user_id, username, created_at, last_seen)
+                VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """, (user_id, username))
+
+            await db.commit()
+
+            # Return the created user
+            async with db.execute(
+                "SELECT * FROM users WHERE user_id = ?",
+                (user_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else {}
+
+    async def get_user_info_async(self, user_id: str) -> Optional[Dict]:
+        """
+        Async version of get_user_info.
+
+        Args:
+            user_id: User identifier
+
+        Returns:
+            User info dictionary or None
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+
+            async with db.execute(
+                "SELECT * FROM users WHERE user_id = ?",
+                (user_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def get_user_preferences_async(self, user_id: str) -> Optional[Dict]:
+        """
+        Async version of get_user_preferences.
+
+        Args:
+            user_id: User identifier
+
+        Returns:
+            User preferences dictionary or None
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+
+            async with db.execute(
+                "SELECT * FROM user_preferences WHERE slack_user_id = ?",
+                (user_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def create_default_user_preferences_async(self, user_id: str, email: str) -> Dict:
+        """
+        Async version of create_default_user_preferences.
+
+        Args:
+            user_id: User identifier
+            email: User email
+
+        Returns:
+            Created preferences dictionary
+        """
+        from config import BotConfig
+        config = BotConfig()
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+
+            # Create default preferences
+            await db.execute("""
+                INSERT OR REPLACE INTO user_preferences (
+                    slack_user_id, slack_email,
+                    model, temperature,
+                    enable_streaming, reasoning_effort, verbosity
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                user_id, email,
+                config.gpt_model, config.default_temperature,
+                1 if config.enable_streaming else 0, config.default_reasoning_effort, config.default_verbosity
+            ))
+
+            await db.commit()
+
+            # Return the created preferences
+            async with db.execute(
+                "SELECT * FROM user_preferences WHERE slack_user_id = ?",
+                (user_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else {}
+
+    async def get_user_timezone_async(self, user_id: str) -> Optional[str]:
+        """
+        Async version of get_user_timezone.
+
+        Args:
+            user_id: User identifier
+
+        Returns:
+            Timezone string or None
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+
+            async with db.execute(
+                "SELECT timezone FROM users WHERE user_id = ?",
+                (user_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row["timezone"] if row and row["timezone"] else None
+
+    async def save_user_info_async(self, user_id: str, username: str, real_name: str, email: str,
+                                   timezone: str = None, tz_label: str = None, tz_offset: int = None):
+        """
+        Async version of save_user_info.
+
+        Args:
+            user_id: User identifier
+            username: Username
+            real_name: Real name
+            email: Email address
+            timezone: Optional timezone
+            tz_label: Optional timezone label
+            tz_offset: Optional timezone offset
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+
+            await db.execute("""
+                UPDATE users
+                SET username = ?, real_name = ?, email = ?, timezone = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ?
+            """, (username, real_name, email, timezone, user_id))
+
+            await db.commit()
+
+    async def update_user_preferences_async(self, user_id: str, preferences: Dict) -> bool:
+        """
+        Async version of update_user_preferences.
+
+        Args:
+            user_id: User identifier
+            preferences: Preferences to update
+
+        Returns:
+            True if update successful
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+
+            # Build dynamic update query
+            valid_fields = {
+                'model', 'temperature', 'top_p',
+                'enable_streaming', 'reasoning_effort', 'verbosity',
+                'vision_model', 'vision_detail', 'image_size',
+                'image_quality', 'image_style', 'settings_completed'
+            }
+
+            update_fields = []
+            values = []
+            for key, value in preferences.items():
+                if key in valid_fields:
+                    update_fields.append(f"{key} = ?")
+                    values.append(value)
+
+            if not update_fields:
+                return False
+
+            values.append(user_id)
+            query = f"""
+                UPDATE user_preferences
+                SET {', '.join(update_fields)}, updated_at = CURRENT_TIMESTAMP
+                WHERE slack_user_id = ?
+            """
+
+            await db.execute(query, values)
+            await db.commit()
+            return True
+
+    async def get_or_create_thread_async(self, thread_id: str, channel_id: str, user_id: Optional[str] = None) -> Dict:
+        """
+        Async version of get_or_create_thread.
+
+        Args:
+            thread_id: Thread identifier
+            channel_id: Channel identifier
+            user_id: Optional user identifier
+
+        Returns:
+            Thread data dictionary
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+
+            # Try to get existing thread
+            async with db.execute(
+                "SELECT * FROM threads WHERE thread_id = ?",
+                (thread_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+
+            if row:
+                return dict(row)
+
+            # Create new thread
+            await db.execute("""
+                INSERT INTO threads (thread_id, channel_id, user_id, created_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            """, (thread_id, channel_id, user_id))
+
+            await db.commit()
+
+            # Return the created thread
+            async with db.execute(
+                "SELECT * FROM threads WHERE thread_id = ?",
+                (thread_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else {}
+
+    async def get_thread_config_async(self, thread_id: str) -> Optional[Dict]:
+        """
+        Async version of get_thread_config.
+
+        Args:
+            thread_id: Thread identifier
+
+        Returns:
+            Thread config dictionary or None
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+
+            async with db.execute(
+                "SELECT config_json FROM threads WHERE thread_id = ?",
+                (thread_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+
+            if row and row["config_json"]:
+                return json.loads(row["config_json"])
+
+            return None
+
     def close(self):
         """Close database connection."""
         if self.conn:

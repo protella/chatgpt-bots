@@ -5,6 +5,7 @@ Test script for URL image detection and downloading functionality
 
 import sys
 import logging
+import asyncio
 from image_url_handler import ImageURLHandler
 
 # Setup logging
@@ -54,64 +55,62 @@ def test_url_extraction():
     
     return True
 
-def test_url_validation():
+async def test_url_validation():
     """Test URL validation (requires internet connection)"""
-    handler = ImageURLHandler()
-    
-    # Note: These are example URLs - in production you'd use real URLs
-    test_urls = [
-        # Valid image URLs (placeholders - replace with real URLs for testing)
-        "https://via.placeholder.com/150",  # Returns a PNG
-        "https://via.placeholder.com/300.jpg",  # Returns a JPEG
-        
-        # Invalid URLs
-        "https://example.com/not-found-404.jpg",  # 404 error
-        "https://example.com/document.pdf",  # Not an image
-    ]
-    
-    print("\nTesting URL validation:")
-    print("-" * 50)
-    
-    for url in test_urls:
-        is_valid, mimetype, error = handler.validate_image_url(url)
-        status = "✓" if is_valid else "✗"
-        print(f"{status} URL: {url}")
-        if is_valid:
-            print(f"  MIME type: {mimetype}")
-        else:
-            print(f"  Error: {error}")
-        print()
-    
-    return True
+    async with ImageURLHandler() as handler:
+        # Note: These are example URLs - in production you'd use real URLs
+        test_urls = [
+            # Valid image URLs (placeholders - replace with real URLs for testing)
+            "https://via.placeholder.com/150",  # Returns a PNG
+            "https://via.placeholder.com/300.jpg",  # Returns a JPEG
 
-def test_integration():
+            # Invalid URLs
+            "https://example.com/not-found-404.jpg",  # 404 error
+            "https://example.com/document.pdf",  # Not an image
+        ]
+
+        print("\nTesting URL validation:")
+        print("-" * 50)
+
+        for url in test_urls:
+            is_valid, mimetype, error = await handler.validate_image_url(url)
+            status = "✓" if is_valid else "✗"
+            print(f"{status} URL: {url}")
+            if is_valid:
+                print(f"  MIME type: {mimetype}")
+            else:
+                print(f"  Error: {error}")
+            print()
+
+        return True
+
+async def test_integration():
     """Test the full integration"""
-    handler = ImageURLHandler()
-    
-    # Test text with mixed content
-    test_text = """
-    Here's a regular link: https://google.com
-    And here's an image: https://via.placeholder.com/200.png
-    Another image: https://via.placeholder.com/300.jpg
-    And a broken link: https://example.com/broken.jpg
-    """
-    
-    print("\nTesting full integration:")
-    print("-" * 50)
-    print(f"Input text: {test_text[:100]}...")
-    
-    downloaded_images, failed_urls = handler.process_urls_from_text(test_text)
-    
-    print(f"\nResults:")
-    print(f"  Successfully downloaded: {len(downloaded_images)} images")
-    for img in downloaded_images:
-        print(f"    - {img['url']} ({img['mimetype']}, {img['size']} bytes)")
-    
-    print(f"  Failed URLs: {len(failed_urls)}")
-    for url in failed_urls:
-        print(f"    - {url}")
-    
-    return True
+    async with ImageURLHandler() as handler:
+        # Test text with mixed content
+        test_text = """
+        Here's a regular link: https://google.com
+        And here's an image: https://via.placeholder.com/200.png
+        Another image: https://via.placeholder.com/300.jpg
+        And a broken link: https://example.com/broken.jpg
+        """
+
+        print("\nTesting full integration:")
+        print("-" * 50)
+        print(f"Input text: {test_text[:100]}...")
+
+        downloaded_images, failed_urls = await handler.process_urls_from_text(test_text)
+
+        print(f"\nResults:")
+        print(f"  Successfully downloaded: {len(downloaded_images)} images")
+        for img in downloaded_images:
+            print(f"    - {img['url']} ({img['mimetype']}, {img['size']} bytes)")
+
+        print(f"  Failed URLs: {len(failed_urls)}")
+        for url in failed_urls:
+            print(f"    - {url}")
+
+        return True
 
 def main():
     """Run all tests"""

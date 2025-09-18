@@ -5,9 +5,8 @@ Supports multiple chat platforms with shared AI capabilities
 """
 import sys
 import signal
-import time
+import asyncio
 import argparse
-from threading import Thread
 from typing import Optional
 from config import config
 from logger import log_session_start, log_session_end, main_logger
@@ -22,12 +21,12 @@ class ChatBotV2:
         self.platform = platform.lower()
         self.client: Optional[BaseClient] = None
         self.processor = None  # Will be initialized after client
-        self.cleanup_thread = None
+        self.cleanup_task = None
         self.running = False
         self.sigint_count = 0  # Track number of SIGINT received
         self.last_sigint_time = 0  # Track time of last SIGINT
         
-    def initialize(self):
+    async def initialize(self):
         """Initialize the bot components"""
         main_logger.info(f"Initializing Chat Bot V2 for {self.platform}...")
         
@@ -62,30 +61,30 @@ class ChatBotV2:
         
         main_logger.info("Initialization complete")
     
-    def handle_message(self, message: Message, client: BaseClient):
+    async def handle_message(self, message: Message, client: BaseClient):
         """Handle incoming message from any platform"""
         # Send initial thinking indicator
-        thinking_id = client.send_thinking_indicator(
+        thinking_id = await client.send_thinking_indicator(
             message.channel_id,
             message.thread_id
         )
-        
+
         try:
             # Process the message and get intent
-            response = self.processor.process_message(message, client, thinking_id)
+            response = await self.processor.process_message(message, client, thinking_id)
             
             # Delete thinking indicator (but not if streaming was used - it's already the response)
             if thinking_id and not (response and response.metadata.get("streamed")):
-                client.delete_message(message.channel_id, thinking_id)
+                await client.delete_message(message.channel_id, thinking_id)
             
             # Handle the response
             if response:
                 if response.type == "busy":
                     # Special handling for busy state
                     if hasattr(client, 'send_busy_message'):
-                        client.send_busy_message(message.channel_id, message.thread_id)
+                        await client.send_busy_message(message.channel_id, message.thread_id)
                     else:
-                        client.send_message(
+                        await client.send_message(
                             message.channel_id,
                             message.thread_id,
                             response.content
@@ -95,7 +94,7 @@ class ChatBotV2:
                     if not response.metadata.get("streamed"):
                         # Format and send text
                         formatted_text = client.format_text(response.content)
-                        client.send_message(
+                        await client.send_message(
                             message.channel_id,
                             message.thread_id,
                             formatted_text
@@ -111,22 +110,22 @@ class ChatBotV2:
                         # For streamed cases, we have a separate status message - update that, NOT the prompt!
                         status_msg_id = response.metadata.get("status_message_id")
                         if status_msg_id and hasattr(client, 'update_message'):
-                            client.update_message(message.channel_id, status_msg_id, upload_status)
+                            await client.update_message(message.channel_id, status_msg_id, upload_status)
                             upload_status_id = status_msg_id
                         else:
                             # Fallback: create new status message if not provided
-                            upload_status_id = client.send_thinking_indicator(message.channel_id, message.thread_id)
+                            upload_status_id = await client.send_thinking_indicator(message.channel_id, message.thread_id)
                             if upload_status_id and hasattr(client, 'update_message'):
-                                client.update_message(message.channel_id, upload_status_id, upload_status)
+                                await client.update_message(message.channel_id, upload_status_id, upload_status)
                     else:
                         # Non-streaming case - create new status message
-                        upload_status_id = client.send_thinking_indicator(message.channel_id, message.thread_id)
+                        upload_status_id = await client.send_thinking_indicator(message.channel_id, message.thread_id)
                         if upload_status_id and hasattr(client, 'update_message'):
-                            client.update_message(message.channel_id, upload_status_id, upload_status)
+                            await client.update_message(message.channel_id, upload_status_id, upload_status)
                     
                     # Send image
                     image_data = response.content
-                    file_url = client.send_image(
+                    file_url = await client.send_image(
                         message.channel_id,
                         message.thread_id,
                         image_data.to_bytes(),
@@ -136,7 +135,7 @@ class ChatBotV2:
                     
                     # Update thread state with the URL
                     if file_url:
-                        self.processor.update_last_image_url(
+                        await self.processor.update_last_image_url(
                             message.channel_id,
                             message.thread_id,
                             file_url
@@ -144,14 +143,13 @@ class ChatBotV2:
                     
                     # Wait 4 seconds then handle cleanup
                     if upload_status_id:
-                        import time
-                        time.sleep(4)
-                        
+                        await asyncio.sleep(4)
+
                         # Delete the status message - the enhanced prompt message remains untouched
-                        client.delete_message(message.channel_id, upload_status_id)
+                        await client.delete_message(message.channel_id, upload_status_id)
                 elif response.type == "error":
                     # Send error message
-                    client.handle_error(
+                    await client.handle_error(
                         message.channel_id,
                         message.thread_id,
                         response.content
@@ -162,10 +160,10 @@ class ChatBotV2:
             
             # Delete thinking indicator on error
             if thinking_id:
-                client.delete_message(message.channel_id, thinking_id)
-            
+                await client.delete_message(message.channel_id, thinking_id)
+
             # Send error message
-            client.handle_error(
+            await client.handle_error(
                 message.channel_id,
                 message.thread_id,
                 str(e)
@@ -174,7 +172,8 @@ class ChatBotV2:
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals - double Ctrl-C for force exit"""
         import os
-        
+        import time
+
         # Handle SIGINT (Ctrl-C) with double-press for force exit
         if signum == signal.SIGINT:
             current_time = time.time()
@@ -201,20 +200,22 @@ class ChatBotV2:
             if self.sigint_count == 1:
                 main_logger.info(f"Received signal {signum}, attempting graceful shutdown...")
                 main_logger.info("Press Ctrl-C again within 2 seconds to force exit")
-                self.shutdown()
+                # Schedule shutdown on the event loop
+                asyncio.create_task(self.shutdown())
             else:
                 main_logger.warning("Shutdown already in progress... Press Ctrl-C again to force exit")
         else:
             # Handle other signals normally
             main_logger.info(f"Received signal {signum}, shutting down...")
-            self.shutdown()
+            # Schedule shutdown on the event loop
+            asyncio.create_task(self.shutdown())
     
-    def start_cleanup_thread(self):
-        """Start background thread for periodic cleanup"""
-        def cleanup_worker():
+    async def start_cleanup_task(self):
+        """Start background task for periodic cleanup"""
+        async def cleanup_worker():
             from croniter import croniter
             import datetime
-            
+
             try:
                 # Validate cron expression
                 cron = croniter(config.cleanup_schedule, datetime.datetime.now())
@@ -224,90 +225,118 @@ class ChatBotV2:
                 main_logger.error(f"Invalid cron expression '{config.cleanup_schedule}': {e}")
                 main_logger.info("Falling back to daily at midnight (0 0 * * *)")
                 cron = croniter("0 0 * * *", datetime.datetime.now())
-            
+
             while self.running:
                 try:
                     # Calculate next run time
                     next_run = cron.get_next(datetime.datetime)
                     now = datetime.datetime.now()
                     seconds_until_next = (next_run - now).total_seconds()
-                    
+
                     # Log when next cleanup will occur
                     if seconds_until_next > 3600:
                         main_logger.info(f"Next cleanup scheduled for {next_run.strftime('%Y-%m-%d %H:%M:%S')} ({seconds_until_next/3600:.1f} hours from now)")
                     else:
                         main_logger.info(f"Next cleanup scheduled for {next_run.strftime('%Y-%m-%d %H:%M:%S')} ({seconds_until_next/60:.1f} minutes from now)")
-                    
+
                     # Sleep until next scheduled time
-                    time.sleep(seconds_until_next)
-                    
+                    await asyncio.sleep(seconds_until_next)
+
                     if self.running:
                         main_logger.info(f"Running scheduled cleanup (removing threads older than {config.cleanup_max_age_hours} hours)...")
                         # Convert hours to seconds for the cleanup function
                         max_age_seconds = config.cleanup_max_age_hours * 3600
-                        self.processor.thread_manager.cleanup_old_threads(max_age=max_age_seconds)
+                        await self.processor.thread_manager.cleanup_old_threads(max_age=max_age_seconds)
                         stats = self.processor.get_stats()
                         main_logger.info(f"Cleanup complete. Stats: {stats}")
+                except asyncio.CancelledError:
+                    main_logger.info("Cleanup task cancelled")
+                    break
                 except Exception as e:
-                    main_logger.error(f"Error in cleanup thread: {e}")
+                    main_logger.error(f"Error in cleanup task: {e}")
                     # Wait 5 minutes before retrying on error
-                    time.sleep(300)
-        
-        self.cleanup_thread = Thread(target=cleanup_worker, daemon=True)
-        self.cleanup_thread.start()
-        main_logger.info("Started cleanup thread")
+                    await asyncio.sleep(300)
+
+        self.cleanup_task = asyncio.create_task(cleanup_worker())
+        main_logger.info("Started cleanup task")
     
-    def run(self):
+    async def run(self):
         """Run the bot"""
         log_session_start()
-        
+
         try:
-            self.initialize()
+            await self.initialize()
             self.running = True
-            
-            # Start cleanup thread
-            self.start_cleanup_thread()
-            
+
+            # Start cleanup task
+            await self.start_cleanup_task()
+
             # Start the client (blocks)
             main_logger.info(f"Starting {self.platform} bot...")
             if self.client:
-                self.client.start()
-            
+                try:
+                    await self.client.start()
+                except asyncio.CancelledError:
+                    main_logger.info("Bot client cancelled during shutdown")
+                    pass
+
         except KeyboardInterrupt:
             main_logger.info("Received keyboard interrupt")
         except Exception as e:
             main_logger.error(f"Unexpected error: {e}", exc_info=True)
         finally:
-            self.shutdown()
+            await self.shutdown()
     
-    def shutdown(self):
+    async def shutdown(self):
         """Shutdown the bot gracefully"""
         if not self.running:
             return
-        
+
         self.running = False
         main_logger.info(f"Shutting down {self.platform} bot...")
-        
+
+        # Cancel cleanup task
+        if self.cleanup_task and not self.cleanup_task.done():
+            self.cleanup_task.cancel()
+            try:
+                await self.cleanup_task
+            except asyncio.CancelledError:
+                pass
+
         # Stop the client (this should interrupt any stuck operations)
         if self.client:
             try:
-                self.client.stop()
+                await self.client.stop()
             except Exception as e:
                 main_logger.warning(f"Error stopping client: {e}")
-        
+
         # Clean up resources
         try:
             if self.processor:
                 stats = self.processor.get_stats()
                 main_logger.info(f"Final stats: {stats}")
+                # Clean up processor resources
+                await self.processor.cleanup()
         except Exception as e:
-            main_logger.warning(f"Error getting final stats: {e}")
-        
+            main_logger.warning(f"Error during processor cleanup: {e}")
+
+        # Give aiohttp sessions and pending coroutines a moment to clean up
+        await asyncio.sleep(0.5)
+
+        # Cancel any remaining tasks that might be lingering
+        tasks = [t for t in asyncio.all_tasks() if t != asyncio.current_task()]
+        if tasks:
+            main_logger.warning(f"Cancelling {len(tasks)} remaining tasks...")
+            for task in tasks:
+                task.cancel()
+            # Wait briefly for cancellation
+            await asyncio.gather(*tasks, return_exceptions=True)
+
         log_session_end()
-        sys.exit(0)
+        main_logger.info("Shutdown complete")
 
 
-def main():
+async def main():
     """Main entry point"""
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Multi-platform AI Chat Bot")
@@ -317,13 +346,13 @@ def main():
         default="slack",
         help="Chat platform to use (default: slack)"
     )
-    
+
     args = parser.parse_args()
-    
+
     # Create and run bot
     bot = ChatBotV2(platform=args.platform)
-    bot.run()
+    await bot.run()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

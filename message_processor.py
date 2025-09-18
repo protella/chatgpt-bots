@@ -1101,9 +1101,9 @@ MIME Type: {mimetype}
 
             # Update thinking message to show timeout
             if thinking_id and hasattr(client, 'update_message'):
-                timeout_msg = f"{config.error_emoji} OpenAI is not responding. Try again shortly."
+                timeout_msg = "OpenAI is not responding. Try again shortly."
                 try:
-                    client.update_message(message.channel_id, thinking_id, timeout_msg)
+                    self._update_status(client, message.channel_id, thinking_id, timeout_msg, emoji=config.error_emoji)
                     self.log_debug("Updated thinking message to show timeout")
                 except Exception as update_error:
                     self.log_error(f"Failed to update thinking message: {update_error}")
@@ -1148,9 +1148,9 @@ MIME Type: {mimetype}
                    for timeout_indicator in ['timeout', 'readtimeout', 'connecttimeout']):
                 # Update thinking message to show timeout
                 if thinking_id and hasattr(client, 'update_message'):
-                    timeout_msg = f"{config.error_emoji} OpenAI is not responding. Try again shortly."
+                    timeout_msg = "OpenAI is not responding. Try again shortly."
                     try:
-                        client.update_message(message.channel_id, thinking_id, timeout_msg)
+                        self._update_status(client, message.channel_id, thinking_id, timeout_msg, emoji=config.error_emoji)
                     except Exception:
                         pass  # Don't let update failure affect error handling
 
@@ -1168,9 +1168,9 @@ MIME Type: {mimetype}
             else:
                 # Update thinking message to show error
                 if thinking_id and hasattr(client, 'update_message'):
-                    error_msg = f"{config.error_emoji} Something went wrong. Try again."
+                    error_msg = "Something went wrong. Try again."
                     try:
-                        client.update_message(message.channel_id, thinking_id, error_msg)
+                        self._update_status(client, message.channel_id, thinking_id, error_msg, emoji=config.error_emoji)
                     except Exception:
                         pass  # Don't let update failure affect error handling
 
@@ -2341,20 +2341,6 @@ MIME Type: {mimetype}
         
         return base_prompt + time_context + user_context + model_context + web_search_context + trimming_context + custom_instructions_context
     
-    def _update_status(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], message: str, emoji: Optional[str] = None):
-        """Update the thinking indicator with a status message"""
-        if thinking_id and hasattr(client, 'update_message'):
-            status_emoji = emoji or config.thinking_emoji
-            client.update_message(
-                channel_id,
-                thinking_id,
-                f"{status_emoji} {message}"
-            )
-            self.log_debug(f"Status updated: {message}")
-        elif not thinking_id:
-            self.log_debug("No thinking_id provided for status update")
-        else:
-            self.log_debug("Client doesn't support message updates")
 
     def _start_progress_updater(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], operation: str = "request") -> threading.Thread:
         """Start a background thread that updates thinking message periodically"""
@@ -2546,13 +2532,8 @@ MIME Type: {mimetype}
         self._add_message_with_token_management(thread_state, "assistant", response_text, db=self.db, thread_key=thread_key)
         
         # Schedule async cleanup after response
-        import threading
-        cleanup_thread = threading.Thread(
-            target=self._async_post_response_cleanup,
-            args=(thread_state, thread_key),
-            daemon=True
-        )
-        cleanup_thread.start()
+        cleanup_coro = self._async_post_response_cleanup(thread_state, thread_key)
+        self._schedule_async_call(cleanup_coro)
         
         return Response(
             type="text",
@@ -2653,7 +2634,7 @@ MIME Type: {mimetype}
         if thinking_id:
             # Update existing thinking message
             message_id = thinking_id
-            client.update_message(message.channel_id, message_id, initial_message)
+            self._schedule_async_call(client.update_message(message.channel_id, message_id, initial_message))
         else:
             # We need a way to post a message and get its ID - this would depend on client implementation
             self.log_warning("No thinking_id provided for streaming - falling back to non-streaming")
@@ -2685,7 +2666,7 @@ MIME Type: {mimetype}
                     status_msg = f"{config.web_search_emoji} Searching the web (query {search_counts['web_search']})..."
                     try:
                         # Use update_message_streaming for consistency with streaming flow
-                        result = client.update_message_streaming(message.channel_id, message_id, status_msg)
+                        result = self._update_message_streaming_sync(client,message.channel_id, message_id, status_msg)
                         if result["success"]:
                             self.log_info(f"Web search #{search_counts['web_search']} started - updated status")
                         else:
@@ -2699,7 +2680,7 @@ MIME Type: {mimetype}
                     # Show search count consistently for all searches
                     status_msg = f"{config.web_search_emoji} Searching files (query {search_counts['file_search']})..."
                     try:
-                        result = client.update_message_streaming(message.channel_id, message_id, status_msg)
+                        result = self._update_message_streaming_sync(client,message.channel_id, message_id, status_msg)
                         if result["success"]:
                             self.log_info(f"File search #{search_counts['file_search']} started - updated status")
                         else:
@@ -2710,7 +2691,7 @@ MIME Type: {mimetype}
                     tool_states["image_generation"] = True
                     status_msg = f"{config.circle_loader_emoji} Generating image. This may take a minute..."
                     try:
-                        result = client.update_message_streaming(message.channel_id, message_id, status_msg)
+                        result = self._update_message_streaming_sync(client,message.channel_id, message_id, status_msg)
                         if result["success"]:
                             self.log_info("Image generation started - updated status")
                         else:
@@ -2744,7 +2725,7 @@ MIME Type: {mimetype}
                     # Use raw text for final flush - no loading indicator since stream is complete
                     final_text = buffer.get_complete_text()  # No loading indicator on completion
                     try:
-                        result = client.update_message_streaming(message.channel_id, current_message_id, final_text)
+                        result = self._update_message_streaming_sync(client,message.channel_id, current_message_id, final_text)
                         if result["success"]:
                             rate_limiter.record_success()
                             buffer.mark_updated()
@@ -2799,7 +2780,7 @@ MIME Type: {mimetype}
                     # Update current message with continuation indicator
                     final_first_part = f"{first_part_display}\n\n*Continued in next message...*"
                     try:
-                        result = client.update_message_streaming(message.channel_id, current_message_id, final_first_part)
+                        result = self._update_message_streaming_sync(client,message.channel_id, current_message_id, final_first_part)
                         if result["success"]:
                             # Prepare overflow text with proper fence opening if needed
                             if was_in_code_block:
@@ -2820,7 +2801,7 @@ MIME Type: {mimetype}
                             continuation_text = f"*Part {current_part} (continued)*\n\n{continuation_display} {config.loading_ellipse_emoji}"
                             
                             # Send new message and get its ID
-                            new_msg_result = client.send_message_get_ts(message.channel_id, thinking_id, continuation_text)
+                            new_msg_result = self._send_message_get_ts_sync(client, message.channel_id, thinking_id, continuation_text)
                             if new_msg_result and "ts" in new_msg_result:
                                 current_message_id = new_msg_result["ts"]
                                 # Reset buffer with the properly fenced overflow content
@@ -2828,6 +2809,28 @@ MIME Type: {mimetype}
                                 buffer.add_chunk(overflow_with_fence)
                                 buffer.mark_updated()
                                 self.log_info(f"Created overflow message part {current_part}, reopened code block: {was_in_code_block}")
+                            else:
+                                # Couldn't get message ID due to async limitations
+                                # Continue without overflow handling (message will be sent but we can't track it)
+                                self.log_warning(f"Could not get message ID for overflow part {current_part} - continuing with current message")
+
+                                # Clean up the thinking emoji from the current message before continuing
+                                # The current message still has the thinking emoji and initial text,
+                                # but we need to replace it with just the overflow content
+                                try:
+                                    clean_overflow_text = overflow_with_fence
+                                    cleanup_result = self._update_message_streaming_sync(client, message.channel_id, current_message_id, f"{clean_overflow_text} {config.loading_ellipse_emoji}")
+                                    if cleanup_result["success"]:
+                                        self.log_info("Cleaned thinking emoji from current message after overflow failure")
+                                    else:
+                                        self.log_warning(f"Failed to clean thinking emoji after overflow failure: {cleanup_result.get('error', 'Unknown error')}")
+                                except Exception as cleanup_error:
+                                    self.log_error(f"Error cleaning thinking emoji after overflow failure: {cleanup_error}")
+
+                                # Reset buffer but keep using current message ID
+                                buffer.reset()
+                                buffer.add_chunk(overflow_with_fence)
+                                buffer.mark_updated()
                     except Exception as e:
                         self.log_error(f"Error handling message overflow: {e}")
                 else:
@@ -2837,7 +2840,7 @@ MIME Type: {mimetype}
                     
                     # Call client.update_message_streaming with indicator
                     try:
-                        result = client.update_message_streaming(message.channel_id, current_message_id, display_text_with_indicator)
+                        result = self._update_message_streaming_sync(client,message.channel_id, current_message_id, display_text_with_indicator)
                         
                         if result["success"]:
                             rate_limiter.record_success()
@@ -2858,7 +2861,7 @@ MIME Type: {mimetype}
                                         clear_text = buffer.last_sent_text if buffer.last_sent_text else "Processing..."
                                         if len(clear_text) > 3900:
                                             clear_text = clear_text[:3800] + "\n\n*Response too long - see next message*"
-                                        client.update_message_streaming(message.channel_id, message_id, clear_text)
+                                        self._update_message_streaming_sync(client,message.channel_id, message_id, clear_text)
                                     except Exception as clear_error:
                                         self.log_error(f"Failed to clear indicator after circuit break: {clear_error}")
                             else:
@@ -2916,7 +2919,7 @@ MIME Type: {mimetype}
                     if final_part_text:
                         # Add the part indicator
                         final_part_text = f"*Part {current_part} (continued)*\n\n{final_part_text}"
-                        final_result = client.update_message_streaming(message.channel_id, current_message_id, final_part_text)
+                        final_result = self._update_message_streaming_sync(client,message.channel_id, current_message_id, final_part_text)
                         if not final_result["success"]:
                             self.log_error(f"Failed to remove indicator from part {current_part}: {final_result.get('error', 'Unknown error')}")
                 except Exception as e:
@@ -2940,7 +2943,7 @@ MIME Type: {mimetype}
                             # This shouldn't happen if streaming overflow worked correctly
                             # But handle it as a fallback
                             truncated_text = response_text[:3800] + "\n\n*Continued in next message...*"
-                            final_result = client.update_message_streaming(message.channel_id, message_id, truncated_text)
+                            final_result = self._update_message_streaming_sync(client,message.channel_id, message_id, truncated_text)
                             
                             # Send the rest as new messages
                             overflow_text = response_text[3800:]
@@ -2949,7 +2952,7 @@ MIME Type: {mimetype}
                             if not final_result["success"]:
                                 self.log_error(f"Final truncated update failed: {final_result.get('error', 'Unknown error')}")
                         else:
-                            final_result = client.update_message_streaming(message.channel_id, current_message_id, response_text)
+                            final_result = self._update_message_streaming_sync(client,message.channel_id, current_message_id, response_text)
                             if not final_result["success"]:
                                 self.log_error(f"Final correction update failed: {final_result.get('error', 'Unknown error')}")
                     except Exception as e:
@@ -2963,13 +2966,8 @@ MIME Type: {mimetype}
             self._add_message_with_token_management(thread_state, "assistant", response_text, db=self.db, thread_key=thread_key)
             
             # Schedule async cleanup after response
-            import threading
-            cleanup_thread = threading.Thread(
-                target=self._async_post_response_cleanup,
-                args=(thread_state, thread_key),
-                daemon=True
-            )
-            cleanup_thread.start()
+            cleanup_coro = self._async_post_response_cleanup(thread_state, thread_key)
+            self._schedule_async_call(cleanup_coro)
             
             # Log streaming stats
             stats = rate_limiter.get_stats()
@@ -2994,7 +2992,7 @@ MIME Type: {mimetype}
                         error_text = buffer.get_complete_text()
                     else:
                         error_text = f"{config.error_emoji} *OpenAI Stream Interrupted*\n\nOpenAI's streaming response was interrupted. I'll try again without streaming..."
-                    client.update_message_streaming(message.channel_id, message_id, error_text)
+                    self._update_message_streaming_sync(client,message.channel_id, message_id, error_text)
                 except Exception as cleanup_error:
                     self.log_debug(f"Could not remove loading indicator: {cleanup_error}")
             
@@ -3148,7 +3146,7 @@ MIME Type: {mimetype}
                         # Final update without loading indicator
                         if message_id:
                             final_text = buffer.get_complete_text()
-                            client.update_message_streaming(channel_id, message_id, final_text)
+                            self._update_message_streaming_sync(client,channel_id, message_id, final_text)
                         return
                     
                     buffer.add_chunk(chunk)
@@ -3161,7 +3159,7 @@ MIME Type: {mimetype}
                         display_text = buffer.get_complete_text() + " " + config.loading_ellipse_emoji
                         
                         # Try to update the message
-                        result = client.update_message_streaming(channel_id, message_id, display_text)
+                        result = self._update_message_streaming_sync(client,channel_id, message_id, display_text)
                         
                         if result["success"]:
                             rate_limiter.record_success()
@@ -3380,7 +3378,7 @@ MIME Type: {mimetype}
                     rate_limiter.record_request_attempt()
                     display_text = f"*Enhanced Prompt:* ✨ _{buffer.get_complete_text()}_ {config.loading_ellipse_emoji}"
                     
-                    result = client.update_message_streaming(channel_id, thinking_id, display_text)
+                    result = self._update_message_streaming_sync(client,channel_id, thinking_id, display_text)
                     
                     if result["success"]:
                         rate_limiter.record_success()
@@ -3408,7 +3406,7 @@ MIME Type: {mimetype}
             # Show the final enhanced prompt
             if enhanced_prompt and thinking_id:
                 enhanced_text = f"*Enhanced Prompt:* ✨ _{enhanced_prompt}_"
-                client.update_message_streaming(channel_id, thinking_id, enhanced_text)
+                self._update_message_streaming_sync(client,channel_id, thinking_id, enhanced_text)
                 # Mark that we should NOT touch this message again
                 response_metadata["prompt_message_id"] = thinking_id
             
@@ -3462,7 +3460,7 @@ MIME Type: {mimetype}
             # After image is generated, update message to show just the enhanced prompt
             # (remove the "Generating image..." status) - but respect rate limits
             if enhanced_prompt and thinking_id and rate_limiter.can_make_request():
-                result = client.update_message_streaming(channel_id, thinking_id, f"*Enhanced Prompt:* ✨ _{enhanced_prompt}_")
+                result = self._update_message_streaming_sync(client,channel_id, thinking_id, f"*Enhanced Prompt:* ✨ _{enhanced_prompt}_")
                 if result["success"]:
                     rate_limiter.record_success()
                 else:
@@ -3721,7 +3719,7 @@ MIME Type: {mimetype}
                                 rate_limiter.record_request_attempt()
                                 display_text = f"*Enhanced Prompt:* ✨ _{buffer.get_complete_text()}_ {config.loading_ellipse_emoji}"
                                 
-                                result = client.update_message_streaming(channel_id, thinking_id, display_text)
+                                result = self._update_message_streaming_sync(client,channel_id, thinking_id, display_text)
                                 
                                 if result["success"]:
                                     rate_limiter.record_success()
@@ -3750,7 +3748,7 @@ MIME Type: {mimetype}
                         # Show the final enhanced prompt
                         if enhanced_edit_prompt and thinking_id:
                             enhanced_text = f"*Enhanced Prompt:* ✨ _{enhanced_edit_prompt}_"
-                            client.update_message_streaming(channel_id, thinking_id, enhanced_text)
+                            self._update_message_streaming_sync(client,channel_id, thinking_id, enhanced_text)
                             # Mark that we should NOT touch this message again
                             response_metadata["prompt_message_id"] = thinking_id
                         
@@ -4137,7 +4135,7 @@ MIME Type: {mimetype}
                     rate_limiter.record_request_attempt()
                     display_text = f"*Enhanced Prompt:* ✨ _{buffer.get_complete_text()}_ {config.loading_ellipse_emoji}"
                     
-                    result = client.update_message_streaming(channel_id, thinking_id, display_text)
+                    result = self._update_message_streaming_sync(client,channel_id, thinking_id, display_text)
                     
                     if result["success"]:
                         rate_limiter.record_success()
@@ -4166,7 +4164,7 @@ MIME Type: {mimetype}
             # Show the final enhanced prompt
             if enhanced_edit_prompt and thinking_id:
                 enhanced_text = f"Enhanced Prompt: ✨ _{enhanced_edit_prompt}_"
-                client.update_message_streaming(channel_id, thinking_id, enhanced_text)
+                self._update_message_streaming_sync(client,channel_id, thinking_id, enhanced_text)
                 # Mark that we should NOT touch this message again
                 response_metadata["prompt_message_id"] = thinking_id
             
@@ -4199,7 +4197,7 @@ MIME Type: {mimetype}
                 # After edit is complete, update message to show just the enhanced prompt
                 # (remove the "Generating edited image..." status) - but respect rate limits
                 if enhanced_edit_prompt and thinking_id and rate_limiter.can_make_request():
-                    result = client.update_message_streaming(channel_id, thinking_id, f"*Enhanced Prompt:* ✨ _{enhanced_edit_prompt}_")
+                    result = self._update_message_streaming_sync(client,channel_id, thinking_id, f"*Enhanced Prompt:* ✨ _{enhanced_edit_prompt}_")
                     if result["success"]:
                         rate_limiter.record_success()
                     else:
@@ -4343,3 +4341,16 @@ MIME Type: {mimetype}
     def get_stats(self) -> Dict[str, int]:
         """Get processor statistics"""
         return self.thread_manager.get_stats()
+
+    async def cleanup(self):
+        """Clean up resources and close clients."""
+        self.log_info("Cleaning up MessageProcessor resources...")
+        if hasattr(self, 'openai_client') and self.openai_client:
+            await self.openai_client.close()
+        # Close image URL handler resources
+        if hasattr(self, 'image_url_handler') and self.image_url_handler:
+            await self.image_url_handler.cleanup()
+        # Close thread manager resources if needed
+        if hasattr(self.thread_manager, 'cleanup'):
+            await self.thread_manager.cleanup()
+        self.log_info("MessageProcessor cleanup completed")

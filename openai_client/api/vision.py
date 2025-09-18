@@ -6,7 +6,7 @@ from config import config
 from prompts import VISION_ENHANCEMENT_PROMPT
 
 
-def _enhance_vision_prompt(
+async def _enhance_vision_prompt(
     client,
     user_question: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
@@ -55,7 +55,7 @@ def _enhance_vision_prompt(
         else:
             request_params["temperature"] = 0.7
 
-        response = self._safe_api_call(
+        response = await self._safe_api_call(
             self.client.responses.create,
             operation_type="general",
             **request_params,
@@ -82,7 +82,7 @@ def _enhance_vision_prompt(
         return user_question
 
 
-def analyze_images(
+async def analyze_images(
     client,
     images: List[str],
     question: str,
@@ -154,14 +154,14 @@ def analyze_images(
 
             # Stream the response
             output_text = ""
-            stream = self._safe_api_call(
+            stream = await self._safe_api_call(
                 self.client.responses.create,
                 operation_type="general",
                 **request_params,
             )
 
             # Process stream events (similar to create_streaming_response)
-            for event in stream:
+            async for event in stream:
                 try:
                     # Get event type
                     event_type = getattr(event, "type", "unknown")
@@ -222,7 +222,7 @@ def analyze_images(
 
             # API call with enforced timeout wrapper
             self.log_debug(f"Calling analyze_images API with {config.api_timeout_read}s timeout")
-            response = self._safe_api_call(
+            response = await self._safe_api_call(
                 self.client.responses.create,
                 operation_type="general",
                 **request_params,
@@ -264,7 +264,7 @@ def analyze_images(
         raise
 
 
-def analyze_image(
+async def analyze_image(
     client,
     image_data: str,
     question: str,

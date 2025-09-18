@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
 import time
@@ -10,8 +11,8 @@ from streaming import RateLimitManager, StreamingBuffer
 
 
 class ImageGenerationMixin:
-    def _handle_image_generation(self, prompt: str, thread_state, client: BaseClient, 
-                                channel_id: str, thinking_id: Optional[str], message: Message, 
+    async def _handle_image_generation(self, prompt: str, thread_state, client: BaseClient,
+                                channel_id: str, thinking_id: Optional[str], message: Message,
                                 skip_enhancement: bool = False) -> Response:
         """Handle image generation request with streaming enhancement
         
@@ -34,7 +35,7 @@ class ImageGenerationMixin:
         enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state)
         
         # Pre-trim messages to fit within context window
-        enhanced_messages = self._pre_trim_messages_for_api(enhanced_messages)
+        enhanced_messages = await self._pre_trim_messages_for_api(enhanced_messages)
         
         # Check if streaming is supported (respecting user prefs) and enhancement is needed
         streaming_enabled = thread_config.get('enable_streaming', config.enable_streaming)
@@ -63,7 +64,7 @@ class ImageGenerationMixin:
                     rate_limiter.record_request_attempt()
                     display_text = f"*Enhanced Prompt:* ✨ _{buffer.get_complete_text()}_ {config.loading_ellipse_emoji}"
                     
-                    result = client.update_message_streaming(channel_id, thinking_id, display_text)
+                    result = self._update_message_streaming_sync(client, channel_id, thinking_id, display_text)
                     
                     if result["success"]:
                         rate_limiter.record_success()
@@ -82,7 +83,7 @@ class ImageGenerationMixin:
                             rate_limiter.record_failure(is_rate_limit=False)
             
             # Enhance prompt with streaming (returns the complete enhanced text)
-            enhanced_prompt = self.openai_client._enhance_image_prompt(
+            enhanced_prompt = await self.openai_client._enhance_image_prompt(
                 prompt=prompt,
                 conversation_history=enhanced_messages,
                 stream_callback=enhancement_callback
@@ -91,12 +92,12 @@ class ImageGenerationMixin:
             # Show the final enhanced prompt
             if enhanced_prompt and thinking_id:
                 enhanced_text = f"*Enhanced Prompt:* ✨ _{enhanced_prompt}_"
-                client.update_message_streaming(channel_id, thinking_id, enhanced_text)
+                self._update_message_streaming_sync(client, channel_id, thinking_id, enhanced_text)
                 # Mark that we should NOT touch this message again
                 response_metadata["prompt_message_id"] = thinking_id
             
             # Create a NEW message for generating status - don't touch the enhanced prompt!
-            generating_id = client.send_thinking_indicator(channel_id, thread_state.thread_ts)
+            generating_id = await client.send_thinking_indicator(channel_id, thread_state.thread_ts)
             self._update_status(client, channel_id, generating_id, 
                               "Generating image. This may take a minute...", 
                               emoji=config.circle_loader_emoji)
@@ -105,7 +106,7 @@ class ImageGenerationMixin:
             
             # Generate image with already-enhanced prompt
             try:
-                image_data = self.openai_client.generate_image(
+                image_data = await self.openai_client.generate_image(
                     prompt=enhanced_prompt,
                     size=thread_config.get("image_size"),
                     quality=thread_config.get("image_quality"),
@@ -145,7 +146,7 @@ class ImageGenerationMixin:
             # After image is generated, update message to show just the enhanced prompt
             # (remove the "Generating image..." status) - but respect rate limits
             if enhanced_prompt and thinking_id and rate_limiter.can_make_request():
-                result = client.update_message_streaming(channel_id, thinking_id, f"*Enhanced Prompt:* ✨ _{enhanced_prompt}_")
+                result = self._update_message_streaming_sync(client, channel_id, thinking_id, f"*Enhanced Prompt:* ✨ _{enhanced_prompt}_")
                 if result["success"]:
                     rate_limiter.record_success()
                 else:
@@ -161,7 +162,7 @@ class ImageGenerationMixin:
             self._update_status(client, channel_id, thinking_id, "Creating your image. This may take a minute...", emoji=config.circle_loader_emoji)
             
             try:
-                image_data = self.openai_client.generate_image(
+                image_data = await self.openai_client.generate_image(
                     prompt=prompt,
                     size=thread_config.get("image_size"),
                     quality=thread_config.get("image_quality"),

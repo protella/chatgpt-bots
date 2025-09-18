@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List, Optional
 
 from base_client import BaseClient, Message
@@ -49,7 +50,7 @@ class ThreadManagementMixin:
         total_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
         self.log_debug(f"MESSAGE ADDED | Role: {role} | Tokens: {msg_tokens} | Total: {total_tokens}/{max_tokens}")
 
-    def _pre_trim_messages_for_api(self, messages: List[Dict[str, Any]], new_message_tokens: int = 0, model: str = None, thread_state=None) -> List[Dict[str, Any]]:
+    async def _pre_trim_messages_for_api(self, messages: List[Dict[str, Any]], new_message_tokens: int = 0, model: str = None, thread_state=None) -> List[Dict[str, Any]]:
         """Pre-trim messages to fit within context window before sending to API
         
         Args:
@@ -74,7 +75,7 @@ class ThreadManagementMixin:
         # If we have thread_state, use smart trimming
         if thread_state:
             # Apply smart trimming with document summarization
-            trimmed_count = self._smart_trim_with_summarization(thread_state)
+            trimmed_count = await self._smart_trim_with_summarization(thread_state)
             if trimmed_count > 0:
                 new_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
                 self.log_info(f"Smart trim complete: {current_tokens} → {new_tokens} tokens ({trimmed_count} messages processed)")
@@ -157,7 +158,7 @@ class ThreadManagementMixin:
         
         return False
 
-    def _summarize_document_content(self, content: str) -> str:
+    async def _summarize_document_content(self, content: str) -> str:
         """Summarize document content to reduce token usage
         
         Args:
@@ -193,7 +194,7 @@ class ThreadManagementMixin:
             
             # Use proper role separation for document summarization
             # Developer message contains the instruction, user message contains the document
-            summary = self.openai_client.create_text_response(
+            summary = await self.openai_client.create_text_response(
                 messages=[
                     {"role": "developer", "content": DOCUMENT_SUMMARIZATION_PROMPT},
                     {"role": "user", "content": doc_text}  # Full document, no truncation
@@ -220,7 +221,7 @@ class ThreadManagementMixin:
             self.log_error(f"Error summarizing document: {e}")
             return content  # Return original if summarization fails
 
-    def _smart_trim_with_summarization(self, thread_state, trim_count: int = None) -> int:
+    async def _smart_trim_with_summarization(self, thread_state, trim_count: int = None) -> int:
         """Intelligently trim messages, summarizing documents only when they're in the trim list
         
         This method identifies the oldest N messages to be trimmed. If any contain
@@ -271,7 +272,7 @@ class ThreadManagementMixin:
                     self.log_info(f"Summarizing document at index {idx} (in trim list of {len(indices_to_process)} messages)")
                     
                     # Summarize the document
-                    summarized_content = self._summarize_document_content(original_content)
+                    summarized_content = await self._summarize_document_content(original_content)
                     
                     # Update the message IN PLACE with summarized content
                     thread_state.messages[idx]["content"] = summarized_content
@@ -348,7 +349,7 @@ class ThreadManagementMixin:
         
         return trimmed
 
-    def _async_post_response_cleanup(self, thread_state, thread_key: str):
+    async def _async_post_response_cleanup(self, thread_state, thread_key: str):
         """Asynchronously clean up thread after response is sent
         
         This runs after the response has been sent to Slack to proactively
@@ -372,7 +373,7 @@ class ThreadManagementMixin:
                 self.log_info(f"Thread at {current_tokens}/{max_tokens} tokens ({current_tokens/max_tokens:.1%}), triggering cleanup")
                 
                 # Use smart trim with summarization for documents
-                trimmed = self._smart_trim_with_summarization(thread_state)
+                trimmed = await self._smart_trim_with_summarization(thread_state)
                 
                 if trimmed > 0:
                     # Update token count after trimming
@@ -383,11 +384,11 @@ class ThreadManagementMixin:
                     if self.db:
                         # Clear and rebuild cache with current state
                         # This ensures DB reflects summarizations and removals
-                        self.db.clear_thread_messages(thread_key)
+                        await self.db.clear_thread_messages(thread_key)
                         for msg in thread_state.messages:
-                            self.db.cache_message(
-                                thread_key, 
-                                msg.get("role"), 
+                            await self.db.cache_message_async(
+                                thread_key,
+                                msg.get("role"),
                                 msg.get("content"),
                                 message_ts=None,  # Timestamp not needed for cache rebuild
                                 metadata=msg.get("metadata")
@@ -400,14 +401,14 @@ class ThreadManagementMixin:
             self.log_error(f"Error during async cleanup: {e}")
             # Don't let cleanup errors affect the main flow
 
-    def _get_or_rebuild_thread_state(
+    async def _get_or_rebuild_thread_state(
         self,
         message: Message,
         client: BaseClient,
         thinking_id: Optional[str] = None
     ) -> Any:
         """Get existing thread state or rebuild from platform history"""
-        thread_state = self.thread_manager.get_or_create_thread(
+        thread_state = await self.thread_manager.get_or_create_thread_async(
             message.thread_id,
             message.channel_id
         )
@@ -432,7 +433,7 @@ class ThreadManagementMixin:
             self.log_info(f"Checking thread history for {message.thread_id}")
             
             # Get history from platform first to see if there's anything to rebuild
-            history = client.get_thread_history(
+            history = await client.get_thread_history(
                 message.channel_id,
                 message.thread_id
             )
@@ -482,7 +483,7 @@ class ThreadManagementMixin:
                             # Get the slack_client from metadata if available
                             slack_client = hist_msg.metadata.get("slack_client") if hist_msg.metadata else None
                             if slack_client:
-                                username = client.get_username(hist_msg.user_id, slack_client)
+                                username = await client.get_username(hist_msg.user_id, slack_client)
                             else:
                                 # Try without slack_client
                                 username = hist_msg.user_id  # Fallback to user_id
@@ -584,7 +585,7 @@ class ThreadManagementMixin:
                                 # Try to download and process the document
                                 try:
                                     # Download the document using the client
-                                    document_data = client.download_file(att_url, attachment.get("id"))
+                                    document_data = await client.download_file(att_url, attachment.get("id"))
                                     
                                     if document_data and self.document_handler:
                                         # Extract document content
@@ -697,7 +698,7 @@ class ThreadManagementMixin:
             
             # Keep trimming until we're under the limit
             while current_tokens > max_tokens:
-                trimmed_count = self._smart_trim_with_summarization(thread_state)
+                trimmed_count = await self._smart_trim_with_summarization(thread_state)
                 total_trimmed += trimmed_count
                 
                 if trimmed_count == 0:
@@ -715,9 +716,9 @@ class ThreadManagementMixin:
                 # Update database with trimmed state
                 if self.db:
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-                    self.db.clear_thread_messages(thread_key)
+                    await self.db.clear_thread_messages(thread_key)
                     for msg in thread_state.messages:
-                        self.db.cache_message(
+                        await self.db.cache_message_async(
                             thread_id=thread_key,
                             role=msg.get("role"),
                             content=msg.get("content"),

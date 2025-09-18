@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime
 import threading
 import time
@@ -157,7 +158,7 @@ class MessageUtilitiesMixin:
         # We'll determine the file type when processing them
         return all_urls
 
-    def _process_attachments(
+    async def _process_attachments(
         self,
         message: Message,
         client: BaseClient,
@@ -193,7 +194,7 @@ class MessageUtilitiesMixin:
                         processed_file_ids.add(file_id)
                     
                     # Download the image
-                    image_data = client.download_file(
+                    image_data = await client.download_file(
                         attachment.get("url"),
                         file_id
                     )
@@ -217,7 +218,7 @@ class MessageUtilitiesMixin:
                         if self.db and attachment.get("url"):
                             thread_key = f"{message.channel_id}:{message.thread_id}"
                             try:
-                                self.db.save_image_metadata(
+                                await self.db.save_image_metadata_async(
                                     thread_id=thread_key,
                                     url=attachment.get("url"),
                                     image_type="uploaded",
@@ -251,7 +252,7 @@ class MessageUtilitiesMixin:
                                           emoji=config.analyze_emoji)
                     
                     # Download the document
-                    document_data = client.download_file(
+                    document_data = await client.download_file(
                         attachment.get("url"),
                         file_id
                     )
@@ -398,7 +399,7 @@ class MessageUtilitiesMixin:
                     
                     # Download the Slack file using the client's download_file method
                     self.log_info(f"Downloading Slack file from URL: {url}")
-                    file_data = client.download_file(url)
+                    file_data = await client.download_file(url)
                     
                     if file_data:
                         if is_pdf or is_doc:
@@ -536,7 +537,7 @@ class MessageUtilitiesMixin:
             if hasattr(client, '__class__') and client.__class__.__name__ == 'SlackBot':
                 auth_token = config.slack_bot_token
             
-            downloaded_images, failed_urls = self.image_url_handler.process_urls_from_text(text_for_url_processing, auth_token)
+            downloaded_images, failed_urls = await self.image_url_handler.process_urls_from_text(text_for_url_processing, auth_token)
             
             for img_data in downloaded_images:
                 if image_count >= max_images:
@@ -760,15 +761,74 @@ class MessageUtilitiesMixin:
         
         return base_prompt + time_context + user_context + model_context + web_search_context + trimming_context + custom_instructions_context
 
+    def _schedule_async_call(self, coro):
+        """Helper to schedule async calls from sync contexts"""
+        import asyncio
+        try:
+            # Try to get the current event loop, if one exists
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # We're in an async context, schedule as task
+                return asyncio.create_task(coro)
+            else:
+                # No running loop, run the coroutine
+                return asyncio.run(coro)
+        except RuntimeError:
+            # No event loop, create one
+            return asyncio.run(coro)
+
+    def _update_message_streaming_sync(self, client, channel_id: str, message_id: str, text: str):
+        """Wrapper for calling async update_message_streaming from sync contexts
+
+        Returns a fake success result since we can't wait for the actual result
+        in a synchronous callback context.
+        """
+        try:
+            result_coro = client.update_message_streaming(channel_id, message_id, text)
+            if hasattr(result_coro, '__await__'):
+                # This is a coroutine - schedule it to run
+                self._schedule_async_call(result_coro)
+                # Return a success result since we can't wait for the actual result
+                return {"success": True, "rate_limited": False, "retry_after": None}
+            else:
+                # It's already a result (shouldn't happen with async methods)
+                return result_coro
+        except Exception as e:
+            self.log_error(f"Error scheduling async message update: {e}")
+            return {"success": False, "rate_limited": False, "retry_after": None, "error": str(e)}
+
+    def _send_message_get_ts_sync(self, client, channel_id: str, thread_id: str, text: str):
+        """Wrapper for calling async send_message_get_ts from sync contexts
+
+        Returns a placeholder result since we can't wait for the actual result
+        in a synchronous callback context. The message will be sent but we
+        can't reliably get the timestamp back.
+        """
+        try:
+            result_coro = client.send_message_get_ts(channel_id, thread_id, text)
+            if hasattr(result_coro, '__await__'):
+                # This is a coroutine - schedule it to run
+                self._schedule_async_call(result_coro)
+                # Return a placeholder result since we can't wait for the actual result
+                # The overflow handling will need to be more resilient
+                return None  # Signal that we couldn't get the message ID
+            else:
+                # It's already a result (shouldn't happen with async methods)
+                return result_coro
+        except Exception as e:
+            self.log_error(f"Error scheduling async message send: {e}")
+            return None
+
     def _update_status(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], message: str, emoji: Optional[str] = None):
         """Update the thinking indicator with a status message"""
         if thinking_id and hasattr(client, 'update_message'):
             status_emoji = emoji or config.thinking_emoji
-            client.update_message(
+            # Schedule the async call as a task to avoid blocking
+            self._schedule_async_call(client.update_message(
                 channel_id,
                 thinking_id,
                 f"{status_emoji} {message}"
-            )
+            ))
             self.log_debug(f"Status updated: {message}")
         elif not thinking_id:
             self.log_debug("No thinking_id provided for status update")
@@ -851,7 +911,7 @@ class MessageUtilitiesMixin:
             
         return False
 
-    def update_last_image_url(self, channel_id: str, thread_id: str, url: str):
+    async def update_last_image_url(self, channel_id: str, thread_id: str, url: str):
         """Update the last assistant message with the image URL"""
         thread_state = self.thread_manager.get_or_create_thread(thread_id, channel_id)
         
@@ -876,7 +936,7 @@ class MessageUtilitiesMixin:
                         prompt = metadata.get("prompt", "")
                         
                         # Save the image metadata to DB
-                        self.db.save_image_metadata(
+                        await self.db.save_image_metadata_async(
                             thread_id=thread_key,
                             url=url,
                             image_type=image_type,
