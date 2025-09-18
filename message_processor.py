@@ -4122,21 +4122,21 @@ MIME Type: {mimetype}
         message: Message
     ) -> Response:
         """Handle vision request when no images are uploaded - use text response with context"""
-        
+
         # Check if we have any images in the conversation that provide context
         image_registry = self._extract_image_registry(thread_state)
         has_images = bool(image_registry) or self._has_recent_image(thread_state)
-        
+
         # Check if we have documents in the conversation
         document_ledger = self.thread_manager.get_document_ledger(thread_state.thread_ts)
         has_documents = document_ledger and len(document_ledger.documents) > 0
-        
+
         if has_images or has_documents:
             # We have image/document context in the conversation - let the model use that
             self.log_info(f"Vision intent with {'image' if has_images else ''}{' and ' if has_images and has_documents else ''}{'document' if has_documents else ''} context in history - using text response with context")
         else:
             self.log_info("Vision intent but no images or documents found in conversation")
-        
+
         # Don't attach documents to the message - they're already in the thread history
         # The model will have access to them from the conversation context
         return self._handle_text_response(text, thread_state, client, message, thinking_id, retry_count=0)

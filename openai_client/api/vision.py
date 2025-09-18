@@ -105,7 +105,7 @@ async def analyze_images(
     # Enhance the question if requested
     enhanced_question = question
     if enhance_prompt:
-        enhanced_question = self._enhance_vision_prompt(question, conversation_history)
+        enhanced_question = await self._enhance_vision_prompt(question, conversation_history)
         self.log_info(f"Vision analysis with enhanced prompt: {enhanced_question[:100]}...")
 
     # Build content array with text and images
@@ -272,4 +272,4 @@ async def analyze_image(
     """Analyze a single image (backward compatibility wrapper)."""
 
     self = client
-    return self.analyze_images([image_data], question, detail)
+    return await self.analyze_images([image_data], question, detail)

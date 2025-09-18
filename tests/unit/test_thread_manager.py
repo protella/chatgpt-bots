@@ -73,7 +73,7 @@ class TestThreadState:
         for i in range(30):
             thread.add_message("user", f"Message {i}")
         
-        thread.clear_old_messages(keep_last=5)
+        thread.clear_old_messages(_keep_last=5)
         # Should not limit messages anymore
         assert len(thread.messages) == 30
 
@@ -442,7 +442,7 @@ class TestThreadStateManager:
         assert len(thread.messages) == 100
         
         # clear_old_messages should be no-op
-        thread.clear_old_messages(keep_last=5)
+        thread.clear_old_messages(_keep_last=5)
         assert len(thread.messages) == 100  # Still 100, not limited
     
     @patch('thread_manager.threading.Thread')
