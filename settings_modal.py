@@ -21,7 +21,8 @@ class SettingsModal(LoggerMixin):
                             is_new_user: bool = False,
                             thread_id: Optional[str] = None,
                             in_thread: bool = False,
-                            scope: str = None) -> Dict:
+                            scope: str = None,
+                            pending_message: Optional[Dict] = None) -> Dict:
         """
         Build the complete settings modal.
 
@@ -33,6 +34,7 @@ class SettingsModal(LoggerMixin):
             thread_id: Thread ID if opened from within a thread
             in_thread: Whether modal was opened from within a thread
             scope: Selected scope ('thread' or 'global')
+            pending_message: Pending message to process after settings save (for new users)
 
         Returns:
             Modal view dictionary for Slack API
@@ -67,6 +69,18 @@ class SettingsModal(LoggerMixin):
         # Slack modal titles have a 24 character limit
         modal_title = "ChatGPT Settings (Dev)" if is_dev else "ChatGPT Bot Settings"
         
+        # Build metadata with all necessary context
+        metadata = {
+            "settings": current_settings,
+            "thread_id": thread_id,
+            "in_thread": in_thread,
+            "scope": scope
+        }
+
+        # Include pending message if provided (for new users)
+        if pending_message:
+            metadata["pending_message"] = pending_message
+
         return {
             "type": "modal",
             "callback_id": callback_id,
@@ -74,12 +88,7 @@ class SettingsModal(LoggerMixin):
             "submit": {"type": "plain_text", "text": "Save Settings"},
             "close": {"type": "plain_text", "text": "Cancel"},
             "blocks": blocks,
-            "private_metadata": json.dumps({
-                "settings": current_settings,
-                "thread_id": thread_id,
-                "in_thread": in_thread,
-                "scope": scope
-            })  # Store settings and context including selected scope
+            "private_metadata": json.dumps(metadata)
         }
     
     def _build_modal_blocks(self, settings: Dict, selected_model: str, 
