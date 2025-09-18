@@ -428,9 +428,13 @@ class ThreadStateManager(LoggerMixin):
             # Watchdog should be MUCH more aggressive to prevent 630s double timeouts
             # Check frequently and release locks that are stuck after API timeout
             api_timeout = int(config.api_timeout_read)
-            # Use a SHORTER timeout - don't add extra time, just detect stuck threads
-            max_lock_duration = api_timeout + 5  # Only 5s buffer after API timeout
-            self.log_info(f"Thread lock watchdog started with {max_lock_duration}s timeout (API timeout: {api_timeout}s)")
+
+            # Calculate maximum possible timeout (for image operations which can take 5 minutes)
+            max_possible_timeout = 300  # 5 minutes for image operations
+            # Use a buffer after the longest possible operation
+            max_lock_duration = max_possible_timeout + 10  # 10s buffer after longest operation
+
+            self.log_info(f"Thread lock watchdog started with {max_lock_duration}s timeout (base API timeout: {api_timeout}s, max operation timeout: {max_possible_timeout}s)")
 
             while True:
                 try:
@@ -738,9 +742,13 @@ class AsyncThreadStateManager(LoggerMixin):
         """Start the background task that monitors for stuck locks"""
         async def async_watchdog():
             api_timeout = int(config.api_timeout_read)
-            # Use a SHORTER timeout - don't add extra time, just detect stuck threads
-            max_lock_duration = api_timeout + 5  # Only 5s buffer after API timeout
-            self.log_info(f"Async thread lock watchdog started with {max_lock_duration}s timeout (API timeout: {api_timeout}s)")
+
+            # Calculate maximum possible timeout (for image operations which can take 5 minutes)
+            max_possible_timeout = 300  # 5 minutes for image operations
+            # Use a buffer after the longest possible operation
+            max_lock_duration = max_possible_timeout + 10  # 10s buffer after longest operation
+
+            self.log_info(f"Async thread lock watchdog started with {max_lock_duration}s timeout (base API timeout: {api_timeout}s, max operation timeout: {max_possible_timeout}s)")
 
             while True:
                 try:

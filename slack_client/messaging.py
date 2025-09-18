@@ -136,6 +136,13 @@ class SlackMessagingMixin:
                 except Exception as e:
                     self.log_warning(f"Error closing _async_client session: {e}")
 
+        # Clean up utilities session if it exists
+        if hasattr(self, '_cleanup_session'):
+            try:
+                await self._cleanup_session()
+            except Exception as e:
+                self.log_warning(f"Error cleaning up utilities session: {e}")
+
     async def send_message(self, channel_id: str, thread_id: str, text: str) -> bool:
         """Send a text message to Slack, splitting if needed"""
         try:
