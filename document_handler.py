@@ -1207,9 +1207,9 @@ class DocumentHandler(LoggerMixin):
                 self.log_info(f"Converted first {max_pages} of {len(images)} PDF pages to images")
             else:
                 self.log_info(f"Converted all {len(images)} PDF pages to images")
-            
+
             return converted_pages
-            
+
         except Exception as e:
             self.log_error(f"Failed to convert PDF to images: {e}")
             # Check if it's a poppler issue

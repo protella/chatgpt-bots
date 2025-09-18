@@ -12,9 +12,9 @@ class SlackSettingsHandlersMixin:
     def _register_settings_handlers(self):
         # Register slash command handler
         @self.app.command(config.settings_slash_command)
-        def handle_settings_command(ack, body, client):
+        async def handle_settings_command(ack, body, client):
             """Handle the settings slash command"""
-            ack()  # Acknowledge command receipt immediately
+            await ack()  # Acknowledge command receipt immediately
             
             user_id = body.get('user_id')
             trigger_id = body.get('trigger_id')
@@ -25,18 +25,18 @@ class SlackSettingsHandlersMixin:
             self.log_info(f"Settings command invoked by user {user_id}")
             
             # Get current settings or create defaults
-            current_settings = self.db.get_user_preferences(user_id)
+            current_settings = await self.db.get_user_preferences_async(user_id)
             is_new_user = current_settings is None
-            
+
             if is_new_user:
                 # Get user's email for preferences
-                user_data = self.db.get_or_create_user(user_id)
+                user_data = await self.db.get_or_create_user_async(user_id)
                 email = user_data.get('email') if user_data else None
-                current_settings = self.db.create_default_user_preferences(user_id, email)
+                current_settings = await self.db.create_default_user_preferences_async(user_id, email)
             
             # Build and open modal for global settings
             try:
-                modal = self.settings_modal.build_settings_modal(
+                modal = await self.settings_modal.build_settings_modal(
                     user_id=user_id,
                     trigger_id=trigger_id,
                     current_settings=current_settings,
@@ -47,7 +47,7 @@ class SlackSettingsHandlersMixin:
                 # Keep default title "ChatGPT Settings (Dev)" from settings_modal.py
                 
                 # Open the modal
-                response = client.views_open(
+                response = await client.views_open(
                     trigger_id=trigger_id,
                     view=modal
                 )
@@ -61,7 +61,7 @@ class SlackSettingsHandlersMixin:
                 self.log_error(f"Error opening settings modal: {e}")
                 # Fallback to ephemeral message
                 try:
-                    client.chat_postEphemeral(
+                    await client.chat_postEphemeral(
                         channel=body.get('channel_id'),
                         user=user_id,
                         text="❌ Sorry, I couldn't open the settings modal. Please try again."
@@ -72,7 +72,7 @@ class SlackSettingsHandlersMixin:
         # Register modal submission handlers
         @self.app.view("settings_modal")
         @self.app.view("welcome_settings_modal")
-        def handle_settings_submission(ack, body, view, client):
+        async def handle_settings_submission(ack, body, view, client):
             """Handle settings modal submission"""
             
             user_id = body['user']['id']
@@ -104,12 +104,12 @@ class SlackSettingsHandlersMixin:
             
             # Check if we need confirmation for global custom instructions from thread
             needs_confirmation = False
-            if (in_thread and selected_scope == 'global' and 
-                form_values.get('custom_instructions') and 
+            if (in_thread and selected_scope == 'global' and
+                form_values.get('custom_instructions') and
                 not metadata.get('confirmed')):
-                
+
                 # Check if there are existing global custom instructions
-                existing_prefs = self.db.get_user_preferences(user_id)
+                existing_prefs = await self.db.get_user_preferences_async(user_id)
                 existing_custom = existing_prefs.get('custom_instructions', '') if existing_prefs else ''
                 
                 if existing_custom:
@@ -141,11 +141,11 @@ class SlackSettingsHandlersMixin:
                 }
                 
                 # Use 'push' to stack this modal on top, preserving the settings modal
-                ack(response_action="push", view=confirmation_modal)
+                await ack(response_action="push", view=confirmation_modal)
                 return
             
             # Normal flow - acknowledge immediately
-            ack()
+            await ack()
             
             # Validate settings
             validated_settings = self.settings_modal.validate_settings(form_values)
@@ -155,7 +155,7 @@ class SlackSettingsHandlersMixin:
             if selected_scope == 'thread' and thread_id:
                 # For thread settings, get the current thread config from DB to check for model switch
                 try:
-                    current_thread_config = self.db.get_thread_config(thread_id)
+                    current_thread_config = await self.db.get_thread_config_async(thread_id)
                     if current_thread_config:
                         old_model = current_thread_config.get('model')
                         new_model = validated_settings.get('model')
@@ -168,7 +168,8 @@ class SlackSettingsHandlersMixin:
                     self.log_debug(f"Could not check for model switch: {e}")
             else:
                 # For global settings, check current default
-                old_model = self.db.get_user_preferences(user_id).get('model') if self.db else config.gpt_model
+                user_prefs = await self.db.get_user_preferences_async(user_id) if self.db else None
+                old_model = user_prefs.get('model') if user_prefs else config.gpt_model
                 new_model = validated_settings.get('model')
                 
                 if old_model and new_model:
@@ -193,8 +194,8 @@ class SlackSettingsHandlersMixin:
                 thread_settings = {k: v for k, v in validated_settings.items() if k != 'settings_completed'}
                 # Ensure thread exists
                 channel_id, thread_ts = thread_id.split(':')
-                self.db.get_or_create_thread(thread_id, channel_id)
-                self.db.save_thread_config(thread_id, thread_settings)
+                await self.db.get_or_create_thread_async(thread_id, channel_id)
+                await self.db.save_thread_config_async(thread_id, thread_settings)
                 
                 # Update memory cache immediately if processor is available
                 if hasattr(self, 'processor') and self.processor:
@@ -214,7 +215,7 @@ class SlackSettingsHandlersMixin:
                 # Mark settings as completed for user preferences
                 validated_settings['settings_completed'] = True
                 # Update user preferences
-                success = self.db.update_user_preferences(user_id, validated_settings)
+                success = await self.db.update_user_preferences_async(user_id, validated_settings)
                 save_location = "global"
                 self.log_info(f"Global settings saved for user {user_id}: {validated_settings}")
             
@@ -225,7 +226,7 @@ class SlackSettingsHandlersMixin:
                     if save_location == "thread" and thread_id:
                         # Send ephemeral confirmation in the thread
                         channel_id, thread_ts = thread_id.split(':')
-                        client.chat_postEphemeral(
+                        await client.chat_postEphemeral(
                             channel=channel_id,
                             thread_ts=thread_ts,
                             user=user_id,
@@ -257,7 +258,7 @@ class SlackSettingsHandlersMixin:
                             }
                         ]
                         
-                        client.chat_postMessage(
+                        await client.chat_postMessage(
                             channel=user_id,  # Send to user's DM
                             text=f"✅ Your global settings have been saved successfully!{warning_message}",
                             blocks=blocks
@@ -269,7 +270,7 @@ class SlackSettingsHandlersMixin:
                 if hasattr(self, '_reminder_messages') and user_id in self._reminder_messages:
                     for msg_info in self._reminder_messages[user_id]:
                         try:
-                            client.chat_delete(
+                            await client.chat_delete(
                                 channel=msg_info['channel'],
                                 ts=msg_info['ts']
                             )
@@ -283,7 +284,7 @@ class SlackSettingsHandlersMixin:
                     welcome_info = self._welcome_messages[user_id]
                     try:
                         # Update to compact settings button
-                        client.chat_update(
+                        await client.chat_update(
                             channel=welcome_info['channel'],
                             ts=welcome_info['ts'],
                             text="Settings available",
@@ -332,7 +333,7 @@ class SlackSettingsHandlersMixin:
                         self.log_info(f"Original message was too long for new user {user_id}")
                         # Notify the user to resend their message IN THE THREAD
                         try:
-                            client.chat_postMessage(
+                            await client.chat_postMessage(
                                 channel=pending_message.get('channel_id', user_id),
                                 thread_ts=pending_message.get('thread_id'),  # Send to thread if it exists
                                 text="✅ Settings saved! I couldn't save your initial message during setup (too long). Please send it again and I'll process it normally."
@@ -368,13 +369,13 @@ class SlackSettingsHandlersMixin:
                                 synthetic_event['files'] = files
 
                             # Process the original message now that settings are configured
-                            self._handle_slack_message(synthetic_event, client)
+                            await self._handle_slack_message(synthetic_event, client)
 
                         except Exception as e:
                             self.log_error(f"Error processing pending message: {e}")
                             # Send error message to user
                             try:
-                                client.chat_postMessage(
+                                await client.chat_postMessage(
                                     channel=pending_message['channel_id'],
                                     thread_ts=pending_message.get('thread_id'),
                                     text="I'm ready now! Could you please repeat your question?"
@@ -385,7 +386,7 @@ class SlackSettingsHandlersMixin:
             else:
                 self.log_error(f"Failed to save settings for user {user_id}")
                 try:
-                    client.chat_postMessage(
+                    await client.chat_postMessage(
                         channel=user_id,
                         text="❌ Sorry, there was an error saving your settings. Please try again."
                     )
@@ -394,7 +395,7 @@ class SlackSettingsHandlersMixin:
         
         # Handler for custom instructions confirmation modal submission
         @self.app.view("confirm_global_custom_instructions")
-        def handle_custom_instructions_confirmation(ack, body, view, client):
+        async def handle_custom_instructions_confirmation(ack, body, view, client):
             """Handle confirmation for overwriting global custom instructions"""
             # Clear all modals when confirmed
             ack(response_action="clear")
@@ -413,7 +414,7 @@ class SlackSettingsHandlersMixin:
             validated_settings['settings_completed'] = True
             
             # Update user preferences with the confirmed custom instructions
-            success = self.db.update_user_preferences(user_id, validated_settings)
+            success = await self.db.update_user_preferences_async(user_id, validated_settings)
             
             if success:
                 self.log_info(f"Global settings saved after confirmation for user {user_id}: {validated_settings}")
@@ -444,7 +445,7 @@ class SlackSettingsHandlersMixin:
                         }
                     ]
                     
-                    client.chat_postMessage(
+                    await client.chat_postMessage(
                         channel=user_id,
                         text="✅ Your global settings have been saved successfully!",
                         blocks=blocks
@@ -456,9 +457,9 @@ class SlackSettingsHandlersMixin:
         
         # Register modal action handlers (for dynamic updates)
         @self.app.action("model_select")
-        def handle_model_change(ack, body, client):
+        async def handle_model_change(ack, body, client):
             """Handle model selection changes for dynamic modal updates"""
-            ack()
+            await ack()
             
             user_id = body['user']['id']
             selected_model = body['actions'][0]['selected_option']['value']
@@ -488,12 +489,12 @@ class SlackSettingsHandlersMixin:
             
             # If no stored settings, get user's saved preferences
             if not stored_settings:
-                saved_settings = self.db.get_user_preferences(user_id)
+                saved_settings = await self.db.get_user_preferences_async(user_id)
                 if not saved_settings:
                     # If no saved settings, get defaults
-                    user_data = self.db.get_or_create_user(user_id)
+                    user_data = await self.db.get_or_create_user_async(user_id)
                     email = user_data.get('email') if user_data else None
-                    saved_settings = self.db.create_default_user_preferences(user_id, email)
+                    saved_settings = await self.db.create_default_user_preferences_async(user_id, email)
                 stored_settings = saved_settings
             
             # Extract current form values (only gets visible fields)
@@ -509,7 +510,7 @@ class SlackSettingsHandlersMixin:
             
             # Build updated modal with new model selection
             is_new_user = body['view']['callback_id'] == 'welcome_settings_modal'
-            updated_modal = self.settings_modal.build_settings_modal(
+            updated_modal = await self.settings_modal.build_settings_modal(
                 user_id=user_id,
                 trigger_id=None,  # Not needed for update
                 current_settings=merged_settings,
@@ -521,7 +522,7 @@ class SlackSettingsHandlersMixin:
             
             # Update the modal view
             try:
-                response = client.views_update(
+                response = await client.views_update(
                     view_id=body['view']['id'],
                     view=updated_modal
                 )
@@ -536,9 +537,9 @@ class SlackSettingsHandlersMixin:
         
         # Register handler for features checkbox (needs modal rebuild for web search)
         @self.app.action("features")
-        def handle_features_change(ack, body, client):
+        async def handle_features_change(ack, body, client):
             """Handle feature checkbox changes, especially web search"""
-            ack()
+            await ack()
             
             user_id = body['user']['id']
             
@@ -613,7 +614,7 @@ class SlackSettingsHandlersMixin:
             
             # Rebuild modal
             is_new_user = body['view']['callback_id'] == 'welcome_settings_modal'
-            updated_modal = self.settings_modal.build_settings_modal(
+            updated_modal = await self.settings_modal.build_settings_modal(
                 user_id=user_id,
                 trigger_id=None,
                 current_settings=merged_settings,
@@ -658,8 +659,8 @@ class SlackSettingsHandlersMixin:
                         "in_thread": metadata_context.get('in_thread', False),
                         "scope": metadata_context.get('scope')  # Preserve selected scope
                     })
-                
-                response = client.views_update(
+
+                response = await client.views_update(
                     view_id=body['view']['id'],
                     view=updated_modal
                 )
@@ -673,9 +674,9 @@ class SlackSettingsHandlersMixin:
         
         # Register handler for settings scope toggle
         @self.app.action("settings_scope")
-        def handle_scope_change(ack, body, client):
+        async def handle_scope_change(ack, body, client):
             """Handle scope toggle between thread and global settings"""
-            ack()
+            await ack()
             
             user_id = body['user']['id']
             selected_scope = body['actions'][0]['selected_option']['value']
@@ -708,7 +709,7 @@ class SlackSettingsHandlersMixin:
             
             # Rebuild modal with new scope
             is_new_user = body['view']['callback_id'] == 'welcome_settings_modal'
-            updated_modal = self.settings_modal.build_settings_modal(
+            updated_modal = await self.settings_modal.build_settings_modal(
                 user_id=user_id,
                 trigger_id=None,
                 current_settings=merged_settings,
@@ -720,7 +721,7 @@ class SlackSettingsHandlersMixin:
             
             # Update the modal
             try:
-                response = client.views_update(
+                response = await client.views_update(
                     view_id=body['view']['id'],
                     view=updated_modal
                 )
@@ -736,30 +737,30 @@ class SlackSettingsHandlersMixin:
         @self.app.action("input_fidelity")
         @self.app.action("vision_detail")
         @self.app.action("image_size")
-        def handle_modal_actions(ack):
+        async def handle_modal_actions(ack):
             """Acknowledge modal actions that don't need processing"""
-            ack()  # Just acknowledge - values are captured on submission
+            await ack()  # Just acknowledge - values are captured on submission
         
         # Handler for global settings button in DM
         @self.app.action("open_global_settings_dm")
-        def handle_open_global_settings_dm(ack, body, client):
+        async def handle_open_global_settings_dm(ack, body, client):
             """Handle button click to open global settings from DM"""
             # ALWAYS acknowledge first, no matter what
-            ack()
+            await ack()
             
             try:
                 user_id = body['user']['id']
                 trigger_id = body['trigger_id']
                 
                 # Get user preferences
-                user_prefs = self.db.get_user_preferences(user_id)
+                user_prefs = await self.db.get_user_preferences_async(user_id)
                 if not user_prefs:
-                    user_data = self.db.get_or_create_user(user_id)
+                    user_data = await self.db.get_or_create_user_async(user_id)
                     email = user_data.get('email') if user_data else None
-                    user_prefs = self.db.create_default_user_preferences(user_id, email)
+                    user_prefs = await self.db.create_default_user_preferences_async(user_id, email)
                 
                 # Open the settings modal for global settings
-                modal = self.settings_modal.build_settings_modal(
+                modal = await self.settings_modal.build_settings_modal(
                     user_id=user_id,
                     trigger_id=trigger_id,
                     current_settings=user_prefs,
@@ -768,8 +769,8 @@ class SlackSettingsHandlersMixin:
                     in_thread=False,  # Always global from DM button
                     scope='global'
                 )
-                
-                response = client.views_open(
+
+                response = await client.views_open(
                     trigger_id=trigger_id,
                     view=modal
                 )
@@ -784,10 +785,10 @@ class SlackSettingsHandlersMixin:
         
         # Handler for welcome settings button
         @self.app.action("open_welcome_settings")
-        def handle_open_welcome_settings(ack, body, client):
+        async def handle_open_welcome_settings(ack, body, client):
             """Handle button click to open welcome settings modal"""
             # ALWAYS acknowledge first, no matter what
-            ack()
+            await ack()
             
             user_id = body['user']['id']
             trigger_id = body['trigger_id']
@@ -808,7 +809,7 @@ class SlackSettingsHandlersMixin:
                 
                 try:
                     # Get the original message from Slack
-                    result = client.conversations_history(
+                    result = await client.conversations_history(
                         channel=channel_id,
                         latest=ts,
                         oldest=ts,
@@ -848,13 +849,13 @@ class SlackSettingsHandlersMixin:
                     # Keep the truncated context as-is
             
             # Get or create user preferences
-            user_data = self.db.get_or_create_user(user_id)
+            user_data = await self.db.get_or_create_user_async(user_id)
             email = user_data.get('email') if user_data else None
-            user_prefs = self.db.get_user_preferences(user_id)
-            
+            user_prefs = await self.db.get_user_preferences_async(user_id)
+
             if not user_prefs:
                 # Create default preferences if they don't exist
-                user_prefs = self.db.create_default_user_preferences(user_id, email)
+                user_prefs = await self.db.create_default_user_preferences_async(user_id, email)
             
             # Track if this is a new user based on settings_completed flag
             is_new_user = not user_prefs.get('settings_completed', False)
@@ -882,7 +883,7 @@ class SlackSettingsHandlersMixin:
                 # If we're in a thread, check for thread-specific settings
                 thread_settings = None
                 if in_thread and thread_id:
-                    thread_config = self.db.get_thread_config(thread_id)
+                    thread_config = await self.db.get_thread_config_async(thread_id)
                     if thread_config:
                         # Merge thread config with user prefs (thread overrides)
                         thread_settings = user_prefs.copy()
@@ -894,7 +895,7 @@ class SlackSettingsHandlersMixin:
                 # Use thread settings if available when in thread, otherwise user prefs
                 current_settings = thread_settings if thread_settings else user_prefs
                 
-                modal = self.settings_modal.build_settings_modal(
+                modal = await self.settings_modal.build_settings_modal(
                     user_id=user_id,
                     trigger_id=trigger_id,
                     current_settings=current_settings,
@@ -928,7 +929,7 @@ class SlackSettingsHandlersMixin:
                 else:
                     self.log_debug(f"Not adding pending message - is_new_user: {is_new_user}, has_message: {bool(original_context and original_context.get('original_message'))}")
                 
-                response = client.views_open(
+                response = await client.views_open(
                     trigger_id=trigger_id,
                     view=modal
                 )
@@ -945,10 +946,10 @@ class SlackSettingsHandlersMixin:
         # Register message shortcut for thread-specific settings
         @self.app.shortcut("configure_thread_settings_dev")  # Dev callback ID
         @self.app.shortcut("configure_thread_settings")  # Prod callback ID (when configured)
-        def handle_thread_settings_shortcut(ack, shortcut, client):
+        async def handle_thread_settings_shortcut(ack, shortcut, client):
             """Handle the thread settings message shortcut"""
             # ALWAYS acknowledge first, no matter what
-            ack()
+            await ack()
             
             # Get thread context from the shortcut - this is reliable!
             channel_id = shortcut["channel"]["id"]
@@ -960,15 +961,15 @@ class SlackSettingsHandlersMixin:
             self.log_info(f"Thread settings shortcut invoked for thread {thread_id} by user {user_id}")
             
             # Load existing thread config if it exists
-            thread_config = self.db.get_thread_config(thread_id)
-            
+            thread_config = await self.db.get_thread_config_async(thread_id)
+
             # Get user preferences as base
-            user_settings = self.db.get_user_preferences(user_id)
+            user_settings = await self.db.get_user_preferences_async(user_id)
             if not user_settings:
                 # Create defaults if user has no settings yet
-                user_data = self.db.get_or_create_user(user_id)
+                user_data = await self.db.get_or_create_user_async(user_id)
                 email = user_data.get('email') if user_data else None
-                user_settings = self.db.create_default_user_preferences(user_id, email)
+                user_settings = await self.db.create_default_user_preferences_async(user_id, email)
             
             # Merge thread config over user settings for display
             current_settings = user_settings.copy()
@@ -977,7 +978,7 @@ class SlackSettingsHandlersMixin:
             
             # Build modal specifically for thread settings
             try:
-                modal = self.settings_modal.build_settings_modal(
+                modal = await self.settings_modal.build_settings_modal(
                     user_id=user_id,
                     trigger_id=shortcut["trigger_id"],
                     current_settings=current_settings,
@@ -989,7 +990,7 @@ class SlackSettingsHandlersMixin:
                 # The header inside will say "Configure Thread Preferences"
                 
                 # Open the modal
-                response = client.views_open(
+                response = await client.views_open(
                     trigger_id=shortcut["trigger_id"],
                     view=modal
                 )

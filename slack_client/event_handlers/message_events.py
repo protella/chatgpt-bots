@@ -9,7 +9,7 @@ from base_client import Message
 
 
 class SlackMessageEventsMixin:
-    def _handle_slack_message(self, event: Dict[str, Any], client):
+    async def _handle_slack_message(self, event: Dict[str, Any], client):
         """Convert Slack event to universal Message format"""
         
         # Skip message_changed events
@@ -38,8 +38,8 @@ class SlackMessageEventsMixin:
         
         # Get username and timezone for logging
         user_id = event.get("user")
-        username = self.get_username(user_id, client) if user_id else "unknown"
-        user_timezone = self.get_user_timezone(user_id, client) if user_id else "UTC"
+        username = await self.get_username(user_id, client) if user_id else "unknown"
+        user_timezone = await self.get_user_timezone(user_id, client) if user_id else "UTC"
         
         # Get timezone label (EST, PST, etc.), real name, and email if available
         user_tz_label = None
@@ -52,7 +52,7 @@ class SlackMessageEventsMixin:
             self.log_debug(f"User cache for {user_id}: email={user_email}, real_name={user_real_name}")
         else:
             # Try to get from database if not in cache
-            user_info = self.db.get_user_info(user_id)
+            user_info = await self.db.get_user_info_async(user_id)
             if user_info:
                 user_real_name = user_info.get('real_name')
                 user_email = user_info.get('email')
@@ -78,13 +78,13 @@ class SlackMessageEventsMixin:
         )
         
         # Check if this is a new user (for auto-modal trigger)
-        user_prefs = self.db.get_user_preferences(user_id)
+        user_prefs = await self.db.get_user_preferences_async(user_id)
         
         if not user_prefs:
             # Create default preferences for new user
-            user_data = self.db.get_or_create_user(user_id)
+            user_data = await self.db.get_or_create_user_async(user_id)
             email = user_data.get('email') if user_data else None
-            user_prefs = self.db.create_default_user_preferences(user_id, email)
+            user_prefs = await self.db.create_default_user_preferences_async(user_id, email)
             self.log_info(f"Created default preferences for new user {user_id}")
         
         # Check if user has completed settings
@@ -105,9 +105,9 @@ class SlackMessageEventsMixin:
             
             if trigger_id and is_first_message:
                 # Create default preferences
-                user_data = self.db.get_or_create_user(user_id)
+                user_data = await self.db.get_or_create_user_async(user_id)
                 email = user_data.get('email') if user_data else None
-                default_prefs = self.db.create_default_user_preferences(user_id, email)
+                default_prefs = await self.db.create_default_user_preferences_async(user_id, email)
                 
                 # Open welcome modal
                 try:
@@ -118,7 +118,7 @@ class SlackMessageEventsMixin:
                         is_new_user=True
                     )
                     
-                    response = client.views_open(
+                    response = await client.views_open(
                         trigger_id=trigger_id,
                         view=modal
                     )
@@ -127,7 +127,7 @@ class SlackMessageEventsMixin:
                         self.log_info(f"Welcome modal opened for new user {user_id}")
                         
                         # Send welcome message
-                        client.chat_postMessage(
+                        await client.chat_postMessage(
                             channel=message.channel_id,
                             thread_ts=message.thread_id,
                             text="👋 Welcome! I've opened your settings panel. Please configure your preferences and I'll be ready to help!"
@@ -178,7 +178,7 @@ class SlackMessageEventsMixin:
                         target_thread = None  # No thread in DM
                         
                         # Also send a brief message in the thread to acknowledge
-                        client.chat_postMessage(
+                        await client.chat_postMessage(
                             channel=message.channel_id,
                             thread_ts=message.thread_id,
                             text="👋 Welcome! I've sent you a direct message to configure your settings."
@@ -215,7 +215,7 @@ class SlackMessageEventsMixin:
                     
                     # No need to warn user - we handle truncation transparently
                     
-                    response = client.chat_postMessage(
+                    response = await client.chat_postMessage(
                         channel=target_channel,
                         thread_ts=target_thread,
                         text="👋 Welcome! Please configure your settings to get started.",
@@ -238,7 +238,7 @@ class SlackMessageEventsMixin:
             else:
                 # Not first message - send regular reminder that we can delete later
                 try:
-                    response = client.chat_postMessage(
+                    response = await client.chat_postMessage(
                         channel=message.channel_id,
                         thread_ts=message.thread_id,
                         text="⚠️ Please configure your settings before I can help you. Click the *Configure Settings* button above to get started."
@@ -258,13 +258,13 @@ class SlackMessageEventsMixin:
                 return  # Don't process until settings are configured
         else:
             # Existing user with preferences - check if this is a new thread that needs a settings button
-            self._post_settings_button_if_new_thread(message, client, user_prefs)
+            await self._post_settings_button_if_new_thread(message, client, user_prefs)
         
         # Call the message handler if set
         if self.message_handler:
-            self.message_handler(message, self)
+            await self.message_handler(message, self)
 
-    def _post_settings_button_if_new_thread(self, message: Message, client, user_prefs: dict):
+    async def _post_settings_button_if_new_thread(self, message: Message, client, user_prefs: dict):
         """Post a settings button at the start of a new thread"""
         try:
             # Check if this is the start of a new thread
@@ -278,7 +278,7 @@ class SlackMessageEventsMixin:
             if is_dm:
                 # In DMs, every message is technically a new "thread" (unique timestamp)
                 # Check if this specific thread already has messages
-                history = client.conversations_replies(
+                history = await client.conversations_replies(
                     channel=message.channel_id,
                     ts=message.thread_id
                 )
@@ -385,7 +385,7 @@ class SlackMessageEventsMixin:
                     ]
                 
                 # Post the settings button as the first message in the thread
-                client.chat_postMessage(
+                await client.chat_postMessage(
                     channel=message.channel_id,
                     thread_ts=message.thread_id,  # Always use thread_ts to post in the thread
                     text="Settings available",

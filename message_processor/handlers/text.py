@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, List, Optional
 
 from base_client import BaseClient, Message, Response
@@ -8,7 +9,7 @@ from streaming import FenceHandler, RateLimitManager, StreamingBuffer
 
 
 class TextHandlerMixin:
-    def _handle_text_response(self, user_content: Any, thread_state, client: BaseClient,
+    async def _handle_text_response(self, user_content: Any, thread_state, client: BaseClient,
                               message: Message, thinking_id: Optional[str] = None,
                               attachment_urls: Optional[List[str]] = None,
                               retry_count: int = 0) -> Response:
@@ -25,7 +26,7 @@ class TextHandlerMixin:
         streaming_enabled = thread_config.get('enable_streaming', config.enable_streaming)
         if (hasattr(client, 'supports_streaming') and client.supports_streaming() and
             streaming_enabled and thinking_id is not None and retry_count == 0):  # Streaming requires a message ID to update
-            return self._handle_streaming_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls)
+            return await self._handle_streaming_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls)
         
         # Fall back to non-streaming logic
         # For vision requests with images, store only a text breadcrumb with URLs, not the base64 data
@@ -67,7 +68,7 @@ class TextHandlerMixin:
         messages_for_api = self._inject_image_analyses(messages_for_api, thread_state)
         
         # Pre-trim messages to fit within context window
-        messages_for_api = self._pre_trim_messages_for_api(messages_for_api, model=thread_state.current_model)
+        messages_for_api = await self._pre_trim_messages_for_api(messages_for_api, model=thread_state.current_model)
         
         # Get thread config (with user preferences)
         thread_config = config.get_thread_config(
@@ -97,7 +98,7 @@ class TextHandlerMixin:
             model = config.web_search_model or thread_config["model"]
             
             # Generate response with web search tool available
-            response_text = self.openai_client.create_text_response_with_tools(
+            response_text = await self.openai_client.create_text_response_with_tools(
                 messages=messages_for_api,
                 tools=[{"type": "web_search"}],
                 model=model,
@@ -110,7 +111,7 @@ class TextHandlerMixin:
             )
         else:
             # Generate response without tools
-            response_text = self.openai_client.create_text_response(
+            response_text = await self.openai_client.create_text_response(
                 messages=messages_for_api,
                 model=thread_config["model"],
                 temperature=thread_config["temperature"],
@@ -132,27 +133,22 @@ class TextHandlerMixin:
         self._add_message_with_token_management(thread_state, "assistant", response_text, db=self.db, thread_key=thread_key)
         
         # Schedule async cleanup after response
-        import threading
-        cleanup_thread = threading.Thread(
-            target=self._async_post_response_cleanup,
-            args=(thread_state, thread_key),
-            daemon=True
-        )
-        cleanup_thread.start()
+        cleanup_coro = self._async_post_response_cleanup(thread_state, thread_key)
+        self._schedule_async_call(cleanup_coro)
         
         return Response(
             type="text",
             content=response_text
         )
 
-    def _handle_streaming_text_response(self, user_content: Any, thread_state, client: BaseClient, 
+    async def _handle_streaming_text_response(self, user_content: Any, thread_state, client: BaseClient,
                                       message: Message, thinking_id: Optional[str] = None,
                                       attachment_urls: Optional[List[str]] = None) -> Response:
         """Handle text-only response generation with streaming support"""
         # Check if client supports streaming
         if not hasattr(client, 'supports_streaming') or not client.supports_streaming():
             self.log_debug("Client doesn't support streaming, falling back to non-streaming")
-            return self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls, retry_count=0)
+            return await self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls, retry_count=0)
         
         # Get streaming configuration from client
         streaming_config = client.get_streaming_config() if hasattr(client, 'get_streaming_config') else {}
@@ -213,7 +209,7 @@ class TextHandlerMixin:
         messages_for_api = self._inject_image_analyses(messages_for_api, thread_state)
         
         # Pre-trim messages to fit within context window
-        messages_for_api = self._pre_trim_messages_for_api(messages_for_api, model=thread_state.current_model)
+        messages_for_api = await self._pre_trim_messages_for_api(messages_for_api, model=thread_state.current_model)
         
         # Get thread config (with user preferences)
         thread_config = config.get_thread_config(
@@ -240,11 +236,11 @@ class TextHandlerMixin:
         if thinking_id:
             # Update existing thinking message
             message_id = thinking_id
-            client.update_message(message.channel_id, message_id, initial_message)
+            await client.update_message(message.channel_id, message_id, initial_message)
         else:
             # We need a way to post a message and get its ID - this would depend on client implementation
             self.log_warning("No thinking_id provided for streaming - falling back to non-streaming")
-            return self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls, retry_count=0)
+            return await self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls, retry_count=0)
         
         # Track tool states for status updates
         tool_states = {
@@ -272,7 +268,7 @@ class TextHandlerMixin:
                     status_msg = f"{config.web_search_emoji} Searching the web (query {search_counts['web_search']})..."
                     try:
                         # Use update_message_streaming for consistency with streaming flow
-                        result = client.update_message_streaming(message.channel_id, message_id, status_msg)
+                        result = self._update_message_streaming_sync(client, message.channel_id, message_id, status_msg)
                         if result["success"]:
                             self.log_info(f"Web search #{search_counts['web_search']} started - updated status")
                         else:
@@ -286,7 +282,7 @@ class TextHandlerMixin:
                     # Show search count consistently for all searches
                     status_msg = f"{config.web_search_emoji} Searching files (query {search_counts['file_search']})..."
                     try:
-                        result = client.update_message_streaming(message.channel_id, message_id, status_msg)
+                        result = self._update_message_streaming_sync(client, message.channel_id, message_id, status_msg)
                         if result["success"]:
                             self.log_info(f"File search #{search_counts['file_search']} started - updated status")
                         else:
@@ -297,7 +293,7 @@ class TextHandlerMixin:
                     tool_states["image_generation"] = True
                     status_msg = f"{config.circle_loader_emoji} Generating image. This may take a minute..."
                     try:
-                        result = client.update_message_streaming(message.channel_id, message_id, status_msg)
+                        result = self._update_message_streaming_sync(client, message.channel_id, message_id, status_msg)
                         if result["success"]:
                             self.log_info("Image generation started - updated status")
                         else:
@@ -331,7 +327,7 @@ class TextHandlerMixin:
                     # Use raw text for final flush - no loading indicator since stream is complete
                     final_text = buffer.get_complete_text()  # No loading indicator on completion
                     try:
-                        result = client.update_message_streaming(message.channel_id, current_message_id, final_text)
+                        result = self._update_message_streaming_sync(client, message.channel_id, current_message_id, final_text)
                         if result["success"]:
                             rate_limiter.record_success()
                             buffer.mark_updated()
@@ -386,7 +382,7 @@ class TextHandlerMixin:
                     # Update current message with continuation indicator
                     final_first_part = f"{first_part_display}\n\n*Continued in next message...*"
                     try:
-                        result = client.update_message_streaming(message.channel_id, current_message_id, final_first_part)
+                        result = self._update_message_streaming_sync(client, message.channel_id, current_message_id, final_first_part)
                         if result["success"]:
                             # Prepare overflow text with proper fence opening if needed
                             if was_in_code_block:
@@ -407,7 +403,7 @@ class TextHandlerMixin:
                             continuation_text = f"*Part {current_part} (continued)*\n\n{continuation_display} {config.loading_ellipse_emoji}"
                             
                             # Send new message and get its ID
-                            new_msg_result = client.send_message_get_ts(message.channel_id, thinking_id, continuation_text)
+                            new_msg_result = self._send_message_get_ts_sync(client, message.channel_id, thinking_id, continuation_text)
                             if new_msg_result and "ts" in new_msg_result:
                                 current_message_id = new_msg_result["ts"]
                                 # Reset buffer with the properly fenced overflow content
@@ -415,6 +411,28 @@ class TextHandlerMixin:
                                 buffer.add_chunk(overflow_with_fence)
                                 buffer.mark_updated()
                                 self.log_info(f"Created overflow message part {current_part}, reopened code block: {was_in_code_block}")
+                            else:
+                                # Couldn't get message ID due to async limitations
+                                # Continue without overflow handling (message will be sent but we can't track it)
+                                self.log_warning(f"Could not get message ID for overflow part {current_part} - continuing with current message")
+
+                                # Clean up the thinking emoji from the current message before continuing
+                                # The current message still has the thinking emoji and initial text,
+                                # but we need to replace it with just the overflow content
+                                try:
+                                    clean_overflow_text = overflow_with_fence
+                                    cleanup_result = self._update_message_streaming_sync(client, message.channel_id, current_message_id, f"{clean_overflow_text} {config.loading_ellipse_emoji}")
+                                    if cleanup_result["success"]:
+                                        self.log_info("Cleaned thinking emoji from current message after overflow failure")
+                                    else:
+                                        self.log_warning(f"Failed to clean thinking emoji after overflow failure: {cleanup_result.get('error', 'Unknown error')}")
+                                except Exception as cleanup_error:
+                                    self.log_error(f"Error cleaning thinking emoji after overflow failure: {cleanup_error}")
+
+                                # Reset buffer but keep using current message ID
+                                buffer.reset()
+                                buffer.add_chunk(overflow_with_fence)
+                                buffer.mark_updated()
                     except Exception as e:
                         self.log_error(f"Error handling message overflow: {e}")
                 else:
@@ -424,8 +442,8 @@ class TextHandlerMixin:
                     
                     # Call client.update_message_streaming with indicator
                     try:
-                        result = client.update_message_streaming(message.channel_id, current_message_id, display_text_with_indicator)
-                        
+                        result = self._update_message_streaming_sync(client, message.channel_id, current_message_id, display_text_with_indicator)
+
                         if result["success"]:
                             rate_limiter.record_success()
                             buffer.mark_updated()
@@ -445,7 +463,7 @@ class TextHandlerMixin:
                                         clear_text = buffer.last_sent_text if buffer.last_sent_text else "Processing..."
                                         if len(clear_text) > 3900:
                                             clear_text = clear_text[:3800] + "\n\n*Response too long - see next message*"
-                                        client.update_message_streaming(message.channel_id, message_id, clear_text)
+                                        self._update_message_streaming_sync(client, message.channel_id, message_id, clear_text)
                                     except Exception as clear_error:
                                         self.log_error(f"Failed to clear indicator after circuit break: {clear_error}")
                             else:
@@ -464,7 +482,7 @@ class TextHandlerMixin:
                 model = config.web_search_model or thread_config["model"]
                 
                 # Generate response with web search tool available
-                response_text = self.openai_client.create_streaming_response_with_tools(
+                response_text = await self.openai_client.create_streaming_response_with_tools(
                     messages=messages_for_api,
                     tools=[{"type": "web_search"}],
                     stream_callback=stream_callback,
@@ -479,7 +497,7 @@ class TextHandlerMixin:
                 )
             else:
                 # Generate response without tools
-                response_text = self.openai_client.create_streaming_response(
+                response_text = await self.openai_client.create_streaming_response(
                     messages=messages_for_api,
                     stream_callback=stream_callback,
                     tool_callback=tool_callback,  # Add tool callback even without tools (in case of built-in tools)
@@ -503,7 +521,7 @@ class TextHandlerMixin:
                     if final_part_text:
                         # Add the part indicator
                         final_part_text = f"*Part {current_part} (continued)*\n\n{final_part_text}"
-                        final_result = client.update_message_streaming(message.channel_id, current_message_id, final_part_text)
+                        final_result = self._update_message_streaming_sync(client, message.channel_id, current_message_id, final_part_text)
                         if not final_result["success"]:
                             self.log_error(f"Failed to remove indicator from part {current_part}: {final_result.get('error', 'Unknown error')}")
                 except Exception as e:
@@ -527,16 +545,16 @@ class TextHandlerMixin:
                             # This shouldn't happen if streaming overflow worked correctly
                             # But handle it as a fallback
                             truncated_text = response_text[:3800] + "\n\n*Continued in next message...*"
-                            final_result = client.update_message_streaming(message.channel_id, message_id, truncated_text)
-                            
+                            final_result = self._update_message_streaming_sync(client, message.channel_id, message_id, truncated_text)
+
                             # Send the rest as new messages
                             overflow_text = response_text[3800:]
-                            client.send_message(message.channel_id, thinking_id, f"*...continued*\n\n{overflow_text}")
+                            await client.send_message(message.channel_id, thinking_id, f"*...continued*\n\n{overflow_text}")
                             
                             if not final_result["success"]:
                                 self.log_error(f"Final truncated update failed: {final_result.get('error', 'Unknown error')}")
                         else:
-                            final_result = client.update_message_streaming(message.channel_id, current_message_id, response_text)
+                            final_result = self._update_message_streaming_sync(client, message.channel_id, current_message_id, response_text)
                             if not final_result["success"]:
                                 self.log_error(f"Final correction update failed: {final_result.get('error', 'Unknown error')}")
                     except Exception as e:
@@ -550,13 +568,8 @@ class TextHandlerMixin:
             self._add_message_with_token_management(thread_state, "assistant", response_text, db=self.db, thread_key=thread_key)
             
             # Schedule async cleanup after response
-            import threading
-            cleanup_thread = threading.Thread(
-                target=self._async_post_response_cleanup,
-                args=(thread_state, thread_key),
-                daemon=True
-            )
-            cleanup_thread.start()
+            cleanup_coro = self._async_post_response_cleanup(thread_state, thread_key)
+            self._schedule_async_call(cleanup_coro)
             
             # Log streaming stats
             stats = rate_limiter.get_stats()
@@ -581,7 +594,7 @@ class TextHandlerMixin:
                         error_text = buffer.get_complete_text()
                     else:
                         error_text = f"{config.error_emoji} *OpenAI Stream Interrupted*\n\nOpenAI's streaming response was interrupted. I'll try again without streaming..."
-                    client.update_message_streaming(message.channel_id, message_id, error_text)
+                    self._update_message_streaming_sync(client, message.channel_id, message_id, error_text)
                 except Exception as cleanup_error:
                     self.log_debug(f"Could not remove loading indicator: {cleanup_error}")
             
@@ -595,4 +608,4 @@ class TextHandlerMixin:
                 self.log_debug("Removed duplicate user message before fallback")
 
             # Pass retry_count=1 to prevent re-entering streaming after timeout
-            return self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls, retry_count=1)
+            return await self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls, retry_count=1)

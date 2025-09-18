@@ -5,14 +5,15 @@ Simple launcher for running the Slack bot directly
 Usage: python slackbot.py
 """
 
+import asyncio
 from main import ChatBotV2
 
 
-def main():
+async def main():
     """Launch the Slack bot"""
     bot = ChatBotV2(platform="slack")
-    bot.run()
+    await bot.run()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

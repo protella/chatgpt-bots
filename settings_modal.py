@@ -16,7 +16,7 @@ class SettingsModal(LoggerMixin):
         self.db = db
         self.logger_name = "SettingsModal"
     
-    def build_settings_modal(self, user_id: str, trigger_id: str, 
+    async def build_settings_modal(self, user_id: str, trigger_id: str,
                             current_settings: Optional[Dict] = None,
                             is_new_user: bool = False,
                             thread_id: Optional[str] = None,
@@ -24,7 +24,7 @@ class SettingsModal(LoggerMixin):
                             scope: str = None) -> Dict:
         """
         Build the complete settings modal.
-        
+
         Args:
             user_id: Slack user ID
             trigger_id: Slack trigger ID for modal
@@ -33,17 +33,17 @@ class SettingsModal(LoggerMixin):
             thread_id: Thread ID if opened from within a thread
             in_thread: Whether modal was opened from within a thread
             scope: Selected scope ('thread' or 'global')
-            
+
         Returns:
             Modal view dictionary for Slack API
         """
         if not current_settings:
-            current_settings = self.db.get_user_preferences(user_id)
+            current_settings = await self.db.get_user_preferences_async(user_id)
             if not current_settings:
                 # Get user's email from users table
-                user_data = self.db.get_or_create_user(user_id)
+                user_data = await self.db.get_or_create_user_async(user_id)
                 email = user_data.get('email') if user_data else None
-                current_settings = self.db.create_default_user_preferences(user_id, email)
+                current_settings = await self.db.create_default_user_preferences_async(user_id, email)
         
         # Determine which model is selected
         selected_model = current_settings.get('model', config.gpt_model)

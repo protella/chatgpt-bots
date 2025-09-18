@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, List, Optional
 from config import config
 from prompts import IMAGE_INTENT_SYSTEM_PROMPT
 
-def create_text_response(
+async def create_text_response(
     self,
     messages: List[Dict[str, Any]],
     model: Optional[str] = None,
@@ -91,7 +91,7 @@ def create_text_response(
     try:
         # API call with enforced timeout wrapper
         self.log_debug(f"[HANG_DEBUG] About to create text response with {len(input_messages)} messages")
-        response = self._safe_api_call(
+        response = await self._safe_api_call(
             self.client.responses.create,
             operation_type="general",
             **request_params
@@ -113,7 +113,7 @@ def create_text_response(
         self.log_error(f"Error creating text response: {e}", exc_info=True)
         raise
 
-def create_text_response_with_tools(
+async def create_text_response_with_tools(
     self,
     messages: List[Dict[str, Any]],
     tools: List[Dict[str, Any]],
@@ -187,7 +187,7 @@ def create_text_response_with_tools(
     
     try:
         # API call with enforced timeout wrapper
-        response = self._safe_api_call(
+        response = await self._safe_api_call(
             self.client.responses.create,
             operation_type="general",
             **request_params
@@ -209,7 +209,7 @@ def create_text_response_with_tools(
         self.log_error(f"Error creating response with tools: {e}", exc_info=True)
         raise
 
-def create_streaming_response(
+async def create_streaming_response(
     self,
     messages: List[Dict[str, Any]],
     stream_callback: Callable[[str], None],
@@ -297,7 +297,7 @@ def create_streaming_response(
     self.log_debug(f"Creating streaming response with model {model}, temp {temperature}")
     
     try:
-        response = self._safe_api_call(
+        response = await self._safe_api_call(
             self.client.responses.create,
             operation_type="general",
             **request_params
@@ -308,7 +308,7 @@ def create_streaming_response(
         first_event = True
         
         # Process streaming events
-        for event in response:
+        async for event in response:
             try:
                 current_time = time.time()
                 
@@ -413,7 +413,7 @@ def create_streaming_response(
         self.log_error(f"Error creating streaming response: {e}", exc_info=True)
         raise
 
-def create_streaming_response_with_tools(
+async def create_streaming_response_with_tools(
     self,
     messages: List[Dict[str, Any]],
     tools: List[Dict[str, Any]],
@@ -492,7 +492,7 @@ def create_streaming_response_with_tools(
     self.log_debug(f"Creating streaming response with tools using model {model}, tools: {tools}")
     
     try:
-        response = self._safe_api_call(
+        response = await self._safe_api_call(
             self.client.responses.create,
             operation_type="general",
             **request_params
@@ -503,7 +503,7 @@ def create_streaming_response_with_tools(
         first_event = True
         
         # Process streaming events
-        for event in response:
+        async for event in response:
             try:
                 current_time = time.time()
                 
@@ -608,7 +608,7 @@ def create_streaming_response_with_tools(
         self.log_error(f"Error creating streaming response with tools: {e}", exc_info=True)
         raise
 
-def classify_intent(
+async def classify_intent(
     self,
     messages: List[Dict[str, Any]],
     last_user_message: str,
@@ -709,7 +709,7 @@ def classify_intent(
         
         # Use safe API call wrapper with intent-specific timeout
         self.log_debug("[HANG_DEBUG] Starting intent classification API call")
-        response = self._safe_api_call(
+        response = await self._safe_api_call(
             self.client.responses.create,
             operation_type="intent",  # Uses min(30s, API_TIMEOUT_READ from .env)
             **request_params
@@ -766,7 +766,7 @@ def classify_intent(
 
             try:
                 # Retry the classification
-                response = self._safe_api_call(
+                response = await self._safe_api_call(
                     self.client.responses.create,
                     operation_type="intent",
                     timeout_seconds=15,  # Shorter timeout for retries

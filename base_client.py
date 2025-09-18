@@ -58,34 +58,68 @@ class BaseClient(ABC, LoggerMixin):
     def send_message(self, channel_id: str, thread_id: str, text: str) -> bool:
         """Send a text message"""
         pass
-    
+
+    @abstractmethod
+    async def send_message_async(self, channel_id: str, thread_id: str, text: str) -> bool:
+        """Send a text message (async version)"""
+        pass
+
     @abstractmethod
     def send_image(self, channel_id: str, thread_id: str, image_data: bytes, filename: str, caption: str = "") -> bool:
         """Send an image"""
         pass
-    
+
+    @abstractmethod
+    async def send_image_async(self, channel_id: str, thread_id: str, image_data: bytes, filename: str, caption: str = "") -> bool:
+        """Send an image (async version)"""
+        pass
+
     @abstractmethod
     def send_thinking_indicator(self, channel_id: str, thread_id: str) -> Optional[str]:
         """Send a thinking/processing indicator"""
         pass
-    
+
+    @abstractmethod
+    async def send_thinking_indicator_async(self, channel_id: str, thread_id: str) -> Optional[str]:
+        """Send a thinking/processing indicator (async version)"""
+        pass
+
     @abstractmethod
     def delete_message(self, channel_id: str, message_id: str) -> bool:
         """Delete a message"""
         pass
-    
+
+    @abstractmethod
+    async def delete_message_async(self, channel_id: str, message_id: str) -> bool:
+        """Delete a message (async version)"""
+        pass
+
     def update_message(self, channel_id: str, message_id: str, text: str) -> bool:
         """Update a message (optional - not all platforms support this)"""
         return False
-    
+
+    async def update_message_async(self, channel_id: str, message_id: str, text: str) -> bool:
+        """Update a message (async version - optional)"""
+        return False
+
     @abstractmethod
     def get_thread_history(self, channel_id: str, thread_id: str, limit: int = None) -> List[Message]:
         """Get message history for a thread - fetches ALL messages by default"""
         pass
-    
+
+    @abstractmethod
+    async def get_thread_history_async(self, channel_id: str, thread_id: str, limit: int = None) -> List[Message]:
+        """Get message history for a thread (async version)"""
+        pass
+
     @abstractmethod
     def download_file(self, file_url: str, file_id: str) -> Optional[bytes]:
         """Download a file/image from the platform"""
+        pass
+
+    @abstractmethod
+    async def download_file_async(self, file_url: str, file_id: str) -> Optional[bytes]:
+        """Download a file/image from the platform (async version)"""
         pass
     
     @abstractmethod
@@ -93,13 +127,13 @@ class BaseClient(ABC, LoggerMixin):
         """Format text for the specific platform (markdown conversion)"""
         pass
     
-    def handle_error(self, channel_id: str, thread_id: str, error: str):
+    async def handle_error(self, channel_id: str, thread_id: str, error: str):
         """Default error handler"""
         self.log_error(f"Error in {self.name}: {error}")
-        
+
         # Format error message for better readability
         formatted_error = self.format_error_message(error)
-        self.send_message(channel_id, thread_id, formatted_error)
+        await self.send_message_async(channel_id, thread_id, formatted_error)
     
     def format_error_message(self, error: str) -> str:
         """Format error messages for display (can be overridden by platform-specific clients)"""
