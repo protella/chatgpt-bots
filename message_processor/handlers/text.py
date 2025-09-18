@@ -256,7 +256,7 @@ class TextHandlerMixin:
         }
 
         # Define tool event callback
-        def tool_callback(tool_type: str, status: str):
+        async def tool_callback(tool_type: str, status: str):
             """Handle tool events for status updates"""
             if status == "started":
                 # Tool just started - update status with appropriate emoji
@@ -268,7 +268,7 @@ class TextHandlerMixin:
                     status_msg = f"{config.web_search_emoji} Searching the web (query {search_counts['web_search']})..."
                     try:
                         # Use update_message_streaming for consistency with streaming flow
-                        result = self._update_message_streaming_sync(client, message.channel_id, message_id, status_msg)
+                        result = await client.update_message_streaming(message.channel_id, message_id, status_msg)
                         if result["success"]:
                             self.log_info(f"Web search #{search_counts['web_search']} started - updated status")
                         else:
@@ -282,7 +282,7 @@ class TextHandlerMixin:
                     # Show search count consistently for all searches
                     status_msg = f"{config.web_search_emoji} Searching files (query {search_counts['file_search']})..."
                     try:
-                        result = self._update_message_streaming_sync(client, message.channel_id, message_id, status_msg)
+                        result = await client.update_message_streaming(message.channel_id, message_id, status_msg)
                         if result["success"]:
                             self.log_info(f"File search #{search_counts['file_search']} started - updated status")
                         else:
@@ -293,7 +293,7 @@ class TextHandlerMixin:
                     tool_states["image_generation"] = True
                     status_msg = f"{config.circle_loader_emoji} Generating image. This may take a minute..."
                     try:
-                        result = self._update_message_streaming_sync(client, message.channel_id, message_id, status_msg)
+                        result = await client.update_message_streaming(message.channel_id, message_id, status_msg)
                         if result["success"]:
                             self.log_info("Image generation started - updated status")
                         else:
@@ -314,7 +314,7 @@ class TextHandlerMixin:
         message_char_limit = 3700  # Leave room for indicators
         
         # Define the streaming callback
-        def stream_callback(text_chunk: str):
+        async def stream_callback(text_chunk: str):
             """Callback function called with each text chunk from OpenAI"""
             nonlocal current_message_id, current_part, overflow_buffer
             
@@ -327,7 +327,7 @@ class TextHandlerMixin:
                     # Use raw text for final flush - no loading indicator since stream is complete
                     final_text = buffer.get_complete_text()  # No loading indicator on completion
                     try:
-                        result = self._update_message_streaming_sync(client, message.channel_id, current_message_id, final_text)
+                        result = await client.update_message_streaming(message.channel_id, current_message_id, final_text)
                         if result["success"]:
                             rate_limiter.record_success()
                             buffer.mark_updated()
@@ -382,7 +382,7 @@ class TextHandlerMixin:
                     # Update current message with continuation indicator
                     final_first_part = f"{first_part_display}\n\n*Continued in next message...*"
                     try:
-                        result = self._update_message_streaming_sync(client, message.channel_id, current_message_id, final_first_part)
+                        result = await client.update_message_streaming(message.channel_id, current_message_id, final_first_part)
                         if result["success"]:
                             # Prepare overflow text with proper fence opening if needed
                             if was_in_code_block:
@@ -401,10 +401,10 @@ class TextHandlerMixin:
                             continuation_display = fence_handler_continuation.get_display_safe_text()
                             
                             continuation_text = f"*Part {current_part} (continued)*\n\n{continuation_display} {config.loading_ellipse_emoji}"
-                            
+
                             # Send new message and get its ID
-                            new_msg_result = self._send_message_get_ts_sync(client, message.channel_id, thinking_id, continuation_text)
-                            if new_msg_result and "ts" in new_msg_result:
+                            new_msg_result = await client.send_message_get_ts(message.channel_id, thinking_id, continuation_text)
+                            if new_msg_result and new_msg_result.get("success") and "ts" in new_msg_result:
                                 current_message_id = new_msg_result["ts"]
                                 # Reset buffer with the properly fenced overflow content
                                 buffer.reset()
@@ -421,7 +421,7 @@ class TextHandlerMixin:
                                 # but we need to replace it with just the overflow content
                                 try:
                                     clean_overflow_text = overflow_with_fence
-                                    cleanup_result = self._update_message_streaming_sync(client, message.channel_id, current_message_id, f"{clean_overflow_text} {config.loading_ellipse_emoji}")
+                                    cleanup_result = await client.update_message_streaming(message.channel_id, current_message_id, f"{clean_overflow_text} {config.loading_ellipse_emoji}")
                                     if cleanup_result["success"]:
                                         self.log_info("Cleaned thinking emoji from current message after overflow failure")
                                     else:
@@ -442,7 +442,7 @@ class TextHandlerMixin:
                     
                     # Call client.update_message_streaming with indicator
                     try:
-                        result = self._update_message_streaming_sync(client, message.channel_id, current_message_id, display_text_with_indicator)
+                        result = await client.update_message_streaming(message.channel_id, current_message_id, display_text_with_indicator)
 
                         if result["success"]:
                             rate_limiter.record_success()
@@ -463,7 +463,7 @@ class TextHandlerMixin:
                                         clear_text = buffer.last_sent_text if buffer.last_sent_text else "Processing..."
                                         if len(clear_text) > 3900:
                                             clear_text = clear_text[:3800] + "\n\n*Response too long - see next message*"
-                                        self._update_message_streaming_sync(client, message.channel_id, message_id, clear_text)
+                                        await client.update_message_streaming(message.channel_id, message_id, clear_text)
                                     except Exception as clear_error:
                                         self.log_error(f"Failed to clear indicator after circuit break: {clear_error}")
                             else:
@@ -521,7 +521,7 @@ class TextHandlerMixin:
                     if final_part_text:
                         # Add the part indicator
                         final_part_text = f"*Part {current_part} (continued)*\n\n{final_part_text}"
-                        final_result = self._update_message_streaming_sync(client, message.channel_id, current_message_id, final_part_text)
+                        final_result = await client.update_message_streaming(message.channel_id, current_message_id, final_part_text)
                         if not final_result["success"]:
                             self.log_error(f"Failed to remove indicator from part {current_part}: {final_result.get('error', 'Unknown error')}")
                 except Exception as e:
@@ -545,7 +545,7 @@ class TextHandlerMixin:
                             # This shouldn't happen if streaming overflow worked correctly
                             # But handle it as a fallback
                             truncated_text = response_text[:3800] + "\n\n*Continued in next message...*"
-                            final_result = self._update_message_streaming_sync(client, message.channel_id, message_id, truncated_text)
+                            final_result = await client.update_message_streaming(message.channel_id, message_id, truncated_text)
 
                             # Send the rest as new messages
                             overflow_text = response_text[3800:]
@@ -554,7 +554,7 @@ class TextHandlerMixin:
                             if not final_result["success"]:
                                 self.log_error(f"Final truncated update failed: {final_result.get('error', 'Unknown error')}")
                         else:
-                            final_result = self._update_message_streaming_sync(client, message.channel_id, current_message_id, response_text)
+                            final_result = await client.update_message_streaming(message.channel_id, current_message_id, response_text)
                             if not final_result["success"]:
                                 self.log_error(f"Final correction update failed: {final_result.get('error', 'Unknown error')}")
                     except Exception as e:
@@ -594,7 +594,7 @@ class TextHandlerMixin:
                         error_text = buffer.get_complete_text()
                     else:
                         error_text = f"{config.error_emoji} *OpenAI Stream Interrupted*\n\nOpenAI's streaming response was interrupted. I'll try again without streaming..."
-                    self._update_message_streaming_sync(client, message.channel_id, message_id, error_text)
+                    await client.update_message_streaming(message.channel_id, message_id, error_text)
                 except Exception as cleanup_error:
                     self.log_debug(f"Could not remove loading indicator: {cleanup_error}")
             
