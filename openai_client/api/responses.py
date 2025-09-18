@@ -212,7 +212,7 @@ async def create_text_response_with_tools(
 async def create_streaming_response(
     self,
     messages: List[Dict[str, Any]],
-    stream_callback: Callable[[str], None],
+    stream_callback: Callable[[str], Any],
     model: Optional[str] = None,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
@@ -221,7 +221,7 @@ async def create_streaming_response(
     reasoning_effort: Optional[str] = None,
     verbosity: Optional[str] = None,
     store: bool = False,
-    tool_callback: Optional[Callable[[str, str], None]] = None,
+    tool_callback: Optional[Callable[[str, str], Any]] = None,
 ) -> str:
     """
     Create a streaming text response using the Responses API
@@ -359,7 +359,10 @@ async def create_streaming_response(
                         complete_text += text_chunk
                         # Call the callback with the text chunk
                         try:
-                            stream_callback(text_chunk)
+                            result = stream_callback(text_chunk)
+                            # If the callback returns a coroutine, await it
+                            if hasattr(result, '__await__'):
+                                await result
                         except Exception as callback_error:
                             self.log_warning(f"Stream callback error: {callback_error}")
                     continue
@@ -370,31 +373,42 @@ async def create_streaming_response(
                     # Signal the callback that streaming is complete with None
                     # This allows it to flush any remaining buffered text
                     try:
-                        stream_callback(None)
+                        result = stream_callback(None)
+                        # If the callback returns a coroutine, await it
+                        if hasattr(result, '__await__'):
+                            await result
                     except Exception as callback_error:
                         self.log_warning(f"Stream completion callback error: {callback_error}")
                     break
                 elif event_type and ("call" in event_type or "tool" in event_type):
                     # Handle specific tool events
                     if tool_callback:
-                        if event_type == "response.web_search_call.in_progress":
-                            tool_callback("web_search", "started")
-                        elif event_type == "response.web_search_call.searching":
-                            tool_callback("web_search", "searching")
-                        elif event_type == "response.web_search_call.completed":
-                            tool_callback("web_search", "completed")
-                        elif event_type == "response.file_search_call.in_progress":
-                            tool_callback("file_search", "started")
-                        elif event_type == "response.file_search_call.searching":
-                            tool_callback("file_search", "searching")
-                        elif event_type == "response.file_search_call.completed":
-                            tool_callback("file_search", "completed")
-                        elif event_type == "response.image_generation_call.in_progress":
-                            tool_callback("image_generation", "started")
-                        elif event_type == "response.image_generation_call.generating":
-                            tool_callback("image_generation", "generating")
-                        elif event_type == "response.image_generation_call.completed":
-                            tool_callback("image_generation", "completed")
+                        try:
+                            result = None
+                            if event_type == "response.web_search_call.in_progress":
+                                result = tool_callback("web_search", "started")
+                            elif event_type == "response.web_search_call.searching":
+                                result = tool_callback("web_search", "searching")
+                            elif event_type == "response.web_search_call.completed":
+                                result = tool_callback("web_search", "completed")
+                            elif event_type == "response.file_search_call.in_progress":
+                                result = tool_callback("file_search", "started")
+                            elif event_type == "response.file_search_call.searching":
+                                result = tool_callback("file_search", "searching")
+                            elif event_type == "response.file_search_call.completed":
+                                result = tool_callback("file_search", "completed")
+                            elif event_type == "response.image_generation_call.in_progress":
+                                result = tool_callback("image_generation", "started")
+                            elif event_type == "response.image_generation_call.generating":
+                                result = tool_callback("image_generation", "generating")
+                            elif event_type == "response.image_generation_call.completed":
+                                result = tool_callback("image_generation", "completed")
+
+                            # If the tool callback returns a coroutine, await it
+                            if result and hasattr(result, '__await__'):
+                                await result
+                        except Exception as tool_callback_error:
+                            self.log_warning(f"Tool callback error: {tool_callback_error}")
                     # Log tool-related events for visibility
                     self.log_info(f"Tool event: {event_type}")
                     continue
@@ -417,7 +431,7 @@ async def create_streaming_response_with_tools(
     self,
     messages: List[Dict[str, Any]],
     tools: List[Dict[str, Any]],
-    stream_callback: Callable[[str], None],
+    stream_callback: Callable[[str], Any],
     model: Optional[str] = None,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
@@ -426,7 +440,7 @@ async def create_streaming_response_with_tools(
     reasoning_effort: Optional[str] = None,
     verbosity: Optional[str] = None,
     store: bool = False,
-    tool_callback: Optional[Callable[[str, str], None]] = None
+    tool_callback: Optional[Callable[[str, str], Any]] = None
 ) -> str:
     """
     Create streaming text response with tools (e.g., web search)
@@ -554,7 +568,10 @@ async def create_streaming_response_with_tools(
                         complete_text += text_chunk
                         # Call the callback with the text chunk
                         try:
-                            stream_callback(text_chunk)
+                            result = stream_callback(text_chunk)
+                            # If the callback returns a coroutine, await it
+                            if hasattr(result, '__await__'):
+                                await result
                         except Exception as callback_error:
                             self.log_warning(f"Stream callback error: {callback_error}")
                     continue
@@ -565,31 +582,42 @@ async def create_streaming_response_with_tools(
                     # Signal the callback that streaming is complete with None
                     # This allows it to flush any remaining buffered text
                     try:
-                        stream_callback(None)
+                        result = stream_callback(None)
+                        # If the callback returns a coroutine, await it
+                        if hasattr(result, '__await__'):
+                            await result
                     except Exception as callback_error:
                         self.log_warning(f"Stream completion callback error: {callback_error}")
                     break
                 elif event_type and ("call" in event_type or "tool" in event_type):
                     # Handle specific tool events
                     if tool_callback:
-                        if event_type == "response.web_search_call.in_progress":
-                            tool_callback("web_search", "started")
-                        elif event_type == "response.web_search_call.searching":
-                            tool_callback("web_search", "searching")
-                        elif event_type == "response.web_search_call.completed":
-                            tool_callback("web_search", "completed")
-                        elif event_type == "response.file_search_call.in_progress":
-                            tool_callback("file_search", "started")
-                        elif event_type == "response.file_search_call.searching":
-                            tool_callback("file_search", "searching")
-                        elif event_type == "response.file_search_call.completed":
-                            tool_callback("file_search", "completed")
-                        elif event_type == "response.image_generation_call.in_progress":
-                            tool_callback("image_generation", "started")
-                        elif event_type == "response.image_generation_call.generating":
-                            tool_callback("image_generation", "generating")
-                        elif event_type == "response.image_generation_call.completed":
-                            tool_callback("image_generation", "completed")
+                        try:
+                            result = None
+                            if event_type == "response.web_search_call.in_progress":
+                                result = tool_callback("web_search", "started")
+                            elif event_type == "response.web_search_call.searching":
+                                result = tool_callback("web_search", "searching")
+                            elif event_type == "response.web_search_call.completed":
+                                result = tool_callback("web_search", "completed")
+                            elif event_type == "response.file_search_call.in_progress":
+                                result = tool_callback("file_search", "started")
+                            elif event_type == "response.file_search_call.searching":
+                                result = tool_callback("file_search", "searching")
+                            elif event_type == "response.file_search_call.completed":
+                                result = tool_callback("file_search", "completed")
+                            elif event_type == "response.image_generation_call.in_progress":
+                                result = tool_callback("image_generation", "started")
+                            elif event_type == "response.image_generation_call.generating":
+                                result = tool_callback("image_generation", "generating")
+                            elif event_type == "response.image_generation_call.completed":
+                                result = tool_callback("image_generation", "completed")
+
+                            # If the tool callback returns a coroutine, await it
+                            if result and hasattr(result, '__await__'):
+                                await result
+                        except Exception as tool_callback_error:
+                            self.log_warning(f"Tool callback error: {tool_callback_error}")
                     # Log tool-related events for visibility
                     self.log_info(f"Tool event: {event_type}")
                     continue

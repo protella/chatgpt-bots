@@ -167,7 +167,7 @@ class OpenAIClient(LoggerMixin):
     async def create_streaming_response(
         self,
         messages: List[Dict[str, Any]],
-        stream_callback: Callable[[Optional[str]], None],
+        stream_callback: Callable[[Optional[str]], Any],
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
@@ -176,7 +176,7 @@ class OpenAIClient(LoggerMixin):
         reasoning_effort: Optional[str] = None,
         verbosity: Optional[str] = None,
         store: bool = False,
-        tool_callback: Optional[Callable[[str, str], None]] = None,
+        tool_callback: Optional[Callable[[str, str], Any]] = None,
     ) -> str:
         return await responses_api.create_streaming_response(
             self,
@@ -197,7 +197,7 @@ class OpenAIClient(LoggerMixin):
         self,
         messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
-        stream_callback: Callable[[Optional[str]], None],
+        stream_callback: Callable[[Optional[str]], Any],
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
@@ -206,7 +206,7 @@ class OpenAIClient(LoggerMixin):
         reasoning_effort: Optional[str] = None,
         verbosity: Optional[str] = None,
         store: bool = False,
-        tool_callback: Optional[Callable[[str, str], None]] = None,
+        tool_callback: Optional[Callable[[str, str], Any]] = None,
     ) -> str:
         return await responses_api.create_streaming_response_with_tools(
             self,
