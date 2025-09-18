@@ -1596,7 +1596,7 @@ class DatabaseManager(LoggerMixin):
 
             await db.execute("""
                 UPDATE users
-                SET username = ?, real_name = ?, email = ?, timezone = ?, updated_at = CURRENT_TIMESTAMP
+                SET username = ?, real_name = ?, email = ?, timezone = ?, last_seen = CURRENT_TIMESTAMP
                 WHERE user_id = ?
             """, (username, real_name, email, timezone, user_id))
 
