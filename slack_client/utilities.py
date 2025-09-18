@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import aiohttp
 from typing import Optional
 
 from slack_sdk.errors import SlackApiError
@@ -8,6 +9,22 @@ from config import config
 
 
 class SlackUtilitiesMixin:
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._session = None  # Reusable aiohttp session
+
+    def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create a reusable aiohttp session"""
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=30)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
+
+    async def _cleanup_session(self):
+        """Clean up aiohttp session"""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self.log_debug("SlackUtilities aiohttp session closed")
     async def get_username(self, user_id: str, client) -> str:
         """Get username from user ID, with caching"""
         # Check memory cache first
@@ -132,37 +149,40 @@ class SlackUtilitiesMixin:
             file_id: Optional file ID (will be extracted from URL if not provided)
         """
         try:
-            import requests
-            
             # If file_id not provided, try to extract from URL
             if not file_id:
                 # URL format: https://files.slack.com/files-pri/[TEAM]-[FILE_ID]/filename
                 # or https://[team].slack.com/files/[USER]/[FILE_ID]/filename
                 import re
-                
+
                 # Try to extract file ID from the URL
                 patterns = [
                     r'/files-pri/[^/]+-([^/]+)/',  # files-pri format
                     r'/files/[^/]+/([^/]+)/',       # permalink format
                 ]
-                
+
                 for pattern in patterns:
                     match = re.search(pattern, file_url)
                     if match:
                         file_id = match.group(1)
                         self.log_debug(f"Extracted file ID from URL: {file_id}")
                         break
-                
+
                 if not file_id:
                     # If we can't extract ID, try direct download with the URL
                     self.log_debug("Could not extract file ID, trying direct download")
                     headers = {"Authorization": f"Bearer {config.slack_bot_token}"}
-                    response = requests.get(file_url, headers=headers)
-                    
-                    if response.status_code == 200:
-                        return response.content
-                    else:
-                        self.log_error(f"Failed to download file directly: HTTP {response.status_code}")
+
+                    session = self._get_session()
+                    try:
+                        async with session.get(file_url, headers=headers) as response:
+                            if response.status == 200:
+                                return await response.read()
+                            else:
+                                self.log_error(f"Failed to download file directly: HTTP {response.status}")
+                                return None
+                    except aiohttp.ClientError as e:
+                        self.log_error(f"Network error downloading file directly: {e}")
                         return None
             
             # Get file info to get the private URL
@@ -185,20 +205,26 @@ class SlackUtilitiesMixin:
             
             self.log_debug(f"Downloading from private URL: {url_private[:50]}...")
             
-            # Download file using requests with auth header
+            # Download file using aiohttp with auth header
             headers = {"Authorization": f"Bearer {config.slack_bot_token}"}
-            response = requests.get(url_private, headers=headers)
-            
-            if response.status_code == 200:
-                # Check if we got actual image data
-                content_type = response.headers.get('content-type', '').lower()
-                if 'text/html' in content_type:
-                    self.log_error("Got HTML instead of image data from private URL")
-                    self.log_debug(f"Response preview: {response.text[:200]}")
-                    return None
-                return response.content
-            else:
-                self.log_error(f"Failed to download file: HTTP {response.status_code}")
+
+            session = self._get_session()
+            try:
+                async with session.get(url_private, headers=headers) as response:
+                    if response.status == 200:
+                        # Check if we got actual image data
+                        content_type = response.headers.get('content-type', '').lower()
+                        if 'text/html' in content_type:
+                            self.log_error("Got HTML instead of image data from private URL")
+                            text_preview = await response.text()
+                            self.log_debug(f"Response preview: {text_preview[:200]}")
+                            return None
+                        return await response.read()
+                    else:
+                        self.log_error(f"Failed to download file: HTTP {response.status}")
+                        return None
+            except aiohttp.ClientError as e:
+                self.log_error(f"Network error downloading file: {e}")
                 return None
             
         except SlackApiError as e:

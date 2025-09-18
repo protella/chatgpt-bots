@@ -78,7 +78,6 @@ class MessageProcessor(ThreadManagementMixin,
         request_start_time = time.time()
 
         # Check if thread is busy
-        self.log_debug(f"[HANG_DEBUG] About to acquire thread lock for {thread_key}")
         lock_acquired = False
         try:
             lock_acquired = await self.thread_manager.acquire_thread_lock(
@@ -86,9 +85,8 @@ class MessageProcessor(ThreadManagementMixin,
                 message.channel_id,
                 timeout=0  # Don't wait, return immediately if busy
             )
-            self.log_debug(f"[HANG_DEBUG] Lock acquisition result: {lock_acquired}")
         except Exception as lock_error:
-            self.log_error(f"[HANG_DEBUG] Lock acquisition failed with error: {lock_error}", exc_info=True)
+            self.log_error(f"Lock acquisition failed with error: {lock_error}", exc_info=True)
             raise
 
         if not lock_acquired:
@@ -105,7 +103,6 @@ class MessageProcessor(ThreadManagementMixin,
         
         try:
             # Get or rebuild thread state
-            self.log_debug(f"[HANG_DEBUG] Lock acquired, getting thread state for {thread_key}")
             thread_state = await self._get_or_rebuild_thread_state(
                 message,
                 client,
@@ -794,15 +791,13 @@ class MessageProcessor(ThreadManagementMixin,
         finally:
             # Always release the thread lock, even on timeout
             try:
-                self.log_debug(f"[HANG_DEBUG] About to release thread lock for {thread_key}")
                 await self.thread_manager.release_thread_lock(
                     message.thread_id,
                     message.channel_id
                 )
-                self.log_debug(f"[HANG_DEBUG] Thread lock successfully released for {thread_key}")
             except Exception as lock_error:
                 # Even if release fails, log it but don't crash
-                self.log_error(f"[HANG_DEBUG] Error releasing thread lock for {thread_key}: {lock_error}", exc_info=True)
+                self.log_error(f"Error releasing thread lock for {thread_key}: {lock_error}", exc_info=True)
 
     async def cleanup(self):
         """Clean up resources and close clients."""
