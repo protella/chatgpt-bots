@@ -54,6 +54,21 @@ Slack Event → Event Loop → Async OpenAI Call → Response
 
 ### Pre-Work: Inventory Synchronous Touchpoints
 
+#### Current Sync Touchpoints (Updated 2025-09-17)
+
+- `main.py`: message handler and cleanup loop are synchronous; uses `threading.Thread`, blocking `time.sleep`, and invokes sync client/database layers.
+- `slack_client/` mixins: built on `slack_bolt.App` with sync handlers; all Slack WebClient calls (`views_open`, `chat_postMessage`, file download) block the worker threads.
+- `message_processor/`: `process_message` uses blocking `thread_manager`, synchronous OpenAI calls, direct sqlite access, background `threading.Thread` progress updaters, and `time.sleep` paths in image handling.
+- `openai_client/`: wraps `OpenAI` sync client and exposes only blocking create/stream methods with manual timeout wrappers.
+- `thread_manager.py`: relies on `threading.Lock`, watchdog thread, and synchronous cleanup; exposes blocking `acquire_*` APIs.
+- `database.py`: uses `sqlite3` with autocommit connection accessed synchronously from multiple threads.
+- `settings_modal.py`: synchronous DB lookups and Slack interactions triggered inside request threads.
+- `document_handler.py`: runs CPU-heavy parsers synchronously on request threads; safe move to `asyncio.to_thread` when wiring async pipeline.
+- `image_url_handler.py`: performs network I/O via `requests` in blocking fashion for validation and download.
+- `base_client.py` & derivatives: contract is synchronous (`send_message`, `send_image`, etc.), which propagates blocking semantics throughout the app.
+- Tests (`tests/unit`, `tests/integration`): assume synchronous interfaces and patch threading constructs; will need async fixtures and `pytest-asyncio` coverage once refactor lands.
+
+
 - Catalog every Slack handler, mixin, and shared utility that currently performs blocking work (Slack WebClient calls, database/file operations, OpenAI requests).
 - Map call graphs to understand which functions and helpers will require signature changes before converting to async.
 - Flag thread-based helpers, watchdog behaviors, or other concurrency constructs slated for removal in the async migration.
