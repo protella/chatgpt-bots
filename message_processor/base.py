@@ -2,10 +2,11 @@
 Shared Message Processor
 Client-agnostic message processing logic
 """
+import asyncio
 import time
 from typing import Optional
 from base_client import BaseClient, Message, Response
-from thread_manager import ThreadStateManager
+from thread_manager import AsyncThreadStateManager
 from openai_client import OpenAIClient
 from config import config
 from logger import LoggerMixin
@@ -34,7 +35,7 @@ class MessageProcessor(ThreadManagementMixin,
     """Handles message processing logic independent of chat platform"""
     
     def __init__(self, db = None):
-        self.thread_manager = ThreadStateManager(db=db)
+        self.thread_manager = AsyncThreadStateManager(db=db)
         self.openai_client = OpenAIClient()
         self.image_url_handler = ImageURLHandler()
         self.document_handler = DocumentHandler() if DOCUMENT_HANDLER_AVAILABLE else None
@@ -51,7 +52,7 @@ class MessageProcessor(ThreadManagementMixin,
 
 
 
-    def process_message(self, message: Message, client: BaseClient, thinking_id: Optional[str] = None) -> Optional[Response]:
+    async def process_message(self, message: Message, client: BaseClient, thinking_id: Optional[str] = None) -> Optional[Response]:
         """
         Process a message and return a response
         
@@ -80,9 +81,9 @@ class MessageProcessor(ThreadManagementMixin,
         self.log_debug(f"[HANG_DEBUG] About to acquire thread lock for {thread_key}")
         lock_acquired = False
         try:
-            lock_acquired = self.thread_manager.acquire_thread_lock(
-            message.thread_id, 
-            message.channel_id,
+            lock_acquired = await self.thread_manager.acquire_thread_lock(
+                message.thread_id,
+                message.channel_id,
                 timeout=0  # Don't wait, return immediately if busy
             )
             self.log_debug(f"[HANG_DEBUG] Lock acquisition result: {lock_acquired}")
@@ -105,7 +106,7 @@ class MessageProcessor(ThreadManagementMixin,
         try:
             # Get or rebuild thread state
             self.log_debug(f"[HANG_DEBUG] Lock acquired, getting thread state for {thread_key}")
-            thread_state = self._get_or_rebuild_thread_state(
+            thread_state = await self._get_or_rebuild_thread_state(
                 message,
                 client,
                 thinking_id
@@ -115,10 +116,10 @@ class MessageProcessor(ThreadManagementMixin,
             if hasattr(thread_state, 'had_timeout') and thread_state.had_timeout:
                 # Send timeout notification to user
                 timeout_msg = f"⚠️ Your previous request timed out - OpenAI's API didn't respond within {int(config.api_timeout_read)} seconds."
-                client.post_message(
+                await client.send_message(
                     channel_id=message.channel_id,
                     text=timeout_msg,
-                    thread_ts=message.thread_id
+                    thread_id=message.thread_id
                 )
                 # Clear the timeout flag
                 thread_state.had_timeout = False
@@ -145,7 +146,7 @@ class MessageProcessor(ThreadManagementMixin,
             thread_state.system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"], web_search_enabled, thread_state.has_trimmed_messages, thread_config.get('custom_instructions'))
             
             # Process any attachments (images, documents, and other files)
-            image_inputs, document_inputs, unsupported_files = self._process_attachments(message, client, thinking_id)
+            image_inputs, document_inputs, unsupported_files = await self._process_attachments(message, client, thinking_id)
             
             # Check for unsupported files and notify user
             if unsupported_files:
@@ -305,7 +306,7 @@ class MessageProcessor(ThreadManagementMixin,
                 
                 # Use already-trimmed thread state for intent classification
                 # Only mark as having attachments if there are actual image uploads
-                intent = self.openai_client.classify_intent(
+                intent = await self.openai_client.classify_intent(
                     trimmed_history_for_intent,  # Documents truncated for classification
                     combined_context,
                     has_attached_images=len(image_inputs) > 0
@@ -357,7 +358,7 @@ class MessageProcessor(ThreadManagementMixin,
                     thread_state.messages.append(temp_intent_msg)
                     
                     # Pre-trim messages INCLUDING the current message
-                    trimmed_messages = self._pre_trim_messages_for_api(thread_state.messages, model=thread_state.current_model, thread_state=thread_state)
+                    trimmed_messages = await self._pre_trim_messages_for_api(thread_state.messages, model=thread_state.current_model, thread_state=thread_state)
                     
                     # Remove the temp message
                     if thread_state.messages and thread_state.messages[-1] == temp_intent_msg:
@@ -394,7 +395,7 @@ class MessageProcessor(ThreadManagementMixin,
                     
                     # Only mark as having attachments if there are actual image uploads
                     # Documents shouldn't affect image intent classification
-                    intent = self.openai_client.classify_intent(
+                    intent = await self.openai_client.classify_intent(
                         trimmed_history_for_intent,  # Trimmed conversation history (without current)
                         intent_text,  # Current message (potentially trimmed/summarized)
                         has_attached_images=len(image_inputs) > 0
@@ -431,7 +432,7 @@ class MessageProcessor(ThreadManagementMixin,
                 thread_state.messages.append(temp_intent_msg)
                 
                 # Pre-trim messages INCLUDING the current message
-                trimmed_messages = self._pre_trim_messages_for_api(thread_state.messages, model=thread_state.current_model, thread_state=thread_state)
+                trimmed_messages = await self._pre_trim_messages_for_api(thread_state.messages, model=thread_state.current_model, thread_state=thread_state)
                 
                 # Remove the temp message
                 if thread_state.messages and thread_state.messages[-1] == temp_intent_msg:
@@ -467,7 +468,7 @@ class MessageProcessor(ThreadManagementMixin,
                     trimmed_history_for_intent.append(msg_copy)
                 
                 # Only mark as having attachments if there are actual image uploads
-                intent = self.openai_client.classify_intent(
+                intent = await self.openai_client.classify_intent(
                     trimmed_history_for_intent,  # Trimmed conversation history (without current)
                     intent_text,  # Current message (potentially trimmed/summarized)
                     has_attached_images=False  # Documents alone don't count as image attachments
@@ -529,14 +530,14 @@ class MessageProcessor(ThreadManagementMixin,
             
             # Generate response based on intent
             if intent == "new_image":
-                response = self._handle_image_generation(message.text, thread_state, client, message.channel_id, thinking_id, message)
+                response = await self._handle_image_generation(message.text, thread_state, client, message.channel_id, thinking_id, message)
             elif intent == "edit_image":
                 # Check if we have uploaded images or need to find recent ones
                 if image_inputs:
                     # User uploaded images with edit request
                     # Extract URLs from attachments for tracking
                     attachment_urls = [att.get("url") for att in message.attachments if att.get("type") == "image"]
-                    response = self._handle_image_edit(
+                    response = await self._handle_image_edit(
                         message.text,
                         image_inputs,
                         thread_state,
@@ -548,9 +549,9 @@ class MessageProcessor(ThreadManagementMixin,
                     )
                 else:
                     # Try to find and edit recent image
-                    response = self._handle_image_modification(
-                        message.text, 
-                        thread_state, 
+                    response = await self._handle_image_modification(
+                        message.text,
+                        thread_state,
                         message.thread_id,
                         client,
                         message.channel_id,
@@ -572,7 +573,7 @@ class MessageProcessor(ThreadManagementMixin,
                         self._update_status(client, message.channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
                         
                         # Documents are already in enhanced_text, just process as text with vision intent
-                        response = self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0)
+                        response = await self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0)
                     elif image_inputs and document_inputs:
                         # Both images and documents - use two-call approach
                         total_files = len(image_inputs) + len(document_inputs)
@@ -580,7 +581,7 @@ class MessageProcessor(ThreadManagementMixin,
                         self._update_status(client, message.channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
                         
                         # Use new two-call approach for mixed content
-                        response = self._handle_mixed_content_analysis(
+                        response = await self._handle_mixed_content_analysis(
                             user_text=message.text,
                             image_inputs=image_inputs,
                             document_inputs=document_inputs,
@@ -592,21 +593,21 @@ class MessageProcessor(ThreadManagementMixin,
                         )
                     else:
                         # Images only - use existing vision handler
-                        response = self._handle_vision_analysis(message.text, image_inputs, thread_state, message.attachments, 
+                        response = await self._handle_vision_analysis(message.text, image_inputs, thread_state, message.attachments,
                                                                client, message.channel_id, thinking_id, message)
                 else:
                     # Vision-related question but no images or documents - try to find previous images
                     self.log_debug("Vision intent detected but no files attached - searching for previous images")
-                    response = self._handle_vision_without_upload(
-                        message.text, 
-                        thread_state, 
-                        client, 
-                        message.channel_id, 
+                    response = await self._handle_vision_without_upload(
+                        message.text,
+                        thread_state,
+                        client,
+                        message.channel_id,
                         thinking_id,
                         message
                     )
             else:
-                response = self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0)
+                response = await self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0)
             
             # DEBUG: Print conversation history after processing (with truncated content)
             import json
@@ -661,10 +662,10 @@ class MessageProcessor(ThreadManagementMixin,
                     )
                     
                     # Send as regular message so everyone in channel threads can see it
-                    client.post_message(
+                    await client.send_message(
                         channel_id=message.channel_id,
                         text=warning_msg,
-                        thread_ts=message.thread_id
+                        thread_id=message.thread_id
                     )
                     
                     # Mark that we've shown the warning
@@ -700,7 +701,7 @@ class MessageProcessor(ThreadManagementMixin,
             if thinking_id and hasattr(client, 'update_message'):
                 timeout_msg = f"{config.error_emoji} OpenAI is not responding. Try again shortly."
                 try:
-                    client.update_message(message.channel_id, thinking_id, timeout_msg)
+                    await client.update_message(message.channel_id, thinking_id, timeout_msg)
                     self.log_debug("Updated thinking message to show timeout")
                 except Exception as update_error:
                     self.log_error(f"Failed to update thinking message: {update_error}")
@@ -747,7 +748,7 @@ class MessageProcessor(ThreadManagementMixin,
                 if thinking_id and hasattr(client, 'update_message'):
                     timeout_msg = f"{config.error_emoji} OpenAI is not responding. Try again shortly."
                     try:
-                        client.update_message(message.channel_id, thinking_id, timeout_msg)
+                        await client.update_message(message.channel_id, thinking_id, timeout_msg)
                     except Exception:
                         pass  # Don't let update failure affect error handling
 
@@ -767,7 +768,7 @@ class MessageProcessor(ThreadManagementMixin,
                 if thinking_id and hasattr(client, 'update_message'):
                     error_msg = f"{config.error_emoji} Something went wrong. Try again."
                     try:
-                        client.update_message(message.channel_id, thinking_id, error_msg)
+                        await client.update_message(message.channel_id, thinking_id, error_msg)
                     except Exception:
                         pass  # Don't let update failure affect error handling
 
@@ -794,7 +795,7 @@ class MessageProcessor(ThreadManagementMixin,
             # Always release the thread lock, even on timeout
             try:
                 self.log_debug(f"[HANG_DEBUG] About to release thread lock for {thread_key}")
-                self.thread_manager.release_thread_lock(
+                await self.thread_manager.release_thread_lock(
                     message.thread_id,
                     message.channel_id
                 )
@@ -802,6 +803,16 @@ class MessageProcessor(ThreadManagementMixin,
             except Exception as lock_error:
                 # Even if release fails, log it but don't crash
                 self.log_error(f"[HANG_DEBUG] Error releasing thread lock for {thread_key}: {lock_error}", exc_info=True)
+
+    async def cleanup(self):
+        """Clean up resources and close clients."""
+        self.log_info("Cleaning up MessageProcessor resources...")
+        if hasattr(self, 'openai_client') and self.openai_client:
+            await self.openai_client.close()
+        # Close thread manager resources if needed
+        if hasattr(self.thread_manager, 'cleanup'):
+            await self.thread_manager.cleanup()
+        self.log_info("MessageProcessor cleanup completed")
     
 
 

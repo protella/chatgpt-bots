@@ -21,7 +21,7 @@ class TestChatBotV2Initialization:
         assert bot.platform == "slack"
         assert bot.client is None
         assert bot.processor is None
-        assert bot.cleanup_thread is None
+        assert bot.cleanup_task is None
         assert bot.running is False
         assert bot.sigint_count == 0
         assert bot.last_sigint_time == 0
@@ -40,19 +40,20 @@ class TestChatBotV2Initialization:
     @patch('main.config')
     @patch('slack_client.SlackBot')
     @patch('main.MessageProcessor')
-    def test_initialize_slack_success(self, mock_processor_class, mock_slackbot_class, mock_config):
+    @pytest.mark.asyncio
+    async def test_initialize_slack_success(self, mock_processor_class, mock_slackbot_class, mock_config):
         """Test successful Slack initialization"""
         mock_config.validate.return_value = None
         mock_client = Mock()
         mock_client.db = Mock()
         mock_slackbot_class.return_value = mock_client
-        
+
         bot = ChatBotV2(platform="slack")
-        bot.initialize()
-        
+        await bot.initialize()
+
         # Verify config validated
         mock_config.validate.assert_called_once()
-        
+
         # Verify Slack client created
         mock_slackbot_class.assert_called_once()
         assert bot.client is mock_client
@@ -62,48 +63,52 @@ class TestChatBotV2Initialization:
         assert bot.processor is not None
     
     @patch('main.config')
-    def test_initialize_config_error(self, mock_config):
+    @pytest.mark.asyncio
+    async def test_initialize_config_error(self, mock_config):
         """Test initialization with config validation error"""
         mock_config.validate.side_effect = ValueError("Invalid config")
-        
+
         bot = ChatBotV2(platform="slack")
-        
+
         with pytest.raises(SystemExit):
-            bot.initialize()
+            await bot.initialize()
     
     @patch('main.config')
-    def test_initialize_discord_not_implemented(self, mock_config):
+    @pytest.mark.asyncio
+    async def test_initialize_discord_not_implemented(self, mock_config):
         """Test Discord platform not yet implemented"""
         mock_config.validate.return_value = None
-        
+
         bot = ChatBotV2(platform="discord")
-        
+
         with pytest.raises(SystemExit):
-            bot.initialize()
+            await bot.initialize()
     
     @patch('main.config')
-    def test_initialize_unknown_platform(self, mock_config):
+    @pytest.mark.asyncio
+    async def test_initialize_unknown_platform(self, mock_config):
         """Test unknown platform error"""
         mock_config.validate.return_value = None
-        
+
         bot = ChatBotV2(platform="unknown")
-        
+
         with pytest.raises(SystemExit):
-            bot.initialize()
+            await bot.initialize()
     
     @patch('main.signal.signal')
     @patch('main.config')
     @patch('slack_client.SlackBot')
     @patch('main.MessageProcessor')
-    def test_signal_handlers_setup(self, mock_processor, mock_slackbot, mock_config, mock_signal):
+    @pytest.mark.asyncio
+    async def test_signal_handlers_setup(self, mock_processor, mock_slackbot, mock_config, mock_signal):
         """Test signal handlers are set up"""
         mock_config.validate.return_value = None
         mock_client = Mock(db=Mock())
         mock_slackbot.return_value = mock_client
-        
+
         bot = ChatBotV2(platform="slack")
-        bot.initialize()
-        
+        await bot.initialize()
+
         # Verify signal handlers registered
         calls = mock_signal.call_args_list
         signals = [call[0][0] for call in calls]
@@ -120,24 +125,29 @@ class TestChatBotV2MessageHandling:
         bot.processor = Mock()
         return bot
     
-    def test_handle_message_text_response(self, bot):
+    @pytest.mark.asyncio
+    async def test_handle_message_text_response(self, bot):
         """Test handling text response"""
         message = Mock(channel_id="C123", thread_id="thread_123")
         client = Mock()
-        
+
+        # Make client methods async-compatible
+        from unittest.mock import AsyncMock
+        client.send_thinking_indicator = AsyncMock(return_value="thinking_123")
+        client.delete_message = AsyncMock()
+        client.send_message = AsyncMock()
+        client.format_text = Mock(return_value="Formatted: Hello world")
+
         # Mock processor response
         response = Mock(
             type="text",
             content="Hello world",
             metadata={"streamed": False}
         )
-        bot.processor.process_message.return_value = response
-        
-        # Mock thinking indicator
-        client.send_thinking_indicator.return_value = "thinking_123"
-        
-        bot.handle_message(message, client)
-        
+        bot.processor.process_message = AsyncMock(return_value=response)
+
+        await bot.handle_message(message, client)
+
         # Verify thinking indicator sent and deleted
         client.send_thinking_indicator.assert_called_once()
         client.delete_message.assert_called_once_with("C123", "thinking_123")
@@ -342,23 +352,24 @@ class TestChatBotV2Lifecycle:
     @patch('slack_client.SlackBot')
     @patch('main.MessageProcessor')
     @patch('main.config')
-    def test_run_normal_flow(self, mock_config, mock_processor_class, 
+    @pytest.mark.asyncio
+    async def test_run_normal_flow(self, mock_config, mock_processor_class,
                              mock_slackbot_class, mock_log_start, mock_log_end, mock_exit, bot):
         """Test normal run flow"""
         mock_config.validate.return_value = None
         mock_client = Mock(db=Mock())
         mock_slackbot_class.return_value = mock_client
-        
+
         # Make client.start() raise an exception to trigger the finally block
         mock_client.start.side_effect = KeyboardInterrupt("Test interrupt")
-        
-        bot.run()
-        
+
+        await bot.run()
+
         # Verify session logging
         mock_log_start.assert_called_once()
         # log_session_end is called by run() when it exits normally
         mock_log_end.assert_called_once()
-        
+
         # Verify client started
         mock_client.start.assert_called_once()
     
@@ -368,16 +379,17 @@ class TestChatBotV2Lifecycle:
     @patch('slack_client.SlackBot')
     @patch('main.MessageProcessor')
     @patch('main.config')
-    def test_run_keyboard_interrupt(self, mock_config, mock_processor_class,
+    @pytest.mark.asyncio
+    async def test_run_keyboard_interrupt(self, mock_config, mock_processor_class,
                                    mock_slackbot_class, mock_log_start, mock_log_end, mock_exit, bot):
         """Test handling keyboard interrupt"""
         mock_config.validate.return_value = None
         mock_client = Mock(db=Mock())
         mock_slackbot_class.return_value = mock_client
         mock_client.start.side_effect = KeyboardInterrupt()
-        
-        bot.run()
-        
+
+        await bot.run()
+
         # Should handle gracefully
         mock_log_start.assert_called_once()
         mock_log_end.assert_called_once()
@@ -388,115 +400,119 @@ class TestChatBotV2Lifecycle:
     @patch('slack_client.SlackBot')
     @patch('main.MessageProcessor')
     @patch('main.config')
-    def test_run_unexpected_error(self, mock_config, mock_processor_class,
+    @pytest.mark.asyncio
+    async def test_run_unexpected_error(self, mock_config, mock_processor_class,
                                  mock_slackbot_class, mock_log_start, mock_log_end, mock_exit, bot):
         """Test handling unexpected errors"""
         mock_config.validate.return_value = None
         mock_client = Mock(db=Mock())
         mock_slackbot_class.return_value = mock_client
         mock_client.start.side_effect = Exception("Unexpected error")
-        
-        bot.run()
-        
+
+        await bot.run()
+
         # Should handle gracefully
         mock_log_start.assert_called_once()
         mock_log_end.assert_called_once()
     
-    def test_shutdown(self, bot):
+    @pytest.mark.asyncio
+    async def test_shutdown(self, bot):
         """Test shutdown process"""
         bot.running = True
         bot.client = Mock()
+        bot.client.stop = Mock(return_value=None)  # Make it async-compatible
         bot.processor = Mock()
         bot.processor.get_stats.return_value = {"threads": 5}
-        
-        with patch('main.sys.exit') as mock_exit:
-            bot.shutdown()
-        
+
+        # Should not call sys.exit anymore - graceful shutdown should just complete
+        await bot.shutdown()
+
         assert bot.running is False
         bot.client.stop.assert_called_once()
         bot.processor.get_stats.assert_called_once()
-        mock_exit.assert_called_once_with(0)
     
-    def test_shutdown_idempotent(self, bot):
+    @pytest.mark.asyncio
+    async def test_shutdown_idempotent(self, bot):
         """Test shutdown is idempotent"""
         bot.running = False
-        
-        with patch('main.sys.exit') as mock_exit:
-            bot.shutdown()
-        
+
         # Should not do anything if not running
-        mock_exit.assert_not_called()
+        await bot.shutdown()
+
+        # Running state should remain False
+        assert bot.running is False
     
-    def test_shutdown_with_client_error(self, bot):
+    @pytest.mark.asyncio
+    async def test_shutdown_with_client_error(self, bot):
         """Test shutdown handles client.stop() errors gracefully"""
         bot.running = True
         bot.client = Mock()
         bot.client.stop.side_effect = Exception("Failed to stop client")
         bot.processor = Mock()
         bot.processor.get_stats.return_value = {"threads": 5}
-        
-        with patch('main.sys.exit') as mock_exit:
-            bot.shutdown()
-        
+
         # Should continue despite error
+        await bot.shutdown()
+
         assert bot.running is False
         bot.processor.get_stats.assert_called_once()
-        mock_exit.assert_called_once_with(0)
     
-    def test_shutdown_with_stats_error(self, bot):
+    @pytest.mark.asyncio
+    async def test_shutdown_with_stats_error(self, bot):
         """Test shutdown handles get_stats() errors gracefully"""
         bot.running = True
         bot.client = Mock()
+        bot.client.stop = Mock(return_value=None)  # Make it async-compatible
         bot.processor = Mock()
         bot.processor.get_stats.side_effect = Exception("Failed to get stats")
-        
-        with patch('main.sys.exit') as mock_exit:
-            bot.shutdown()
-        
+
         # Should continue despite error
+        await bot.shutdown()
+
         assert bot.running is False
         bot.client.stop.assert_called_once()
-        mock_exit.assert_called_once_with(0)
     
-    def test_shutdown_with_all_errors(self, bot):
+    @pytest.mark.asyncio
+    async def test_shutdown_with_all_errors(self, bot):
         """Test shutdown handles multiple errors gracefully"""
         bot.running = True
         bot.client = Mock()
         bot.client.stop.side_effect = Exception("Client error")
         bot.processor = Mock()
         bot.processor.get_stats.side_effect = Exception("Stats error")
-        
-        with patch('main.sys.exit') as mock_exit:
-            bot.shutdown()
-        
+
         # Should still complete shutdown
+        await bot.shutdown()
+
         assert bot.running is False
-        mock_exit.assert_called_once_with(0)
     
-    def test_signal_handler_sigterm(self, bot):
+    @patch('asyncio.create_task')
+    def test_signal_handler_sigterm(self, mock_create_task, bot):
         """Test SIGTERM handler calls shutdown"""
         bot.shutdown = Mock()
-        
+
         bot._signal_handler(signal.SIGTERM, None)
-        
-        bot.shutdown.assert_called_once()
+
+        # Verify create_task was called with shutdown
+        mock_create_task.assert_called_once_with(bot.shutdown())
     
-    @patch('main.time.time')
-    def test_signal_handler_first_sigint(self, mock_time, bot):
+    @patch('asyncio.create_task')
+    @patch('time.time')
+    def test_signal_handler_first_sigint(self, mock_time, mock_create_task, bot):
         """Test first SIGINT attempts graceful shutdown"""
         mock_time.return_value = 1000.0
         bot.shutdown = Mock()
         bot.sigint_count = 0
         bot.last_sigint_time = 0
-        
+
         bot._signal_handler(signal.SIGINT, None)
-        
+
         # Should increment count and attempt shutdown
         assert bot.sigint_count == 1
         assert bot.last_sigint_time == 1000.0
-        bot.shutdown.assert_called_once()
+        mock_create_task.assert_called_once_with(bot.shutdown())
     
-    @patch('main.time.time')
+    @patch('time.time')
     def test_signal_handler_second_sigint_after_delay(self, mock_time, bot):
         """Test second SIGINT after delay attempts another graceful shutdown"""
         # First SIGINT at time 1000
@@ -517,7 +533,7 @@ class TestChatBotV2Lifecycle:
     
     @patch('os._exit')
     @patch('threading.enumerate')
-    @patch('main.time.time')
+    @patch('time.time')
     def test_signal_handler_double_sigint_force_exit(self, mock_time, mock_enumerate, mock_exit, bot):
         """Test double SIGINT within 2 seconds forces exit"""
         # First SIGINT at time 1000
@@ -545,7 +561,7 @@ class TestChatBotV2Lifecycle:
     
     @patch('os._exit')
     @patch('threading.enumerate')
-    @patch('main.time.time')
+    @patch('time.time')
     def test_signal_handler_double_sigint_no_extra_threads(self, mock_time, mock_enumerate, mock_exit, bot):
         """Test double SIGINT with only main thread"""
         bot.sigint_count = 1
@@ -568,7 +584,7 @@ class TestChatBotV2Lifecycle:
         bot.last_sigint_time = 1000.0
         bot.shutdown = Mock()
         
-        with patch('main.time.time', return_value=1005.0):
+        with patch('time.time', return_value=1005.0):
             bot._signal_handler(signal.SIGINT, None)
         
         # Should not call shutdown again

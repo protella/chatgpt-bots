@@ -18,9 +18,10 @@ class TestMessageProcessor:
     @pytest.fixture
     def mock_thread_manager(self):
         """Create a mock thread manager"""
+        from unittest.mock import AsyncMock
         mock = MagicMock()
-        mock.acquire_thread_lock.return_value = True
-        mock.release_thread_lock.return_value = None
+        mock.acquire_thread_lock = AsyncMock(return_value=True)
+        mock.release_thread_lock = AsyncMock(return_value=None)
         mock.get_or_create_thread.return_value = MagicMock(
             thread_ts="123.456",
             channel_id="C123",
@@ -78,8 +79,8 @@ class TestMessageProcessor:
     @pytest.fixture
     def processor(self, mock_thread_manager, mock_openai_client):
         """Create a MessageProcessor with mocked dependencies"""
-        with patch('message_processor.ThreadStateManager', return_value=mock_thread_manager):
-            with patch('message_processor.OpenAIClient', return_value=mock_openai_client):
+        with patch('message_processor.base.AsyncThreadStateManager', return_value=mock_thread_manager):
+            with patch('message_processor.base.OpenAIClient', return_value=mock_openai_client):
                 processor = MessageProcessor()
                 processor.thread_manager = mock_thread_manager
                 processor.openai_client = mock_openai_client
@@ -91,10 +92,10 @@ class TestMessageProcessor:
     
     def test_initialization_without_db(self):
         """Test MessageProcessor initialization without database"""
-        with patch('message_processor.ThreadStateManager') as mock_thread_manager:
-            with patch('message_processor.OpenAIClient') as mock_openai:
+        with patch('message_processor.base.AsyncThreadStateManager') as mock_thread_manager:
+            with patch('message_processor.base.OpenAIClient') as mock_openai:
                 processor = MessageProcessor()
-                
+
                 assert processor.db is None
                 mock_thread_manager.assert_called_once_with(db=None)
                 mock_openai.assert_called_once()
@@ -102,14 +103,14 @@ class TestMessageProcessor:
     def test_initialization_with_db(self):
         """Test MessageProcessor initialization with database"""
         mock_db = MagicMock()
-        with patch('message_processor.ThreadStateManager') as mock_thread_manager:
-            with patch('message_processor.OpenAIClient') as mock_openai:
+        with patch('message_processor.base.AsyncThreadStateManager') as mock_thread_manager:
+            with patch('message_processor.base.OpenAIClient') as mock_openai:
                 processor = MessageProcessor(db=mock_db)
-                
+
                 assert processor.db is mock_db
                 mock_thread_manager.assert_called_once_with(db=mock_db)
     
-    def test_process_message_thread_busy(self, processor, mock_client):
+    async def test_process_message_thread_busy(self, processor, mock_client):
         """Test processing message when thread is busy"""
         message = Message(
             text="Hello",
@@ -117,16 +118,18 @@ class TestMessageProcessor:
             channel_id="C456",
             thread_id="T789"
         )
-        
+
         # Make thread busy
-        processor.thread_manager.acquire_thread_lock.return_value = False
-        
-        response = processor.process_message(message, mock_client)
-        
+        async def mock_acquire_lock(*args, **kwargs):
+            return False
+        processor.thread_manager.acquire_thread_lock = mock_acquire_lock
+
+        response = await processor.process_message(message, mock_client)
+
         assert response.type == "busy"
         assert "currently processing" in response.content
     
-    def test_process_message_simple_chat(self, processor, mock_client):
+    async def test_process_message_simple_chat(self, processor, mock_client):
         """Test processing a simple chat message"""
         message = Message(
             text="Hello bot",
@@ -135,7 +138,7 @@ class TestMessageProcessor:
             thread_id="T789",
             metadata={"username": "testuser"}
         )
-        
+
         # Mock thread state
         thread_state = MagicMock(
             thread_ts="T789",
@@ -148,10 +151,10 @@ class TestMessageProcessor:
             system_prompt=None
         )
         processor.thread_manager.get_or_create_thread.return_value = thread_state
-        
+
         # Process message
-        response = processor.process_message(message, mock_client)
-        
+        response = await processor.process_message(message, mock_client)
+
         # Should return a response (either text or error)
         assert response is not None
         assert response.type in ["text", "error"]
@@ -365,8 +368,8 @@ class TestMessageProcessorHelpers:
     @pytest.fixture
     def processor(self):
         """Create a MessageProcessor with mocked dependencies"""
-        with patch('message_processor.ThreadStateManager'):
-            with patch('message_processor.OpenAIClient'):
+        with patch('message_processor.base.AsyncThreadStateManager'):
+            with patch('message_processor.base.OpenAIClient'):
                 return MessageProcessor()
     
     def test_extract_slack_file_urls(self, processor):
@@ -433,8 +436,8 @@ class TestMessageProcessorScenarios:
     @pytest.fixture
     def processor(self):
         """Create a fully mocked MessageProcessor"""
-        with patch('message_processor.ThreadStateManager') as mock_thread:
-            with patch('message_processor.OpenAIClient') as mock_openai:
+        with patch('message_processor.base.AsyncThreadStateManager') as mock_thread:
+            with patch('message_processor.base.OpenAIClient') as mock_openai:
                 processor = MessageProcessor()
                 
                 # Setup default thread state
@@ -517,8 +520,8 @@ class TestMessageProcessorContract:
     @pytest.mark.critical
     def test_contract_processor_interface(self):
         """Contract: MessageProcessor must provide expected interface"""
-        with patch('message_processor.ThreadStateManager'):
-            with patch('message_processor.OpenAIClient'):
+        with patch('message_processor.base.AsyncThreadStateManager'):
+            with patch('message_processor.base.OpenAIClient'):
                 processor = MessageProcessor()
                 
                 # Required attributes
@@ -552,8 +555,8 @@ class TestMessageProcessorDiagnostics:
     
     def test_diagnostic_thread_state_tracking(self):
         """Diagnostic: Track thread state during processing"""
-        with patch('message_processor.ThreadStateManager') as mock_thread:
-            with patch('message_processor.OpenAIClient'):
+        with patch('message_processor.base.AsyncThreadStateManager') as mock_thread:
+            with patch('message_processor.base.OpenAIClient'):
                 processor = MessageProcessor()
                 
                 # Track thread state changes

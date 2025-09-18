@@ -8,17 +8,17 @@ from config import config
 
 
 class SlackUtilitiesMixin:
-    def get_username(self, user_id: str, client) -> str:
+    async def get_username(self, user_id: str, client) -> str:
         """Get username from user ID, with caching"""
         # Check memory cache first
         if user_id in self.user_cache and 'username' in self.user_cache[user_id]:
             return self.user_cache[user_id]['username']
         
         # Check database for user
-        user_data = self.db.get_or_create_user(user_id)
+        user_data = await self.db.get_or_create_user_async(user_id)
         if user_data.get('username'):
             # Load from DB to memory cache
-            tz_info = self.db.get_user_timezone(user_id)
+            tz_info = await self.db.get_user_timezone_async(user_id)
             if tz_info:
                 self.user_cache[user_id] = {
                     'username': user_data['username'],
@@ -30,7 +30,7 @@ class SlackUtilitiesMixin:
         
         try:
             # Fetch user info from Slack API
-            result = client.users_info(user=user_id)
+            result = await client.users_info(user=user_id)
             if result["ok"]:
                 user_info = result["user"]
                 # Get both display name and real name
@@ -54,8 +54,8 @@ class SlackUtilitiesMixin:
                 }
                 
                 # Save to database with all user info
-                self.db.get_or_create_user(user_id, username)
-                self.db.save_user_info(
+                await self.db.get_or_create_user_async(user_id, username)
+                await self.db.save_user_info_async(
                     user_id,
                     username=username,
                     real_name=real_name,
@@ -72,14 +72,14 @@ class SlackUtilitiesMixin:
         
         return user_id  # Fallback to user ID if fetch fails
 
-    def get_user_timezone(self, user_id: str, client) -> str:
+    async def get_user_timezone(self, user_id: str, client) -> str:
         """Get user's timezone, fetching if necessary"""
         # Check memory cache first
         if user_id in self.user_cache and 'timezone' in self.user_cache[user_id]:
             return self.user_cache[user_id]['timezone']
         
         # Check database
-        tz_info = self.db.get_user_timezone(user_id)
+        tz_info = await self.db.get_user_timezone_async(user_id)
         if tz_info:
             # Load to memory cache
             if user_id not in self.user_cache:
@@ -90,7 +90,7 @@ class SlackUtilitiesMixin:
             return tz_info[0]
         
         # Fetch user info (which will also cache it)
-        self.get_username(user_id, client)
+        await self.get_username(user_id, client)
         
         # Return timezone from cache or default to UTC
         if user_id in self.user_cache and 'timezone' in self.user_cache[user_id]:
@@ -124,7 +124,7 @@ class SlackUtilitiesMixin:
         
         return None
 
-    def download_file(self, file_url: str, file_id: Optional[str] = None) -> Optional[bytes]:
+    async def download_file(self, file_url: str, file_id: Optional[str] = None) -> Optional[bytes]:
         """Download a file from Slack
         
         Args:
@@ -167,7 +167,7 @@ class SlackUtilitiesMixin:
             
             # Get file info to get the private URL
             self.log_debug(f"Getting file info for file ID: {file_id}")
-            file_info = self.app.client.files_info(file=file_id)
+            file_info = await self.app.client.files_info(file=file_id)
             
             # Check if file exists and is accessible
             if not file_info.get("ok"):

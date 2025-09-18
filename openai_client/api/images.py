@@ -9,7 +9,7 @@ from prompts import IMAGE_EDIT_SYSTEM_PROMPT, IMAGE_GEN_SYSTEM_PROMPT
 from ..utilities import ImageData
 
 
-def generate_image(
+async def generate_image(
     client,
     prompt: str,
     size: Optional[str] = None,
@@ -32,7 +32,7 @@ def generate_image(
     # Enhance prompt if requested
     enhanced_prompt = prompt
     if enhance_prompt:
-        enhanced_prompt = self._enhance_image_prompt(prompt, conversation_history)
+        enhanced_prompt = await self._enhance_image_prompt(prompt, conversation_history)
 
     self.log_info(f"Generating image: {prompt[:100]}...")
 
@@ -59,7 +59,7 @@ def generate_image(
 
         # Use the images.generate API for image generation
         self.log_debug(f"Calling generate_image API with {config.api_timeout_read}s timeout")
-        response = self._safe_api_call(
+        response = await self._safe_api_call(
             self.client.images.generate,
             operation_type="general",
             **params,
@@ -99,7 +99,7 @@ def generate_image(
         raise
 
 
-def _enhance_image_edit_prompt(
+async def _enhance_image_edit_prompt(
     client,
     user_request: str,
     image_description: str,
@@ -166,7 +166,7 @@ def _enhance_image_edit_prompt(
         # Check if streaming callback provided
         if stream_callback:
             # Create streaming response with timeout wrapper
-            stream = self._safe_api_call(
+            stream = await self._safe_api_call(
                 self.client.responses.create,
                 operation_type="streaming",
                 stream=True,
@@ -174,7 +174,7 @@ def _enhance_image_edit_prompt(
             )
             enhanced = ""
 
-            for event in stream:
+            async for event in stream:
                 event_type = event.type if hasattr(event, "type") else None
 
                 if event_type in ["response.output_item.delta", "response.output_text.delta"]:
@@ -198,7 +198,7 @@ def _enhance_image_edit_prompt(
                             stream_callback(text_chunk)
         else:
             # Non-streaming fallback
-            response = self._safe_api_call(
+            response = await self._safe_api_call(
                 self.client.responses.create,
                 operation_type="general",
                 **request_params,
@@ -234,7 +234,7 @@ def _enhance_image_edit_prompt(
         return f"{image_description}. Change: {user_request}"
 
 
-def _enhance_image_prompt(
+async def _enhance_image_prompt(
     client,
     prompt: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
@@ -274,7 +274,7 @@ def _enhance_image_prompt(
         # If streaming callback provided, use streaming response
         if stream_callback:
             # Use streaming version for real-time feedback
-            enhanced = self.create_streaming_response(
+            enhanced = await self.create_streaming_response(
                 messages=[{"role": "user", "content": context}],
                 stream_callback=stream_callback,
                 model=config.utility_model,
@@ -314,7 +314,7 @@ def _enhance_image_prompt(
             else:
                 request_params["temperature"] = 0.7
 
-            response = self._safe_api_call(
+            response = await self._safe_api_call(
                 self.client.responses.create,
                 operation_type="general",
                 **request_params,
@@ -352,7 +352,7 @@ def _enhance_image_prompt(
         return prompt  # Return original on error
 
 
-def edit_image(
+async def edit_image(
     client,
     input_images: List[str],
     prompt: str,
@@ -382,14 +382,14 @@ def edit_image(
     if enhance_prompt:
         # Use the edit-specific enhancement for image editing
         if image_description:
-            enhanced_prompt = self._enhance_image_edit_prompt(
+            enhanced_prompt = await self._enhance_image_edit_prompt(
                 user_request=prompt,
                 image_description=image_description,
                 conversation_history=conversation_history,
             )
         else:
             # Fallback to regular enhancement if no description
-            enhanced_prompt = self._enhance_image_prompt(prompt, conversation_history)
+            enhanced_prompt = await self._enhance_image_prompt(prompt, conversation_history)
 
     self.log_info(f"Editing {len(input_images)} image(s): {prompt[:100]}...")
 
@@ -442,7 +442,7 @@ def edit_image(
 
         # Use the images.edit API
         self.log_debug(f"Calling edit_image API with {config.api_timeout_read}s timeout")
-        response = self._safe_api_call(
+        response = await self._safe_api_call(
             self.client.images.edit,
             operation_type="general",
             **params,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Dict, List, Optional
 
 import time
@@ -73,7 +74,7 @@ class VisionHandlerMixin:
         
         return enhanced_messages
 
-    def _handle_vision_analysis(self, user_text: str, image_inputs: List[Dict], thread_state, attachments: List[Dict],
+    async def _handle_vision_analysis(self, user_text: str, image_inputs: List[Dict], thread_state, attachments: List[Dict],
                                client: BaseClient, channel_id: str, thinking_id: Optional[str], message: Message) -> Response:
         """Handle vision analysis of uploaded images"""
         if not image_inputs:
@@ -144,7 +145,7 @@ class VisionHandlerMixin:
             enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state)
             
             # Pre-trim messages to fit within context window
-            enhanced_messages = self._pre_trim_messages_for_api(enhanced_messages, model=thread_state.current_model)
+            enhanced_messages = await self._pre_trim_messages_for_api(enhanced_messages, model=thread_state.current_model)
             
             # Update status to show we're preparing the analysis
             self._update_status(client, channel_id, thinking_id, "Preparing analysis...", emoji=config.analyze_emoji)
@@ -160,7 +161,7 @@ class VisionHandlerMixin:
             # Enhance the vision prompt with conversation context
             enhanced_question = user_question
             if user_question:  # Only enhance if there's actually a question
-                enhanced_question = self.openai_client._enhance_vision_prompt(
+                enhanced_question = await self.openai_client._enhance_vision_prompt(
                     user_question,
                     conversation_history=enhanced_messages  # Pass the full conversation context
                 )
@@ -211,7 +212,7 @@ class VisionHandlerMixin:
                         # Final update without loading indicator
                         if message_id:
                             final_text = buffer.get_complete_text()
-                            client.update_message_streaming(channel_id, message_id, final_text)
+                            self._update_message_streaming_sync(client, channel_id, message_id, final_text)
                         return
                     
                     buffer.add_chunk(chunk)
@@ -224,7 +225,7 @@ class VisionHandlerMixin:
                         display_text = buffer.get_complete_text() + " " + config.loading_ellipse_emoji
                         
                         # Try to update the message
-                        result = client.update_message_streaming(channel_id, message_id, display_text)
+                        result = self._update_message_streaming_sync(client, channel_id, message_id, display_text)
                         
                         if result["success"]:
                             rate_limiter.record_success()
@@ -246,7 +247,7 @@ class VisionHandlerMixin:
                 
                 # Call analyze_images with streaming callback
                 self.log_info("Streaming vision analysis")
-                analysis_result = self.openai_client.analyze_images(
+                analysis_result = await self.openai_client.analyze_images(
                     images=images_to_analyze,
                     question=enhanced_question,
                     detail="high",
@@ -265,7 +266,7 @@ class VisionHandlerMixin:
                 self.log_debug(f"Vision analysis completed: {len(analysis_result)} chars")
             else:
                 # Non-streaming version
-                analysis_result = self.openai_client.analyze_images(
+                analysis_result = await self.openai_client.analyze_images(
                     images=images_to_analyze,
                     question=enhanced_question,
                     detail="high",
@@ -390,7 +391,7 @@ class VisionHandlerMixin:
             metadata=response_metadata
         )
 
-    def _handle_mixed_content_analysis(
+    async def _handle_mixed_content_analysis(
         self,
         user_text: str,
         image_inputs: List[Dict],
@@ -422,7 +423,7 @@ class VisionHandlerMixin:
                             images_to_analyze.append(base64_data)
             
             # Analyze images with technical prompt (no enhancement needed)
-            image_analysis = self.openai_client.analyze_images(
+            image_analysis = await self.openai_client.analyze_images(
                 images=images_to_analyze,
                 question=IMAGE_ANALYSIS_PROMPT,
                 detail="high",
@@ -469,7 +470,7 @@ class VisionHandlerMixin:
             self._update_status(client, channel_id, thinking_id, "Generating comprehensive response...", emoji=config.thinking_emoji)
             
             # Use text response handler with the combined context
-            return self._handle_text_response(combined_context, thread_state, client, message, thinking_id, retry_count=0)
+            return await self._handle_text_response(combined_context, thread_state, client, message, thinking_id, retry_count=0)
             
         except Exception as e:
             self.log_error(f"Mixed content analysis failed: {e}", exc_info=True)
@@ -478,7 +479,7 @@ class VisionHandlerMixin:
                 content=f"Failed to analyze mixed content: {str(e)}"
             )
 
-    def _handle_vision_without_upload(
+    async def _handle_vision_without_upload(
         self,
         text: str,
         thread_state,
@@ -505,4 +506,4 @@ class VisionHandlerMixin:
         
         # Don't attach documents to the message - they're already in the thread history
         # The model will have access to them from the conversation context
-        return self._handle_text_response(text, thread_state, client, message, thinking_id, retry_count=0)
+        return await self._handle_text_response(text, thread_state, client, message, thinking_id, retry_count=0)

@@ -4,6 +4,7 @@ Manages conversation state, locks, and memory for each Slack thread
 """
 import time
 import threading
+import asyncio
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from threading import Lock
@@ -98,7 +99,7 @@ class ThreadState:
         """Get the most recent messages for context"""
         return self.messages[-count:] if self.messages else []
     
-    def clear_old_messages(self, keep_last: int = 20):
+    def clear_old_messages(self, _keep_last: int = 20):
         """Keep only the most recent messages to manage memory"""
         # With database, we don't need to limit messages
         # This method is kept for backward compatibility but does nothing
@@ -181,7 +182,7 @@ class DocumentLedger:
         """Get the most recent documents"""
         return self.documents[-count:] if self.documents else []
     
-    def clear_old_documents(self, keep_last: int = 10):
+    def clear_old_documents(self, _keep_last: int = 10):
         """Keep only the most recent documents to manage memory"""
         # With database, we don't need to limit documents
         # This method is kept for backward compatibility but does nothing
@@ -256,7 +257,7 @@ class AssetLedger:
         """Get the most recent images"""
         return self.images[-count:] if self.images else []
     
-    def clear_old_images(self, keep_last: int = 10):
+    def clear_old_images(self, _keep_last: int = 10):
         """Keep only the most recent images to manage memory"""
         # With database, we don't need to limit images
         # This method is kept for backward compatibility but does nothing
@@ -336,10 +337,72 @@ class ThreadLockManager(LoggerMixin):
             return False
         return True
     
-    def cleanup_old_locks(self, max_age: int = 3600):
+    def cleanup_old_locks(self, _max_age: int = 3600):
         """Remove locks that haven't been used recently"""
         # This is a placeholder for potential cleanup logic
         # In practice, locks are lightweight and can persist
+        pass
+
+
+class AsyncThreadLockManager(LoggerMixin):
+    """
+    Async version of ThreadLockManager using asyncio.Lock
+    Manages thread locks and processing state without force-release corruption
+    """
+
+    def __init__(self):
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._lock_acquisition_times: Dict[str, float] = {}  # Track when locks were acquired
+        self._global_lock = asyncio.Lock()
+        self.log_info("AsyncThreadLockManager initialized")
+
+    async def get_lock(self, thread_key: str) -> asyncio.Lock:
+        """Get or create a lock for a specific thread"""
+        async with self._global_lock:
+            if thread_key not in self._locks:
+                self._locks[thread_key] = asyncio.Lock()
+                self.log_debug(f"Created new async lock for thread {thread_key}")
+            return self._locks[thread_key]
+
+    async def record_acquisition(self, thread_key: str):
+        """Record when a lock was acquired"""
+        async with self._global_lock:
+            self._lock_acquisition_times[thread_key] = time.time()
+            self.log_debug(f"Async lock acquired for thread {thread_key}")
+
+    async def clear_acquisition(self, thread_key: str):
+        """Clear the acquisition time when lock is released"""
+        async with self._global_lock:
+            if thread_key in self._lock_acquisition_times:
+                del self._lock_acquisition_times[thread_key]
+                # Don't log here - the caller already logs
+
+    async def get_stuck_threads(self, max_duration: int = 300) -> List[str]:
+        """Get list of threads that have been locked too long"""
+        stuck = []
+        now = time.time()
+        async with self._global_lock:
+            for thread_key, acquire_time in self._lock_acquisition_times.items():
+                if now - acquire_time > max_duration:
+                    stuck.append(thread_key)
+        return stuck
+
+    async def is_busy(self, thread_key: str) -> bool:
+        """Check if a thread is currently processing"""
+        lock = await self.get_lock(thread_key)
+        # For asyncio.Lock, we can't check if it's locked without acquiring
+        # So we try to acquire with timeout 0
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=0)
+            lock.release()
+            return False
+        except asyncio.TimeoutError:
+            return True
+
+    async def cleanup_old_locks(self, _max_age: int = 3600):
+        """Remove locks that haven't been used recently"""
+        # This is a placeholder for potential cleanup logic
+        # In practice, async locks are lightweight and can persist
         pass
 
 
@@ -513,11 +576,7 @@ class ThreadStateManager(LoggerMixin):
         """
         thread_key = f"{channel_id}:{thread_ts}"
         lock = self._lock_manager.get_lock(thread_key)
-        
-        # Handle None or 0 timeout - ensure it's a valid number
-        if timeout is None or not isinstance(timeout, (int, float)):
-            timeout = 0
-        
+
         # Acquire lock with proper timeout handling
         # For non-blocking (timeout=0), use acquire(blocking=False) without timeout parameter
         if timeout > 0:
@@ -634,6 +693,360 @@ class ThreadStateManager(LoggerMixin):
         if threads_to_remove:
             self.log_info(f"Cleaned up {len(threads_to_remove)} old thread states")
     
+    def get_stats(self) -> Dict[str, int]:
+        """Get statistics about managed threads"""
+        return {
+            "active_threads": len(self._threads),
+            "asset_ledgers": len(self._assets),
+            "document_ledgers": len(self._documents),
+            "processing_threads": sum(1 for t in self._threads.values() if t.is_processing)
+        }
+
+    # =============================
+    # ASYNC VERSION OF ThreadStateManager
+    # =============================
+
+    def create_async_manager(self, db=None):
+        """Factory method to create async version of this manager"""
+        return AsyncThreadStateManager(db=db, existing_state=self)
+
+
+class AsyncThreadStateManager(LoggerMixin):
+    """Async version of ThreadStateManager - manages conversation state for all threads"""
+
+    def __init__(self, db=None, existing_state=None):
+        # Copy existing state if provided (for migration)
+        if existing_state:
+            self._threads = existing_state._threads.copy()
+            self._assets = existing_state._assets.copy()
+            self._documents = existing_state._documents.copy()
+        else:
+            self._threads: Dict[str, ThreadState] = {}
+            self._assets: Dict[str, AssetLedger] = {}
+            self._documents: Dict[str, DocumentLedger] = {}
+
+        self._lock_manager = AsyncThreadLockManager()
+        self._state_lock = asyncio.Lock()
+        self._token_counter = TokenCounter(config.gpt_model)
+        self._max_tokens = config.thread_max_token_count
+        self.db = db  # Optional database manager
+        self._watchdog_task = None
+        self._watchdog_started = False
+        self.log_info(f"AsyncThreadStateManager initialized {'with' if db else 'without'} database")
+
+    def _start_async_watchdog(self):
+        """Start the background task that monitors for stuck locks"""
+        async def async_watchdog():
+            api_timeout = int(config.api_timeout_read)
+            # Use a SHORTER timeout - don't add extra time, just detect stuck threads
+            max_lock_duration = api_timeout + 5  # Only 5s buffer after API timeout
+            self.log_info(f"Async thread lock watchdog started with {max_lock_duration}s timeout (API timeout: {api_timeout}s)")
+
+            while True:
+                try:
+                    await asyncio.sleep(10)  # Check every 10 seconds
+
+                    # Get stuck threads (locked for more than API timeout duration)
+                    stuck_threads = await self._lock_manager.get_stuck_threads(max_duration=max_lock_duration)
+
+                    for thread_key in stuck_threads:
+                        self.log_error(f"Detected stuck async thread: {thread_key} - after {max_lock_duration}s")
+
+                        # Mark thread as no longer processing
+                        if thread_key in self._threads:
+                            self._threads[thread_key].is_processing = False
+                            # Store that this thread had a timeout for notification
+                            self._threads[thread_key].had_timeout = True
+
+                        # With async locks, we don't force-release - they timeout naturally
+                        self.log_warning(f"Async thread {thread_key} will timeout naturally with asyncio.wait_for")
+
+                except Exception as e:
+                    self.log_error(f"Async watchdog error: {e}", exc_info=True)
+
+        # Start the watchdog task
+        self._watchdog_task = asyncio.create_task(async_watchdog())
+
+    async def acquire_thread_lock(self, thread_ts: str, channel_id: str, timeout: float = 0, user_id: Optional[str] = None) -> bool:
+        """
+        Async version of acquire_thread_lock - try to acquire lock for thread processing
+
+        Args:
+            thread_ts: Thread timestamp
+            channel_id: Channel ID
+            timeout: How long to wait for lock (0 = don't wait)
+            user_id: Optional user ID
+
+        Returns:
+            True if lock acquired, False if thread is busy
+        """
+        # Start watchdog on first use
+        if not self._watchdog_started:
+            self._start_async_watchdog()
+            self._watchdog_started = True
+
+        thread_key = f"{channel_id}:{thread_ts}"
+        lock = await self._lock_manager.get_lock(thread_key)
+
+        # Acquire lock with proper timeout handling
+        try:
+            if timeout > 0:
+                await asyncio.wait_for(lock.acquire(), timeout=timeout)
+            else:
+                # Non-blocking attempt with immediate return if busy
+                acquired = lock.locked()
+                if acquired:
+                    return False  # Lock is already held
+                await lock.acquire()
+
+            # Successfully acquired lock
+            thread = await self.get_or_create_thread_async(thread_ts, channel_id, user_id)
+            thread.is_processing = True
+            # Record lock acquisition time for watchdog
+            await self._lock_manager.record_acquisition(thread_key)
+            self.log_debug(f"Acquired async lock for thread {thread_key}")
+            return True
+
+        except asyncio.TimeoutError:
+            # Lock is busy
+            return False
+
+    async def release_thread_lock(self, thread_ts: str, channel_id: str):
+        """Async version of release_thread_lock - release lock for thread processing"""
+        thread_key = f"{channel_id}:{thread_ts}"
+        lock = await self._lock_manager.get_lock(thread_key)
+
+        thread = await self.get_thread_async(thread_ts, channel_id)
+        if thread:
+            thread.is_processing = False
+
+        try:
+            lock.release()
+            # Clear lock acquisition time for watchdog
+            await self._lock_manager.clear_acquisition(thread_key)
+            self.log_debug(f"Released async lock for thread {thread_key}")
+        except RuntimeError:
+            self.log_warning(f"Attempted to release unheld async lock for {thread_key}")
+
+    async def get_or_create_thread_async(self, thread_ts: str, channel_id: str, user_id: Optional[str] = None) -> ThreadState:
+        """Async version of get_or_create_thread - get existing thread state or create new one"""
+        thread_key = f"{channel_id}:{thread_ts}"
+
+        async with self._state_lock:
+            if thread_key not in self._threads:
+                # Create new thread state
+                thread_state = ThreadState(
+                    thread_ts=thread_ts,
+                    channel_id=channel_id
+                )
+
+                # If database available, check for persisted state
+                if self.db:
+                    # Get or create in database
+                    self.db.get_or_create_thread(thread_key, channel_id, user_id)
+
+                    # Load config from database if exists
+                    thread_config = await self.db.get_thread_config_async(thread_key)
+                    if thread_config:
+                        thread_state.config_overrides = thread_config
+
+                    # Load cached messages from database
+                    cached_messages = await self.db.get_cached_messages_async(thread_key)
+                    if cached_messages:
+                        # Convert DB format to thread format
+                        for msg in cached_messages:
+                            message_dict = {
+                                "role": msg["role"],
+                                "content": msg["content"]
+                            }
+                            # Include metadata if present
+                            if msg.get("metadata"):
+                                message_dict["metadata"] = msg["metadata"]
+                            thread_state.messages.append(message_dict)
+                        self.log_debug(f"Loaded {len(cached_messages)} cached messages for {thread_key}")
+
+                self._threads[thread_key] = thread_state
+                self.log_debug(f"Created new async thread state for {thread_key}")
+
+            thread = self._threads[thread_key]
+            thread.last_activity = time.time()
+
+            # Always refresh config from database to ensure we have latest settings
+            if self.db:
+                thread_config = await self.db.get_thread_config_async(thread_key)
+                if thread_config:
+                    thread.config_overrides = thread_config
+                    self.log_debug(f"Refreshed thread config from database for {thread_key}")
+
+                # Update database activity
+                await self.db.update_thread_activity_async(thread_key)
+
+            return thread
+
+    async def get_thread_async(self, thread_ts: str, channel_id: str) -> Optional[ThreadState]:
+        """Async version of get_thread - get thread state if it exists"""
+        thread_key = f"{channel_id}:{thread_ts}"
+        return self._threads.get(thread_key)
+
+    async def is_thread_busy(self, thread_ts: str, channel_id: str) -> bool:
+        """Async version of is_thread_busy - check if a thread is currently processing"""
+        thread_key = f"{channel_id}:{thread_ts}"
+        return await self._lock_manager.is_busy(thread_key)
+
+    async def cleanup_old_threads(self, max_age: int = 86400):
+        """Async version of cleanup_old_threads - remove thread states that haven't been active recently"""
+        current_time = time.time()
+        threads_to_remove = []
+
+        async with self._state_lock:
+            for key, thread in self._threads.items():
+                if current_time - thread.last_activity > max_age and not thread.is_processing:
+                    threads_to_remove.append(key)
+
+            for key in threads_to_remove:
+                del self._threads[key]
+                # Also clean up associated asset and document ledgers
+                thread_ts = key.split(":")[1]
+                if thread_ts in self._assets:
+                    del self._assets[thread_ts]
+                if thread_ts in self._documents:
+                    del self._documents[thread_ts]
+                self.log_debug(f"Cleaned up old async thread state: {key}")
+
+        if threads_to_remove:
+            self.log_info(f"Cleaned up {len(threads_to_remove)} old async thread states")
+
+    def get_or_create_asset_ledger(self, thread_ts: str) -> AssetLedger:
+        """Get or create asset ledger for a thread"""
+        if thread_ts not in self._assets:
+            # Use a simple approach - just create if missing
+            # This is safe for dict access in most cases
+            self._assets[thread_ts] = AssetLedger(thread_ts=thread_ts)
+            self.log_debug(f"Created new asset ledger for thread {thread_ts}")
+        return self._assets[thread_ts]
+
+    def get_asset_ledger(self, thread_ts: str) -> Optional[AssetLedger]:
+        """Get asset ledger if it exists"""
+        return self._assets.get(thread_ts)
+
+    def get_or_create_document_ledger(self, thread_ts: str) -> DocumentLedger:
+        """Get or create document ledger for a thread"""
+        if thread_ts not in self._documents:
+            # Use a simple approach - just create if missing
+            # This is safe for dict access in most cases
+            self._documents[thread_ts] = DocumentLedger(thread_ts=thread_ts)
+            self.log_debug(f"Created new document ledger for thread {thread_ts}")
+        return self._documents[thread_ts]
+
+    def get_document_ledger(self, thread_ts: str) -> Optional[DocumentLedger]:
+        """Get document ledger if it exists"""
+        return self._documents.get(thread_ts)
+
+    async def update_thread_documents(self, thread_ts: str, channel_id: str, documents: List[Dict[str, Any]]):
+        """Update documents for a specific thread"""
+        thread_key = f"{channel_id}:{thread_ts}"
+        document_ledger = self.get_or_create_document_ledger(thread_ts)
+
+        # Add documents to ledger
+        for doc in documents:
+            document_ledger.add_document(
+                content=doc.get('content', ''),
+                filename=doc.get('filename', 'unknown'),
+                mime_type=doc.get('mime_type', 'text/plain'),
+                page_structure=doc.get('page_structure'),
+                total_pages=doc.get('total_pages'),
+                summary=doc.get('summary'),
+                metadata=doc.get('metadata'),
+                timestamp=doc.get('timestamp'),
+                db=self.db,
+                thread_id=thread_key,
+                message_ts=doc.get('message_ts')
+            )
+
+        self.log_info(f"Updated documents for thread {thread_ts}: {len(documents)} documents")
+
+    async def get_thread_documents(self, thread_ts: str, channel_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Get documents for a specific thread"""
+        thread_key = f"{channel_id}:{thread_ts}"
+
+        # Try to get from database first
+        if self.db:
+            # Note: Database methods need to be async-compatible or wrapped
+            if hasattr(self.db, 'get_thread_documents_async'):
+                documents = await self.db.get_thread_documents_async(thread_key, limit=limit)
+            else:
+                documents = self.db.get_thread_documents(thread_key, limit=limit)
+            if documents:
+                self.log_debug(f"Retrieved {len(documents)} documents from database for {thread_key}")
+                return documents
+
+        # Fallback to in-memory ledger
+        document_ledger = self.get_document_ledger(thread_ts)
+        if document_ledger:
+            recent_docs = document_ledger.get_recent_documents(count=limit or 10)
+            self.log_debug(f"Retrieved {len(recent_docs)} documents from memory for {thread_ts}")
+            return recent_docs
+
+        return []
+
+    async def update_thread_config(self, thread_ts: str, channel_id: str, config_overrides: Dict[str, Any]):
+        """Update configuration for a specific thread"""
+        thread = await self.get_or_create_thread_async(thread_ts, channel_id)
+        thread.config_overrides.update(config_overrides)
+
+        # Save to database if available
+        if self.db:
+            thread_key = f"{channel_id}:{thread_ts}"
+            if hasattr(self.db, 'save_thread_config_async'):
+                await self.db.save_thread_config_async(thread_key, thread.config_overrides)
+            else:
+                self.db.save_thread_config(thread_key, thread.config_overrides)
+
+        self.log_info(f"Updated config for thread {thread_ts}: {config_overrides}")
+
+    def get_or_create_thread(self, thread_ts: str, channel_id: str, user_id: Optional[str] = None) -> ThreadState:
+        """Sync wrapper for get_or_create_thread_async - compatibility method"""
+        # This is a sync wrapper that should only be used in mixed sync/async contexts
+        # For pure async code, use get_or_create_thread_async instead
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If we're in an async context, we can't use this sync method
+                raise RuntimeError("Cannot call sync get_or_create_thread from async context. Use get_or_create_thread_async instead.")
+            else:
+                return loop.run_until_complete(self.get_or_create_thread_async(thread_ts, channel_id, user_id))
+        except RuntimeError:
+            # No event loop, create one
+            return asyncio.run(self.get_or_create_thread_async(thread_ts, channel_id, user_id))
+
+    def get_thread(self, thread_ts: str, channel_id: str) -> Optional[ThreadState]:
+        """Get thread state if it exists (sync version for compatibility)"""
+        thread_key = f"{channel_id}:{thread_ts}"
+        return self._threads.get(thread_key)
+
+    async def cleanup(self):
+        """Cleanup method for graceful shutdown"""
+        self.log_info("Cleaning up ThreadManager...")
+        # Release all thread locks
+        if hasattr(self, '_locks'):
+            for thread_key in list(self._locks.keys()):
+                lock = self._locks.get(thread_key)
+                if lock and lock.locked():
+                    self.log_debug(f"Releasing lock for thread {thread_key}")
+            # Clear locks dictionary
+            self._locks.clear()
+        self.log_info("ThreadManager cleanup completed")
+
+    def get_thread_if_exists(self, thread_key: str) -> Optional[ThreadState]:
+        """Get thread state if it exists, without creating a new one"""
+        return self._threads.get(thread_key)
+
+    def get_thread_state(self, channel_id: str, thread_ts: str) -> Optional[ThreadState]:
+        """Get thread state if it exists (alternative method signature)"""
+        thread_key = f"{channel_id}:{thread_ts}"
+        return self._threads.get(thread_key)
+
     def get_stats(self) -> Dict[str, int]:
         """Get statistics about managed threads"""
         return {

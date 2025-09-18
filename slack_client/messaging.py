@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Dict, List, Optional
 
-from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_sdk.errors import SlackApiError
 
 from base_client import Message, Response
@@ -10,19 +11,132 @@ from config import config
 
 
 class SlackMessagingMixin:
-    def start(self):
+    async def start(self):
         """Start the Slack bot"""
-        self.handler = SocketModeHandler(self.app, config.slack_app_token)
+        self.handler = AsyncSocketModeHandler(self.app, config.slack_app_token)
         self.log_info("Starting Slack bot in socket mode...")
-        self.handler.start()
 
-    def stop(self):
+        # Create a task for start_async that can be cancelled
+        self._start_task = asyncio.create_task(self.handler.start_async())
+
+        try:
+            await self._start_task
+        except asyncio.CancelledError:
+            self.log_info("Slack bot start task cancelled")
+            raise
+        except Exception as e:
+            self.log_error(f"Error in Slack bot start: {e}")
+            raise
+
+    async def stop(self):
         """Stop the Slack bot"""
         if self.handler:
             self.log_info("Stopping Slack bot...")
-            self.handler.close()
 
-    def send_message(self, channel_id: str, thread_id: str, text: str) -> bool:
+            # Cancel the start task to break out of the blocking start_async call
+            if hasattr(self, '_start_task') and not self._start_task.done():
+                self.log_info("Cancelling start task...")
+                self._start_task.cancel()
+                try:
+                    await self._start_task
+                except asyncio.CancelledError:
+                    self.log_info("Slack bot start task cancelled")
+
+            # Try to close handler sessions first before calling handler.close_async()
+            # Also try to close the socket client's session if it exists
+            if hasattr(self.handler, 'client') and self.handler.client:
+                if hasattr(self.handler.client, 'session') and self.handler.client.session:
+                    if not self.handler.client.session.closed:
+                        self.log_debug("Closing handler client session")
+                        try:
+                            await asyncio.wait_for(self.handler.client.session.close(), timeout=0.5)
+                            self.log_debug("Handler client session closed")
+                        except asyncio.TimeoutError:
+                            self.log_warning("Timeout closing handler client session")
+                        except Exception as e:
+                            self.log_warning(f"Error closing handler client session: {e}")
+
+                if hasattr(self.handler.client, 'aiohttp_client_session') and self.handler.client.aiohttp_client_session:
+                    session = self.handler.client.aiohttp_client_session
+                    if not session.closed:
+                        # Don't call session.close() or connector.close() as they hang
+                        # Just forcibly mark everything as closed
+                        try:
+                            # Mark the connector as closed without actually closing it
+                            if hasattr(session, '_connector') and session._connector:
+                                if hasattr(session._connector, '_closed'):
+                                    session._connector._closed = True
+                                # Clear any transports
+                                if hasattr(session._connector, '_transports'):
+                                    session._connector._transports = []
+                                # Clear conns if it exists
+                                if hasattr(session._connector, '_conns'):
+                                    session._connector._conns = {}
+
+                            # Also try the public connector attribute
+                            if hasattr(session, 'connector') and session.connector:
+                                if hasattr(session.connector, '_closed'):
+                                    session.connector._closed = True
+
+                            # Mark session as closed
+                            if hasattr(session, '_closed'):
+                                session._closed = True
+
+                            # Try to detach from the event loop
+                            if hasattr(session, '_loop'):
+                                session._loop = None
+
+                        except Exception as e:
+                            self.log_warning(f"Error during force-close of aiohttp_client_session: {e}")
+
+            # Now try to close the socket mode handler itself - but skip if it might hang
+            # Check if we should even try - if we manually closed sessions, maybe skip handler close
+            skip_handler_close = False
+            if hasattr(self.handler, 'client') and self.handler.client:
+                if hasattr(self.handler.client, 'aiohttp_client_session'):
+                    # If we have the session and it's closed, we probably don't need handler.close_async
+                    if self.handler.client.aiohttp_client_session.closed:
+                        skip_handler_close = True
+
+            if not skip_handler_close:
+                try:
+                    # Create a task for handler close so it doesn't block
+                    close_task = asyncio.create_task(self.handler.close_async())
+
+                    # Wait for it with a very short timeout since it tends to hang
+                    try:
+                        await asyncio.wait_for(asyncio.shield(close_task), timeout=0.1)
+                        self.log_debug("Socket mode handler closed")
+                    except asyncio.TimeoutError:
+                        self.log_warning("Socket mode handler close timed out after 0.1 seconds, continuing...")
+                        # Don't cancel the task, let it complete in background
+                except Exception as e:
+                    self.log_warning(f"Error closing socket mode handler: {e}")
+
+        # Close the web client's aiohttp session if it exists
+        if self.app:
+            # Try the main client
+            if self.app.client:
+                try:
+                    # The AsyncWebClient has a _session attribute that needs closing
+                    if hasattr(self.app.client, '_session') and self.app.client._session:
+                        if not self.app.client._session.closed:
+                            await self.app.client._session.close()
+                            self.log_info("Closed Slack web client session")
+                except Exception as e:
+                    self.log_warning(f"Error closing web client session: {e}")
+
+            # Check for _async_client as well (some versions use this)
+            if hasattr(self.app, '_async_client') and self.app._async_client:
+                try:
+                    if hasattr(self.app._async_client, '_session') and self.app._async_client._session:
+                        if not self.app._async_client._session.closed:
+                            await self.app._async_client._session.close()
+                            self.log_info("Closed app._async_client session")
+                except Exception as e:
+                    self.log_warning(f"Error closing _async_client session: {e}")
+
+    async def send_message(self, channel_id: str, thread_id: str, text: str) -> bool:
         """Send a text message to Slack, splitting if needed"""
         try:
             # Format text for Slack
@@ -31,7 +145,7 @@ class SlackMessagingMixin:
             # Check if we need to split the message
             if len(formatted_text) <= self.MAX_MESSAGE_LENGTH:
                 # Single message
-                self.app.client.chat_postMessage(
+                await self.app.client.chat_postMessage(
                     channel=channel_id,
                     thread_ts=thread_id,
                     text=formatted_text
@@ -42,7 +156,7 @@ class SlackMessagingMixin:
                 for i, chunk in enumerate(chunks, 1):
                     # Add pagination indicator
                     paginated_chunk = f"*Part {i}/{len(chunks)}*\n\n{chunk}"
-                    self.app.client.chat_postMessage(
+                    await self.app.client.chat_postMessage(
                         channel=channel_id,
                         thread_ts=thread_id,
                         text=paginated_chunk
@@ -85,7 +199,7 @@ class SlackMessagingMixin:
         
         return chunks
 
-    def send_message_get_ts(self, channel_id: str, thread_id: str, text: str) -> Dict:
+    async def send_message_get_ts(self, channel_id: str, thread_id: str, text: str) -> Dict:
         """Send a message and return the response including timestamp"""
         try:
             # Format text for Slack
@@ -96,7 +210,7 @@ class SlackMessagingMixin:
             if len(formatted_text) > self.MAX_MESSAGE_LENGTH:
                 formatted_text = formatted_text[:self.MAX_MESSAGE_LENGTH - 80] + "\n\n*[Message exceeded Slack limit]*"
             
-            result = self.app.client.chat_postMessage(
+            result = await self.app.client.chat_postMessage(
                 channel=channel_id,
                 thread_ts=thread_id,
                 text=formatted_text
@@ -107,11 +221,11 @@ class SlackMessagingMixin:
             self.log_error(f"Error sending message: {e}")
             return {"success": False, "error": str(e)}
 
-    def send_image(self, channel_id: str, thread_id: str, image_data: bytes, filename: str, caption: str = "") -> Optional[str]:
+    async def send_image(self, channel_id: str, thread_id: str, image_data: bytes, filename: str, caption: str = "") -> Optional[str]:
         """Send an image to Slack and return the file URL"""
         try:
             # Use files_upload_v2 for image upload
-            result = self.app.client.files_upload_v2(
+            result = await self.app.client.files_upload_v2(
                 channel=channel_id,  # Changed from channels to channel (singular)
                 thread_ts=thread_id,
                 file=image_data,
@@ -133,10 +247,10 @@ class SlackMessagingMixin:
             self.log_error(f"Error uploading image: {e}")
             return None
 
-    def send_thinking_indicator(self, channel_id: str, thread_id: str) -> Optional[str]:
+    async def send_thinking_indicator(self, channel_id: str, thread_id: str) -> Optional[str]:
         """Send thinking indicator to Slack"""
         try:
-            result = self.app.client.chat_postMessage(
+            result = await self.app.client.chat_postMessage(
                 channel=channel_id,
                 thread_ts=thread_id,
                 text=f"{config.thinking_emoji} Thinking..."
@@ -146,10 +260,10 @@ class SlackMessagingMixin:
             self.log_error(f"Error sending thinking indicator: {e}")
             return None
 
-    def delete_message(self, channel_id: str, message_id: str) -> bool:
+    async def delete_message(self, channel_id: str, message_id: str) -> bool:
         """Delete a message from Slack"""
         try:
-            self.app.client.chat_delete(
+            await self.app.client.chat_delete(
                 channel=channel_id,
                 ts=message_id
             )
@@ -158,10 +272,10 @@ class SlackMessagingMixin:
             self.log_debug(f"Could not delete message: {e}")
             return False
 
-    def update_message(self, channel_id: str, message_id: str, text: str) -> bool:
+    async def update_message(self, channel_id: str, message_id: str, text: str) -> bool:
         """Update a message in Slack"""
         try:
-            self.app.client.chat_update(
+            await self.app.client.chat_update(
                 channel=channel_id,
                 ts=message_id,
                 text=text,
@@ -172,7 +286,7 @@ class SlackMessagingMixin:
             self.log_error(f"Could not update message: {e}")
             return False
 
-    def get_thread_history(self, channel_id: str, thread_id: str, limit: int = None) -> List[Message]:
+    async def get_thread_history(self, channel_id: str, thread_id: str, limit: int = None) -> List[Message]:
         """Get COMPLETE thread history from Slack - fetches ALL messages by default"""
         messages = []
         
@@ -195,7 +309,7 @@ class SlackMessagingMixin:
                 if cursor:
                     kwargs["cursor"] = cursor
                 
-                result = self.app.client.conversations_replies(**kwargs)
+                result = await self.app.client.conversations_replies(**kwargs)
                 slack_messages = result.get("messages", [])
                 
                 if not slack_messages:
@@ -273,9 +387,9 @@ class SlackMessagingMixin:
             self.log_error(f"Error getting thread history: {e}")
             return []
 
-    def send_busy_message(self, channel_id: str, thread_id: str):
+    async def send_busy_message(self, channel_id: str, thread_id: str):
         """Send a busy message"""
-        self.send_message(
+        await self.send_message(
             channel_id,
             thread_id,
             ":warning: `This thread is currently processing another request. Please wait a moment and try again.`"
@@ -297,7 +411,7 @@ class SlackMessagingMixin:
             "platform": "slack"
         }
 
-    def update_message_streaming(self, channel_id: str, message_id: str, text: str) -> Dict:
+    async def update_message_streaming(self, channel_id: str, message_id: str, text: str) -> Dict:
         """Updates a message with rate limit awareness"""
         try:
             # For messages that already contain Slack mrkdwn (like enhanced prompts with _italics_),
@@ -323,7 +437,7 @@ class SlackMessagingMixin:
                 formatted_text = truncated + "\n\n*...continued in next message...*"
             
             # Call Slack API's chat_update method
-            result = self.app.client.chat_update(
+            result = await self.app.client.chat_update(
                 channel=channel_id,
                 ts=message_id,
                 text=formatted_text,
@@ -348,7 +462,7 @@ class SlackMessagingMixin:
                     very_short += '\n```'
                 
                 try:
-                    result = self.app.client.chat_update(
+                    result = await self.app.client.chat_update(
                         channel=channel_id,
                         ts=message_id,
                         text=very_short,
@@ -402,14 +516,14 @@ class SlackMessagingMixin:
                 "error": str(e)
             }
 
-    def handle_response(self, channel_id: str, thread_id: str, response: Response):
+    async def handle_response(self, channel_id: str, thread_id: str, response: Response):
         """Handle a Response object and send to Slack"""
         if response.type == "text":
-            self.send_message(channel_id, thread_id, response.content)
+            await self.send_message(channel_id, thread_id, response.content)
         elif response.type == "image":
             # response.content should be ImageData
             image_data = response.content
-            file_url = self.send_image(
+            file_url = await self.send_image(
                 channel_id,
                 thread_id,
                 image_data.to_bytes(),
@@ -423,4 +537,4 @@ class SlackMessagingMixin:
                 
         elif response.type == "error":
             formatted_error = self.format_error_message(response.content)
-            self.send_message(channel_id, thread_id, formatted_error)
+            await self.send_message(channel_id, thread_id, formatted_error)
