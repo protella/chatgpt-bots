@@ -325,7 +325,7 @@ class TestBotConfig:
     def test_diagnostic_config_values(self, mock_env):
         """Diagnostic test: Log all config values for debugging"""
         config = BotConfig()
-        
+
         # Capture important values for debugging
         diagnostic_info = {
             "model": config.gpt_model,
@@ -343,11 +343,101 @@ class TestBotConfig:
                 "debug": config.debug_mode
             }
         }
-        
+
         # This would help diagnose config issues
         print(f"\nDiagnostic Config Info: {diagnostic_info}")
-        
+
         # Verify critical values are present
         assert diagnostic_info["model"] is not None
         assert diagnostic_info["temperature"] > 0
         assert diagnostic_info["max_tokens"] > 0
+
+    def test_get_model_token_limit_gpt5(self, mock_env):
+        """Test get_model_token_limit for GPT-5 models"""
+        config = BotConfig()
+
+        # Test GPT-5 model
+        limit = config.get_model_token_limit("gpt-5")
+        expected = int(config.gpt5_max_tokens * config.token_buffer_percentage)
+        assert limit == expected
+
+        # Test GPT-5 mini
+        limit = config.get_model_token_limit("gpt-5-mini")
+        assert limit == expected
+
+        # Test GPT-5 nano
+        limit = config.get_model_token_limit("gpt-5-nano")
+        assert limit == expected
+
+    def test_get_model_token_limit_gpt4(self, mock_env):
+        """Test get_model_token_limit for GPT-4 models"""
+        config = BotConfig()
+
+        # Test GPT-4.1 model
+        limit = config.get_model_token_limit("gpt-4.1")
+        expected = int(config.gpt4_max_tokens * config.token_buffer_percentage)
+        assert limit == expected
+
+        # Test GPT-4o
+        limit = config.get_model_token_limit("gpt-4o")
+        assert limit == expected
+
+    def test_get_model_token_limit_unknown_model(self, mock_env):
+        """Test get_model_token_limit defaults to GPT-4 for unknown models"""
+        config = BotConfig()
+
+        # Test unknown model
+        limit = config.get_model_token_limit("unknown-model")
+        expected = int(config.gpt4_max_tokens * config.token_buffer_percentage)
+        assert limit == expected
+
+        # Test empty model name
+        limit = config.get_model_token_limit("")
+        assert limit == expected
+
+    def test_get_thread_config_with_custom_instructions(self, mock_env):
+        """Test get_thread_config handles custom instructions from user preferences"""
+        from unittest.mock import Mock
+
+        config = BotConfig()
+        mock_db = Mock()
+
+        # Mock user preferences with custom instructions
+        mock_db.get_user_preferences.return_value = {
+            'model': 'gpt-5-mini',
+            'custom_instructions': 'Always be helpful and concise'
+        }
+
+        thread_config = config.get_thread_config(
+            overrides={},
+            db=mock_db,
+            user_id='U123'
+        )
+
+        # Verify custom instructions are included
+        assert thread_config["custom_instructions"] == 'Always be helpful and concise'
+        assert thread_config["model"] == 'gpt-5-mini'
+
+    def test_get_thread_config_without_custom_instructions(self, mock_env):
+        """Test get_thread_config when user has no custom instructions"""
+        from unittest.mock import Mock
+
+        config = BotConfig()
+        mock_db = Mock()
+
+        # Mock user preferences without custom instructions
+        mock_db.get_user_preferences.return_value = {
+            'model': 'gpt-5-mini',
+            'temperature': 0.5
+        }
+
+        thread_config = config.get_thread_config(
+            overrides={},
+            db=mock_db,
+            user_id='U123'
+        )
+
+        # Verify custom instructions are not included if not set
+        assert "custom_instructions" not in thread_config
+        assert thread_config["model"] == 'gpt-5-mini'
+        assert thread_config["temperature"] == 0.5

@@ -5,7 +5,7 @@ Tests the abstract base client for platform implementations
 import pytest
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
-from unittest.mock import MagicMock, patch, Mock
+from unittest.mock import MagicMock, patch, Mock, AsyncMock
 from base_client import BaseClient, Message, Response
 
 
@@ -167,14 +167,39 @@ class TestBaseClient:
         async def handle_event(self, event: Dict[str, Any]) -> None:
             """Mock handle event"""
             pass
-        
+
         async def start(self):
             """Mock start"""
             pass
-        
+
         async def stop(self):
             """Mock stop"""
             pass
+
+        # Add the missing async abstract methods
+        async def send_message_async(self, channel: str, text: str, thread_ts: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+            """Async version of send_message"""
+            return await self.send_message(channel, text, thread_ts, **kwargs)
+
+        async def send_image_async(self, channel: str, image_data: bytes, filename: str, thread_ts: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+            """Async version of send_image"""
+            return await self.send_image(channel, image_data, filename, thread_ts, **kwargs)
+
+        async def get_thread_history_async(self, channel: str, thread_ts: str, **kwargs) -> List[Dict[str, Any]]:
+            """Async version of get_thread_history"""
+            return await self.get_thread_history(channel, thread_ts, **kwargs)
+
+        async def send_thinking_indicator_async(self, channel: str, thread_ts: Optional[str] = None) -> Optional[str]:
+            """Async version of send_thinking_indicator"""
+            return await self.send_thinking_indicator(channel, thread_ts)
+
+        async def delete_message_async(self, channel: str, ts: str) -> bool:
+            """Async version of delete_message"""
+            return await self.delete_message(channel, ts)
+
+        async def download_file_async(self, url: str) -> bytes:
+            """Async version of download_file"""
+            return await self.download_file(url)
     
     @pytest.fixture
     def mock_client(self):
@@ -377,15 +402,16 @@ class TestBaseClientContract:
         except Exception as e:
             pytest.fail(f"Basic client operations failed: {e}")
     
-    def test_handle_error_method(self):
+    @pytest.mark.asyncio
+    async def test_handle_error_method(self):
         """Test the handle_error method calls correct methods"""
         client = TestBaseClient.MockClient()
-        
-        # Mock the send_message method
-        with patch.object(client, 'send_message') as mock_send:
-            client.handle_error("C123", "T456", "Something went wrong")
-            
-            # Verify send_message was called with formatted error
+
+        # Mock the send_message_async method since handle_error is now async
+        with patch.object(client, 'send_message_async', new_callable=AsyncMock) as mock_send:
+            await client.handle_error("C123", "T456", "Something went wrong")
+
+            # Verify send_message_async was called with formatted error
             mock_send.assert_called_once_with("C123", "T456", "Error: Something went wrong")
     
     def test_format_error_message_default(self):

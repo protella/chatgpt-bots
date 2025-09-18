@@ -479,7 +479,8 @@ class SlackSettingsHandlersMixin:
                         metadata_context = {
                             'thread_id': metadata.get('thread_id'),
                             'in_thread': metadata.get('in_thread', False),
-                            'scope': metadata.get('scope')  # Extract scope
+                            'scope': metadata.get('scope'),  # Extract scope
+                            'pending_message': metadata.get('pending_message')  # Preserve pending message
                         }
                     else:
                         # Old format - just settings
@@ -517,7 +518,8 @@ class SlackSettingsHandlersMixin:
                 is_new_user=is_new_user,
                 thread_id=metadata_context.get('thread_id'),
                 in_thread=metadata_context.get('in_thread', False),
-                scope=metadata_context.get('scope')  # Preserve selected scope
+                scope=metadata_context.get('scope'),  # Preserve selected scope
+                pending_message=metadata_context.get('pending_message')  # Preserve pending message
             )
             
             # Update the modal view
@@ -555,7 +557,8 @@ class SlackSettingsHandlersMixin:
                         metadata_context = {
                             'thread_id': metadata.get('thread_id'),
                             'in_thread': metadata.get('in_thread', False),
-                            'scope': metadata.get('scope')  # Extract scope
+                            'scope': metadata.get('scope'),  # Extract scope
+                            'pending_message': metadata.get('pending_message')  # Preserve pending message
                         }
                     else:
                         stored_settings = metadata
@@ -621,16 +624,9 @@ class SlackSettingsHandlersMixin:
                 is_new_user=is_new_user,
                 thread_id=metadata_context.get('thread_id'),
                 in_thread=metadata_context.get('in_thread', False),
-                scope=metadata_context.get('scope')  # Preserve selected scope
+                scope=metadata_context.get('scope'),  # Preserve selected scope
+                pending_message=metadata_context.get('pending_message')  # Preserve pending message
             )
-            
-            # Update private metadata
-            updated_modal["private_metadata"] = json.dumps({
-                "settings": merged_settings,
-                "thread_id": metadata_context.get('thread_id'),
-                "in_thread": metadata_context.get('in_thread', False),
-                "scope": metadata_context.get('scope')  # Preserve selected scope
-            })
             
             # Validate the modal before sending (debug)
             for idx, block in enumerate(updated_modal.get('blocks', [])):
@@ -648,17 +644,14 @@ class SlackSettingsHandlersMixin:
                 # Slack has a bug where it won't select 'low' when minimal is removed from options
                 # We need to work around this by forcing the selection in the metadata
                 if (stored_settings.get('reasoning_effort') == 'minimal' and
-                    merged_settings.get('enable_web_search') and 
+                    merged_settings.get('enable_web_search') and
                     merged_settings.get('reasoning_effort') == 'low'):
                     # Force the reasoning to be properly set in metadata
                     self.log_debug("Forcing reasoning selection from minimal to low due to web search")
-                    # Make sure the metadata reflects the change
-                    updated_modal["private_metadata"] = json.dumps({
-                        "settings": {**merged_settings, 'reasoning_effort': 'low'},  # Force low
-                        "thread_id": metadata_context.get('thread_id'),
-                        "in_thread": metadata_context.get('in_thread', False),
-                        "scope": metadata_context.get('scope')  # Preserve selected scope
-                    })
+                    # Update the metadata to force low reasoning
+                    metadata_dict = json.loads(updated_modal.get("private_metadata", "{}"))
+                    metadata_dict["settings"]["reasoning_effort"] = "low"  # Force low
+                    updated_modal["private_metadata"] = json.dumps(metadata_dict)
 
                 response = await client.views_update(
                     view_id=body['view']['id'],
@@ -695,7 +688,8 @@ class SlackSettingsHandlersMixin:
                         metadata_context = {
                             'thread_id': metadata.get('thread_id'),
                             'in_thread': metadata.get('in_thread', False),
-                            'scope': selected_scope  # Update the scope
+                            'scope': selected_scope,  # Update the scope
+                            'pending_message': metadata.get('pending_message')  # Preserve pending message
                         }
             except Exception:
                 pass
@@ -716,7 +710,8 @@ class SlackSettingsHandlersMixin:
                 is_new_user=is_new_user,
                 thread_id=metadata_context.get('thread_id'),
                 in_thread=metadata_context.get('in_thread', False),
-                scope=selected_scope  # Pass the new scope
+                scope=selected_scope,  # Pass the new scope
+                pending_message=metadata_context.get('pending_message')  # Preserve pending message
             )
             
             # Update the modal
@@ -894,40 +889,48 @@ class SlackSettingsHandlersMixin:
                 
                 # Use thread settings if available when in thread, otherwise user prefs
                 current_settings = thread_settings if thread_settings else user_prefs
-                
+
+                # Prepare pending_message for new users
+                pending_message = None
+                if is_new_user and original_context and original_context.get('original_message'):
+                    # Check if the message would fit in metadata
+                    test_metadata = {
+                        "settings": current_settings,
+                        "thread_id": thread_id if in_thread else None,
+                        "in_thread": in_thread,
+                        "scope": "global",
+                        "pending_message": original_context
+                    }
+
+                    if len(json.dumps(test_metadata)) > 3000:
+                        # Message too long - use truncated version
+                        self.log_info(f"Pending message too long for metadata ({len(json.dumps(test_metadata))} chars), will ask user to resend")
+                        pending_message = {
+                            'too_long': True,
+                            'channel_id': original_context.get('channel_id'),
+                            'thread_id': original_context.get('thread_id')
+                        }
+                    else:
+                        # Message fits, use it normally
+                        pending_message = original_context
+                        self.log_info(f"Including pending message for new user: {original_context.get('original_message', '')[:50]}...")
+                else:
+                    self.log_debug(f"Not adding pending message - is_new_user: {is_new_user}, has_message: {bool(original_context and original_context.get('original_message'))}")
+
+                # Build modal with pending_message
                 modal = await self.settings_modal.build_settings_modal(
                     user_id=user_id,
                     trigger_id=trigger_id,
                     current_settings=current_settings,
                     is_new_user=is_new_user,
                     thread_id=thread_id if in_thread else None,
-                    in_thread=in_thread
+                    in_thread=in_thread,
+                    pending_message=pending_message  # Pass the pending message directly
                 )
-                
-                # Only add the original message context for new users who need to reprocess their message
-                if is_new_user and original_context and original_context.get('original_message'):
-                    existing_metadata = json.loads(modal.get('private_metadata', '{}'))
-                    # Check if adding the message would exceed Slack's limit
-                    test_metadata = existing_metadata.copy()
-                    test_metadata['pending_message'] = original_context
 
-                    if len(json.dumps(test_metadata)) > 3000:
-                        # Message too long - skip storing it and notify user later
-                        self.log_info(f"Pending message too long for metadata ({len(json.dumps(test_metadata))} chars), will ask user to resend")
-                        # Store a flag that we need to ask them to resend
-                        existing_metadata['pending_message'] = {
-                            'too_long': True,
-                            'channel_id': original_context.get('channel_id'),
-                            'thread_id': original_context.get('thread_id')
-                        }
-                    else:
-                        # Message fits, store it normally
-                        existing_metadata['pending_message'] = original_context
-
-                    modal['private_metadata'] = json.dumps(existing_metadata)
-                    self.log_debug(f"Metadata size for new user: {len(json.dumps(existing_metadata))} chars")
-                else:
-                    self.log_debug(f"Not adding pending message - is_new_user: {is_new_user}, has_message: {bool(original_context and original_context.get('original_message'))}")
+                # Log the metadata size for debugging
+                if is_new_user and pending_message:
+                    self.log_debug(f"Metadata size for new user: {len(modal.get('private_metadata', '{}'))} chars")
                 
                 response = await client.views_open(
                     trigger_id=trigger_id,

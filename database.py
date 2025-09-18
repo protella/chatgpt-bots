@@ -1277,6 +1277,8 @@ class DatabaseManager(LoggerMixin):
                 """, (thread_id, role, content, message_ts,
                       json.dumps(metadata) if metadata else None))
 
+                await db.commit()
+
                 # Update thread activity
                 await self.update_thread_activity_async(thread_id)
 
@@ -1338,6 +1340,8 @@ class DatabaseManager(LoggerMixin):
                 WHERE thread_id = ?
             """, (thread_id,))
 
+            await db.commit()
+
     async def save_image_metadata_async(self, thread_id: str, url: str, image_type: str,
                                        prompt: Optional[str] = None, analysis: Optional[str] = None,
                                        original_analysis: Optional[str] = None, metadata: Optional[Dict] = None,
@@ -1371,6 +1375,8 @@ class DatabaseManager(LoggerMixin):
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (thread_id, url, image_type, prompt, analysis, original_analysis,
                       json.dumps(metadata) if metadata else None, message_ts))
+
+                await db.commit()
 
                 self.log_info(f"DB: Successfully saved image metadata for {url[:50]}... in thread {thread_id}")
 
@@ -1421,6 +1427,7 @@ class DatabaseManager(LoggerMixin):
                 WHERE thread_id = ?
             """, (json.dumps(config), thread_id))
 
+            await db.commit()
             logger.debug(f"Saved config for thread {thread_id} (async)")
 
     async def get_or_create_user_async(self, user_id: str, username: Optional[str] = None) -> Dict:
@@ -1513,7 +1520,14 @@ class DatabaseManager(LoggerMixin):
                 (user_id,)
             ) as cursor:
                 row = await cursor.fetchone()
-                return dict(row) if row else None
+                if row:
+                    prefs = dict(row)
+                    # Convert SQLite boolean (0/1) to Python boolean
+                    prefs['enable_web_search'] = bool(prefs.get('enable_web_search', 1))
+                    prefs['enable_streaming'] = bool(prefs.get('enable_streaming', 1))
+                    prefs['settings_completed'] = bool(prefs.get('settings_completed', 0))
+                    return prefs
+                return None
 
     async def create_default_user_preferences_async(self, user_id: str, email: str) -> Dict:
         """
@@ -1537,13 +1551,18 @@ class DatabaseManager(LoggerMixin):
             await db.execute("""
                 INSERT OR REPLACE INTO user_preferences (
                     slack_user_id, slack_email,
-                    model, temperature,
-                    enable_streaming, reasoning_effort, verbosity
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    model, temperature, top_p,
+                    enable_web_search, enable_streaming,
+                    reasoning_effort, verbosity,
+                    image_size, input_fidelity, vision_detail
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 user_id, email,
-                config.gpt_model, config.default_temperature,
-                1 if config.enable_streaming else 0, config.default_reasoning_effort, config.default_verbosity
+                config.gpt_model, config.default_temperature, config.default_top_p,
+                1 if config.enable_web_search else 0,
+                1 if config.enable_streaming else 0,
+                config.default_reasoning_effort, config.default_verbosity,
+                config.default_image_size, config.default_input_fidelity, config.default_detail_level
             ))
 
             await db.commit()
@@ -1554,7 +1573,14 @@ class DatabaseManager(LoggerMixin):
                 (user_id,)
             ) as cursor:
                 row = await cursor.fetchone()
-                return dict(row) if row else {}
+                if row:
+                    prefs = dict(row)
+                    # Convert SQLite boolean (0/1) to Python boolean
+                    prefs['enable_web_search'] = bool(prefs.get('enable_web_search', 1))
+                    prefs['enable_streaming'] = bool(prefs.get('enable_streaming', 1))
+                    prefs['settings_completed'] = bool(prefs.get('settings_completed', 0))
+                    return prefs
+                return {}
 
     async def get_user_timezone_async(self, user_id: str) -> Optional[str]:
         """
@@ -1617,19 +1643,22 @@ class DatabaseManager(LoggerMixin):
             await db.execute("PRAGMA journal_mode=WAL")
 
             # Build dynamic update query
-            valid_fields = {
-                'model', 'temperature', 'top_p',
-                'enable_streaming', 'reasoning_effort', 'verbosity',
-                'vision_model', 'vision_detail', 'image_size',
-                'image_quality', 'image_style', 'settings_completed'
-            }
-
             update_fields = []
             values = []
-            for key, value in preferences.items():
-                if key in valid_fields:
-                    update_fields.append(f"{key} = ?")
-                    values.append(value)
+
+            # Handle regular fields
+            for field in ['model', 'reasoning_effort', 'verbosity', 'temperature',
+                         'top_p', 'image_size', 'input_fidelity', 'vision_detail',
+                         'slack_email', 'settings_completed', 'custom_instructions']:
+                if field in preferences:
+                    update_fields.append(f"{field} = ?")
+                    values.append(preferences[field])
+
+            # Handle boolean fields - convert to integers for SQLite
+            for field in ['enable_web_search', 'enable_streaming']:
+                if field in preferences:
+                    update_fields.append(f"{field} = ?")
+                    values.append(1 if preferences[field] else 0)
 
             if not update_fields:
                 return False
@@ -1672,10 +1701,30 @@ class DatabaseManager(LoggerMixin):
                 return dict(row)
 
             # Create new thread
+            thread_ts = thread_id.split(":", 1)[1] if ":" in thread_id else thread_id
+
+            # Get user config if user_id provided
+            config = {}
+            if user_id:
+                user_prefs = await self.get_user_preferences_async(user_id)
+                if user_prefs:
+                    # Extract relevant config from user preferences
+                    config = {
+                        'model': user_prefs.get('model'),
+                        'reasoning_effort': user_prefs.get('reasoning_effort'),
+                        'verbosity': user_prefs.get('verbosity'),
+                        'temperature': user_prefs.get('temperature'),
+                        'top_p': user_prefs.get('top_p'),
+                        'enable_web_search': user_prefs.get('enable_web_search'),
+                        'enable_streaming': user_prefs.get('enable_streaming')
+                    }
+                    # Remove None values
+                    config = {k: v for k, v in config.items() if v is not None}
+
             await db.execute("""
-                INSERT INTO threads (thread_id, channel_id, user_id, created_at)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-            """, (thread_id, channel_id, user_id))
+                INSERT INTO threads (thread_id, channel_id, thread_ts, config_json)
+                VALUES (?, ?, ?, ?)
+            """, (thread_id, channel_id, thread_ts, json.dumps(config) if config else None))
 
             await db.commit()
 

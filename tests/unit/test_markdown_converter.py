@@ -50,21 +50,390 @@ class TestSlackConversion:
         assert "*Header 1*" in result
         assert "*Header 2*" in result
         assert "*Header 3*" in result
-    
-    def test_convert_bold(self):
-        """Test bold text conversion"""
-        text = "This is **bold** and __also bold__"
+
+    def test_convert_headers_all_levels(self):
+        """Test all header levels conversion"""
+        text = "# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6"
         result = self.converter.convert(text)
-        assert "This is *bold* and *also bold*" in result
-    
-    def test_convert_italic(self):
-        """Test italic text conversion"""
+
+        # All headers should become bold
+        assert "*H1*" in result
+        assert "*H2*" in result
+        assert "*H3*" in result
+        assert "*H4*" in result
+        assert "*H5*" in result
+        assert "*H6*" in result
+
+    def test_convert_bold_markdown(self):
+        """Test bold markdown conversion"""
+        # Test **bold**
+        text = "This is **bold** text"
+        result = self.converter.convert(text)
+        assert "*bold*" in result
+        assert "**bold**" not in result
+
+        # Test __bold__
+        text = "This is __bold__ text"
+        result = self.converter.convert(text)
+        assert "*bold*" in result
+        assert "__bold__" not in result
+
+    def test_convert_italic_markdown(self):
+        """Test italic markdown conversion"""
+        # Test *italic*
         text = "This is *italic* text"
         result = self.converter.convert(text)
-        assert "This is _italic_ text" in result
-    
+        assert "_italic_" in result
+
+        # Test _italic_
+        text = "This is _italic_ text"
+        result = self.converter.convert(text)
+        assert "_italic_" in result
+
     def test_convert_strikethrough(self):
         """Test strikethrough conversion"""
+        text = "This is ~~strikethrough~~ text"
+        result = self.converter.convert(text)
+        assert "~strikethrough~" in result
+        assert "~~strikethrough~~" not in result
+
+    def test_convert_links(self):
+        """Test link conversion"""
+        text = "[Google](https://google.com)"
+        result = self.converter.convert(text)
+        assert "<https://google.com|Google>" in result
+
+    def test_convert_bare_urls(self):
+        """Test bare URL conversion"""
+        text = "Visit https://example.com for more info"
+        result = self.converter.convert(text)
+        assert "<https://example.com>" in result
+
+    def test_convert_unordered_lists(self):
+        """Test unordered list conversion"""
+        text = "- Item 1\n- Item 2\n* Item 3\n+ Item 4"
+        result = self.converter.convert(text)
+        assert "• Item 1" in result
+        assert "• Item 2" in result
+        assert "• Item 3" in result
+        assert "• Item 4" in result
+
+    def test_convert_ordered_lists(self):
+        """Test ordered list preservation"""
+        text = "1. First item\n2. Second item\n3. Third item"
+        result = self.converter.convert(text)
+        # Ordered lists should remain unchanged
+        assert "1. First item" in result
+        assert "2. Second item" in result
+        assert "3. Third item" in result
+
+    def test_convert_blockquotes(self):
+        """Test blockquote conversion"""
+        text = "> This is a quote\n>Another line"
+        result = self.converter.convert(text)
+        assert "> This is a quote" in result
+        assert "> Another line" in result
+
+    def test_convert_horizontal_rules(self):
+        """Test horizontal rule conversion"""
+        text = "---\n***\n___"
+        result = self.converter.convert(text)
+        # Should convert to em dashes
+        assert "———————————" in result
+
+    def test_code_block_preservation(self):
+        """Test that code blocks are preserved during conversion"""
+        text = "```python\nprint('hello')\n```"
+        result = self.converter.convert(text)
+        # Code block should remain unchanged
+        assert "```" in result
+        assert "print('hello')" in result
+
+    def test_inline_code_preservation(self):
+        """Test that inline code is preserved"""
+        text = "Use `print()` function"
+        result = self.converter.convert(text)
+        assert "`print()`" in result
+
+    def test_complex_markdown_conversion(self):
+        """Test complex markdown with multiple elements"""
+        text = """# Main Header
+
+This is **bold** and this is *italic*.
+
+- List item with `code`
+- Another item
+
+[Link to Google](https://google.com)
+
+> This is a blockquote
+
+```python
+def hello():
+    print("world")
+```"""
+
+        result = self.converter.convert(text)
+
+        # Check various conversions
+        assert "*Main Header*" in result
+        assert "*bold*" in result
+        assert "_italic_" in result
+        assert "• List item" in result
+        assert "<https://google.com|Link to Google>" in result
+        assert "> This is a blockquote" in result
+        assert "```python" in result
+        assert "`code`" in result
+
+    def test_whitespace_cleanup(self):
+        """Test whitespace cleanup"""
+        text = "Line 1\n\n\n\nLine 2   \n   Line 3   "
+        result = self.converter.convert(text)
+        # Should reduce multiple newlines and trim whitespace
+        assert result.count('\n\n\n') == 0
+        assert not result.endswith(' ')
+
+    def test_nested_formatting(self):
+        """Test nested formatting scenarios"""
+        # Bold inside headers
+        text = "# Header with **bold** text"
+        result = self.converter.convert(text)
+        assert "*Header with *bold* text*" in result
+
+    def test_edge_case_empty_elements(self):
+        """Test edge cases with empty elements"""
+        text = "**empty bold****another**"
+        result = self.converter.convert(text)
+        # Should handle empty bold elements
+        assert "**empty bold**" not in result
+
+    def test_code_block_with_language(self):
+        """Test code block with language specification"""
+        text = "```javascript\nconst x = 5;\n```"
+        result = self.converter.convert(text)
+        # Should preserve code block content
+        assert "const x = 5;" in result
+        assert "```" in result
+
+    def test_mixed_list_types(self):
+        """Test mixed list types"""
+        text = """1. Ordered item
+- Unordered item
+2. Another ordered
+* Another unordered"""
+
+        result = self.converter.convert(text)
+        assert "1. Ordered item" in result
+        assert "• Unordered item" in result
+        assert "2. Another ordered" in result
+        assert "• Another unordered" in result
+
+    def test_link_edge_cases(self):
+        """Test link conversion edge cases"""
+        # Link with existing angle brackets shouldn't be double-wrapped
+        text = "Already formatted: <https://example.com>"
+        result = self.converter.convert(text)
+        # Should not become <<https://example.com>>
+        assert "<<https://example.com>>" not in result
+        assert "<https://example.com>" in result
+
+    def test_italic_bold_interaction(self):
+        """Test interaction between italic and bold conversion"""
+        text = "***bold and italic***"
+        result = self.converter.convert(text)
+        # Should handle complex formatting
+        assert "***" not in result
+
+
+class TestDiscordConversion:
+    """Test Discord-specific markdown conversion"""
+
+    def setup_method(self):
+        """Setup test fixtures"""
+        self.converter = MarkdownConverter("discord")
+
+    def test_discord_preserves_standard_markdown(self):
+        """Test that Discord preserves standard markdown"""
+        text = "**bold** *italic* ~~strikethrough~~"
+        result = self.converter.convert(text)
+        # Discord supports standard markdown, so should be preserved
+        assert "**bold**" in result
+        assert "*italic*" in result
+        assert "~~strikethrough~~" in result
+
+    def test_discord_headers_preserved(self):
+        """Test that Discord headers are preserved"""
+        text = "# Header 1\n## Header 2"
+        result = self.converter.convert(text)
+        assert "# Header 1" in result
+        assert "## Header 2" in result
+
+    def test_discord_code_blocks_preserved(self):
+        """Test that Discord code blocks are preserved"""
+        text = "```python\nprint('hello')\n```"
+        result = self.converter.convert(text)
+        assert "```python" in result
+        assert "print('hello')" in result
+
+    def test_discord_links_preserved(self):
+        """Test that Discord links are preserved"""
+        text = "[Google](https://google.com)"
+        result = self.converter.convert(text)
+        assert "[Google](https://google.com)" in result
+
+    def test_discord_whitespace_cleanup(self):
+        """Test Discord whitespace cleanup"""
+        text = "Line 1\n\n\n\nLine 2   "
+        result = self.converter.convert(text)
+        # Should still clean up excess whitespace
+        assert result.count('\n\n\n') == 0
+        assert not result.endswith(' ')
+
+
+class TestCodeBlockExtraction:
+    """Test code block extraction and restoration"""
+
+    def setup_method(self):
+        """Setup test fixtures"""
+        self.converter = MarkdownConverter("slack")
+
+    def test_fenced_code_block_extraction(self):
+        """Test extraction of fenced code blocks"""
+        storage = []
+        text = "Some text ```code here``` more text"
+        result = self.converter._extract_code_blocks(text, storage)
+
+        assert "###CODE_BLOCK_0###" in result
+        assert len(storage) == 1
+        assert storage[0] == "```code here```"
+
+    def test_inline_code_extraction(self):
+        """Test extraction of inline code"""
+        storage = []
+        text = "Some text `inline code` more text"
+        result = self.converter._extract_code_blocks(text, storage)
+
+        assert "###CODE_INLINE_0###" in result
+        assert len(storage) == 1
+        assert storage[0] == "`inline code`"
+
+    def test_mixed_code_extraction(self):
+        """Test extraction of mixed code types"""
+        storage = []
+        text = "Text ```block``` and `inline` code"
+        result = self.converter._extract_code_blocks(text, storage)
+
+        assert "###CODE_BLOCK_0###" in result
+        assert "###CODE_INLINE_1###" in result
+        assert len(storage) == 2
+
+    def test_code_block_restoration(self):
+        """Test restoration of code blocks"""
+        storage = ["```python\nprint('hello')\n```", "`variable`"]
+        text = "Text ###CODE_BLOCK_0### and ###CODE_INLINE_1### here"
+
+        result = self.converter._restore_code_blocks_slack(text, storage)
+
+        assert "```python" in result
+        assert "print('hello')" in result
+        assert "`variable`" in result
+        assert "###CODE_BLOCK_0###" not in result
+        assert "###CODE_INLINE_1###" not in result
+
+
+class TestUtilityMethods:
+    """Test utility methods in MarkdownConverter"""
+
+    def setup_method(self):
+        """Setup test fixtures"""
+        self.converter = MarkdownConverter("slack")
+
+    def test_clean_whitespace_multiple_newlines(self):
+        """Test cleaning multiple consecutive newlines"""
+        text = "Line 1\n\n\n\n\nLine 2"
+        result = self.converter._clean_whitespace(text)
+        assert "\n\n\n" not in result
+        assert "Line 1\n\nLine 2" == result
+
+    def test_clean_whitespace_trailing_spaces(self):
+        """Test removing trailing spaces"""
+        text = "Line with spaces   \nAnother line   "
+        result = self.converter._clean_whitespace(text)
+        assert not any(line.endswith(' ') for line in result.split('\n'))
+
+    def test_clean_whitespace_strip_text(self):
+        """Test stripping leading/trailing whitespace from entire text"""
+        text = "   Some text   "
+        result = self.converter._clean_whitespace(text)
+        assert result == "Some text"
+
+
+@pytest.mark.critical
+class TestMarkdownConverterCritical:
+    """Critical tests for markdown converter functionality"""
+
+    def test_critical_platform_routing(self):
+        """Critical test for platform-specific routing"""
+        slack_converter = MarkdownConverter("slack")
+        discord_converter = MarkdownConverter("discord")
+
+        text = "**bold** text"
+
+        slack_result = slack_converter.convert(text)
+        discord_result = discord_converter.convert(text)
+
+        # Results should be different for different platforms
+        assert slack_result != discord_result
+        assert "*bold*" in slack_result  # Slack format
+        assert "**bold**" in discord_result  # Discord preserves standard
+
+    def test_critical_code_preservation(self):
+        """Critical test that code blocks are not corrupted during conversion"""
+        converter = MarkdownConverter("slack")
+
+        original_code = "```python\ndef function(**kwargs):\n    return *args\n```"
+        result = converter.convert(original_code)
+
+        # Code content should be preserved exactly
+        assert "def function(**kwargs):" in result
+        assert "return *args" in result
+        assert "```" in result
+
+    def test_critical_no_data_loss(self):
+        """Critical test that no content is lost during conversion"""
+        converter = MarkdownConverter("slack")
+
+        text = "Important **data** with `code` and [links](http://example.com)"
+        result = converter.convert(text)
+
+        # All content words should be preserved
+        assert "Important" in result
+        assert "data" in result
+        assert "code" in result
+        assert "links" in result
+        assert "example.com" in result
+
+
+@pytest.mark.smoke
+class TestMarkdownConverterSmoke:
+    """Smoke tests for markdown converter"""
+
+    def test_smoke_basic_functionality(self):
+        """Smoke test for basic converter functionality"""
+        converter = MarkdownConverter("slack")
+
+        # Should not raise exceptions
+        assert converter.convert("") == ""
+        assert converter.convert("plain text") == "plain text"
+        assert isinstance(converter.convert("**bold**"), str)
+
+    def test_smoke_all_platforms(self):
+        """Smoke test for all supported platforms"""
+        for platform in ["slack", "discord", "unknown"]:
+            converter = MarkdownConverter(platform)
+            result = converter.convert("**test**")
+            assert isinstance(result, str)
+            assert len(result) > 0
         text = "This is ~~strikethrough~~ text"
         result = self.converter.convert(text)
         assert "This is ~strikethrough~ text" in result

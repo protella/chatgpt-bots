@@ -913,7 +913,7 @@ class MessageUtilitiesMixin:
 
     async def update_last_image_url(self, channel_id: str, thread_id: str, url: str):
         """Update the last assistant message with the image URL"""
-        thread_state = self.thread_manager.get_or_create_thread(thread_id, channel_id)
+        thread_state = await self.thread_manager.get_or_create_thread_async(thread_id, channel_id)
         
         # Find the last assistant message with image metadata or legacy format
         for i in range(len(thread_state.messages) - 1, -1, -1):
