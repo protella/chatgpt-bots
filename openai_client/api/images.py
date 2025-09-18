@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from typing import Any, Callable, Dict, List, Optional
 
+import aiohttp
 from config import config
 from prompts import IMAGE_EDIT_SYSTEM_PROMPT, IMAGE_GEN_SYSTEM_PROMPT
 
@@ -58,10 +59,9 @@ async def generate_image(
         # - style parameter
 
         # Use the images.generate API for image generation
-        self.log_debug(f"Calling generate_image API with {config.api_timeout_read}s timeout")
         response = await self._safe_api_call(
             self.client.images.generate,
-            operation_type="general",
+            operation_type="image_generation",
             **params,
         )
 
@@ -72,15 +72,19 @@ async def generate_image(
                 image_data = response.data[0].b64_json
             # Otherwise, we might have a URL - need to download it
             elif hasattr(response.data[0], "url") and response.data[0].url:
-                import requests
-
                 url = response.data[0].url
                 self.log_debug(f"Downloading image from URL: {url}")
-                img_response = requests.get(url)
-                if img_response.status_code == 200:
-                    image_data = base64.b64encode(img_response.content).decode("utf-8")
-                else:
-                    raise ValueError(f"Failed to download image from URL: {url}")
+
+                session = self._get_session()
+                try:
+                    async with session.get(url) as img_response:
+                        if img_response.status == 200:
+                            content = await img_response.read()
+                            image_data = base64.b64encode(content).decode("utf-8")
+                        else:
+                            raise ValueError(f"Failed to download image from URL: {url} (status {img_response.status})")
+                except aiohttp.ClientError as e:
+                    raise ValueError(f"Network error downloading image from URL {url}: {e}")
             else:
                 raise ValueError("No image data or URL in response")
         else:
@@ -168,13 +172,13 @@ async def _enhance_image_edit_prompt(
             # Create streaming response with timeout wrapper
             stream = await self._safe_api_call(
                 self.client.responses.create,
-                operation_type="streaming",
+                operation_type="prompt_enhancement",
                 stream=True,
                 **request_params,
             )
             enhanced = ""
 
-            async for event in stream:
+            async for event in self._safe_stream_iteration(stream, "prompt_enhancement"):
                 event_type = event.type if hasattr(event, "type") else None
 
                 if event_type in ["response.output_item.delta", "response.output_text.delta"]:
@@ -200,7 +204,7 @@ async def _enhance_image_edit_prompt(
             # Non-streaming fallback
             response = await self._safe_api_call(
                 self.client.responses.create,
-                operation_type="general",
+                operation_type="prompt_enhancement",
                 **request_params,
             )
 
@@ -441,10 +445,9 @@ async def edit_image(
             params["mask"] = BytesIO(mask_bytes)
 
         # Use the images.edit API
-        self.log_debug(f"Calling edit_image API with {config.api_timeout_read}s timeout")
         response = await self._safe_api_call(
             self.client.images.edit,
-            operation_type="general",
+            operation_type="image_edit",
             **params,
         )
 
@@ -455,15 +458,19 @@ async def edit_image(
                 image_data = response.data[0].b64_json
             # Otherwise, we might have a URL - need to download it
             elif hasattr(response.data[0], "url") and response.data[0].url:
-                import requests
-
                 url = response.data[0].url
                 self.log_debug(f"Downloading edited image from URL: {url}")
-                img_response = requests.get(url)
-                if img_response.status_code == 200:
-                    image_data = base64.b64encode(img_response.content).decode("utf-8")
-                else:
-                    raise ValueError(f"Failed to download edited image from URL: {url}")
+
+                session = self._get_session()
+                try:
+                    async with session.get(url) as img_response:
+                        if img_response.status == 200:
+                            content = await img_response.read()
+                            image_data = base64.b64encode(content).decode("utf-8")
+                        else:
+                            raise ValueError(f"Failed to download edited image from URL: {url} (status {img_response.status})")
+                except aiohttp.ClientError as e:
+                    raise ValueError(f"Network error downloading edited image from URL {url}: {e}")
             else:
                 raise ValueError("No image data or URL in response")
         else:

@@ -89,11 +89,13 @@ async def create_text_response(
     self.log_debug(f"Creating text response with model {model}, temp {temperature}")
 
     try:
+        # Determine operation type based on reasoning effort and context
+        operation_type = "text_high_reasoning" if reasoning_effort in ["high", "maximum"] else "text_normal"
+
         # API call with enforced timeout wrapper
-        self.log_debug(f"[HANG_DEBUG] About to create text response with {len(input_messages)} messages")
         response = await self._safe_api_call(
             self.client.responses.create,
-            operation_type="general",
+            operation_type=operation_type,
             **request_params
         )
         
@@ -184,12 +186,15 @@ async def create_text_response_with_tools(
         request_params["top_p"] = top_p
     
     self.log_debug(f"Creating text response with tools using model {model}, tools: {tools}")
-    
+
     try:
+        # Determine operation type based on reasoning effort and context
+        operation_type = "text_high_reasoning" if reasoning_effort in ["high", "maximum"] else "text_normal"
+
         # API call with enforced timeout wrapper
         response = await self._safe_api_call(
             self.client.responses.create,
-            operation_type="general",
+            operation_type=operation_type,
             **request_params
         )
         
@@ -295,36 +300,22 @@ async def create_streaming_response(
         request_params["top_p"] = top_p
     
     self.log_debug(f"Creating streaming response with model {model}, temp {temperature}")
-    
+
     try:
+        # Determine operation type based on reasoning effort and context
+        operation_type = "text_high_reasoning" if reasoning_effort in ["high", "maximum"] else "text_normal"
+
         response = await self._safe_api_call(
             self.client.responses.create,
-            operation_type="general",
+            operation_type=operation_type,
             **request_params
         )
-        
+
         complete_text = ""
-        last_chunk_time = None  # Don't start timer until first event
-        first_event = True
-        
-        # Process streaming events
-        async for event in response:
+
+        # Process streaming events with timeout protection
+        async for event in self._safe_stream_iteration(response, operation_type):
             try:
-                current_time = time.time()
-                
-                # Only check timeout after first event has been received
-                if last_chunk_time is not None:
-                    time_since_last_chunk = current_time - last_chunk_time
-                    # Log if event took unusually long but don't error
-                    if time_since_last_chunk > self.stream_timeout_seconds:
-                        self.log_warning(f"Stream event took {time_since_last_chunk:.1f}s to arrive (timeout is {self.stream_timeout_seconds}s)")
-                elif first_event:
-                    # Log time to first event for monitoring
-                    self.log_debug("Received first streaming event")
-                    first_event = False
-                
-                # Update timer for next iteration
-                last_chunk_time = current_time
                 
                 # Get event type without logging every single one
                 event_type = getattr(event, 'type', 'unknown')
@@ -504,36 +495,22 @@ async def create_streaming_response_with_tools(
         request_params["top_p"] = top_p
     
     self.log_debug(f"Creating streaming response with tools using model {model}, tools: {tools}")
-    
+
     try:
+        # Determine operation type based on reasoning effort and context
+        operation_type = "text_high_reasoning" if reasoning_effort in ["high", "maximum"] else "text_normal"
+
         response = await self._safe_api_call(
             self.client.responses.create,
-            operation_type="general",
+            operation_type=operation_type,
             **request_params
         )
-        
+
         complete_text = ""
-        last_chunk_time = None  # Don't start timer until first event
-        first_event = True
-        
-        # Process streaming events
-        async for event in response:
+
+        # Process streaming events with timeout protection
+        async for event in self._safe_stream_iteration(response, operation_type):
             try:
-                current_time = time.time()
-                
-                # Only check timeout after first event has been received
-                if last_chunk_time is not None:
-                    time_since_last_chunk = current_time - last_chunk_time
-                    # Log if event took unusually long but don't error
-                    if time_since_last_chunk > self.stream_timeout_seconds:
-                        self.log_warning(f"Stream event took {time_since_last_chunk:.1f}s to arrive (timeout is {self.stream_timeout_seconds}s)")
-                elif first_event:
-                    # Log time to first event for monitoring
-                    self.log_debug("Received first streaming event")
-                    first_event = False
-                
-                # Update timer for next iteration
-                last_chunk_time = current_time
                 
                 # Get event type without logging every single one
                 event_type = getattr(event, 'type', 'unknown')
@@ -736,13 +713,11 @@ async def classify_intent(
         self.log_debug(f"Using model: {config.utility_model}, timeout: {self.client.timeout}s")
         
         # Use safe API call wrapper with intent-specific timeout
-        self.log_debug("[HANG_DEBUG] Starting intent classification API call")
         response = await self._safe_api_call(
             self.client.responses.create,
-            operation_type="intent",  # Uses min(30s, API_TIMEOUT_READ from .env)
+            operation_type="intent_classification",  # Uses 30s timeout
             **request_params
         )
-        self.log_debug("[HANG_DEBUG] Intent classification completed")
 
         self.log_debug(f"Response received from API at {time.strftime('%H:%M:%S')}")
         
@@ -793,10 +768,10 @@ async def classify_intent(
             time.sleep(wait_time)
 
             try:
-                # Retry the classification
+                # Retry the classification with shorter timeout
                 response = await self._safe_api_call(
                     self.client.responses.create,
-                    operation_type="intent",
+                    operation_type="intent_classification",
                     timeout_seconds=15,  # Shorter timeout for retries
                     **request_params
                 )
@@ -849,3 +824,217 @@ async def classify_intent(
         self.log_error(f"Error classifying intent: {e}")
         self.log_error(f"Exception type: {type(e).__name__}")
         return 'error'  # Return error instead of defaulting to text
+
+async def _create_text_response_with_timeout(
+    self,
+    messages: List[Dict[str, Any]],
+    model: Optional[str] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
+    system_prompt: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    verbosity: Optional[str] = None,
+    store: bool = False,
+    timeout_seconds: float = 60.0,
+) -> str:
+    """
+    Create a text response with custom timeout (for retry scenarios)
+
+    Args:
+        messages: List of message dictionaries
+        model: Model to use (defaults to config)
+        temperature: Sampling temperature
+        max_tokens: Maximum tokens in response
+        top_p: Nucleus sampling parameter (not supported by GPT-5 reasoning models)
+        system_prompt: System instructions
+        reasoning_effort: For GPT-5 models (minimal, low, medium, high)
+        verbosity: For GPT-5 models (low, medium, high)
+        store: Whether to store the response (default False for stateless)
+        timeout_seconds: Custom timeout for the API call
+
+    Returns:
+        Generated text response
+    """
+    model = model or config.gpt_model
+    temperature = temperature if temperature is not None else config.default_temperature
+    max_tokens = max_tokens or config.default_max_tokens
+    top_p = top_p if top_p is not None else config.default_top_p
+
+    # Build input for Responses API
+    input_messages = []
+
+    # Add system prompt if provided
+    if system_prompt:
+        input_messages.append({
+            "role": "developer",
+            "content": system_prompt
+        })
+
+    # Add conversation messages (filter out metadata - Responses API rejects unknown fields)
+    for msg in messages:
+        # Only include role and content for API
+        api_msg = {"role": msg["role"], "content": msg["content"]}
+        input_messages.append(api_msg)
+
+    # Build request parameters
+    request_params = {
+        "model": model,
+        "input": input_messages,
+        "temperature": temperature,
+        "max_output_tokens": max_tokens,
+        "store": store,
+    }
+
+    # Handle model-specific parameters
+    if model.startswith("gpt-5"):
+        # Check if it's a reasoning model (not chat model)
+        is_reasoning_model = "chat" not in model.lower()
+
+        if is_reasoning_model:
+            # GPT-5 reasoning models (nano, mini, full)
+            # Fixed temperature, supports reasoning_effort and verbosity
+            request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
+            reasoning_effort = reasoning_effort or config.default_reasoning_effort
+            request_params["reasoning"] = {"effort": reasoning_effort}
+            verbosity = verbosity or config.default_verbosity
+            request_params["text"] = {"verbosity": verbosity}
+        else:
+            # GPT-5 chat models - standard parameters only
+            # temperature and top_p work normally, no reasoning/verbosity
+            request_params["top_p"] = top_p
+    else:
+        # GPT-4 and other models - include top_p
+        request_params["top_p"] = top_p
+
+    self.log_debug(f"Creating text response with custom timeout {timeout_seconds}s, model {model}")
+
+    try:
+        # Determine operation type based on reasoning effort and context
+        operation_type = "text_high_reasoning" if reasoning_effort in ["high", "maximum"] else "text_normal"
+
+        # API call with custom timeout
+        response = await self._safe_api_call(
+            self.client.responses.create,
+            operation_type=operation_type,
+            timeout_seconds=timeout_seconds,
+            **request_params
+        )
+
+        # Extract text from response
+        output_text = ""
+        if response.output:
+            for item in response.output:
+                if hasattr(item, "content") and item.content:
+                    for content in item.content:
+                        if hasattr(content, "text"):
+                            output_text += content.text
+
+        self.log_info(f"Generated response with custom timeout: {len(output_text)} chars")
+        return output_text
+
+    except Exception as e:
+        self.log_error(f"Error creating text response with timeout: {e}", exc_info=True)
+        raise
+
+async def _create_text_response_with_tools_with_timeout(
+    self,
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    model: Optional[str] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
+    system_prompt: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    verbosity: Optional[str] = None,
+    store: bool = False,
+    timeout_seconds: float = 60.0
+) -> str:
+    """
+    Create text response with tools and custom timeout (for retry scenarios)
+
+    Args:
+        messages: Conversation messages
+        tools: List of tools to enable (e.g., [{"type": "web_search"}])
+        model: Model to use (defaults to config)
+        temperature: Sampling temperature
+        max_tokens: Maximum tokens to generate
+        top_p: Top-p sampling
+        system_prompt: System prompt to use
+        reasoning_effort: Reasoning effort for GPT-5 reasoning models
+        verbosity: Output verbosity for GPT-5 reasoning models
+        store: Whether to store the response
+        timeout_seconds: Custom timeout for the API call
+
+    Returns:
+        Generated text response
+    """
+    model = model or config.gpt_model
+    temperature = temperature if temperature is not None else config.default_temperature
+    max_tokens = max_tokens or config.default_max_tokens
+    top_p = top_p if top_p is not None else config.default_top_p
+
+    # Build request parameters
+    request_params = {
+        "model": model,
+        "input": [{"role": msg["role"], "content": msg["content"]} for msg in messages],
+        "tools": tools,
+        "temperature": temperature,
+        "max_output_tokens": max_tokens,
+        "store": store,
+    }
+
+    # Add system prompt if provided
+    if system_prompt:
+        request_params["instructions"] = system_prompt
+
+    # Handle model-specific parameters
+    if model.startswith("gpt-5"):
+        # Check if it's a reasoning model (not chat model)
+        is_reasoning_model = "chat" not in model.lower()
+
+        if is_reasoning_model:
+            # GPT-5 reasoning models (nano, mini, full)
+            # Fixed temperature, supports reasoning_effort and verbosity
+            request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
+            reasoning_effort = reasoning_effort or config.default_reasoning_effort
+            request_params["reasoning"] = {"effort": reasoning_effort}
+            verbosity = verbosity or config.default_verbosity
+            request_params["text"] = {"verbosity": verbosity}
+        else:
+            # GPT-5 chat models - standard parameters only
+            request_params["top_p"] = top_p
+    else:
+        # GPT-4 and other models - include top_p
+        request_params["top_p"] = top_p
+
+    self.log_debug(f"Creating text response with tools and custom timeout {timeout_seconds}s, model {model}")
+
+    try:
+        # Determine operation type based on reasoning effort and context
+        operation_type = "text_high_reasoning" if reasoning_effort in ["high", "maximum"] else "text_normal"
+
+        # API call with custom timeout
+        response = await self._safe_api_call(
+            self.client.responses.create,
+            operation_type=operation_type,
+            timeout_seconds=timeout_seconds,
+            **request_params
+        )
+
+        # Extract text from response
+        output_text = ""
+        if response.output:
+            for item in response.output:
+                if hasattr(item, "content") and item.content:
+                    for content in item.content:
+                        if hasattr(content, "text"):
+                            output_text += content.text
+
+        self.log_info(f"Generated response with tools and custom timeout: {len(output_text)} chars")
+        return output_text
+
+    except Exception as e:
+        self.log_error(f"Error creating response with tools and timeout: {e}", exc_info=True)
+        raise

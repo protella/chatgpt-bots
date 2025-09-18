@@ -454,7 +454,7 @@ MIME Type: {mimetype}
             self.log_error(f"Error during async cleanup: {e}")
             # Don't let cleanup errors affect the main flow
     
-    def process_message(self, message: Message, client: BaseClient, thinking_id: Optional[str] = None) -> Optional[Response]:
+    async def process_message(self, message: Message, client: BaseClient, thinking_id: Optional[str] = None) -> Optional[Response]:
         """
         Process a message and return a response
         
@@ -480,7 +480,6 @@ MIME Type: {mimetype}
         request_start_time = time.time()
 
         # Check if thread is busy
-        self.log_debug(f"[HANG_DEBUG] About to acquire thread lock for {thread_key}")
         lock_acquired = False
         try:
             lock_acquired = self.thread_manager.acquire_thread_lock(
@@ -488,9 +487,8 @@ MIME Type: {mimetype}
             message.channel_id,
                 timeout=0  # Don't wait, return immediately if busy
             )
-            self.log_debug(f"[HANG_DEBUG] Lock acquisition result: {lock_acquired}")
         except Exception as lock_error:
-            self.log_error(f"[HANG_DEBUG] Lock acquisition failed with error: {lock_error}", exc_info=True)
+            self.log_error(f"Lock acquisition failed with error: {lock_error}", exc_info=True)
             raise
 
         if not lock_acquired:
@@ -507,7 +505,6 @@ MIME Type: {mimetype}
         
         try:
             # Get or rebuild thread state
-            self.log_debug(f"[HANG_DEBUG] Lock acquired, getting thread state for {thread_key}")
             thread_state = self._get_or_rebuild_thread_state(
                 message,
                 client,
@@ -708,7 +705,7 @@ MIME Type: {mimetype}
                 
                 # Use already-trimmed thread state for intent classification
                 # Only mark as having attachments if there are actual image uploads
-                intent = self.openai_client.classify_intent(
+                intent = await self.openai_client.classify_intent(
                     trimmed_history_for_intent,  # Documents truncated for classification
                     combined_context,
                     has_attached_images=len(image_inputs) > 0
@@ -797,7 +794,7 @@ MIME Type: {mimetype}
                     
                     # Only mark as having attachments if there are actual image uploads
                     # Documents shouldn't affect image intent classification
-                    intent = self.openai_client.classify_intent(
+                    intent = await self.openai_client.classify_intent(
                         trimmed_history_for_intent,  # Trimmed conversation history (without current)
                         intent_text,  # Current message (potentially trimmed/summarized)
                         has_attached_images=len(image_inputs) > 0
@@ -870,7 +867,7 @@ MIME Type: {mimetype}
                     trimmed_history_for_intent.append(msg_copy)
                 
                 # Only mark as having attachments if there are actual image uploads
-                intent = self.openai_client.classify_intent(
+                intent = await self.openai_client.classify_intent(
                     trimmed_history_for_intent,  # Trimmed conversation history (without current)
                     intent_text,  # Current message (potentially trimmed/summarized)
                     has_attached_images=False  # Documents alone don't count as image attachments
@@ -975,7 +972,7 @@ MIME Type: {mimetype}
                         self._update_status(client, message.channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
                         
                         # Documents are already in enhanced_text, just process as text with vision intent
-                        response = self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0)
+                        response = await self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0)
                     elif image_inputs and document_inputs:
                         # Both images and documents - use two-call approach
                         total_files = len(image_inputs) + len(document_inputs)
@@ -1009,7 +1006,7 @@ MIME Type: {mimetype}
                         message
                     )
             else:
-                response = self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0)
+                response = await self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0)
             
             # DEBUG: Print conversation history after processing (with truncated content)
             import json
@@ -1084,6 +1081,7 @@ MIME Type: {mimetype}
         except TimeoutError as e:
             # Handle timeout errors gracefully without stack trace
             elapsed = time.time() - request_start_time
+
             # Try to get token count even on error
             try:
                 error_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages) if 'thread_state' in locals() else 0
@@ -1091,7 +1089,108 @@ MIME Type: {mimetype}
             except Exception:
                 token_info = ""
 
-            self.log_warning(f"Request timeout after {elapsed:.2f} seconds for thread {thread_key}: {e}")
+            # Get the operation type that timed out
+            operation_type = getattr(e, 'operation_type', 'unknown')
+            self.log_warning(f"Request timeout after {elapsed:.2f} seconds for thread {thread_key} (operation: {operation_type}): {e}")
+
+            # Check if we should retry (only for text/intent operations, not image/vision operations)
+            already_retried = getattr(e, 'already_retried', False)
+            should_retry = (
+                operation_type in ['text_normal', 'text_high_reasoning', 'intent_classification']
+                and not already_retried
+                and 'intent' not in locals()  # Don't retry if we're already in intent classification
+            )
+
+            if should_retry:
+                # Mark as retry attempt to prevent infinite loops
+                e.already_retried = True
+
+                # Update status to show retry
+                if thinking_id and hasattr(client, 'update_message'):
+                    retry_msg = "OpenAI is slow to respond. Retrying with shorter timeout..."
+                    try:
+                        self._update_status(client, message.channel_id, thinking_id, retry_msg, emoji="⏳")
+                        self.log_debug("Updated thinking message to show retry attempt")
+                    except Exception as update_error:
+                        self.log_error(f"Failed to update thinking message for retry: {update_error}")
+
+                self.log_info(f"Retrying {operation_type} operation with 60s timeout...")
+
+                try:
+                    # Retry the operation based on what failed
+                    if operation_type == 'intent_classification':
+                        # We need to re-determine which variables to use for retry
+                        # The classification could have failed with images or without images
+                        if 'image_inputs' in locals() and image_inputs:
+                            # There were uploaded images - use the appropriate variables
+                            retry_intent = await self.openai_client.classify_intent(
+                                messages=trimmed_history_for_intent if 'trimmed_history_for_intent' in locals() else [],
+                                last_user_message=intent_text if 'intent_text' in locals() else str(user_content),
+                                has_attached_images=len(image_inputs) > 0
+                            )
+                        else:
+                            # No uploaded images - use standard variables
+                            retry_intent = await self.openai_client.classify_intent(
+                                messages=trimmed_history_for_intent if 'trimmed_history_for_intent' in locals() else [],
+                                last_user_message=intent_text if 'intent_text' in locals() else str(user_content),
+                                has_attached_images=False
+                            )
+
+                        # Continue with the classification result
+                        if retry_intent == "error":
+                            raise TimeoutError("Intent classification failed after retry")
+
+                        # Use the retry result and continue processing
+                        intent = retry_intent
+
+                        # Process based on intent (re-enter the main flow)
+                        if intent in ["new_image", "ambiguous_image"]:
+                            if 'image_inputs' in locals() and image_inputs:
+                                # Override with edit for uploaded images
+                                intent = "edit_image"
+
+                        if intent == "new_image":
+                            response = self._handle_image_generation(
+                                enhanced_text if 'enhanced_text' in locals() else user_content,
+                                thread_state, client, message.channel_id, thinking_id, message
+                            )
+                        elif intent == "edit_image":
+                            response = self._handle_image_edit(
+                                enhanced_text if 'enhanced_text' in locals() else user_content,
+                                image_inputs if 'image_inputs' in locals() else [],
+                                thread_state, client, message.channel_id, thinking_id, message
+                            )
+                        elif intent == "vision":
+                            response = self._handle_vision_analysis(
+                                enhanced_text if 'enhanced_text' in locals() else user_content,
+                                image_inputs if 'image_inputs' in locals() else [],
+                                thread_state, thread_state.attachments if hasattr(thread_state, 'attachments') else [],
+                                client, message.channel_id, thinking_id, message
+                            )
+                        else:
+                            response = await self._handle_text_response(
+                                enhanced_text if 'enhanced_text' in locals() else user_content,
+                                thread_state, client, message, thinking_id, retry_count=1
+                            )
+
+                        self.log_info(f"Retry successful for {operation_type}")
+                        return response
+
+                    elif operation_type in ['text_normal', 'text_high_reasoning']:
+                        # Retry text response with shorter timeout and retry_count=1
+                        response = await self._handle_text_response(
+                            enhanced_text if 'enhanced_text' in locals() else user_content,
+                            thread_state, client, message, thinking_id, retry_count=1
+                        )
+                        self.log_info(f"Retry successful for {operation_type}")
+                        return response
+
+                except TimeoutError as retry_error:
+                    self.log_warning(f"Retry also failed for {operation_type}: {retry_error}")
+                    # Continue to error handling below
+                except Exception as retry_error:
+                    self.log_error(f"Retry failed with unexpected error for {operation_type}: {retry_error}")
+                    # Continue to error handling below
 
             self.log_info("")
             self.log_info("="*100)
@@ -1099,7 +1198,7 @@ MIME Type: {mimetype}
             self.log_info("="*100)
             self.log_info("")
 
-            # Update thinking message to show timeout
+            # Update thinking message to show final timeout
             if thinking_id and hasattr(client, 'update_message'):
                 timeout_msg = "OpenAI is not responding. Try again shortly."
                 try:
@@ -1112,11 +1211,28 @@ MIME Type: {mimetype}
             if 'thread_state' in locals() and thread_state:
                 thread_state.had_timeout = True
 
-            error_message = (
-                "⏱️ **OpenAI Timeout**\n\n"
-                "OpenAI's API is not responding (timed out after 5 minutes).\n\n"
-                "This is an issue on OpenAI's end. Please try again in a moment."
-            )
+            # Build operation-specific error message
+            if operation_type in ['image_generation', 'image_edit', 'vision_analysis']:
+                error_message = (
+                    "⏱️ **OpenAI Image Service Timeout**\n\n"
+                    "OpenAI's image processing service is taking too long to respond (over 5 minutes).\n"
+                    "This is unusual and likely an issue on OpenAI's end.\n\n"
+                    "Please try your request again."
+                )
+            elif operation_type == 'intent_classification':
+                error_message = (
+                    "⏱️ **OpenAI Service Issue**\n\n"
+                    "OpenAI's service is not responding to basic requests.\n"
+                    "There may be an outage on OpenAI's end.\n\n"
+                    "Please try again shortly."
+                )
+            else:
+                error_message = (
+                    "⏱️ **OpenAI Response Timeout**\n\n"
+                    "OpenAI's text generation service is not responding.\n"
+                    "This is an issue on OpenAI's end.\n\n"
+                    "Please try again in a moment."
+                )
 
             return Response(
                 type="error",
@@ -1196,15 +1312,13 @@ MIME Type: {mimetype}
         finally:
             # Always release the thread lock, even on timeout
             try:
-                self.log_debug(f"[HANG_DEBUG] About to release thread lock for {thread_key}")
                 self.thread_manager.release_thread_lock(
                     message.thread_id,
                     message.channel_id
                 )
-                self.log_debug(f"[HANG_DEBUG] Thread lock successfully released for {thread_key}")
             except Exception as lock_error:
                 # Even if release fails, log it but don't crash
-                self.log_error(f"[HANG_DEBUG] Error releasing thread lock for {thread_key}: {lock_error}", exc_info=True)
+                self.log_error(f"Error releasing thread lock for {thread_key}: {lock_error}", exc_info=True)
     
     def _inject_image_analyses(self, messages: List[Dict], thread_state) -> List[Dict]:
         """Inject stored image analyses into conversation for context"""
@@ -2408,7 +2522,7 @@ MIME Type: {mimetype}
         self._update_status(client, channel_id, thinking_id, 
                           "Generating image. This may take a minute, please wait...",
                           emoji=config.circle_loader_emoji)
-    def _handle_text_response(self, user_content: Any, thread_state, client: BaseClient,
+    async def _handle_text_response(self, user_content: Any, thread_state, client: BaseClient,
                               message: Message, thinking_id: Optional[str] = None,
                               attachment_urls: Optional[List[str]] = None,
                               retry_count: int = 0) -> Response:
@@ -2492,33 +2606,65 @@ MIME Type: {mimetype}
         
         # Check if web search should be available (respecting user prefs)
         web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
+
+        # Determine timeout based on retry attempt
+        retry_timeout = 60.0 if retry_count > 0 else None
+
         if web_search_enabled:
             # Use web search model if specified, otherwise use thread config model
             model = config.web_search_model or thread_config["model"]
-            
+
             # Generate response with web search tool available
-            response_text = self.openai_client.create_text_response_with_tools(
-                messages=messages_for_api,
-                tools=[{"type": "web_search"}],
-                model=model,
-                temperature=thread_config["temperature"],
-                max_tokens=thread_config["max_tokens"],
-                system_prompt=system_prompt,
-                reasoning_effort=thread_config.get("reasoning_effort"),
-                verbosity=thread_config.get("verbosity"),
-                store=False  # Match the existing behavior
-            )
+            if retry_timeout:
+                # Use shorter timeout for retry via direct _safe_api_call
+                response_text = await self.openai_client._create_text_response_with_tools_with_timeout(
+                    messages=messages_for_api,
+                    tools=[{"type": "web_search"}],
+                    model=model,
+                    temperature=thread_config["temperature"],
+                    max_tokens=thread_config["max_tokens"],
+                    system_prompt=system_prompt,
+                    reasoning_effort=thread_config.get("reasoning_effort"),
+                    verbosity=thread_config.get("verbosity"),
+                    store=False,
+                    timeout_seconds=retry_timeout
+                )
+            else:
+                response_text = await self.openai_client.create_text_response_with_tools(
+                    messages=messages_for_api,
+                    tools=[{"type": "web_search"}],
+                    model=model,
+                    temperature=thread_config["temperature"],
+                    max_tokens=thread_config["max_tokens"],
+                    system_prompt=system_prompt,
+                    reasoning_effort=thread_config.get("reasoning_effort"),
+                    verbosity=thread_config.get("verbosity"),
+                    store=False  # Match the existing behavior
+                )
         else:
             # Generate response without tools
-            response_text = self.openai_client.create_text_response(
-                messages=messages_for_api,
-                model=thread_config["model"],
-                temperature=thread_config["temperature"],
-                max_tokens=thread_config["max_tokens"],
-                system_prompt=system_prompt,
-                reasoning_effort=thread_config.get("reasoning_effort"),
-                verbosity=thread_config.get("verbosity")
-            )
+            if retry_timeout:
+                # Use shorter timeout for retry via direct _safe_api_call
+                response_text = await self.openai_client._create_text_response_with_timeout(
+                    messages=messages_for_api,
+                    model=thread_config["model"],
+                    temperature=thread_config["temperature"],
+                    max_tokens=thread_config["max_tokens"],
+                    system_prompt=system_prompt,
+                    reasoning_effort=thread_config.get("reasoning_effort"),
+                    verbosity=thread_config.get("verbosity"),
+                    timeout_seconds=retry_timeout
+                )
+            else:
+                response_text = await self.openai_client.create_text_response(
+                    messages=messages_for_api,
+                    model=thread_config["model"],
+                    temperature=thread_config["temperature"],
+                    max_tokens=thread_config["max_tokens"],
+                    system_prompt=system_prompt,
+                    reasoning_effort=thread_config.get("reasoning_effort"),
+                    verbosity=thread_config.get("verbosity")
+                )
         
         # Check if response used web search and add citation note
         if web_search_enabled:

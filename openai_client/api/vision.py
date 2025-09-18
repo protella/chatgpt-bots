@@ -57,7 +57,7 @@ async def _enhance_vision_prompt(
 
         response = await self._safe_api_call(
             self.client.responses.create,
-            operation_type="general",
+            operation_type="prompt_enhancement",
             **request_params,
         )
 
@@ -156,12 +156,12 @@ async def analyze_images(
             output_text = ""
             stream = await self._safe_api_call(
                 self.client.responses.create,
-                operation_type="general",
+                operation_type="vision_analysis",
                 **request_params,
             )
 
-            # Process stream events (similar to create_streaming_response)
-            async for event in stream:
+            # Process stream events with timeout protection
+            async for event in self._safe_stream_iteration(stream, "vision_analysis"):
                 try:
                     # Get event type
                     event_type = getattr(event, "type", "unknown")
@@ -221,10 +221,9 @@ async def analyze_images(
                 request_params["text"] = {"verbosity": config.analysis_verbosity}
 
             # API call with enforced timeout wrapper
-            self.log_debug(f"Calling analyze_images API with {config.api_timeout_read}s timeout")
             response = await self._safe_api_call(
                 self.client.responses.create,
-                operation_type="general",
+                operation_type="vision_analysis",
                 **request_params,
             )
 
