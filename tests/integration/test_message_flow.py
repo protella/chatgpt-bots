@@ -6,7 +6,7 @@ import pytest
 import asyncio
 import time
 from unittest.mock import MagicMock, AsyncMock, patch, Mock
-from message_processor import MessageProcessor
+from message_processor.base import MessageProcessor
 from base_client import Message, Response
 from thread_manager import ThreadStateManager
 from openai_client import OpenAIClient

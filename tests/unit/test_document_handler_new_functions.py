@@ -321,7 +321,7 @@ class TestSlackFileURLExtraction:
     
     def test_extract_slack_file_urls_workspace_specific(self):
         """Test extraction of workspace-specific Slack file URLs"""
-        from message_processor import MessageProcessor
+        from message_processor.base import MessageProcessor
         
         processor = MessageProcessor()
         
@@ -334,7 +334,7 @@ class TestSlackFileURLExtraction:
     
     def test_extract_slack_file_urls_generic(self):
         """Test extraction of generic Slack file URLs"""
-        from message_processor import MessageProcessor
+        from message_processor.base import MessageProcessor
         
         processor = MessageProcessor()
         
@@ -347,7 +347,7 @@ class TestSlackFileURLExtraction:
     
     def test_extract_slack_file_urls_multiple(self):
         """Test extraction of multiple Slack file URLs"""
-        from message_processor import MessageProcessor
+        from message_processor.base import MessageProcessor
         
         processor = MessageProcessor()
         
@@ -364,7 +364,7 @@ class TestSlackFileURLExtraction:
     
     def test_extract_slack_file_urls_no_angle_brackets(self):
         """Test extraction without angle brackets"""
-        from message_processor import MessageProcessor
+        from message_processor.base import MessageProcessor
         
         processor = MessageProcessor()
         
@@ -377,7 +377,7 @@ class TestSlackFileURLExtraction:
     
     def test_extract_slack_file_urls_dedupe(self):
         """Test deduplication of URLs"""
-        from message_processor import MessageProcessor
+        from message_processor.base import MessageProcessor
         
         processor = MessageProcessor()
         

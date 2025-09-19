@@ -686,7 +686,110 @@ class MessageProcessor(ThreadManagementMixin,
             except Exception:
                 token_info = ""
 
-            self.log_warning(f"Request timeout after {elapsed:.2f} seconds for thread {thread_key}: {e}")
+            # Get the operation type that timed out
+            operation_type = getattr(e, 'operation_type', 'unknown')
+            self.log_warning(f"Request timeout after {elapsed:.2f} seconds for thread {thread_key} (operation: {operation_type}): {e}")
+
+            # Check if we should retry (only for text/intent operations, not image/vision operations)
+            already_retried = getattr(e, 'already_retried', False)
+            should_retry = (
+                operation_type in ['text_normal', 'text_high_reasoning', 'intent_classification']
+                and not already_retried
+                and 'intent' not in locals()  # Don't retry if we're already in intent classification
+            )
+
+            if should_retry:
+                # Mark as retry attempt to prevent infinite loops
+                e.already_retried = True
+
+                # Update status to show retry
+                if thinking_id and hasattr(client, 'update_message'):
+                    retry_msg = "OpenAI is slow to respond. Retrying with shorter timeout..."
+                    try:
+                        self._update_status(client, message.channel_id, thinking_id, retry_msg, emoji="⏳")
+                        self.log_debug("Updated thinking message to show retry attempt")
+                    except Exception as update_error:
+                        self.log_error(f"Failed to update thinking message for retry: {update_error}")
+
+                self.log_info(f"Retrying {operation_type} operation with 60s timeout...")
+
+                try:
+                    # Retry the operation based on what failed
+                    if operation_type == 'intent_classification':
+                        # Re-run intent classification
+                        if 'image_inputs' in locals() and image_inputs:
+                            retry_intent = await self.openai_client.classify_intent(
+                                messages=trimmed_history_for_intent if 'trimmed_history_for_intent' in locals() else [],
+                                last_user_message=intent_text if 'intent_text' in locals() else str(user_content),
+                                has_attached_images=len(image_inputs) > 0
+                            )
+                        else:
+                            retry_intent = await self.openai_client.classify_intent(
+                                messages=trimmed_history_for_intent if 'trimmed_history_for_intent' in locals() else [],
+                                last_user_message=intent_text if 'intent_text' in locals() else str(user_content),
+                                has_attached_images=False
+                            )
+
+                        # Continue with the classification result
+                        if retry_intent == "error":
+                            raise TimeoutError("Intent classification failed after retry")
+
+                        # Use the retry result and continue processing
+                        intent = retry_intent
+
+                        # Process based on intent (re-enter the main flow)
+                        if intent in ["new_image", "ambiguous_image"]:
+                            if 'image_inputs' in locals() and image_inputs:
+                                intent = "edit_image"
+
+                        if intent == "new_image":
+                            response = await self._handle_image_generation(
+                                enhanced_text if 'enhanced_text' in locals() else user_content,
+                                thread_state, client, message.channel_id, thinking_id, message
+                            )
+                        elif intent == "edit_image":
+                            response = await self._handle_image_edit(
+                                enhanced_text if 'enhanced_text' in locals() else user_content,
+                                image_inputs if 'image_inputs' in locals() else [],
+                                thread_state, client, message.channel_id, thinking_id,
+                                attachment_urls if 'attachment_urls' in locals() else None,
+                                message
+                            )
+                        elif intent == "vision":
+                            response = await self._handle_vision_analysis(
+                                enhanced_text if 'enhanced_text' in locals() else user_content,
+                                image_inputs if 'image_inputs' in locals() else [],
+                                thread_state, thread_state.attachments if hasattr(thread_state, 'attachments') else [],
+                                client, message.channel_id, thinking_id, message
+                            )
+                        else:
+                            response = await self._handle_text_response(
+                                enhanced_text if 'enhanced_text' in locals() else user_content,
+                                thread_state, client, message, thinking_id,
+                                attachment_urls if 'attachment_urls' in locals() else None,
+                                retry_count=1
+                            )
+
+                        self.log_info(f"Retry successful for {operation_type}")
+                        return response
+
+                    elif operation_type in ['text_normal', 'text_high_reasoning']:
+                        # Retry text response with shorter timeout and retry_count=1
+                        response = await self._handle_text_response(
+                            enhanced_text if 'enhanced_text' in locals() else user_content,
+                            thread_state, client, message, thinking_id,
+                            attachment_urls if 'attachment_urls' in locals() else None,
+                            retry_count=1
+                        )
+                        self.log_info(f"Retry successful for {operation_type}")
+                        return response
+
+                except TimeoutError as retry_error:
+                    self.log_warning(f"Retry also failed for {operation_type}: {retry_error}")
+                    # Continue to error handling below
+                except Exception as retry_error:
+                    self.log_error(f"Retry failed with unexpected error for {operation_type}: {retry_error}")
+                    # Continue to error handling below
 
             self.log_info("")
             self.log_info("="*100)
@@ -694,11 +797,11 @@ class MessageProcessor(ThreadManagementMixin,
             self.log_info("="*100)
             self.log_info("")
 
-            # Update thinking message to show timeout
+            # Update thinking message to show final timeout
             if thinking_id and hasattr(client, 'update_message'):
-                timeout_msg = f"{config.error_emoji} OpenAI is not responding. Try again shortly."
+                timeout_msg = "OpenAI is not responding. Try again shortly."
                 try:
-                    await client.update_message(message.channel_id, thinking_id, timeout_msg)
+                    self._update_status(client, message.channel_id, thinking_id, timeout_msg, emoji=config.error_emoji)
                     self.log_debug("Updated thinking message to show timeout")
                 except Exception as update_error:
                     self.log_error(f"Failed to update thinking message: {update_error}")
@@ -708,9 +811,9 @@ class MessageProcessor(ThreadManagementMixin,
                 thread_state.had_timeout = True
 
             error_message = (
-                "⏱️ **OpenAI Timeout**\n\n"
-                "OpenAI's API is not responding (timed out after 5 minutes).\n\n"
-                "This is an issue on OpenAI's end. Please try again in a moment."
+                "⏱️ **Taking Too Long**\n\n"
+                "OpenAI is being slow right now.\n\n"
+                "Please try again in a moment."
             )
 
             return Response(

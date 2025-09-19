@@ -9,7 +9,7 @@ import os
 from unittest.mock import Mock, patch
 from openai_client import OpenAIClient, ImageData
 from config import BotConfig
-from message_processor import MessageProcessor
+from message_processor.base import MessageProcessor
 from base_client import Message
 
 

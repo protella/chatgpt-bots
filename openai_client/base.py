@@ -92,7 +92,7 @@ class OpenAIClient(LoggerMixin):
 
     async def _safe_stream_iteration(self, stream, operation_type: str = "streaming"):
         """
-        Safely iterate over a stream with proper timeout protection.
+        Safely iterate over a stream with activity-based timeout protection.
 
         Args:
             stream: The async stream to iterate over
@@ -102,66 +102,85 @@ class OpenAIClient(LoggerMixin):
             Events from the stream
 
         Raises:
-            asyncio.TimeoutError: If stream times out (overall duration exceeded)
+            asyncio.TimeoutError: If no activity for timeout period
         """
         start_time = asyncio.get_event_loop().time()
-        max_duration = self._get_operation_timeout(operation_type)
-        # Use chunk timeout from config, but warn after 30s
-        chunk_warning_threshold = 30.0  # Warn after 30 seconds of no chunks
-        chunk_timeout = config.api_timeout_streaming_chunk  # Use config value from .env
-        last_chunk_time = None
+
+        # Get the appropriate timeout for this operation type
+        # This will be API_TIMEOUT_STREAMING_CHUNK (150s) for text operations
+        # or API_TIMEOUT_READ (300s) for image/vision operations
+        activity_timeout = self._get_operation_timeout(operation_type)
+
+        # Warning threshold for long gaps between chunks
+        chunk_warning_threshold = 30.0  # Warn after 30 seconds of no activity
+
+        last_activity_time = start_time
         first_event = True
         warned_about_delay = False  # Track if we've warned about this delay
+        total_events = 0
 
-        self.log_debug(f"Starting stream iteration with max_duration={max_duration}s, chunk_timeout={chunk_timeout}s")
+        self.log_debug(f"Starting stream iteration with activity-based timeout={activity_timeout}s for {operation_type}")
 
         while True:
             try:
-                # Check overall timeout
-                elapsed = asyncio.get_event_loop().time() - start_time
-                if elapsed > max_duration:
-                    error_msg = f"Stream exceeded maximum duration of {max_duration}s (elapsed: {elapsed:.2f}s)"
-                    self.log_error(error_msg)
-                    raise asyncio.TimeoutError(error_msg)
+                # Try to get next event with activity timeout
+                # This timeout resets on each activity
+                time_since_activity = asyncio.get_event_loop().time() - last_activity_time
+                remaining_timeout = max(activity_timeout - time_since_activity, 1.0)
 
-                # Try to get next event with chunk timeout
-                # All operations use the same chunk timeout (2.5 minutes)
                 try:
                     event = await asyncio.wait_for(
                         stream.__anext__(),
-                        timeout=chunk_timeout
+                        timeout=remaining_timeout
                     )
 
-                    # Track timing for monitoring
+                    # We got activity! Reset the activity timer
                     current_time = asyncio.get_event_loop().time()
-                    if last_chunk_time is not None:
-                        time_since_last_chunk = current_time - last_chunk_time
-                        if time_since_last_chunk > chunk_warning_threshold:
-                            self.log_debug(
-                                f"Stream chunk received after {time_since_last_chunk:.1f}s"
-                            )
+                    time_since_last = current_time - last_activity_time
+
+                    # Log if there was a significant gap
+                    if time_since_last > chunk_warning_threshold:
+                        self.log_debug(
+                            f"Stream event received after {time_since_last:.1f}s gap (event #{total_events + 1})"
+                        )
                     elif first_event:
                         self.log_debug("Received first streaming event")
                         first_event = False
 
-                    last_chunk_time = current_time
-                    # Reset warning flag since we got a chunk
-                    warned_about_delay = False
+                    last_activity_time = current_time
+                    warned_about_delay = False  # Reset warning flag on activity
+                    total_events += 1
+
                     yield event
 
                 except asyncio.TimeoutError:
-                    # Chunk timeout - only warn, never fail
-                    time_since_last = asyncio.get_event_loop().time() - (last_chunk_time or start_time)
+                    # Check if we've exceeded the activity timeout
+                    time_since_activity = asyncio.get_event_loop().time() - last_activity_time
 
-                    # Warn after 30 seconds of no chunks (only once per delay)
-                    if time_since_last >= chunk_warning_threshold and not warned_about_delay:
+                    if time_since_activity >= activity_timeout:
+                        # No activity for the full timeout period - this is a real timeout
+                        elapsed_total = asyncio.get_event_loop().time() - start_time
+                        error_msg = (
+                            f"Stream timeout: No activity for {activity_timeout}s "
+                            f"(total elapsed: {elapsed_total:.1f}s, events received: {total_events})"
+                        )
+                        self.log_error(error_msg)
+                        # Create TimeoutError with operation_type for retry logic
+                        timeout_error = asyncio.TimeoutError(error_msg)
+                        timeout_error.operation_type = operation_type
+                        raise timeout_error
+
+                    # Still within timeout but worth a warning
+                    if time_since_activity >= chunk_warning_threshold and not warned_about_delay:
+                        elapsed_total = asyncio.get_event_loop().time() - start_time
                         self.log_warning(
-                            f"Stream chunk warning - no data received for {time_since_last:.1f}s. "
-                            f"Continuing to wait (will timeout at {max_duration}s total)..."
+                            f"Stream activity warning: No data for {time_since_activity:.1f}s "
+                            f"(will timeout after {activity_timeout}s of inactivity, "
+                            f"total elapsed: {elapsed_total:.1f}s, events so far: {total_events})"
                         )
                         warned_about_delay = True
 
-                    # Always continue waiting - never fail on chunk timeout
+                    # Continue waiting for more activity
                     continue
 
             except StopAsyncIteration:

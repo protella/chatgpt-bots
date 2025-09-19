@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch, Mock, call, PropertyMock
 from datetime import datetime
 from dataclasses import dataclass
 from typing import List, Dict, Any
-from message_processor import MessageProcessor
+from message_processor.base import MessageProcessor
 from openai_client import OpenAIClient
 from slack_client import SlackBot
 import asyncio
