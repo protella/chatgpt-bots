@@ -3081,7 +3081,7 @@ MIME Type: {mimetype}
                     try:
                         # Handle empty response
                         if not response_text:
-                            response_text = "I apologize, but I wasn't able to generate a response. Please try again."
+                            response_text = "I apologize, but I couldn't generate a response. OpenAI either didn't respond or returned an empty response. Please try again."
                             self.log_warning("Empty response detected, using fallback message")
                         
                         # Check if message is too long for a single update

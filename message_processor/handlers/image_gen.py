@@ -89,10 +89,12 @@ class ImageGenerationMixin:
                 stream_callback=enhancement_callback
             )
             
-            # Show the final enhanced prompt
+            # Show the final enhanced prompt (without loading indicator)
             if enhanced_prompt and thinking_id:
                 enhanced_text = f"*Enhanced Prompt:* ✨ _{enhanced_prompt}_"
-                self._update_message_streaming_sync(client, channel_id, thinking_id, enhanced_text)
+                result = self._update_message_streaming_sync(client, channel_id, thinking_id, enhanced_text)
+                if not result["success"] and result.get("rate_limited"):
+                    self.log_debug("Couldn't remove loading indicator from enhanced prompt due to rate limit")
                 # Mark that we should NOT touch this message again
                 response_metadata["prompt_message_id"] = thinking_id
             
@@ -104,6 +106,17 @@ class ImageGenerationMixin:
             # Track the status message ID
             response_metadata["status_message_id"] = generating_id
             
+            # Start progress updater for image generation
+            progress_task = None
+            try:
+                progress_task = await self._start_progress_updater_async(
+                    client, channel_id, generating_id, "image generation", emoji=config.circle_loader_emoji
+                )
+                self.log_debug("Started progress updater for image generation")
+            except Exception as e:
+                self.log_warning(f"Failed to start progress updater: {e}")
+                progress_task = None
+
             # Generate image with already-enhanced prompt
             try:
                 image_data = await self.openai_client.generate_image(
@@ -113,7 +126,18 @@ class ImageGenerationMixin:
                     enhance_prompt=False,  # Already enhanced!
                     conversation_history=None  # Not needed since we enhanced already
                 )
+
+                # Cancel progress updater if still running
+                if progress_task and not progress_task.done():
+                    progress_task.cancel()
+                    self.log_debug("Cancelled progress updater after image generation")
+
             except Exception as e:
+                # Cancel progress updater on error
+                if progress_task and not progress_task.done():
+                    progress_task.cancel()
+                    self.log_debug("Cancelled progress updater due to error")
+
                 error_str = str(e)
                 if "moderation_blocked" in error_str or "safety system" in error_str or "content policy" in error_str.lower():
                     # Clean up status message

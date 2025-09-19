@@ -133,12 +133,29 @@ class ImageEditMixin:
                     # Analyze the image first
                     self.log_debug("Analyzing image for context")
                     self._update_status(client, channel_id, thinking_id, "Analyzing the image...", emoji=config.analyze_emoji)
-                    
-                    image_description = await self.openai_client.analyze_images(
-                        images=[base64_data],
-                        question=IMAGE_ANALYSIS_PROMPT,
-                        detail="high"
-                    )
+
+                    # Start progress updater for analysis
+                    progress_task = None
+                    try:
+                        progress_task = await self._start_progress_updater_async(
+                            client, channel_id, thinking_id, "image analysis", emoji=config.analyze_emoji
+                        )
+                        self.log_debug("Started progress updater for image analysis")
+                    except Exception as e:
+                        self.log_warning(f"Failed to start progress updater: {e}")
+                        progress_task = None
+
+                    try:
+                        image_description = await self.openai_client.analyze_images(
+                            images=[base64_data],
+                            question=IMAGE_ANALYSIS_PROMPT,
+                            detail="high"
+                        )
+                    finally:
+                        # Cancel progress updater
+                        if progress_task and not progress_task.done():
+                            progress_task.cancel()
+                            self.log_debug("Cancelled progress updater after image analysis")
                     
                     # Prepare for edit
                     self.log_info(f"Editing existing image with request: {text}")
@@ -209,10 +226,12 @@ class ImageEditMixin:
                             stream_callback=enhancement_callback
                         )
                         
-                        # Show the final enhanced prompt
+                        # Show the final enhanced prompt (without loading indicator)
                         if enhanced_edit_prompt and thinking_id:
                             enhanced_text = f"*Enhanced Prompt:* ✨ _{enhanced_edit_prompt}_"
-                            self._update_message_streaming_sync(client, channel_id, thinking_id, enhanced_text)
+                            result = self._update_message_streaming_sync(client, channel_id, thinking_id, enhanced_text)
+                            if not result["success"] and result.get("rate_limited"):
+                                self.log_debug("Couldn't remove loading indicator from enhanced prompt due to rate limit")
                             # Mark that we should NOT touch this message again
                             response_metadata["prompt_message_id"] = thinking_id
                         
@@ -401,6 +420,17 @@ class ImageEditMixin:
         print(f"Analysis Question: {IMAGE_ANALYSIS_PROMPT}")
         print("="*100)
         
+        # Start progress updater for analysis
+        progress_task = None
+        try:
+            progress_task = await self._start_progress_updater_async(
+                client, channel_id, thinking_id, "image analysis", emoji=config.analyze_emoji
+            )
+            self.log_debug("Started progress updater for image analysis")
+        except Exception as e:
+            self.log_warning(f"Failed to start progress updater: {e}")
+            progress_task = None
+
         try:
             # Analyze the images to understand what's in them
             image_description = await self.openai_client.analyze_images(
@@ -408,23 +438,23 @@ class ImageEditMixin:
                 question=IMAGE_ANALYSIS_PROMPT,
                 detail="high"
             )
-            
+
             # Log the full analysis result
             print("\n" + "="*100)
             print("DEBUG: IMAGE EDIT FLOW - STEP 2: ANALYSIS RESULT")
             print("="*100)
             print(f"Image Description (Full):\n{image_description}")
             print("="*100)
-            
+
             # Don't show the analysis - just update status to show we're editing
             # The analysis is only used internally for better edit quality
             if thinking_id:
                 self._update_status(client, channel_id, thinking_id, "Editing your image. This may take a minute...", emoji=config.circle_loader_emoji)
-            
+
             # Store the description and user request separately for clean enhancement
             image_analysis = image_description
             user_edit_request = text
-            
+
         except Exception as e:
             self.log_warning(f"Failed to analyze images, continuing without context: {e}")
             image_analysis = None
@@ -435,6 +465,11 @@ class ImageEditMixin:
             print(f"Error: {e}")
             print(f"Falling back to user prompt only: {text}")
             print("="*100)
+        finally:
+            # Cancel progress updater
+            if progress_task and not progress_task.done():
+                progress_task.cancel()
+                self.log_debug("Cancelled progress updater after image analysis")
         
         # Get thread config for settings (with user preferences)
         thread_config = config.get_thread_config(
@@ -507,10 +542,12 @@ class ImageEditMixin:
                 stream_callback=enhancement_callback
             )
             
-            # Show the final enhanced prompt
+            # Show the final enhanced prompt (without loading indicator)
             if enhanced_edit_prompt and thinking_id:
-                enhanced_text = f"Enhanced Prompt: ✨ _{enhanced_edit_prompt}_"
-                self._update_message_streaming_sync(client, channel_id, thinking_id, enhanced_text)
+                enhanced_text = f"*Enhanced Prompt:* ✨ _{enhanced_edit_prompt}_"
+                result = self._update_message_streaming_sync(client, channel_id, thinking_id, enhanced_text)
+                if not result["success"] and result.get("rate_limited"):
+                    self.log_debug("Couldn't remove loading indicator from enhanced prompt due to rate limit")
                 # Mark that we should NOT touch this message again
                 response_metadata["prompt_message_id"] = thinking_id
             
