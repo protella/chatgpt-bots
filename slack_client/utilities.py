@@ -34,15 +34,18 @@ class SlackUtilitiesMixin:
         # Check database for user
         user_data = await self.db.get_or_create_user_async(user_id)
         if user_data.get('username'):
-            # Load from DB to memory cache
-            tz_info = await self.db.get_user_timezone_async(user_id)
-            if tz_info:
+            # Load full user info from DB to memory cache
+            user_info = await self.db.get_user_info_async(user_id)
+            if user_info:
                 self.user_cache[user_id] = {
                     'username': user_data['username'],
-                    'timezone': tz_info[0],
-                    'tz_label': tz_info[1],
-                    'tz_offset': tz_info[2] or 0
+                    'real_name': user_info.get('real_name'),
+                    'email': user_info.get('email'),
+                    'timezone': user_info.get('timezone', 'UTC'),
+                    'tz_label': user_info.get('tz_label', 'UTC'),
+                    'tz_offset': user_info.get('tz_offset', 0)
                 }
+                self.log_debug(f"Loaded user info from DB for {user_id}: email={user_info.get('email')}, real_name={user_info.get('real_name')}, timezone={user_info.get('timezone')}")
                 return user_data['username']
         
         try:
