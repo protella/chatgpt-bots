@@ -10,6 +10,9 @@ A production-ready Slack bot built with Python and OpenAI's Responses API (not C
 
 For a detailed list of recent changes and improvements, please see the [CHANGELOG.md](CHANGELOG.md) file.
 
+### ⚠️ Important: Timeout Configuration Update
+**Breaking change for streaming responses:** The timeout behavior has been updated to improve reliability. If you previously had `OPENAI_STREAMING_CHUNK_TIMEOUT` set to a low value (e.g., 30 seconds), you must increase it to avoid premature stream termination. Check the updated `.env.example` for recommended values and update your `.env` file accordingly. Low timeout values will now cause responses to drop mid-stream.
+
 ## Getting Started
 
 ### Requirements
