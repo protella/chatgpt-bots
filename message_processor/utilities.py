@@ -835,8 +835,117 @@ class MessageUtilitiesMixin:
         else:
             self.log_debug("Client doesn't support message updates")
 
+    async def _start_progress_updater_async(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], operation: str = "request", emoji: Optional[str] = None):
+        """Start an async task that updates thinking message periodically
+
+        Returns:
+            asyncio.Task that can be cancelled when streaming starts
+        """
+        if not thinking_id or not hasattr(client, 'update_message_streaming'):
+            return None
+
+        async def update_progress():
+            import random
+            messages = [
+                f"Processing your {operation}...",
+                "Still working on this...",
+                "Still here, just thinking...",
+                "Bear with me a moment longer...",
+                "This is taking longer than I expected..."
+            ]
+
+            intervals = [10, 20, 30, 45, 60]  # Seconds before each message
+            message_index = 0
+            start_time = asyncio.get_event_loop().time()
+
+            try:
+                while message_index < len(messages):
+                    elapsed = int(asyncio.get_event_loop().time() - start_time)
+
+                    # Wait for the next interval
+                    if message_index < len(intervals):
+                        wait_time = intervals[message_index] - elapsed
+                        if wait_time > 0:
+                            await asyncio.sleep(wait_time)
+
+                    # Update message
+                    progress_msg = messages[message_index]
+
+                    try:
+                        # Use streaming update method with appropriate emoji
+                        status_emoji = emoji or config.thinking_emoji
+                        progress_msg_with_emoji = f"{status_emoji} {progress_msg}"
+                        result = await client.update_message_streaming(channel_id, thinking_id, progress_msg_with_emoji)
+                        if result["success"]:
+                            self.log_debug(f"Progress update {message_index+1}: {progress_msg}")
+                        else:
+                            self.log_warning(f"Failed to update progress: {result.get('error', 'Unknown error')}")
+                    except Exception as e:
+                        self.log_error(f"Failed to update progress: {e}")
+                        return  # Exit task on error
+
+                    message_index += 1
+
+                # After initial messages, use random selection without repeats
+                ongoing_messages = [
+                    "Still processing...",
+                    "This is a tough one...",
+                    "Haven't forgotten about you...",
+                    "Almost there... maybe...",
+                    "Quality takes time...",
+                    "Still working on it...",
+                    "Your request is important to us...",
+                    "Consulting the AI elders...",
+                    "Still thinking about this...",
+                    "Not ignoring you, promise...",
+                    "This deserves a thorough response...",
+                    "Taking the scenic route to the answer...",
+                    "Complex questions need time...",
+                    "Still here, still working...",
+                    "Patience is a virtue, they say...",
+                    "Crafting something special...",
+                    "Worth the wait, hopefully...",
+                    "Deep in thought...",
+                    "Processing intensifies...",
+                    "The gears are turning..."
+                ]
+
+                # Create a copy to track unused messages
+                unused_messages = ongoing_messages.copy()
+
+                while True:
+                    await asyncio.sleep(30)
+                    try:
+                        # If we've used all messages, refill the pool (but avoid immediate repeat)
+                        if not unused_messages:
+                            last_msg = progress_msg if 'progress_msg' in locals() else None
+                            unused_messages = ongoing_messages.copy()
+                            # Remove the last used message to avoid immediate repeat
+                            if last_msg and last_msg in unused_messages:
+                                unused_messages.remove(last_msg)
+
+                        # Pick a random message from unused pool
+                        progress_msg = random.choice(unused_messages)
+                        unused_messages.remove(progress_msg)
+                        status_emoji = emoji or config.thinking_emoji
+                        progress_msg_with_emoji = f"{status_emoji} {progress_msg}"
+                        result = await client.update_message_streaming(channel_id, thinking_id, progress_msg_with_emoji)
+                        if not result["success"]:
+                            self.log_warning(f"Failed to update progress: {result.get('error', 'Unknown error')}")
+                    except Exception:
+                        return  # Exit task on error
+
+            except asyncio.CancelledError:
+                # Task was cancelled (streaming started or operation completed)
+                self.log_debug("Progress updater cancelled - streaming started or operation completed")
+                raise  # Re-raise to properly cancel the task
+
+        # Create and start the task
+        task = asyncio.create_task(update_progress())
+        return task
+
     def _start_progress_updater(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], operation: str = "request") -> threading.Thread:
-        """Start a background thread that updates thinking message periodically"""
+        """Legacy threading version - kept for compatibility with sync code"""
         if not thinking_id or not hasattr(client, 'update_message'):
             return None
 
@@ -846,10 +955,10 @@ class MessageUtilitiesMixin:
         def update_progress():
             messages = [
                 f"Processing your {operation}...",
-                f"Still working on your {operation}...",
-                "This is taking longer than expected...",
-                "Thank you for your patience...",
-                f"Still processing your {operation}..."
+                "Still working on this...",
+                "Still here, just thinking...",
+                "Bear with me a moment longer...",
+                "This is taking longer than I expected..."
             ]
 
             intervals = [10, 20, 30, 45, 60]  # Seconds before each message
@@ -867,8 +976,7 @@ class MessageUtilitiesMixin:
                             break
 
                 # Update message
-                elapsed = int(time.time() - start_time)
-                progress_msg = f"{messages[message_index]} ({elapsed}s)"
+                progress_msg = messages[message_index]
                 try:
                     self._update_status(client, channel_id, thinking_id, progress_msg, emoji=config.thinking_emoji)
                 except Exception as e:
@@ -877,16 +985,54 @@ class MessageUtilitiesMixin:
 
                 message_index += 1
 
-                # After all messages, just update the time every 30s
+                # After initial messages, use random selection without repeats
                 if message_index >= len(messages):
+                    import random
+
+                    ongoing_messages = [
+                        "Still processing...",
+                        "This is a tough one...",
+                        "Haven't forgotten about you...",
+                        "Almost there... maybe...",
+                        "Quality takes time...",
+                        "Still working on it...",
+                        "Your request is important to us...",
+                        "Consulting the AI elders...",
+                        "Still thinking about this...",
+                        "Not ignoring you, promise...",
+                        "This deserves a thorough response...",
+                        "Taking the scenic route to the answer...",
+                        "Complex questions need time...",
+                        "Still here, still working...",
+                        "Patience is a virtue, they say...",
+                        "Crafting something special...",
+                        "Worth the wait, hopefully...",
+                        "Deep in thought...",
+                        "Processing intensifies...",
+                        "The gears are turning..."
+                    ]
+
+                    # Create a copy to track unused messages
+                    unused_messages = ongoing_messages.copy()
+
                     while not stop_event.is_set():
                         stop_event.wait(30)
                         if stop_event.is_set():
                             break
-                        elapsed = int(time.time() - start_time)
                         try:
+                            # If we've used all messages, refill the pool (but avoid immediate repeat)
+                            if not unused_messages:
+                                last_msg = progress_msg if 'progress_msg' in locals() else None
+                                unused_messages = ongoing_messages.copy()
+                                # Remove the last used message to avoid immediate repeat
+                                if last_msg and last_msg in unused_messages:
+                                    unused_messages.remove(last_msg)
+
+                            # Pick a random message from unused pool
+                            progress_msg = random.choice(unused_messages)
+                            unused_messages.remove(progress_msg)
                             self._update_status(client, channel_id, thinking_id,
-                                             f"Still processing... ({elapsed}s)",
+                                             progress_msg,
                                              emoji=config.thinking_emoji)
                         except Exception:
                             break

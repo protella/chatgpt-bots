@@ -299,13 +299,18 @@ class SettingsModal(LoggerMixin):
             self.log_warning(f"Current reasoning {current_reasoning} not in available options, using fallback")
         
         # Build the reasoning block
-        # Use a different action_id based on whether minimal is available
+        # Use different block_id AND action_id to force Slack mobile to re-render
         # This works around a Slack bug where selections are lost when options change
-        action_id = "reasoning_level" if not web_search_enabled else "reasoning_level_no_minimal"
-        
+        if web_search_enabled:
+            block_id = "reasoning_block_web"
+            action_id = "reasoning_level_no_minimal"
+        else:
+            block_id = "reasoning_block_no_web"
+            action_id = "reasoning_level"
+
         reasoning_block = {
             "type": "section",
-            "block_id": "reasoning_block",
+            "block_id": block_id,
             "text": {
                 "type": "mrkdwn",
                 "text": "*Reasoning Level*\nControls depth of analysis and problem-solving"
@@ -317,28 +322,40 @@ class SettingsModal(LoggerMixin):
             }
         }
         
-        # Add initial_option only if we have a valid selection
-        if current_reasoning and current_reasoning != 'None':
+        # Add initial_option if we have a valid selection
+        # Always try to set an initial option to work around Slack mobile bug
+        if current_reasoning and current_reasoning != 'None' and current_reasoning in available_values:
             reasoning_block["accessory"]["initial_option"] = {
                 "text": {"type": "plain_text", "text": self._get_reasoning_display(current_reasoning)},
                 "value": current_reasoning
             }
+            self.log_debug(f"Set initial_option for reasoning: {current_reasoning}")
         else:
-            # If no selection (can happen due to Slack bug when options change)
-            # We'll add a note for the user
-            self.log_debug("No reasoning selection - likely due to Slack option change bug")
+            # If no valid selection, try to provide a sensible default
+            # This helps with the Slack mobile bug where selections are lost
+            if available_values:
+                # Use the first available option as default
+                default_value = available_values[0]
+                reasoning_block["accessory"]["initial_option"] = {
+                    "text": {"type": "plain_text", "text": self._get_reasoning_display(default_value)},
+                    "value": default_value
+                }
+                self.log_debug(f"No valid reasoning selection - set default initial_option: {default_value}")
+            else:
+                self.log_debug("No reasoning selection and no available values - cannot set initial_option")
         
         blocks.append(reasoning_block)
-        
-        # Add a warning if we detected the Slack bug (minimal was removed and no selection)
-        if web_search_enabled and settings.get('reasoning_effort') == 'low' and not current_reasoning:
-            blocks.append({
-                "type": "context",
-                "elements": [{
-                    "type": "mrkdwn", 
-                    "text": "⚠️ _Please select a reasoning level (Low is recommended)_"
-                }]
-            })
+
+        # Add a warning if the initial option had to be defaulted (mobile bug workaround)
+        if not (current_reasoning and current_reasoning != 'None' and current_reasoning in available_values):
+            if available_values:
+                blocks.append({
+                    "type": "context",
+                    "elements": [{
+                        "type": "mrkdwn",
+                        "text": f"ℹ️ _Selection defaulted to {self._get_reasoning_display(available_values[0])} - please verify your preference_"
+                    }]
+                })
         
         # Add note about minimal restriction only if minimal is shown
         if not web_search_enabled:
@@ -594,12 +611,16 @@ class SettingsModal(LoggerMixin):
                 extracted['model'] = selected['value']
         
         # GPT-5 settings
-        reasoning_block = values.get('reasoning_block', {})
-        # Check both possible action_ids (we use different ones based on web search state)
+        # Check both possible block_ids (we use different ones based on web search state)
+        reasoning_block = values.get('reasoning_block_no_web', {}) or values.get('reasoning_block_web', {})
+
+        # Check both possible action_ids
+        reasoning_found = False
         if 'reasoning_level' in reasoning_block:
             selected = reasoning_block['reasoning_level'].get('selected_option')
             if selected:
                 extracted['reasoning_effort'] = selected['value']
+                reasoning_found = True
             else:
                 # No selection - might happen during modal updates
                 self.log_debug("No reasoning_level selected_option found")
@@ -607,8 +628,24 @@ class SettingsModal(LoggerMixin):
             selected = reasoning_block['reasoning_level_no_minimal'].get('selected_option')
             if selected:
                 extracted['reasoning_effort'] = selected['value']
+                reasoning_found = True
             else:
                 self.log_debug("No reasoning_level_no_minimal selected_option found")
+
+        # Fallback if no reasoning selection due to Slack modal update bug
+        if not reasoning_found:
+            # Check if web search is enabled from the form
+            features_block = values.get('features_block', {})
+            web_search_enabled = False
+            if 'features' in features_block:
+                selected_options = features_block['features'].get('selected_options', [])
+                selected_values = [opt['value'] for opt in selected_options]
+                web_search_enabled = 'web_search' in selected_values
+
+            # Use a safe default based on web search state
+            default_reasoning = 'low' if web_search_enabled else 'minimal'
+            extracted['reasoning_effort'] = default_reasoning
+            self.log_debug(f"No reasoning selection found - using default: {default_reasoning} (web_search: {web_search_enabled})")
         
         verbosity_block = values.get('verbosity_block', {})
         if 'verbosity' in verbosity_block:

@@ -65,22 +65,23 @@ class OpenAIClient(LoggerMixin):
 
         # Operation-specific timeouts based on real-world usage patterns
         operation_timeouts = {
-            # Image operations - can take 2-3 minutes especially with reasoning models
+            # Image operations - full API timeout
             "image_generation": 300.0,  # 5 minutes
             "image_edit": 300.0,        # 5 minutes
             "vision_analysis": 300.0,   # 5 minutes - large image analysis takes time
 
-            # Text operations with varying complexity
-            "text_high_reasoning": 120.0,  # 2 minutes for complex reasoning
-            "text_normal": 90.0,           # 1.5 minutes for normal responses
-            "intent_classification": 30.0, # 30 seconds - should be fast
-            "prompt_enhancement": 45.0,     # 45 seconds - slightly longer than intent
+            # All text operations - 2.5 minutes regardless of complexity/tools/reasoning
+            "text_high_reasoning": 150.0,  # 2.5 minutes (kept for compatibility)
+            "text_with_tools": 150.0,      # 2.5 minutes
+            "text_normal": 150.0,          # 2.5 minutes
+            "intent_classification": 150.0, # 2.5 minutes
+            "prompt_enhancement": 150.0,    # 2.5 minutes
 
             # Streaming operations
             "streaming_chunk": config.api_timeout_streaming_chunk,  # Time between chunks
             "streaming": config.api_timeout_read,  # Overall streaming timeout
 
-            # Fallback
+            # Fallback - use full API timeout
             "general": config.api_timeout_read,
         }
 
@@ -105,16 +106,12 @@ class OpenAIClient(LoggerMixin):
         """
         start_time = asyncio.get_event_loop().time()
         max_duration = self._get_operation_timeout(operation_type)
-        chunk_timeout = self._get_operation_timeout("streaming_chunk")
+        # Use chunk timeout from config, but warn after 30s
+        chunk_warning_threshold = 30.0  # Warn after 30 seconds of no chunks
+        chunk_timeout = config.api_timeout_streaming_chunk  # Use config value from .env
         last_chunk_time = None
         first_event = True
-
-        # For vision operations, be more patient with chunks
-        is_vision_op = operation_type == "vision_analysis"
-        if is_vision_op:
-            # Vision models can take 60+ seconds between chunks when processing complex images
-            chunk_timeout = 120.0  # 2 minutes between chunks for vision
-            self.log_debug(f"Using extended chunk timeout for vision: {chunk_timeout}s")
+        warned_about_delay = False  # Track if we've warned about this delay
 
         self.log_debug(f"Starting stream iteration with max_duration={max_duration}s, chunk_timeout={chunk_timeout}s")
 
@@ -127,68 +124,45 @@ class OpenAIClient(LoggerMixin):
                     self.log_error(error_msg)
                     raise asyncio.TimeoutError(error_msg)
 
-                # Try to get next event
-                # For vision and other slow operations, we don't use chunk timeout
-                # because it can cause issues with the stream iterator
-                if is_vision_op:
-                    # No chunk timeout for vision - just wait for the next event
-                    # The overall max_duration will still protect us
-                    try:
-                        event = await stream.__anext__()
-                    except StopAsyncIteration:
-                        # Stream ended
-                        elapsed = asyncio.get_event_loop().time() - start_time
-                        self.log_debug(f"Stream completed normally after {elapsed:.2f}s")
-                        break
+                # Try to get next event with chunk timeout
+                # All operations use the same chunk timeout (2.5 minutes)
+                try:
+                    event = await asyncio.wait_for(
+                        stream.__anext__(),
+                        timeout=chunk_timeout
+                    )
 
                     # Track timing for monitoring
                     current_time = asyncio.get_event_loop().time()
                     if last_chunk_time is not None:
                         time_since_last_chunk = current_time - last_chunk_time
-                        if time_since_last_chunk > 60:
-                            # For vision, log if it's been over a minute
+                        if time_since_last_chunk > chunk_warning_threshold:
                             self.log_debug(
-                                f"Vision stream chunk received after {time_since_last_chunk:.1f}s"
+                                f"Stream chunk received after {time_since_last_chunk:.1f}s"
                             )
                     elif first_event:
                         self.log_debug("Received first streaming event")
                         first_event = False
 
                     last_chunk_time = current_time
+                    # Reset warning flag since we got a chunk
+                    warned_about_delay = False
                     yield event
-                else:
-                    # For non-vision operations, use chunk timeout
-                    try:
-                        event = await asyncio.wait_for(
-                            stream.__anext__(),
-                            timeout=chunk_timeout
-                        )
 
-                        # Track timing for monitoring
-                        current_time = asyncio.get_event_loop().time()
-                        if last_chunk_time is not None:
-                            time_since_last_chunk = current_time - last_chunk_time
-                            if time_since_last_chunk > chunk_timeout:
-                                self.log_warning(
-                                    f"Stream event took {time_since_last_chunk:.1f}s to arrive "
-                                    f"(timeout is {chunk_timeout}s)"
-                                )
-                        elif first_event:
-                            self.log_debug("Received first streaming event")
-                            first_event = False
+                except asyncio.TimeoutError:
+                    # Chunk timeout - only warn, never fail
+                    time_since_last = asyncio.get_event_loop().time() - (last_chunk_time or start_time)
 
-                        last_chunk_time = current_time
-                        yield event
-
-                    except asyncio.TimeoutError:
-                        # Chunk timeout for non-vision operations
-                        time_since_last = asyncio.get_event_loop().time() - (last_chunk_time or start_time)
+                    # Warn after 30 seconds of no chunks (only once per delay)
+                    if time_since_last >= chunk_warning_threshold and not warned_about_delay:
                         self.log_warning(
-                            f"Stream chunk timeout - no data received for {time_since_last:.1f}s "
-                            f"(chunk timeout: {chunk_timeout}s). Continuing to wait..."
+                            f"Stream chunk warning - no data received for {time_since_last:.1f}s. "
+                            f"Continuing to wait (will timeout at {max_duration}s total)..."
                         )
-                        # Continue waiting for next chunk unless we hit max duration
-                        continue
+                        warned_about_delay = True
+
+                    # Always continue waiting - never fail on chunk timeout
+                    continue
 
             except StopAsyncIteration:
                 # Stream completed normally

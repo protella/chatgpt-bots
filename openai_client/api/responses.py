@@ -90,7 +90,8 @@ async def create_text_response(
 
     try:
         # Determine operation type based on reasoning effort and context
-        operation_type = "text_high_reasoning" if reasoning_effort in ["high", "maximum"] else "text_normal"
+        # All text operations use the same timeout regardless of reasoning level
+        operation_type = "text_normal"
 
         # API call with enforced timeout wrapper
         response = await self._safe_api_call(
@@ -189,7 +190,8 @@ async def create_text_response_with_tools(
 
     try:
         # Determine operation type based on reasoning effort and context
-        operation_type = "text_high_reasoning" if reasoning_effort in ["high", "maximum"] else "text_normal"
+        # All text operations use the same timeout regardless of reasoning level
+        operation_type = "text_normal"
 
         # API call with enforced timeout wrapper
         response = await self._safe_api_call(
@@ -303,7 +305,8 @@ async def create_streaming_response(
 
     try:
         # Determine operation type based on reasoning effort and context
-        operation_type = "text_high_reasoning" if reasoning_effort in ["high", "maximum"] else "text_normal"
+        # All text operations use the same timeout regardless of reasoning level
+        operation_type = "text_normal"
 
         response = await self._safe_api_call(
             self.client.responses.create,
@@ -498,7 +501,11 @@ async def create_streaming_response_with_tools(
 
     try:
         # Determine operation type based on reasoning effort and context
-        operation_type = "text_high_reasoning" if reasoning_effort in ["high", "maximum"] else "text_normal"
+        # Determine operation type - all text operations use same timeout regardless of reasoning/tools
+        if tools:
+            operation_type = "text_with_tools"  # 2.5 minutes
+        else:
+            operation_type = "text_normal"  # 2.5 minutes
 
         response = await self._safe_api_call(
             self.client.responses.create,
@@ -911,7 +918,8 @@ async def _create_text_response_with_timeout(
 
     try:
         # Determine operation type based on reasoning effort and context
-        operation_type = "text_high_reasoning" if reasoning_effort in ["high", "maximum"] else "text_normal"
+        # All text operations use the same timeout regardless of reasoning level
+        operation_type = "text_normal"
 
         # API call with custom timeout
         response = await self._safe_api_call(
@@ -1013,7 +1021,8 @@ async def _create_text_response_with_tools_with_timeout(
 
     try:
         # Determine operation type based on reasoning effort and context
-        operation_type = "text_high_reasoning" if reasoning_effort in ["high", "maximum"] else "text_normal"
+        # All text operations use the same timeout regardless of reasoning level
+        operation_type = "text_normal"
 
         # API call with custom timeout
         response = await self._safe_api_call(

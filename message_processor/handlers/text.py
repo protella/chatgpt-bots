@@ -258,7 +258,14 @@ class TextHandlerMixin:
         # Define tool event callback
         async def tool_callback(tool_type: str, status: str):
             """Handle tool events for status updates"""
+            nonlocal progress_task
+
             if status == "started":
+                # Cancel progress updater when tools start (web search takes over status)
+                if progress_task and not progress_task.done():
+                    progress_task.cancel()
+                    self.log_debug("Cancelled progress updater - tool started")
+
                 # Tool just started - update status with appropriate emoji
                 if tool_type == "web_search":
                     if not tool_states["web_search"]:
@@ -311,12 +318,29 @@ class TextHandlerMixin:
         current_message_id = message_id
         current_part = 1
         overflow_buffer = ""
-        message_char_limit = 3700  # Leave room for indicators
-        
+        continuation_msg = "\n\n*Continued in next message...*"
+        message_char_limit = 3700 - len(continuation_msg)  # Reserve space for continuation indicator
+        streaming_aborted = False  # Track if we had to abort streaming due to failures
+
+        # Start progress updater task (will be cancelled when streaming starts)
+        progress_task = None
+        first_chunk_received = False
+
         # Define the streaming callback
         async def stream_callback(text_chunk: str):
             """Callback function called with each text chunk from OpenAI"""
-            nonlocal current_message_id, current_part, overflow_buffer
+            nonlocal current_message_id, current_part, overflow_buffer, progress_task, first_chunk_received, streaming_aborted
+
+            # If we've aborted, ignore further chunks
+            if streaming_aborted:
+                return
+
+            # Cancel progress updater on first real chunk (not the None completion signal)
+            if not first_chunk_received and text_chunk is not None:
+                first_chunk_received = True
+                if progress_task and not progress_task.done():
+                    progress_task.cancel()
+                    self.log_debug("Cancelled progress updater - streaming started")
             
             # Check if this is the completion signal (None)
             if text_chunk is None:
@@ -326,6 +350,11 @@ class TextHandlerMixin:
                     rate_limiter.record_request_attempt()
                     # Use raw text for final flush - no loading indicator since stream is complete
                     final_text = buffer.get_complete_text()  # No loading indicator on completion
+
+                    # Preserve part number prefix for overflow messages in final flush
+                    if current_part > 1:
+                        final_text = f"*Part {current_part} (continued)*\n\n{final_text}"
+
                     try:
                         result = await client.update_message_streaming(message.channel_id, current_message_id, final_text)
                         if result["success"]:
@@ -349,22 +378,32 @@ class TextHandlerMixin:
                 raw_text = buffer.get_complete_text()
                 
                 if len(raw_text) > message_char_limit:
-                    # Find a good split point - preferably at a line break
-                    split_point = message_char_limit
-                    
-                    # Look backwards for the last newline before the limit
-                    last_newline = raw_text.rfind('\n', 0, message_char_limit)
-                    
-                    # If we found a newline within reasonable distance (not too far back)
-                    # Use it as the split point to avoid breaking lines
-                    if last_newline > message_char_limit - 500 and last_newline > 0:
-                        split_point = last_newline + 1  # Include the newline in first part
+                    # Find a good split point - look for paragraph or sentence breaks
+                    # Start from the limit and work backwards
+                    search_start = max(0, message_char_limit - 500)  # Look back up to 500 chars
+
+                    # Priority 1: Try to find a paragraph break (double newline)
+                    double_newline = raw_text.rfind('\n\n', search_start, message_char_limit)
+                    if double_newline > 0:
+                        split_point = double_newline + 2  # Keep the paragraph break in first part
                     else:
-                        # No good newline found, try to at least avoid splitting words
-                        # Look for last space before the limit
-                        last_space = raw_text.rfind(' ', max(0, message_char_limit - 100), message_char_limit)
-                        if last_space > 0:
-                            split_point = last_space + 1
+                        # Priority 2: Try to find end of sentence
+                        last_period = raw_text.rfind('. ', search_start, message_char_limit)
+                        if last_period > 0:
+                            split_point = last_period + 2  # Include period and space
+                        else:
+                            # Priority 3: Try to find a single newline
+                            last_newline = raw_text.rfind('\n', search_start, message_char_limit)
+                            if last_newline > 0:
+                                split_point = last_newline + 1
+                            else:
+                                # Priority 4: At least don't split a word
+                                last_space = raw_text.rfind(' ', search_start, message_char_limit)
+                                if last_space > 0:
+                                    split_point = last_space + 1
+                                else:
+                                    # Last resort: hard cut at limit
+                                    split_point = message_char_limit
                     
                     # Split the RAW text at the chosen point
                     first_part_raw = raw_text[:split_point]
@@ -380,9 +419,26 @@ class TextHandlerMixin:
                     first_part_display = fence_handler_temp.get_display_safe_text()
                     
                     # Update current message with continuation indicator
-                    final_first_part = f"{first_part_display}\n\n*Continued in next message...*"
+                    final_first_part = f"{first_part_display}{continuation_msg}"
                     try:
                         result = await client.update_message_streaming(message.channel_id, current_message_id, final_first_part)
+                        if not result["success"]:
+                            # CRITICAL: Overflow update failed - retry immediately
+                            self.log_warning(f"Overflow update failed: {result.get('error', 'Unknown')} - retrying")
+                            await asyncio.sleep(1.0)  # Brief pause
+                            result = await client.update_message_streaming(message.channel_id, current_message_id, final_first_part)
+                            if not result["success"]:
+                                self.log_error(f"Overflow retry failed: {result.get('error', 'Unknown')} - stopping stream")
+                                # Cannot continue safely without losing data
+                                streaming_aborted = True
+                                # Show what we have with error notice
+                                error_msg = f"{final_first_part}\n\n{config.error_emoji} *Streaming interrupted at message overflow. Partial response shown above.*"
+                                try:
+                                    await client.update_message_streaming(message.channel_id, current_message_id, error_msg)
+                                except:
+                                    pass
+                                return  # Exit callback
+
                         if result["success"]:
                             # Prepare overflow text with proper fence opening if needed
                             if was_in_code_block:
@@ -438,8 +494,13 @@ class TextHandlerMixin:
                 else:
                     # Normal update - get display-safe text with closed fences
                     display_text = buffer.get_display_text()
-                    display_text_with_indicator = f"{display_text} {config.loading_ellipse_emoji}"
-                    
+
+                    # Preserve part number prefix for overflow messages
+                    if current_part > 1:
+                        display_text_with_indicator = f"*Part {current_part} (continued)*\n\n{display_text} {config.loading_ellipse_emoji}"
+                    else:
+                        display_text_with_indicator = f"{display_text} {config.loading_ellipse_emoji}"
+
                     # Call client.update_message_streaming with indicator
                     try:
                         result = await client.update_message_streaming(message.channel_id, current_message_id, display_text_with_indicator)
@@ -449,31 +510,138 @@ class TextHandlerMixin:
                             buffer.mark_updated()
                             buffer.update_interval_setting(rate_limiter.get_current_interval())
                         else:
+                            # Update failed - this is CRITICAL, we must not lose text!
                             if result["rate_limited"]:
                                 # Handle rate limit response
                                 if result["retry_after"]:
                                     rate_limiter.set_retry_after(result["retry_after"])
                                 rate_limiter.record_failure(is_rate_limit=True)
-                                
-                                # Check if we should fall back to non-streaming
-                                if not rate_limiter.is_streaming_enabled():
-                                    self.log_warning("Circuit breaker opened - will complete without further streaming")
-                                    # Try to clear the thinking indicator
-                                    try:
-                                        clear_text = buffer.last_sent_text if buffer.last_sent_text else "Processing..."
-                                        if len(clear_text) > 3900:
-                                            clear_text = clear_text[:3800] + "\n\n*Response too long - see next message*"
-                                        await client.update_message_streaming(message.channel_id, message_id, clear_text)
-                                    except Exception as clear_error:
-                                        self.log_error(f"Failed to clear indicator after circuit break: {clear_error}")
+
+                                # Wait and retry with the same accumulated text
+                                retry_wait = result.get("retry_after", 2.0)
+                                self.log_warning(f"Rate limited - waiting {retry_wait}s before retry")
+                                await asyncio.sleep(retry_wait)
+
+                                # Retry the update with the same text
+                                try:
+                                    retry_result = await client.update_message_streaming(message.channel_id, current_message_id, display_text_with_indicator)
+                                    if retry_result["success"]:
+                                        self.log_info("Retry successful after rate limit")
+                                        buffer.mark_updated()
+                                    else:
+                                        self.log_error(f"Retry failed after rate limit: {retry_result.get('error', 'Unknown error')}")
+                                        # Keep retrying with exponential backoff
+                                        retry_count = 2
+                                        while retry_count < 5:  # Max 5 total attempts
+                                            wait_time = 2.0 * retry_count
+                                            self.log_warning(f"Retry {retry_count} failed - waiting {wait_time}s before next attempt")
+                                            await asyncio.sleep(wait_time)
+                                            try:
+                                                retry_result = await client.update_message_streaming(message.channel_id, current_message_id, display_text_with_indicator)
+                                                if retry_result["success"]:
+                                                    self.log_info(f"Retry {retry_count} successful")
+                                                    buffer.mark_updated()
+                                                    break
+                                            except Exception as e:
+                                                self.log_error(f"Retry {retry_count} exception: {e}")
+                                            retry_count += 1
+
+                                        if retry_count >= 5 and not retry_result.get("success"):
+                                            # After 5 attempts, we really need to stop
+                                            self.log_error("CRITICAL: Unable to update after 5 attempts - stopping stream")
+                                            streaming_aborted = True
+                                            return
+                                except Exception as retry_error:
+                                    self.log_error(f"Retry exception: {retry_error}")
+                                    # Try a few more times with backoff
+                                    retry_count = 2
+                                    while retry_count < 5:
+                                        wait_time = 2.0 * retry_count
+                                        await asyncio.sleep(wait_time)
+                                        try:
+                                            retry_result = await client.update_message_streaming(message.channel_id, current_message_id, display_text_with_indicator)
+                                            if retry_result["success"]:
+                                                self.log_info(f"Retry {retry_count} successful after exception")
+                                                buffer.mark_updated()
+                                                break
+                                        except:
+                                            pass
+                                        retry_count += 1
                             else:
+                                # Non-rate-limit failure - try one immediate retry
                                 rate_limiter.record_failure(is_rate_limit=False)
-                                self.log_warning(f"Message update failed: {result.get('error', 'Unknown error')}")
+                                self.log_warning(f"Message update failed: {result.get('error', 'Unknown error')} - attempting retry")
+
+                                # Immediate retry
+                                try:
+                                    retry_result = await client.update_message_streaming(message.channel_id, current_message_id, display_text_with_indicator)
+                                    if retry_result["success"]:
+                                        self.log_info("Immediate retry successful")
+                                        buffer.mark_updated()
+                                    else:
+                                        self.log_error(f"Immediate retry failed: {retry_result.get('error', 'Unknown error')}")
+                                        self.log_error(f"Immediate retry failed: {retry_result.get('error', 'Unknown error')}")
+                                        # Keep retrying with exponential backoff
+                                        retry_count = 2
+                                        while retry_count < 5:  # Max 5 total attempts
+                                            wait_time = 1.0 * retry_count  # Shorter waits for non-rate-limit
+                                            self.log_warning(f"Retry {retry_count} - waiting {wait_time}s")
+                                            await asyncio.sleep(wait_time)
+                                            try:
+                                                retry_result = await client.update_message_streaming(message.channel_id, current_message_id, display_text_with_indicator)
+                                                if retry_result["success"]:
+                                                    self.log_info(f"Retry {retry_count} successful")
+                                                    buffer.mark_updated()
+                                                    break
+                                            except Exception as e:
+                                                self.log_error(f"Retry {retry_count} exception: {e}")
+                                            retry_count += 1
+
+                                        if retry_count >= 5 and not retry_result.get("success"):
+                                            # After 5 attempts, stop to prevent infinite loop
+                                            self.log_error("CRITICAL: Unable to update after 5 attempts")
+                                            streaming_aborted = True
+                                            error_msg = f"{buffer.get_complete_text()}\n\n{config.error_emoji} *Streaming interrupted after multiple failures.*"
+                                            try:
+                                                await client.update_message_streaming(message.channel_id, current_message_id, error_msg)
+                                            except:
+                                                pass
+                                            return
+                                except Exception as retry_error:
+                                    self.log_error(f"Retry exception: {retry_error}")
+                                    # Try a few more times
+                                    retry_count = 2
+                                    while retry_count < 5:
+                                        wait_time = 1.0 * retry_count
+                                        await asyncio.sleep(wait_time)
+                                        try:
+                                            retry_result = await client.update_message_streaming(message.channel_id, current_message_id, display_text_with_indicator)
+                                            if retry_result["success"]:
+                                                self.log_info(f"Retry {retry_count} successful after exception")
+                                                buffer.mark_updated()
+                                                break
+                                        except:
+                                            pass
+                                        retry_count += 1
+
+                                    if retry_count >= 5:
+                                        streaming_aborted = True
+                                        return
                             
                     except Exception as e:
                         rate_limiter.record_failure(is_rate_limit=False)
                         self.log_error(f"Error updating streaming message: {e}")
         
+        # Start progress updater before making API call
+        try:
+            progress_task = await self._start_progress_updater_async(
+                client, message.channel_id, message_id, "request", emoji=config.thinking_emoji
+            )
+            self.log_debug("Started progress updater task")
+        except Exception as e:
+            self.log_warning(f"Failed to start progress updater: {e}")
+            progress_task = None
+
         # Start streaming from OpenAI with the callback
         try:
             web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
@@ -508,7 +676,23 @@ class TextHandlerMixin:
                     reasoning_effort=thread_config.get("reasoning_effort"),
                     verbosity=thread_config.get("verbosity")
                 )
-            
+
+            # Ensure progress updater is cancelled if still running
+            if progress_task and not progress_task.done():
+                progress_task.cancel()
+                self.log_debug("Cancelled progress updater after API call completed")
+
+            # Check if streaming was aborted due to failures
+            if streaming_aborted:
+                self.log_error("Streaming was aborted due to update failures")
+                # The error message was already shown in the callback
+                # Return an error response to prevent saving incomplete data
+                return Response(
+                    type="error",
+                    content=f"Streaming was interrupted. Partial response was shown but may be incomplete.",
+                    metadata={"streaming_aborted": True}
+                )
+
             # Safety check: ensure all text was sent AND remove loading indicator
             # Note: current_message_id might be different from message_id if we overflowed
             # We need to update the current message (which might be part 2, 3, etc)
@@ -537,7 +721,7 @@ class TextHandlerMixin:
                     try:
                         # Handle empty response
                         if not response_text:
-                            response_text = "I apologize, but I wasn't able to generate a response. Please try again."
+                            response_text = "I apologize, but I couldn't generate a response. OpenAI either didn't respond or returned an empty response. Please try again."
                             self.log_warning("Empty response detected, using fallback message")
                         
                         # Check if message is too long for a single update
@@ -585,7 +769,12 @@ class TextHandlerMixin:
             
         except Exception as e:
             self.log_error(f"Error in streaming response generation: {e}")
-            
+
+            # Ensure progress updater is cancelled on error
+            if progress_task and not progress_task.done():
+                progress_task.cancel()
+                self.log_debug("Cancelled progress updater due to error")
+
             # Try to remove the loading indicator if we had a message_id
             if message_id and hasattr(client, 'update_message_streaming'):
                 try:

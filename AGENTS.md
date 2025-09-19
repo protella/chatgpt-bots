@@ -5,7 +5,6 @@
 - Core functionality lives in focused modules: `message_processor.py`, `document_handler.py`, `thread_manager.py`, and `openai_client.py`. Shared utilities (logging, token math) sit alongside them in the root for easy reuse.
 - Persistent assets reside in `data/` and `Docs/`; generated artifacts such as logs and coverage reports land in `logs/` and `htmlcov/`.
 - Tests are split by scope under `tests/unit/` and `tests/integration/`, with fixtures configured in `tests/conftest.py`.
-- Read `async-refactor-plan.md` when working on the async refactor project. Follow this guide and don't stop til its goals are met.
 
 ## Build, Test, and Development Commands
 - `make install` — install runtime and test dependencies from `requirements.txt`.

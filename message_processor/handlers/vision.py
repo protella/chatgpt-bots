@@ -204,9 +204,21 @@ class VisionHandlerMixin:
                 )
                 
                 message_id = thinking_id  # Start with the thinking message
-                
+
+                # Start progress updater task (will be cancelled when streaming starts)
+                progress_task = None
+                first_chunk_received = False
+
                 def stream_callback(chunk: str):
-                    nonlocal message_id
+                    nonlocal message_id, progress_task, first_chunk_received
+
+                    # Cancel progress updater on first real chunk
+                    if not first_chunk_received and chunk is not None:
+                        first_chunk_received = True
+                        if progress_task and not progress_task.done():
+                            # Note: We're in a sync callback, so we can't await cancel
+                            # The task will be cancelled from the async context below
+                            pass
                     # Handle completion signal (None chunk)
                     if chunk is None:
                         # Final update without loading indicator
@@ -244,7 +256,17 @@ class VisionHandlerMixin:
                             else:
                                 rate_limiter.record_failure(is_rate_limit=False)
                             self.log_debug(f"Failed to update message: {result.get('error', 'unknown error')}")
-                
+
+                # Start progress updater before making API call
+                try:
+                    progress_task = await self._start_progress_updater_async(
+                        client, channel_id, message_id, "image analysis", emoji=config.analyze_emoji
+                    )
+                    self.log_debug("Started progress updater for vision analysis")
+                except Exception as e:
+                    self.log_warning(f"Failed to start progress updater: {e}")
+                    progress_task = None
+
                 # Call analyze_images with streaming callback
                 self.log_info("Streaming vision analysis")
                 analysis_result = await self.openai_client.analyze_images(
@@ -256,7 +278,12 @@ class VisionHandlerMixin:
                     system_prompt=system_prompt,  # Pass platform system prompt
                     stream_callback=stream_callback
                 )
-                
+
+                # Ensure progress updater is cancelled if still running
+                if progress_task and not progress_task.done():
+                    progress_task.cancel()
+                    self.log_debug("Cancelled progress updater after vision analysis")
+
                 # Log streaming stats
                 stats = rate_limiter.get_stats()
                 buffer_stats = buffer.get_stats()
@@ -266,6 +293,17 @@ class VisionHandlerMixin:
                 self.log_debug(f"Vision analysis completed: {len(analysis_result)} chars")
             else:
                 # Non-streaming version
+                # Start progress updater for non-streaming vision analysis
+                progress_task = None
+                try:
+                    progress_task = await self._start_progress_updater_async(
+                        client, channel_id, thinking_id, "image analysis", emoji=config.analyze_emoji
+                    )
+                    self.log_debug("Started progress updater for non-streaming vision analysis")
+                except Exception as e:
+                    self.log_warning(f"Failed to start progress updater: {e}")
+                    progress_task = None
+
                 analysis_result = await self.openai_client.analyze_images(
                     images=images_to_analyze,
                     question=enhanced_question,
@@ -274,10 +312,20 @@ class VisionHandlerMixin:
                     conversation_history=enhanced_messages,  # Pass enhanced conversation with image analyses
                     system_prompt=system_prompt  # Pass platform system prompt
                 )
+
+                # Cancel progress updater after completion
+                if progress_task and not progress_task.done():
+                    progress_task.cancel()
+                    self.log_debug("Cancelled progress updater after non-streaming vision analysis")
+
                 self.log_debug(f"Vision analysis completed: {len(analysis_result)} chars")
-            
-            
+
+
         except TimeoutError as e:
+            # Cancel progress updater on timeout
+            if 'progress_task' in locals() and progress_task and not progress_task.done():
+                progress_task.cancel()
+                self.log_debug("Cancelled progress updater due to timeout")
             self.log_error(f"Vision analysis timed out: {e}")
             return Response(
                 type="error",
