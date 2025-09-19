@@ -237,28 +237,53 @@ class ImageEditMixin:
                         
                         # Create a NEW message for editing status - don't touch the enhanced prompt!
                         editing_id = await client.send_thinking_indicator(channel_id, thread_state.thread_ts)
-                        self._update_status(client, channel_id, editing_id, 
-                                          "Editing your image. This may take a minute...", 
+                        self._update_status(client, channel_id, editing_id,
+                                          "Editing your image. This may take a minute...",
                                           emoji=config.circle_loader_emoji)
                         # Track the status message ID
                         response_metadata["status_message_id"] = editing_id
-                        
+
                         # Mark as streamed for main.py
                         response_metadata["streamed"] = True
-                        
+
+                        # Start progress updater for image editing
+                        progress_task = None
+                        try:
+                            progress_task = await self._start_progress_updater_async(
+                                client, channel_id, editing_id, "image edit", emoji=config.circle_loader_emoji
+                            )
+                            self.log_debug("Started progress updater for image editing")
+                        except Exception as e:
+                            self.log_warning(f"Failed to start progress updater: {e}")
+                            progress_task = None
+
                         # Use the edit_image API with the pre-enhanced prompt
-                        edited_image = await self.openai_client.edit_image(
-                            input_images=[base64_data],
-                            prompt=enhanced_edit_prompt,
-                            image_description=None,  # Already used for enhancement
-                            input_mimetypes=["image/png"],
-                            input_fidelity=thread_config.get("input_fidelity", "high"),
-                            background=thread_config.get("image_background", "auto"),
-                            output_format=thread_config.get("image_format", "png"),
-                            output_compression=thread_config.get("image_compression", 100),
-                            enhance_prompt=False,  # Already enhanced!
-                            conversation_history=None  # Not needed since we enhanced already
-                        )
+                        try:
+                            edited_image = await self.openai_client.edit_image(
+                                input_images=[base64_data],
+                                prompt=enhanced_edit_prompt,
+                                image_description=None,  # Already used for enhancement
+                                input_mimetypes=["image/png"],
+                                input_fidelity=thread_config.get("input_fidelity", "high"),
+                                background=thread_config.get("image_background", "auto"),
+                                output_format=thread_config.get("image_format", "png"),
+                                output_compression=thread_config.get("image_compression", 100),
+                                enhance_prompt=False,  # Already enhanced!
+                                conversation_history=None  # Not needed since we enhanced already
+                            )
+
+                            # Cancel progress updater if still running
+                            if progress_task and not progress_task.done():
+                                progress_task.cancel()
+                                self.log_debug("Cancelled progress updater after image editing")
+
+                        except Exception as e:
+                            # Cancel progress updater on error
+                            if progress_task and not progress_task.done():
+                                progress_task.cancel()
+                                self.log_debug("Cancelled progress updater due to error")
+                            # Re-raise the error to be handled by outer try/catch
+                            raise
                     else:
                         # Non-streaming fallback
                         self._update_status(client, channel_id, thinking_id, "Enhancing your edit request...")
@@ -553,15 +578,26 @@ class ImageEditMixin:
             
             # Create a NEW message for editing status - don't touch the enhanced prompt!
             editing_id = await client.send_thinking_indicator(channel_id, thread_state.thread_ts)
-            self._update_status(client, channel_id, editing_id, 
-                              "Generating edited image. This may take a minute...", 
+            self._update_status(client, channel_id, editing_id,
+                              "Generating edited image. This may take a minute...",
                               emoji=config.circle_loader_emoji)
             # Track the status message ID
             response_metadata["status_message_id"] = editing_id
-            
+
             # Mark as streamed for main.py
             response_metadata["streamed"] = True
-            
+
+            # Start progress updater for image editing
+            progress_task = None
+            try:
+                progress_task = await self._start_progress_updater_async(
+                    client, channel_id, editing_id, "image edit", emoji=config.circle_loader_emoji
+                )
+                self.log_debug("Started progress updater for image editing")
+            except Exception as e:
+                self.log_warning(f"Failed to start progress updater: {e}")
+                progress_task = None
+
             # Use the edit_image API with the pre-enhanced prompt
             try:
                 image_data = await self.openai_client.edit_image(
@@ -576,7 +612,12 @@ class ImageEditMixin:
                     enhance_prompt=False,  # Already enhanced!
                     conversation_history=None  # Not needed since already enhanced
                 )
-                
+
+                # Cancel progress updater if still running
+                if progress_task and not progress_task.done():
+                    progress_task.cancel()
+                    self.log_debug("Cancelled progress updater after image editing")
+
                 # After edit is complete, update message to show just the enhanced prompt
                 # (remove the "Generating edited image..." status) - but respect rate limits
                 if enhanced_edit_prompt and thinking_id and rate_limiter.can_make_request():
@@ -587,8 +628,12 @@ class ImageEditMixin:
                         if result["rate_limited"]:
                             rate_limiter.record_failure(is_rate_limit=True)
                             self.log_debug("Couldn't clean up image edit status due to rate limit")
-                    
+
             except Exception as e:
+                # Cancel progress updater on error
+                if progress_task and not progress_task.done():
+                    progress_task.cancel()
+                    self.log_debug("Cancelled progress updater due to error")
                 self.log_error(f"Error editing image: {e}")
                 return Response(
                     type="error",

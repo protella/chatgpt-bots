@@ -91,35 +91,66 @@ class TextHandlerMixin:
         # Update status before generating
         self._update_status(client, message.channel_id, thinking_id, "Generating response...")
         
+        # Determine timeout based on retry attempt
+        retry_timeout = 60.0 if retry_count > 0 else None
+
         # Check if web search should be available (respecting user prefs)
         web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
         if web_search_enabled:
             # Use web search model if specified, otherwise use thread config model
             model = config.web_search_model or thread_config["model"]
-            
+
             # Generate response with web search tool available
-            response_text = await self.openai_client.create_text_response_with_tools(
-                messages=messages_for_api,
-                tools=[{"type": "web_search"}],
-                model=model,
-                temperature=thread_config["temperature"],
-                max_tokens=thread_config["max_tokens"],
-                system_prompt=system_prompt,
-                reasoning_effort=thread_config.get("reasoning_effort"),
-                verbosity=thread_config.get("verbosity"),
-                store=False  # Match the existing behavior
-            )
+            if retry_timeout:
+                # Use shorter timeout for retry via direct _safe_api_call
+                response_text = await self.openai_client._create_text_response_with_tools_with_timeout(
+                    messages=messages_for_api,
+                    tools=[{"type": "web_search"}],
+                    model=model,
+                    temperature=thread_config["temperature"],
+                    max_tokens=thread_config["max_tokens"],
+                    system_prompt=system_prompt,
+                    reasoning_effort=thread_config.get("reasoning_effort"),
+                    verbosity=thread_config.get("verbosity"),
+                    store=False,
+                    timeout_seconds=retry_timeout
+                )
+            else:
+                response_text = await self.openai_client.create_text_response_with_tools(
+                    messages=messages_for_api,
+                    tools=[{"type": "web_search"}],
+                    model=model,
+                    temperature=thread_config["temperature"],
+                    max_tokens=thread_config["max_tokens"],
+                    system_prompt=system_prompt,
+                    reasoning_effort=thread_config.get("reasoning_effort"),
+                    verbosity=thread_config.get("verbosity"),
+                    store=False  # Match the existing behavior
+                )
         else:
             # Generate response without tools
-            response_text = await self.openai_client.create_text_response(
-                messages=messages_for_api,
-                model=thread_config["model"],
-                temperature=thread_config["temperature"],
-                max_tokens=thread_config["max_tokens"],
-                system_prompt=system_prompt,
-                reasoning_effort=thread_config.get("reasoning_effort"),
-                verbosity=thread_config.get("verbosity")
-            )
+            if retry_timeout:
+                # Use shorter timeout for retry via direct _safe_api_call
+                response_text = await self.openai_client._create_text_response_with_timeout(
+                    messages=messages_for_api,
+                    model=thread_config["model"],
+                    temperature=thread_config["temperature"],
+                    max_tokens=thread_config["max_tokens"],
+                    system_prompt=system_prompt,
+                    reasoning_effort=thread_config.get("reasoning_effort"),
+                    verbosity=thread_config.get("verbosity"),
+                    timeout_seconds=retry_timeout
+                )
+            else:
+                response_text = await self.openai_client.create_text_response(
+                    messages=messages_for_api,
+                    model=thread_config["model"],
+                    temperature=thread_config["temperature"],
+                    max_tokens=thread_config["max_tokens"],
+                    system_prompt=system_prompt,
+                    reasoning_effort=thread_config.get("reasoning_effort"),
+                    verbosity=thread_config.get("verbosity")
+                )
         
         # Check if response used web search and add citation note
         if web_search_enabled:

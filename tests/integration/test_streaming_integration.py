@@ -7,7 +7,7 @@ import asyncio
 import time
 from unittest.mock import Mock, patch, MagicMock
 from threading import Event
-from message_processor import MessageProcessor
+from message_processor.base import MessageProcessor
 from openai_client import OpenAIClient
 from base_client import Message
 from streaming.buffer import StreamingBuffer

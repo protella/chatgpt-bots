@@ -3,7 +3,7 @@ Tests for message trimming, preservation, and document summarization functionali
 """
 import pytest
 from unittest.mock import MagicMock, patch
-from message_processor import MessageProcessor
+from message_processor.base import MessageProcessor
 from thread_manager import ThreadState
 from config import config
 

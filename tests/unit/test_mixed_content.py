@@ -5,7 +5,7 @@ Tests the two-call approach for analyzing both visual and document content
 import pytest
 import base64
 from unittest.mock import MagicMock, patch, Mock, call
-from message_processor import MessageProcessor
+from message_processor.base import MessageProcessor
 from base_client import Message, Response
 
 

@@ -8,7 +8,7 @@ import time
 from io import BytesIO
 from unittest.mock import MagicMock, patch, Mock, call, AsyncMock
 from datetime import datetime
-from message_processor import MessageProcessor
+from message_processor.base import MessageProcessor
 from base_client import Message, Response
 
 

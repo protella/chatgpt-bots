@@ -4,7 +4,7 @@ import pytest
 from unittest.mock import Mock, patch, MagicMock
 from datetime import datetime
 
-from message_processor import MessageProcessor
+from message_processor.base import MessageProcessor
 
 
 class TestMessageProcessorHelpers:

@@ -7,7 +7,7 @@ from datetime import datetime
 from io import BytesIO
 import base64
 
-from message_processor import MessageProcessor
+from message_processor.base import MessageProcessor
 from base_client import Message, Response
 from openai_client import ImageData
 from thread_manager import ThreadState, AssetLedger
