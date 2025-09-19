@@ -186,7 +186,7 @@ class VisionHandlerMixin:
                 streaming_enabled and thinking_id is not None):
                 # Stream the vision analysis response
                 from streaming.buffer import StreamingBuffer
-                from streaming import RateLimitManager
+                from streaming.global_rate_limiter import GlobalRateLimiter
                 
                 streaming_config = client.get_streaming_config() if hasattr(client, 'get_streaming_config') else {}
                 buffer = StreamingBuffer(
@@ -195,100 +195,150 @@ class VisionHandlerMixin:
                     min_update_interval=streaming_config.get("min_interval", 1.0)
                 )
                 
-                rate_limiter = RateLimitManager(
-                    base_interval=streaming_config.get("update_interval", 2.0),
-                    min_interval=streaming_config.get("min_interval", 1.0),
-                    max_interval=streaming_config.get("max_interval", 30.0),
-                    failure_threshold=streaming_config.get("circuit_breaker_threshold", 5),
-                    cooldown_seconds=streaming_config.get("circuit_breaker_cooldown", 300)
-                )
+                global_limiter = await GlobalRateLimiter.get_instance()
+                rate_limiter = global_limiter.get_limiter()
                 
                 message_id = thinking_id  # Start with the thinking message
 
-                # Start progress updater task (will be cancelled when streaming starts)
-                progress_task = None
-                first_chunk_received = False
-
-                def stream_callback(chunk: str):
-                    nonlocal message_id, progress_task, first_chunk_received
-
-                    # Cancel progress updater on first real chunk
-                    if not first_chunk_received and chunk is not None:
-                        first_chunk_received = True
-                        if progress_task and not progress_task.done():
-                            # Note: We're in a sync callback, so we can't await cancel
-                            # The task will be cancelled from the async context below
-                            pass
-                    # Handle completion signal (None chunk)
-                    if chunk is None:
-                        # Final update without loading indicator
-                        if message_id:
-                            final_text = buffer.get_complete_text()
-                            self._update_message_streaming_sync(client, channel_id, message_id, final_text)
-                        return
-                    
-                    buffer.add_chunk(chunk)
-                    
-                    # Only update if both buffer says it's time AND rate limiter allows it
-                    if buffer.should_update() and rate_limiter.can_make_request():
-                        rate_limiter.record_request_attempt()
-                        
-                        # Build display text with loading indicator
-                        display_text = buffer.get_complete_text() + " " + config.loading_ellipse_emoji
-                        
-                        # Try to update the message
-                        result = self._update_message_streaming_sync(client, channel_id, message_id, display_text)
-                        
-                        if result["success"]:
-                            rate_limiter.record_success()
-                            buffer.mark_updated()
-                            buffer.update_interval_setting(rate_limiter.get_current_interval())
-                        else:
-                            if result["rate_limited"]:
-                                # Handle rate limit response
-                                if result["retry_after"]:
-                                    rate_limiter.set_retry_after(result["retry_after"])
-                                rate_limiter.record_failure(is_rate_limit=True)
-                                
-                                # Check if we should fall back to non-streaming
-                                if not rate_limiter.is_streaming_enabled():
-                                    self.log_warning("Vision streaming circuit breaker opened")
-                            else:
-                                rate_limiter.record_failure(is_rate_limit=False)
-                            self.log_debug(f"Failed to update message: {result.get('error', 'unknown error')}")
-
-                # Start progress updater before making API call
-                try:
-                    progress_task = await self._start_progress_updater_async(
-                        client, channel_id, message_id, "image analysis", emoji=config.analyze_emoji
-                    )
-                    self.log_debug("Started progress updater for vision analysis")
-                except Exception as e:
-                    self.log_warning(f"Failed to start progress updater: {e}")
+                # Check if streaming is allowed by the global limiter
+                if not await global_limiter.is_streaming_allowed():
+                    self.log_warning("Global rate limiter circuit breaker is open - falling back to non-streaming")
+                    # Fall back to non-streaming
                     progress_task = None
+                    try:
+                        progress_task = await self._start_progress_updater_async(
+                            client, channel_id, thinking_id, "image analysis", emoji=config.analyze_emoji
+                        )
+                        self.log_debug("Started progress updater for non-streaming vision analysis (circuit breaker fallback)")
+                    except Exception as e:
+                        self.log_warning(f"Failed to start progress updater: {e}")
+                        progress_task = None
 
-                # Call analyze_images with streaming callback
-                self.log_info("Streaming vision analysis")
-                analysis_result = await self.openai_client.analyze_images(
-                    images=images_to_analyze,
-                    question=enhanced_question,
-                    detail="high",
-                    enhance_prompt=False,  # Already enhanced
-                    conversation_history=enhanced_messages,  # Pass enhanced conversation with image analyses
-                    system_prompt=system_prompt,  # Pass platform system prompt
-                    stream_callback=stream_callback
-                )
+                    analysis_result = await self.openai_client.analyze_images(
+                        images=images_to_analyze,
+                        question=enhanced_question,
+                        detail="high",
+                        enhance_prompt=False,  # Already enhanced
+                        conversation_history=enhanced_messages,  # Pass enhanced conversation with image analyses
+                        system_prompt=system_prompt  # Pass platform system prompt
+                    )
 
-                # Ensure progress updater is cancelled if still running
-                if progress_task and not progress_task.done():
-                    progress_task.cancel()
-                    self.log_debug("Cancelled progress updater after vision analysis")
+                    # Cancel progress updater after completion
+                    if progress_task and not progress_task.done():
+                        progress_task.cancel()
+                        self.log_debug("Cancelled progress updater after non-streaming vision analysis (circuit breaker fallback)")
+                else:
+                    # Start progress updater task (will be cancelled when streaming starts)
+                    progress_task = None
+                    first_chunk_received = False
 
-                # Log streaming stats
-                stats = rate_limiter.get_stats()
-                buffer_stats = buffer.get_stats()
-                self.log_info(f"Vision streaming completed: {stats['successful_requests']}/{stats['total_requests']} updates, "
-                             f"final length: {buffer_stats['text_length']} chars")
+                    # Initialize local stats tracking for the synchronous callback
+                    callback_stats = {
+                        'total_requests': 0,
+                        'successful_requests': 0,
+                        'rate_limited_requests': 0,
+                        'consecutive_failures': 0,
+                        'next_allowed_time': 0
+                    }
+
+                    def stream_callback(chunk: str):
+                        nonlocal message_id, progress_task, first_chunk_received, callback_stats
+
+                        # Cancel progress updater on first real chunk
+                        if not first_chunk_received and chunk is not None:
+                            first_chunk_received = True
+                            if progress_task and not progress_task.done():
+                                # Note: We're in a sync callback, so we can't await cancel
+                                # The task will be cancelled from the async context below
+                                pass
+                        # Handle completion signal (None chunk)
+                        if chunk is None:
+                            # Final update without loading indicator
+                            if message_id:
+                                final_text = buffer.get_complete_text()
+                                self._update_message_streaming_sync(client, channel_id, message_id, final_text)
+                            return
+
+                        buffer.add_chunk(chunk)
+
+                        # Only update if both buffer says it's time AND local rate limiter allows it
+                        current_time = time.time()
+                        if buffer.should_update() and current_time >= callback_stats['next_allowed_time']:
+                            callback_stats['total_requests'] += 1
+
+                            # Build display text with loading indicator
+                            display_text = buffer.get_complete_text() + " " + config.loading_ellipse_emoji
+
+                            # Try to update the message
+                            result = self._update_message_streaming_sync(client, channel_id, message_id, display_text)
+
+                            if result["success"]:
+                                callback_stats['successful_requests'] += 1
+                                callback_stats['consecutive_failures'] = 0
+                                buffer.mark_updated()
+                                buffer.update_interval_setting(2.0)  # Use reasonable default
+                            else:
+                                if result["rate_limited"]:
+                                    # Handle rate limit response
+                                    callback_stats['rate_limited_requests'] += 1
+                                    callback_stats['consecutive_failures'] += 1
+                                    if result["retry_after"]:
+                                        callback_stats['next_allowed_time'] = current_time + result["retry_after"]
+
+                                    # Simple circuit breaker check
+                                    if callback_stats['consecutive_failures'] >= 3:
+                                        self.log_warning("Vision streaming circuit breaker opened (local)")
+                                else:
+                                    callback_stats['consecutive_failures'] += 1
+                                self.log_debug(f"Failed to update message: {result.get('error', 'unknown error')}")
+
+                    # Start progress updater before making API call
+                    try:
+                        progress_task = await self._start_progress_updater_async(
+                            client, channel_id, message_id, "image analysis", emoji=config.analyze_emoji
+                        )
+                        self.log_debug("Started progress updater for vision analysis")
+                    except Exception as e:
+                        self.log_warning(f"Failed to start progress updater: {e}")
+                        progress_task = None
+
+                    # Call analyze_images with streaming callback
+                    self.log_info("Streaming vision analysis")
+                    analysis_result = await self.openai_client.analyze_images(
+                        images=images_to_analyze,
+                        question=enhanced_question,
+                        detail="high",
+                        enhance_prompt=False,  # Already enhanced
+                        conversation_history=enhanced_messages,  # Pass enhanced conversation with image analyses
+                        system_prompt=system_prompt,  # Pass platform system prompt
+                        stream_callback=stream_callback
+                    )
+
+                    # Ensure progress updater is cancelled if still running
+                    if progress_task and not progress_task.done():
+                        progress_task.cancel()
+                        self.log_debug("Cancelled progress updater after vision analysis")
+
+                    # Sync local stats back to global rate limiter
+                    try:
+                        # Record all requests that were made during streaming
+                        for _ in range(callback_stats['total_requests']):
+                            await rate_limiter.record_request_attempt()
+                        for _ in range(callback_stats['successful_requests']):
+                            await rate_limiter.record_success()
+                        for _ in range(callback_stats['rate_limited_requests']):
+                            await rate_limiter.record_failure(is_rate_limit=True)
+                        # Record any other failures
+                        other_failures = callback_stats['total_requests'] - callback_stats['successful_requests'] - callback_stats['rate_limited_requests']
+                        for _ in range(max(0, other_failures)):
+                            await rate_limiter.record_failure(is_rate_limit=False)
+                    except Exception as e:
+                        self.log_warning(f"Failed to sync streaming stats to global limiter: {e}")
+
+                    # Log streaming stats
+                    buffer_stats = buffer.get_stats()
+                    self.log_info(f"Vision streaming completed: {callback_stats['successful_requests']}/{callback_stats['total_requests']} updates, "
+                                 f"final length: {buffer_stats['text_length']} chars")
                 
                 self.log_debug(f"Vision analysis completed: {len(analysis_result)} chars")
             else:

@@ -178,7 +178,7 @@ class ImageEditMixin:
                     if hasattr(client, 'supports_streaming') and client.supports_streaming() and streaming_enabled:
                         # Stream the enhancement to user with proper rate limiting
                         from streaming.buffer import StreamingBuffer
-                        from streaming import RateLimitManager
+                        from streaming.global_rate_limiter import GlobalRateLimiter
                         
                         streaming_config = client.get_streaming_config() if hasattr(client, 'get_streaming_config') else {}
                         buffer = StreamingBuffer(
@@ -187,36 +187,68 @@ class ImageEditMixin:
                             min_update_interval=streaming_config.get("min_interval", 1.0)
                         )
                         
-                        rate_limiter = RateLimitManager(
-                            base_interval=streaming_config.get("update_interval", 2.0),
-                            failure_threshold=streaming_config.get("circuit_breaker_threshold", 5),
-                            cooldown_seconds=streaming_config.get("circuit_breaker_cooldown", 60)
-                        )
+                        # Get the global rate limiter instance
+                        global_limiter = await GlobalRateLimiter.get_instance()
+                        rate_limiter = global_limiter.get_limiter()
+
+                        # Check if circuit breaker allows streaming
+                        if not await global_limiter.is_streaming_allowed():
+                            # Fall back to non-streaming
+                            self.log_warning("Circuit breaker open - falling back to non-streaming image editing")
+                            self._update_status(client, channel_id, thinking_id, "Enhancing your edit request...")
+                            self._update_status(client, channel_id, thinking_id, "Editing your image. This may take a minute...", emoji=config.circle_loader_emoji)
+
+                            edited_image = await self.openai_client.edit_image(
+                                input_images=[base64_data],
+                                prompt=text,
+                                image_description=image_description,
+                                input_mimetypes=["image/png"],
+                                input_fidelity=thread_config.get("input_fidelity", "high"),
+                                background=thread_config.get("image_background", "auto"),
+                                output_format=thread_config.get("image_format", "png"),
+                                output_compression=thread_config.get("image_compression", 100),
+                                enhance_prompt=True,
+                                conversation_history=enhanced_messages
+                            )
+
+                            # Add breadcrumbs with metadata
+                            thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+                            message_ts = message.metadata.get("ts") if message.metadata else None
+                            formatted_text = self._format_user_content_with_username(text, message)
+                            self._add_message_with_token_management(thread_state, "user", formatted_text, db=self.db, thread_key=thread_key, message_ts=message_ts)
+                            self._add_message_with_token_management(thread_state,
+                                "assistant",
+                                edited_image.prompt,
+                                db=self.db,
+                                thread_key=thread_key,
+                                metadata={
+                                    "type": "image_edit",
+                                    "prompt": edited_image.prompt,
+                                    "url": None
+                                }
+                            )
+
+                            return Response(
+                                type="image",
+                                content=edited_image,
+                                metadata={}
+                            )
                         
                         def enhancement_callback(chunk: str):
                             buffer.add_chunk(chunk)
-                            # Only update if both buffer says it's time AND rate limiter allows it
-                            if buffer.should_update() and rate_limiter.can_make_request():
-                                rate_limiter.record_request_attempt()
-                                display_text = f"*Enhanced Prompt:* ✨ _{buffer.get_complete_text()}_ {config.loading_ellipse_emoji}"
-
-                                result = self._update_message_streaming_sync(client, channel_id, thinking_id, display_text)
-                                
-                                if result["success"]:
-                                    rate_limiter.record_success()
-                                    buffer.mark_updated()
-                                    buffer.update_interval_setting(rate_limiter.get_current_interval())
-                                else:
-                                    if result["rate_limited"]:
-                                        if result["retry_after"]:
-                                            rate_limiter.set_retry_after(result["retry_after"])
-                                        rate_limiter.record_failure(is_rate_limit=True)
-                                        
-                                        # Check if circuit breaker opened
-                                        if not rate_limiter.is_streaming_enabled():
-                                            self.log_warning("Image edit enhancement rate limited - circuit breaker opened")
-                                    else:
-                                        rate_limiter.record_failure(is_rate_limit=False)
+                            # Check if buffer says it's time to update
+                            if buffer.should_update():
+                                # Use sync version since we can't await in callback
+                                try:
+                                    loop = asyncio.get_event_loop()
+                                    if loop.is_running():
+                                        display_text = f"*Enhanced Prompt:* ✨ _{buffer.get_complete_text()}_ {config.loading_ellipse_emoji}"
+                                        result = self._update_message_streaming_sync(client, channel_id, thinking_id, display_text)
+                                        if result["success"]:
+                                            buffer.mark_updated()
+                                        # Note: Rate limiter stats update skipped due to callback constraints
+                                except Exception as e:
+                                    self.log_debug(f"Enhancement callback error: {e}")
                         
                         # First enhance the prompt with streaming
                         enhanced_edit_prompt = await self.openai_client._enhance_image_edit_prompt(
@@ -516,7 +548,7 @@ class ImageEditMixin:
         if hasattr(client, 'supports_streaming') and client.supports_streaming() and streaming_enabled:
             # Stream the enhancement to user with proper rate limiting
             from streaming.buffer import StreamingBuffer
-            from streaming import RateLimitManager
+            from streaming.global_rate_limiter import GlobalRateLimiter
             
             streaming_config = client.get_streaming_config() if hasattr(client, 'get_streaming_config') else {}
             buffer = StreamingBuffer(
@@ -525,39 +557,88 @@ class ImageEditMixin:
                 min_update_interval=streaming_config.get("min_interval", 1.0)
             )
             
-            rate_limiter = RateLimitManager(
-                base_interval=streaming_config.get("update_interval", 2.0),
-                min_interval=streaming_config.get("min_interval", 1.0),
-                max_interval=streaming_config.get("max_interval", 30.0),
-                failure_threshold=streaming_config.get("circuit_breaker_threshold", 5),
-                cooldown_seconds=streaming_config.get("circuit_breaker_cooldown", 300)
-            )
+            # Get the global rate limiter instance
+            global_limiter = await GlobalRateLimiter.get_instance()
+            rate_limiter = global_limiter.get_limiter()
+
+            # Check if circuit breaker allows streaming
+            if not await global_limiter.is_streaming_allowed():
+                # Fall back to non-streaming
+                self.log_warning("Circuit breaker open - falling back to non-streaming image editing")
+                try:
+                    image_data = await self.openai_client.edit_image(
+                        input_images=input_images,
+                        input_mimetypes=input_mimetypes,
+                        prompt=user_edit_request,
+                        image_description=image_analysis,
+                        input_fidelity=thread_config.get("input_fidelity", "high"),
+                        background=thread_config.get("image_background", "auto"),
+                        output_format=thread_config.get("image_format", "png"),
+                        output_compression=thread_config.get("image_compression", 100),
+                        enhance_prompt=True,
+                        conversation_history=enhanced_messages
+                    )
+                except Exception as e:
+                    self.log_error(f"Error editing image: {e}")
+                    return Response(
+                        type="error",
+                        content=f"Failed to edit image: {str(e)}"
+                    )
+
+                # Add breadcrumbs and store image
+                user_breadcrumb = text or ""
+                thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+                message_ts = message.metadata.get("ts") if message.metadata else None
+                formatted_breadcrumb = self._format_user_content_with_username(user_breadcrumb, message)
+                self._add_message_with_token_management(thread_state, "user", formatted_breadcrumb, db=self.db, thread_key=thread_key, message_ts=message_ts)
+
+                asset_ledger = self.thread_manager.get_or_create_asset_ledger(thread_state.thread_ts)
+                asset_ledger.add_image(
+                    image_data.base64_data,
+                    image_data.prompt,
+                    time.time(),
+                    source="edited",
+                    db=self.db,
+                    thread_id=thread_key,
+                    analysis=image_analysis
+                )
+
+                content = f"{image_data.prompt}\n\n[Original: {image_analysis}]" if image_analysis else image_data.prompt
+                self._add_message_with_token_management(thread_state,
+                    "assistant",
+                    content,
+                    db=self.db,
+                    thread_key=thread_key,
+                    metadata={
+                        "type": "image_edit",
+                        "prompt": image_data.prompt,
+                        "original_analysis": image_analysis if image_analysis else None,
+                        "url": None
+                    }
+                )
+
+                return Response(
+                    type="image",
+                    content=image_data,
+                    metadata={}
+                )
             
             
             def enhancement_callback(chunk: str):
                 buffer.add_chunk(chunk)
-                # Only update if both buffer says it's time AND rate limiter allows it
-                if buffer.should_update() and rate_limiter.can_make_request():
-                    rate_limiter.record_request_attempt()
-                    display_text = f"*Enhanced Prompt:* ✨ _{buffer.get_complete_text()}_ {config.loading_ellipse_emoji}"
-
-                    result = self._update_message_streaming_sync(client, channel_id, thinking_id, display_text)
-                    
-                    if result["success"]:
-                        rate_limiter.record_success()
-                        buffer.mark_updated()
-                        buffer.update_interval_setting(rate_limiter.get_current_interval())
-                    else:
-                        if result["rate_limited"]:
-                            if result["retry_after"]:
-                                rate_limiter.set_retry_after(result["retry_after"])
-                            rate_limiter.record_failure(is_rate_limit=True)
-                            
-                            # Check if circuit breaker opened
-                            if not rate_limiter.is_streaming_enabled():
-                                self.log_warning("Image edit enhancement rate limited - circuit breaker opened")
-                        else:
-                            rate_limiter.record_failure(is_rate_limit=False)
+                # Check if buffer says it's time to update
+                if buffer.should_update():
+                    # Use sync version since we can't await in callback
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            display_text = f"*Enhanced Prompt:* ✨ _{buffer.get_complete_text()}_ {config.loading_ellipse_emoji}"
+                            result = self._update_message_streaming_sync(client, channel_id, thinking_id, display_text)
+                            if result["success"]:
+                                buffer.mark_updated()
+                            # Note: Rate limiter stats update skipped due to callback constraints
+                    except Exception as e:
+                        self.log_debug(f"Enhancement callback error: {e}")
             
             # First enhance the prompt with streaming
             enhanced_edit_prompt = await self.openai_client._enhance_image_edit_prompt(
@@ -620,14 +701,19 @@ class ImageEditMixin:
 
                 # After edit is complete, update message to show just the enhanced prompt
                 # (remove the "Generating edited image..." status) - but respect rate limits
-                if enhanced_edit_prompt and thinking_id and rate_limiter.can_make_request():
+                if enhanced_edit_prompt and thinking_id and await rate_limiter.can_make_request():
+                    await rate_limiter.record_request_attempt()
                     result = self._update_message_streaming_sync(client, channel_id, thinking_id, f"*Enhanced Prompt:* ✨ _{enhanced_edit_prompt}_")
                     if result["success"]:
-                        rate_limiter.record_success()
+                        await rate_limiter.record_success()
                     else:
                         if result["rate_limited"]:
-                            rate_limiter.record_failure(is_rate_limit=True)
+                            if result["retry_after"]:
+                                await rate_limiter.set_retry_after(result["retry_after"])
+                            await rate_limiter.record_failure(is_rate_limit=True)
                             self.log_debug("Couldn't clean up image edit status due to rate limit")
+                        else:
+                            await rate_limiter.record_failure(is_rate_limit=False)
 
             except Exception as e:
                 # Cancel progress updater on error

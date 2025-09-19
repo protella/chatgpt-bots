@@ -5,7 +5,8 @@ from typing import Any, List, Optional
 
 from base_client import BaseClient, Message, Response
 from config import config
-from streaming import FenceHandler, RateLimitManager, StreamingBuffer
+from streaming import FenceHandler, StreamingBuffer
+from streaming.global_rate_limiter import GlobalRateLimiter
 
 
 class TextHandlerMixin:
@@ -172,6 +173,47 @@ class TextHandlerMixin:
             content=response_text
         )
 
+    async def _update_message_with_retry(self, client, channel_id: str, message_id: str, text: str, max_retries: int = 3):
+        """
+        Update a message with retry logic for rate limit handling
+
+        Args:
+            client: Slack client
+            channel_id: Channel ID
+            message_id: Message timestamp/ID
+            text: Text to update message with
+            max_retries: Maximum number of retry attempts
+        """
+        import asyncio
+
+        for attempt in range(max_retries):
+            try:
+                result = await client.update_message_streaming(channel_id, message_id, text)
+                if result["success"]:
+                    return result
+
+                # Check if it's a rate limit error
+                error_msg = str(result.get('error', ''))
+                if 'ratelimited' in error_msg.lower() or '429' in error_msg:
+                    # Calculate exponential backoff: 2^attempt seconds (1s, 2s, 4s)
+                    wait_time = 2 ** attempt
+                    self.log_warning(f"Rate limited on cleanup attempt {attempt + 1}/{max_retries}, waiting {wait_time}s")
+                    await asyncio.sleep(wait_time)
+                else:
+                    # Non-rate-limit error, don't retry
+                    raise Exception(f"Update failed: {error_msg}")
+
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    # Final attempt failed
+                    raise
+                else:
+                    # Log and retry
+                    self.log_debug(f"Cleanup attempt {attempt + 1} failed: {e}")
+                    await asyncio.sleep(2 ** attempt)
+
+        raise Exception(f"Failed to update message after {max_retries} attempts")
+
     async def _handle_streaming_text_response(self, user_content: Any, thread_state, client: BaseClient,
                                       message: Message, thinking_id: Optional[str] = None,
                                       attachment_urls: Optional[List[str]] = None) -> Response:
@@ -191,13 +233,20 @@ class TextHandlerMixin:
             min_update_interval=streaming_config.get("min_interval", 1.0)
         )
         
-        rate_limiter = RateLimitManager(
-            base_interval=streaming_config.get("update_interval", 2.0),
-            min_interval=streaming_config.get("min_interval", 1.0),
-            max_interval=streaming_config.get("max_interval", 30.0),
-            failure_threshold=streaming_config.get("circuit_breaker_threshold", 5),
-            cooldown_seconds=streaming_config.get("circuit_breaker_cooldown", 300)
-        )
+        # Get global rate limiter instance
+        global_limiter = await GlobalRateLimiter.get_instance()
+
+        # Check if circuit breaker allows streaming
+        if not await global_limiter.is_streaming_allowed():
+            cooldown = await global_limiter.get_cooldown_remaining()
+            self.log_warning(f"Circuit breaker OPEN - falling back to non-streaming (cooldown: {cooldown:.1f}s)")
+            return await self._handle_text_response(
+                user_content, thread_state, client, message,
+                thinking_id, attachment_urls, retry_count=0
+            )
+
+        # Use the shared rate limiter
+        rate_limiter = global_limiter.get_limiter()
         
         self.log_info("Starting streaming response generation")
         
@@ -352,6 +401,7 @@ class TextHandlerMixin:
         continuation_msg = "\n\n*Continued in next message...*"
         message_char_limit = 3700 - len(continuation_msg)  # Reserve space for continuation indicator
         streaming_aborted = False  # Track if we had to abort streaming due to failures
+        circuit_breaker_tripped = False  # Track if circuit breaker tripped during streaming
 
         # Start progress updater task (will be cancelled when streaming starts)
         progress_task = None
@@ -360,10 +410,10 @@ class TextHandlerMixin:
         # Define the streaming callback
         async def stream_callback(text_chunk: str):
             """Callback function called with each text chunk from OpenAI"""
-            nonlocal current_message_id, current_part, overflow_buffer, progress_task, first_chunk_received, streaming_aborted
+            nonlocal current_message_id, current_part, overflow_buffer, progress_task, first_chunk_received, streaming_aborted, circuit_breaker_tripped
 
             # If we've aborted, ignore further chunks
-            if streaming_aborted:
+            if streaming_aborted or circuit_breaker_tripped:
                 return
 
             # Cancel progress updater on first real chunk (not the None completion signal)
@@ -376,9 +426,8 @@ class TextHandlerMixin:
             # Check if this is the completion signal (None)
             if text_chunk is None:
                 # Stream is complete - flush any remaining buffered text WITHOUT loading indicator
-                if buffer.has_pending_update() and rate_limiter.can_make_request():
+                if buffer.has_pending_update():
                     self.log_info("Flushing final buffered text")
-                    rate_limiter.record_request_attempt()
                     # Use raw text for final flush - no loading indicator since stream is complete
                     final_text = buffer.get_complete_text()  # No loading indicator on completion
 
@@ -389,7 +438,6 @@ class TextHandlerMixin:
                     try:
                         result = await client.update_message_streaming(message.channel_id, current_message_id, final_text)
                         if result["success"]:
-                            rate_limiter.record_success()
                             buffer.mark_updated()
                     except Exception as e:
                         self.log_error(f"Error flushing final text: {e}")
@@ -400,10 +448,10 @@ class TextHandlerMixin:
                 
             # Add chunk to buffer
             buffer.add_chunk(text_chunk)
-            
+
             # Check if it's time to update
-            if buffer.should_update() and rate_limiter.can_make_request():
-                rate_limiter.record_request_attempt()
+            if buffer.should_update() and await rate_limiter.can_make_request():
+                await rate_limiter.record_request_attempt()
                 
                 # Check if we need to overflow based on RAW text (not display text)
                 raw_text = buffer.get_complete_text()
@@ -537,16 +585,23 @@ class TextHandlerMixin:
                         result = await client.update_message_streaming(message.channel_id, current_message_id, display_text_with_indicator)
 
                         if result["success"]:
-                            rate_limiter.record_success()
+                            await rate_limiter.record_success()
                             buffer.mark_updated()
-                            buffer.update_interval_setting(rate_limiter.get_current_interval())
+                            buffer.update_interval_setting(await rate_limiter.get_current_interval())
                         else:
                             # Update failed - this is CRITICAL, we must not lose text!
                             if result["rate_limited"]:
                                 # Handle rate limit response
-                                if result["retry_after"]:
-                                    rate_limiter.set_retry_after(result["retry_after"])
-                                rate_limiter.record_failure(is_rate_limit=True)
+                                if result.get("retry_after"):
+                                    await rate_limiter.set_retry_after(result["retry_after"])
+                                await rate_limiter.record_failure(is_rate_limit=True)
+
+                                # Check if circuit breaker has tripped
+                                if not await global_limiter.is_streaming_allowed():
+                                    self.log_error("Circuit breaker tripped during streaming - aborting stream")
+                                    circuit_breaker_tripped = True
+                                    streaming_aborted = True
+                                    return
 
                                 # Wait and retry with the same accumulated text
                                 retry_wait = result.get("retry_after", 2.0)
@@ -580,6 +635,12 @@ class TextHandlerMixin:
                                         if retry_count >= 5 and not retry_result.get("success"):
                                             # After 5 attempts, we really need to stop
                                             self.log_error("CRITICAL: Unable to update after 5 attempts - stopping stream")
+
+                                            # Check if circuit breaker has tripped
+                                            if not await global_limiter.is_streaming_allowed():
+                                                self.log_error("Circuit breaker tripped after multiple failures")
+                                                circuit_breaker_tripped = True
+
                                             streaming_aborted = True
                                             return
                                 except Exception as retry_error:
@@ -600,7 +661,7 @@ class TextHandlerMixin:
                                         retry_count += 1
                             else:
                                 # Non-rate-limit failure - try one immediate retry
-                                rate_limiter.record_failure(is_rate_limit=False)
+                                await rate_limiter.record_failure(is_rate_limit=False)
                                 self.log_warning(f"Message update failed: {result.get('error', 'Unknown error')} - attempting retry")
 
                                 # Immediate retry
@@ -631,12 +692,21 @@ class TextHandlerMixin:
                                         if retry_count >= 5 and not retry_result.get("success"):
                                             # After 5 attempts, stop to prevent infinite loop
                                             self.log_error("CRITICAL: Unable to update after 5 attempts")
+
+                                            # Check if circuit breaker has tripped
+                                            if not await global_limiter.is_streaming_allowed():
+                                                self.log_error("Circuit breaker tripped after non-rate-limit failures")
+                                                circuit_breaker_tripped = True
+                                            else:
+                                                # Show error message only if circuit breaker hasn't tripped
+                                                # (if it has, we'll fall back to non-streaming instead)
+                                                error_msg = f"{buffer.get_complete_text()}\n\n{config.error_emoji} *Streaming interrupted after multiple failures.*"
+                                                try:
+                                                    await client.update_message_streaming(message.channel_id, current_message_id, error_msg)
+                                                except:
+                                                    pass
+
                                             streaming_aborted = True
-                                            error_msg = f"{buffer.get_complete_text()}\n\n{config.error_emoji} *Streaming interrupted after multiple failures.*"
-                                            try:
-                                                await client.update_message_streaming(message.channel_id, current_message_id, error_msg)
-                                            except:
-                                                pass
                                             return
                                 except Exception as retry_error:
                                     self.log_error(f"Retry exception: {retry_error}")
@@ -660,7 +730,7 @@ class TextHandlerMixin:
                                         return
                             
                     except Exception as e:
-                        rate_limiter.record_failure(is_rate_limit=False)
+                        await rate_limiter.record_failure(is_rate_limit=False)
                         self.log_error(f"Error updating streaming message: {e}")
         
         # Start progress updater before making API call
@@ -672,6 +742,26 @@ class TextHandlerMixin:
         except Exception as e:
             self.log_warning(f"Failed to start progress updater: {e}")
             progress_task = None
+
+        # Start circuit breaker monitor task
+        circuit_monitor_task = None
+        async def monitor_circuit_breaker():
+            """Background task to monitor circuit breaker state during streaming"""
+            nonlocal circuit_breaker_tripped, streaming_aborted
+            while not streaming_aborted and not circuit_breaker_tripped:
+                await asyncio.sleep(2.0)  # Check every 2 seconds
+                if not await global_limiter.is_streaming_allowed():
+                    self.log_warning("Circuit breaker detected as OPEN during streaming")
+                    circuit_breaker_tripped = True
+                    streaming_aborted = True
+                    break
+
+        try:
+            circuit_monitor_task = asyncio.create_task(monitor_circuit_breaker())
+            self.log_debug("Started circuit breaker monitor task")
+        except Exception as e:
+            self.log_warning(f"Failed to start circuit monitor: {e}")
+            circuit_monitor_task = None
 
         # Start streaming from OpenAI with the callback
         try:
@@ -713,11 +803,37 @@ class TextHandlerMixin:
                 progress_task.cancel()
                 self.log_debug("Cancelled progress updater after API call completed")
 
+            # Ensure circuit monitor is cancelled if still running
+            if circuit_monitor_task and not circuit_monitor_task.done():
+                circuit_monitor_task.cancel()
+                self.log_debug("Cancelled circuit breaker monitor after API call completed")
+
             # Check if streaming was aborted due to failures
             if streaming_aborted:
                 self.log_error("Streaming was aborted due to update failures")
-                # The error message was already shown in the callback
-                # Return an error response to prevent saving incomplete data
+
+                # If circuit breaker tripped, delete the broken message and fall back to non-streaming
+                if circuit_breaker_tripped:
+                    self.log_warning("Circuit breaker tripped during streaming - deleting broken message and falling back to non-streaming")
+
+                    # Try to delete the broken streaming message
+                    try:
+                        # Delete the message with loading indicator
+                        delete_text = ""  # Empty message to effectively "delete" it visually
+                        await client.update_message(message.channel_id, current_message_id, delete_text)
+                        self.log_info("Deleted broken streaming message")
+                    except Exception as e:
+                        self.log_error(f"Failed to delete broken streaming message: {e}")
+                        # Even if deletion fails, we'll still fall back to non-streaming
+
+                    # Fall back to non-streaming response
+                    self.log_info("Falling back to non-streaming response after circuit breaker trip")
+                    return await self._handle_text_response(
+                        user_content, thread_state, client, message,
+                        thinking_id, attachment_urls, retry_count=0
+                    )
+
+                # Non-circuit-breaker abort - return error
                 return Response(
                     type="error",
                     content=f"Streaming was interrupted. Partial response was shown but may be incomplete.",
@@ -736,11 +852,10 @@ class TextHandlerMixin:
                     if final_part_text:
                         # Add the part indicator
                         final_part_text = f"*Part {current_part} (continued)*\n\n{final_part_text}"
-                        final_result = await client.update_message_streaming(message.channel_id, current_message_id, final_part_text)
-                        if not final_result["success"]:
-                            self.log_error(f"Failed to remove indicator from part {current_part}: {final_result.get('error', 'Unknown error')}")
+                        # Use retry logic for cleanup
+                        await self._update_message_with_retry(client, message.channel_id, current_message_id, final_part_text)
                 except Exception as e:
-                    self.log_error(f"Error removing indicator from overflow message: {e}")
+                    self.log_error(f"Error removing indicator from overflow message after retries: {e}")
             else:
                 # Original message - check if we need to handle any remaining text
                 if response_text != buffer.last_sent_text or True:  # Always update to remove indicator
@@ -760,34 +875,31 @@ class TextHandlerMixin:
                             # This shouldn't happen if streaming overflow worked correctly
                             # But handle it as a fallback
                             truncated_text = response_text[:3800] + "\n\n*Continued in next message...*"
-                            final_result = await client.update_message_streaming(message.channel_id, message_id, truncated_text)
+                            # Use retry logic for cleanup
+                            await self._update_message_with_retry(client, message.channel_id, message_id, truncated_text)
 
                             # Send the rest as new messages
                             overflow_text = response_text[3800:]
                             await client.send_message(message.channel_id, thinking_id, f"*...continued*\n\n{overflow_text}")
-                            
-                            if not final_result["success"]:
-                                self.log_error(f"Final truncated update failed: {final_result.get('error', 'Unknown error')}")
                         else:
-                            final_result = await client.update_message_streaming(message.channel_id, current_message_id, response_text)
-                            if not final_result["success"]:
-                                self.log_error(f"Final correction update failed: {final_result.get('error', 'Unknown error')}")
+                            # Use retry logic for final cleanup
+                            await self._update_message_with_retry(client, message.channel_id, current_message_id, response_text)
                     except Exception as e:
                         self.log_error(f"Error in final correction update: {e}")
             
             # Note: To properly detect if web search was used, we'd need to track
             # tool events during streaming. The presence of URLs doesn't mean web search was used.
-            
+
             # Add assistant response to thread state
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
             self._add_message_with_token_management(thread_state, "assistant", response_text, db=self.db, thread_key=thread_key)
-            
+
             # Schedule async cleanup after response
             cleanup_coro = self._async_post_response_cleanup(thread_state, thread_key)
             self._schedule_async_call(cleanup_coro)
-            
+
             # Log streaming stats
-            stats = rate_limiter.get_stats()
+            stats = await rate_limiter.get_stats()
             buffer_stats = buffer.get_stats()
             self.log_info(f"Streaming completed: {stats['successful_requests']}/{stats['total_requests']} updates, "
                          f"final length: {buffer_stats['text_length']} chars")
@@ -806,6 +918,11 @@ class TextHandlerMixin:
                 progress_task.cancel()
                 self.log_debug("Cancelled progress updater due to error")
 
+            # Ensure circuit monitor is cancelled on error
+            if circuit_monitor_task and not circuit_monitor_task.done():
+                circuit_monitor_task.cancel()
+                self.log_debug("Cancelled circuit breaker monitor due to error")
+
             # Try to remove the loading indicator if we had a message_id
             if message_id and hasattr(client, 'update_message_streaming'):
                 try:
@@ -814,9 +931,11 @@ class TextHandlerMixin:
                         error_text = buffer.get_complete_text()
                     else:
                         error_text = f"{config.error_emoji} *OpenAI Stream Interrupted*\n\nOpenAI's streaming response was interrupted. I'll try again without streaming..."
-                    await client.update_message_streaming(message.channel_id, message_id, error_text)
+
+                    # Retry cleanup with exponential backoff if rate limited
+                    await self._update_message_with_retry(client, message.channel_id, message_id, error_text)
                 except Exception as cleanup_error:
-                    self.log_debug(f"Could not remove loading indicator: {cleanup_error}")
+                    self.log_debug(f"Could not remove loading indicator after retries: {cleanup_error}")
             
             # Fall back to non-streaming on error
             self.log_info("Falling back to non-streaming due to error")

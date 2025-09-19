@@ -7,7 +7,8 @@ import time
 
 from base_client import BaseClient, Message, Response
 from config import config
-from streaming import RateLimitManager, StreamingBuffer
+from streaming.global_rate_limiter import GlobalRateLimiter
+from streaming.buffer import StreamingBuffer
 
 
 class ImageGenerationMixin:
@@ -48,39 +49,105 @@ class ImageGenerationMixin:
                 min_update_interval=streaming_config.get("min_interval", 1.0)
             )
             
-            rate_limiter = RateLimitManager(
-                base_interval=streaming_config.get("update_interval", 2.0),
-                min_interval=streaming_config.get("min_interval", 1.0),
-                max_interval=streaming_config.get("max_interval", 30.0),
-                failure_threshold=streaming_config.get("circuit_breaker_threshold", 5),
-                cooldown_seconds=streaming_config.get("circuit_breaker_cooldown", 300)
-            )
+            # Get the global rate limiter instance
+            global_limiter = await GlobalRateLimiter.get_instance()
+            rate_limiter = global_limiter.get_limiter()
+
+            # Check if circuit breaker allows streaming
+            if not await global_limiter.is_streaming_allowed():
+                # Fall back to non-streaming
+                self.log_warning("Circuit breaker open - falling back to non-streaming image generation")
+                # Non-streaming fallback
+                if not skip_enhancement:
+                    self._update_status(client, channel_id, thinking_id, "Enhancing your prompt...")
+
+                # Generate image with or without enhancement
+                self._update_status(client, channel_id, thinking_id, "Creating your image. This may take a minute...", emoji=config.circle_loader_emoji)
+
+                try:
+                    image_data = await self.openai_client.generate_image(
+                        prompt=prompt,
+                        size=thread_config.get("image_size"),
+                        quality=thread_config.get("image_quality"),
+                        enhance_prompt=not skip_enhancement,
+                        conversation_history=enhanced_messages if not skip_enhancement else None
+                    )
+                except Exception as e:
+                    error_str = str(e)
+                    if "moderation_blocked" in error_str or "safety system" in error_str or "content policy" in error_str.lower():
+                        moderation_msg = (
+                            "I couldn't generate that image as it was flagged by content safety filters. "
+                            "This can happen with certain brand names, people, or other protected content. "
+                            "Try rephrasing your request or describing what you want without using specific names."
+                        )
+
+                        thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+                        message_ts = message.metadata.get("ts") if message.metadata else None
+                        formatted_prompt = self._format_user_content_with_username(prompt, message)
+                        self._add_message_with_token_management(thread_state, "user", formatted_prompt, db=self.db, thread_key=thread_key, message_ts=message_ts)
+                        self._add_message_with_token_management(thread_state, "assistant", moderation_msg, db=self.db, thread_key=thread_key)
+
+                        return Response(
+                            type="text",
+                            content=moderation_msg
+                        )
+                    else:
+                        raise
+
+                # Store in asset ledger and add breadcrumbs
+                asset_ledger = self.thread_manager.get_or_create_asset_ledger(thread_state.thread_ts)
+                thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+                asset_ledger.add_image(
+                    image_data.base64_data,
+                    image_data.prompt,
+                    time.time(),
+                    db=self.db,
+                    thread_id=thread_key
+                )
+
+                message_ts = message.metadata.get("ts") if message.metadata else None
+                formatted_prompt = self._format_user_content_with_username(prompt, message)
+                self._add_message_with_token_management(thread_state, "user", formatted_prompt, db=self.db, thread_key=thread_key, message_ts=message_ts)
+                self._add_message_with_token_management(thread_state,
+                    "assistant",
+                    image_data.prompt,
+                    db=self.db,
+                    thread_key=thread_key,
+                    metadata={
+                        "type": "image_generation",
+                        "prompt": image_data.prompt,
+                        "url": None
+                    }
+                )
+
+                return Response(
+                    type="image",
+                    content=image_data,
+                    metadata={}
+                )
             
             
             def enhancement_callback(chunk: str):
                 buffer.add_chunk(chunk)
-                # Only update if both buffer says it's time AND rate limiter allows it
-                if buffer.should_update() and rate_limiter.can_make_request():
-                    rate_limiter.record_request_attempt()
-                    display_text = f"*Enhanced Prompt:* ✨ _{buffer.get_complete_text()}_ {config.loading_ellipse_emoji}"
-                    
-                    result = self._update_message_streaming_sync(client, channel_id, thinking_id, display_text)
-                    
-                    if result["success"]:
-                        rate_limiter.record_success()
-                        buffer.mark_updated()
-                        buffer.update_interval_setting(rate_limiter.get_current_interval())
-                    else:
-                        if result["rate_limited"]:
-                            if result["retry_after"]:
-                                rate_limiter.set_retry_after(result["retry_after"])
-                            rate_limiter.record_failure(is_rate_limit=True)
-                            
-                            # Check if circuit breaker opened
-                            if not rate_limiter.is_streaming_enabled():
-                                self.log_warning("Image enhancement rate limited - circuit breaker opened")
+                # Check if buffer says it's time to update
+                if buffer.should_update():
+                    # Use sync version to check if rate limiter allows it
+                    try:
+                        # Create a new event loop or get the existing one for sync access
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            # We're in an async context but can't await here, so use create_task
+                            # This is a limitation of the callback design - we'll skip rate limiting here
+                            display_text = f"*Enhanced Prompt:* ✨ _{buffer.get_complete_text()}_ {config.loading_ellipse_emoji}"
+                            result = self._update_message_streaming_sync(client, channel_id, thinking_id, display_text)
+                            if result["success"]:
+                                buffer.mark_updated()
+                            # Note: We can't update rate limiter stats here due to callback constraints
                         else:
-                            rate_limiter.record_failure(is_rate_limit=False)
+                            # No event loop, this shouldn't happen in our context
+                            pass
+                    except Exception as e:
+                        self.log_debug(f"Enhancement callback error: {e}")
             
             # Enhance prompt with streaming (returns the complete enhanced text)
             enhanced_prompt = await self.openai_client._enhance_image_prompt(
@@ -169,14 +236,19 @@ class ImageGenerationMixin:
             
             # After image is generated, update message to show just the enhanced prompt
             # (remove the "Generating image..." status) - but respect rate limits
-            if enhanced_prompt and thinking_id and rate_limiter.can_make_request():
+            if enhanced_prompt and thinking_id and await rate_limiter.can_make_request():
+                await rate_limiter.record_request_attempt()
                 result = self._update_message_streaming_sync(client, channel_id, thinking_id, f"*Enhanced Prompt:* ✨ _{enhanced_prompt}_")
                 if result["success"]:
-                    rate_limiter.record_success()
+                    await rate_limiter.record_success()
                 else:
                     if result["rate_limited"]:
-                        rate_limiter.record_failure(is_rate_limit=True)
+                        if result["retry_after"]:
+                            await rate_limiter.set_retry_after(result["retry_after"])
+                        await rate_limiter.record_failure(is_rate_limit=True)
                         self.log_debug("Couldn't clean up image gen status due to rate limit")
+                    else:
+                        await rate_limiter.record_failure(is_rate_limit=False)
         else:
             # Non-streaming fallback or skip enhancement
             if not skip_enhancement:
