@@ -1,7 +1,7 @@
 """Test multi-user conversation support"""
 import pytest
 from unittest.mock import MagicMock, patch
-from message_processor import MessageProcessor
+from message_processor.base import MessageProcessor
 from base_client import Message
 from config import config
 

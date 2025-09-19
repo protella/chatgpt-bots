@@ -5,7 +5,7 @@ These tests verify the full flow with real-like data
 import pytest
 import base64
 from unittest.mock import MagicMock, patch, Mock
-from message_processor import MessageProcessor
+from message_processor.base import MessageProcessor
 from base_client import Message, Response
 from document_handler import DocumentHandler
 from thread_manager import ThreadStateManager

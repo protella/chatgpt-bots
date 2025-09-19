@@ -616,6 +616,10 @@ async def create_streaming_response_with_tools(
         self.log_info(f"Generated streaming response with tools: {len(complete_text)} chars")
         return complete_text
         
+    except asyncio.TimeoutError as e:
+        # Log timeout as warning without stack trace
+        self.log_warning(f"Streaming response with tools timed out: {e}")
+        raise
     except Exception as e:
         self.log_error(f"Error creating streaming response with tools: {e}", exc_info=True)
         raise
@@ -941,6 +945,10 @@ async def _create_text_response_with_timeout(
         self.log_info(f"Generated response with custom timeout: {len(output_text)} chars")
         return output_text
 
+    except asyncio.TimeoutError as e:
+        # Log timeout as warning without stack trace
+        self.log_warning(f"Text response timed out: {e}")
+        raise
     except Exception as e:
         self.log_error(f"Error creating text response with timeout: {e}", exc_info=True)
         raise
@@ -1044,6 +1052,10 @@ async def _create_text_response_with_tools_with_timeout(
         self.log_info(f"Generated response with tools and custom timeout: {len(output_text)} chars")
         return output_text
 
+    except asyncio.TimeoutError as e:
+        # Log timeout as warning without stack trace
+        self.log_warning(f"Response with tools timed out: {e}")
+        raise
     except Exception as e:
         self.log_error(f"Error creating response with tools and timeout: {e}", exc_info=True)
         raise
