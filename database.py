@@ -185,8 +185,8 @@ class DatabaseManager(LoggerMixin):
                 
                 -- Model settings
                 model TEXT DEFAULT 'gpt-5',
-                reasoning_effort TEXT DEFAULT 'medium',
-                verbosity TEXT DEFAULT 'medium',
+                reasoning_effort TEXT DEFAULT 'low',
+                verbosity TEXT DEFAULT 'low',
                 temperature REAL DEFAULT 0.8,
                 top_p REAL DEFAULT 1.0,
                 
@@ -288,8 +288,8 @@ class DatabaseManager(LoggerMixin):
                         
                         -- Model settings
                         model TEXT DEFAULT 'gpt-5',
-                        reasoning_effort TEXT DEFAULT 'medium',
-                        verbosity TEXT DEFAULT 'medium',
+                        reasoning_effort TEXT DEFAULT 'low',
+                        verbosity TEXT DEFAULT 'low',
                         temperature REAL DEFAULT 0.8,
                         top_p REAL DEFAULT 1.0,
                         

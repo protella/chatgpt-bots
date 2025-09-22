@@ -265,7 +265,9 @@ class SettingsModal(LoggerMixin):
         
         # Reasoning Level
         # Ensure initial option is valid for the current options list
-        current_reasoning = settings.get('reasoning_effort', 'medium')
+        # Use config defaults if not set in settings
+        from config import config
+        current_reasoning = settings.get('reasoning_effort', config.default_reasoning_effort)
         self.log_debug(f"Building reasoning options - web_search: {web_search_enabled}, current: {current_reasoning}")
         
         # Force-validate the reasoning level for web search compatibility
@@ -274,8 +276,8 @@ class SettingsModal(LoggerMixin):
             current_reasoning = 'low'
             self.log_debug("Adjusted reasoning from minimal to low for display")
         elif not current_reasoning or current_reasoning not in ['minimal', 'low', 'medium', 'high']:
-            # Fallback if no valid reasoning is set
-            current_reasoning = 'low' if web_search_enabled else 'medium'
+            # Fallback if no valid reasoning is set - use config defaults
+            current_reasoning = 'low' if web_search_enabled else config.default_reasoning_effort
             self.log_debug(f"No valid reasoning, defaulting to {current_reasoning}")
         
         # Build options list - use the _get_reasoning_display function for consistency
@@ -295,7 +297,7 @@ class SettingsModal(LoggerMixin):
         # Final validation - ensure current_reasoning is in available options
         if current_reasoning not in available_values:
             # This shouldn't happen with our logic above, but let's be safe
-            current_reasoning = 'low' if web_search_enabled else 'medium'
+            current_reasoning = 'low' if web_search_enabled else config.default_reasoning_effort
             self.log_warning(f"Current reasoning {current_reasoning} not in available options, using fallback")
         
         # Build the reasoning block
@@ -379,8 +381,8 @@ class SettingsModal(LoggerMixin):
                 "type": "radio_buttons",
                 "action_id": "verbosity",
                 "initial_option": {
-                    "text": {"type": "plain_text", "text": self._get_verbosity_display(settings.get('verbosity', 'medium'))},
-                    "value": settings.get('verbosity', 'medium')
+                    "text": {"type": "plain_text", "text": self._get_verbosity_display(settings.get('verbosity', config.default_verbosity))},
+                    "value": settings.get('verbosity', config.default_verbosity)
                 },
                 "options": [
                     {"text": {"type": "plain_text", "text": "📝 Concise"}, "value": "low"},
