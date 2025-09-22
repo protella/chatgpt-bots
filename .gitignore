@@ -170,3 +170,4 @@ data/backups/*
 # BMAD (local only)
 .bmad-core/
 .bmad-*/
+metrics_reports/
