@@ -9,6 +9,9 @@ croniter
 pytz
 tiktoken>=0.5.0
 
+# Logging dependencies
+concurrent-log-handler>=0.9.28
+
 # Async dependencies
 aiosqlite>=0.19.0
 aiofiles>=23.0.0
