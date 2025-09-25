@@ -693,7 +693,7 @@ class MessageProcessor(ThreadManagementMixin,
             # Check if we should retry (only for text/intent operations, not image/vision operations)
             already_retried = getattr(e, 'already_retried', False)
             should_retry = (
-                operation_type in ['text_normal', 'text_high_reasoning', 'intent_classification']
+                operation_type in ['text_normal', 'intent_classification']
                 and not already_retried
                 and 'intent' not in locals()  # Don't retry if we're already in intent classification
             )
@@ -773,7 +773,7 @@ class MessageProcessor(ThreadManagementMixin,
                         self.log_info(f"Retry successful for {operation_type}")
                         return response
 
-                    elif operation_type in ['text_normal', 'text_high_reasoning']:
+                    elif operation_type == 'text_normal':
                         # Retry text response with shorter timeout and retry_count=1
                         response = await self._handle_text_response(
                             enhanced_text if 'enhanced_text' in locals() else user_content,

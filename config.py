@@ -97,6 +97,9 @@ class BotConfig:
     # Slack settings configuration
     settings_slash_command: str = field(default_factory=lambda: os.getenv("SETTINGS_SLASH_COMMAND", "/chatgpt-settings"))
     
+    # Database configuration
+    database_dir: str = field(default_factory=lambda: os.getenv("DATABASE_DIR", "data"))
+
     # Logging configuration
     log_level: str = field(default_factory=lambda: os.getenv("BOT_LOG_LEVEL", "INFO"))
     slack_log_level: str = field(default_factory=lambda: os.getenv("SLACK_LOG_LEVEL", "INFO"))

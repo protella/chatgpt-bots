@@ -199,4 +199,5 @@ Directories:
 - Don't break existing bot code - if fixes are needed, consult user first
 - Always use absolute paths for file operations
 - Full context must be included in all API calls - no message limits
+- Do NOT provide "timelines" or "work estimates" for work to be completed. They're always invalid because you will do them in short order, not a human.
 - TEST FILES GO IN THE TESTS FOLDER, NOT THE WORKSPACE ROOT!

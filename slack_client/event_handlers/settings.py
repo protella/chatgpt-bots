@@ -9,6 +9,50 @@ from config import config
 
 
 class SlackSettingsHandlersMixin:
+    async def _get_session_data(self, body) -> dict:
+        """
+        Helper to get session data from database using session_id in metadata.
+
+        Args:
+            body: Slack modal interaction body
+
+        Returns:
+            Session data dict or None if not found
+        """
+        try:
+            private_metadata = body.get('view', {}).get('private_metadata')
+            if private_metadata:
+                metadata = json.loads(private_metadata)
+                session_id = metadata.get('session_id')
+                if session_id:
+                    session_data = await self.db.get_modal_session_async(session_id)
+                    return session_data
+        except Exception as e:
+            self.log_error(f"Failed to get session data: {e}")
+        return None
+
+    async def _update_session_data(self, body, new_data) -> bool:
+        """
+        Helper to update session data in database.
+
+        Args:
+            body: Slack modal interaction body
+            new_data: Updated session data
+
+        Returns:
+            True if updated successfully
+        """
+        try:
+            private_metadata = body.get('view', {}).get('private_metadata')
+            if private_metadata:
+                metadata = json.loads(private_metadata)
+                session_id = metadata.get('session_id')
+                if session_id:
+                    return await self.db.update_modal_session_async(session_id, new_data)
+        except Exception as e:
+            self.log_error(f"Failed to update session data: {e}")
+        return False
+
     def _register_settings_handlers(self):
         # Register slash command handler
         @self.app.command(config.settings_slash_command)
@@ -74,14 +118,21 @@ class SlackSettingsHandlersMixin:
         @self.app.view("welcome_settings_modal")
         async def handle_settings_submission(ack, body, view, client):
             """Handle settings modal submission"""
-            
+
             user_id = body['user']['id']
-            
-            # Extract metadata to determine context (thread vs global)
-            metadata = json.loads(view.get('private_metadata', '{}'))
-            thread_id = metadata.get('thread_id')
-            in_thread = metadata.get('in_thread', False)
-            pending_message = metadata.get('pending_message')  # Get any pending message to process
+
+            # Get session data from database
+            metadata = json.loads(view.get('private_metadata', '{}'))  # Always parse for session_id
+            session_data = await self._get_session_data(body)
+            if not session_data:
+                # Fallback for old modals - extract from metadata directly
+                thread_id = metadata.get('thread_id')
+                in_thread = metadata.get('in_thread', False)
+                pending_message = metadata.get('pending_message')
+            else:
+                thread_id = session_data.get('thread_id')
+                in_thread = session_data.get('in_thread', False)
+                pending_message = session_data.get('pending_message')
             
             # Determine if this is a new user
             is_new_user = view.get('callback_id') == 'welcome_settings_modal'
@@ -91,13 +142,16 @@ class SlackSettingsHandlersMixin:
                 selected_scope = 'global'
                 self.log_info("New user setup - forcing save to global settings")
             else:
-                selected_scope = metadata.get('scope', 'thread' if in_thread else 'global')  # Get selected scope
-            
+                if session_data:
+                    selected_scope = session_data.get('scope', 'thread' if in_thread else 'global')
+                else:
+                    selected_scope = metadata.get('scope', 'thread' if in_thread else 'global')  # Get selected scope
+
             # Debug logging
-            self.log_debug(f"Modal submission metadata: {metadata}")
+            self.log_debug(f"Modal submission session/metadata: session_id={metadata.get('session_id') if session_data else 'legacy'}")
             self.log_debug(f"Selected scope for save: {selected_scope} (is_new_user: {is_new_user})")
             if pending_message:
-                self.log_info(f"Found pending message in metadata: {pending_message}")
+                self.log_info(f"Found pending message: {pending_message}")
             
             # Extract form values
             form_values = self.settings_modal.extract_form_values(view['state'])
@@ -220,6 +274,16 @@ class SlackSettingsHandlersMixin:
                 self.log_info(f"Global settings saved for user {user_id}: {validated_settings}")
             
             if success:
+                # Clean up the session from database
+                if session_data:
+                    try:
+                        session_id = json.loads(view.get('private_metadata', '{}')).get('session_id')
+                        if session_id:
+                            await self.db.delete_modal_session_async(session_id)
+                            self.log_debug(f"Cleaned up modal session {session_id} after successful save")
+                    except Exception as e:
+                        self.log_warning(f"Failed to clean up session: {e}")
+
                 # Send confirmation message
                 try:
                     # Determine message based on save location
@@ -465,38 +529,20 @@ class SlackSettingsHandlersMixin:
             selected_model = body['actions'][0]['selected_option']['value']
             
             self.log_info(f"Model selection changed to {selected_model} for user {user_id}")
-            
-            # Try to get stored settings from private_metadata first (preserves unsaved changes)
-            stored_settings = {}
-            metadata_context = {}
-            try:
-                private_metadata = body.get('view', {}).get('private_metadata')
-                if private_metadata:
-                    metadata = json.loads(private_metadata)
-                    if isinstance(metadata, dict) and 'settings' in metadata:
-                        # New format with context
-                        stored_settings = metadata['settings']
-                        metadata_context = {
-                            'thread_id': metadata.get('thread_id'),
-                            'in_thread': metadata.get('in_thread', False),
-                            'scope': metadata.get('scope'),  # Extract scope
-                            'pending_message': metadata.get('pending_message')  # Preserve pending message
-                        }
-                    else:
-                        # Old format - just settings
-                        stored_settings = metadata
-            except Exception:
-                pass
-            
-            # If no stored settings, get user's saved preferences
-            if not stored_settings:
-                saved_settings = await self.db.get_user_preferences_async(user_id)
-                if not saved_settings:
-                    # If no saved settings, get defaults
-                    user_data = await self.db.get_or_create_user_async(user_id)
-                    email = user_data.get('email') if user_data else None
-                    saved_settings = await self.db.create_default_user_preferences_async(user_id, email)
-                stored_settings = saved_settings
+
+            # Get session data from database
+            session_data = await self._get_session_data(body)
+            if not session_data:
+                self.log_error("No session found for modal interaction")
+                return
+
+            stored_settings = session_data.get('settings', {})
+            metadata_context = {
+                'thread_id': session_data.get('thread_id'),
+                'in_thread': session_data.get('in_thread', False),
+                'scope': session_data.get('scope'),
+                'pending_message': session_data.get('pending_message')
+            }
             
             # Extract current form values (only gets visible fields)
             current_values = self.settings_modal.extract_form_values(body['view']['state'])
@@ -508,8 +554,14 @@ class SlackSettingsHandlersMixin:
             else:
                 merged_settings = {}
             merged_settings.update(current_values)
-            
+
+            # Update session with merged settings
+            session_data['settings'] = merged_settings
+            await self._update_session_data(body, session_data)
+
             # Build updated modal with new model selection
+            # Note: build_settings_modal will create a NEW session, but that's okay
+            # because each modal update gets a fresh session_id
             is_new_user = body['view']['callback_id'] == 'welcome_settings_modal'
             updated_modal = await self.settings_modal.build_settings_modal(
                 user_id=user_id,
@@ -545,25 +597,19 @@ class SlackSettingsHandlersMixin:
             
             user_id = body['user']['id']
             
-            # Extract current settings and context from metadata
-            stored_settings = {}
-            metadata_context = {}
-            try:
-                private_metadata = body.get('view', {}).get('private_metadata')
-                if private_metadata:
-                    metadata = json.loads(private_metadata)
-                    if isinstance(metadata, dict) and 'settings' in metadata:
-                        stored_settings = metadata['settings']
-                        metadata_context = {
-                            'thread_id': metadata.get('thread_id'),
-                            'in_thread': metadata.get('in_thread', False),
-                            'scope': metadata.get('scope'),  # Extract scope
-                            'pending_message': metadata.get('pending_message')  # Preserve pending message
-                        }
-                    else:
-                        stored_settings = metadata
-            except Exception:
-                pass
+            # Get session data from database
+            session_data = await self._get_session_data(body)
+            if not session_data:
+                self.log_error("No session found for modal interaction")
+                return
+
+            stored_settings = session_data.get('settings', {})
+            metadata_context = {
+                'thread_id': session_data.get('thread_id'),
+                'in_thread': session_data.get('in_thread', False),
+                'scope': session_data.get('scope'),
+                'pending_message': session_data.get('pending_message')
+            }
             
             # Get current form values
             current_values = self.settings_modal.extract_form_values(body['view']['state'])
@@ -614,7 +660,11 @@ class SlackSettingsHandlersMixin:
             
             # Debug logging
             self.log_debug(f"Features change - Web search: {merged_settings.get('enable_web_search')}, Reasoning: {merged_settings.get('reasoning_effort')}")
-            
+
+            # Update session with merged settings
+            session_data['settings'] = merged_settings
+            await self._update_session_data(body, session_data)
+
             # Rebuild modal
             is_new_user = body['view']['callback_id'] == 'welcome_settings_modal'
             updated_modal = await self.settings_modal.build_settings_modal(
@@ -670,29 +720,25 @@ class SlackSettingsHandlersMixin:
         async def handle_scope_change(ack, body, client):
             """Handle scope toggle between thread and global settings"""
             await ack()
-            
+
             user_id = body['user']['id']
             selected_scope = body['actions'][0]['selected_option']['value']
-            
+
             self.log_info(f"Settings scope changed to {selected_scope} for user {user_id}")
-            
-            # Get current metadata context
-            metadata_context = {}
-            stored_settings = {}
-            try:
-                private_metadata = body.get('view', {}).get('private_metadata')
-                if private_metadata:
-                    metadata = json.loads(private_metadata)
-                    if isinstance(metadata, dict):
-                        stored_settings = metadata.get('settings', {})
-                        metadata_context = {
-                            'thread_id': metadata.get('thread_id'),
-                            'in_thread': metadata.get('in_thread', False),
-                            'scope': selected_scope,  # Update the scope
-                            'pending_message': metadata.get('pending_message')  # Preserve pending message
-                        }
-            except Exception:
-                pass
+
+            # Get session data from database
+            session_data = await self._get_session_data(body)
+            if not session_data:
+                self.log_error("No session found for modal interaction")
+                return
+
+            stored_settings = session_data.get('settings', {})
+            metadata_context = {
+                'thread_id': session_data.get('thread_id'),
+                'in_thread': session_data.get('in_thread', False),
+                'scope': selected_scope,  # Update the scope
+                'pending_message': session_data.get('pending_message')
+            }
             
             # Extract current form values to preserve user's changes
             current_values = self.settings_modal.extract_form_values(body['view']['state'])
@@ -700,7 +746,12 @@ class SlackSettingsHandlersMixin:
             # Merge settings
             merged_settings = stored_settings.copy() if stored_settings else {}
             merged_settings.update(current_values)
-            
+
+            # Update session with merged settings and new scope
+            session_data['settings'] = merged_settings
+            session_data['scope'] = selected_scope
+            await self._update_session_data(body, session_data)
+
             # Rebuild modal with new scope
             is_new_user = body['view']['callback_id'] == 'welcome_settings_modal'
             updated_modal = await self.settings_modal.build_settings_modal(

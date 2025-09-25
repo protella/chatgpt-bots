@@ -66,16 +66,15 @@ class OpenAIClient(LoggerMixin):
         # Operation-specific timeouts based on real-world usage patterns
         operation_timeouts = {
             # Image operations - full API timeout
-            "image_generation": 300.0,  # 5 minutes
-            "image_edit": 300.0,        # 5 minutes
-            "vision_analysis": 300.0,   # 5 minutes - large image analysis takes time
+            "image_generation": config.api_timeout_read,  # Use configured timeout
+            "image_edit": config.api_timeout_read,        # Use configured timeout
+            "vision_analysis": config.api_timeout_read,   # Use configured timeout
 
-            # All text operations - 2.5 minutes regardless of complexity/tools/reasoning
-            "text_high_reasoning": 150.0,  # 2.5 minutes (kept for compatibility)
-            "text_with_tools": 150.0,      # 2.5 minutes
-            "text_normal": 150.0,          # 2.5 minutes
-            "intent_classification": 150.0, # 2.5 minutes
-            "prompt_enhancement": 150.0,    # 2.5 minutes
+            # All text operations - use streaming chunk timeout from config
+            "text_with_tools": config.api_timeout_streaming_chunk,      # Use configured timeout
+            "text_normal": config.api_timeout_streaming_chunk,          # Use configured timeout
+            "intent_classification": config.api_timeout_streaming_chunk, # Use configured timeout
+            "prompt_enhancement": config.api_timeout_streaming_chunk,    # Use configured timeout
 
             # Streaming operations
             "streaming_chunk": config.api_timeout_streaming_chunk,  # Time between chunks
@@ -107,8 +106,8 @@ class OpenAIClient(LoggerMixin):
         start_time = asyncio.get_event_loop().time()
 
         # Get the appropriate timeout for this operation type
-        # This will be API_TIMEOUT_STREAMING_CHUNK (150s) for text operations
-        # or API_TIMEOUT_READ (300s) for image/vision operations
+        # This will be API_TIMEOUT_STREAMING_CHUNK for text operations
+        # or API_TIMEOUT_READ for image/vision operations
         activity_timeout = self._get_operation_timeout(operation_type)
 
         # Warning threshold for long gaps between chunks

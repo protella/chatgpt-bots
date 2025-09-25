@@ -6,6 +6,7 @@ from typing import Dict, Optional, List
 from config import config
 from logger import LoggerMixin
 import json
+import uuid
 
 
 class SettingsModal(LoggerMixin):
@@ -63,14 +64,17 @@ class SettingsModal(LoggerMixin):
         
         # Determine callback ID based on user status
         callback_id = "welcome_settings_modal" if is_new_user else "settings_modal"
-        
+
         # Determine if we're in dev environment
         is_dev = config.settings_slash_command.endswith("-dev")
         # Slack modal titles have a 24 character limit
         modal_title = "ChatGPT Settings (Dev)" if is_dev else "ChatGPT Bot Settings"
-        
-        # Build metadata with all necessary context
-        metadata = {
+
+        # Create session for modal state storage
+        session_id = str(uuid.uuid4())
+
+        # Build full state to store in DB
+        session_state = {
             "settings": current_settings,
             "thread_id": thread_id,
             "in_thread": in_thread,
@@ -79,7 +83,15 @@ class SettingsModal(LoggerMixin):
 
         # Include pending message if provided (for new users)
         if pending_message:
-            metadata["pending_message"] = pending_message
+            session_state["pending_message"] = pending_message
+
+        # Store session in database
+        await self.db.create_modal_session_async(session_id, user_id, session_state, modal_type='settings')
+
+        # Only store session_id in metadata - much smaller!
+        metadata = {
+            "session_id": session_id
+        }
 
         return {
             "type": "modal",
