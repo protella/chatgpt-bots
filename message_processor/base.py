@@ -230,7 +230,7 @@ class MessageProcessor(ThreadManagementMixin,
                 # Keep trimming until we're under the limit
                 while current_tokens > max_tokens:
                     # Smart trim will work on all messages including the temp one
-                    trimmed_count = self._smart_trim_with_summarization(thread_state)
+                    trimmed_count = await self._smart_trim_with_summarization(thread_state)
                     total_trimmed += trimmed_count
                     
                     if trimmed_count == 0:

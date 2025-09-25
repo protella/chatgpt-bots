@@ -1557,6 +1557,26 @@ class DatabaseManager(LoggerMixin):
 
             await db.commit()
 
+    async def clear_thread_messages_async(self, thread_id: str):
+        """
+        Async version of clear_thread_messages.
+        Clear all cached messages for a thread.
+
+        Args:
+            thread_id: Thread identifier
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+
+            await db.execute(
+                "DELETE FROM messages WHERE thread_id = ?",
+                (thread_id,)
+            )
+
+            await db.commit()
+            logger.debug(f"Cleared messages for thread {thread_id} (async)")
+
     async def save_image_metadata_async(self, thread_id: str, url: str, image_type: str,
                                        prompt: Optional[str] = None, analysis: Optional[str] = None,
                                        original_analysis: Optional[str] = None, metadata: Optional[Dict] = None,

@@ -384,7 +384,7 @@ class ThreadManagementMixin:
                     if self.db:
                         # Clear and rebuild cache with current state
                         # This ensures DB reflects summarizations and removals
-                        await self.db.clear_thread_messages(thread_key)
+                        await self.db.clear_thread_messages_async(thread_key)
                         for msg in thread_state.messages:
                             await self.db.cache_message_async(
                                 thread_key,
@@ -716,7 +716,7 @@ class ThreadManagementMixin:
                 # Update database with trimmed state
                 if self.db:
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-                    await self.db.clear_thread_messages(thread_key)
+                    await self.db.clear_thread_messages_async(thread_key)
                     for msg in thread_state.messages:
                         await self.db.cache_message_async(
                             thread_id=thread_key,
