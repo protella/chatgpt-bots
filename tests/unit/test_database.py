@@ -428,4 +428,174 @@ class TestDatabaseContract:
         
         # Required methods for user management
         assert callable(temp_db.get_or_create_user)
+
+        # Required methods for modal sessions
+        assert callable(temp_db.create_modal_session)
+        assert callable(temp_db.get_modal_session)
+        assert callable(temp_db.update_modal_session)
+        assert callable(temp_db.delete_modal_session)
+        assert callable(temp_db.cleanup_old_modal_sessions)
         assert callable(temp_db.save_user_timezone)
+
+
+class TestModalSessions:
+    """Test modal session management functionality"""
+
+    @pytest.fixture
+    def temp_db(self):
+        """Create a temporary database for testing"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = DatabaseManager("test")
+            db.db_path = f"{tmpdir}/test.db"
+            # Recreate connection with new path
+            db.conn = sqlite3.connect(
+                db.db_path,
+                check_same_thread=False,
+                isolation_level=None
+            )
+            db.conn.row_factory = sqlite3.Row
+            db.init_schema()
+            yield db
+            db.conn.close()
+
+    def test_create_modal_session(self, temp_db):
+        """Test creating a new modal session"""
+        session_id = "test-session-123"
+        user_id = "U123456"
+        state = {
+            "settings": {"model": "gpt-5", "temperature": 0.8},
+            "thread_id": "C123:456.789",
+            "scope": "global"
+        }
+
+        result = temp_db.create_modal_session(session_id, user_id, state)
+        assert result is True
+
+        # Verify it was created
+        cursor = temp_db.conn.execute(
+            "SELECT * FROM modal_sessions WHERE session_id = ?",
+            (session_id,)
+        )
+        row = cursor.fetchone()
+        assert row is not None
+        assert row["user_id"] == user_id
+        assert json.loads(row["state"]) == state
+
+    def test_get_modal_session(self, temp_db):
+        """Test retrieving a modal session"""
+        session_id = "test-session-456"
+        user_id = "U789"
+        state = {"settings": {"model": "gpt-4"}, "scope": "thread"}
+
+        # Create session first
+        temp_db.create_modal_session(session_id, user_id, state)
+
+        # Retrieve it
+        retrieved_state = temp_db.get_modal_session(session_id)
+        assert retrieved_state == state
+
+        # Try to get non-existent session
+        result = temp_db.get_modal_session("non-existent")
+        assert result is None
+
+    def test_update_modal_session(self, temp_db):
+        """Test updating a modal session"""
+        session_id = "test-session-789"
+        user_id = "U456"
+        initial_state = {"settings": {"model": "gpt-5"}}
+        updated_state = {"settings": {"model": "gpt-4", "temperature": 0.9}}
+
+        # Create session
+        temp_db.create_modal_session(session_id, user_id, initial_state)
+
+        # Update it
+        result = temp_db.update_modal_session(session_id, updated_state)
+        assert result is True
+
+        # Verify the update
+        retrieved_state = temp_db.get_modal_session(session_id)
+        assert retrieved_state == updated_state
+
+        # Try to update non-existent session
+        result = temp_db.update_modal_session("non-existent", updated_state)
+        assert result is False
+
+    def test_delete_modal_session(self, temp_db):
+        """Test deleting a modal session"""
+        session_id = "test-session-delete"
+        user_id = "U999"
+        state = {"test": "data"}
+
+        # Create session
+        temp_db.create_modal_session(session_id, user_id, state)
+
+        # Delete it
+        result = temp_db.delete_modal_session(session_id)
+        assert result is True
+
+        # Verify it's gone
+        retrieved = temp_db.get_modal_session(session_id)
+        assert retrieved is None
+
+        # Try to delete non-existent session
+        result = temp_db.delete_modal_session("non-existent")
+        assert result is False
+
+    def test_cleanup_old_modal_sessions(self, temp_db):
+        """Test cleaning up old modal sessions"""
+        import time
+
+        # Create sessions with different ages
+        old_session_id = "old-session"
+        new_session_id = "new-session"
+        user_id = "U111"
+
+        # Create old session (manually set created_at to be old)
+        old_timestamp = int((datetime.now() - timedelta(hours=25)).timestamp())
+        temp_db.conn.execute(
+            """
+            INSERT INTO modal_sessions (session_id, user_id, modal_type, state, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (old_session_id, user_id, "settings", json.dumps({"old": True}), old_timestamp)
+        )
+
+        # Create new session (will have current timestamp)
+        temp_db.create_modal_session(new_session_id, user_id, {"new": True})
+
+        # Clean up sessions older than 24 hours
+        temp_db.cleanup_old_modal_sessions(hours=24)
+
+        # Old session should be gone
+        assert temp_db.get_modal_session(old_session_id) is None
+
+        # New session should still exist
+        assert temp_db.get_modal_session(new_session_id) is not None
+
+    def test_modal_session_with_large_custom_instructions(self, temp_db):
+        """Test that modal sessions can handle large custom instructions"""
+        session_id = "large-session"
+        user_id = "U_LARGE"
+
+        # Create a large custom instructions string (2500 chars)
+        large_custom_instructions = "x" * 2500
+
+        state = {
+            "settings": {
+                "model": "gpt-5",
+                "custom_instructions": large_custom_instructions,
+                "temperature": 0.8,
+                "other_settings": "various values"
+            },
+            "thread_id": "C123:456.789",
+            "scope": "global"
+        }
+
+        # Should be able to store without issues
+        result = temp_db.create_modal_session(session_id, user_id, state)
+        assert result is True
+
+        # Should be able to retrieve it
+        retrieved = temp_db.get_modal_session(session_id)
+        assert retrieved == state
+        assert len(retrieved["settings"]["custom_instructions"]) == 2500

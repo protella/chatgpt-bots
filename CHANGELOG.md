@@ -2,6 +2,85 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.1.4] - 2025-09-24
+
+### 🎯 Configuration, Session Management & Licensing Update
+
+#### Added
+- **MIT License**: Added open source MIT license to the project
+- **Database Directory Configuration**: New `DATABASE_DIR` environment variable for customizable database location
+- **Modal Session Database Storage**: Settings modal sessions now stored in database instead of Slack metadata
+- **Modal Session Cleanup**: Automatic cleanup of orphaned settings modal sessions during daily maintenance
+
+#### Fixed
+- **Hardcoded Timeouts Removed**: All text operations now respect configured `API_TIMEOUT_STREAMING_CHUNK` value instead of hardcoded 150s
+- **Dead Code Cleanup**: Removed unused `text_high_reasoning` operation type that was never utilized
+- **Slack Metadata Size Limits**: Resolved issues with oversized private_metadata by moving session data to database
+
+#### Changed
+- **Settings Modal Architecture**: Migrated from storing full session state in Slack's private_metadata to database-backed sessions with UUID references
+- **Timeout Configuration**: Text operations (intent classification, prompt enhancement, normal text, text with tools) now use environment-configured timeouts
+- **Database Path Flexibility**: Database and backup directories now use configurable path from `DATABASE_DIR` setting
+
+## [2.1.3] - 2025-09-18
+
+### 🐛 Settings & Configuration Fixes
+
+#### Fixed
+- **Default Values Correction**: Fixed incorrect default values for `reasoning_effort` and `verbosity` in user preferences
+- **Settings Modal Defaults**: Ensured proper default values are applied when creating new user preferences
+
+## [2.1.2] - 2025-09-17
+
+### 🔧 Logging & Thread Safety Improvements
+
+#### Fixed
+- **Logger Thread Safety**: Updated logger implementation for async/thread safety paradigms after refactor
+- **Log Rotation Issues**: Fixed problems with log file rotation under concurrent access
+- **Import Errors**: Fixed missing imports in refactored modules
+
+#### Changed
+- **Message Processor Restoration**: Reverted accidental restoration of monolithic message processor, re-applied modular version
+
+## [2.1.1] - 2025-09-16
+
+### 🚀 Enhanced Streaming Reliability & UX Improvements
+
+#### Fixed
+- **User Context**: Fixed user timezone/context not being injected after async refactor
+- **Settings Modal**: Fixed reasoning level being lost on mobile when toggling web search
+- **Streaming Reliability**: Fixed text truncation when Slack API updates fail (17/18 success case)
+- **Message Overflow**: Fixed transitions with proper continuation handling
+- **Part Labels**: Fixed "Part X" labels disappearing during streaming updates
+- **Loading Indicators**: Fixed enhanced prompt loading indicators not being removed properly
+
+#### Changed
+- **Timeout Adjustments**: Increased all text operation timeouts to 2.5 minutes minimum
+- **Progress Feedback**: Added humorous progress messages after 30s and 60s+ for long operations
+- **Image Analysis**: Added progress monitoring to image analysis operations
+- **Timeout Handling**: Improved to only warn (never fail) on chunk timeouts
+
+## [2.1.0] - 2025-09-16
+
+### 🎉 Major Async/Await Refactor & Critical Stability Fixes
+
+#### Changed
+- **Async/Await Migration**: Migrated critical components to async/await pattern to fix concurrency issues
+- **Thread Management**: Added AsyncThreadStateManager and AsyncThreadLockManager for proper synchronization
+- **Database Operations**: Implemented async database methods running in parallel with sync versions
+
+#### Fixed
+- **Database Commits**: Fixed missing commits in async methods (save_thread_config_async, cache_message_async, etc.)
+- **Settings Modal**: Fixed not preserving pending messages for new user flow
+- **Web Search Persistence**: Fixed checkbox not persisting after save
+- **Boolean Conversions**: Fixed issues in async database methods
+- **Thread Config**: Fixed retrieval issues under concurrent load
+- **Race Conditions**: Eliminated crashes under concurrent load
+
+#### Added
+- **Comprehensive Testing**: Expanded test coverage for async operations
+- **Load Testing**: Verified stability under production workloads
+
 ## [2.0.4] - 2025-09-16
 
 ### 🐛 Critical Bug Fix - Bot Hanging Resolution
