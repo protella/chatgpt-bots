@@ -247,6 +247,12 @@ class ChatBotV2:
                         # Convert hours to seconds for the cleanup function
                         max_age_seconds = config.cleanup_max_age_hours * 3600
                         await self.processor.thread_manager.cleanup_old_threads(max_age=max_age_seconds)
+
+                        # Also clean up old modal sessions (24 hours old)
+                        if hasattr(self.processor, 'db') and self.processor.db:
+                            self.processor.db.cleanup_old_modal_sessions(hours=24)
+                            main_logger.info("Cleaned up old modal sessions")
+
                         stats = self.processor.get_stats()
                         main_logger.info(f"Cleanup complete. Stats: {stats}")
                 except asyncio.CancelledError:

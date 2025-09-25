@@ -25,18 +25,23 @@ class DatabaseManager(LoggerMixin):
     def __init__(self, platform: str = "slack"):
         """
         Initialize database connection for the specified platform.
-        
+
         Args:
             platform: Platform name (slack, discord, etc.)
         """
         self.platform = platform
-        
+
+        # Get database directory from config
+        from config import BotConfig
+        config = BotConfig()
+        self.db_dir = config.database_dir
+
         # Ensure directories exist
-        os.makedirs("data", exist_ok=True)
-        os.makedirs("data/backups", exist_ok=True)
-        
+        os.makedirs(self.db_dir, exist_ok=True)
+        os.makedirs(f"{self.db_dir}/backups", exist_ok=True)
+
         # Connect to platform-specific database
-        self.db_path = f"data/{platform}.db"
+        self.db_path = f"{self.db_dir}/{platform}.db"
         self.conn = sqlite3.connect(
             self.db_path,
             check_same_thread=False,  # Allow multi-threaded access
@@ -210,12 +215,34 @@ class DatabaseManager(LoggerMixin):
         
         # Create index for email lookups
         self.conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_user_prefs_email 
+            CREATE INDEX IF NOT EXISTS idx_user_prefs_email
             ON user_preferences(slack_email)
         """)
-        
+
+        # Modal sessions table for temporary modal state storage
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS modal_sessions (
+                session_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                modal_type TEXT DEFAULT 'settings',
+                state TEXT NOT NULL,
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+            )
+        """)
+
+        # Create indexes for modal sessions
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_modal_session_user
+            ON modal_sessions(user_id)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_modal_session_created
+            ON modal_sessions(created_at)
+        """)
+
         self.conn.commit()
-        
+
         # Run migrations for existing databases
         self._run_migrations()
     
@@ -1177,14 +1204,203 @@ class DatabaseManager(LoggerMixin):
     
     # Maintenance operations
     
+    # =============================
+    # MODAL SESSION MANAGEMENT
+    # =============================
+
+    def create_modal_session(self, session_id: str, user_id: str, state: Dict, modal_type: str = 'settings') -> bool:
+        """
+        Create a new modal session.
+
+        Args:
+            session_id: Unique session identifier (UUID)
+            user_id: User ID who owns this session
+            state: Initial state dictionary
+            modal_type: Type of modal (default 'settings')
+
+        Returns:
+            True if created successfully
+        """
+        try:
+            self.conn.execute("""
+                INSERT INTO modal_sessions (session_id, user_id, modal_type, state)
+                VALUES (?, ?, ?, ?)
+            """, (session_id, user_id, modal_type, json.dumps(state)))
+            self.log_debug(f"Created modal session {session_id} for user {user_id}")
+            return True
+        except Exception as e:
+            self.log_error(f"Failed to create modal session: {e}")
+            return False
+
+    def get_modal_session(self, session_id: str) -> Optional[Dict]:
+        """
+        Retrieve modal session state.
+
+        Args:
+            session_id: Session identifier
+
+        Returns:
+            State dictionary or None if not found
+        """
+        try:
+            cursor = self.conn.execute("""
+                SELECT state FROM modal_sessions
+                WHERE session_id = ?
+            """, (session_id,))
+
+            row = cursor.fetchone()
+            if row:
+                return json.loads(row[0])
+            return None
+        except Exception as e:
+            self.log_error(f"Failed to get modal session: {e}")
+            return None
+
+    def update_modal_session(self, session_id: str, state: Dict) -> bool:
+        """
+        Update modal session state.
+
+        Args:
+            session_id: Session identifier
+            state: Updated state dictionary
+
+        Returns:
+            True if updated successfully
+        """
+        try:
+            cursor = self.conn.execute("""
+                UPDATE modal_sessions
+                SET state = ?, updated_at = strftime('%s', 'now')
+                WHERE session_id = ?
+            """, (json.dumps(state), session_id))
+
+            if cursor.rowcount > 0:
+                self.log_debug(f"Updated modal session {session_id}")
+                return True
+            return False
+        except Exception as e:
+            self.log_error(f"Failed to update modal session: {e}")
+            return False
+
+    def delete_modal_session(self, session_id: str) -> bool:
+        """
+        Delete a modal session.
+
+        Args:
+            session_id: Session identifier
+
+        Returns:
+            True if deleted successfully
+        """
+        try:
+            cursor = self.conn.execute("""
+                DELETE FROM modal_sessions
+                WHERE session_id = ?
+            """, (session_id,))
+
+            if cursor.rowcount > 0:
+                self.log_debug(f"Deleted modal session {session_id}")
+                return True
+            return False
+        except Exception as e:
+            self.log_error(f"Failed to delete modal session: {e}")
+            return False
+
+    def cleanup_old_modal_sessions(self, hours: int = 24):
+        """
+        Clean up modal sessions older than specified hours.
+
+        Args:
+            hours: Number of hours to retain sessions (default 24)
+        """
+        try:
+            cutoff = int((datetime.now() - timedelta(hours=hours)).timestamp())
+
+            cursor = self.conn.execute("""
+                DELETE FROM modal_sessions
+                WHERE created_at < ?
+            """, (cutoff,))
+
+            if cursor.rowcount > 0:
+                self.log_info(f"Cleaned up {cursor.rowcount} modal sessions older than {hours} hours")
+        except Exception as e:
+            self.log_error(f"Failed to cleanup modal sessions: {e}")
+
+    # Async versions for modal sessions
+    async def create_modal_session_async(self, session_id: str, user_id: str, state: Dict, modal_type: str = 'settings') -> bool:
+        """Async version of create_modal_session."""
+        async with self._async_db_semaphore:
+            async with aiosqlite.connect(self.db_path) as db:
+                try:
+                    await db.execute("""
+                        INSERT INTO modal_sessions (session_id, user_id, modal_type, state)
+                        VALUES (?, ?, ?, ?)
+                    """, (session_id, user_id, modal_type, json.dumps(state)))
+                    await db.commit()
+                    self.log_debug(f"Created modal session {session_id} for user {user_id} (async)")
+                    return True
+                except Exception as e:
+                    self.log_error(f"Failed to create modal session (async): {e}")
+                    return False
+
+    async def get_modal_session_async(self, session_id: str) -> Optional[Dict]:
+        """Async version of get_modal_session."""
+        async with self._async_db_semaphore:
+            async with aiosqlite.connect(self.db_path) as db:
+                try:
+                    async with db.execute("""
+                        SELECT state FROM modal_sessions
+                        WHERE session_id = ?
+                    """, (session_id,)) as cursor:
+                        row = await cursor.fetchone()
+                        if row:
+                            return json.loads(row[0])
+                    return None
+                except Exception as e:
+                    self.log_error(f"Failed to get modal session (async): {e}")
+                    return None
+
+    async def update_modal_session_async(self, session_id: str, state: Dict) -> bool:
+        """Async version of update_modal_session."""
+        async with self._async_db_semaphore:
+            async with aiosqlite.connect(self.db_path) as db:
+                try:
+                    await db.execute("""
+                        UPDATE modal_sessions
+                        SET state = ?, updated_at = strftime('%s', 'now')
+                        WHERE session_id = ?
+                    """, (json.dumps(state), session_id))
+                    await db.commit()
+                    self.log_debug(f"Updated modal session {session_id} (async)")
+                    return True
+                except Exception as e:
+                    self.log_error(f"Failed to update modal session (async): {e}")
+                    return False
+
+    async def delete_modal_session_async(self, session_id: str) -> bool:
+        """Async version of delete_modal_session."""
+        async with self._async_db_semaphore:
+            async with aiosqlite.connect(self.db_path) as db:
+                try:
+                    await db.execute("""
+                        DELETE FROM modal_sessions
+                        WHERE session_id = ?
+                    """, (session_id,))
+                    await db.commit()
+                    self.log_debug(f"Deleted modal session {session_id} (async)")
+                    return True
+                except Exception as e:
+                    self.log_error(f"Failed to delete modal session (async): {e}")
+                    return False
+
     def backup_database(self):
         """Create timestamped backup of database."""
         # Checkpoint WAL file before backup
         self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        
+
         # Create timestamped backup
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = f"data/backups/{self.platform}_{timestamp}.db"
+        backup_path = f"{self.db_dir}/backups/{self.platform}_{timestamp}.db"
         
         # Use SQLite backup API
         backup_conn = sqlite3.connect(backup_path)
@@ -1200,8 +1416,8 @@ class DatabaseManager(LoggerMixin):
     def cleanup_old_backups(self):
         """Remove backups older than 7 days."""
         cutoff = datetime.now() - timedelta(days=7)
-        
-        for filename in os.listdir("data/backups"):
+
+        for filename in os.listdir(f"{self.db_dir}/backups"):
             if filename.startswith(f"{self.platform}_") and filename.endswith(".db"):
                 try:
                     # Parse timestamp from filename
@@ -1209,9 +1425,8 @@ class DatabaseManager(LoggerMixin):
                     if len(parts) >= 3:
                         date_str = parts[-2] + parts[-1]
                         file_date = datetime.strptime(date_str, "%Y%m%d%H%M%S")
-                        
                         if file_date < cutoff:
-                            os.remove(f"data/backups/{filename}")
+                            os.remove(f"{self.db_dir}/backups/{filename}")
                             logger.info(f"Removed old backup: {filename}")
                             
                 except Exception as e:
