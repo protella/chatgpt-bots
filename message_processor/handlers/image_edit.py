@@ -72,7 +72,7 @@ class ImageEditMixin:
                     messages=[{"role": "user", "content": context}],
                     model=config.utility_model,
                     temperature=0.1,
-                    max_tokens=50,  # Increased to handle reasoning tokens
+                    max_tokens=config.utility_max_tokens,  # Use configurable utility tokens
                     reasoning_effort=config.utility_reasoning_effort,  # Use utility config
                     verbosity=config.utility_verbosity  # Use utility config
                 )

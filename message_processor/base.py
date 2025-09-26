@@ -244,7 +244,35 @@ class MessageProcessor(ThreadManagementMixin,
                 
                 if total_trimmed > 0:
                     self.log_info(f"Smart trim complete: {total_trimmed} total messages processed, final: {current_tokens}/{max_tokens} tokens")
-            
+
+                # Check if we're still over the limit after trimming
+                if current_tokens > max_tokens:
+                    self.log_warning(f"Smart trim insufficient. Need {current_tokens - max_tokens} more tokens. Dropping oldest messages...")
+
+                    # Keep dropping oldest messages until we fit
+                    messages_dropped = 0
+                    while current_tokens > max_tokens and len(thread_state.messages) > 1:  # Keep at least the new message
+                        # Find the first droppable message (not the temp message we just added)
+                        for i in range(len(thread_state.messages) - 1):  # -1 to exclude the temp message
+                            # Drop the oldest message
+                            dropped_msg = thread_state.messages.pop(i)
+                            messages_dropped += 1
+
+                            # Recalculate tokens
+                            current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+                            self.log_debug(f"Dropped message {i}, now at {current_tokens}/{max_tokens} tokens")
+                            break
+
+                        # Safety check to prevent infinite loop
+                        if messages_dropped > 50:
+                            self.log_error("Dropped 50 messages but still over limit - something is wrong")
+                            break
+
+                    if messages_dropped > 0:
+                        self.log_info(f"Dropped {messages_dropped} oldest messages to make room. Final: {current_tokens}/{max_tokens} tokens")
+                        # Mark that we've trimmed messages
+                        thread_state.has_trimmed_messages = True
+
             # Remove the temporary message - handlers will add it properly
             if thread_state.messages and thread_state.messages[-1] == temp_message:
                 thread_state.messages.pop()

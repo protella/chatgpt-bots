@@ -129,7 +129,11 @@ class BaseClient(ABC, LoggerMixin):
     
     async def handle_error(self, channel_id: str, thread_id: str, error: str):
         """Default error handler"""
-        self.log_error(f"Error in {self.name}: {error}")
+        # Check if this is a handled case (documents too large, etc) vs an actual error
+        if "Documents Too Large" in error or "Message Too Long" in error:
+            self.log_warning(f"Handled limit exceeded in {self.name}: {error[:100]}...")
+        else:
+            self.log_error(f"Error in {self.name}: {error}")
 
         # Format error message for better readability
         formatted_error = self.format_error_message(error)
