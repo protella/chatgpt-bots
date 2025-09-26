@@ -372,6 +372,56 @@ class OpenAIClient(LoggerMixin):
             max_retries=max_retries,
         )
 
+    async def _safe_api_call(
+        self,
+        api_method: Callable,
+        *args,
+        timeout_seconds: Optional[float] = None,
+        operation_type: str = "general",
+        **kwargs,
+    ):
+        """Async wrapper for OpenAI API calls with enforced timeout."""
+
+        # Determine timeout based on operation type and .env settings
+        if timeout_seconds:
+            timeout = timeout_seconds
+        else:
+            timeout = self._get_operation_timeout(operation_type)
+
+        self.log_debug(
+            f"Using timeout: {timeout}s for {operation_type} operation (from .env: "
+            f"read={config.api_timeout_read}s, chunk={config.api_timeout_streaming_chunk}s)"
+        )
+
+        api_name = getattr(api_method, "__name__", str(api_method))
+
+        call_start = time.time()
+        try:
+            # Use asyncio.wait_for for proper async timeout handling
+            result = await asyncio.wait_for(
+                api_method(*args, **kwargs),
+                timeout=timeout
+            )
+            call_duration = time.time() - call_start
+            return result
+        except asyncio.TimeoutError:
+            call_duration = time.time() - call_start
+            self.log_error(f"API call ({operation_type}) timed out after {timeout}s")
+            # Create TimeoutError with operation_type attribute for smart retry logic
+            timeout_error = TimeoutError(f"OpenAI API call timed out after {timeout} seconds")
+            timeout_error.operation_type = operation_type
+            raise timeout_error
+        except Exception as e:
+            call_duration = time.time() - call_start
+            error_msg = str(e).lower()
+            if "timeout" in error_msg or "timed out" in error_msg or "read timeout" in error_msg:
+                self.log_error(f"API call ({operation_type}) timed out after {timeout}s: {e}")
+                # Create TimeoutError with operation_type attribute for smart retry logic
+                timeout_error = TimeoutError(f"OpenAI API call timed out after {timeout} seconds")
+                timeout_error.operation_type = operation_type
+                raise timeout_error
+            raise
+
     async def generate_image(
         self,
         prompt: str,

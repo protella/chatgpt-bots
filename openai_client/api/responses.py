@@ -707,7 +707,7 @@ async def classify_intent(
         request_params = {
             "model": config.utility_model,
             "input": conversation_messages,
-            "max_output_tokens": 20,  # Only need one word response
+            "max_output_tokens": config.utility_max_tokens,  # Configurable for different reasoning efforts
             "store": False,  # Never store classification calls
         }
         
