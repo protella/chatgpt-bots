@@ -219,7 +219,12 @@ class ThreadManagementMixin:
             
         except Exception as e:
             self.log_error(f"Error summarizing document: {e}")
-            return content  # Return original if summarization fails
+            # Check if it's a context length error
+            if "context_length_exceeded" in str(e) or "context window" in str(e):
+                self.log_error(f"Document exceeds model context window for summarization")
+                # Return truncated version with error marker
+                return f"[ERROR: Document too large for model context window]\n{content[:1000]}..."
+            return content  # Return original if summarization fails for other reasons
 
     async def _smart_trim_with_summarization(self, thread_state, trim_count: int = None) -> int:
         """Intelligently trim messages, summarizing documents only when they're in the trim list
@@ -268,9 +273,46 @@ class ThreadManagementMixin:
                 # Check if this is an unsummarized document
                 if "=== DOCUMENT:" in content and "[SUMMARIZED" not in content:
                     original_content = msg.get("content", "")
-                    
+
+                    # Check if document would exceed context window for summarization
+                    # Count tokens to see if it fits in the 350k limit
+                    doc_tokens = self.thread_manager._token_counter.count_tokens(original_content)
+
+                    # Get the model's token limit
+                    from config import config
+                    model = thread_state.current_model or config.gpt_model
+                    max_tokens = config.get_model_token_limit(model)
+
+                    if doc_tokens > max_tokens:  # Model's token limit
+                        self.log_warning(f"Document too large to summarize: {doc_tokens} tokens > {max_tokens} limit - dropping from context")
+
+                        # Replace the message content with a placeholder
+                        truncated_content = f"[Document removed - exceeded context window: {doc_tokens:,} tokens]\nFilename: "
+
+                        # Try to extract filename for the placeholder
+                        import re
+                        doc_match = re.search(r'=== DOCUMENT: (.*?) ===', original_content)
+                        if doc_match:
+                            filename = doc_match.group(1).strip()
+                            truncated_content += filename
+                        else:
+                            truncated_content += "Unknown"
+
+                        # Update the message with placeholder
+                        thread_state.messages[idx]["content"] = truncated_content
+
+                        # Update metadata
+                        if "metadata" not in thread_state.messages[idx]:
+                            thread_state.messages[idx]["metadata"] = {}
+                        thread_state.messages[idx]["metadata"]["document_removed"] = True
+                        thread_state.messages[idx]["metadata"]["original_tokens"] = doc_tokens
+
+                        self.log_info(f"Replaced oversized document with placeholder: {doc_tokens} tokens -> {len(truncated_content)} chars")
+                        documents_summarized += 1  # Count as "processed" so we make progress
+                        continue
+
                     self.log_info(f"Summarizing document at index {idx} (in trim list of {len(indices_to_process)} messages)")
-                    
+
                     # Summarize the document
                     summarized_content = await self._summarize_document_content(original_content)
                     
