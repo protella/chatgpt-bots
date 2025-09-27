@@ -1,5 +1,6 @@
 # secrets
 .env
+mcp_config.json
 
 # VSCode
 .vscode/
