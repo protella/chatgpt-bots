@@ -123,10 +123,16 @@ class BotConfig:
     api_timeout_streaming_chunk: float = field(default_factory=lambda: float(os.getenv("API_TIMEOUT_STREAMING_CHUNK", "30")))  # Max time between streaming chunks
     
     # Model token limits
-    gpt5_max_tokens: int = field(default_factory=lambda: int(os.getenv("GPT5_MAX_TOKENS", "400000")))
+    # GPT-5: 400k total context window (shared between input, output, and reasoning)
+    # With max_output_tokens=32k, we can theoretically use up to 368k for input
+    # BUT: We must also account for system prompt (~1k), tool definitions (~0.5k),
+    # and API formatting overhead (~8.5k), so practical limit is ~358k
+    # We use 67.5% (270k) to ensure we stay well under the actual limit
+    gpt5_max_tokens: int = field(default_factory=lambda: int(os.getenv("GPT5_MAX_TOKENS", "400000")))  # Total context window
     gpt4_max_tokens: int = field(default_factory=lambda: int(os.getenv("GPT4_MAX_TOKENS", "128000")))
     
     # Token management configuration
+    # Buffer to leave room for output/reasoning tokens and overhead
     token_buffer_percentage: float = field(default_factory=lambda: float(os.getenv("TOKEN_BUFFER_PERCENTAGE", "0.875")))
     token_cleanup_threshold: float = field(default_factory=lambda: float(os.getenv("TOKEN_CLEANUP_THRESHOLD", "0.8")))
     token_trim_message_count: int = field(default_factory=lambda: int(os.getenv("TOKEN_TRIM_MESSAGE_COUNT", "5")))
@@ -145,13 +151,17 @@ class BotConfig:
     streaming_circuit_breaker_cooldown: int = field(default_factory=lambda: int(os.getenv("STREAMING_CIRCUIT_BREAKER_COOLDOWN", "300")))
     
     def get_model_token_limit(self, model: str) -> int:
-        """Get the token limit for a specific model
-        
+        """Get the effective input token limit for a specific model
+
+        This returns the maximum number of input tokens we should send.
+        For GPT-5: 400k total - output reservation = ~350k with buffer
+        For GPT-4: 128k total - output reservation = ~112k with buffer
+
         Args:
             model: Model name (e.g., 'gpt-5', 'gpt-4.1', 'gpt-4o')
-            
+
         Returns:
-            Buffered token limit for the model
+            Buffered token limit for safe operation
         """
         # Determine base limit based on model family
         if model.startswith('gpt-5'):

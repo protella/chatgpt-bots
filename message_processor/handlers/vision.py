@@ -492,11 +492,17 @@ class VisionHandlerMixin:
                 context_parts.append(image_analysis)
                 context_parts.append("")
             
-            # Add document content
+            # Add document content - get from thread state which may be summarized
+            # DO NOT use document_inputs directly as they contain full unsummarized content
             if document_inputs:
-                doc_text = self._build_message_with_documents("", document_inputs)
-                if doc_text and isinstance(doc_text, str):  # Ensure it's a string
-                    context_parts.append(doc_text)
+                # Find the most recent user message in thread_state that contains documents
+                for msg in reversed(thread_state.messages):
+                    if msg.get("role") == "user":
+                        content = msg.get("content", "")
+                        if "=== DOCUMENT:" in content:
+                            # This message has document content (possibly summarized)
+                            context_parts.append(content)
+                            break
             
             # Add user question
             context_parts.append("")  # Empty line before question
