@@ -15,6 +15,7 @@ from .handlers.text import TextHandlerMixin
 from .handlers.vision import VisionHandlerMixin
 from .handlers.image_gen import ImageGenerationMixin
 from .handlers.image_edit import ImageEditMixin
+from .handlers.mcp import MCPHandlerMixin
 from .utilities import MessageUtilitiesMixin
 from image_url_handler import ImageURLHandler
 try:
@@ -30,19 +31,46 @@ class MessageProcessor(ThreadManagementMixin,
                        VisionHandlerMixin,
                        ImageGenerationMixin,
                        ImageEditMixin,
+                       MCPHandlerMixin,
                        MessageUtilitiesMixin,
                        LoggerMixin):
     """Handles message processing logic independent of chat platform"""
-    
+
     def __init__(self, db = None):
         self.thread_manager = AsyncThreadStateManager(db=db)
         self.openai_client = OpenAIClient()
         self.image_url_handler = ImageURLHandler()
         self.document_handler = DocumentHandler() if DOCUMENT_HANDLER_AVAILABLE else None
         self.db = db  # Database manager
+        self.mcp_manager = None  # MCP client manager (initialized separately)
         if not DOCUMENT_HANDLER_AVAILABLE:
             self.log_warning("DocumentHandler not available - document processing will be disabled")
         self.log_info(f"MessageProcessor initialized {'with' if db else 'without'} database")
+
+    async def initialize_mcp(self, config_path: str = "mcp_config.json") -> bool:
+        """
+        Initialize MCP connections
+
+        Args:
+            config_path: Path to MCP configuration file
+
+        Returns:
+            True if MCP initialized successfully
+        """
+        try:
+            from mcp_client_manager import MCPClientManager
+            self.mcp_manager = MCPClientManager(config_path)
+            success = await self.mcp_manager.initialize()
+            if success:
+                tools = await self.mcp_manager.get_available_tools()
+                self.log_info(f"MCP initialized with {len(tools)} tools available")
+            return success
+        except ImportError:
+            self.log_warning("MCPClientManager not available - MCP features disabled")
+            return False
+        except Exception as e:
+            self.log_error(f"Failed to initialize MCP: {e}")
+            return False
     
 
 
@@ -654,7 +682,17 @@ class MessageProcessor(ThreadManagementMixin,
                         message
                     )
             else:
-                response = await self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0)
+                # Check for MCP tool invocation first
+                mcp_response = await self._handle_mcp_tool(
+                    user_content,
+                    thread_state, client, message, thinking_id
+                )
+
+                if mcp_response:
+                    response = mcp_response
+                else:
+                    # No MCP tool matched, fall back to text response
+                    response = await self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0)
             
             # DEBUG: Print conversation history after processing (with truncated content)
             import json
@@ -816,11 +854,21 @@ class MessageProcessor(ThreadManagementMixin,
                                 client, message.channel_id, thinking_id, message
                             )
                         else:
-                            response = await self._handle_text_response(
+                            # Check for MCP tool invocation first
+                            mcp_response = await self._handle_mcp_tool(
                                 enhanced_text if 'enhanced_text' in locals() else user_content,
-                                thread_state, client, message, thinking_id,
-                                attachment_urls if 'attachment_urls' in locals() else None,
-                                retry_count=1
+                                thread_state, client, message, thinking_id
+                            )
+
+                            if mcp_response:
+                                response = mcp_response
+                            else:
+                                # No MCP tool matched, fall back to text response
+                                response = await self._handle_text_response(
+                                    enhanced_text if 'enhanced_text' in locals() else user_content,
+                                    thread_state, client, message, thinking_id,
+                                    attachment_urls if 'attachment_urls' in locals() else None,
+                                    retry_count=1
                             )
 
                         self.log_info(f"Retry successful for {operation_type}")
@@ -960,6 +1008,9 @@ class MessageProcessor(ThreadManagementMixin,
         self.log_info("Cleaning up MessageProcessor resources...")
         if hasattr(self, 'openai_client') and self.openai_client:
             await self.openai_client.close()
+        # Close MCP connections if initialized
+        if hasattr(self, 'mcp_manager') and self.mcp_manager:
+            await self.mcp_manager.cleanup()
         # Close thread manager resources if needed
         if hasattr(self.thread_manager, 'cleanup'):
             await self.thread_manager.cleanup()

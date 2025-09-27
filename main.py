@@ -45,6 +45,17 @@ class ChatBotV2:
             self.processor = MessageProcessor(db=self.client.db)
             # Give the client a reference to the processor for thread state updates
             self.client.processor = self.processor
+
+            # Initialize MCP if configured
+            try:
+                mcp_initialized = await self.processor.initialize_mcp()
+                if mcp_initialized:
+                    main_logger.info("MCP integration initialized successfully")
+                else:
+                    main_logger.info("MCP integration not configured or failed to initialize")
+            except Exception as e:
+                main_logger.warning(f"MCP initialization error: {e}")
+                # Continue without MCP - it's optional
         elif self.platform == "discord":
             # Future: from discordbot import DiscordBot
             # self.client = DiscordBot(message_handler=self.handle_message)
@@ -147,6 +158,14 @@ class ChatBotV2:
 
                         # Delete the status message - the enhanced prompt message remains untouched
                         await client.delete_message(message.channel_id, upload_status_id)
+                elif response.type == "mcp_tool":
+                    # MCP tool was invoked, send the result
+                    formatted_text = client.format_text(response.content)
+                    await client.send_message(
+                        message.channel_id,
+                        message.thread_id,
+                        formatted_text
+                    )
                 elif response.type == "error":
                     # Send error message
                     await client.handle_error(
