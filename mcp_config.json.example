@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "example-disabled": {
+      "_comment": "Example MCP server configuration (disabled by default)",
+      "_transport": "http",
+      "_url": "http://localhost:8001/mcp",
+      "_description": "Example MCP server",
+      "_headers": {
+        "Authorization": "Bearer ${MCP_API_KEY}"
+      }
+    }
+  }
+}
