@@ -279,7 +279,6 @@ class ThreadManagementMixin:
                     doc_tokens = self.thread_manager._token_counter.count_tokens(original_content)
 
                     # Get the model's token limit
-                    from config import config
                     model = thread_state.current_model or config.gpt_model
                     max_tokens = config.get_model_token_limit(model)
 

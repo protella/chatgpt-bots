@@ -500,6 +500,15 @@ async def create_streaming_response_with_tools(
     
     self.log_debug(f"Creating streaming response with tools using model {model}, tools: {tools}")
 
+    # Debug: Log actual token counts being sent
+    import json
+    total_input_chars = sum(len(msg["content"]) for msg in messages)
+    if system_prompt:
+        total_input_chars += len(system_prompt)
+    self.log_debug(f"Sending to API: {len(messages)} messages, {total_input_chars} total chars")
+    self.log_debug(f"System prompt length: {len(system_prompt) if system_prompt else 0} chars")
+    self.log_debug(f"Max output tokens requested: {max_tokens}")
+
     try:
         # Determine operation type based on reasoning effort and context
         # Determine operation type - all text operations use same timeout regardless of reasoning/tools

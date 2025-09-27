@@ -213,54 +213,79 @@ class MessageProcessor(ThreadManagementMixin,
             # Determine what content to use for checking
             content_to_check = enhanced_text if not image_inputs else (enhanced_text if enhanced_text else f"{username}: [uploaded image(s) for analysis]")
             
-            # Temporarily add message to check total tokens
-            temp_message = {"role": "user", "content": content_to_check}
-            thread_state.messages.append(temp_message)
-            
-            # Check token count with the new message
+            # Check token count with the new message (WITHOUT adding it to thread yet)
             model = thread_state.current_model or config.gpt_model
             max_tokens = config.get_model_token_limit(model)
+
+            # Calculate what the tokens would be with the new message
+            temp_message = {"role": "user", "content": content_to_check}
+            new_message_tokens = self.thread_manager._token_counter.count_message_tokens(temp_message)
             current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-            
+            projected_tokens = current_tokens + new_message_tokens
+
+            # Debug logging for token counting
+            self.log_debug(f"Token calculation: current={current_tokens}, new_message={new_message_tokens}, projected={projected_tokens}")
+            self.log_debug(f"New message length: {len(content_to_check)} chars = {new_message_tokens} tokens")
+
             # Apply smart trimming if needed - keep trimming until under limit
-            if current_tokens > max_tokens:
-                self.log_info(f"Thread would exceed limit with new message ({current_tokens}/{max_tokens} tokens), applying smart trim")
+            if projected_tokens > max_tokens:
+                self.log_info(f"Thread would exceed limit with new message ({projected_tokens}/{max_tokens} tokens), applying smart trim")
+
+                # Update status to show we're optimizing
+                if thinking_id:
+                    self._update_status(
+                        client,
+                        message.channel_id,
+                        thinking_id,
+                        f"Optimizing conversation history ({projected_tokens:,}/{max_tokens:,} tokens)...",
+                        emoji=config.thinking_emoji
+                    )
+
                 total_trimmed = 0
-                
-                # Keep trimming until we're under the limit
-                while current_tokens > max_tokens:
-                    # Smart trim will work on all messages including the temp one
+
+                # Keep trimming until we're under the limit (accounting for the new message we'll add)
+                while projected_tokens > max_tokens:
+                    # Smart trim will work on existing messages only (not the temp one)
                     trimmed_count = await self._smart_trim_with_summarization(thread_state)
                     total_trimmed += trimmed_count
                     
                     if trimmed_count == 0:
                         # No more messages to trim, we've done all we can
-                        self.log_warning(f"Cannot trim further - still at {current_tokens} tokens")
+                        self.log_warning(f"Cannot trim further - still at {projected_tokens} tokens")
                         break
-                    
-                    # Recalculate tokens after trimming
+
+                    # Recalculate tokens after trimming (including the message we'll add)
                     current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-                    self.log_debug(f"After trimming {trimmed_count} messages, now at {current_tokens}/{max_tokens} tokens")
+                    projected_tokens = current_tokens + new_message_tokens
+                    self.log_debug(f"After trimming {trimmed_count} messages, now at {projected_tokens}/{max_tokens} tokens (current: {current_tokens} + new: {new_message_tokens})")
                 
                 if total_trimmed > 0:
-                    self.log_info(f"Smart trim complete: {total_trimmed} total messages processed, final: {current_tokens}/{max_tokens} tokens")
+                    self.log_info(f"Smart trim complete: {total_trimmed} total messages processed, final: {projected_tokens}/{max_tokens} tokens")
 
                 # Check if we're still over the limit after trimming
-                if current_tokens > max_tokens:
-                    self.log_warning(f"Smart trim insufficient. Need {current_tokens - max_tokens} more tokens. Dropping oldest messages...")
+                if projected_tokens > max_tokens:
+                    self.log_warning(f"Smart trim insufficient. Need {projected_tokens - max_tokens} more tokens. Dropping oldest messages...")
 
                     # Keep dropping oldest messages until we fit
                     messages_dropped = 0
-                    while current_tokens > max_tokens and len(thread_state.messages) > 1:  # Keep at least the new message
-                        # Find the first droppable message (not the temp message we just added)
-                        for i in range(len(thread_state.messages) - 1):  # -1 to exclude the temp message
-                            # Drop the oldest message
-                            dropped_msg = thread_state.messages.pop(i)
-                            messages_dropped += 1
+                    while projected_tokens > max_tokens and len(thread_state.messages) > 0:
+                        # Drop the oldest non-preserved message
+                        dropped = False
+                        for i in range(len(thread_state.messages)):
+                            if not self._should_preserve_message(thread_state.messages[i]):
+                                dropped_msg = thread_state.messages.pop(i)
+                                messages_dropped += 1
+                                dropped = True
 
-                            # Recalculate tokens
-                            current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-                            self.log_debug(f"Dropped message {i}, now at {current_tokens}/{max_tokens} tokens")
+                                # Recalculate tokens
+                                current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+                                projected_tokens = current_tokens + new_message_tokens
+                                self.log_debug(f"Dropped message {i}, now at {projected_tokens}/{max_tokens} tokens")
+                                break
+
+                        if not dropped:
+                            # No more droppable messages
+                            self.log_warning("No more messages can be dropped (all are preserved)")
                             break
 
                         # Safety check to prevent infinite loop
@@ -269,29 +294,26 @@ class MessageProcessor(ThreadManagementMixin,
                             break
 
                     if messages_dropped > 0:
-                        self.log_info(f"Dropped {messages_dropped} oldest messages to make room. Final: {current_tokens}/{max_tokens} tokens")
+                        self.log_info(f"Dropped {messages_dropped} oldest messages to make room. Final: {projected_tokens}/{max_tokens} tokens")
                         # Mark that we've trimmed messages
                         thread_state.has_trimmed_messages = True
 
-            # Remove the temporary message - handlers will add it properly
-            if thread_state.messages and thread_state.messages[-1] == temp_message:
-                thread_state.messages.pop()
+            # No need to remove temp message since we never added it to thread_state.messages
             
             # Check if this single message alone exceeds the model's context window
-            message_tokens = self.thread_manager._token_counter.count_message_tokens(temp_message)
             max_model_tokens = config.thread_max_token_count  # Model's context limit
-            
+
             # Check if this single message exceeds the model's context window
-            if message_tokens > max_model_tokens:
+            if new_message_tokens > max_model_tokens:
                 error_msg = (
                     f"❌ Your message is too large for the model to process.\n\n"
-                    f"• Message size: {message_tokens:,} tokens\n"
+                    f"• Message size: {new_message_tokens:,} tokens\n"
                     f"• Model limit: {max_model_tokens:,} tokens\n\n"
                     f"Please reduce the size of your documents or split them into smaller requests."
                 )
-                
+
                 # Log the issue
-                self.log_error(f"Message exceeds context window: {message_tokens} > {max_model_tokens}")
+                self.log_error(f"Message exceeds context window: {new_message_tokens} > {max_model_tokens}")
                 
                 # Add minimal breadcrumb to history
                 thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
@@ -784,8 +806,11 @@ class MessageProcessor(ThreadManagementMixin,
                                 message
                             )
                         elif intent == "vision":
+                            # Build username-prefixed text without documents
+                            username = message.metadata.get("username", "User") if message.metadata else "User"
+                            text_with_username = f"{username}: {message.text}" if message.text else f"{username}:"
                             response = await self._handle_vision_analysis(
-                                enhanced_text if 'enhanced_text' in locals() else user_content,
+                                text_with_username,  # Use username-prefixed text, not enhanced with full documents
                                 image_inputs if 'image_inputs' in locals() else [],
                                 thread_state, thread_state.attachments if hasattr(thread_state, 'attachments') else [],
                                 client, message.channel_id, thinking_id, message

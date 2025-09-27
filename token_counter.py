@@ -80,19 +80,25 @@ class TokenCounter(LoggerMixin):
     def count_message_tokens(self, message: Dict[str, Any]) -> int:
         """
         Count tokens in a message dict
-        
+
         Args:
             message: Message dictionary with role and content
-            
+
         Returns:
             Number of tokens including formatting overhead
         """
         # Account for message structure overhead (role, separators, etc)
-        # Typically adds 3-4 tokens per message
+        # Typically adds 3-4 tokens per message for the structure
+        # Plus the role itself (user/assistant/system) is usually 1-2 tokens
         overhead = 4
-        
+
         tokens = overhead
-        
+
+        # Count role tokens
+        role = message.get("role", "")
+        if role:
+            tokens += self.count_tokens(role)
+
         # Count content tokens
         content = message.get("content", "")
         if content:
