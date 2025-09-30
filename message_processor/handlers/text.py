@@ -764,7 +764,7 @@ class TextHandlerMixin:
 
                             # Send the rest as new messages
                             overflow_text = response_text[3800:]
-                            await client.send_message(message.channel_id, thinking_id, f"*...continued*\n\n{overflow_text}")
+                            await client.send_message(message.channel_id, message.thread_id, f"*...continued*\n\n{overflow_text}")
                             
                             if not final_result["success"]:
                                 self.log_error(f"Final truncated update failed: {final_result.get('error', 'Unknown error')}")
