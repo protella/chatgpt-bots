@@ -172,3 +172,4 @@ data/backups/*
 .bmad-core/
 .bmad-*/
 metrics_reports/
+Docs/MCP_SLASH_COMMAND_IMPLEMENTATION.md

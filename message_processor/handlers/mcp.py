@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup
 from base_client import Response
 from config import config
 from logger import LoggerMixin
+from message_processor.formatters import FormatterRegistry
 
 
 class MCPHandlerMixin(LoggerMixin):
@@ -19,7 +20,8 @@ class MCPHandlerMixin(LoggerMixin):
         thread_state,
         client,
         message,
-        thinking_id: Optional[str] = None
+        thinking_id: Optional[str] = None,
+        force_invoke: bool = False
     ) -> Optional[Response]:
         """
         Check if message should invoke an MCP tool and handle it
@@ -30,6 +32,7 @@ class MCPHandlerMixin(LoggerMixin):
             client: Platform client for updates
             message: Original message object
             thinking_id: ID of thinking indicator to update
+            force_invoke: If True, skip LLM tool selection and directly invoke first available MCP tool
 
         Returns:
             Response if MCP tool was invoked, None otherwise
@@ -38,18 +41,39 @@ class MCPHandlerMixin(LoggerMixin):
             return None
 
         try:
-            # Use LLM to select appropriate tool
-            tool_selection = await self.mcp_manager.select_tool_for_message(
-                user_content,
-                self.openai_client
-            )
+            # If forced (e.g., from slash command), skip LLM tool selection
+            if force_invoke:
+                # Get first available tool
+                available_tools = await self.mcp_manager.get_available_tools()
+                if not available_tools:
+                    self.log_error("Force invoke requested but no MCP tools available")
+                    return None
 
-            if not tool_selection:
-                # No MCP tool matches, return None to fall through to text response
-                return None
+                tool_info = available_tools[0]  # Use first tool
+                self.log_info(f"Force invoking MCP tool: {tool_info.get('name', 'unknown')}")
+            else:
+                # Use LLM to select appropriate tool
+                tool_selection = await self.mcp_manager.select_tool_for_message(
+                    user_content,
+                    self.openai_client
+                )
 
-            tool_info = tool_selection.get("tool", {})
-            parameters = tool_selection.get("parameters", {})
+                if not tool_selection:
+                    # No MCP tool matches, return None to fall through to text response
+                    return None
+
+                tool_info = tool_selection.get("tool", {})
+
+            # Extract clean query - remove username prefix if present
+            clean_query = user_content
+            if message.metadata:
+                username = message.metadata.get("username", "")
+                if username and clean_query.startswith(f"{username}:"):
+                    # Strip "Username: " prefix
+                    clean_query = clean_query.split(":", 1)[1].strip()
+
+            # Use the original user query verbatim, don't let LLM elaborate
+            parameters = {"query": clean_query}
 
             # Ensure tool_info is a dict
             if not isinstance(tool_info, dict):
@@ -67,7 +91,58 @@ class MCPHandlerMixin(LoggerMixin):
 
             self.log_info(f"Invoking MCP tool: {tool_info.get('name', 'unknown')} with parameters: {parameters}")
 
-            # Call the MCP tool
+            # Get thread config to check streaming preference
+            thread_config = config.get_thread_config(
+                overrides=thread_state.config_overrides,
+                user_id=message.user_id,
+                db=self.db
+            )
+
+            # Check if streaming is enabled and supported
+            use_streaming = thread_config.get('enable_streaming', config.enable_streaming)
+
+            if use_streaming and thinking_id:
+                # Use streaming mode
+                self.log_info("Using MCP streaming mode")
+                final_content = await self._stream_mcp_response(
+                    tool_info.get("name", "unknown"),
+                    parameters,
+                    tool_info,
+                    client,
+                    message.channel_id,
+                    thinking_id,
+                    server_name=tool_info.get("server")
+                )
+
+                if final_content:
+                    # Add messages to thread history
+                    formatted_user = self._format_user_content_with_username(user_content, message)
+                    thread_state.messages.append({"role": "user", "content": formatted_user})
+                    thread_state.messages.append({"role": "assistant", "content": final_content})
+
+                    # Cache messages
+                    if self.db:
+                        thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+                        message_ts = message.metadata.get("ts") if message.metadata else None
+                        await self.db.cache_message_async(thread_key, "user", formatted_user, message_ts=message_ts)
+                        await self.db.cache_message_async(thread_key, "assistant", final_content)
+
+                    return Response(
+                        type="text",
+                        content=final_content,
+                        metadata={
+                            "tool": tool_info.get("name", "unknown"),
+                            "server": tool_info.get("server"),
+                            "parameters": parameters,
+                            "streamed": True
+                        }
+                    )
+                else:
+                    # Streaming failed, fall back to non-streaming
+                    self.log_warning("MCP streaming returned empty content, falling back to non-streaming")
+
+            # Non-streaming mode or streaming fallback
+            self.log_info("Using MCP non-streaming mode")
             result = await self.mcp_manager.call_tool(
                 tool_info.get("name", "unknown"),
                 parameters,
@@ -140,8 +215,19 @@ class MCPHandlerMixin(LoggerMixin):
                     if parsed.get("status") == "success" and "content" in parsed:
                         # Extract HTML content from successful response
                         html_content = parsed["content"]
-                        # Convert HTML to platform-appropriate markdown
-                        response_text = self._convert_html_to_markdown(html_content, client)
+
+                        # Use formatter plugin if available, otherwise fall back to generic conversion
+                        server_name = tool_info.get("server", "")
+                        response_text = FormatterRegistry.format_response(
+                            server_name,
+                            html_content,
+                            tool_info,
+                            client
+                        )
+
+                        # If no formatter was applied (same content returned), use generic conversion
+                        if response_text == html_content and '<' in html_content:
+                            response_text = self._convert_html_to_markdown(html_content, client)
                     elif parsed.get("status") == "error":
                         # Handle error response gracefully without exposing technical details
                         error_msg = parsed.get("error", "")
@@ -179,15 +265,36 @@ class MCPHandlerMixin(LoggerMixin):
                 else:
                     # Plain text or HTML response
                     if '<' in response_content and '>' in response_content:
-                        # Looks like HTML
-                        response_text = self._convert_html_to_markdown(response_content, client)
+                        # Try formatter plugin first
+                        server_name = tool_info.get("server", "")
+                        response_text = FormatterRegistry.format_response(
+                            server_name,
+                            response_content,
+                            tool_info,
+                            client
+                        )
+
+                        # If no formatter applied, use generic conversion
+                        if response_text == response_content:
+                            response_text = self._convert_html_to_markdown(response_content, client)
                     else:
                         # Plain text
                         response_text = response_content
             except json.JSONDecodeError:
                 # Not JSON, treat as plain text/HTML
                 if '<' in response_content and '>' in response_content:
-                    response_text = self._convert_html_to_markdown(response_content, client)
+                    # Try formatter plugin first
+                    server_name = tool_info.get("server", "")
+                    response_text = FormatterRegistry.format_response(
+                        server_name,
+                        response_content,
+                        tool_info,
+                        client
+                    )
+
+                    # If no formatter applied, use generic conversion
+                    if response_text == response_content:
+                        response_text = self._convert_html_to_markdown(response_content, client)
                 else:
                     response_text = response_content
 
@@ -230,6 +337,151 @@ class MCPHandlerMixin(LoggerMixin):
                 type="error",
                 content=error_message
             )
+
+    async def _stream_mcp_response(
+        self,
+        tool_name: str,
+        parameters: Dict[str, Any],
+        tool_info: Dict[str, Any],
+        client,
+        channel_id: str,
+        message_id: str,
+        server_name: Optional[str] = None
+    ) -> str:
+        """
+        Stream MCP tool response with real-time updates
+
+        Args:
+            tool_name: Name of MCP tool to call
+            parameters: Tool parameters
+            tool_info: Tool metadata
+            client: Platform client for updates
+            channel_id: Channel ID
+            message_id: Message to update
+            server_name: Optional server name
+
+        Returns:
+            Final formatted content for conversation history
+        """
+        import asyncio
+        from streaming.buffer import StreamingBuffer
+        from streaming.rate_limiter import RateLimitManager
+        from config import config
+
+        # Initialize streaming components
+        buffer = StreamingBuffer()
+        rate_limiter = RateLimitManager()
+        accumulated_html = ""
+        last_update_time = 0
+        min_update_interval = 0.3  # 300ms between updates
+
+        # Use configured loading ellipse emoji
+        loading_indicator = config.loading_ellipse_emoji
+
+        try:
+            # Create progress handler that will be called as chunks arrive
+            # FastMCP passes (progress_token, progress, total) to the handler
+            async def progress_handler(progress_token, progress, total):
+                nonlocal accumulated_html, last_update_time
+
+                # Progress notifications from ctx.report_progress() don't contain content
+                # We need to capture info notifications from ctx.info() instead
+                # But the handler signature doesn't match what we need
+                # The actual content comes through in the final result, not progress updates
+                return
+
+                if chunk and isinstance(chunk, str):
+                    # Accumulate the chunk
+                    accumulated_html += chunk
+
+                    # Convert to markdown via formatter plugin
+                    server_name_local = tool_info.get("server", "")
+                    formatted = FormatterRegistry.format_response(
+                        server_name_local,
+                        accumulated_html,
+                        tool_info,
+                        client
+                    )
+
+                    # If no formatter applied, use generic conversion
+                    if formatted == accumulated_html and '<' in accumulated_html:
+                        formatted = self._convert_html_to_markdown(accumulated_html, client)
+
+                    # Check if we should update (rate limiting)
+                    current_time = asyncio.get_event_loop().time()
+                    if current_time - last_update_time >= min_update_interval:
+                        if rate_limiter.can_make_request():
+                            rate_limiter.record_request_attempt()
+                            # Update the message
+                            update_result = await client.update_message_streaming(
+                                channel_id,
+                                message_id,
+                                formatted + f"\n\n{loading_indicator}"
+                            )
+
+                            if update_result["success"]:
+                                rate_limiter.record_success()
+                                buffer.mark_updated()
+                                last_update_time = current_time
+                            else:
+                                rate_limiter.record_failure(
+                                    is_rate_limit="rate_limit" in str(update_result.get("error", ""))
+                                )
+
+            # Call MCP tool with progress handler
+            result = await self.mcp_manager.call_tool(
+                tool_name,
+                parameters,
+                server_name=server_name,
+                progress_handler=progress_handler
+            )
+
+            # Extract final content from result
+            if hasattr(result, 'content'):
+                if isinstance(result.content, list) and len(result.content) > 0:
+                    content_item = result.content[0]
+                    if hasattr(content_item, 'text'):
+                        final_html = content_item.text
+                    else:
+                        final_html = str(content_item)
+                else:
+                    final_html = str(result.content)
+            elif isinstance(result, dict) and "content" in result:
+                final_html = result["content"]
+            else:
+                final_html = accumulated_html  # Use accumulated chunks
+
+            # Parse if JSON
+            if isinstance(final_html, str) and final_html.strip().startswith('{'):
+                parsed = json.loads(final_html)
+                if parsed.get("status") == "success" and "content" in parsed:
+                    final_html = parsed["content"]
+
+            # Format final response via formatter plugin
+            server_name_local = tool_info.get("server", "")
+            final_formatted = FormatterRegistry.format_response(
+                server_name_local,
+                final_html,
+                tool_info,
+                client
+            )
+
+            # If no formatter applied, use generic conversion
+            if final_formatted == final_html and '<' in final_html:
+                final_formatted = self._convert_html_to_markdown(final_html, client)
+
+            # Final update to remove loading indicator
+            await client.update_message_streaming(channel_id, message_id, final_formatted)
+
+            self.log_info(f"MCP streaming complete: {len(final_html)} chars")
+            return final_formatted
+
+        except asyncio.TimeoutError:
+            self.log_error("MCP streaming request timed out")
+            return ""
+        except Exception as e:
+            self.log_error(f"Error in MCP streaming: {e}", exc_info=True)
+            return ""
 
     def _format_tool_result_as_context(self, tool_info: Dict[str, Any], result: Any) -> str:
         """

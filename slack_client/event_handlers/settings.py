@@ -54,7 +54,132 @@ class SlackSettingsHandlersMixin:
         return False
 
     def _register_settings_handlers(self):
-        # Register slash command handler
+        # Register MCP slash command handler
+        @self.app.command(config.mcp_slash_command)
+        async def handle_mcp_command(ack, body, client):
+            """Handle the MCP slash command for direct ReportPro access"""
+            await ack()  # Acknowledge command receipt immediately
+
+            user_id = body.get('user_id')
+            channel_id = body.get('channel_id')
+            command_text = body.get('text', '').strip()
+
+            self.log_info(f"MCP command invoked by user {user_id} in channel {channel_id}: {command_text[:100]}")
+
+            # For DM channels, check if it's a self-DM and redirect to bot's DM
+            original_channel_id = channel_id
+            if channel_id.startswith('D'):
+                try:
+                    open_result = await client.conversations_open(users=user_id)
+                    if open_result.get('ok'):
+                        bot_dm_channel = open_result['channel']['id']
+                        if bot_dm_channel != channel_id:
+                            self.log_info(f"Redirecting from DM {channel_id} to bot DM {bot_dm_channel}")
+                            channel_id = bot_dm_channel
+                except Exception as e:
+                    self.log_debug(f"Could not verify DM channel: {e}")
+
+            # Check if command text is empty
+            if not command_text:
+                try:
+                    await client.chat_postEphemeral(
+                        channel=channel_id,
+                        user=user_id,
+                        text=f"❓ **Usage:** `{config.mcp_slash_command} [your question]`\n\nPlease provide a question about food industry data, trends, or statistics."
+                    )
+                except Exception as e:
+                    self.log_error(f"Error sending usage message: {e}")
+                return
+
+            try:
+                # Send the user's query as the thread starter
+                initial_response = await client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"<@{user_id}> asked ReportPro: {command_text}"
+                )
+
+                thread_ts = initial_response['ts']
+                message_ts = initial_response['ts']
+
+                # Post settings button as first reply in thread
+                button_value = json.dumps({
+                    "channel_id": channel_id,
+                    "thread_id": thread_ts
+                })
+
+                settings_blocks = [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "⚙️ *Quick Settings Access*"
+                        }
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": {
+                                    "type": "plain_text",
+                                    "text": "Settings"
+                                },
+                                "style": "primary",
+                                "action_id": "open_welcome_settings",
+                                "value": button_value
+                            }
+                        ]
+                    }
+                ]
+
+                settings_response = await client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=thread_ts,
+                    blocks=settings_blocks,
+                    text="Settings"
+                )
+
+                if not settings_response.get('ok'):
+                    self.log_error(f"Failed to send settings button: {settings_response}")
+
+                # Create synthetic message event to process through normal flow
+                synthetic_event = {
+                    'type': 'message',
+                    'text': command_text,
+                    'user': user_id,
+                    'channel': channel_id,
+                    'ts': message_ts,
+                    'thread_ts': thread_ts,
+                    'force_intent': 'mcp',  # Force MCP tool intent
+                }
+
+                # Process through normal handler
+                await self._handle_slack_message(synthetic_event, client, is_slash_command=True)
+
+            except Exception as e:
+                self.log_error(f"Error handling MCP command: {e}", exc_info=True)
+
+                error_msg = str(e)
+                if 'channel_not_found' in error_msg or 'not_in_channel' in error_msg:
+                    try:
+                        await client.chat_postEphemeral(
+                            channel=original_channel_id,
+                            user=user_id,
+                            text=f"❌ I need to be added to this channel to use the `{config.mcp_slash_command}` command.\n\nPlease invite me to the channel or use the command in a direct message."
+                        )
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        await client.chat_postEphemeral(
+                            channel=original_channel_id,
+                            user=user_id,
+                            text="❌ Sorry, there was an error processing your query. Please try again."
+                        )
+                    except Exception:
+                        pass
+
+        # Register settings slash command handler
         @self.app.command(config.settings_slash_command)
         async def handle_settings_command(ack, body, client):
             """Handle the settings slash command"""

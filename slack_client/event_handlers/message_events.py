@@ -9,7 +9,7 @@ from base_client import Message
 
 
 class SlackMessageEventsMixin:
-    async def _handle_slack_message(self, event: Dict[str, Any], client):
+    async def _handle_slack_message(self, event: Dict[str, Any], client, is_slash_command: bool = False):
         """Convert Slack event to universal Message format"""
         
         # Skip message_changed events
@@ -71,6 +71,8 @@ class SlackMessageEventsMixin:
                 "slack_client": client,
                 "username": username,  # Add username to metadata
                 "user_real_name": user_real_name,  # Add real name to metadata
+                "force_intent": event.get("force_intent"),  # Pass through forced intent if present
+                "thinking_id": event.get("thinking_id"),  # Pass through thinking_id for slash commands
                 "user_email": user_email,  # Add email to metadata
                 "user_timezone": user_timezone,  # Add timezone to metadata
                 "user_tz_label": user_tz_label  # Add timezone label (EST, PST, etc.)
@@ -258,8 +260,10 @@ class SlackMessageEventsMixin:
                 return  # Don't process until settings are configured
         else:
             # Existing user with preferences - check if this is a new thread that needs a settings button
-            await self._post_settings_button_if_new_thread(message, client, user_prefs)
-        
+            # Skip if this is a slash command (settings button already posted)
+            if not is_slash_command:
+                await self._post_settings_button_if_new_thread(message, client, user_prefs)
+
         # Call the message handler if set
         if self.message_handler:
             await self.message_handler(message, self)

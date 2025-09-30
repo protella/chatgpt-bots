@@ -479,26 +479,39 @@ class ThreadManagementMixin:
                 message.thread_id
             )
             
-            # Only show rebuilding status if there's actual history (excluding current message)
+            # Only show rebuilding status if there's actual history (excluding current message and UI elements)
             current_ts = message.metadata.get("ts")
-            has_history = any(msg.metadata.get("ts") != current_ts for msg in history)
-            
-            if has_history:
-                # Update status to show we're rebuilding
+
+            # Track pending image URLs for vision analysis association
+            pending_image_urls = []
+            pending_image_metadata = {}  # Store additional metadata per URL
+
+            # First pass: determine if there's meaningful history to rebuild
+            meaningful_history_count = 0
+            for hist_msg in history:
+                # Skip current message
+                if hist_msg.metadata.get("ts") == current_ts:
+                    continue
+
+                # Skip UI elements (Settings button)
+                is_bot = hist_msg.metadata.get("is_bot", False)
+                if is_bot and hist_msg.text and hist_msg.text.strip() in ["Settings", "⚙️ Quick Settings Access"]:
+                    continue
+
+                meaningful_history_count += 1
+
+            # Show rebuilding status only if there's meaningful history
+            if meaningful_history_count > 0:
                 if thinking_id:
                     self._update_status(
-                        client, 
-                        message.channel_id, 
+                        client,
+                        message.channel_id,
                         thinking_id,
                         "Rebuilding thread history from Slack...",
                         emoji=config.circle_loader_emoji
                     )
                 self.log_info(f"Rebuilding thread state for {message.thread_id} with {len(history)} messages")
-            
-            # Track pending image URLs for vision analysis association
-            pending_image_urls = []
-            pending_image_metadata = {}  # Store additional metadata per URL
-            
+
             # Convert to thread state messages
             for hist_msg in history:
                 # Skip the current message being processed
@@ -508,7 +521,11 @@ class ThreadManagementMixin:
                 # Determine role based on metadata
                 is_bot = hist_msg.metadata.get("is_bot", False)
                 role = "assistant" if is_bot else "user"
-                
+
+                # Skip bot messages that are just UI elements (Settings button, etc.)
+                if is_bot and hist_msg.text and hist_msg.text.strip() in ["Settings", "⚙️ Quick Settings Access"]:
+                    continue
+
                 # Build content with attachment info
                 content = hist_msg.text
                 

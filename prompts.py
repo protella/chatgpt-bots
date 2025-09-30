@@ -137,7 +137,9 @@ Classify the LATEST user message into one of these categories:
    - Technical descriptions or explanations about visual things (unless asking for actual visual output)
 
 Consider the conversation context and PATTERN:
+- Single word messages with no additional context are not image-related - classify as "none"
 - Look at what the LAST assistant response was - that sets expectation for "again" or "another"
+- If the last response appears to be a follow-up question with limited context, go back to the previous message(s) and use that as the context to help classify the intent
 - If the last response was text/data, "again" means more text/data → classify as "none"
 - If the last response was an image, "again" means another image → classify as "new"
 - Vision classification REQUIRES actual file attachments (images or documents) mentioned in the message metadata
@@ -257,3 +259,58 @@ Requirements:
 - Just provide the factual summary
 
 Document content to summarize:"""
+
+# MCP Tool Selection Prompt
+MCP_TOOL_SELECTION_PROMPT = """You are an expert tool selector for a chatbot with access to specialized external data sources and APIs.
+
+Your task is to determine if the user's question should be answered using one of the available external tools, or if it should be answered using your general knowledge.
+
+**CRITICAL DECISION CRITERIA:**
+
+When a specialized tool is available for a domain, you MUST prioritize using that tool over your training data, even if you believe you know the answer. External tools provide:
+- Current, up-to-date information beyond your knowledge cutoff
+- Proprietary data not available in your training set
+- Authoritative sources with citations and verifiable data
+- Industry-specific insights and analysis
+
+**TOOL SELECTION RULES:**
+
+1. **Review each available tool's description carefully** to understand its domain and capabilities
+
+2. **When to USE a tool:**
+   - The user's question falls within the tool's described domain or expertise area
+   - The question asks for data, trends, statistics, or insights that the tool specializes in
+   - The question requires current, authoritative information beyond general knowledge
+   - The tool's description indicates it can provide better information than your training data
+
+3. **When NOT to use external tools:**
+   - Questions clearly outside all available tools' domains
+   - General knowledge questions with no specialized tool match
+   - Personal opinions or creative requests
+   - Mathematical calculations or logic puzzles
+   - Code generation or technical programming help (unless a specialized coding tool is available)
+   - Basic how-to questions that don't require specialized data
+
+**AMBIGUOUS CASES:**
+
+When a question COULD be answered by your training data but falls within a tool's domain, ALWAYS prefer the tool. The user is asking you because they want authoritative, current data, not your training knowledge.
+
+- If the tool's description mentions topics related to the user's question, use it
+- If you see any reasonable overlap between the question and the tool's domain, favor using the tool
+- When in doubt, prefer the specialized tool over general knowledge unless specifically asked not to use the tool
+
+**OUTPUT REQUIREMENTS:**
+
+Respond with valid JSON only. No other text, explanations, or commentary.
+
+Format:
+{{"tool": "tool_name"}} - if a tool should be used (use the exact tool name from the list)
+{{"tool": "NONE"}} - if no tool is appropriate
+
+User Message: {message}
+
+{tools_context}
+
+Analyze the user's message against the available tools and their descriptions. Determine if any tool is appropriate for this query.
+
+Your response (JSON only):"""

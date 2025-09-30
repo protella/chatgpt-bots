@@ -97,6 +97,9 @@ class BotConfig:
     
     # Slack settings configuration
     settings_slash_command: str = field(default_factory=lambda: os.getenv("SETTINGS_SLASH_COMMAND", "/chatgpt-settings"))
+
+    # MCP slash command
+    mcp_slash_command: str = field(default_factory=lambda: os.getenv("MCP_SLASH_COMMAND", "/reportpro-dev"))
     
     # Database configuration
     database_dir: str = field(default_factory=lambda: os.getenv("DATABASE_DIR", "data"))

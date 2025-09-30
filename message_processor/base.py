@@ -49,7 +49,7 @@ class MessageProcessor(ThreadManagementMixin,
 
     async def initialize_mcp(self, config_path: str = "mcp_config.json") -> bool:
         """
-        Initialize MCP connections
+        Initialize MCP connections and formatter plugins
 
         Args:
             config_path: Path to MCP configuration file
@@ -58,6 +58,11 @@ class MessageProcessor(ThreadManagementMixin,
             True if MCP initialized successfully
         """
         try:
+            # Initialize formatter registry (auto-discovers plugins)
+            from message_processor.formatters import FormatterRegistry
+            FormatterRegistry.initialize()
+
+            # Initialize MCP client manager
             from mcp_client_manager import MCPClientManager
             self.mcp_manager = MCPClientManager(config_path)
             success = await self.mcp_manager.initialize()
@@ -415,7 +420,12 @@ class MessageProcessor(ThreadManagementMixin,
                 # Use the original request text for processing
                 message.text = original_request
                 self.log_debug(f"Clarified intent: {intent}")
-            
+
+            # Check for forced intent from slash commands
+            elif message.metadata and message.metadata.get('force_intent'):
+                intent = message.metadata.get('force_intent')
+                self.log_info(f"Using forced intent from slash command: {intent}")
+
             # Determine intent based on context
             elif image_inputs:
                 # User uploaded images - determine if it's vision or edit request
@@ -681,6 +691,26 @@ class MessageProcessor(ThreadManagementMixin,
                         thinking_id,
                         message
                     )
+            elif intent == "mcp":
+                # Handle MCP tool query (forced by slash command)
+                if hasattr(self, 'mcp_manager') and self.mcp_manager and self.mcp_manager.initialized:
+                    self.log_info(f"Processing forced MCP query: {message.text[:100]}...")
+
+                    # Directly invoke MCP handler without LLM tool selection
+                    response = await self._handle_mcp_tool(
+                        user_content,
+                        thread_state, client, message, thinking_id,
+                        force_invoke=True
+                    )
+
+                    if not response:
+                        # MCP failed, fall back to text response
+                        self.log_warning("MCP tool invocation failed, falling back to text response")
+                        response = await self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0)
+                else:
+                    # MCP not available, fall back to text
+                    self.log_warning("MCP intent specified but MCP not initialized, falling back to text response")
+                    response = await self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0)
             else:
                 # Check for MCP tool invocation first
                 mcp_response = await self._handle_mcp_tool(

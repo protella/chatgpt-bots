@@ -144,6 +144,10 @@ See `.env.example` for a complete configuration template with all available sett
 - **Document Processing**: Extract and analyze text from PDFs, Office files, and code
 - **Web Search**: Current information retrieval (GPT-5 models only)
 - **Streaming Responses**: Real-time message updates as responses generate
+- **MCP Integration**: Support for Model Context Protocol (MCP) servers for specialized data access
+  - Auto-discovery of MCP tools from configured servers
+  - Intelligent tool selection based on query intent
+  - Plugin-based response formatting system (see [Formatter Plugins](#formatter-plugins))
 
 #### User Experience
 - **Settings Modal**: Interactive configuration UI with `/chatgpt-settings`
@@ -151,6 +155,20 @@ See `.env.example` for a complete configuration template with all available sett
 - **Custom Instructions**: Personalized response styles per user
 - **Multi-User Context**: Maintains separate contexts in shared conversations
 - **Persistent Settings**: User preferences saved to SQLite database
+
+### Formatter Plugins
+
+The bot supports custom response formatters for MCP servers through a plugin system. Formatters can customize how responses from external MCP tools are displayed to users.
+
+**Plugin Location**: `plugins/mcp-server/client-plugins/chatgpt-bot/`
+
+For detailed information on creating and configuring formatter plugins, see the [Formatter Plugin README](plugins/mcp-server/client-plugins/chatgpt-bot/README.md).
+
+**Key Features**:
+- Auto-discovery of formatters from MCP server repositories
+- Platform-specific formatting (Slack, Discord, etc.)
+- HTML to markdown conversion with inline citations
+- Customizable response styling per MCP server
 
 ### Configuration - Memory Cleanup
 Thread cleanup runs on a schedule (cron format):

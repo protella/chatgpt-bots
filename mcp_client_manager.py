@@ -76,10 +76,19 @@ class MCPClientManager(LoggerMixin):
                 self.log_info(f"Connecting to MCP server: {server_name}")
 
                 # Create client with server configuration
-                # FastMCP Client expects URL or command, not nested config
+                # FastMCP Client accepts config dict with url, transport, headers
                 if "url" in server_config:
-                    # HTTP/SSE server
-                    client = Client(server_config["url"])
+                    # HTTP/SSE server with optional headers
+                    from fastmcp.client.transports import StreamableHttpTransport
+
+                    url = server_config["url"]
+                    headers = server_config.get("headers", {})
+
+                    self.log_debug(f"Creating transport for {url} with headers: {list(headers.keys())}")
+
+                    # Create transport with headers for authentication
+                    transport = StreamableHttpTransport(url, headers=headers)
+                    client = Client(transport=transport)
                 elif "command" in server_config:
                     # Stdio server
                     client = Client(server_config["command"], server_config.get("args", []))
@@ -149,7 +158,8 @@ class MCPClientManager(LoggerMixin):
         self,
         tool_name: str,
         arguments: Dict[str, Any],
-        server_name: Optional[str] = None
+        server_name: Optional[str] = None,
+        progress_handler: Optional[Any] = None
     ) -> Any:
         """
         Call a specific tool with given arguments
@@ -158,6 +168,7 @@ class MCPClientManager(LoggerMixin):
             tool_name: Name of the tool to call
             arguments: Arguments to pass to the tool
             server_name: Optional server name if tool exists on multiple servers
+            progress_handler: Optional callback for streaming progress updates
 
         Returns:
             Tool execution result
@@ -193,7 +204,17 @@ class MCPClientManager(LoggerMixin):
 
             # Call the tool
             self.log_debug(f"Calling tool {tool_name} on server {server_name} with args: {arguments}")
-            result = await client.call_tool(tool_name, arguments)
+
+            # Debug: Check if transport has headers
+            if hasattr(client, 'transport') and hasattr(client.transport, 'headers'):
+                self.log_debug(f"Transport headers present: {list(client.transport.headers.keys())}")
+
+            # Call tool with progress handler if provided
+            result = await client.call_tool(
+                tool_name,
+                arguments,
+                progress_handler=progress_handler
+            )
 
             self.log_info(f"Tool {tool_name} executed successfully")
             return result
@@ -237,35 +258,24 @@ class MCPClientManager(LoggerMixin):
         if not self.tools:
             return None
 
-        # Build prompt for tool selection
+        # Build prompt for tool selection using the comprehensive prompt from prompts.py
+        from prompts import MCP_TOOL_SELECTION_PROMPT
+
         tools_context = self.get_tools_for_prompt()
-
-        selection_prompt = f"""Given this user message and available tools, determine if any tool should be called.
-
-User Message: {message}
-
-{tools_context}
-
-If a tool should be called:
-1. Return the exact tool name
-2. Extract any parameters from the message
-
-If no tool matches, return "NONE".
-
-Response format:
-If tool matches: {{"tool": "tool_name", "parameters": {{"param1": "value1"}}}}
-If no match: {{"tool": "NONE"}}
-
-Respond with JSON only."""
+        selection_prompt = MCP_TOOL_SELECTION_PROMPT.format(
+            message=message,
+            tools_context=tools_context
+        )
 
         try:
             # Use the utility model for quick tool selection
+            # Pass utility config params and let create_text_response handle model-specific details
             response = await openai_client.create_text_response(
                 messages=[{"role": "user", "content": selection_prompt}],
                 model=config.utility_model,
-                temperature=0.1,
-                max_tokens=200,
-                reasoning_effort="low"
+                max_tokens=config.utility_max_tokens,
+                reasoning_effort=config.utility_reasoning_effort,
+                verbosity=config.utility_verbosity
             )
 
             # Parse the response
@@ -279,8 +289,7 @@ Respond with JSON only."""
             for tool in self.tools:
                 if tool["name"] == tool_name:
                     return {
-                        "tool": tool,
-                        "parameters": result.get("parameters", {})
+                        "tool": tool
                     }
 
             return None

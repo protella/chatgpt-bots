@@ -1,0 +1,6 @@
+# Ignore all plugins (they're separate repos)
+*
+
+# But keep these files
+!.gitignore
+!README.md

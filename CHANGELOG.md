@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### 🔌 MCP Slash Command & Tool Selection Improvements
+
+#### Added
+- **MCP Slash Command**: Added `/reportpro-dev` slash command for direct MCP tool invocation
+  - Bypasses intent classification and directly queries MCP tools
+  - Creates thread with settings button for user configuration
+  - Implements forced intent pattern matching ReportPro implementation
+- **Force Invoke Pattern**: Added `force_invoke` parameter to MCP handler to skip LLM tool selection
+- **Comprehensive Tool Selection Prompt**: Created detailed, generic prompt for MCP tool selection in `prompts.py`
+  - Emphasizes using specialized tools over LLM training data
+  - Generic design works with any MCP tool type
+  - Provides clear guidance for ambiguous cases
+
+#### Changed
+- **MCP Tool Selection**: Updated tool selection to use proper utility model configuration
+  - Now uses `config.utility_model`, `config.utility_max_tokens`, `config.utility_reasoning_effort`, and `config.utility_verbosity`
+  - Follows established pattern for model-specific parameter handling
+  - Removed hardcoded temperature and reasoning_effort values
+- **Settings Button Filtering**: Settings button messages now filtered from thread history rebuild to prevent pollution
+- **Meaningful History Check**: "Rebuilding history" status only shows when meaningful conversation history exists
+- **Dedicated MCP Intent Handler**: Added `elif intent == "mcp":` block for forced MCP invocation without LLM tool selection
+
+#### Fixed
+- **Slash Command Intent Enforcement**: Slash commands with `force_intent: 'mcp'` now correctly invoke MCP tools instead of falling back to text responses
+- **Thread History Rebuild**: Settings button UI elements no longer included in conversation context sent to LLM
+- **Force Intent Passthrough**: Message metadata now properly passes `force_intent` through event handlers
+
 ## [2.1.4] - 2025-09-24
 
 ### 🎯 Configuration, Session Management & Licensing Update
