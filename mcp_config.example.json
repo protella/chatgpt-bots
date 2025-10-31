@@ -1,0 +1,31 @@
+{
+  "mcpServers": {
+    "example-server": {
+      "server_url": "https://api.example.com/mcp",
+      "server_description": "Description of what this MCP server provides (helps AI decide when to use it)",
+      "authorization": "Bearer YOUR_API_KEY_HERE",
+      "require_approval": "never",
+      "allowed_tools": ["tool1", "tool2"],
+      "notes": "Optional: Leave allowed_tools empty or remove it to use all tools from this server"
+    },
+    "context7": {
+      "server_url": "https://mcp.context7.com/mcp",
+      "server_description": "Context7 MCP server - provides documentation and knowledge lookup for various frameworks and libraries",
+      "authorization": "",
+      "require_approval": "never",
+      "allowed_tools": [],
+      "notes": "Public test server - no auth required. Good for testing MCP integration."
+    }
+  },
+  "_comments": {
+    "server_url": "REQUIRED. HTTPS URL to the MCP server endpoint. Must be publicly accessible by OpenAI's API.",
+    "server_description": "OPTIONAL but recommended. Helps OpenAI understand when to use this server's tools. Be descriptive about the domain and capabilities.",
+    "authorization": "OPTIONAL. OAuth access token or API key. Format: 'Bearer TOKEN' or just 'TOKEN' depending on server requirements. Leave empty string if no auth required.",
+    "require_approval": "OPTIONAL. Default: 'never'. Options: 'never' (auto-approve all tool calls), 'always' (require approval for every call), or object with per-tool rules. NOTE: Only 'never' is currently supported - approval UI is a future feature.",
+    "allowed_tools": "OPTIONAL. Array of tool names to whitelist. If empty or omitted, all tools from the server are available. Use this to limit which tools the AI can access.",
+    "notes": "OPTIONAL. This field is ignored by the bot - use it for your own documentation.",
+    "security_note": "IMPORTANT: This file is in .gitignore to prevent accidental commits of API keys. Never commit secrets to version control.",
+    "finding_servers": "See https://modelcontextprotocol.io/servers for a directory of available MCP servers.",
+    "transport_note": "This bot uses OpenAI's native MCP support, which only works with remote MCP servers over HTTPS (Streamable HTTP or HTTP/SSE transport). Local stdio-based MCP servers (npx commands) are not supported."
+  }
+}
