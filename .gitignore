@@ -171,3 +171,4 @@ data/backups/*
 .bmad-core/
 .bmad-*/
 metrics_reports/
+mcp_config.json
