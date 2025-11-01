@@ -192,7 +192,17 @@ class OpenAIClient(LoggerMixin):
                 if isinstance(e, asyncio.TimeoutError):
                     raise
                 elapsed = asyncio.get_event_loop().time() - start_time
-                self.log_error(f"Stream error after {elapsed:.2f}s: {e}")
+
+                # Check if this is an MCP connection error (expected failure, handled gracefully)
+                error_msg = str(e)
+                is_mcp_error = "mcp server" in error_msg.lower() and ("404" in error_msg or "424" in error_msg)
+
+                if is_mcp_error:
+                    # MCP errors are handled gracefully by retry logic - log as WARNING
+                    self.log_warning(f"MCP server connection failed after {elapsed:.2f}s: {error_msg}")
+                else:
+                    # Unexpected errors - log as ERROR with stack trace
+                    self.log_error(f"Stream error after {elapsed:.2f}s: {e}")
                 raise
 
     async def _safe_api_call(

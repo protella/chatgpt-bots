@@ -1,11 +1,44 @@
 from __future__ import annotations
 
 import aiohttp
+import re
 from typing import Optional
 
 from slack_sdk.errors import SlackApiError
 
 from config import config
+
+
+def strip_citations(text: str) -> str:
+    """
+    Strip MCP citation markers from text while preserving web_search citations.
+
+    Citation formats:
+    - MCP: cite:emoji:mcp_<server>.<tool>result<N>:emoji:
+      Example: cite:ship:mcp_aws_knowledge.aws_search_documentationresult8:walking:
+    - Web Search: cite:emoji:turn<N>search<N>:emoji: (preserved - these are clickable links)
+      Example: cite:ship:turn1search4:walking:
+
+    MCP citations are meant for ChatGPT web UI and render as emojis + backend strings in Slack.
+    Web search citations render as clickable links and should be preserved.
+
+    Args:
+        text: Text potentially containing citation markers
+
+    Returns:
+        Text with MCP citation markers removed, web search citations preserved
+    """
+    # Pattern matches MCP citations only (contain "mcp_" in the source identifier)
+    # Format: cite:emoji:mcp_<anything>:emoji:
+    # Handles nested citations like: cite:ship:mcp_aws_knowledge.aws_search_documentationresult0:ship:turn0:walking:
+    mcp_citation_pattern = r'\s*cite:[^:]+:mcp_[^:]+(?::[^:]+)*:\w+:\s*'
+
+    cleaned_text = re.sub(mcp_citation_pattern, ' ', text)
+
+    # Clean up any double spaces created by removing citations (preserve newlines)
+    cleaned_text = re.sub(r' {2,}', ' ', cleaned_text)
+
+    return cleaned_text
 
 
 class SlackUtilitiesMixin:

@@ -117,7 +117,7 @@ Message → Intent Classifier → Handler
 **Optional Fields per Server:**
 - `server_description` - Helps OpenAI understand when to use this server
 - `authorization` - OAuth token or API key
-- `require_approval` - Currently only "never" supported (future: approval UI)
+- `require_approval` - **IGNORED** (always set to "never" internally). Config value preserved for future approval UI implementation
 - `allowed_tools` - Whitelist specific tools (empty = all tools)
 
 **Example Template:** See `mcp_config.example.json`
