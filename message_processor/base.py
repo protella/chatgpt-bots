@@ -17,6 +17,7 @@ from .handlers.image_gen import ImageGenerationMixin
 from .handlers.image_edit import ImageEditMixin
 from .utilities import MessageUtilitiesMixin
 from image_url_handler import ImageURLHandler
+from mcp_manager import MCPManager
 try:
     from document_handler import DocumentHandler
     DOCUMENT_HANDLER_AVAILABLE = True
@@ -40,6 +41,11 @@ class MessageProcessor(ThreadManagementMixin,
         self.image_url_handler = ImageURLHandler()
         self.document_handler = DocumentHandler() if DOCUMENT_HANDLER_AVAILABLE else None
         self.db = db  # Database manager
+
+        # Initialize MCP Manager
+        self.mcp_manager = MCPManager(db=db)
+        self.mcp_manager.initialize()
+
         if not DOCUMENT_HANDLER_AVAILABLE:
             self.log_warning("DocumentHandler not available - document processing will be disabled")
         self.log_info(f"MessageProcessor initialized {'with' if db else 'without'} database")
@@ -930,9 +936,13 @@ class MessageProcessor(ThreadManagementMixin,
                 error_details = str(e)
 
                 # Check for common error types and provide user-friendly messages
-                if "rate" in error_details.lower() or "limit" in error_details.lower():
+                # IMPORTANT: Check MCP errors FIRST before generic "context" check (which would match "context7" server names)
+                if "mcp server" in error_details.lower() and ("404" in error_details or "424" in error_details):
+                    error_message = f"{config.error_emoji} **MCP Connection Failed**\n\nCouldn't connect to one or more MCP servers. Please check your MCP configuration or try again later."
+                elif "rate" in error_details.lower() or "limit" in error_details.lower():
                     error_message = f"{config.error_emoji} **Too Many Requests**\n\nOpenAI is busy. Please wait a minute and try again."
-                elif "context" in error_details.lower() or "token" in error_details.lower():
+                elif "context_length_exceeded" in error_details.lower() or "maximum context length" in error_details.lower():
+                    # More specific context window check (avoid matching MCP server names like "context7")
                     error_message = f"{config.error_emoji} **Message Too Long**\n\nYour message is too long. Please try a shorter request."
                 elif "api" in error_details.lower() or "openai" in error_details.lower():
                     error_message = f"{config.error_emoji} **Service Issue**\n\nOpenAI is having problems. Please try again shortly."

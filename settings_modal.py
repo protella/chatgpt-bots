@@ -502,11 +502,21 @@ class SettingsModal(LoggerMixin):
             "type": "section",
             "text": {"type": "mrkdwn", "text": "*Features*"}
         })
-        
+
+        # Check if model supports MCP (GPT-5 only)
+        current_model = settings.get('model', config.gpt_model)
+        is_gpt5 = current_model.startswith('gpt-5')
+
+        # Adjust enable_mcp if model doesn't support it
+        current_enable_mcp = settings.get('enable_mcp', True)
+        if not is_gpt5 and current_enable_mcp:
+            current_enable_mcp = False
+            self.log_debug(f"Adjusted enable_mcp from True to False for display (model {current_model} doesn't support MCP)")
+
         # Build checkbox options for features
         feature_options = []
         initial_options = []
-        
+
         # Web search
         feature_options.append({
             "text": {"type": "mrkdwn", "text": "🌐 *Web Search*\nAllow searching the web for current information\n_(Disables the \"Minimal\" reasoning option above when enabled)_"},
@@ -514,7 +524,7 @@ class SettingsModal(LoggerMixin):
         })
         if settings.get('enable_web_search', True):
             initial_options.append(feature_options[-1])
-        
+
         # Streaming
         feature_options.append({
             "text": {"type": "mrkdwn", "text": "🌊 *Streaming*\nShow responses as they're generated"},
@@ -522,24 +532,51 @@ class SettingsModal(LoggerMixin):
         })
         if settings.get('enable_streaming', True):
             initial_options.append(feature_options[-1])
-        
+
+        # MCP Servers (only show if GPT-5 model)
+        if is_gpt5:
+            feature_options.append({
+                "text": {"type": "mrkdwn", "text": "🔌 *MCP Servers*\nAccess specialized data sources"},
+                "value": "mcp"
+            })
+            if current_enable_mcp:
+                initial_options.append(feature_options[-1])
+
         # Build the features block
+        # Use different block_id/action_id based on model to force Slack to re-render
+        if is_gpt5:
+            block_id = "features_block_gpt5"
+            action_id = "features_with_mcp"
+        else:
+            block_id = "features_block_gpt4"
+            action_id = "features_no_mcp"
+
         features_block = {
             "type": "section",
-            "block_id": "features_block",
+            "block_id": block_id,
             "text": {"type": "mrkdwn", "text": "Enable features:"},
             "accessory": {
                 "type": "checkboxes",
-                "action_id": "features",
+                "action_id": action_id,
                 "options": feature_options
             }
         }
-        
+
         # Only add initial_options if we have some (Slack requires array or omitted entirely)
         if initial_options:
             features_block["accessory"]["initial_options"] = initial_options
-        
+
         blocks.append(features_block)
+
+        # Add note about MCP being unavailable if not GPT-5
+        if not is_gpt5:
+            blocks.append({
+                "type": "context",
+                "elements": [{
+                    "type": "mrkdwn",
+                    "text": "_Note: MCP Servers feature will be available if you select a GPT-5 model_"
+                }]
+            })
         
         blocks.append({"type": "divider"})
         
@@ -649,10 +686,14 @@ class SettingsModal(LoggerMixin):
         # Fallback if no reasoning selection due to Slack modal update bug
         if not reasoning_found:
             # Check if web search is enabled from the form
-            features_block = values.get('features_block', {})
+            features_block = values.get('features_block_gpt4', {}) or values.get('features_block_gpt5', {})
             web_search_enabled = False
-            if 'features' in features_block:
-                selected_options = features_block['features'].get('selected_options', [])
+            if 'features_no_mcp' in features_block:
+                selected_options = features_block['features_no_mcp'].get('selected_options', [])
+                selected_values = [opt['value'] for opt in selected_options]
+                web_search_enabled = 'web_search' in selected_values
+            elif 'features_with_mcp' in features_block:
+                selected_options = features_block['features_with_mcp'].get('selected_options', [])
                 selected_values = [opt['value'] for opt in selected_options]
                 web_search_enabled = 'web_search' in selected_values
 
@@ -677,12 +718,22 @@ class SettingsModal(LoggerMixin):
             extracted['top_p'] = float(top_p_block['top_p'].get('value', 1.0))
         
         # Features
-        features_block = values.get('features_block', {})
-        if 'features' in features_block:
-            selected_options = features_block['features'].get('selected_options', [])
+        # Check both possible block_ids (we use different ones based on model)
+        features_block = values.get('features_block_gpt4', {}) or values.get('features_block_gpt5', {})
+
+        # Check both possible action_ids
+        if 'features_no_mcp' in features_block:
+            selected_options = features_block['features_no_mcp'].get('selected_options', [])
             selected_values = [opt['value'] for opt in selected_options]
             extracted['enable_web_search'] = 'web_search' in selected_values
             extracted['enable_streaming'] = 'streaming' in selected_values
+            # Don't set enable_mcp when it's not visible - preserve stored value
+        elif 'features_with_mcp' in features_block:
+            selected_options = features_block['features_with_mcp'].get('selected_options', [])
+            selected_values = [opt['value'] for opt in selected_options]
+            extracted['enable_web_search'] = 'web_search' in selected_values
+            extracted['enable_streaming'] = 'streaming' in selected_values
+            extracted['enable_mcp'] = 'mcp' in selected_values
         
         # Custom Instructions
         custom_instructions_block = values.get('custom_instructions_block', {})
@@ -719,7 +770,18 @@ class SettingsModal(LoggerMixin):
     def validate_settings(self, settings: Dict) -> Dict:
         """Validate and adjust settings for compatibility"""
         validated = settings.copy()
-        
+
+        # If non-GPT-5 model selected and MCP enabled, auto-disable MCP
+        model = validated.get('model', config.gpt_model)
+        if not model.startswith('gpt-5'):
+            # For GPT-4 models, ensure MCP is disabled
+            if validated.get('enable_mcp'):
+                validated['enable_mcp'] = False
+                self.log_info(f"Auto-disabled MCP because {model} doesn't support it (requires GPT-5)")
+            elif 'enable_mcp' not in validated:
+                # If not in validated dict (wasn't in the form), explicitly set to False for GPT-4
+                validated['enable_mcp'] = False
+
         # If web search enabled but reasoning too low (minimal), auto-upgrade
         if validated.get('enable_web_search') and validated.get('reasoning_effort') == 'minimal':
             validated['reasoning_effort'] = 'low'

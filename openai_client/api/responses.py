@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from config import config
 from prompts import IMAGE_INTENT_SYSTEM_PROMPT
+from slack_client.utilities import strip_citations
 
 async def create_text_response(
     self,
@@ -351,10 +352,13 @@ async def create_streaming_response(
                     
                     # If we found text, process it
                     if text_chunk:
-                        complete_text += text_chunk
-                        # Call the callback with the text chunk
+                        # Strip MCP citations from chunk before sending to avoid sending emojis/backend strings
+                        # Note: Citations spanning multiple chunks may partially render, but final text is cleaned
+                        cleaned_chunk = strip_citations(text_chunk)
+                        complete_text += cleaned_chunk
+                        # Call the callback with the cleaned text chunk
                         try:
-                            result = stream_callback(text_chunk)
+                            result = stream_callback(cleaned_chunk)
                             # If the callback returns a coroutine, await it
                             if hasattr(result, '__await__'):
                                 await result
@@ -398,6 +402,14 @@ async def create_streaming_response(
                                 result = tool_callback("image_generation", "generating")
                             elif event_type == "response.image_generation_call.completed":
                                 result = tool_callback("image_generation", "completed")
+                            elif event_type == "response.mcp_list_tools.in_progress":
+                                result = tool_callback("mcp", "discovering_tools")
+                            elif event_type == "response.mcp_list_tools.completed":
+                                result = tool_callback("mcp", "tools_discovered")
+                            elif event_type == "response.mcp_call.in_progress":
+                                result = tool_callback("mcp", "calling")
+                            elif event_type == "response.mcp_call.completed":
+                                result = tool_callback("mcp", "completed")
 
                             # If the tool callback returns a coroutine, await it
                             if result and hasattr(result, '__await__'):
@@ -414,7 +426,8 @@ async def create_streaming_response(
             except Exception as event_error:
                 self.log_warning(f"Error processing stream event: {event_error}")
                 continue
-        
+
+        # Citations already stripped per-chunk during streaming
         self.log_info(f"Generated streaming response: {len(complete_text)} chars")
         return complete_text
         
@@ -559,10 +572,13 @@ async def create_streaming_response_with_tools(
                     
                     # If we found text, process it
                     if text_chunk:
-                        complete_text += text_chunk
-                        # Call the callback with the text chunk
+                        # Strip MCP citations from chunk before sending to avoid sending emojis/backend strings
+                        # Note: Citations spanning multiple chunks may partially render, but final text is cleaned
+                        cleaned_chunk = strip_citations(text_chunk)
+                        complete_text += cleaned_chunk
+                        # Call the callback with the cleaned text chunk
                         try:
-                            result = stream_callback(text_chunk)
+                            result = stream_callback(cleaned_chunk)
                             # If the callback returns a coroutine, await it
                             if hasattr(result, '__await__'):
                                 await result
@@ -606,6 +622,14 @@ async def create_streaming_response_with_tools(
                                 result = tool_callback("image_generation", "generating")
                             elif event_type == "response.image_generation_call.completed":
                                 result = tool_callback("image_generation", "completed")
+                            elif event_type == "response.mcp_list_tools.in_progress":
+                                result = tool_callback("mcp", "discovering_tools")
+                            elif event_type == "response.mcp_list_tools.completed":
+                                result = tool_callback("mcp", "tools_discovered")
+                            elif event_type == "response.mcp_call.in_progress":
+                                result = tool_callback("mcp", "calling")
+                            elif event_type == "response.mcp_call.completed":
+                                result = tool_callback("mcp", "completed")
 
                             # If the tool callback returns a coroutine, await it
                             if result and hasattr(result, '__await__'):
@@ -622,7 +646,8 @@ async def create_streaming_response_with_tools(
             except Exception as event_error:
                 self.log_warning(f"Error processing stream event: {event_error}")
                 continue
-        
+
+        # Citations already stripped per-chunk during streaming
         self.log_info(f"Generated streaming response with tools: {len(complete_text)} chars")
         return complete_text
         
@@ -631,7 +656,16 @@ async def create_streaming_response_with_tools(
         self.log_warning(f"Streaming response with tools timed out: {e}")
         raise
     except Exception as e:
-        self.log_error(f"Error creating streaming response with tools: {e}", exc_info=True)
+        # Check if this is an MCP connection error (expected failure, handled gracefully)
+        error_msg = str(e)
+        is_mcp_error = "mcp server" in error_msg.lower() and ("404" in error_msg or "424" in error_msg)
+
+        if is_mcp_error:
+            # MCP errors are handled gracefully by retry logic - log as WARNING without stack trace
+            self.log_warning(f"MCP connection failed during streaming (will retry without failed server): {error_msg}")
+        else:
+            # Unexpected errors - log as ERROR with stack trace
+            self.log_error(f"Error creating streaming response with tools: {e}", exc_info=True)
         raise
 
 async def classify_intent(
@@ -1035,7 +1069,7 @@ async def _create_text_response_with_tools_with_timeout(
         # GPT-4 and other models - include top_p
         request_params["top_p"] = top_p
 
-    self.log_debug(f"Creating text response with tools and custom timeout {timeout_seconds}s, model {model}")
+    self.log_debug(f"Creating text response with tools and custom timeout {timeout_seconds}s, model {model}, tools: {tools}")
 
     try:
         # Determine operation type based on reasoning effort and context

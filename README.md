@@ -152,6 +152,106 @@ See `.env.example` for a complete configuration template with all available sett
 - **Multi-User Context**: Maintains separate contexts in shared conversations
 - **Persistent Settings**: User preferences saved to SQLite database
 
+### MCP (Model Context Protocol) Integration
+
+> **⚠️ BETA FEATURE**: MCP integration is currently in beta. Not all features are fully implemented yet. Notably, the approval UI for tool calls is not available, so `require_approval` is currently ignored and always set to "never" internally. This field is preserved in the configuration for future implementation.
+
+The bot supports OpenAI's native Model Context Protocol, allowing you to connect to specialized data sources and tools for enhanced capabilities.
+
+#### What is MCP?
+
+Model Context Protocol is a standardized way to connect AI applications to external data sources. With MCP, the bot can access:
+- Library documentation (e.g., React, Python packages)
+- Database queries
+- API integrations
+- Custom enterprise data sources
+- And more...
+
+#### Requirements
+
+- **GPT-5 Model**: MCP tools only work with GPT-5 or GPT-5 Mini
+- **HTTP/SSE Transport**: Bot uses OpenAI's native MCP support (stdio not supported)
+
+#### Setup
+
+1. **Create MCP Configuration File**
+
+Copy the example template:
+```bash
+cp mcp_config.example.json mcp_config.json
+```
+
+2. **Configure Your MCP Servers**
+
+Edit `mcp_config.json` with your MCP servers:
+```json
+{
+  "mcpServers": {
+    "context7": {
+      "server_url": "https://mcp.context7.com/mcp",
+      "server_description": "Library documentation and code examples",
+      "require_approval": "never"
+    },
+    "my_database": {
+      "server_url": "https://api.example.com/mcp",
+      "server_description": "Company database access",
+      "authorization": {
+        "type": "bearer",
+        "token": "YOUR_API_KEY"
+      },
+      "require_approval": "never",
+      "allowed_tools": ["query_customers", "get_orders"]
+    }
+  }
+}
+```
+
+3. **Required Fields**:
+   - `server_url`: HTTPS endpoint for the MCP server
+
+4. **Optional Fields**:
+   - `server_description`: Helps the AI understand when to use this server
+   - `authorization`: Authentication credentials (bearer token, API key, etc.)
+   - `require_approval`: **IGNORED** - Always set to "never" internally. No approval UI is implemented yet, so other values would cause the bot to hang. This field is preserved in config for future feature development.
+   - `allowed_tools`: Whitelist specific tools (omit to allow all)
+
+5. **Restart the Bot**
+
+The bot will automatically load and connect to your configured MCP servers on startup.
+
+#### User Configuration
+
+Users can enable/disable MCP access via the settings modal:
+1. Type `/chatgpt-settings` in Slack
+2. Check/uncheck "MCP Servers" in the Features section
+3. Note: Enabling MCP requires selecting a GPT-5 model
+
+#### Finding MCP Servers
+
+- **Context7**: Library documentation - https://mcp.context7.com
+- **MCP Server Directory**: https://modelcontextprotocol.io/servers
+- **Build Your Own**: https://modelcontextprotocol.io/quickstart
+
+#### Security Notes
+
+- `mcp_config.json` is in `.gitignore` - never commit API keys
+- Only connect to trusted MCP servers
+- MCP servers receive conversation context - use appropriate data handling
+- Review server permissions before enabling
+
+#### Troubleshooting
+
+**Bot not using MCP tools:**
+- Verify `mcp_config.json` exists and is valid JSON
+- Check bot logs for MCP initialization errors
+- Ensure user has MCP enabled in settings
+- Confirm model is GPT-5 or GPT-5 Mini
+
+**MCP server connection errors:**
+- Check `server_url` is correct and accessible
+- Verify authorization credentials are valid
+- Review server logs if you control the MCP server
+
 ### Configuration - Memory Cleanup
 Thread cleanup runs on a schedule (cron format):
 - `CLEANUP_SCHEDULE` - Cron expression (default: "0 0 * * *" for daily at midnight)
