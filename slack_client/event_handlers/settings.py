@@ -589,10 +589,12 @@ class SlackSettingsHandlersMixin:
             except SlackApiError as e:
                 self.log_error(f"Error updating modal for model change: {e}")
         
-        # Register handler for features checkbox (needs modal rebuild for web search)
-        @self.app.action("features")
+        # Register handlers for features checkbox (needs modal rebuild for web search and MCP)
+        @self.app.action("features")  # Legacy - kept for compatibility
+        @self.app.action("features_with_mcp")  # GPT-5 models
+        @self.app.action("features_no_mcp")  # GPT-4 models
         async def handle_features_change(ack, body, client):
-            """Handle feature checkbox changes, especially web search"""
+            """Handle feature checkbox changes, especially web search and model-specific features"""
             await ack()
             
             user_id = body['user']['id']

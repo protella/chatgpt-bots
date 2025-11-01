@@ -187,18 +187,19 @@ class DatabaseManager(LoggerMixin):
             CREATE TABLE IF NOT EXISTS user_preferences (
                 slack_user_id TEXT PRIMARY KEY,
                 slack_email TEXT,
-                
+
                 -- Model settings
                 model TEXT DEFAULT 'gpt-5',
                 reasoning_effort TEXT DEFAULT 'low',
                 verbosity TEXT DEFAULT 'low',
                 temperature REAL DEFAULT 0.8,
                 top_p REAL DEFAULT 1.0,
-                
+
                 -- Feature toggles
                 enable_web_search BOOLEAN DEFAULT 1,
+                enable_mcp BOOLEAN DEFAULT 1,
                 enable_streaming BOOLEAN DEFAULT 1,
-                
+
                 -- Image settings
                 image_size TEXT DEFAULT '1024x1024',
                 input_fidelity TEXT DEFAULT 'high',
@@ -239,6 +240,26 @@ class DatabaseManager(LoggerMixin):
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_modal_session_created
             ON modal_sessions(created_at)
+        """)
+
+        # MCP tools cache table
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS mcp_tools (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_label TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                description TEXT,
+                input_schema TEXT,
+                discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_verified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(server_label, tool_name)
+            )
+        """)
+
+        # Create index for mcp_tools
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_mcp_server_label
+            ON mcp_tools(server_label)
         """)
 
         self.conn.commit()
@@ -338,11 +359,50 @@ class DatabaseManager(LoggerMixin):
                     )
                 """)
                 self.conn.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_user_prefs_email 
+                    CREATE INDEX IF NOT EXISTS idx_user_prefs_email
                     ON user_preferences(slack_email)
                 """)
                 self.conn.commit()
                 self.log_info("DB: Successfully created user_preferences table")
+
+            # Check if enable_mcp column exists in user_preferences table
+            cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
+            columns = [col[1] for col in cursor.fetchall()]
+
+            if 'enable_mcp' not in columns:
+                self.log_info("DB: Adding enable_mcp column to user_preferences table")
+                self.conn.execute("""
+                    ALTER TABLE user_preferences
+                    ADD COLUMN enable_mcp BOOLEAN DEFAULT 1
+                """)
+                self.conn.commit()
+                self.log_info("DB: Successfully added enable_mcp column")
+
+            # Check if mcp_tools table exists
+            cursor = self.conn.execute("""
+                SELECT name FROM sqlite_master
+                WHERE type='table' AND name='mcp_tools'
+            """)
+            if not cursor.fetchone():
+                self.log_info("DB: Creating mcp_tools table")
+                self.conn.execute("""
+                    CREATE TABLE mcp_tools (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        server_label TEXT NOT NULL,
+                        tool_name TEXT NOT NULL,
+                        description TEXT,
+                        input_schema TEXT,
+                        discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_verified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(server_label, tool_name)
+                    )
+                """)
+                self.conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_mcp_server_label
+                    ON mcp_tools(server_label)
+                """)
+                self.conn.commit()
+                self.log_info("DB: Successfully created mcp_tools table")
         except Exception as e:
             self.log_error(f"DB: Migration error: {e}", exc_info=True)
     
@@ -1995,6 +2055,91 @@ class DatabaseManager(LoggerMixin):
                 return json.loads(row["config_json"])
 
             return None
+
+    # MCP tool caching methods
+    def save_mcp_tool(self, server_label: str, tool_name: str, description: Optional[str] = None, input_schema: Optional[str] = None):
+        """
+        Save or update an MCP tool in the cache.
+
+        Args:
+            server_label: MCP server label
+            tool_name: Tool name
+            description: Tool description
+            input_schema: Tool input schema (JSON string)
+        """
+        try:
+            self.conn.execute("""
+                INSERT INTO mcp_tools (server_label, tool_name, description, input_schema)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(server_label, tool_name) DO UPDATE SET
+                    description = excluded.description,
+                    input_schema = excluded.input_schema,
+                    last_verified = CURRENT_TIMESTAMP
+            """, (server_label, tool_name, description, input_schema))
+            self.conn.commit()
+            self.log_debug(f"DB: Cached MCP tool {server_label}:{tool_name}")
+        except Exception as e:
+            self.log_error(f"DB: Error caching MCP tool: {e}", exc_info=True)
+
+    def get_mcp_tools(self, server_label: Optional[str] = None) -> List[Dict]:
+        """
+        Get cached MCP tools, optionally filtered by server.
+
+        Args:
+            server_label: Optional server label to filter by
+
+        Returns:
+            List of tool dictionaries
+        """
+        try:
+            if server_label:
+                cursor = self.conn.execute("""
+                    SELECT server_label, tool_name, description, input_schema,
+                           discovered_at, last_verified
+                    FROM mcp_tools
+                    WHERE server_label = ?
+                    ORDER BY server_label, tool_name
+                """, (server_label,))
+            else:
+                cursor = self.conn.execute("""
+                    SELECT server_label, tool_name, description, input_schema,
+                           discovered_at, last_verified
+                    FROM mcp_tools
+                    ORDER BY server_label, tool_name
+                """)
+
+            tools = []
+            for row in cursor.fetchall():
+                tools.append({
+                    'server_label': row[0],
+                    'tool_name': row[1],
+                    'description': row[2],
+                    'input_schema': row[3],
+                    'discovered_at': row[4],
+                    'last_verified': row[5]
+                })
+            return tools
+        except Exception as e:
+            self.log_error(f"DB: Error retrieving MCP tools: {e}", exc_info=True)
+            return []
+
+    def clear_mcp_tools(self, server_label: Optional[str] = None):
+        """
+        Clear cached MCP tools, optionally for a specific server.
+
+        Args:
+            server_label: Optional server label to clear tools for (clears all if not provided)
+        """
+        try:
+            if server_label:
+                self.conn.execute("DELETE FROM mcp_tools WHERE server_label = ?", (server_label,))
+                self.log_info(f"DB: Cleared MCP tools for server {server_label}")
+            else:
+                self.conn.execute("DELETE FROM mcp_tools")
+                self.log_info("DB: Cleared all MCP tools")
+            self.conn.commit()
+        except Exception as e:
+            self.log_error(f"DB: Error clearing MCP tools: {e}", exc_info=True)
 
     def close(self):
         """Close database connection."""
