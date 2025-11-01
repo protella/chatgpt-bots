@@ -172,4 +172,4 @@ data/backups/*
 .bmad-*/
 metrics_reports/
 mcp_config.json
-mcp_config.bak
+mcp_config*.bak
