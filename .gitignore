@@ -172,3 +172,7 @@ data/backups/*
 .bmad-*/
 metrics_reports/
 mcp_config.json
+mcp_config*.bak
+.mcp.json
+.channels_cache_v2.json
+.users_cache.json
