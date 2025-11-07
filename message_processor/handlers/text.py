@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, List, Optional
+import re
+from typing import Any, List, Optional, Set
+from openai import APIError, APIStatusError
 
 from base_client import BaseClient, Message, Response
 from config import config
@@ -12,7 +14,8 @@ class TextHandlerMixin:
     async def _handle_text_response(self, user_content: Any, thread_state, client: BaseClient,
                               message: Message, thinking_id: Optional[str] = None,
                               attachment_urls: Optional[List[str]] = None,
-                              retry_count: int = 0) -> Response:
+                              retry_count: int = 0,
+                              failed_mcp_server: Optional[str] = None) -> Response:
         """Handle text-only response generation"""
         # Get thread config (with user preferences)
         thread_config = config.get_thread_config(
@@ -66,7 +69,13 @@ class TextHandlerMixin:
         
         # Inject stored image analyses into the conversation for full context
         messages_for_api = self._inject_image_analyses(messages_for_api, thread_state)
-        
+
+        # Strip tools attribution from assistant messages before sending to API
+        # (keeps user-visible context clean while preventing metadata pollution)
+        for msg in messages_for_api:
+            if msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
+                msg["content"] = re.sub(r'\n\n_Used Tools:.+?_$', '', msg["content"])
+
         # Pre-trim messages to fit within context window
         messages_for_api = await self._pre_trim_messages_for_api(messages_for_api, model=thread_state.current_model)
         
@@ -94,18 +103,22 @@ class TextHandlerMixin:
         # Determine timeout based on retry attempt
         retry_timeout = 60.0 if retry_count > 0 else None
 
-        # Check if web search should be available (respecting user prefs)
+        # Determine which model to use (web search model if web search enabled)
         web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
-        if web_search_enabled:
-            # Use web search model if specified, otherwise use thread config model
-            model = config.web_search_model or thread_config["model"]
+        model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
 
-            # Generate response with web search tool available
+        # Build tools array (includes web_search and/or MCP tools based on config)
+        # Exclude any MCP server that failed in a previous attempt
+        tools = self._build_tools_array(thread_config, model, exclude_mcp_server=failed_mcp_server)
+
+        # Generate response with or without tools
+        if tools:
+            # Generate response with tools
             if retry_timeout:
                 # Use shorter timeout for retry via direct _safe_api_call
                 response_text = await self.openai_client._create_text_response_with_tools_with_timeout(
                     messages=messages_for_api,
-                    tools=[{"type": "web_search"}],
+                    tools=tools,
                     model=model,
                     temperature=thread_config["temperature"],
                     max_tokens=thread_config["max_tokens"],
@@ -118,7 +131,7 @@ class TextHandlerMixin:
             else:
                 response_text = await self.openai_client.create_text_response_with_tools(
                     messages=messages_for_api,
-                    tools=[{"type": "web_search"}],
+                    tools=tools,
                     model=model,
                     temperature=thread_config["temperature"],
                     max_tokens=thread_config["max_tokens"],
@@ -133,7 +146,7 @@ class TextHandlerMixin:
                 # Use shorter timeout for retry via direct _safe_api_call
                 response_text = await self.openai_client._create_text_response_with_timeout(
                     messages=messages_for_api,
-                    model=thread_config["model"],
+                    model=model,
                     temperature=thread_config["temperature"],
                     max_tokens=thread_config["max_tokens"],
                     system_prompt=system_prompt,
@@ -144,7 +157,7 @@ class TextHandlerMixin:
             else:
                 response_text = await self.openai_client.create_text_response(
                     messages=messages_for_api,
-                    model=thread_config["model"],
+                    model=model,
                     temperature=thread_config["temperature"],
                     max_tokens=thread_config["max_tokens"],
                     system_prompt=system_prompt,
@@ -152,13 +165,35 @@ class TextHandlerMixin:
                     verbosity=thread_config.get("verbosity")
                 )
         
-        # Check if response used web search and add citation note
-        if web_search_enabled:
-            # Look for indicators that web search was used
-            # OpenAI typically includes numbered citations [1], [2] or URLs when web search is used
-            if any(marker in response_text for marker in ["[1]", "[2]", "[3]", "http://", "https://"]):
+        # Build unified tools attribution at the end of response
+        if tools or failed_mcp_server:
+            tools_used = []
+
+            # Check if web search was used (by looking for citation markers)
+            if web_search_enabled and any(marker in response_text for marker in ["[1]", "[2]", "[3]", "http://", "https://"]):
+                tools_used.append("web_search")
                 self.log_info("Response includes web search results")
-        
+
+            # Add MCP servers that were used (all except the excluded one)
+            if tools:
+                mcp_servers = [tool["server_label"] for tool in tools if tool.get("type") == "mcp"]
+                tools_used.extend(mcp_servers)
+
+            # Add unified tools note at the END (show even if only failed MCP)
+            if tools_used or failed_mcp_server:
+                if tools_used:
+                    # Show successful tools
+                    if failed_mcp_server:
+                        tools_note = f"\n\n_Used Tools: {', '.join(tools_used)} (failed: {failed_mcp_server})_"
+                    else:
+                        tools_note = f"\n\n_Used Tools: {', '.join(tools_used)}_"
+                else:
+                    # Only failed MCP, no successful tools
+                    tools_note = f"\n\n_MCP server '{failed_mcp_server}' could not be reached. Response generated without external tools._"
+
+                response_text = response_text + tools_note
+                self.log_info(f"Added tools attribution: {', '.join(tools_used) if tools_used else 'none'}{' with failure note' if failed_mcp_server else ''}")
+
         # Add assistant response to thread state
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
         self._add_message_with_token_management(thread_state, "assistant", response_text, db=self.db, thread_key=thread_key)
@@ -238,7 +273,13 @@ class TextHandlerMixin:
         
         # Inject stored image analyses into the conversation for full context
         messages_for_api = self._inject_image_analyses(messages_for_api, thread_state)
-        
+
+        # Strip tools attribution from assistant messages before sending to API
+        # (keeps user-visible context clean while preventing metadata pollution)
+        for msg in messages_for_api:
+            if msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
+                msg["content"] = re.sub(r'\n\n_Used Tools:.+?_$', '', msg["content"])
+
         # Pre-trim messages to fit within context window
         messages_for_api = await self._pre_trim_messages_for_api(messages_for_api, model=thread_state.current_model)
         
@@ -277,14 +318,19 @@ class TextHandlerMixin:
         tool_states = {
             "web_search": False,
             "file_search": False,
-            "image_generation": False
+            "image_generation": False,
+            "mcp": False
         }
-        
+
         # Track search counts
         search_counts = {
             "web_search": 0,
-            "file_search": 0
+            "file_search": 0,
+            "mcp": 0
         }
+
+        # Track which MCP servers were used
+        mcp_servers_used = set()
 
         # Define tool event callback
         async def tool_callback(tool_type: str, status: str):
@@ -338,6 +384,29 @@ class TextHandlerMixin:
                             self.log_warning(f"Failed to update image gen status: {result.get('error', 'Unknown error')}")
                     except Exception as e:
                         self.log_error(f"Error updating image gen status: {e}")
+            elif tool_type == "mcp":
+                # MCP has its own status values (not "started")
+                if progress_task and not progress_task.done():
+                    progress_task.cancel()
+                    self.log_debug("Cancelled progress updater - MCP tool started")
+
+                if status == "discovering_tools" and not tool_states["mcp"]:
+                    tool_states["mcp"] = True
+                    # Discovery status message suppressed per user preference (logging only)
+                    self.log_info("MCP tool discovery started (status message suppressed)")
+                elif status == "calling":
+                    search_counts["mcp"] += 1
+                    # Build status message with call count if multiple calls
+                    call_suffix = f" (call {search_counts['mcp']})" if search_counts['mcp'] > 1 else ""
+                    status_msg = f"{config.web_search_emoji} Using MCP tools{call_suffix}..."
+                    try:
+                        result = await client.update_message_streaming(message.channel_id, message_id, status_msg)
+                        if result["success"]:
+                            self.log_info(f"MCP call #{search_counts['mcp']} started - updated status")
+                        else:
+                            self.log_warning(f"Failed to update MCP call status: {result.get('error', 'Unknown error')}")
+                    except Exception as e:
+                        self.log_error(f"Error updating MCP call status: {e}")
             elif status == "completed":
                 # Tool completed - clear the status for that tool
                 if tool_type in tool_states:
@@ -350,7 +419,10 @@ class TextHandlerMixin:
         current_part = 1
         overflow_buffer = ""
         continuation_msg = "\n\n*Continued in next message...*"
-        message_char_limit = 3700 - len(continuation_msg)  # Reserve space for continuation indicator
+        # Reserve space for: continuation msg, part prefix (~30), tools attribution (~100), markdown expansion (~200)
+        # This prevents silent truncation in update_message_streaming which has a hard limit at 3700 chars
+        safety_margin = len(continuation_msg) + 330
+        message_char_limit = 3700 - safety_margin  # Approximately 3335 chars
         streaming_aborted = False  # Track if we had to abort streaming due to failures
 
         # Start progress updater task (will be cancelled when streaming starts)
@@ -676,14 +748,17 @@ class TextHandlerMixin:
         # Start streaming from OpenAI with the callback
         try:
             web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
-            if web_search_enabled:
-                # Use web search model if specified, otherwise use thread config model
-                model = config.web_search_model or thread_config["model"]
-                
-                # Generate response with web search tool available
+            # Determine which model to use (web search model if web search enabled)
+            model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
+
+            # Build tools array (includes web_search and/or MCP tools based on config)
+            tools = self._build_tools_array(thread_config, model)
+
+            if tools:
+                # Generate response with tools (web_search and/or MCP)
                 response_text = await self.openai_client.create_streaming_response_with_tools(
                     messages=messages_for_api,
-                    tools=[{"type": "web_search"}],
+                    tools=tools,
                     stream_callback=stream_callback,
                     tool_callback=tool_callback,  # Add tool callback
                     model=model,
@@ -713,6 +788,21 @@ class TextHandlerMixin:
                 progress_task.cancel()
                 self.log_debug("Cancelled progress updater after API call completed")
 
+            # Build list of tools used (unified attribution)
+            tools_used = []
+            if search_counts["web_search"] > 0:
+                tools_used.append("web_search")
+            if search_counts["mcp"] > 0:
+                mcp_servers = [tool["server_label"] for tool in tools if tool.get("type") == "mcp"]
+                tools_used.extend(mcp_servers)
+
+            # Add unified tools note at the END if any tools were used
+            # This works for both paginated and non-paginated responses
+            if tools_used:
+                tools_note = f"\n\n_Used Tools: {', '.join(tools_used)}_"
+                response_text = response_text + tools_note
+                self.log_info(f"Added tools attribution: {', '.join(tools_used)}")
+
             # Check if streaming was aborted due to failures
             if streaming_aborted:
                 self.log_error("Streaming was aborted due to update failures")
@@ -734,6 +824,12 @@ class TextHandlerMixin:
                     # Get the current display text without loading indicator
                     final_part_text = buffer.get_complete_text()
                     if final_part_text:
+                        # Add tools attribution to the final overflow message if tools were used
+                        if tools_used:
+                            tools_note = f"\n\n_Used Tools: {', '.join(tools_used)}_"
+                            final_part_text = final_part_text + tools_note
+                            self.log_debug(f"Added tools attribution to overflow part {current_part}")
+
                         # Add the part indicator
                         final_part_text = f"*Part {current_part} (continued)*\n\n{final_part_text}"
                         final_result = await client.update_message_streaming(message.channel_id, current_message_id, final_part_text)
@@ -745,8 +841,21 @@ class TextHandlerMixin:
                 # Original message - check if we need to handle any remaining text
                 if response_text != buffer.last_sent_text or True:  # Always update to remove indicator
                     if response_text != buffer.last_sent_text:
-                        self.log_warning(f"Text mismatch after streaming - sending correction update "
-                                       f"(sent: {len(buffer.last_sent_text)}, should be: {len(response_text)} chars)")
+                        # Calculate if mismatch is just from tools attribution being added
+                        char_difference = len(response_text) - len(buffer.last_sent_text)
+                        expected_attribution_length = len(tools_note) if tools_used else 0
+
+                        # Allow ±5 char tolerance for minor formatting differences
+                        is_attribution_only = abs(char_difference - expected_attribution_length) <= 5
+
+                        if is_attribution_only:
+                            # Expected mismatch from attribution - just debug log
+                            self.log_debug(f"Final update includes tools attribution (+{char_difference} chars)")
+                        else:
+                            # Unexpected mismatch - warn about it
+                            self.log_warning(f"Unexpected text mismatch after streaming - sending correction update "
+                                           f"(sent: {len(buffer.last_sent_text)}, should be: {len(response_text)} chars, "
+                                           f"difference: {char_difference}, expected attribution: {expected_attribution_length})")
                     else:
                         self.log_debug("Sending final update to ensure loading indicator is removed")
                     try:
@@ -799,7 +908,23 @@ class TextHandlerMixin:
             )
             
         except Exception as e:
-            self.log_error(f"Error in streaming response generation: {e}")
+            # Check if this is an MCP connection error first (before logging)
+            # Streaming throws APIError, non-streaming throws APIStatusError with code 424
+            failed_mcp_server = None
+            error_msg = str(e)
+
+            # Check for MCP server failure in error message
+            if "MCP server" in error_msg and ("404" in error_msg or "424" in error_msg):
+                # Extract MCP server name from error message pattern
+                # Example: "Error retrieving tool list from MCP server: 'context7'"
+                match = re.search(r"MCP server: '([^']+)'", error_msg)
+                if match:
+                    failed_mcp_server = match.group(1)
+                    # Log MCP failures at INFO level - they're handled gracefully
+                    self.log_info(f"MCP server '{failed_mcp_server}' unavailable - retrying request without it")
+            else:
+                # Unexpected errors - log as ERROR
+                self.log_error(f"Error in streaming response generation: {e}")
 
             # Ensure progress updater is cancelled on error
             if progress_task and not progress_task.done():
@@ -813,11 +938,14 @@ class TextHandlerMixin:
                     if buffer.has_content():
                         error_text = buffer.get_complete_text()
                     else:
-                        error_text = f"{config.error_emoji} *OpenAI Stream Interrupted*\n\nOpenAI's streaming response was interrupted. I'll try again without streaming..."
+                        if failed_mcp_server:
+                            error_text = f"{config.error_emoji} *MCP Connection Failed*\n\nCouldn't connect to MCP server '{failed_mcp_server}'. Retrying with other tools..."
+                        else:
+                            error_text = f"{config.error_emoji} *OpenAI Stream Interrupted*\n\nOpenAI's streaming response was interrupted. I'll try again without streaming..."
                     await client.update_message_streaming(message.channel_id, message_id, error_text)
                 except Exception as cleanup_error:
                     self.log_debug(f"Could not remove loading indicator: {cleanup_error}")
-            
+
             # Fall back to non-streaming on error
             self.log_info("Falling back to non-streaming due to error")
 
@@ -828,4 +956,53 @@ class TextHandlerMixin:
                 self.log_debug("Removed duplicate user message before fallback")
 
             # Pass retry_count=1 to prevent re-entering streaming after timeout
-            return await self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls, retry_count=1)
+            # Also pass failed_mcp_server so fallback can exclude it from tools
+            return await self._handle_text_response(
+                user_content, thread_state, client, message, thinking_id,
+                attachment_urls, retry_count=1, failed_mcp_server=failed_mcp_server
+            )
+
+    def _build_tools_array(self, thread_config: dict, model: str,
+                           exclude_mcp_server: Optional[str] = None) -> Optional[List[dict]]:
+        """
+        Build tools array for OpenAI API based on user preferences and model.
+
+        Includes:
+        - web_search if enabled in user preferences
+        - MCP tools if enabled AND model is GPT-5 AND MCP servers are configured
+
+        Args:
+            thread_config: Thread configuration with user preferences
+            model: Model being used for the request
+            exclude_mcp_server: Optional MCP server label to exclude (e.g., if it failed)
+
+        Returns:
+            List of tool definitions, or None if no tools enabled
+        """
+        tools = []
+
+        # Add web_search if enabled
+        web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
+        if web_search_enabled:
+            tools.append({"type": "web_search"})
+            self.log_debug("Added web_search to tools array")
+
+        # Add MCP tools if enabled AND model is GPT-5 AND MCP servers configured
+        mcp_enabled = thread_config.get('enable_mcp', config.mcp_enabled_default)
+        if mcp_enabled and model.startswith('gpt-5') and self.mcp_manager.has_mcp_servers():
+            mcp_tools = self.mcp_manager.get_tools_for_openai()
+
+            # Filter out excluded MCP server if specified
+            if exclude_mcp_server:
+                mcp_tools = [tool for tool in mcp_tools
+                           if tool.get("server_label") != exclude_mcp_server]
+                self.log_info(f"Excluded failed MCP server '{exclude_mcp_server}' from tools array")
+
+            tools.extend(mcp_tools)
+            self.log_debug(f"Added {len(mcp_tools)} MCP server(s) to tools array")
+
+        # Return None if no tools, otherwise return the list
+        if not tools:
+            return None
+
+        return tools
