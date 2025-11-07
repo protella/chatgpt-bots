@@ -1,23 +1,42 @@
 {
-  "_comment": "MCP Server Configuration - See README.md for full documentation",
-  "_note_require_approval": "The 'require_approval' field is currently IGNORED and always set to 'never' internally. No approval UI is implemented yet.",
+  "_comment": "==================================================================================",
+  "_comment2": "MCP Server Configuration for OpenAI's Native Model Context Protocol Support",
+  "_comment3": "==================================================================================",
+  "_comment4": "This file configures MCP servers that extend the bot's capabilities with external",
+  "_comment5": "data sources and tools. Copy this file to 'mcp_config.json' and customize.",
+  "_comment6": "",
+  "_comment7": "Documentation: See README.md section 'MCP (Model Context Protocol) Integration'",
+  "_comment8": "Architecture: See Docs/MCP_INTEGRATION_PLAN.md for implementation details",
+  "_comment9": "==================================================================================",
+
+  "_note_beta": "⚠️ BETA FEATURE: The 'require_approval' field is currently IGNORED and always set to 'never' internally. No approval UI is implemented yet, so setting it to other values would cause the bot to hang waiting for approval that cannot be provided.",
+
+  "_note_requirements": "MCP tools only work with GPT-5 or GPT-5 Mini models. Users must enable MCP in their settings via /chatgpt-settings.",
+
   "mcpServers": {
-    "example_http_server": {
-      "server_url": "https://example.com/mcp",
-      "server_description": "Example MCP server for demonstration",
+
+    "_example_minimal": {
+      "_description": "Minimal example - public MCP server with no authentication",
+      "server_url": "https://public-mcp-server.example.com/mcp",
+      "server_description": "Public MCP server demonstrating minimal configuration",
+      "require_approval": "never"
+    },
+
+    "_example_bearer_token": {
+      "_description": "Bearer token authentication (most common for API keys)",
+      "server_url": "https://api.example.com/mcp",
+      "server_description": "Library documentation and code examples",
       "authorization": {
         "type": "bearer",
         "token": "YOUR_API_KEY_HERE"
       },
-      "require_approval": "never",
-      "allowed_tools": [
-        "search_documents",
-        "get_user_info"
-      ]
+      "require_approval": "never"
     },
-    "example_sse_server": {
+
+    "_example_custom_header": {
+      "_description": "Custom header authentication (for APIs with proprietary auth)",
       "server_url": "https://api.example.com/mcp/sse",
-      "server_description": "Example SSE-based MCP server",
+      "server_description": "Database with custom API key header",
       "authorization": {
         "type": "api_key",
         "header": "X-API-Key",
@@ -25,10 +44,152 @@
       },
       "require_approval": "never"
     },
-    "public_server_no_auth": {
-      "server_url": "https://public.example.com/mcp",
-      "server_description": "Public MCP server with no authentication",
-      "require_approval": "never"
+
+    "_example_with_tool_whitelist": {
+      "_description": "Restrict to specific tools only (security best practice)",
+      "server_url": "https://database.example.com/mcp",
+      "server_description": "Company database with restricted access",
+      "authorization": {
+        "type": "bearer",
+        "token": "YOUR_DATABASE_TOKEN"
+      },
+      "require_approval": "never",
+      "allowed_tools": [
+        "query_customers",
+        "get_orders",
+        "search_products"
+      ],
+      "_note": "Only the tools listed above will be accessible. Omit 'allowed_tools' to allow all tools from this server."
+    },
+
+    "_example_context7": {
+      "_description": "Real-world example: Context7 library documentation server",
+      "server_url": "https://mcp.context7.com/mcp",
+      "server_description": "Library documentation and code examples for popular frameworks",
+      "require_approval": "never",
+      "_note": "Context7 is a public server - no authorization needed. Great for development/testing."
+    },
+
+    "_commented_out_server": {
+      "_description": "You can comment out servers by prefixing the key with underscore",
+      "_server_url": "https://disabled.example.com/mcp",
+      "_note": "This server will be ignored because 'server_url' is prefixed with underscore"
     }
+  },
+
+  "_field_reference": {
+    "_description": "==================== FIELD REFERENCE ====================",
+
+    "server_label": "Each server needs a unique key (like 'context7' above)",
+
+    "server_url": {
+      "_required": true,
+      "_type": "string",
+      "_description": "HTTPS endpoint for the MCP server",
+      "_example": "https://mcp.context7.com/mcp",
+      "_note": "Must use HTTPS. HTTP URLs will be rejected for security."
+    },
+
+    "server_description": {
+      "_required": false,
+      "_type": "string",
+      "_description": "Human-readable description that helps OpenAI understand when to use this server",
+      "_example": "Library documentation and code examples",
+      "_best_practice": "Be specific about what data/capabilities this server provides"
+    },
+
+    "authorization": {
+      "_required": false,
+      "_type": "object",
+      "_description": "Authentication credentials for the MCP server",
+      "_formats": {
+        "bearer_token": {
+          "type": "bearer",
+          "token": "your-api-key"
+        },
+        "custom_header": {
+          "type": "api_key",
+          "header": "X-Custom-Header",
+          "value": "your-api-key"
+        },
+        "no_auth": "Omit the 'authorization' field entirely"
+      },
+      "_note": "Never commit real API keys! Use environment variables or secrets management."
+    },
+
+    "require_approval": {
+      "_required": false,
+      "_type": "string",
+      "_values": ["never", "always", "untrusted"],
+      "_default": "never",
+      "_current_behavior": "IGNORED - Always set to 'never' internally regardless of config value",
+      "_reason": "No approval UI implemented yet. Other values would cause the bot to hang.",
+      "_future": "Field is preserved for when approval UI is implemented in a future release",
+      "_recommendation": "Always set to 'never' for now"
+    },
+
+    "allowed_tools": {
+      "_required": false,
+      "_type": "array of strings",
+      "_description": "Whitelist of specific tools to enable from this server",
+      "_example": ["search_documents", "get_user_info"],
+      "_behavior": "If omitted or empty, all tools from the server are allowed",
+      "_security": "Use this to restrict access to only necessary tools from servers you don't fully trust"
+    }
+  },
+
+  "_common_use_cases": {
+    "_public_api": {
+      "server_url": "https://public.api.com/mcp",
+      "server_description": "No authentication needed"
+    },
+    "_api_key": {
+      "server_url": "https://api.com/mcp",
+      "authorization": {"type": "bearer", "token": "sk-..."}
+    },
+    "_restricted_tools": {
+      "server_url": "https://api.com/mcp",
+      "authorization": {"type": "bearer", "token": "sk-..."},
+      "allowed_tools": ["read_only_tool"]
+    }
+  },
+
+  "_troubleshooting": {
+    "_bot_not_using_mcp": [
+      "1. Verify mcp_config.json exists and is valid JSON",
+      "2. Check bot logs for MCP initialization errors",
+      "3. Ensure user has MCP enabled in /chatgpt-settings",
+      "4. Confirm model is gpt-5 or gpt-5-mini (not gpt-4)",
+      "5. Check that server_url is accessible (test with curl/browser)"
+    ],
+    "_connection_errors": [
+      "1. Verify server_url is correct and uses HTTPS",
+      "2. Test authorization credentials separately",
+      "3. Check if server requires specific headers or formats",
+      "4. Review MCP server logs if you control the server"
+    ],
+    "_tool_not_appearing": [
+      "1. Check if tool is in 'allowed_tools' whitelist",
+      "2. Verify tool name matches exactly (case-sensitive)",
+      "3. Confirm MCP server is returning tool in its capabilities",
+      "4. Check bot logs for tool discovery errors"
+    ]
+  },
+
+  "_security_best_practices": [
+    "1. Never commit mcp_config.json with real API keys to version control",
+    "2. Use environment variables for sensitive tokens when possible",
+    "3. Only connect to MCP servers you trust - they receive conversation context",
+    "4. Use 'allowed_tools' to restrict access to only necessary functionality",
+    "5. Audit MCP server logs regularly if you control the server",
+    "6. Use HTTPS-only endpoints",
+    "7. Rotate API keys periodically",
+    "8. Review which users have MCP enabled in their settings"
+  ],
+
+  "_finding_mcp_servers": {
+    "context7": "https://mcp.context7.com - Library documentation",
+    "mcp_directory": "https://modelcontextprotocol.io/servers - Official directory",
+    "build_your_own": "https://modelcontextprotocol.io/quickstart - Build custom servers"
   }
 }
