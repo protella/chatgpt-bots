@@ -11,12 +11,12 @@ A production-ready Slack bot built with Python and OpenAI's Responses API (not C
 For a detailed list of recent changes and improvements, please see the [CHANGELOG.md](CHANGELOG.md) file.
 
 ### ⚠️ Important: Timeout Configuration Update
-**Breaking change for streaming responses:** The timeout behavior has been updated to improve reliability. If you previously had `OPENAI_STREAMING_CHUNK_TIMEOUT` set to a low value (e.g., 30 seconds), you must increase it to avoid premature stream termination. Check the updated `.env.example` for recommended values and update your `.env` file accordingly. Low timeout values will now cause responses to drop mid-stream.
+**Breaking change for streaming responses:** The timeout behavior has been updated to improve reliability. If you previously had `API_TIMEOUT_STREAMING_CHUNK` set to a low value (e.g., 30 seconds), you must increase it to at least 270 seconds to avoid premature stream termination. Check the updated `.env.example` for recommended values and update your `.env` file accordingly. Low timeout values will cause responses to drop mid-stream.
 
 ## Getting Started
 
 ### Requirements
-- `Python 3.10+` for structural pattern matching (match/case) support
+- `Python 3.12+` 
 - `SQLite 3.35+` for JSON support and WAL mode (usually included with Python)
 
 ### Model Support
@@ -28,7 +28,7 @@ For a detailed list of recent changes and improvements, please see the [CHANGELO
 - **GPT-4.1** (`gpt-4.1`) - Latest GPT-4 variant
 - **GPT-4o** (`gpt-4o`) - Optimized GPT-4 model
 - **Image Generation**: `gpt-image-1`
-- **Utility Model**: `gpt-5-mini` or `gpt-5-nano` for intent classification  
+- **Utility Model**: `gpt-5-mini` (default) or `gpt-4.1-mini` for intent classification  
 
 The setup of a Slack or Discord App is out of scope of this README. There's plenty of documentation online detailing these processes.
   
@@ -36,11 +36,15 @@ The setup of a Slack or Discord App is out of scope of this README. There's plen
 
 You can use the included `slack_app_manifest.yml` file to quickly configure your Slack app with all required settings. Simply:
 1. Create a new Slack app at https://api.slack.com/apps
-2. Choose "From an app manifest" 
+2. Choose "From an app manifest"
 3. Select your workspace
 4. Paste the contents of `slack_app_manifest.yml`
 5. Review and create the app
-6. Install to your workspace and copy the tokens to your `.env` file
+6. **Enable Socket Mode** in your app settings (required - no webhook URLs needed)
+7. Generate an App-Level Token with `connections:write` scope
+8. Install to your workspace and copy both tokens to your `.env` file:
+   - `SLACK_BOT_TOKEN` (starts with `xoxb-`)
+   - `SLACK_APP_TOKEN` (starts with `xapp-`)
 #### The Slack event subscriptions and scope are as follows:
 
 | Event Name  	| Description                                                       	| Required Scope    	|
@@ -49,30 +53,32 @@ You can use the included `slack_app_manifest.yml` file to quickly configure your
 | message.im  	| A message was posted in a direct message channel                  	| im:history        	|    
     
 #### Slack Bot Token Scopes:
-| Scope                	| Description |
-|----------------------	|------------- |
-| app_mentions:read    	| Read messages that mention the bot |
-| channels:history     	| View messages in public channels |
-| channels:join        	| Join public channels |
-| chat:write           	| Send messages as the bot |
-| chat:write.customize 	| Send messages with custom username/avatar |
-| commands             	| Add and respond to slash commands |
-| files:read           	| Access files shared in channels |
-| files:write          	| Upload and modify files |
-| groups:history       	| View messages in private channels |
-| im:history           	| View direct message history |
-| im:read              	| View direct messages |
-| im:write             	| Send direct messages |
-| users:read           	| View people in workspace |
-| users:read.email     	| View email addresses |
+| Scope                	| Description | Usage |
+|----------------------	|------------- |-------|
+| app_mentions:read    	| Read messages that mention the bot | Required for @mentions |
+| channels:history     	| View messages in public channels | Required for conversations_history/replies |
+| channels:join        	| Join public channels | Allows bot to be invited to channels |
+| chat:write           	| Send messages as the bot | Required for all message sending |
+| chat:write.customize 	| Send messages with custom username/avatar | Reserved for future use |
+| commands             	| Add and respond to slash commands | Required for /chatgpt-settings |
+| files:read           	| Access files shared in channels | Required for downloading user uploads |
+| files:write          	| Upload and modify files | Required for image generation |
+| groups:history       	| View messages in private channels | Required for private channel history |
+| im:history           	| View direct message history | Required for DM conversations |
+| im:read              	| View direct messages | Required to access DMs |
+| im:write             	| Send direct messages | Required to send DM responses |
+| users:read           	| View people in workspace | Required for user info (display names, timezones) |
+| users:read.email     	| View email addresses | Used for user preferences |
 
 #### Slack Slash Commands:
 Configure the following slash command in your Slack app:
 - **Command**: `/chatgpt-settings` (production) or `/chatgpt-settings-dev` (development)
-- **Request URL**: Your bot's URL endpoint
+- **Request URL**: Not required when using Socket Mode
 - **Short Description**: "Configure ChatGPT settings"
 - **Usage Hint**: "Opens the settings modal"
 - **Set in .env**: `SETTINGS_SLASH_COMMAND=/chatgpt-settings` (or `/chatgpt-settings-dev` for dev)
+
+**Note:** Socket Mode handles events automatically without webhook URLs.
 
 #### Slack App Shortcuts:
 The bot includes a message shortcut for thread-specific settings:
@@ -81,12 +87,8 @@ The bot includes a message shortcut for thread-specific settings:
 - **Description**: "Configure AI settings for this thread"
 - **Where**: Messages -> Message shortcuts menu (three dots on any message)
 
-#### Slack User Token Scopes:
-| Scope                	| Description |
-|----------------------	|------------- |
-| chat:write           	| Send messages on user's behalf |
-| users:read           	| View people in workspace |
-| users:read.email     	| View email addresses |
+#### Note on User Scopes:
+The bot uses only **Bot Token** authentication. User scopes listed in `slack_app_manifest.yml` are optional and not utilized by the current implementation. You can safely remove them from your app configuration if desired, or leave them for potential future features.
 
 ---
 
@@ -111,20 +113,23 @@ source chatbots/bin/activate
 ### Installing Dependencies:
 ```python3 -m pip install -U -r requirements.txt```
 
-- _Note: The included `requirements.txt` file includes all of the dependencies for all 3 clients in this repo._
+**Optional Dependencies:**
 - _For OCR support on scanned PDFs, install `poppler-utils`: `apt-get install poppler-utils` (Linux) or `brew install poppler` (Mac)_
 - _For better DOCX support, optionally install `pandoc`: `apt-get install pandoc` (Linux) or `brew install pandoc` (Mac)_
 
 ### Setup `.env` file
-- Aquire the necessary keys or tokens from the integration you're using. 
-I.e., OpenAI, Slack and Discord tokens.
-The only required token is the OPENAI_KEY. The others depend on which integration you're using.
+1. Copy the example configuration:
+   ```bash
+   cp .env.example .env
+   ```
 
-- Create a `.env` file in the root of your venv folder and populate it with your keys, tokens, other vars as follows:
+2. Edit `.env` and configure the required values:
+   - `OPENAI_KEY` - **Required**: Your OpenAI API key
+   - `SLACK_BOT_TOKEN` - Required for Slack: Bot token (starts with `xoxb-`)
+   - `SLACK_APP_TOKEN` - Required for Slack: App-level token (starts with `xapp-`)
+   - Other settings are optional with sensible defaults
 
-```
-See `.env.example` for a complete configuration template with all available settings.
-```
+See [.env.example](.env.example) for all available configuration options and detailed descriptions.
 
 ### Key Configuration Options
 
@@ -133,7 +138,26 @@ See `.env.example` for a complete configuration template with all available sett
 - **Thread Settings**: Different settings per conversation thread
 - **Web Search**: Available with GPT-5 models (requires reasoning_effort >= low)
 - **Streaming**: Real-time response streaming with configurable update intervals
+- **Token Management**: Automatic context window management with configurable buffer
 - **Logging**: Comprehensive logging with rotation at 10MB, configurable levels per component
+
+#### Token Buffer Configuration
+The bot manages context window usage automatically using a buffer system:
+
+- `TOKEN_BUFFER_PERCENTAGE` - Percentage of model's context limit to use (default: 0.875 = 87.5%)
+  - GPT-5 (400k): 87.5% = 350k usable tokens
+  - GPT-4 (128k): 87.5% = 112k usable tokens
+  - Lower values (e.g., 0.675 = 67.5%) provide more headroom for system prompts, tools, and reasoning
+  - Higher values maximize context retention but may hit limits with complex tool use or reasoning
+
+- `TOKEN_CLEANUP_THRESHOLD` - When to start trimming old messages (default: 0.8 = 80% of buffered limit)
+- `TOKEN_TRIM_MESSAGE_COUNT` - Messages to remove per cleanup (default: 5)
+
+**Trade-offs:**
+- **Higher buffer** (0.875): More conversation history retained, better context continuity
+- **Lower buffer** (0.675): More reliable with MCP tools, web search, and high reasoning efforts
+
+**Recommendation:** Start with 0.875 and lower if you experience token limit errors with tools enabled.
 
 ### Features
 
@@ -147,10 +171,12 @@ See `.env.example` for a complete configuration template with all available sett
 
 #### User Experience
 - **Settings Modal**: Interactive configuration UI with `/chatgpt-settings`
-- **Thread-Specific Settings**: Different configurations per conversation
+- **New User Welcome**: Automatic settings modal on first interaction with button-based access
+- **Thread-Specific Settings**: Different configurations per conversation via message shortcuts
 - **Custom Instructions**: Personalized response styles per user
 - **Multi-User Context**: Maintains separate contexts in shared conversations
 - **Persistent Settings**: User preferences saved to SQLite database
+- **Smart Message Routing**: Ephemeral messages and DMs for settings, keeping channels clean
 
 ### MCP (Model Context Protocol) Integration
 
@@ -253,16 +279,25 @@ Users can enable/disable MCP access via the settings modal:
 - Review server logs if you control the MCP server
 
 ### Configuration - Memory Cleanup
-Thread cleanup runs on a schedule (cron format):
-- `CLEANUP_SCHEDULE` - Cron expression (default: "0 0 * * *" for daily at midnight)
-- `CLEANUP_MAX_AGE_HOURS` - Remove threads older than this (default: 24 hours)
+The bot automatically cleans up old thread data from memory to prevent resource buildup. Configure cleanup behavior:
+- `CLEANUP_SCHEDULE` - Cron expression for cleanup schedule (default: `0 0 * * *` runs daily at midnight)
+- `CLEANUP_MAX_AGE_HOURS` - Remove inactive threads older than this many hours (default: 24)
+
+**Note:** Cleanup only affects in-memory thread state. Database records are preserved, and threads are rebuilt from platform history when needed.
 
 ### Running the bot
-Run the py file for your chosen interface, e.g.:
 
+**First Run:**
+The bot will automatically create necessary directories on first startup:
+- `data/` - SQLite databases and backups
+- `logs/` - Application logs with automatic rotation
+
+**Start the bot:**
 - `python3 slackbot.py` - Run Slack bot
 - `python3 main.py --platform slack` - Alternative with platform parameter
 - Discord support temporarily unavailable in V2
+
+The bot will connect via Socket Mode and start processing messages immediately.
 
 ### Running as a service/daemon
 - You can run the script in the background with NOHUP on Linux so you can close the terminal and it will continue to run:
