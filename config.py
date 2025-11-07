@@ -94,7 +94,11 @@ class BotConfig:
     # Web search configuration
     enable_web_search: bool = field(default_factory=lambda: os.getenv("ENABLE_WEB_SEARCH", "true").lower() == "true")
     web_search_model: str = field(default_factory=lambda: os.getenv("WEB_SEARCH_MODEL", ""))  # Empty = use default model
-    
+
+    # MCP (Model Context Protocol) configuration
+    mcp_enabled_default: bool = field(default_factory=lambda: os.getenv("MCP_ENABLED_DEFAULT", "true").lower() == "true")
+    mcp_config_path: str = field(default_factory=lambda: os.getenv("MCP_CONFIG_PATH", "mcp_config.json"))
+
     # Slack settings configuration
     settings_slash_command: str = field(default_factory=lambda: os.getenv("SETTINGS_SLASH_COMMAND", "/chatgpt-settings"))
     
@@ -232,6 +236,9 @@ class BotConfig:
             "streaming_buffer_size": self.streaming_buffer_size,
             "streaming_circuit_breaker_threshold": self.streaming_circuit_breaker_threshold,
             "streaming_circuit_breaker_cooldown": self.streaming_circuit_breaker_cooldown,
+
+            # MCP
+            "enable_mcp": self.mcp_enabled_default,
         }
         
         # Apply user preferences if available
@@ -257,6 +264,8 @@ class BotConfig:
                     # Feature toggles
                     if user_prefs.get('enable_web_search') is not None:
                         user_config['enable_web_search'] = bool(user_prefs['enable_web_search'])
+                    if user_prefs.get('enable_mcp') is not None:
+                        user_config['enable_mcp'] = bool(user_prefs['enable_mcp'])
                     if user_prefs.get('enable_streaming') is not None:
                         user_config['enable_streaming'] = bool(user_prefs['enable_streaming'])
                         user_config['slack_streaming'] = bool(user_prefs['enable_streaming'])
