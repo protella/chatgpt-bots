@@ -292,6 +292,7 @@ class OpenAIClient(LoggerMixin):
         reasoning_effort: Optional[str] = None,
         verbosity: Optional[str] = None,
         store: bool = False,
+        return_metadata: bool = False,
     ) -> str:
         return await responses_api.create_text_response_with_tools(
             self,
@@ -305,6 +306,7 @@ class OpenAIClient(LoggerMixin):
             reasoning_effort=reasoning_effort,
             verbosity=verbosity,
             store=store,
+            return_metadata=return_metadata,
         )
 
     async def create_streaming_response(
@@ -591,12 +593,13 @@ class OpenAIClient(LoggerMixin):
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
-        top_p: Optional[float] = None,
+        top_p: Optional[str] = None,
         system_prompt: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
         verbosity: Optional[str] = None,
         store: bool = False,
-        timeout_seconds: float = 60.0
+        timeout_seconds: float = 60.0,
+        return_metadata: bool = False,
     ) -> str:
         return await responses_api._create_text_response_with_tools_with_timeout(
             self,
@@ -610,7 +613,8 @@ class OpenAIClient(LoggerMixin):
             reasoning_effort=reasoning_effort,
             verbosity=verbosity,
             store=store,
-            timeout_seconds=timeout_seconds
+            timeout_seconds=timeout_seconds,
+            return_metadata=return_metadata,
         )
 
     async def close(self):

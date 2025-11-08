@@ -129,7 +129,8 @@ async def create_text_response_with_tools(
     system_prompt: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     verbosity: Optional[str] = None,
-    store: bool = False
+    store: bool = False,
+    return_metadata: bool = False
 ) -> str:
     """
     Create text response with tools (e.g., web search)
@@ -202,16 +203,34 @@ async def create_text_response_with_tools(
             **request_params
         )
         
-        # Extract text from response
+        # Extract text from response and detect tool usage
         output_text = ""
+        tools_actually_used = []
+
         if response.output:
             for item in response.output:
+                # Check for tool usage by examining output item types
+                item_type = getattr(item, "type", None)
+                if item_type == "mcp_call":
+                    if "mcp" not in tools_actually_used:
+                        tools_actually_used.append("mcp")
+                elif item_type == "web_search_call":
+                    if "web_search" not in tools_actually_used:
+                        tools_actually_used.append("web_search")
+
+                # Extract text content
                 if hasattr(item, "content") and item.content:
                     for content in item.content:
                         if hasattr(content, "text"):
                             output_text += content.text
-        
-        self.log_info(f"Generated response with tools: {len(output_text)} chars")
+
+        if tools_actually_used:
+            self.log_info(f"Generated response with tools: {len(output_text)} chars, used: {', '.join(tools_actually_used)}")
+        else:
+            self.log_info(f"Generated response with tools: {len(output_text)} chars (no tools invoked)")
+
+        if return_metadata:
+            return {"text": output_text, "tools_used": tools_actually_used}
         return output_text
         
     except Exception as e:
@@ -1009,7 +1028,8 @@ async def _create_text_response_with_tools_with_timeout(
     reasoning_effort: Optional[str] = None,
     verbosity: Optional[str] = None,
     store: bool = False,
-    timeout_seconds: float = 60.0
+    timeout_seconds: float = 60.0,
+    return_metadata: bool = False
 ) -> str:
     """
     Create text response with tools and custom timeout (for retry scenarios)
@@ -1084,16 +1104,34 @@ async def _create_text_response_with_tools_with_timeout(
             **request_params
         )
 
-        # Extract text from response
+        # Extract text from response and detect tool usage
         output_text = ""
+        tools_actually_used = []
+
         if response.output:
             for item in response.output:
+                # Check for tool usage by examining output item types
+                item_type = getattr(item, "type", None)
+                if item_type == "mcp_call":
+                    if "mcp" not in tools_actually_used:
+                        tools_actually_used.append("mcp")
+                elif item_type == "web_search_call":
+                    if "web_search" not in tools_actually_used:
+                        tools_actually_used.append("web_search")
+
+                # Extract text content
                 if hasattr(item, "content") and item.content:
                     for content in item.content:
                         if hasattr(content, "text"):
                             output_text += content.text
 
-        self.log_info(f"Generated response with tools and custom timeout: {len(output_text)} chars")
+        if tools_actually_used:
+            self.log_info(f"Generated response with tools and custom timeout: {len(output_text)} chars, used: {', '.join(tools_actually_used)}")
+        else:
+            self.log_info(f"Generated response with tools and custom timeout: {len(output_text)} chars (no tools invoked)")
+
+        if return_metadata:
+            return {"text": output_text, "tools_used": tools_actually_used}
         return output_text
 
     except asyncio.TimeoutError as e:
