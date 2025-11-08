@@ -112,11 +112,12 @@ class TextHandlerMixin:
         tools = self._build_tools_array(thread_config, model, exclude_mcp_server=failed_mcp_server)
 
         # Generate response with or without tools
+        tools_actually_used = []  # Track which tools were actually invoked
         if tools:
             # Generate response with tools
             if retry_timeout:
                 # Use shorter timeout for retry via direct _safe_api_call
-                response_text = await self.openai_client._create_text_response_with_tools_with_timeout(
+                result = await self.openai_client._create_text_response_with_tools_with_timeout(
                     messages=messages_for_api,
                     tools=tools,
                     model=model,
@@ -126,10 +127,13 @@ class TextHandlerMixin:
                     reasoning_effort=thread_config.get("reasoning_effort"),
                     verbosity=thread_config.get("verbosity"),
                     store=False,
-                    timeout_seconds=retry_timeout
+                    timeout_seconds=retry_timeout,
+                    return_metadata=True
                 )
+                response_text = result["text"]
+                tools_actually_used = result["tools_used"]
             else:
-                response_text = await self.openai_client.create_text_response_with_tools(
+                result = await self.openai_client.create_text_response_with_tools(
                     messages=messages_for_api,
                     tools=tools,
                     model=model,
@@ -138,8 +142,11 @@ class TextHandlerMixin:
                     system_prompt=system_prompt,
                     reasoning_effort=thread_config.get("reasoning_effort"),
                     verbosity=thread_config.get("verbosity"),
-                    store=False  # Match the existing behavior
+                    store=False,  # Match the existing behavior
+                    return_metadata=True
                 )
+                response_text = result["text"]
+                tools_actually_used = result["tools_used"]
         else:
             # Generate response without tools
             if retry_timeout:
@@ -166,33 +173,21 @@ class TextHandlerMixin:
                 )
         
         # Build unified tools attribution at the end of response
-        if tools or failed_mcp_server:
-            tools_used = []
-
-            # Check if web search was used (by looking for citation markers)
-            if web_search_enabled and any(marker in response_text for marker in ["[1]", "[2]", "[3]", "http://", "https://"]):
-                tools_used.append("web_search")
-                self.log_info("Response includes web search results")
-
-            # Add MCP servers that were used (all except the excluded one)
-            if tools:
-                mcp_servers = [tool["server_label"] for tool in tools if tool.get("type") == "mcp"]
-                tools_used.extend(mcp_servers)
-
-            # Add unified tools note at the END (show even if only failed MCP)
-            if tools_used or failed_mcp_server:
-                if tools_used:
-                    # Show successful tools
-                    if failed_mcp_server:
-                        tools_note = f"\n\n_Used Tools: {', '.join(tools_used)} (failed: {failed_mcp_server})_"
-                    else:
-                        tools_note = f"\n\n_Used Tools: {', '.join(tools_used)}_"
+        # Use the actual tools that were invoked (from response metadata)
+        if tools_actually_used or failed_mcp_server:
+            # Add unified tools note at the END
+            if tools_actually_used:
+                # Show successful tools
+                if failed_mcp_server:
+                    tools_note = f"\n\n_Used Tools: {', '.join(tools_actually_used)} (failed: {failed_mcp_server})_"
                 else:
-                    # Only failed MCP, no successful tools
-                    tools_note = f"\n\n_MCP server '{failed_mcp_server}' could not be reached. Response generated without external tools._"
+                    tools_note = f"\n\n_Used Tools: {', '.join(tools_actually_used)}_"
+            else:
+                # Only failed MCP, no successful tools
+                tools_note = f"\n\n_MCP server '{failed_mcp_server}' could not be reached. Response generated without external tools._"
 
-                response_text = response_text + tools_note
-                self.log_info(f"Added tools attribution: {', '.join(tools_used) if tools_used else 'none'}{' with failure note' if failed_mcp_server else ''}")
+            response_text = response_text + tools_note
+            self.log_info(f"Added tools attribution: {', '.join(tools_actually_used) if tools_actually_used else 'none'}{' with failure note' if failed_mcp_server else ''}")
 
         # Add assistant response to thread state
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
@@ -793,8 +788,9 @@ class TextHandlerMixin:
             if search_counts["web_search"] > 0:
                 tools_used.append("web_search")
             if search_counts["mcp"] > 0:
-                mcp_servers = [tool["server_label"] for tool in tools if tool.get("type") == "mcp"]
-                tools_used.extend(mcp_servers)
+                # Show generic "mcp" instead of listing all available servers
+                # since we don't track which specific servers were actually invoked
+                tools_used.append("mcp")
 
             # Add unified tools note at the END if any tools were used
             # This works for both paginated and non-paginated responses
