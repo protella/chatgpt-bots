@@ -2,6 +2,82 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.2.3] - 2025-11-10
+
+### 🐛 Bug Fix - MCP Settings Persistence
+
+#### Fixed
+- **MCP Toggle Persistence**: Fixed bug where MCP toggle changes in settings modal were not persisting to the database
+  - Added `enable_mcp` to boolean fields list in `update_user_preferences()` (sync/async)
+  - Added boolean conversion in `get_user_preferences()` (sync/async)
+  - Added to thread config propagation in `get_or_create_thread_async()`
+- MCP settings now correctly save and load across sessions for both global and thread-specific configurations
+
+## [2.2.2] - 2025-11-07
+
+### 🐛 Bug Fix - MCP Tool Attribution
+
+#### Fixed
+- **MCP Tool Attribution Accuracy**: Fixed bug where bot reported all available MCP servers in "Used Tools" footer instead of only servers actually invoked
+  - Non-streaming: Detects tools via response.output inspection
+  - Streaming: Detects tools via search_counts tracking
+  - Both modes now show "Used Tools: mcp" only when MCP was actually invoked
+
+#### Changed
+- Simplified MCP attribution to show generic "mcp" label instead of individual server names
+- Added `return_metadata` parameter to response API for tool usage tracking
+
+## [2.2.1] - 2025-11-07
+
+### 📝 Configuration & Documentation
+
+#### Added
+- **MCP Environment Variables**: Added MCP configuration to `.env.example`
+  - `MCP_ENABLED_DEFAULT`: Enable MCP by default for new users
+  - `MCP_CONFIG_PATH`: Path to MCP server configuration file
+- MCP architecture documentation
+
+## [2.2.0] - 2025-11-07
+
+### 🎉 Major Feature - Model Context Protocol (MCP) Integration
+
+#### Added
+- **MCP Support (Beta)**: Full Model Context Protocol integration for GPT-5 models
+  - Server configuration management via `mcp_config.json`
+  - Database schema for caching MCP tool definitions
+  - MCPManager handles server validation and tool discovery
+  - Settings UI toggle for enabling/disabling MCP (GPT-5 only)
+  - Dynamic MCP server inclusion in tools array
+- **Citation & Attribution System**:
+  - Strip MCP citations while preserving web_search citations (clickable links)
+  - Unified tools attribution at end of responses
+  - Clean API messages by removing attribution before OpenAI submission
+- **Error Handling & Retry Logic**:
+  - Graceful MCP connection failure handling with retry logic
+  - Exclude failed MCP servers from retry attempts
+  - User-friendly error messages for connection issues
+  - Show failed servers in tools attribution
+- **UI & Status Updates**:
+  - MCP status messages during tool discovery and execution
+  - Track MCP call counts with generic "MCP call #N" messages
+  - Settings modal integration for GPT-5 models
+  - Beta feature notice in documentation
+
+#### Changed
+- Updated README with MCP configuration instructions and Slack scope requirements
+- Enhanced MCP config example with comprehensive documentation
+- Added MCP metrics gathering for monitoring
+
+## [2.1.5] - 2025-09-30
+
+### 🐛 Bug Fix - Message Pagination
+
+#### Fixed
+- **Overflow Message Display**: Fixed continuation messages not appearing in thread when response exceeded Slack's message length limit
+  - Changed thread_id parameter from thinking_id (status message timestamp) to message.thread_id (actual thread timestamp)
+  - Continuation messages now properly appear in correct thread and trigger pagination if still too long
+  - Full message content was always correctly stored in database - this was purely a display bug affecting Slack message delivery
+
 ## [2.1.4] - 2025-09-24
 
 ### 🎯 Configuration, Session Management & Licensing Update
