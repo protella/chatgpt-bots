@@ -786,6 +786,7 @@ class DatabaseManager(LoggerMixin):
             # Convert SQLite boolean (0/1) to Python boolean
             prefs['enable_web_search'] = bool(prefs.get('enable_web_search', 1))
             prefs['enable_streaming'] = bool(prefs.get('enable_streaming', 1))
+            prefs['enable_mcp'] = bool(prefs.get('enable_mcp', 1))
             prefs['settings_completed'] = bool(prefs.get('settings_completed', 0))
             return prefs
         
@@ -869,7 +870,7 @@ class DatabaseManager(LoggerMixin):
                     values.append(preferences[field])
             
             # Handle boolean fields
-            for field in ['enable_web_search', 'enable_streaming']:
+            for field in ['enable_web_search', 'enable_streaming', 'enable_mcp']:
                 if field in preferences:
                     updates.append(f"{field} = ?")
                     values.append(1 if preferences[field] else 0)
@@ -1820,6 +1821,7 @@ class DatabaseManager(LoggerMixin):
                     # Convert SQLite boolean (0/1) to Python boolean
                     prefs['enable_web_search'] = bool(prefs.get('enable_web_search', 1))
                     prefs['enable_streaming'] = bool(prefs.get('enable_streaming', 1))
+                    prefs['enable_mcp'] = bool(prefs.get('enable_mcp', 1))
                     prefs['settings_completed'] = bool(prefs.get('settings_completed', 0))
                     return prefs
                 return None
@@ -1873,6 +1875,7 @@ class DatabaseManager(LoggerMixin):
                     # Convert SQLite boolean (0/1) to Python boolean
                     prefs['enable_web_search'] = bool(prefs.get('enable_web_search', 1))
                     prefs['enable_streaming'] = bool(prefs.get('enable_streaming', 1))
+                    prefs['enable_mcp'] = bool(prefs.get('enable_mcp', 1))
                     prefs['settings_completed'] = bool(prefs.get('settings_completed', 0))
                     return prefs
                 return {}
@@ -1950,7 +1953,7 @@ class DatabaseManager(LoggerMixin):
                     values.append(preferences[field])
 
             # Handle boolean fields - convert to integers for SQLite
-            for field in ['enable_web_search', 'enable_streaming']:
+            for field in ['enable_web_search', 'enable_streaming', 'enable_mcp']:
                 if field in preferences:
                     update_fields.append(f"{field} = ?")
                     values.append(1 if preferences[field] else 0)
@@ -2011,7 +2014,8 @@ class DatabaseManager(LoggerMixin):
                         'temperature': user_prefs.get('temperature'),
                         'top_p': user_prefs.get('top_p'),
                         'enable_web_search': user_prefs.get('enable_web_search'),
-                        'enable_streaming': user_prefs.get('enable_streaming')
+                        'enable_streaming': user_prefs.get('enable_streaming'),
+                        'enable_mcp': user_prefs.get('enable_mcp')
                     }
                     # Remove None values
                     config = {k: v for k, v in config.items() if v is not None}
