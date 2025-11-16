@@ -4,7 +4,7 @@ Migration script to update users from GPT-5 to GPT-5.1 with appropriate defaults
 
 This script:
 1. Finds all users with model="gpt-5" (the old default)
-2. Updates them to model="gpt-5.1" with reasoning_effort="none"
+2. Updates them to model="gpt-5.1" with reasoning_effort="low"
 3. Leaves users with other models (gpt-4.1, gpt-5-mini, etc.) unchanged
 
 Run this script after updating to GPT-5.1 support to migrate existing users.
@@ -62,7 +62,7 @@ def migrate_users_to_gpt51():
         for slack_user_id, current_model, current_reasoning in users_to_migrate:
             print(f"  User: {slack_user_id}")
             print(f"    Current: model={current_model}, reasoning_effort={current_reasoning}")
-            print(f"    New:     model=gpt-5.1, reasoning_effort=none")
+            print(f"    New:     model=gpt-5.1, reasoning_effort=low")
             print()
 
         # Ask for confirmation
@@ -80,7 +80,7 @@ def migrate_users_to_gpt51():
                 cursor.execute("""
                     UPDATE user_preferences
                     SET model = 'gpt-5.1',
-                        reasoning_effort = 'none'
+                        reasoning_effort = 'low'
                     WHERE slack_user_id = ?
                 """, (slack_user_id,))
                 migrated_count += 1
