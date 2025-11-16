@@ -242,6 +242,7 @@ class SettingsModal(LoggerMixin):
                     "value": selected_model
                 },
                 "options": [
+                    {"text": {"type": "plain_text", "text": "GPT-5.1"}, "value": "gpt-5.1"},
                     {"text": {"type": "plain_text", "text": "GPT-5"}, "value": "gpt-5"},
                     {"text": {"type": "plain_text", "text": "GPT-5 Mini"}, "value": "gpt-5-mini"},
                     {"text": {"type": "plain_text", "text": "GPT-4.1"}, "value": "gpt-4.1"},
@@ -255,6 +256,8 @@ class SettingsModal(LoggerMixin):
         # Add model-specific settings
         if selected_model in ['gpt-5', 'gpt-5-mini']:
             blocks.extend(self._add_gpt5_settings(settings))
+        elif selected_model == 'gpt-5.1':
+            blocks.extend(self._add_gpt51_settings(settings))
         else:  # gpt-4.1, gpt-4o
             blocks.extend(self._add_gpt4_settings(settings))
         
@@ -406,7 +409,103 @@ class SettingsModal(LoggerMixin):
         
         blocks.append({"type": "divider"})
         return blocks
-    
+
+    def _add_gpt51_settings(self, settings: Dict) -> List[Dict]:
+        """Add GPT-5.1 specific settings blocks"""
+        blocks = []
+
+        # Check if web search is enabled - explicitly check for False vs None/missing
+        # Default to True only if the key is missing
+        if 'enable_web_search' in settings:
+            web_search_enabled = bool(settings['enable_web_search'])
+        else:
+            web_search_enabled = True
+        self.log_debug(f"Settings passed to _add_gpt51_settings: enable_web_search={settings.get('enable_web_search')}, evaluated as {web_search_enabled}")
+
+        # Reasoning Level
+        # Use config defaults if not set in settings
+        from config import config
+        current_reasoning = settings.get('reasoning_effort', 'none')  # Default to 'none' for GPT-5.1
+        self.log_debug(f"Building reasoning options for GPT-5.1, current: {current_reasoning}")
+
+        # Build options list - GPT-5.1 has 'none' instead of 'minimal' and no web search constraint
+        reasoning_options = [
+            {"text": {"type": "plain_text", "text": self._get_reasoning_display('none')}, "value": "none"},
+            {"text": {"type": "plain_text", "text": self._get_reasoning_display('low')}, "value": "low"},
+            {"text": {"type": "plain_text", "text": self._get_reasoning_display('medium')}, "value": "medium"},
+            {"text": {"type": "plain_text", "text": self._get_reasoning_display('high')}, "value": "high"}
+        ]
+
+        # Log available options
+        available_values = [opt['value'] for opt in reasoning_options]
+        self.log_debug(f"Reasoning options available for GPT-5.1: {available_values}, initial: {current_reasoning}")
+
+        # Final validation - ensure current_reasoning is in available options
+        if current_reasoning not in available_values:
+            old_reasoning = current_reasoning  # Save old value for logging
+            current_reasoning = 'none'  # Default to 'none' for GPT-5.1
+            self.log_warning(f"Current reasoning '{old_reasoning}' not in available options, using 'none'")
+
+        # Build the reasoning block
+        reasoning_block = {
+            "type": "section",
+            "block_id": "reasoning_block_gpt51",
+            "text": {
+                "type": "mrkdwn",
+                "text": "*Reasoning Level*\nControls depth of analysis and problem-solving"
+            },
+            "accessory": {
+                "type": "radio_buttons",
+                "action_id": "reasoning_level_gpt51",
+                "options": reasoning_options
+            }
+        }
+
+        # Add initial_option if we have a valid selection
+        if current_reasoning and current_reasoning != 'None' and current_reasoning in available_values:
+            reasoning_block["accessory"]["initial_option"] = {
+                "text": {"type": "plain_text", "text": self._get_reasoning_display(current_reasoning)},
+                "value": current_reasoning
+            }
+            self.log_debug(f"Set initial_option for GPT-5.1 reasoning: {current_reasoning}")
+        else:
+            # Default to 'none' if no valid selection
+            if available_values:
+                default_value = 'none'
+                reasoning_block["accessory"]["initial_option"] = {
+                    "text": {"type": "plain_text", "text": self._get_reasoning_display(default_value)},
+                    "value": default_value
+                }
+                self.log_debug(f"No valid reasoning selection - set default initial_option: {default_value}")
+
+        blocks.append(reasoning_block)
+
+        # Response Detail
+        blocks.append({
+            "type": "section",
+            "block_id": "verbosity_block",
+            "text": {
+                "type": "mrkdwn",
+                "text": "*Response Detail*\nControls how detailed responses are"
+            },
+            "accessory": {
+                "type": "radio_buttons",
+                "action_id": "verbosity",
+                "initial_option": {
+                    "text": {"type": "plain_text", "text": self._get_verbosity_display(settings.get('verbosity', config.default_verbosity))},
+                    "value": settings.get('verbosity', config.default_verbosity)
+                },
+                "options": [
+                    {"text": {"type": "plain_text", "text": "📝 Concise"}, "value": "low"},
+                    {"text": {"type": "plain_text", "text": "📄 Standard"}, "value": "medium"},
+                    {"text": {"type": "plain_text", "text": "📚 Detailed"}, "value": "high"}
+                ]
+            }
+        })
+
+        blocks.append({"type": "divider"})
+        return blocks
+
     def _add_gpt4_settings(self, settings: Dict) -> List[Dict]:
         """Add GPT-4 specific settings blocks"""
         blocks = []
@@ -661,11 +760,13 @@ class SettingsModal(LoggerMixin):
             if selected:
                 extracted['model'] = selected['value']
         
-        # GPT-5 settings
-        # Check both possible block_ids (we use different ones based on web search state)
-        reasoning_block = values.get('reasoning_block_no_web', {}) or values.get('reasoning_block_web', {})
+        # GPT-5/5.1 settings
+        # Check all possible block_ids (different ones based on model and web search state)
+        reasoning_block = (values.get('reasoning_block_no_web', {}) or
+                          values.get('reasoning_block_web', {}) or
+                          values.get('reasoning_block_gpt51', {}))
 
-        # Check both possible action_ids
+        # Check all possible action_ids
         reasoning_found = False
         if 'reasoning_level' in reasoning_block:
             selected = reasoning_block['reasoning_level'].get('selected_option')
@@ -682,6 +783,13 @@ class SettingsModal(LoggerMixin):
                 reasoning_found = True
             else:
                 self.log_debug("No reasoning_level_no_minimal selected_option found")
+        elif 'reasoning_level_gpt51' in reasoning_block:
+            selected = reasoning_block['reasoning_level_gpt51'].get('selected_option')
+            if selected:
+                extracted['reasoning_effort'] = selected['value']
+                reasoning_found = True
+            else:
+                self.log_debug("No reasoning_level_gpt51 selected_option found")
 
         # Fallback if no reasoning selection due to Slack modal update bug
         if not reasoning_found:
@@ -697,10 +805,18 @@ class SettingsModal(LoggerMixin):
                 selected_values = [opt['value'] for opt in selected_options]
                 web_search_enabled = 'web_search' in selected_values
 
-            # Use a safe default based on web search state
-            default_reasoning = 'low' if web_search_enabled else 'minimal'
+            # Use a safe default based on model and web search state
+            model = extracted.get('model', 'gpt-5')
+            if web_search_enabled:
+                default_reasoning = 'low'
+            else:
+                # Use model-specific default when web search is off
+                if model == 'gpt-5.1':
+                    default_reasoning = 'none'  # GPT-5.1 default
+                else:
+                    default_reasoning = 'minimal'  # GPT-5/GPT-5-mini default
             extracted['reasoning_effort'] = default_reasoning
-            self.log_debug(f"No reasoning selection found - using default: {default_reasoning} (web_search: {web_search_enabled})")
+            self.log_debug(f"No reasoning selection found - using default: {default_reasoning} for model {model} (web_search: {web_search_enabled})")
         
         verbosity_block = values.get('verbosity_block', {})
         if 'verbosity' in verbosity_block:
@@ -771,16 +887,16 @@ class SettingsModal(LoggerMixin):
         """Validate and adjust settings for compatibility"""
         validated = settings.copy()
 
-        # If non-GPT-5 model selected and MCP enabled, auto-disable MCP
+        # If non-GPT-5 model selected, preserve existing MCP preference (don't force to False)
+        # This allows users to switch between models without losing their MCP preference
         model = validated.get('model', config.gpt_model)
         if not model.startswith('gpt-5'):
-            # For GPT-4 models, ensure MCP is disabled
+            # For GPT-4 models, if MCP is somehow explicitly enabled, disable it
             if validated.get('enable_mcp'):
                 validated['enable_mcp'] = False
                 self.log_info(f"Auto-disabled MCP because {model} doesn't support it (requires GPT-5)")
-            elif 'enable_mcp' not in validated:
-                # If not in validated dict (wasn't in the form), explicitly set to False for GPT-4
-                validated['enable_mcp'] = False
+            # If enable_mcp is not in validated (wasn't in the form), leave it as-is
+            # Don't explicitly set to False - preserve user's preference for when they switch back to GPT-5
 
         # If web search enabled but reasoning too low (minimal), auto-upgrade
         if validated.get('enable_web_search') and validated.get('reasoning_effort') == 'minimal':
@@ -803,13 +919,13 @@ class SettingsModal(LoggerMixin):
                 # Note: We don't reset either value, just warn - let user decide
         
         # Remove invalid parameters for model type
-        if model in ['gpt-5', 'gpt-5-mini']:
+        if model in ['gpt-5', 'gpt-5.1', 'gpt-5-mini']:
             # Remove GPT-4 specific params
             validated.pop('temperature', None)
             validated.pop('top_p', None)
         else:
             # Remove GPT-5 specific params
-            validated.pop('reasoning_effort', None) 
+            validated.pop('reasoning_effort', None)
             validated.pop('verbosity', None)
         
         return validated
@@ -819,6 +935,7 @@ class SettingsModal(LoggerMixin):
         """Get user-friendly model name"""
         display_names = {
             'gpt-5': 'GPT-5',
+            'gpt-5.1': 'GPT-5.1',
             'gpt-5-mini': 'GPT-5 Mini',
             'gpt-4.1': 'GPT-4.1',
             'gpt-4o': 'GPT-4o'
@@ -828,6 +945,7 @@ class SettingsModal(LoggerMixin):
     def _get_reasoning_display(self, level: str) -> str:
         """Get display name for reasoning level"""
         displays = {
+            'none': '🌟 None (Adaptive)',
             'minimal': '⚡ Minimal (Fastest, Chat-like)',
             'low': '🚀 Low (Fast)',
             'medium': '⚖️ Medium (Balanced)',

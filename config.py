@@ -10,16 +10,17 @@ from dataclasses import dataclass, field
 load_dotenv()
 
 # Model knowledge cutoff dates
-# Supported models: gpt-5, gpt-5-mini, gpt-4.1, gpt-4o
+# Supported models: gpt-5, gpt-5.1, gpt-5-mini, gpt-4.1, gpt-4o
 MODEL_KNOWLEDGE_CUTOFFS = {
     # GPT-5 series
     "gpt-5": "September 30, 2024",
+    "gpt-5.1": "September 30, 2024",
     "gpt-5-mini": "September 30, 2024",
-    
+
     # GPT-4 series
     "gpt-4.1": "June 1, 2024",
     "gpt-4o": "October 1, 2023",
-    
+
     # Default fallback
     "default": "January 1, 2024"
 }

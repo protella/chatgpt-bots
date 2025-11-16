@@ -656,9 +656,17 @@ class SlackSettingsHandlersMixin:
                         # Web search is on and wasn't minimal - keep the stored value
                         merged_settings['reasoning_effort'] = reasoning_from_stored
                 else:
-                    # No stored value either - use a safe default
-                    merged_settings['reasoning_effort'] = 'low' if web_search_enabled else 'medium'
-                    self.log_debug(f"No reasoning in form or stored, defaulting to {merged_settings['reasoning_effort']}")
+                    # No stored value either - use a safe default based on model
+                    model = merged_settings.get('model', 'gpt-5')
+                    if web_search_enabled:
+                        merged_settings['reasoning_effort'] = 'low'
+                    else:
+                        # Use model-specific default when web search is off
+                        if model == 'gpt-5.1':
+                            merged_settings['reasoning_effort'] = 'none'  # GPT-5.1 default
+                        else:
+                            merged_settings['reasoning_effort'] = 'minimal'  # GPT-5/GPT-5-mini default
+                    self.log_debug(f"No reasoning in form or stored, defaulting to {merged_settings['reasoning_effort']} for model {model}")
             
             # Debug logging
             self.log_debug(f"Features change - Web search: {merged_settings.get('enable_web_search')}, Reasoning: {merged_settings.get('reasoning_effort')}")
@@ -781,6 +789,7 @@ class SlackSettingsHandlersMixin:
         # Register action handlers for other interactive components (just acknowledge)
         @self.app.action("reasoning_level")
         @self.app.action("reasoning_level_no_minimal")  # Alternative action_id when minimal is hidden
+        @self.app.action("reasoning_level_gpt51")  # GPT-5.1 reasoning options
         @self.app.action("verbosity")
         @self.app.action("input_fidelity")
         @self.app.action("vision_detail")
