@@ -152,6 +152,10 @@ async def analyze_images(
                 request_params["reasoning"] = {"effort": config.analysis_reasoning_effort}
                 request_params["text"] = {"verbosity": config.analysis_verbosity}
 
+                # Add prompt caching for GPT-5.1
+                if config.gpt_model == "gpt-5.1":
+                    request_params["prompt_cache_retention"] = "24h"
+
             # Stream the response
             output_text = ""
             stream = await self._safe_api_call(
@@ -219,6 +223,10 @@ async def analyze_images(
                 request_params["temperature"] = 1.0
                 request_params["reasoning"] = {"effort": config.analysis_reasoning_effort}
                 request_params["text"] = {"verbosity": config.analysis_verbosity}
+
+                # Add prompt caching for GPT-5.1
+                if config.gpt_model == "gpt-5.1":
+                    request_params["prompt_cache_retention"] = "24h"
 
             # API call with enforced timeout wrapper
             response = await self._safe_api_call(

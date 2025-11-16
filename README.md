@@ -23,6 +23,7 @@ For a detailed list of recent changes and improvements, please see the [CHANGELO
 **V2 Architecture**: Uses OpenAI's Responses API exclusively
 
 **Supported Models:**
+- **GPT-5.1** (`gpt-5.1`) - Latest reasoning model with adaptive reasoning and 24-hour prompt caching
 - **GPT-5** (`gpt-5`) - Reasoning model with web search capability
 - **GPT-5 Mini** (`gpt-5-mini`) - Faster reasoning model
 - **GPT-4.1** (`gpt-4.1`) - Latest GPT-4 variant
@@ -133,10 +134,10 @@ See [.env.example](.env.example) for all available configuration options and det
 
 ### Key Configuration Options
 
-- **Models**: Configure GPT-5, GPT-5 Mini, GPT-4.1, or GPT-4o as your primary model
+- **Models**: Configure GPT-5.1, GPT-5, GPT-5 Mini, GPT-4.1, or GPT-4o as your primary model
 - **User Settings**: Users can customize their experience via `/chatgpt-settings` command
 - **Thread Settings**: Different settings per conversation thread
-- **Web Search**: Available with GPT-5 models (requires reasoning_effort >= low)
+- **Web Search**: Available with GPT-5 models (GPT-5 requires reasoning_effort >= low; GPT-5.1 works with all levels)
 - **Streaming**: Real-time response streaming with configurable update intervals
 - **Token Management**: Automatic context window management with configurable buffer
 - **Logging**: Comprehensive logging with rotation at 10MB, configurable levels per component
@@ -195,7 +196,7 @@ Model Context Protocol is a standardized way to connect AI applications to exter
 
 #### Requirements
 
-- **GPT-5 Model**: MCP tools only work with GPT-5 or GPT-5 Mini
+- **GPT-5 Model**: MCP tools only work with GPT-5, GPT-5.1, or GPT-5 Mini
 - **HTTP/SSE Transport**: Bot uses OpenAI's native MCP support (stdio not supported)
 
 #### Setup
@@ -250,7 +251,7 @@ The bot will automatically load and connect to your configured MCP servers on st
 Users can enable/disable MCP access via the settings modal:
 1. Type `/chatgpt-settings` in Slack
 2. Check/uncheck "MCP Servers" in the Features section
-3. Note: Enabling MCP requires selecting a GPT-5 model
+3. Note: Enabling MCP requires selecting a GPT-5 series model (GPT-5, GPT-5.1, or GPT-5 Mini)
 
 #### Finding MCP Servers
 
