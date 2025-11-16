@@ -2,6 +2,53 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+## [2.3.0] - 2025-01-15
+
+### 🚀 Feature - GPT-5.1 Model Support & Performance Optimizations
+
+#### Added
+- **GPT-5.1 Model Support**: Added GPT-5.1 as a new model option with enhanced capabilities
+  - New "None" reasoning_effort option with adaptive reasoning
+  - Automatic reasoning depth adjustment based on query complexity
+  - 24-hour prompt caching for GPT-5.1 across all API calls (chat, vision, intent classification)
+  - Web search now works with all reasoning levels including "none"
+  - Separate settings UI for GPT-5.1 with dedicated reasoning options
+  - Future-proof support for gpt-5.1-mini (not yet released)
+- **Migration Script**: Created `scripts/migrate_users_to_gpt51.py` for automated user migration from GPT-5 to GPT-5.1
+- **Configuration Updates**:
+  - Added `gpt-5.1` to MODEL_KNOWLEDGE_CUTOFFS
+  - Updated model dropdown in settings modal to include GPT-5.1 as top option
+  - Added `_add_gpt51_settings()` method with new reasoning options
+  - Changed default UTILITY_MODEL from gpt-4.1-mini to gpt-5-mini in .env.example
+
+#### Changed
+- **Reasoning Options**:
+  - GPT-5.1 uses "none/low/medium/high" (replaces "minimal" with "none")
+  - GPT-5 retains "minimal/low/medium/high" (backward compatible)
+  - GPT-5.1 removes web_search + minimal reasoning constraint
+- **API Integration**:
+  - Added prompt caching (`prompt_cache_retention="24h"`) for GPT-5.1 in:
+    - Main chat responses (streaming and non-streaming)
+    - Vision analysis (streaming and non-streaming)
+    - Intent classification (for future gpt-5.1-mini support)
+  - Enhanced model detection logic in responses.py
+  - Added `reasoning_level_gpt51` action handler for Slack modal interactions
+- **System Prompt Optimization**: Moved date/time context to end of system prompt to maximize prompt caching effectiveness (90% cost savings on cached tokens)
+
+#### Fixed
+- **MCP Settings Preservation**: Fixed bug where MCP settings were lost when switching between GPT-4 and GPT-5 models
+  - Validation no longer forces `enable_mcp=False` for GPT-4 users
+  - Preserves user's MCP preference when switching back to GPT-5
+  - Database now retains MCP setting even when using non-GPT-5 models
+
+#### Notes
+- GPT-5 model remains unchanged for backward compatibility
+- Users can explicitly opt into GPT-5.1 via settings modal
+- Run migration script manually to update existing GPT-5 users to GPT-5.1
+- Reasoning effort preferences are model-specific and may need adjustment when switching models
+
 ## [2.2.3] - 2025-11-10
 
 ### 🐛 Bug Fix - MCP Settings Persistence

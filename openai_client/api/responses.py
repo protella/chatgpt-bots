@@ -71,15 +71,19 @@ async def create_text_response(
     if model.startswith("gpt-5"):
         # Check if it's a reasoning model (not chat model)
         is_reasoning_model = "chat" not in model.lower()
-        
+
         if is_reasoning_model:
-            # GPT-5 reasoning models (nano, mini, full)
+            # GPT-5 reasoning models (nano, mini, full, 5.1)
             # Fixed temperature, supports reasoning_effort and verbosity
             request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
             reasoning_effort = reasoning_effort or config.default_reasoning_effort
             request_params["reasoning"] = {"effort": reasoning_effort}
             verbosity = verbosity or config.default_verbosity
             request_params["text"] = {"verbosity": verbosity}
+
+            # Add prompt caching for GPT-5.1
+            if model == "gpt-5.1":
+                request_params["prompt_cache_retention"] = "24h"
         else:
             # GPT-5 chat models - standard parameters only
             # temperature and top_p work normally, no reasoning/verbosity
@@ -305,15 +309,19 @@ async def create_streaming_response(
     if model.startswith("gpt-5"):
         # Check if it's a reasoning model (not chat model)
         is_reasoning_model = "chat" not in model.lower()
-        
+
         if is_reasoning_model:
-            # GPT-5 reasoning models (nano, mini, full)
+            # GPT-5 reasoning models (nano, mini, full, 5.1)
             # Fixed temperature, supports reasoning_effort and verbosity
             request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
             reasoning_effort = reasoning_effort or config.default_reasoning_effort
             request_params["reasoning"] = {"effort": reasoning_effort}
             verbosity = verbosity or config.default_verbosity
             request_params["text"] = {"verbosity": verbosity}
+
+            # Add prompt caching for GPT-5.1
+            if model == "gpt-5.1":
+                request_params["prompt_cache_retention"] = "24h"
         else:
             # GPT-5 chat models - standard parameters only
             # temperature and top_p work normally, no reasoning/verbosity
@@ -779,6 +787,10 @@ async def classify_intent(
             request_params["temperature"] = 1.0  # Fixed for reasoning models
             request_params["reasoning"] = {"effort": config.utility_reasoning_effort}  # Use utility config
             request_params["text"] = {"verbosity": config.utility_verbosity}  # Use utility config
+
+            # Add prompt caching for GPT-5.1 (including future gpt-5.1-mini)
+            if config.utility_model.startswith("gpt-5.1"):
+                request_params["prompt_cache_retention"] = "24h"
         else:
             # GPT-4 or other models - use standard parameters
             request_params["temperature"] = 0.3  # Low temperature for consistent classification

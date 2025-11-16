@@ -717,18 +717,15 @@ class MessageUtilitiesMixin:
             current_time = datetime.datetime.now(pytz.UTC)
             timezone_display = "UTC"
         
-        # Format time and user context - emphasize "today's date" for clarity
-        time_context = f"\n\nToday's date and current time: {current_time.strftime('%A, %B %d, %Y at %I:%M %p')} ({timezone_display})\nIMPORTANT: Always consider the current date and time (w/ timezone offset) and adjust your responses accordingly."
-        
         # Add user's name and email if available
         user_context = ""
         if user_real_name and user_email:
-            user_context = f"\nYou're speaking with {user_real_name} (email: {user_email})"
+            user_context = f"\n\nYou're speaking with {user_real_name} (email: {user_email})"
         elif user_real_name:
-            user_context = f"\nYou're speaking with {user_real_name}"
+            user_context = f"\n\nYou're speaking with {user_real_name}"
         elif user_email:
-            user_context = f"\nYou're speaking with user (email: {user_email})"
-        
+            user_context = f"\n\nYou're speaking with user (email: {user_email})"
+
         # Add model and knowledge cutoff info
         model_context = ""
         if model:
@@ -739,7 +736,7 @@ class MessageUtilitiesMixin:
             else:
                 # Fallback for unknown models
                 model_context = f"\n\nYour current model is {model}."
-        
+
         # Add web search capability context
         web_search_context = ""
         if web_search_enabled:
@@ -748,18 +745,21 @@ class MessageUtilitiesMixin:
             # Get the settings command dynamically
             settings_command = config.settings_slash_command if hasattr(config, 'settings_slash_command') else '/chatgpt-settings'
             web_search_context = f"\n\nWeb search is currently disabled. If a user asks for current information or recent events beyond your knowledge cutoff, provide what you know but mention that web search is disabled in their user settings. They can enable it using `{settings_command}`."
-        
+
         # Add trimming notification if messages have been removed
         trimming_context = ""
         if has_trimmed_messages:
             trimming_context = "\n\nNote: Some older messages have been removed from this conversation to manage context length."
-        
+
         # Add custom instructions if provided
         custom_instructions_context = ""
         if custom_instructions:
             custom_instructions_context = f"\n\n--- USER CUSTOM INSTRUCTIONS ---\nThe following are custom instructions provided by the user. These should be followed and may supersede any conflicting default instructions (within legal and ethical boundaries):\n\n{custom_instructions}\n\n--- END OF USER CUSTOM INSTRUCTIONS ---"
-        
-        return base_prompt + time_context + user_context + model_context + web_search_context + trimming_context + custom_instructions_context
+
+        # Format time context - moved to end to maximize prompt caching (date/time changes on every request)
+        time_context = f"\n\nToday's date and current time: {current_time.strftime('%A, %B %d, %Y at %I:%M %p')} ({timezone_display})\nIMPORTANT: Always consider the current date and time (w/ timezone offset) and adjust your responses accordingly."
+
+        return base_prompt + user_context + model_context + web_search_context + trimming_context + custom_instructions_context + time_context
 
     def _schedule_async_call(self, coro):
         """Helper to schedule async calls from sync contexts"""
