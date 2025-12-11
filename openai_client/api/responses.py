@@ -81,8 +81,8 @@ async def create_text_response(
             verbosity = verbosity or config.default_verbosity
             request_params["text"] = {"verbosity": verbosity}
 
-            # Add prompt caching for GPT-5.1
-            if model == "gpt-5.1":
+            # Add prompt caching for GPT-5.1 and GPT-5.2 reasoning models
+            if model in ["gpt-5.1", "gpt-5.2", "gpt-5.2-pro"]:
                 request_params["prompt_cache_retention"] = "24h"
         else:
             # GPT-5 chat models - standard parameters only
@@ -319,8 +319,8 @@ async def create_streaming_response(
             verbosity = verbosity or config.default_verbosity
             request_params["text"] = {"verbosity": verbosity}
 
-            # Add prompt caching for GPT-5.1
-            if model == "gpt-5.1":
+            # Add prompt caching for GPT-5.1 and GPT-5.2 reasoning models
+            if model in ["gpt-5.1", "gpt-5.2", "gpt-5.2-pro"]:
                 request_params["prompt_cache_retention"] = "24h"
         else:
             # GPT-5 chat models - standard parameters only
@@ -788,8 +788,8 @@ async def classify_intent(
             request_params["reasoning"] = {"effort": config.utility_reasoning_effort}  # Use utility config
             request_params["text"] = {"verbosity": config.utility_verbosity}  # Use utility config
 
-            # Add prompt caching for GPT-5.1 (including future gpt-5.1-mini)
-            if config.utility_model.startswith("gpt-5.1"):
+            # Add prompt caching for GPT-5.1 and GPT-5.2 reasoning models
+            if config.utility_model.startswith("gpt-5.1") or config.utility_model.startswith("gpt-5.2"):
                 request_params["prompt_cache_retention"] = "24h"
         else:
             # GPT-4 or other models - use standard parameters

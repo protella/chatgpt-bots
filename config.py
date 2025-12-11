@@ -10,8 +10,13 @@ from dataclasses import dataclass, field
 load_dotenv()
 
 # Model knowledge cutoff dates
-# Supported models: gpt-5, gpt-5.1, gpt-5-mini, gpt-4.1, gpt-4o
+# Supported models: gpt-5.2, gpt-5.2-pro, gpt-5.2-chat-latest, gpt-5, gpt-5.1, gpt-5-mini, gpt-4.1, gpt-4o
 MODEL_KNOWLEDGE_CUTOFFS = {
+    # GPT-5.2 series (August 2025 cutoff - much more recent!)
+    "gpt-5.2": "August 31, 2025",
+    "gpt-5.2-pro": "August 31, 2025",
+    "gpt-5.2-chat-latest": "August 31, 2025",
+
     # GPT-5 series
     "gpt-5": "September 30, 2024",
     "gpt-5.1": "September 30, 2024",
