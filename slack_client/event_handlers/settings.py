@@ -790,6 +790,7 @@ class SlackSettingsHandlersMixin:
         @self.app.action("reasoning_level")
         @self.app.action("reasoning_level_no_minimal")  # Alternative action_id when minimal is hidden
         @self.app.action("reasoning_level_gpt51")  # GPT-5.1 reasoning options
+        @self.app.action("reasoning_level_gpt52")  # GPT-5.2 reasoning options (includes xhigh)
         @self.app.action("verbosity")
         @self.app.action("input_fidelity")
         @self.app.action("vision_detail")

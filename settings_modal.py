@@ -242,6 +242,7 @@ class SettingsModal(LoggerMixin):
                     "value": selected_model
                 },
                 "options": [
+                    {"text": {"type": "plain_text", "text": "GPT-5.2"}, "value": "gpt-5.2"},
                     {"text": {"type": "plain_text", "text": "GPT-5.1"}, "value": "gpt-5.1"},
                     {"text": {"type": "plain_text", "text": "GPT-5"}, "value": "gpt-5"},
                     {"text": {"type": "plain_text", "text": "GPT-5 Mini"}, "value": "gpt-5-mini"},
@@ -254,7 +255,9 @@ class SettingsModal(LoggerMixin):
         blocks.append({"type": "divider"})
         
         # Add model-specific settings
-        if selected_model in ['gpt-5', 'gpt-5-mini']:
+        if selected_model == 'gpt-5.2':
+            blocks.extend(self._add_gpt52_settings(settings))
+        elif selected_model in ['gpt-5', 'gpt-5-mini']:
             blocks.extend(self._add_gpt5_settings(settings))
         elif selected_model == 'gpt-5.1':
             blocks.extend(self._add_gpt51_settings(settings))
@@ -479,6 +482,110 @@ class SettingsModal(LoggerMixin):
                 self.log_debug(f"No valid reasoning selection - set default initial_option: {default_value}")
 
         blocks.append(reasoning_block)
+
+        # Response Detail
+        blocks.append({
+            "type": "section",
+            "block_id": "verbosity_block",
+            "text": {
+                "type": "mrkdwn",
+                "text": "*Response Detail*\nControls how detailed responses are"
+            },
+            "accessory": {
+                "type": "radio_buttons",
+                "action_id": "verbosity",
+                "initial_option": {
+                    "text": {"type": "plain_text", "text": self._get_verbosity_display(settings.get('verbosity', config.default_verbosity))},
+                    "value": settings.get('verbosity', config.default_verbosity)
+                },
+                "options": [
+                    {"text": {"type": "plain_text", "text": "📝 Concise"}, "value": "low"},
+                    {"text": {"type": "plain_text", "text": "📄 Standard"}, "value": "medium"},
+                    {"text": {"type": "plain_text", "text": "📚 Detailed"}, "value": "high"}
+                ]
+            }
+        })
+
+        blocks.append({"type": "divider"})
+        return blocks
+
+    def _add_gpt52_settings(self, settings: Dict) -> List[Dict]:
+        """Add GPT-5.2 specific settings blocks (includes xhigh reasoning)"""
+        blocks = []
+
+        # Check if web search is enabled
+        if 'enable_web_search' in settings:
+            web_search_enabled = bool(settings['enable_web_search'])
+        else:
+            web_search_enabled = True
+        self.log_debug(f"Settings passed to _add_gpt52_settings: enable_web_search={settings.get('enable_web_search')}, evaluated as {web_search_enabled}")
+
+        # Reasoning Level - GPT-5.2 supports 'xhigh' in addition to standard levels
+        from config import config
+        current_reasoning = settings.get('reasoning_effort', 'none')  # Default to 'none' for GPT-5.2
+        self.log_debug(f"Building reasoning options for GPT-5.2, current: {current_reasoning}")
+
+        # Build options list - GPT-5.2 has 'none' and adds 'xhigh' for maximum quality
+        reasoning_options = [
+            {"text": {"type": "plain_text", "text": self._get_reasoning_display('none')}, "value": "none"},
+            {"text": {"type": "plain_text", "text": self._get_reasoning_display('low')}, "value": "low"},
+            {"text": {"type": "plain_text", "text": self._get_reasoning_display('medium')}, "value": "medium"},
+            {"text": {"type": "plain_text", "text": self._get_reasoning_display('high')}, "value": "high"},
+            {"text": {"type": "plain_text", "text": self._get_reasoning_display('xhigh')}, "value": "xhigh"}
+        ]
+
+        # Log available options
+        available_values = [opt['value'] for opt in reasoning_options]
+        self.log_debug(f"Reasoning options available for GPT-5.2: {available_values}, initial: {current_reasoning}")
+
+        # Final validation - ensure current_reasoning is in available options
+        if current_reasoning not in available_values:
+            old_reasoning = current_reasoning
+            current_reasoning = 'none'  # Default to 'none' for GPT-5.2
+            self.log_warning(f"Current reasoning '{old_reasoning}' not in available options, using 'none'")
+
+        # Build the reasoning block
+        reasoning_block = {
+            "type": "section",
+            "block_id": "reasoning_block_gpt52",
+            "text": {
+                "type": "mrkdwn",
+                "text": "*Reasoning Level*\nControls depth of analysis and problem-solving"
+            },
+            "accessory": {
+                "type": "radio_buttons",
+                "action_id": "reasoning_level_gpt52",
+                "options": reasoning_options
+            }
+        }
+
+        # Add initial_option if we have a valid selection
+        if current_reasoning and current_reasoning != 'None' and current_reasoning in available_values:
+            reasoning_block["accessory"]["initial_option"] = {
+                "text": {"type": "plain_text", "text": self._get_reasoning_display(current_reasoning)},
+                "value": current_reasoning
+            }
+            self.log_debug(f"Set initial_option for GPT-5.2 reasoning: {current_reasoning}")
+        else:
+            # Default to 'none' if no valid selection
+            if available_values:
+                default_value = 'none'
+                reasoning_block["accessory"]["initial_option"] = {
+                    "text": {"type": "plain_text", "text": self._get_reasoning_display(default_value)},
+                    "value": default_value
+                }
+                self.log_debug(f"No valid reasoning selection - set default initial_option: {default_value}")
+
+        blocks.append(reasoning_block)
+
+        # Add note about xhigh reasoning
+        blocks.append({
+            "type": "context",
+            "elements": [{
+                "type": "mrkdwn",
+                "text": "_Note: Extra High reasoning provides maximum accuracy but is slower and more expensive_"
+            }]
+        })
 
         # Response Detail
         blocks.append({
@@ -760,11 +867,12 @@ class SettingsModal(LoggerMixin):
             if selected:
                 extracted['model'] = selected['value']
         
-        # GPT-5/5.1 settings
+        # GPT-5/5.1/5.2 settings
         # Check all possible block_ids (different ones based on model and web search state)
         reasoning_block = (values.get('reasoning_block_no_web', {}) or
                           values.get('reasoning_block_web', {}) or
-                          values.get('reasoning_block_gpt51', {}))
+                          values.get('reasoning_block_gpt51', {}) or
+                          values.get('reasoning_block_gpt52', {}))
 
         # Check all possible action_ids
         reasoning_found = False
@@ -790,6 +898,13 @@ class SettingsModal(LoggerMixin):
                 reasoning_found = True
             else:
                 self.log_debug("No reasoning_level_gpt51 selected_option found")
+        elif 'reasoning_level_gpt52' in reasoning_block:
+            selected = reasoning_block['reasoning_level_gpt52'].get('selected_option')
+            if selected:
+                extracted['reasoning_effort'] = selected['value']
+                reasoning_found = True
+            else:
+                self.log_debug("No reasoning_level_gpt52 selected_option found")
 
         # Fallback if no reasoning selection due to Slack modal update bug
         if not reasoning_found:
@@ -811,8 +926,8 @@ class SettingsModal(LoggerMixin):
                 default_reasoning = 'low'
             else:
                 # Use model-specific default when web search is off
-                if model == 'gpt-5.1':
-                    default_reasoning = 'none'  # GPT-5.1 default
+                if model in ['gpt-5.1', 'gpt-5.2']:
+                    default_reasoning = 'none'  # GPT-5.1/5.2 default
                 else:
                     default_reasoning = 'minimal'  # GPT-5/GPT-5-mini default
             extracted['reasoning_effort'] = default_reasoning
@@ -903,10 +1018,11 @@ class SettingsModal(LoggerMixin):
             validated['reasoning_effort'] = 'low'
             self.log_info("Auto-upgraded reasoning_effort from minimal to low for web search compatibility")
         
-        # Check if both temperature and top_p are changed for GPT-4 models
+        # Check if both temperature and top_p are changed for chat models (GPT-4)
         model = validated.get('model', 'gpt-5')
-        if model not in ['gpt-5', 'gpt-5-mini']:
-            # For GPT-4 models, warn if both temperature and top_p are changed from defaults
+        reasoning_models = ['gpt-5', 'gpt-5.1', 'gpt-5-mini', 'gpt-5.2']
+        if model not in reasoning_models:
+            # For chat models, warn if both temperature and top_p are changed from defaults
             default_temp = config.default_temperature
             default_top_p = config.default_top_p
             
@@ -919,12 +1035,13 @@ class SettingsModal(LoggerMixin):
                 # Note: We don't reset either value, just warn - let user decide
         
         # Remove invalid parameters for model type
-        if model in ['gpt-5', 'gpt-5.1', 'gpt-5-mini']:
-            # Remove GPT-4 specific params
+        reasoning_models = ['gpt-5', 'gpt-5.1', 'gpt-5-mini', 'gpt-5.2']
+        if model in reasoning_models:
+            # Remove GPT-4/chat model specific params
             validated.pop('temperature', None)
             validated.pop('top_p', None)
         else:
-            # Remove GPT-5 specific params
+            # Remove GPT-5 reasoning model specific params (for GPT-4, GPT-5.2-chat-latest, etc.)
             validated.pop('reasoning_effort', None)
             validated.pop('verbosity', None)
         
@@ -934,6 +1051,9 @@ class SettingsModal(LoggerMixin):
     def _get_model_display_name(self, model: str) -> str:
         """Get user-friendly model name"""
         display_names = {
+            'gpt-5.2': 'GPT-5.2',
+            'gpt-5.2-pro': 'GPT-5.2 Pro',
+            'gpt-5.2-chat-latest': 'GPT-5.2 Instant',
             'gpt-5': 'GPT-5',
             'gpt-5.1': 'GPT-5.1',
             'gpt-5-mini': 'GPT-5 Mini',
@@ -949,7 +1069,8 @@ class SettingsModal(LoggerMixin):
             'minimal': '⚡ Minimal (Fastest, Chat-like)',
             'low': '🚀 Low (Fast)',
             'medium': '⚖️ Medium (Balanced)',
-            'high': '🧠 High (Thorough, Slowest)'
+            'high': '🧠 High (Thorough)',
+            'xhigh': '💎 Extra High (Maximum Quality)'
         }
         return displays.get(level, '⚖️ Medium (Balanced)')
     
