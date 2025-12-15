@@ -379,8 +379,15 @@ class TextHandlerMixin:
                             self.log_warning(f"Failed to update image gen status: {result.get('error', 'Unknown error')}")
                     except Exception as e:
                         self.log_error(f"Error updating image gen status: {e}")
-            elif tool_type == "mcp":
+            elif tool_type == "mcp" or tool_type.startswith("mcp:"):
                 # MCP has its own status values (not "started")
+                # tool_type can be "mcp" or "mcp:server_label" (e.g., "mcp:context7")
+                server_label = None
+                if tool_type.startswith("mcp:"):
+                    server_label = tool_type[4:]  # Extract server name after "mcp:"
+                    if server_label:
+                        mcp_servers_used.add(server_label)
+
                 if progress_task and not progress_task.done():
                     progress_task.cancel()
                     self.log_debug("Cancelled progress updater - MCP tool started")
@@ -391,13 +398,14 @@ class TextHandlerMixin:
                     self.log_info("MCP tool discovery started (status message suppressed)")
                 elif status == "calling":
                     search_counts["mcp"] += 1
-                    # Build status message with call count if multiple calls
+                    # Build status message with server name if available
+                    server_suffix = f" ({server_label})" if server_label else ""
                     call_suffix = f" (call {search_counts['mcp']})" if search_counts['mcp'] > 1 else ""
-                    status_msg = f"{config.web_search_emoji} Using MCP tools{call_suffix}..."
+                    status_msg = f"{config.web_search_emoji} Using MCP tools{server_suffix}{call_suffix}..."
                     try:
                         result = await client.update_message_streaming(message.channel_id, message_id, status_msg)
                         if result["success"]:
-                            self.log_info(f"MCP call #{search_counts['mcp']} started - updated status")
+                            self.log_info(f"MCP call #{search_counts['mcp']}{server_suffix} started - updated status")
                         else:
                             self.log_warning(f"Failed to update MCP call status: {result.get('error', 'Unknown error')}")
                     except Exception as e:
@@ -464,7 +472,7 @@ class TextHandlerMixin:
             
             if not text_chunk:
                 return
-                
+
             # Add chunk to buffer
             buffer.add_chunk(text_chunk)
             
@@ -787,10 +795,13 @@ class TextHandlerMixin:
             tools_used = []
             if search_counts["web_search"] > 0:
                 tools_used.append("web_search")
-            if search_counts["mcp"] > 0:
-                # Show generic "mcp" instead of listing all available servers
-                # since we don't track which specific servers were actually invoked
-                tools_used.append("mcp")
+            if mcp_servers_used:
+                # Group MCP servers under a single MCP label
+                mcp_list = ", ".join(sorted(mcp_servers_used))
+                tools_used.append(f"MCP ({mcp_list})")
+            elif search_counts["mcp"] > 0:
+                # Fallback to generic "MCP" if server names weren't tracked
+                tools_used.append("MCP")
 
             # Add unified tools note at the END if any tools were used
             # This works for both paginated and non-paginated responses

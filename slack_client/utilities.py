@@ -16,6 +16,8 @@ def strip_citations(text: str) -> str:
     Citation formats:
     - MCP: cite:emoji:mcp_<server>.<tool>result<N>:emoji:
       Example: cite:ship:mcp_aws_knowledge.aws_search_documentationresult8:walking:
+    - MCP Tool: cite:emoji:turn<N>read_documentation:emoji:
+      Example: cite:ship:turn0search1:ship:turn1read_documentation:walking:
     - Web Search: cite:emoji:turn<N>search<N>:emoji: (preserved - these are clickable links)
       Example: cite:ship:turn1search4:walking:
 
@@ -28,12 +30,24 @@ def strip_citations(text: str) -> str:
     Returns:
         Text with MCP citation markers removed, web search citations preserved
     """
-    # Pattern matches MCP citations only (contain "mcp_" in the source identifier)
-    # Format: cite:emoji:mcp_<anything>:emoji:
-    # Handles nested citations like: cite:ship:mcp_aws_knowledge.aws_search_documentationresult0:ship:turn0:walking:
-    mcp_citation_pattern = r'\s*cite:[^:]+:mcp_[^:]+(?::[^:]+)*:\w+:\s*'
+    # Pattern to match citations that should be removed:
+    # - Contains "mcp_" anywhere (MCP server results)
+    # - Contains "read_", "get_", "list_", etc. (MCP tool prefixes)
+    # - Contains "_documentation", "_library", etc. (MCP tool suffixes)
+    # Note: Using [^:]+ for final emoji to match Unicode emojis (not just \w word chars)
+    mcp_patterns = [
+        # Citations containing "mcp_"
+        r'\s*cite:[^:]+:mcp_[^:]+(?::[^:]+)*:[^:]+:\s*',
+        # Citations containing MCP tool patterns (read_documentation, etc.)
+        r'\s*cite:[^:]+:[^:]*(?:read_|get_|list_|fetch_|retrieve_)[^:]+(?::[^:]+)*:[^:]+:\s*',
+        r'\s*cite:[^:]+:[^:]*(?:_documentation|_library|_docs)[^:]*(?::[^:]+)*:[^:]+:\s*',
+        # Complex/nested citations that contain multiple turn references (likely MCP + web search mixed)
+        r'\s*cite:[^:]+:turn\d+search\d+:[^:]+:turn\d+[^:]*(?::[^:]+)*:[^:]+:\s*',
+    ]
 
-    cleaned_text = re.sub(mcp_citation_pattern, ' ', text)
+    cleaned_text = text
+    for pattern in mcp_patterns:
+        cleaned_text = re.sub(pattern, ' ', cleaned_text)
 
     # Clean up any double spaces created by removing citations (preserve newlines)
     cleaned_text = re.sub(r' {2,}', ' ', cleaned_text)

@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.1] - 2025-12-15
+
+### 🔧 Improvements - MCP Citation Stripping & Tool Attribution
+
+#### Changed
+- **MCP Citation Stripping**: Moved citation stripping from streaming layer to Slack messaging layer
+  - Single point of control for all message types (streaming, non-streaming, updates)
+  - Enhanced regex patterns to catch additional MCP citation formats
+  - Properly handles tool-generated citations (`read_documentation`, `get_library`, etc.)
+  - Web search citations preserved as clickable links
+- **MCP Tool Attribution**: "Used Tools" footer now shows specific MCP server names
+  - Format changed from `Used Tools: mcp` to `Used Tools: MCP (aws_knowledge, context7)`
+  - Groups multiple MCP servers under single "MCP" label
+  - Extracts server_label from `response.output_item.done` events for accurate attribution
+
+#### Fixed
+- **Citation Display**: Fixed MCP citations rendering as emoji + backend strings in Slack messages
+- **Tool Attribution Accuracy**: Now correctly identifies which MCP servers were invoked during a response
+
 ## [2.3.0] - 2025-01-15
 
 ### 🚀 Feature - GPT-5.1 Model Support & Performance Optimizations

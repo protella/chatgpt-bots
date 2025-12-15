@@ -8,6 +8,7 @@ from slack_sdk.errors import SlackApiError
 
 from base_client import Message, Response
 from config import config
+from slack_client.utilities import strip_citations
 
 
 class SlackMessagingMixin:
@@ -146,6 +147,8 @@ class SlackMessagingMixin:
     async def send_message(self, channel_id: str, thread_id: str, text: str) -> bool:
         """Send a text message to Slack, splitting if needed"""
         try:
+            # Strip MCP citations from text before sending to Slack
+            text = strip_citations(text)
             # Format text for Slack
             formatted_text = self.format_text(text)
             
@@ -209,6 +212,8 @@ class SlackMessagingMixin:
     async def send_message_get_ts(self, channel_id: str, thread_id: str, text: str) -> Dict:
         """Send a message and return the response including timestamp"""
         try:
+            # Strip MCP citations from text before sending to Slack
+            text = strip_citations(text)
             # Format text for Slack
             formatted_text = self.format_text(text)
             
@@ -282,6 +287,8 @@ class SlackMessagingMixin:
     async def update_message(self, channel_id: str, message_id: str, text: str) -> bool:
         """Update a message in Slack"""
         try:
+            # Strip MCP citations from text before sending to Slack
+            text = strip_citations(text)
             await self.app.client.chat_update(
                 channel=channel_id,
                 ts=message_id,
@@ -421,6 +428,10 @@ class SlackMessagingMixin:
     async def update_message_streaming(self, channel_id: str, message_id: str, text: str) -> Dict:
         """Updates a message with rate limit awareness"""
         try:
+            # Strip MCP citations from text before sending to Slack
+            # This is the single point of control for all streaming updates
+            text = strip_citations(text)
+
             # For messages that already contain Slack mrkdwn (like enhanced prompts with _italics_),
             # skip the markdown conversion to avoid double-processing
             if text.startswith("✨") or text.startswith("*Enhanced Prompt:*") or text.startswith("Enhancing your prompt:"):
