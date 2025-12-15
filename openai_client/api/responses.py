@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from config import config
 from prompts import IMAGE_INTENT_SYSTEM_PROMPT
-from slack_client.utilities import strip_citations
+
 
 async def create_text_response(
     self,
@@ -114,7 +114,7 @@ async def create_text_response(
                     for content in item.content:
                         if hasattr(content, "text"):
                             output_text += content.text
-        
+
         self.log_info(f"Generated response: {len(output_text)} chars")
         return output_text
         
@@ -216,7 +216,11 @@ async def create_text_response_with_tools(
                 # Check for tool usage by examining output item types
                 item_type = getattr(item, "type", None)
                 if item_type == "mcp_call":
-                    if "mcp" not in tools_actually_used:
+                    # Extract MCP server label for attribution
+                    server_label = getattr(item, "server_label", None)
+                    if server_label and server_label not in tools_actually_used:
+                        tools_actually_used.append(server_label)
+                    elif not server_label and "mcp" not in tools_actually_used:
                         tools_actually_used.append("mcp")
                 elif item_type == "web_search_call":
                     if "web_search" not in tools_actually_used:
@@ -379,13 +383,9 @@ async def create_streaming_response(
                     
                     # If we found text, process it
                     if text_chunk:
-                        # Strip MCP citations from chunk before sending to avoid sending emojis/backend strings
-                        # Note: Citations spanning multiple chunks may partially render, but final text is cleaned
-                        cleaned_chunk = strip_citations(text_chunk)
-                        complete_text += cleaned_chunk
-                        # Call the callback with the cleaned text chunk
+                        complete_text += text_chunk
                         try:
-                            result = stream_callback(cleaned_chunk)
+                            result = stream_callback(text_chunk)
                             # If the callback returns a coroutine, await it
                             if hasattr(result, '__await__'):
                                 await result
@@ -393,7 +393,21 @@ async def create_streaming_response(
                             self.log_warning(f"Stream callback error: {callback_error}")
                     continue
                 elif event_type == "response.output_item.done":
-                    continue  # Skip without logging
+                    # Extract MCP server_label from completed items for attribution
+                    if tool_callback and hasattr(event, 'item'):
+                        item = event.item
+                        item_type = getattr(item, 'type', None)
+                        if item_type == 'mcp_call':
+                            server_label = getattr(item, 'server_label', None)
+                            if server_label:
+                                tool_id = f"mcp:{server_label}"
+                                try:
+                                    result = tool_callback(tool_id, "completed")
+                                    if result and hasattr(result, '__await__'):
+                                        await result
+                                except Exception as e:
+                                    self.log_warning(f"Tool callback error for MCP completion: {e}")
+                    continue
                 elif event_type in ["response.done", "response.completed"]:
                     self.log_info("Stream completed")
                     # Signal the callback that streaming is complete with None
@@ -434,9 +448,14 @@ async def create_streaming_response(
                             elif event_type == "response.mcp_list_tools.completed":
                                 result = tool_callback("mcp", "tools_discovered")
                             elif event_type == "response.mcp_call.in_progress":
-                                result = tool_callback("mcp", "calling")
+                                # Extract server_label for attribution (e.g., "context7", "aws_knowledge")
+                                server_label = getattr(event, "server_label", None)
+                                tool_id = f"mcp:{server_label}" if server_label else "mcp"
+                                result = tool_callback(tool_id, "calling")
                             elif event_type == "response.mcp_call.completed":
-                                result = tool_callback("mcp", "completed")
+                                server_label = getattr(event, "server_label", None)
+                                tool_id = f"mcp:{server_label}" if server_label else "mcp"
+                                result = tool_callback(tool_id, "completed")
 
                             # If the tool callback returns a coroutine, await it
                             if result and hasattr(result, '__await__'):
@@ -454,7 +473,6 @@ async def create_streaming_response(
                 self.log_warning(f"Error processing stream event: {event_error}")
                 continue
 
-        # Citations already stripped per-chunk during streaming
         self.log_info(f"Generated streaming response: {len(complete_text)} chars")
         return complete_text
         
@@ -599,13 +617,9 @@ async def create_streaming_response_with_tools(
                     
                     # If we found text, process it
                     if text_chunk:
-                        # Strip MCP citations from chunk before sending to avoid sending emojis/backend strings
-                        # Note: Citations spanning multiple chunks may partially render, but final text is cleaned
-                        cleaned_chunk = strip_citations(text_chunk)
-                        complete_text += cleaned_chunk
-                        # Call the callback with the cleaned text chunk
+                        complete_text += text_chunk
                         try:
-                            result = stream_callback(cleaned_chunk)
+                            result = stream_callback(text_chunk)
                             # If the callback returns a coroutine, await it
                             if hasattr(result, '__await__'):
                                 await result
@@ -613,7 +627,21 @@ async def create_streaming_response_with_tools(
                             self.log_warning(f"Stream callback error: {callback_error}")
                     continue
                 elif event_type == "response.output_item.done":
-                    continue  # Skip without logging
+                    # Extract MCP server_label from completed items for attribution
+                    if tool_callback and hasattr(event, 'item'):
+                        item = event.item
+                        item_type = getattr(item, 'type', None)
+                        if item_type == 'mcp_call':
+                            server_label = getattr(item, 'server_label', None)
+                            if server_label:
+                                tool_id = f"mcp:{server_label}"
+                                try:
+                                    result = tool_callback(tool_id, "completed")
+                                    if result and hasattr(result, '__await__'):
+                                        await result
+                                except Exception as e:
+                                    self.log_warning(f"Tool callback error for MCP completion: {e}")
+                    continue
                 elif event_type in ["response.done", "response.completed"]:
                     self.log_info("Stream completed")
                     # Signal the callback that streaming is complete with None
@@ -654,9 +682,14 @@ async def create_streaming_response_with_tools(
                             elif event_type == "response.mcp_list_tools.completed":
                                 result = tool_callback("mcp", "tools_discovered")
                             elif event_type == "response.mcp_call.in_progress":
-                                result = tool_callback("mcp", "calling")
+                                # Extract server_label for attribution (e.g., "context7", "aws_knowledge")
+                                server_label = getattr(event, "server_label", None)
+                                tool_id = f"mcp:{server_label}" if server_label else "mcp"
+                                result = tool_callback(tool_id, "calling")
                             elif event_type == "response.mcp_call.completed":
-                                result = tool_callback("mcp", "completed")
+                                server_label = getattr(event, "server_label", None)
+                                tool_id = f"mcp:{server_label}" if server_label else "mcp"
+                                result = tool_callback(tool_id, "completed")
 
                             # If the tool callback returns a coroutine, await it
                             if result and hasattr(result, '__await__'):
@@ -674,7 +707,6 @@ async def create_streaming_response_with_tools(
                 self.log_warning(f"Error processing stream event: {event_error}")
                 continue
 
-        # Citations already stripped per-chunk during streaming
         self.log_info(f"Generated streaming response with tools: {len(complete_text)} chars")
         return complete_text
         
@@ -1125,7 +1157,11 @@ async def _create_text_response_with_tools_with_timeout(
                 # Check for tool usage by examining output item types
                 item_type = getattr(item, "type", None)
                 if item_type == "mcp_call":
-                    if "mcp" not in tools_actually_used:
+                    # Extract MCP server label for attribution
+                    server_label = getattr(item, "server_label", None)
+                    if server_label and server_label not in tools_actually_used:
+                        tools_actually_used.append(server_label)
+                    elif not server_label and "mcp" not in tools_actually_used:
                         tools_actually_used.append("mcp")
                 elif item_type == "web_search_call":
                     if "web_search" not in tools_actually_used:
