@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2] - 2025-12-15
+
+### 🐛 Bug Fix - Streaming Blank Message & Pagination Orphan
+
+#### Fixed
+- **Vision Streaming Blank Updates**: Fixed race condition causing messages to briefly go blank during streaming
+  - Root cause: `progress_task.cancel()` only requests cancellation, takes effect at next await point
+  - Without awaiting, progress_task could overwrite streamed content with stale text
+  - Now properly awaits cancellation before proceeding with streaming updates
+- **Vision Pagination Orphan**: Fixed "Continued in next message..." appearing without Part 2
+  - Vision handler had no overflow/pagination logic
+  - Added full overflow handling matching text.py pattern with intelligent split points
+- **Async Callback Support for Vision**: Added async callback support to vision API
+  - Vision streaming callbacks can now properly await async operations
+  - Matches pattern already used in responses.py for text streaming
+
+#### Changed
+- **Safety Margin Increase**: Increased overflow detection margin from 330 to 600 chars
+  - Ensures overflow triggers before messaging layer's backup truncation at 3700 chars
+  - Prevents orphaned "continued" messages from backup truncation
+
 ## [2.3.1] - 2025-12-15
 
 ### 🔧 Improvements - MCP Citation Stripping & Tool Attribution
