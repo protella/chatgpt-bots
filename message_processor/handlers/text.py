@@ -336,6 +336,10 @@ class TextHandlerMixin:
                 # Cancel progress updater when tools start (web search takes over status)
                 if progress_task and not progress_task.done():
                     progress_task.cancel()
+                    try:
+                        await progress_task
+                    except asyncio.CancelledError:
+                        pass
                     self.log_debug("Cancelled progress updater - tool started")
 
                 # Tool just started - update status with appropriate emoji
@@ -390,6 +394,10 @@ class TextHandlerMixin:
 
                 if progress_task and not progress_task.done():
                     progress_task.cancel()
+                    try:
+                        await progress_task
+                    except asyncio.CancelledError:
+                        pass
                     self.log_debug("Cancelled progress updater - MCP tool started")
 
                 if status == "discovering_tools" and not tool_states["mcp"]:
@@ -422,10 +430,12 @@ class TextHandlerMixin:
         current_part = 1
         overflow_buffer = ""
         continuation_msg = "\n\n*Continued in next message...*"
-        # Reserve space for: continuation msg, part prefix (~30), tools attribution (~100), markdown expansion (~200)
-        # This prevents silent truncation in update_message_streaming which has a hard limit at 3700 chars
-        safety_margin = len(continuation_msg) + 330
-        message_char_limit = 3700 - safety_margin  # Approximately 3335 chars
+        # Reserve space for: continuation msg (~40), part prefix (~30), tools attribution (~100), markdown expansion (~400)
+        # CRITICAL: The messaging layer (update_message_streaming) has a backup truncation at 3700 chars
+        # that adds "continued" but doesn't create Part 2. We must trigger overflow BEFORE that.
+        # Markdown conversion can significantly expand text (links, formatting), so we use a large margin.
+        safety_margin = len(continuation_msg) + 600
+        message_char_limit = 3700 - safety_margin  # Approximately 3060 chars - ensures overflow before messaging truncation
         streaming_aborted = False  # Track if we had to abort streaming due to failures
 
         # Start progress updater task (will be cancelled when streaming starts)
@@ -446,6 +456,13 @@ class TextHandlerMixin:
                 first_chunk_received = True
                 if progress_task and not progress_task.done():
                     progress_task.cancel()
+                    # IMPORTANT: Await the cancellation to prevent race condition where
+                    # progress_task completes an update_message_streaming call after cancel
+                    # is requested but before it takes effect, overwriting streamed content
+                    try:
+                        await progress_task
+                    except asyncio.CancelledError:
+                        pass
                     self.log_debug("Cancelled progress updater - streaming started")
             
             # Check if this is the completion signal (None)

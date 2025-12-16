@@ -191,7 +191,11 @@ async def analyze_images(
                         if text_chunk:
                             output_text += text_chunk
                             if stream_callback:
-                                stream_callback(text_chunk)
+                                # Support both sync and async callbacks
+                                result = stream_callback(text_chunk)
+                                # If the callback returns a coroutine, await it
+                                if hasattr(result, '__await__'):
+                                    await result
                         continue
                     elif event_type == "response.output_item.done":
                         continue
@@ -199,7 +203,11 @@ async def analyze_images(
                         self.log_debug("Vision stream completed")
                         if stream_callback:
                             try:
-                                stream_callback(None)
+                                # Support both sync and async callbacks
+                                result = stream_callback(None)
+                                # If the callback returns a coroutine, await it
+                                if hasattr(result, '__await__'):
+                                    await result
                             except Exception as callback_error:
                                 self.log_warning(f"Stream completion callback error: {callback_error}")
                         break
