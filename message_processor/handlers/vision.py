@@ -187,14 +187,15 @@ class VisionHandlerMixin:
                 # Stream the vision analysis response
                 from streaming.buffer import StreamingBuffer
                 from streaming import RateLimitManager
-                
+                from streaming.fence_handler import FenceHandler
+
                 streaming_config = client.get_streaming_config() if hasattr(client, 'get_streaming_config') else {}
                 buffer = StreamingBuffer(
                     update_interval=streaming_config.get("update_interval", 2.0),
                     buffer_size_threshold=streaming_config.get("buffer_size", 500),
                     min_update_interval=streaming_config.get("min_interval", 1.0)
                 )
-                
+
                 rate_limiter = RateLimitManager(
                     base_interval=streaming_config.get("update_interval", 2.0),
                     min_interval=streaming_config.get("min_interval", 1.0),
@@ -202,65 +203,186 @@ class VisionHandlerMixin:
                     failure_threshold=streaming_config.get("circuit_breaker_threshold", 5),
                     cooldown_seconds=streaming_config.get("circuit_breaker_cooldown", 300)
                 )
-                
-                message_id = thinking_id  # Start with the thinking message
+
+                # Track current streaming message and overflow
+                current_message_id = thinking_id
+                current_part = 1
+                continuation_msg = "\n\n*Continued in next message...*"
+                # Reserve space for: continuation msg (~40), part prefix (~30), markdown expansion (~400)
+                # CRITICAL: Must trigger overflow BEFORE messaging layer's backup truncation at 3700 chars
+                safety_margin = len(continuation_msg) + 600
+                message_char_limit = 3700 - safety_margin  # ~3060 chars
+                streaming_aborted = False
 
                 # Start progress updater task (will be cancelled when streaming starts)
                 progress_task = None
                 first_chunk_received = False
 
-                def stream_callback(chunk: str):
-                    nonlocal message_id, progress_task, first_chunk_received
+                async def stream_callback(chunk: str):
+                    nonlocal current_message_id, current_part, progress_task, first_chunk_received, streaming_aborted
+
+                    # If we've aborted, ignore further chunks
+                    if streaming_aborted:
+                        return
 
                     # Cancel progress updater on first real chunk
                     if not first_chunk_received and chunk is not None:
                         first_chunk_received = True
                         if progress_task and not progress_task.done():
-                            # Note: We're in a sync callback, so we can't await cancel
-                            # The task will be cancelled from the async context below
-                            pass
+                            progress_task.cancel()
+                            # IMPORTANT: Await the cancellation to prevent race condition
+                            try:
+                                await progress_task
+                            except asyncio.CancelledError:
+                                pass
+                            self.log_debug("Cancelled progress updater - vision streaming started")
+
                     # Handle completion signal (None chunk)
                     if chunk is None:
                         # Final update without loading indicator
-                        if message_id:
+                        if current_message_id and buffer.has_pending_update():
                             final_text = buffer.get_complete_text()
-                            self._update_message_streaming_sync(client, channel_id, message_id, final_text)
+                            # Preserve part number prefix for overflow messages
+                            if current_part > 1:
+                                final_text = f"*Part {current_part} (continued)*\n\n{final_text}"
+                            try:
+                                await client.update_message_streaming(channel_id, current_message_id, final_text)
+                            except Exception as e:
+                                self.log_error(f"Error updating final vision text: {e}")
                         return
-                    
+
+                    if not chunk:
+                        return
+
                     buffer.add_chunk(chunk)
-                    
+
                     # Only update if both buffer says it's time AND rate limiter allows it
                     if buffer.should_update() and rate_limiter.can_make_request():
                         rate_limiter.record_request_attempt()
-                        
-                        # Build display text with loading indicator
-                        display_text = buffer.get_complete_text() + " " + config.loading_ellipse_emoji
-                        
-                        # Try to update the message
-                        result = self._update_message_streaming_sync(client, channel_id, message_id, display_text)
-                        
-                        if result["success"]:
-                            rate_limiter.record_success()
-                            buffer.mark_updated()
-                            buffer.update_interval_setting(rate_limiter.get_current_interval())
-                        else:
-                            if result["rate_limited"]:
-                                # Handle rate limit response
-                                if result["retry_after"]:
-                                    rate_limiter.set_retry_after(result["retry_after"])
-                                rate_limiter.record_failure(is_rate_limit=True)
-                                
-                                # Check if we should fall back to non-streaming
-                                if not rate_limiter.is_streaming_enabled():
-                                    self.log_warning("Vision streaming circuit breaker opened")
+
+                        # Check if we need to overflow based on RAW text
+                        raw_text = buffer.get_complete_text()
+
+                        if len(raw_text) > message_char_limit:
+                            # Find a good split point - look for paragraph or sentence breaks
+                            search_start = max(0, message_char_limit - 500)
+
+                            # Priority 1: paragraph break
+                            double_newline = raw_text.rfind('\n\n', search_start, message_char_limit)
+                            if double_newline > 0:
+                                split_point = double_newline + 2
                             else:
-                                rate_limiter.record_failure(is_rate_limit=False)
-                            self.log_debug(f"Failed to update message: {result.get('error', 'unknown error')}")
+                                # Priority 2: end of sentence
+                                last_period = raw_text.rfind('. ', search_start, message_char_limit)
+                                if last_period > 0:
+                                    split_point = last_period + 2
+                                else:
+                                    # Priority 3: single newline
+                                    last_newline = raw_text.rfind('\n', search_start, message_char_limit)
+                                    if last_newline > 0:
+                                        split_point = last_newline + 1
+                                    else:
+                                        # Priority 4: word boundary
+                                        last_space = raw_text.rfind(' ', search_start, message_char_limit)
+                                        if last_space > 0:
+                                            split_point = last_space + 1
+                                        else:
+                                            split_point = message_char_limit
+
+                            # Split the raw text
+                            first_part_raw = raw_text[:split_point]
+                            overflow_raw = raw_text[split_point:]
+
+                            # Check if splitting inside a code block
+                            fence_handler_temp = FenceHandler()
+                            fence_handler_temp.update_text(first_part_raw)
+                            was_in_code_block = fence_handler_temp.is_in_code_block()
+                            language_hint = fence_handler_temp.get_current_language_hint()
+
+                            # Get display-safe version (closed fences if needed)
+                            first_part_display = fence_handler_temp.get_display_safe_text()
+
+                            # Update current message with continuation indicator
+                            final_first_part = f"{first_part_display}{continuation_msg}"
+                            try:
+                                result = await client.update_message_streaming(channel_id, current_message_id, final_first_part)
+                                if not result["success"]:
+                                    self.log_warning(f"Overflow update failed: {result.get('error', 'Unknown')} - retrying")
+                                    await asyncio.sleep(1.0)
+                                    result = await client.update_message_streaming(channel_id, current_message_id, final_first_part)
+                                    if not result["success"]:
+                                        self.log_error(f"Overflow retry failed - stopping stream")
+                                        streaming_aborted = True
+                                        return
+
+                                if result["success"]:
+                                    # Prepare overflow text with proper fence opening if needed
+                                    if was_in_code_block:
+                                        lang_str = language_hint if language_hint else ""
+                                        overflow_with_fence = f"```{lang_str}\n{overflow_raw}"
+                                    else:
+                                        overflow_with_fence = overflow_raw
+
+                                    # Post a new message for overflow
+                                    current_part += 1
+
+                                    # Create new fence handler for continuation
+                                    fence_handler_cont = FenceHandler()
+                                    fence_handler_cont.update_text(overflow_with_fence)
+                                    continuation_display = fence_handler_cont.get_display_safe_text()
+
+                                    continuation_text = f"*Part {current_part} (continued)*\n\n{continuation_display} {config.loading_ellipse_emoji}"
+
+                                    # Send new message and get its ID
+                                    new_msg_result = await client.send_message_get_ts(channel_id, thinking_id, continuation_text)
+                                    if new_msg_result and new_msg_result.get("success") and "ts" in new_msg_result:
+                                        current_message_id = new_msg_result["ts"]
+                                        buffer.reset()
+                                        buffer.add_chunk(overflow_with_fence)
+                                        buffer.mark_updated()
+                                        self.log_info(f"Created vision overflow part {current_part}")
+                                    else:
+                                        self.log_warning(f"Could not get message ID for overflow - continuing with current message")
+                                        buffer.reset()
+                                        buffer.add_chunk(overflow_with_fence)
+                                        buffer.mark_updated()
+                            except Exception as e:
+                                self.log_error(f"Error handling vision overflow: {e}")
+                        else:
+                            # Normal update - get display-safe text
+                            display_text = buffer.get_display_text()
+
+                            # Preserve part number prefix for overflow messages
+                            if current_part > 1:
+                                display_text_with_indicator = f"*Part {current_part} (continued)*\n\n{display_text} {config.loading_ellipse_emoji}"
+                            else:
+                                display_text_with_indicator = f"{display_text} {config.loading_ellipse_emoji}"
+
+                            # Try to update the message
+                            try:
+                                result = await client.update_message_streaming(channel_id, current_message_id, display_text_with_indicator)
+
+                                if result["success"]:
+                                    rate_limiter.record_success()
+                                    buffer.mark_updated()
+                                    buffer.update_interval_setting(rate_limiter.get_current_interval())
+                                else:
+                                    if result["rate_limited"]:
+                                        if result["retry_after"]:
+                                            rate_limiter.set_retry_after(result["retry_after"])
+                                        rate_limiter.record_failure(is_rate_limit=True)
+                                        if not rate_limiter.is_streaming_enabled():
+                                            self.log_warning("Vision streaming circuit breaker opened")
+                                    else:
+                                        rate_limiter.record_failure(is_rate_limit=False)
+                                    self.log_debug(f"Failed to update message: {result.get('error', 'unknown error')}")
+                            except Exception as e:
+                                self.log_error(f"Error updating vision streaming message: {e}")
 
                 # Start progress updater before making API call
                 try:
                     progress_task = await self._start_progress_updater_async(
-                        client, channel_id, message_id, "image analysis", emoji=config.analyze_emoji
+                        client, channel_id, current_message_id, "image analysis", emoji=config.analyze_emoji
                     )
                     self.log_debug("Started progress updater for vision analysis")
                 except Exception as e:
