@@ -36,7 +36,10 @@ def mock_env(monkeypatch):
         'STREAMING_CIRCUIT_BREAKER_THRESHOLD': '5',
         'API_TIMEOUT_READ': '180',
         'API_TIMEOUT_STREAMING_CHUNK': '30',
-        'LOG_LEVEL': 'DEBUG'
+        'LOG_LEVEL': 'DEBUG',
+        # Image generation settings
+        'DEFAULT_IMAGE_QUALITY': 'medium',
+        'DEFAULT_IMAGE_BACKGROUND': 'auto',
     }
     for key, value in test_env.items():
         monkeypatch.setenv(key, value)

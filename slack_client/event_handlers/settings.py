@@ -795,6 +795,8 @@ class SlackSettingsHandlersMixin:
         @self.app.action("input_fidelity")
         @self.app.action("vision_detail")
         @self.app.action("image_size")
+        @self.app.action("image_quality")
+        @self.app.action("image_background")
         async def handle_modal_actions(ack):
             """Acknowledge modal actions that don't need processing"""
             await ack()  # Just acknowledge - values are captured on submission

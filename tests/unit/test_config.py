@@ -89,7 +89,8 @@ class TestBotConfig:
         assert thread_config["verbosity"] == '2'
         assert thread_config["enable_streaming"] is True
         assert thread_config["image_size"] == "1024x1024"
-        assert thread_config["image_quality"] == "hd"
+        assert thread_config["image_quality"] == "medium"
+        assert thread_config["image_background"] == "auto"
     
     def test_get_thread_config_with_overrides(self, mock_env):
         """Test get_thread_config with overrides"""
@@ -136,8 +137,8 @@ class TestBotConfig:
         """Test image generation parameters"""
         config = BotConfig()
         assert config.default_image_size == "1024x1024"
-        assert config.default_image_quality == "hd"
-        assert config.default_image_style == "natural"
+        assert config.default_image_quality == "medium"  # low, medium, high
+        assert config.default_image_background == "auto"  # auto, transparent, opaque
         assert config.default_image_number == 1
         assert config.default_image_format == "png"
     

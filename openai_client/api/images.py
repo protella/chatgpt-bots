@@ -21,14 +21,28 @@ async def generate_image(
     enhance_prompt: bool = True,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> ImageData:
-    """Generate an image using GPT-Image-1 model."""
+    """Generate an image using gpt-image-1.5 model.
 
+    Args:
+        client: OpenAI client instance
+        prompt: Text description of the image to generate
+        size: Image dimensions (1024x1024, 1024x1536, 1536x1024, auto)
+        quality: Rendering quality (low, medium, high) - affects cost and detail
+        background: Background type (auto, transparent, opaque)
+        format: Output format (png, jpeg, webp)
+        compression: Compression level for jpeg/webp (0-100)
+        enhance_prompt: Whether to enhance the prompt with AI
+        conversation_history: Previous messages for context
+
+    Returns:
+        ImageData with base64 encoded image
+    """
     self = client
-    # Default size for gpt-image-1
-    size = size or config.default_image_size
 
-    # Quality parameter is not used by gpt-image-1
-    # Reserved for future DALL-E 3 support
+    # Apply defaults from config
+    size = size or config.default_image_size
+    quality = quality or config.default_image_quality
+    background = background or config.default_image_background
 
     # Enhance prompt if requested
     enhanced_prompt = prompt
@@ -39,24 +53,14 @@ async def generate_image(
 
     try:
         # Build parameters for images.generate
-        # Default to gpt-image-1 parameters
         params = {
-            "model": config.image_model,  # gpt-image-1
-            "prompt": enhanced_prompt,  # Use the enhanced prompt
-            "n": 1,  # Number of images to generate
+            "model": config.image_model,
+            "prompt": enhanced_prompt,
+            "n": 1,
+            "size": size,
+            "quality": quality,
+            "background": background,
         }
-
-        # Add size if specified (gpt-image-1 supports size)
-        if size:
-            params["size"] = size
-
-        # Note: gpt-image-1 doesn't support response_format or quality parameters
-        # It returns URLs that we'll download and convert to base64
-
-        # Future: When adding DALL-E 3 support, check model and add:
-        # - response_format="b64_json"
-        # - quality parameter
-        # - style parameter
 
         # Use the images.generate API for image generation
         response = await self._safe_api_call(
@@ -370,7 +374,7 @@ async def edit_image(
     enhance_prompt: bool = True,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> ImageData:
-    """Edit or combine images using GPT-Image-1 model."""
+    """Edit or combine images using gpt-image-1.5 model."""
 
     self = client
     # Limit to 16 images

@@ -70,12 +70,11 @@ class BotConfig:
     analysis_verbosity: str = field(default_factory=lambda: os.getenv("ANALYSIS_VERBOSITY", "medium"))
     vision_max_tokens: int = field(default_factory=lambda: int(os.getenv("VISION_MAX_TOKENS", "8192")))
     
-    # Image generation parameters
+    # Image generation parameters (gpt-image-1.5)
     default_image_size: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_SIZE", "1024x1024"))
-    default_image_quality: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_QUALITY", "hd"))  # standard or hd
-    default_image_style: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_STYLE", "natural"))  # natural or vivid
+    default_image_quality: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_QUALITY", "medium"))  # low, medium, high
+    default_image_background: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_BACKGROUND", "auto"))  # transparent, opaque, auto
     default_image_number: int = field(default_factory=lambda: int(os.getenv("DEFAULT_IMAGE_NUMBER", "1")))  # Number of images
-    default_image_background: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_BACKGROUND", "auto"))
     default_image_format: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_FORMAT", "png"))
     default_image_compression: int = field(default_factory=lambda: int(os.getenv("DEFAULT_IMAGE_COMPRESSION", "100")))  # 100 for PNG, can be less for JPEG/WebP
     default_input_fidelity: str = field(default_factory=lambda: os.getenv("DEFAULT_INPUT_FIDELITY", "high"))  # high or low
@@ -223,9 +222,8 @@ class BotConfig:
             "image_model": self.image_model,
             "image_size": self.default_image_size,
             "image_quality": self.default_image_quality,
-            "image_style": self.default_image_style,
-            "image_number": self.default_image_number,
             "image_background": self.default_image_background,
+            "image_number": self.default_image_number,
             "image_format": self.default_image_format,
             "image_compression": self.default_image_compression,
             "input_fidelity": self.default_input_fidelity,
