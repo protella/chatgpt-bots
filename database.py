@@ -202,7 +202,7 @@ class DatabaseManager(LoggerMixin):
 
                 -- Image settings
                 image_size TEXT DEFAULT '1024x1024',
-                image_quality TEXT DEFAULT 'medium',
+                image_quality TEXT DEFAULT 'auto',
                 image_background TEXT DEFAULT 'auto',
                 input_fidelity TEXT DEFAULT 'high',
                 vision_detail TEXT DEFAULT 'auto',
@@ -349,7 +349,7 @@ class DatabaseManager(LoggerMixin):
                         
                         -- Image settings
                         image_size TEXT DEFAULT '1024x1024',
-                        image_quality TEXT DEFAULT 'medium',
+                        image_quality TEXT DEFAULT 'auto',
                         image_background TEXT DEFAULT 'auto',
                         input_fidelity TEXT DEFAULT 'high',
                         vision_detail TEXT DEFAULT 'auto',
@@ -377,7 +377,7 @@ class DatabaseManager(LoggerMixin):
                 self.log_info("DB: Adding image_quality column to user_preferences table")
                 self.conn.execute("""
                     ALTER TABLE user_preferences
-                    ADD COLUMN image_quality TEXT DEFAULT 'medium'
+                    ADD COLUMN image_quality TEXT DEFAULT 'auto'
                 """)
                 self.conn.commit()
                 self.log_info("DB: Successfully added image_quality column")

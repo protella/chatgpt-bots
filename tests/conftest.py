@@ -38,7 +38,7 @@ def mock_env(monkeypatch):
         'API_TIMEOUT_STREAMING_CHUNK': '30',
         'LOG_LEVEL': 'DEBUG',
         # Image generation settings
-        'DEFAULT_IMAGE_QUALITY': 'medium',
+        'DEFAULT_IMAGE_QUALITY': 'auto',
         'DEFAULT_IMAGE_BACKGROUND': 'auto',
     }
     for key, value in test_env.items():
