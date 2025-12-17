@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.4] - 2025-12-16
+
+### 🔧 Improvement - Image Quality Auto Option
+
+#### Changed
+- **Auto Quality Default**: Added 'auto' option for image quality and set as new default
+  - Lets the model decide quality level based on prompt complexity
+  - Available options now: auto, low, medium, high
+
+## [2.3.3] - 2025-12-16
+
+### 🚀 Feature - Image Quality & Background Settings
+
+#### Added
+- **Image Quality Setting**: User-configurable quality for image generation
+  - Options: Auto, Low (faster/cheaper), Medium (balanced), High (best quality)
+  - Exposed in `/chatgpt-settings` modal under Image Generation
+- **Image Background Setting**: User-configurable background type
+  - Options: Auto, Transparent, Opaque
+  - Exposed in `/chatgpt-settings` modal under Image Generation
+- **Database Migrations**: Automatic schema updates for existing users
+  - New columns added with smart defaults on bot startup
+  - No manual intervention required
+
+#### Changed
+- **Default Image Model**: Updated to `gpt-image-1.5` in `.env.example`
+- **Documentation**: Updated README with GPT-5.2 model references
+
+#### Removed
+- **Deprecated Settings**: Removed `image_style` parameter (was DALL-E 3 only)
+
 ## [2.3.2] - 2025-12-15
 
 ### 🐛 Bug Fix - Streaming Blank Message & Pagination Orphan
