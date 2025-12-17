@@ -824,10 +824,11 @@ class SettingsModal(LoggerMixin):
                 "action_id": "image_quality",
                 "placeholder": {"type": "plain_text", "text": "Select quality"},
                 "initial_option": {
-                    "text": {"type": "plain_text", "text": self._get_image_quality_display(settings.get('image_quality', 'medium'))},
-                    "value": settings.get('image_quality', 'medium')
+                    "text": {"type": "plain_text", "text": self._get_image_quality_display(settings.get('image_quality', 'auto'))},
+                    "value": settings.get('image_quality', 'auto')
                 },
                 "options": [
+                    {"text": {"type": "plain_text", "text": "Auto"}, "value": "auto"},
                     {"text": {"type": "plain_text", "text": "Low (Faster, cheaper)"}, "value": "low"},
                     {"text": {"type": "plain_text", "text": "Medium (Balanced)"}, "value": "medium"},
                     {"text": {"type": "plain_text", "text": "High (Best quality)"}, "value": "high"}
@@ -1167,11 +1168,12 @@ class SettingsModal(LoggerMixin):
     def _get_image_quality_display(self, quality: str) -> str:
         """Get display name for image quality"""
         displays = {
+            'auto': 'Auto',
             'low': 'Low (Faster, cheaper)',
             'medium': 'Medium (Balanced)',
             'high': 'High (Best quality)'
         }
-        return displays.get(quality, 'Medium (Balanced)')
+        return displays.get(quality, 'Auto')
 
     def _get_image_background_display(self, background: str) -> str:
         """Get display name for image background"""
