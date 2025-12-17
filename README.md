@@ -13,6 +13,14 @@ For a detailed list of recent changes and improvements, please see the [CHANGELO
 ### ⚠️ Important: Timeout Configuration Update
 **Breaking change for streaming responses:** The timeout behavior has been updated to improve reliability. If you previously had `API_TIMEOUT_STREAMING_CHUNK` set to a low value (e.g., 30 seconds), you must increase it to at least 270 seconds to avoid premature stream termination. Check the updated `.env.example` for recommended values and update your `.env` file accordingly. Low timeout values will cause responses to drop mid-stream.
 
+### ⚠️ Important: Image Settings Update (v2.3.4)
+**Breaking change for image generation:** The image model has been updated to `gpt-image-1.5` which uses different quality values. If you have `DEFAULT_IMAGE_QUALITY` set to `hd` or `standard` in your `.env`, you must update it:
+```
+DEFAULT_IMAGE_QUALITY=auto  # Valid values: auto, low, medium, high
+DEFAULT_IMAGE_BACKGROUND=auto  # Valid values: auto, transparent, opaque
+```
+The old `DEFAULT_IMAGE_STYLE` setting has been removed (was DALL-E 3 only). Old quality values will cause API errors.
+
 ## Getting Started
 
 ### Requirements
