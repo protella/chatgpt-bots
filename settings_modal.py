@@ -792,11 +792,11 @@ class SettingsModal(LoggerMixin):
             "text": {"type": "mrkdwn", "text": "*Image Generation*"}
         })
         
-        # Image size
+        # Image size (orientation)
         blocks.append({
             "type": "section",
             "block_id": "image_size_block",
-            "text": {"type": "mrkdwn", "text": "Default image size:"},
+            "text": {"type": "mrkdwn", "text": "Image orientation:"},
             "accessory": {
                 "type": "static_select",
                 "action_id": "image_size",
@@ -813,7 +813,49 @@ class SettingsModal(LoggerMixin):
                 ]
             }
         })
-        
+
+        # Image quality
+        blocks.append({
+            "type": "section",
+            "block_id": "image_quality_block",
+            "text": {"type": "mrkdwn", "text": "Image quality:"},
+            "accessory": {
+                "type": "static_select",
+                "action_id": "image_quality",
+                "placeholder": {"type": "plain_text", "text": "Select quality"},
+                "initial_option": {
+                    "text": {"type": "plain_text", "text": self._get_image_quality_display(settings.get('image_quality', 'medium'))},
+                    "value": settings.get('image_quality', 'medium')
+                },
+                "options": [
+                    {"text": {"type": "plain_text", "text": "Low (Faster, cheaper)"}, "value": "low"},
+                    {"text": {"type": "plain_text", "text": "Medium (Balanced)"}, "value": "medium"},
+                    {"text": {"type": "plain_text", "text": "High (Best quality)"}, "value": "high"}
+                ]
+            }
+        })
+
+        # Image background
+        blocks.append({
+            "type": "section",
+            "block_id": "image_background_block",
+            "text": {"type": "mrkdwn", "text": "Image background:"},
+            "accessory": {
+                "type": "static_select",
+                "action_id": "image_background",
+                "placeholder": {"type": "plain_text", "text": "Select background"},
+                "initial_option": {
+                    "text": {"type": "plain_text", "text": self._get_image_background_display(settings.get('image_background', 'auto'))},
+                    "value": settings.get('image_background', 'auto')
+                },
+                "options": [
+                    {"text": {"type": "plain_text", "text": "Auto"}, "value": "auto"},
+                    {"text": {"type": "plain_text", "text": "Transparent"}, "value": "transparent"},
+                    {"text": {"type": "plain_text", "text": "Opaque"}, "value": "opaque"}
+                ]
+            }
+        })
+
         # Input fidelity for edits
         blocks.append({
             "type": "section",
@@ -983,7 +1025,19 @@ class SettingsModal(LoggerMixin):
             selected = image_size_block['image_size'].get('selected_option')
             if selected:
                 extracted['image_size'] = selected['value']
-        
+
+        image_quality_block = values.get('image_quality_block', {})
+        if 'image_quality' in image_quality_block:
+            selected = image_quality_block['image_quality'].get('selected_option')
+            if selected:
+                extracted['image_quality'] = selected['value']
+
+        image_background_block = values.get('image_background_block', {})
+        if 'image_background' in image_background_block:
+            selected = image_background_block['image_background'].get('selected_option')
+            if selected:
+                extracted['image_background'] = selected['value']
+
         fidelity_block = values.get('input_fidelity_block', {})
         if 'input_fidelity' in fidelity_block:
             selected = fidelity_block['input_fidelity'].get('selected_option')
@@ -1105,7 +1159,25 @@ class SettingsModal(LoggerMixin):
         """Get display name for vision detail"""
         displays = {
             'auto': '🤖 Auto',
-            'low': '🔍 Low Detail', 
+            'low': '🔍 Low Detail',
             'high': '🔬 High Detail'
         }
         return displays.get(detail, '🤖 Auto')
+
+    def _get_image_quality_display(self, quality: str) -> str:
+        """Get display name for image quality"""
+        displays = {
+            'low': 'Low (Faster, cheaper)',
+            'medium': 'Medium (Balanced)',
+            'high': 'High (Best quality)'
+        }
+        return displays.get(quality, 'Medium (Balanced)')
+
+    def _get_image_background_display(self, background: str) -> str:
+        """Get display name for image background"""
+        displays = {
+            'auto': 'Auto',
+            'transparent': 'Transparent',
+            'opaque': 'Opaque'
+        }
+        return displays.get(background, 'Auto')

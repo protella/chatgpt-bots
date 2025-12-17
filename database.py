@@ -202,9 +202,11 @@ class DatabaseManager(LoggerMixin):
 
                 -- Image settings
                 image_size TEXT DEFAULT '1024x1024',
+                image_quality TEXT DEFAULT 'medium',
+                image_background TEXT DEFAULT 'auto',
                 input_fidelity TEXT DEFAULT 'high',
                 vision_detail TEXT DEFAULT 'auto',
-                
+
                 -- Metadata
                 created_at INTEGER DEFAULT (strftime('%s', 'now')),
                 updated_at INTEGER DEFAULT (strftime('%s', 'now')),
@@ -347,14 +349,16 @@ class DatabaseManager(LoggerMixin):
                         
                         -- Image settings
                         image_size TEXT DEFAULT '1024x1024',
+                        image_quality TEXT DEFAULT 'medium',
+                        image_background TEXT DEFAULT 'auto',
                         input_fidelity TEXT DEFAULT 'high',
                         vision_detail TEXT DEFAULT 'auto',
-                        
+
                         -- Metadata
                         created_at INTEGER DEFAULT (strftime('%s', 'now')),
                         updated_at INTEGER DEFAULT (strftime('%s', 'now')),
                         settings_completed BOOLEAN DEFAULT 0,
-                        
+
                         FOREIGN KEY (slack_user_id) REFERENCES users(user_id)
                     )
                 """)
@@ -364,6 +368,32 @@ class DatabaseManager(LoggerMixin):
                 """)
                 self.conn.commit()
                 self.log_info("DB: Successfully created user_preferences table")
+
+            # Check if image_quality column exists in user_preferences table
+            cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
+            columns = [col[1] for col in cursor.fetchall()]
+
+            if 'image_quality' not in columns:
+                self.log_info("DB: Adding image_quality column to user_preferences table")
+                self.conn.execute("""
+                    ALTER TABLE user_preferences
+                    ADD COLUMN image_quality TEXT DEFAULT 'medium'
+                """)
+                self.conn.commit()
+                self.log_info("DB: Successfully added image_quality column")
+
+            # Check if image_background column exists in user_preferences table
+            cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
+            columns = [col[1] for col in cursor.fetchall()]
+
+            if 'image_background' not in columns:
+                self.log_info("DB: Adding image_background column to user_preferences table")
+                self.conn.execute("""
+                    ALTER TABLE user_preferences
+                    ADD COLUMN image_background TEXT DEFAULT 'auto'
+                """)
+                self.conn.commit()
+                self.log_info("DB: Successfully added image_background column")
 
             # Check if enable_mcp column exists in user_preferences table
             cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
@@ -816,26 +846,29 @@ class DatabaseManager(LoggerMixin):
             'enable_web_search': config.enable_web_search,
             'enable_streaming': config.enable_streaming,
             'image_size': config.default_image_size,
+            'image_quality': config.default_image_quality,
+            'image_background': config.default_image_background,
             'input_fidelity': config.default_input_fidelity,
             'vision_detail': config.default_detail_level,
             'settings_completed': False
         }
-        
+
         try:
             # Insert with defaults
             self.conn.execute("""
-                INSERT INTO user_preferences 
+                INSERT INTO user_preferences
                 (slack_user_id, slack_email, model, reasoning_effort, verbosity,
                  temperature, top_p, enable_web_search, enable_streaming,
-                 image_size, input_fidelity, vision_detail, settings_completed)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 image_size, image_quality, image_background, input_fidelity, vision_detail, settings_completed)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 user_id, email, defaults['model'],
                 defaults['reasoning_effort'], defaults['verbosity'],
                 defaults['temperature'], defaults['top_p'],
                 1 if defaults['enable_web_search'] else 0,
                 1 if defaults['enable_streaming'] else 0,
-                defaults['image_size'], defaults['input_fidelity'],
+                defaults['image_size'], defaults['image_quality'],
+                defaults['image_background'], defaults['input_fidelity'],
                 defaults['vision_detail'], 0
             ))
             
@@ -863,7 +896,8 @@ class DatabaseManager(LoggerMixin):
             values = []
             
             for field in ['model', 'reasoning_effort', 'verbosity', 'temperature',
-                         'top_p', 'image_size', 'input_fidelity', 'vision_detail',
+                         'top_p', 'image_size', 'image_quality', 'image_background',
+                         'input_fidelity', 'vision_detail',
                          'slack_email', 'settings_completed', 'custom_instructions']:
                 if field in preferences:
                     updates.append(f"{field} = ?")
@@ -1059,7 +1093,7 @@ class DatabaseManager(LoggerMixin):
             "verbosity": config.default_verbosity,
             "image_size": config.default_image_size,
             "image_quality": config.default_image_quality,
-            "image_style": config.default_image_style,
+            "image_background": config.default_image_background,
             "input_fidelity": config.default_input_fidelity,
             "detail_level": config.default_detail_level
         }
@@ -1246,7 +1280,7 @@ class DatabaseManager(LoggerMixin):
             "verbosity": bot_config.default_verbosity,
             "image_size": bot_config.default_image_size,
             "image_quality": bot_config.default_image_quality,
-            "image_style": bot_config.default_image_style,
+            "image_background": bot_config.default_image_background,
             "input_fidelity": bot_config.default_input_fidelity,
             "detail_level": bot_config.default_detail_level
         }
@@ -1851,15 +1885,17 @@ class DatabaseManager(LoggerMixin):
                     model, temperature, top_p,
                     enable_web_search, enable_streaming,
                     reasoning_effort, verbosity,
-                    image_size, input_fidelity, vision_detail
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    image_size, image_quality, image_background,
+                    input_fidelity, vision_detail
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 user_id, email,
                 config.gpt_model, config.default_temperature, config.default_top_p,
                 1 if config.enable_web_search else 0,
                 1 if config.enable_streaming else 0,
                 config.default_reasoning_effort, config.default_verbosity,
-                config.default_image_size, config.default_input_fidelity, config.default_detail_level
+                config.default_image_size, config.default_image_quality, config.default_image_background,
+                config.default_input_fidelity, config.default_detail_level
             ))
 
             await db.commit()
@@ -1946,7 +1982,8 @@ class DatabaseManager(LoggerMixin):
 
             # Handle regular fields
             for field in ['model', 'reasoning_effort', 'verbosity', 'temperature',
-                         'top_p', 'image_size', 'input_fidelity', 'vision_detail',
+                         'top_p', 'image_size', 'image_quality', 'image_background',
+                         'input_fidelity', 'vision_detail',
                          'slack_email', 'settings_completed', 'custom_instructions']:
                 if field in preferences:
                     update_fields.append(f"{field} = ?")

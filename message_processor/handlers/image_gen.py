@@ -123,6 +123,7 @@ class ImageGenerationMixin:
                     prompt=enhanced_prompt,
                     size=thread_config.get("image_size"),
                     quality=thread_config.get("image_quality"),
+                    background=thread_config.get("image_background"),
                     enhance_prompt=False,  # Already enhanced!
                     conversation_history=None  # Not needed since we enhanced already
                 )
@@ -190,6 +191,7 @@ class ImageGenerationMixin:
                     prompt=prompt,
                     size=thread_config.get("image_size"),
                     quality=thread_config.get("image_quality"),
+                    background=thread_config.get("image_background"),
                     enhance_prompt=not skip_enhancement,  # Skip if fallback from failed edit
                     conversation_history=enhanced_messages if not skip_enhancement else None  # Only pass if enhancing
                 )
