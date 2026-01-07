@@ -25,11 +25,17 @@ class TextHandlerMixin:
         )
         
         # Check if streaming is enabled and supported (respecting user prefs)
-        # CRITICAL: Don't retry streaming if we've already failed once
+        # Allow streaming on retry if the failure was just MCP-related (not a streaming failure)
         streaming_enabled = thread_config.get('enable_streaming', config.enable_streaming)
-        if (hasattr(client, 'supports_streaming') and client.supports_streaming() and
-            streaming_enabled and thinking_id is not None and retry_count == 0):  # Streaming requires a message ID to update
-            return await self._handle_streaming_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls)
+        can_stream = (hasattr(client, 'supports_streaming') and client.supports_streaming() and
+                     streaming_enabled and thinking_id is not None)
+        # Stream on first attempt OR on MCP-failure retry (streaming itself didn't fail)
+        should_stream = can_stream and (retry_count == 0 or failed_mcp_server is not None)
+        if should_stream:
+            return await self._handle_streaming_text_response(
+                user_content, thread_state, client, message, thinking_id, attachment_urls,
+                exclude_mcp_server=failed_mcp_server
+            )
         
         # Fall back to non-streaming logic
         # For vision requests with images, store only a text breadcrumb with URLs, not the base64 data
@@ -98,7 +104,13 @@ class TextHandlerMixin:
         system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, thread_state.has_trimmed_messages, thread_config.get('custom_instructions'))
         
         # Update status before generating
-        self._update_status(client, message.channel_id, thinking_id, "Generating response...")
+        if failed_mcp_server:
+            self._update_status(client, message.channel_id, thinking_id,
+                               f"Retrying without '{failed_mcp_server}'...", emoji=config.circle_loader_emoji)
+        elif retry_count > 0:
+            self._update_status(client, message.channel_id, thinking_id, "Retrying response...", emoji=config.circle_loader_emoji)
+        else:
+            self._update_status(client, message.channel_id, thinking_id, "Generating response...")
         
         # Determine timeout based on retry attempt
         retry_timeout = 60.0 if retry_count > 0 else None
@@ -111,66 +123,88 @@ class TextHandlerMixin:
         # Exclude any MCP server that failed in a previous attempt
         tools = self._build_tools_array(thread_config, model, exclude_mcp_server=failed_mcp_server)
 
+        # Start progress updater for fallback/retry scenarios (streaming already has one)
+        # This provides the cycling status messages during long-running API calls
+        progress_task = None
+        if retry_count > 0 and thinking_id:
+            try:
+                progress_task = await self._start_progress_updater_async(
+                    client, message.channel_id, thinking_id, "retry", emoji=config.circle_loader_emoji
+                )
+                self.log_debug("Started progress updater for non-streaming retry")
+            except Exception as e:
+                self.log_warning(f"Failed to start progress updater: {e}")
+
         # Generate response with or without tools
         tools_actually_used = []  # Track which tools were actually invoked
-        if tools:
-            # Generate response with tools
-            if retry_timeout:
-                # Use shorter timeout for retry via direct _safe_api_call
-                result = await self.openai_client._create_text_response_with_tools_with_timeout(
-                    messages=messages_for_api,
-                    tools=tools,
-                    model=model,
-                    temperature=thread_config["temperature"],
-                    max_tokens=thread_config["max_tokens"],
-                    system_prompt=system_prompt,
-                    reasoning_effort=thread_config.get("reasoning_effort"),
-                    verbosity=thread_config.get("verbosity"),
-                    store=False,
-                    timeout_seconds=retry_timeout,
-                    return_metadata=True
-                )
-                response_text = result["text"]
-                tools_actually_used = result["tools_used"]
+        try:
+            if tools:
+                # Generate response with tools
+                if retry_timeout:
+                    # Use shorter timeout for retry via direct _safe_api_call
+                    result = await self.openai_client._create_text_response_with_tools_with_timeout(
+                        messages=messages_for_api,
+                        tools=tools,
+                        model=model,
+                        temperature=thread_config["temperature"],
+                        max_tokens=thread_config["max_tokens"],
+                        system_prompt=system_prompt,
+                        reasoning_effort=thread_config.get("reasoning_effort"),
+                        verbosity=thread_config.get("verbosity"),
+                        store=False,
+                        timeout_seconds=retry_timeout,
+                        return_metadata=True
+                    )
+                    response_text = result["text"]
+                    tools_actually_used = result["tools_used"]
+                else:
+                    result = await self.openai_client.create_text_response_with_tools(
+                        messages=messages_for_api,
+                        tools=tools,
+                        model=model,
+                        temperature=thread_config["temperature"],
+                        max_tokens=thread_config["max_tokens"],
+                        system_prompt=system_prompt,
+                        reasoning_effort=thread_config.get("reasoning_effort"),
+                        verbosity=thread_config.get("verbosity"),
+                        store=False,  # Match the existing behavior
+                        return_metadata=True
+                    )
+                    response_text = result["text"]
+                    tools_actually_used = result["tools_used"]
             else:
-                result = await self.openai_client.create_text_response_with_tools(
-                    messages=messages_for_api,
-                    tools=tools,
-                    model=model,
-                    temperature=thread_config["temperature"],
-                    max_tokens=thread_config["max_tokens"],
-                    system_prompt=system_prompt,
-                    reasoning_effort=thread_config.get("reasoning_effort"),
-                    verbosity=thread_config.get("verbosity"),
-                    store=False,  # Match the existing behavior
-                    return_metadata=True
-                )
-                response_text = result["text"]
-                tools_actually_used = result["tools_used"]
-        else:
-            # Generate response without tools
-            if retry_timeout:
-                # Use shorter timeout for retry via direct _safe_api_call
-                response_text = await self.openai_client._create_text_response_with_timeout(
-                    messages=messages_for_api,
-                    model=model,
-                    temperature=thread_config["temperature"],
-                    max_tokens=thread_config["max_tokens"],
-                    system_prompt=system_prompt,
-                    reasoning_effort=thread_config.get("reasoning_effort"),
-                    verbosity=thread_config.get("verbosity"),
-                    timeout_seconds=retry_timeout
-                )
-            else:
-                response_text = await self.openai_client.create_text_response(
-                    messages=messages_for_api,
-                    model=model,
-                    temperature=thread_config["temperature"],
-                    max_tokens=thread_config["max_tokens"],
-                    system_prompt=system_prompt,
-                    reasoning_effort=thread_config.get("reasoning_effort"),
-                    verbosity=thread_config.get("verbosity")
-                )
+                # Generate response without tools
+                if retry_timeout:
+                    # Use shorter timeout for retry via direct _safe_api_call
+                    response_text = await self.openai_client._create_text_response_with_timeout(
+                        messages=messages_for_api,
+                        model=model,
+                        temperature=thread_config["temperature"],
+                        max_tokens=thread_config["max_tokens"],
+                        system_prompt=system_prompt,
+                        reasoning_effort=thread_config.get("reasoning_effort"),
+                        verbosity=thread_config.get("verbosity"),
+                        timeout_seconds=retry_timeout
+                    )
+                else:
+                    response_text = await self.openai_client.create_text_response(
+                        messages=messages_for_api,
+                        model=model,
+                        temperature=thread_config["temperature"],
+                        max_tokens=thread_config["max_tokens"],
+                        system_prompt=system_prompt,
+                        reasoning_effort=thread_config.get("reasoning_effort"),
+                        verbosity=thread_config.get("verbosity")
+                    )
+        finally:
+            # Cancel progress updater when API call completes
+            if progress_task and not progress_task.done():
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
+                self.log_debug("Cancelled progress updater - API call completed")
         
         # Build unified tools attribution at the end of response
         # Use the actual tools that were invoked (from response metadata)
@@ -204,7 +238,8 @@ class TextHandlerMixin:
 
     async def _handle_streaming_text_response(self, user_content: Any, thread_state, client: BaseClient,
                                       message: Message, thinking_id: Optional[str] = None,
-                                      attachment_urls: Optional[List[str]] = None) -> Response:
+                                      attachment_urls: Optional[List[str]] = None,
+                                      exclude_mcp_server: Optional[str] = None) -> Response:
         """Handle text-only response generation with streaming support"""
         # Check if client supports streaming
         if not hasattr(client, 'supports_streaming') or not client.supports_streaming():
@@ -297,9 +332,12 @@ class TextHandlerMixin:
         system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, thread_state.has_trimmed_messages, thread_config.get('custom_instructions'))
         
         # Post an initial message to get the message ID for streaming updates
-        # For streaming with potential tools, start with "Working on it" 
+        # For streaming with potential tools, start with "Working on it"
         # (will be overridden if tools are used)
-        initial_message = f"{config.thinking_emoji} Working on it..."
+        if exclude_mcp_server:
+            initial_message = f"{config.circle_loader_emoji} Retrying without '{exclude_mcp_server}'..."
+        else:
+            initial_message = f"{config.thinking_emoji} Working on it..."
         if thinking_id:
             # Update existing thinking message
             message_id = thinking_id
@@ -772,7 +810,8 @@ class TextHandlerMixin:
             model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
 
             # Build tools array (includes web_search and/or MCP tools based on config)
-            tools = self._build_tools_array(thread_config, model)
+            # Exclude any MCP server that failed in a previous attempt
+            tools = self._build_tools_array(thread_config, model, exclude_mcp_server=exclude_mcp_server)
 
             if tools:
                 # Generate response with tools (web_search and/or MCP)
@@ -822,10 +861,18 @@ class TextHandlerMixin:
 
             # Add unified tools note at the END if any tools were used
             # This works for both paginated and non-paginated responses
-            if tools_used:
-                tools_note = f"\n\n_Used Tools: {', '.join(tools_used)}_"
+            if tools_used or exclude_mcp_server:
+                if tools_used:
+                    # Show successful tools
+                    if exclude_mcp_server:
+                        tools_note = f"\n\n_Used Tools: {', '.join(tools_used)} (failed: {exclude_mcp_server})_"
+                    else:
+                        tools_note = f"\n\n_Used Tools: {', '.join(tools_used)}_"
+                else:
+                    # Only failed MCP, no successful tools
+                    tools_note = f"\n\n_MCP server '{exclude_mcp_server}' could not be reached. Response generated without external tools._"
                 response_text = response_text + tools_note
-                self.log_info(f"Added tools attribution: {', '.join(tools_used)}")
+                self.log_info(f"Added tools attribution: {', '.join(tools_used) if tools_used else 'none'}{' with failure note' if exclude_mcp_server else ''}")
 
             # Check if streaming was aborted due to failures
             if streaming_aborted:
@@ -849,8 +896,14 @@ class TextHandlerMixin:
                     final_part_text = buffer.get_complete_text()
                     if final_part_text:
                         # Add tools attribution to the final overflow message if tools were used
-                        if tools_used:
-                            tools_note = f"\n\n_Used Tools: {', '.join(tools_used)}_"
+                        if tools_used or exclude_mcp_server:
+                            if tools_used:
+                                if exclude_mcp_server:
+                                    tools_note = f"\n\n_Used Tools: {', '.join(tools_used)} (failed: {exclude_mcp_server})_"
+                                else:
+                                    tools_note = f"\n\n_Used Tools: {', '.join(tools_used)}_"
+                            else:
+                                tools_note = f"\n\n_MCP server '{exclude_mcp_server}' could not be reached. Response generated without external tools._"
                             final_part_text = final_part_text + tools_note
                             self.log_debug(f"Added tools attribution to overflow part {current_part}")
 
@@ -938,7 +991,8 @@ class TextHandlerMixin:
             error_msg = str(e)
 
             # Check for MCP server failure in error message
-            if "MCP server" in error_msg and ("404" in error_msg or "424" in error_msg):
+            # Catch any error from MCP servers (400, 401, 403, 404, 424, 500, timeouts, etc.)
+            if "MCP server" in error_msg:
                 # Extract MCP server name from error message pattern
                 # Example: "Error retrieving tool list from MCP server: 'context7'"
                 match = re.search(r"MCP server: '([^']+)'", error_msg)
