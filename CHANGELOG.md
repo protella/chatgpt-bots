@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.5] - 2026-01-07
+
+### 🐛 Bug Fix - MCP Authentication Headers
+
+#### Fixed
+- **MCP Headers Support**: Fixed authentication not being passed to MCP servers
+  - Code was looking for `authorization` key but OpenAI expects `headers` object
+  - Now correctly passes `headers` (including `Authorization: Bearer ...`) to OpenAI API
+  - MCP servers requiring authentication will now work properly
+
+#### Changed
+- **MCP Example Config**: Updated `mcp_config.example.json` with correct format
+  - Changed from incorrect `authorization` object to proper `headers` format
+  - Simplified from ~225 lines to 39 lines with clear, copy-paste-ready examples
+  - Shows four common patterns: public server, Bearer auth, custom header, tool whitelist
+
 ## [2.3.4] - 2025-12-16
 
 ### 🔧 Improvement - Image Quality Auto Option
