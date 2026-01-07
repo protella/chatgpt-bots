@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.6] - 2026-01-07
+
+### 🐛 Bug Fix - MCP Error Handling & Retry UX
+
+#### Fixed
+- **MCP Graceful Fallback**: Improved error handling when MCP servers fail
+  - Errors no longer shown directly to Slack users
+  - Bot gracefully retries without the failing MCP server
+  - Clear attribution shows which tools succeeded vs failed
+- **Streaming on MCP Retry**: Fixed unnecessary fallback to non-streaming
+  - Previously ANY retry fell back to non-streaming path
+  - Now streaming continues when only MCP failed (streaming itself worked)
+- **Retry Status Messages**: Non-streaming retries now show cycling progress updates
+  - Added progress updater for retry scenarios
+  - Uses proper emojis from config instead of hardcoded values
+
+#### Changed
+- **Status Message Emojis**: Now uses `circle_loader_emoji` from config for retry states
+- **Tools Attribution**: Shows "(failed: server-name)" when MCP server couldn't be reached
+
 ## [2.3.5] - 2026-01-07
 
 ### 🐛 Bug Fix - MCP Authentication Headers
