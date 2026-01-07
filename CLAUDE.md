@@ -185,12 +185,79 @@ Directories:
 ## Development Workflow
 
 1. **Before making changes**: Run `make test` to ensure tests pass
-2. **After making changes**: 
+2. **After making changes**:
    - Run `make test` for unit tests
    - Run `make test-all` if changes affect API interactions
    - Run `make lint` to check code quality
 3. **When debugging tests**: Use `-xvs` flags for detailed output
 4. **For test coverage**: Check `htmlcov/index.html` after running tests
+
+## Git Commit & Release Workflow
+
+When committing changes and creating releases, follow this workflow:
+
+### 1. Pre-commit checks
+```bash
+git status                    # View changed files
+git log --oneline -5          # Check recent commit message style
+git diff <file>               # Review changes
+```
+
+### 2. Update CHANGELOG.md
+- Add new version section at top (after `## [Unreleased]`)
+- Follow existing format: `## [X.Y.Z] - YYYY-MM-DD`
+- Use sections: `### Added`, `### Fixed`, `### Changed`, `### Removed`
+- Include emoji in section header (e.g., `### 🐛 Bug Fix - Description`)
+
+### 3. Stage and commit
+```bash
+git add <files> CHANGELOG.md
+git commit -m "$(cat <<'EOF'
+Short summary of changes
+
+- Detailed bullet points of what changed
+- Additional context as needed
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+EOF
+)"
+```
+
+### 4. Push to remote
+```bash
+git push origin master
+```
+
+### 5. Create release (ASK USER FIRST - not all commits need a release)
+```bash
+# Check existing tag format
+git tag --sort=-version:refname | head -5    # Format: v2.3.6
+gh release list --limit 3                     # Check title/description format
+
+# Create tag and push
+git tag vX.Y.Z
+git push origin vX.Y.Z
+
+# Create GitHub release (use HEREDOC for multi-line notes)
+gh release create vX.Y.Z --title "vX.Y.Z - Short Description" --notes "$(cat <<'EOF'
+## 🐛 Bug Fix - Category Name (or 🚀 Feature, 🔧 Improvement)
+
+### Fixed
+- **Bold Item**: Description of fix
+  - Sub-detail if needed
+
+### Changed
+- **Bold Item**: Description of change
+EOF
+)"
+```
+
+### Version numbering
+- **Patch** (X.Y.Z → X.Y.Z+1): Bug fixes, minor improvements
+- **Minor** (X.Y.Z → X.Y+1.0): New features, non-breaking changes
+- **Major** (X.Y.Z → X+1.0.0): Breaking changes (rare)
 
 ## Important Instructions
 
