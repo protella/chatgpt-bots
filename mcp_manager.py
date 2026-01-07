@@ -185,8 +185,8 @@ class MCPManager(LoggerMixin):
             if "server_description" in server_config:
                 tool_def["server_description"] = server_config["server_description"]
 
-            if "authorization" in server_config:
-                tool_def["authorization"] = server_config["authorization"]
+            if "headers" in server_config:
+                tool_def["headers"] = server_config["headers"]
 
             # FUTURE FEATURE: require_approval support
             # Currently hardcoded to "never" because we don't have an approval UI implemented.
