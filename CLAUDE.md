@@ -192,7 +192,7 @@ Directories:
 3. **When debugging tests**: Use `-xvs` flags for detailed output
 4. **For test coverage**: Check `htmlcov/index.html` after running tests
 
-## Git Commit & Release Workflow
+## Git Commit & Release Workflow - DO NOT decide to commit changes on your own. Ask user, or user will explicitly ask to run this git flow.
 
 When committing changes and creating releases, follow this workflow:
 

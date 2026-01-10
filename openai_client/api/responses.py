@@ -353,13 +353,8 @@ async def create_streaming_response(
         async for event in self._safe_stream_iteration(response, operation_type):
             try:
                 
-                # Get event type without logging every single one
+                # Get event type
                 event_type = getattr(event, 'type', 'unknown')
-                
-                # DEBUG: Log ALL events to see what's actually coming through
-                if event_type not in ["response.output_item.added", "response.output_item.delta", 
-                                     "response.output_text.delta", "response.output_item.done"]:
-                    self.log_debug(f"Stream event received: {event_type}")
                 
                 if event_type == "response.created":
                     self.log_info("Stream started")
@@ -394,12 +389,15 @@ async def create_streaming_response(
                     continue
                 elif event_type == "response.output_item.done":
                     # Extract MCP server_label from completed items for attribution
-                    if tool_callback and hasattr(event, 'item'):
+                    if hasattr(event, 'item'):
                         item = event.item
                         item_type = getattr(item, 'type', None)
                         if item_type == 'mcp_call':
                             server_label = getattr(item, 'server_label', None)
-                            if server_label:
+                            tool_error = getattr(item, 'error', None)
+                            if tool_error:
+                                self.log_warning(f"MCP call error: {tool_error}")
+                            if tool_callback and server_label:
                                 tool_id = f"mcp:{server_label}"
                                 try:
                                     result = tool_callback(tool_id, "completed")
@@ -448,12 +446,14 @@ async def create_streaming_response(
                             elif event_type == "response.mcp_list_tools.completed":
                                 result = tool_callback("mcp", "tools_discovered")
                             elif event_type == "response.mcp_call.in_progress":
-                                # Extract server_label for attribution (e.g., "context7", "aws_knowledge")
-                                server_label = getattr(event, "server_label", None)
+                                # Extract server_label for attribution
+                                event_data = getattr(event, "data", event)
+                                server_label = getattr(event, "server_label", None) or getattr(event_data, "server_label", None)
                                 tool_id = f"mcp:{server_label}" if server_label else "mcp"
                                 result = tool_callback(tool_id, "calling")
                             elif event_type == "response.mcp_call.completed":
-                                server_label = getattr(event, "server_label", None)
+                                event_data = getattr(event, "data", event)
+                                server_label = getattr(event, "server_label", None) or getattr(event_data, "server_label", None)
                                 tool_id = f"mcp:{server_label}" if server_label else "mcp"
                                 result = tool_callback(tool_id, "completed")
 
@@ -462,8 +462,6 @@ async def create_streaming_response(
                                 await result
                         except Exception as tool_callback_error:
                             self.log_warning(f"Tool callback error: {tool_callback_error}")
-                    # Log tool-related events for visibility
-                    self.log_info(f"Tool event: {event_type}")
                     continue
                 else:
                     # Only log unhandled events for debugging
@@ -556,16 +554,7 @@ async def create_streaming_response_with_tools(
         # GPT-4 and other models - include top_p
         request_params["top_p"] = top_p
     
-    self.log_debug(f"Creating streaming response with tools using model {model}, tools: {tools}")
-
-    # Debug: Log actual token counts being sent
-    import json
-    total_input_chars = sum(len(msg["content"]) for msg in messages)
-    if system_prompt:
-        total_input_chars += len(system_prompt)
-    self.log_debug(f"Sending to API: {len(messages)} messages, {total_input_chars} total chars")
-    self.log_debug(f"System prompt length: {len(system_prompt) if system_prompt else 0} chars")
-    self.log_debug(f"Max output tokens requested: {max_tokens}")
+    self.log_debug(f"Creating streaming response with tools using model {model}")
 
     try:
         # Determine operation type based on reasoning effort and context
@@ -587,13 +576,8 @@ async def create_streaming_response_with_tools(
         async for event in self._safe_stream_iteration(response, operation_type):
             try:
                 
-                # Get event type without logging every single one
+                # Get event type
                 event_type = getattr(event, 'type', 'unknown')
-                
-                # DEBUG: Log ALL events to see what's actually coming through
-                if event_type not in ["response.output_item.added", "response.output_item.delta", 
-                                     "response.output_text.delta", "response.output_item.done"]:
-                    self.log_debug(f"Stream event received: {event_type}")
                 
                 if event_type == "response.created":
                     self.log_info("Stream started")
@@ -628,12 +612,15 @@ async def create_streaming_response_with_tools(
                     continue
                 elif event_type == "response.output_item.done":
                     # Extract MCP server_label from completed items for attribution
-                    if tool_callback and hasattr(event, 'item'):
+                    if hasattr(event, 'item'):
                         item = event.item
                         item_type = getattr(item, 'type', None)
                         if item_type == 'mcp_call':
                             server_label = getattr(item, 'server_label', None)
-                            if server_label:
+                            tool_error = getattr(item, 'error', None)
+                            if tool_error:
+                                self.log_warning(f"MCP call error: {tool_error}")
+                            if tool_callback and server_label:
                                 tool_id = f"mcp:{server_label}"
                                 try:
                                     result = tool_callback(tool_id, "completed")
@@ -682,12 +669,14 @@ async def create_streaming_response_with_tools(
                             elif event_type == "response.mcp_list_tools.completed":
                                 result = tool_callback("mcp", "tools_discovered")
                             elif event_type == "response.mcp_call.in_progress":
-                                # Extract server_label for attribution (e.g., "context7", "aws_knowledge")
-                                server_label = getattr(event, "server_label", None)
+                                # Extract server_label for attribution
+                                event_data = getattr(event, "data", event)
+                                server_label = getattr(event, "server_label", None) or getattr(event_data, "server_label", None)
                                 tool_id = f"mcp:{server_label}" if server_label else "mcp"
                                 result = tool_callback(tool_id, "calling")
                             elif event_type == "response.mcp_call.completed":
-                                server_label = getattr(event, "server_label", None)
+                                event_data = getattr(event, "data", event)
+                                server_label = getattr(event, "server_label", None) or getattr(event_data, "server_label", None)
                                 tool_id = f"mcp:{server_label}" if server_label else "mcp"
                                 result = tool_callback(tool_id, "completed")
 
@@ -696,8 +685,6 @@ async def create_streaming_response_with_tools(
                                 await result
                         except Exception as tool_callback_error:
                             self.log_warning(f"Tool callback error: {tool_callback_error}")
-                    # Log tool-related events for visibility
-                    self.log_info(f"Tool event: {event_type}")
                     continue
                 else:
                     # Only log unhandled events for debugging
