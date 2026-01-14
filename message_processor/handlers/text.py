@@ -1024,8 +1024,11 @@ class TextHandlerMixin:
                 except Exception as cleanup_error:
                     self.log_debug(f"Could not remove loading indicator: {cleanup_error}")
 
-            # Fall back to non-streaming on error
-            self.log_info("Falling back to non-streaming due to error")
+            # Retry request - streaming preserved for MCP failures, non-streaming for other errors
+            if failed_mcp_server:
+                self.log_info(f"Retrying with streaming (excluding failed MCP server)")
+            else:
+                self.log_info("Falling back to non-streaming due to error")
 
             # Remove the message that was just added by streaming attempt
             # to prevent duplicates when fallback adds it again
@@ -1078,6 +1081,10 @@ class TextHandlerMixin:
 
             tools.extend(mcp_tools)
             self.log_debug(f"Added {len(mcp_tools)} MCP server(s) to tools array")
+            # Debug: Log MCP tool structure to verify headers are included
+            for mcp_tool in mcp_tools:
+                has_headers = "headers" in mcp_tool
+                self.log_info(f"MCP tool '{mcp_tool.get('server_label')}': url={mcp_tool.get('server_url')}, has_headers={has_headers}")
 
         # Return None if no tools, otherwise return the list
         if not tools:
