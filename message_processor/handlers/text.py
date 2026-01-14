@@ -920,7 +920,7 @@ class TextHandlerMixin:
                     if response_text != buffer.last_sent_text:
                         # Calculate if mismatch is just from tools attribution being added
                         char_difference = len(response_text) - len(buffer.last_sent_text)
-                        expected_attribution_length = len(tools_note) if tools_used else 0
+                        expected_attribution_length = len(tools_note) if (tools_used or exclude_mcp_server) else 0
 
                         # Allow ±5 char tolerance for minor formatting differences
                         is_attribution_only = abs(char_difference - expected_attribution_length) <= 5
