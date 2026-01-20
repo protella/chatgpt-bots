@@ -11,42 +11,47 @@ from config import config
 
 def strip_citations(text: str) -> str:
     """
-    Strip MCP citation markers from text while preserving web_search citations.
+    Strip OpenAI Responses API citation markers from text.
 
-    Citation formats:
-    - MCP: cite:emoji:mcp_<server>.<tool>result<N>:emoji:
-      Example: cite:ship:mcp_aws_knowledge.aws_search_documentationresult8:walking:
-    - MCP Tool: cite:emoji:turn<N>read_documentation:emoji:
-      Example: cite:ship:turn0search1:ship:turn1read_documentation:walking:
-    - Web Search: cite:emoji:turn<N>search<N>:emoji: (preserved - these are clickable links)
-      Example: cite:ship:turn1search4:walking:
+    OpenAI's Responses API automatically adds citation markers (cite:...:) when incorporating
+    tool results (MCP, web_search, etc.) into responses. These render as clickable links in
+    ChatGPT's web UI but appear as garbage text in other clients like Slack.
 
-    MCP citations are meant for ChatGPT web UI and render as emojis + backend strings in Slack.
-    Web search citations render as clickable links and should be preserved.
+    Note: MCP servers return clean data - the cite markers are added by OpenAI, not the servers.
+
+    Citation formats to REMOVE (MCP tool results):
+    - cite:emoji:mcp_<server>.<tool>result<N>:emoji:
+    - cite:emoji:turn<N>:emoji: (simple tool reference)
+    - cite:emoji:turn<N>read_documentation:emoji:
+
+    Citation formats to PRESERVE (web search - these may render as links):
+    - cite:emoji:turn<N>search<N>:emoji:
 
     Args:
         text: Text potentially containing citation markers
 
     Returns:
-        Text with MCP citation markers removed, web search citations preserved
+        Text with MCP/tool citation markers removed, web search citations preserved
     """
-    # Pattern to match citations that should be removed:
-    # - Contains "mcp_" anywhere (MCP server results)
-    # - Contains "read_", "get_", "list_", etc. (MCP tool prefixes)
-    # - Contains "_documentation", "_library", etc. (MCP tool suffixes)
-    # Note: Using [^:]+ for final emoji to match Unicode emojis (not just \w word chars)
-    mcp_patterns = [
-        # Citations containing "mcp_"
+    # Patterns for OpenAI-added citation markers to remove:
+    # These are added by OpenAI's Responses API to attribute tool call results.
+    # Format: cite:emoji:reference:emoji: where reference identifies the source.
+    # We preserve web_search citations (turn<N>search<N>) as they may render as links.
+    tool_citation_patterns = [
+        # MCP server references: cite:ship:mcp_aws_knowledge.tool_name...:walking:
         r'\s*cite:[^:]+:mcp_[^:]+(?::[^:]+)*:[^:]+:\s*',
-        # Citations containing MCP tool patterns (read_documentation, etc.)
+        # Tool action patterns: read_, get_, list_, fetch_, retrieve_
         r'\s*cite:[^:]+:[^:]*(?:read_|get_|list_|fetch_|retrieve_)[^:]+(?::[^:]+)*:[^:]+:\s*',
         r'\s*cite:[^:]+:[^:]*(?:_documentation|_library|_docs)[^:]*(?::[^:]+)*:[^:]+:\s*',
-        # Complex/nested citations that contain multiple turn references (likely MCP + web search mixed)
+        # Nested citations (MCP + web search mixed in same marker)
         r'\s*cite:[^:]+:turn\d+search\d+:[^:]+:turn\d+[^:]*(?::[^:]+)*:[^:]+:\s*',
+        # Simple tool citations: turn<N> without search (e.g., cite:ship:turn0:walking:)
+        # Note: turn<N>search<N> = web search (preserved), turn<N> alone = tool result (removed)
+        r'\s*cite:[^:]+:turn\d+:[^:]+:\s*',
     ]
 
     cleaned_text = text
-    for pattern in mcp_patterns:
+    for pattern in tool_citation_patterns:
         cleaned_text = re.sub(pattern, ' ', cleaned_text)
 
     # Clean up any double spaces created by removing citations (preserve newlines)
