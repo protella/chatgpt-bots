@@ -124,7 +124,7 @@ class BotConfig:
     message_timeout: int = field(default_factory=lambda: int(os.getenv("MESSAGE_TIMEOUT", "60")))
     
     # Cleanup settings
-    cleanup_schedule: str = field(default_factory=lambda: os.getenv("CLEANUP_SCHEDULE", "0 0 * * *"))  # Default: midnight daily
+    cleanup_schedule: str = field(default_factory=lambda: os.getenv("CLEANUP_SCHEDULE", "0 0 * * 0"))  # Default: midnight Sunday (weekly)
     cleanup_max_age_hours: float = field(default_factory=lambda: float(os.getenv("CLEANUP_MAX_AGE_HOURS", "24")))
     
     # API Timeout settings (in seconds)
