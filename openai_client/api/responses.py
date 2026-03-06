@@ -73,16 +73,20 @@ async def create_text_response(
         is_reasoning_model = "chat" not in model.lower()
 
         if is_reasoning_model:
-            # GPT-5 reasoning models (nano, mini, full, 5.1)
-            # Fixed temperature, supports reasoning_effort and verbosity
-            request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
+            # GPT-5 reasoning models
             reasoning_effort = reasoning_effort or config.default_reasoning_effort
             request_params["reasoning"] = {"effort": reasoning_effort}
             verbosity = verbosity or config.default_verbosity
             request_params["text"] = {"verbosity": verbosity}
 
-            # Add prompt caching for GPT-5.1 and GPT-5.2 reasoning models
-            if model in ["gpt-5.1", "gpt-5.2", "gpt-5.2-pro"]:
+            # GPT-5.4 allows temperature/top_p when reasoning=none
+            if model.startswith("gpt-5.4") and reasoning_effort == "none":
+                request_params["top_p"] = top_p
+            else:
+                request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
+
+            # Add prompt caching for GPT-5.1+ reasoning models
+            if model in ["gpt-5.1", "gpt-5.2", "gpt-5.2-pro", "gpt-5.4"]:
                 request_params["prompt_cache_retention"] = "24h"
         else:
             # GPT-5 chat models - standard parameters only
@@ -91,7 +95,7 @@ async def create_text_response(
     else:
         # GPT-4 and other models - include top_p
         request_params["top_p"] = top_p
-    
+
     self.log_debug(f"Creating text response with model {model}, temp {temperature}")
 
     try:
@@ -177,22 +181,26 @@ async def create_text_response_with_tools(
     if model.startswith("gpt-5"):
         # Check if it's a reasoning model (not chat model)
         is_reasoning_model = "chat" not in model.lower()
-        
+
         if is_reasoning_model:
-            # GPT-5 reasoning models (nano, mini, full)
-            # Fixed temperature, supports reasoning_effort and verbosity
-            request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
+            # GPT-5 reasoning models
             reasoning_effort = reasoning_effort or config.default_reasoning_effort
             request_params["reasoning"] = {"effort": reasoning_effort}
             verbosity = verbosity or config.default_verbosity
             request_params["text"] = {"verbosity": verbosity}
+
+            # GPT-5.4 allows temperature/top_p when reasoning=none
+            if model.startswith("gpt-5.4") and reasoning_effort == "none":
+                request_params["top_p"] = top_p
+            else:
+                request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
         else:
             # GPT-5 chat models - standard parameters only
             request_params["top_p"] = top_p
     else:
         # GPT-4 and other models - include top_p
         request_params["top_p"] = top_p
-    
+
     self.log_debug(f"Creating text response with tools using model {model}, tools: {tools}")
 
     try:
@@ -315,16 +323,20 @@ async def create_streaming_response(
         is_reasoning_model = "chat" not in model.lower()
 
         if is_reasoning_model:
-            # GPT-5 reasoning models (nano, mini, full, 5.1)
-            # Fixed temperature, supports reasoning_effort and verbosity
-            request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
+            # GPT-5 reasoning models
             reasoning_effort = reasoning_effort or config.default_reasoning_effort
             request_params["reasoning"] = {"effort": reasoning_effort}
             verbosity = verbosity or config.default_verbosity
             request_params["text"] = {"verbosity": verbosity}
 
-            # Add prompt caching for GPT-5.1 and GPT-5.2 reasoning models
-            if model in ["gpt-5.1", "gpt-5.2", "gpt-5.2-pro"]:
+            # GPT-5.4 allows temperature/top_p when reasoning=none
+            if model.startswith("gpt-5.4") and reasoning_effort == "none":
+                request_params["top_p"] = top_p
+            else:
+                request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
+
+            # Add prompt caching for GPT-5.1+ reasoning models
+            if model in ["gpt-5.1", "gpt-5.2", "gpt-5.2-pro", "gpt-5.4"]:
                 request_params["prompt_cache_retention"] = "24h"
         else:
             # GPT-5 chat models - standard parameters only
@@ -333,7 +345,7 @@ async def create_streaming_response(
     else:
         # GPT-4 and other models - include top_p
         request_params["top_p"] = top_p
-    
+
     self.log_debug(f"Creating streaming response with model {model}, temp {temperature}")
 
     try:
@@ -538,22 +550,26 @@ async def create_streaming_response_with_tools(
     if model.startswith("gpt-5"):
         # Check if it's a reasoning model (not chat model)
         is_reasoning_model = "chat" not in model.lower()
-        
+
         if is_reasoning_model:
-            # GPT-5 reasoning models (nano, mini, full)
-            # Fixed temperature, supports reasoning_effort and verbosity
-            request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
+            # GPT-5 reasoning models
             reasoning_effort = reasoning_effort or config.default_reasoning_effort
             request_params["reasoning"] = {"effort": reasoning_effort}
             verbosity = verbosity or config.default_verbosity
             request_params["text"] = {"verbosity": verbosity}
+
+            # GPT-5.4 allows temperature/top_p when reasoning=none
+            if model.startswith("gpt-5.4") and reasoning_effort == "none":
+                request_params["top_p"] = top_p
+            else:
+                request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
         else:
             # GPT-5 chat models - standard parameters only
             request_params["top_p"] = top_p
     else:
         # GPT-4 and other models - include top_p
         request_params["top_p"] = top_p
-    
+
     self.log_debug(f"Creating streaming response with tools using model {model}")
 
     try:
@@ -997,13 +1013,17 @@ async def _create_text_response_with_timeout(
         is_reasoning_model = "chat" not in model.lower()
 
         if is_reasoning_model:
-            # GPT-5 reasoning models (nano, mini, full)
-            # Fixed temperature, supports reasoning_effort and verbosity
-            request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
+            # GPT-5 reasoning models
             reasoning_effort = reasoning_effort or config.default_reasoning_effort
             request_params["reasoning"] = {"effort": reasoning_effort}
             verbosity = verbosity or config.default_verbosity
             request_params["text"] = {"verbosity": verbosity}
+
+            # GPT-5.4 allows temperature/top_p when reasoning=none
+            if model.startswith("gpt-5.4") and reasoning_effort == "none":
+                request_params["top_p"] = top_p
+            else:
+                request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
         else:
             # GPT-5 chat models - standard parameters only
             # temperature and top_p work normally, no reasoning/verbosity
@@ -1106,13 +1126,17 @@ async def _create_text_response_with_tools_with_timeout(
         is_reasoning_model = "chat" not in model.lower()
 
         if is_reasoning_model:
-            # GPT-5 reasoning models (nano, mini, full)
-            # Fixed temperature, supports reasoning_effort and verbosity
-            request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
+            # GPT-5 reasoning models
             reasoning_effort = reasoning_effort or config.default_reasoning_effort
             request_params["reasoning"] = {"effort": reasoning_effort}
             verbosity = verbosity or config.default_verbosity
             request_params["text"] = {"verbosity": verbosity}
+
+            # GPT-5.4 allows temperature/top_p when reasoning=none
+            if model.startswith("gpt-5.4") and reasoning_effort == "none":
+                request_params["top_p"] = top_p
+            else:
+                request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
         else:
             # GPT-5 chat models - standard parameters only
             request_params["top_p"] = top_p

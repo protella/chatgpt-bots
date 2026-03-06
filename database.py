@@ -189,7 +189,7 @@ class DatabaseManager(LoggerMixin):
                 slack_email TEXT,
 
                 -- Model settings
-                model TEXT DEFAULT 'gpt-5',
+                model TEXT DEFAULT 'gpt-5.4',
                 reasoning_effort TEXT DEFAULT 'low',
                 verbosity TEXT DEFAULT 'low',
                 temperature REAL DEFAULT 0.8,
@@ -337,7 +337,7 @@ class DatabaseManager(LoggerMixin):
                         slack_email TEXT,
                         
                         -- Model settings
-                        model TEXT DEFAULT 'gpt-5',
+                        model TEXT DEFAULT 'gpt-5.4',
                         reasoning_effort TEXT DEFAULT 'low',
                         verbosity TEXT DEFAULT 'low',
                         temperature REAL DEFAULT 0.8,

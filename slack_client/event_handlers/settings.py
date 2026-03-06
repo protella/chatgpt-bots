@@ -786,6 +786,71 @@ class SlackSettingsHandlersMixin:
             except SlackApiError as e:
                 self.log_error(f"Error updating modal for scope change: {e}")
         
+        # GPT-5.4 reasoning level change needs modal rebuild (to show/hide temp/top_p)
+        @self.app.action("reasoning_level_gpt54")
+        async def handle_reasoning_level_gpt54_change(ack, body, client):
+            """Handle GPT-5.4 reasoning level change - rebuilds modal to show/hide temp/top_p"""
+            await ack()
+
+            user_id = body['user']['id']
+            selected_reasoning = body['actions'][0]['selected_option']['value']
+
+            self.log_info(f"GPT-5.4 reasoning changed to {selected_reasoning} for user {user_id}")
+
+            # Get session data from database
+            session_data = await self._get_session_data(body)
+            if not session_data:
+                self.log_error("No session found for modal interaction")
+                return
+
+            stored_settings = session_data.get('settings', {})
+            metadata_context = {
+                'thread_id': session_data.get('thread_id'),
+                'in_thread': session_data.get('in_thread', False),
+                'scope': session_data.get('scope'),
+                'pending_message': session_data.get('pending_message')
+            }
+
+            # Extract current form values and merge with stored
+            current_values = self.settings_modal.extract_form_values(body['view']['state'])
+            if isinstance(stored_settings, dict):
+                merged_settings = stored_settings.copy()
+            else:
+                merged_settings = {}
+            merged_settings.update(current_values)
+
+            # Ensure the new reasoning level is reflected
+            merged_settings['reasoning_effort'] = selected_reasoning
+
+            # Update session
+            session_data['settings'] = merged_settings
+            await self._update_session_data(body, session_data)
+
+            # Rebuild modal
+            is_new_user = body['view']['callback_id'] == 'welcome_settings_modal'
+            updated_modal = await self.settings_modal.build_settings_modal(
+                user_id=user_id,
+                trigger_id=None,
+                current_settings=merged_settings,
+                is_new_user=is_new_user,
+                thread_id=metadata_context.get('thread_id'),
+                in_thread=metadata_context.get('in_thread', False),
+                scope=metadata_context.get('scope'),
+                pending_message=metadata_context.get('pending_message')
+            )
+
+            try:
+                response = await client.views_update(
+                    view_id=body['view']['id'],
+                    view=updated_modal
+                )
+                if response.get('ok'):
+                    self.log_debug(f"Modal updated for GPT-5.4 reasoning change: {selected_reasoning}")
+                else:
+                    self.log_error(f"Failed to update modal: {response.get('error')}")
+            except SlackApiError as e:
+                self.log_error(f"Error updating modal for reasoning change: {e}")
+
         # Register action handlers for other interactive components (just acknowledge)
         @self.app.action("reasoning_level")
         @self.app.action("reasoning_level_no_minimal")  # Alternative action_id when minimal is hidden
