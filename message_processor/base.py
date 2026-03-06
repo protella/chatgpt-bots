@@ -307,7 +307,8 @@ class MessageProcessor(ThreadManagementMixin,
             # No need to remove temp message since we never added it to thread_state.messages
             
             # Check if this single message alone exceeds the model's context window
-            max_model_tokens = config.thread_max_token_count  # Model's context limit
+            model = thread_state.current_model or config.gpt_model
+            max_model_tokens = config.get_model_token_limit(model)
 
             # Check if this single message exceeds the model's context window
             if new_message_tokens > max_model_tokens:

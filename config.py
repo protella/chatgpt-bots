@@ -10,9 +10,12 @@ from dataclasses import dataclass, field
 load_dotenv()
 
 # Model knowledge cutoff dates
-# Supported models: gpt-5.2, gpt-5.2-pro, gpt-5.2-chat-latest, gpt-5, gpt-5.1, gpt-5-mini, gpt-4.1, gpt-4o
+# Supported models: gpt-5.4, gpt-5.2, gpt-5.2-pro, gpt-5.2-chat-latest, gpt-5, gpt-5.1, gpt-5-mini, gpt-4.1, gpt-4o
 MODEL_KNOWLEDGE_CUTOFFS = {
-    # GPT-5.2 series (August 2025 cutoff - much more recent!)
+    # GPT-5.4 (August 2025 cutoff, 1.05M context window)
+    "gpt-5.4": "August 31, 2025",
+
+    # GPT-5.2 series (August 2025 cutoff)
     "gpt-5.2": "August 31, 2025",
     "gpt-5.2-pro": "August 31, 2025",
     "gpt-5.2-chat-latest": "August 31, 2025",
@@ -47,7 +50,7 @@ class BotConfig:
     openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_KEY", ""))
     
     # Model configuration
-    gpt_model: str = field(default_factory=lambda: os.getenv("GPT_MODEL", "gpt-5"))
+    gpt_model: str = field(default_factory=lambda: os.getenv("GPT_MODEL", "gpt-5.4"))
     utility_model: str = field(default_factory=lambda: os.getenv("UTILITY_MODEL", "gpt-5-mini"))
     image_model: str = field(default_factory=lambda: os.getenv("GPT_IMAGE_MODEL", "gpt-image-1"))
     
@@ -132,16 +135,19 @@ class BotConfig:
     api_timeout_streaming_chunk: float = field(default_factory=lambda: float(os.getenv("API_TIMEOUT_STREAMING_CHUNK", "30")))  # Max time between streaming chunks
     
     # Model token limits
-    # GPT-5: 400k total context window (shared between input, output, and reasoning)
-    # With max_output_tokens=32k, we can theoretically use up to 368k for input
-    # BUT: We must also account for system prompt (~1k), tool definitions (~0.5k),
-    # and API formatting overhead (~8.5k), so practical limit is ~358k
-    # We use 67.5% (270k) to ensure we stay well under the actual limit
-    gpt5_max_tokens: int = field(default_factory=lambda: int(os.getenv("GPT5_MAX_TOKENS", "400000")))  # Total context window
+    # GPT-5.4: 1.05M total context window (shared between input, output, and reasoning)
+    # GPT-5: 400k total context window
+    # Reserved for output/reasoning/overhead is ~130k (static across models)
+    # Buffer percentages are calculated so effective input = total - 130k reserved
+    gpt54_max_tokens: int = field(default_factory=lambda: int(os.getenv("GPT54_MAX_TOKENS", "1050000")))  # GPT-5.4 context window
+    gpt5_max_tokens: int = field(default_factory=lambda: int(os.getenv("GPT5_MAX_TOKENS", "400000")))  # GPT-5/5.1/5.2 context window
     gpt4_max_tokens: int = field(default_factory=lambda: int(os.getenv("GPT4_MAX_TOKENS", "128000")))
-    
+
     # Token management configuration
     # Buffer to leave room for output/reasoning tokens and overhead
+    # GPT-5.4: 0.876 = ~920k usable of 1.05M (130k reserved)
+    # GPT-5: 0.675 = ~270k usable of 400k (130k reserved)
+    gpt54_token_buffer_percentage: float = field(default_factory=lambda: float(os.getenv("GPT54_TOKEN_BUFFER_PERCENTAGE", "0.876")))
     token_buffer_percentage: float = field(default_factory=lambda: float(os.getenv("TOKEN_BUFFER_PERCENTAGE", "0.875")))
     token_cleanup_threshold: float = field(default_factory=lambda: float(os.getenv("TOKEN_CLEANUP_THRESHOLD", "0.8")))
     token_trim_message_count: int = field(default_factory=lambda: int(os.getenv("TOKEN_TRIM_MESSAGE_COUNT", "5")))
@@ -163,24 +169,27 @@ class BotConfig:
         """Get the effective input token limit for a specific model
 
         This returns the maximum number of input tokens we should send.
-        For GPT-5: 400k total - output reservation = ~350k with buffer
+        For GPT-5.4: 1.05M total - 130k reserved = ~920k usable
+        For GPT-5: 400k total - 130k reserved = ~270k usable
         For GPT-4: 128k total - output reservation = ~112k with buffer
 
         Args:
-            model: Model name (e.g., 'gpt-5', 'gpt-4.1', 'gpt-4o')
+            model: Model name (e.g., 'gpt-5.4', 'gpt-5', 'gpt-4.1', 'gpt-4o')
 
         Returns:
             Buffered token limit for safe operation
         """
-        # Determine base limit based on model family
-        if model.startswith('gpt-5'):
+        # Determine base limit and buffer based on model family
+        if model.startswith('gpt-5.4'):
+            return int(self.gpt54_max_tokens * self.gpt54_token_buffer_percentage)
+        elif model.startswith('gpt-5'):
             base_limit = self.gpt5_max_tokens
         elif model.startswith('gpt-4'):
             base_limit = self.gpt4_max_tokens
         else:
             # Default to GPT-4 limit for unknown models
             base_limit = self.gpt4_max_tokens
-        
+
         # Apply buffer percentage
         return int(base_limit * self.token_buffer_percentage)
     
