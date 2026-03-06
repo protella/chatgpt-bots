@@ -176,3 +176,4 @@ mcp_config*.bak
 .mcp.json
 .channels_cache_v2.json
 .users_cache.json
+extract_metrics.py

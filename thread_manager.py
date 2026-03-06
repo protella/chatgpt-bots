@@ -416,7 +416,6 @@ class ThreadStateManager(LoggerMixin):
         self._lock_manager = ThreadLockManager()
         self._state_lock = Lock()
         self._token_counter = TokenCounter(config.gpt_model)
-        self._max_tokens = config.thread_max_token_count
         self.db = db  # Optional database manager
         self._watchdog_thread = None
         self._start_watchdog()
@@ -732,7 +731,6 @@ class AsyncThreadStateManager(LoggerMixin):
         self._lock_manager = AsyncThreadLockManager()
         self._state_lock = asyncio.Lock()
         self._token_counter = TokenCounter(config.gpt_model)
-        self._max_tokens = config.thread_max_token_count
         self.db = db  # Optional database manager
         self._watchdog_task = None
         self._watchdog_started = False
