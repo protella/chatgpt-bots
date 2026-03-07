@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-03-06
+
+### 🚀 Feature - GPT-5.4 Support with 1M Context Window
+
+#### Added
+- **GPT-5.4 as default model**: 1.05M token context window (~920k usable input)
+- **Temperature/Top P for GPT-5.4**: Available when reasoning is set to None, dynamically shown/hidden in settings modal
+- **Migration script**: `migrate_to_gpt54.py` to bump existing users (dry run by default)
+- **Prompt caching**: Enabled for GPT-5.4 (24h retention)
+
+#### Changed
+- **Token limits fully model-aware**: Removed legacy flat `thread_max_token_count` usage; all paths now use `get_model_token_limit(model)`
+- **API parameter handling**: GPT-5.4 with reasoning=none passes through temperature/top_p, otherwise forces temp=1.0
+
+#### Fixed
+- **Reasoning level compatibility**: Migration converts `minimal` (GPT-5/5-mini only) to `low` for GPT-5.4
+
+#### Upgrade Instructions
+Add these new environment variables to your `.env`:
+```
+GPT_MODEL = "gpt-5.4"
+GPT54_MAX_TOKENS = "1050000"
+GPT54_TOKEN_BUFFER_PERCENTAGE = "0.876"
+```
+Existing variables (`TOKEN_BUFFER_PERCENTAGE`, `TOKEN_CLEANUP_THRESHOLD`, etc.) do not need to change.
+
+Run the migration to update existing user preferences:
+```bash
+python3 migrate_to_gpt54.py --db data/slack.db          # dry run
+python3 migrate_to_gpt54.py --db data/slack.db --apply   # apply
+```
+
 ## [2.3.6] - 2026-01-07
 
 ### 🐛 Bug Fix - MCP Error Handling & Retry UX
