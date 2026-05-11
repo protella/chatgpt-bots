@@ -13,6 +13,10 @@ updates:
     commit-message:
       prefix: "deps"
       include: "scope"
+    # pip-tools two-file layout: edit requirements.in, regenerate requirements.txt.
+    # Dependabot updates the lockfile (requirements.txt) but leaves the manifest
+    # (requirements.in) untouched. Direct deps are still bumped via the lockfile.
+    versioning-strategy: "lockfile-only"
     groups:
       python-minor-patch:
         update-types:
