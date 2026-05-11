@@ -17,9 +17,19 @@ help:
 	@echo "  make format        - Auto-format code"
 	@echo "  make check         - Run all checks (lint + test)"
 
-# Install dependencies
+# Install dependencies from the locked file
 install:
-	python3 -m pip install -U -r requirements.txt
+	python3 -m pip install --require-hashes -r requirements.txt
+
+# Regenerate locked requirements.txt from requirements.in (run after editing .in)
+lock:
+	python3 -m pip install -U pip-tools
+	pip-compile --generate-hashes --output-file=requirements.txt requirements.in
+
+# Upgrade all deps to latest within the constraints in requirements.in
+lock-upgrade:
+	python3 -m pip install -U pip-tools
+	pip-compile --generate-hashes --upgrade --output-file=requirements.txt requirements.in
 
 # Basic test run with coverage (unit tests only by default)
 test:
