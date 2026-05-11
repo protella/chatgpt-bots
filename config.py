@@ -10,8 +10,11 @@ from dataclasses import dataclass, field
 load_dotenv()
 
 # Model knowledge cutoff dates
-# Supported models: gpt-5.4, gpt-5.2, gpt-5.2-pro, gpt-5.2-chat-latest, gpt-5, gpt-5.1, gpt-5-mini, gpt-4.1, gpt-4o
+# Supported models: gpt-5.5, gpt-5.4, gpt-5.2, gpt-5.2-pro, gpt-5.2-chat-latest, gpt-5, gpt-5.1, gpt-5-mini, gpt-4.1, gpt-4o
 MODEL_KNOWLEDGE_CUTOFFS = {
+    # GPT-5.5 (August 2025 cutoff, 1.05M context window, released April 23, 2026)
+    "gpt-5.5": "August 31, 2025",
+
     # GPT-5.4 (August 2025 cutoff, 1.05M context window)
     "gpt-5.4": "August 31, 2025",
 
@@ -50,7 +53,7 @@ class BotConfig:
     openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_KEY", ""))
     
     # Model configuration
-    gpt_model: str = field(default_factory=lambda: os.getenv("GPT_MODEL", "gpt-5.4"))
+    gpt_model: str = field(default_factory=lambda: os.getenv("GPT_MODEL", "gpt-5.5"))
     utility_model: str = field(default_factory=lambda: os.getenv("UTILITY_MODEL", "gpt-5-mini"))
     image_model: str = field(default_factory=lambda: os.getenv("GPT_IMAGE_MODEL", "gpt-image-2"))
     
@@ -174,13 +177,15 @@ class BotConfig:
         For GPT-4: 128k total - output reservation = ~112k with buffer
 
         Args:
-            model: Model name (e.g., 'gpt-5.4', 'gpt-5', 'gpt-4.1', 'gpt-4o')
+            model: Model name (e.g., 'gpt-5.5', 'gpt-5.4', 'gpt-5', 'gpt-4.1', 'gpt-4o')
 
         Returns:
             Buffered token limit for safe operation
         """
-        # Determine base limit and buffer based on model family
-        if model.startswith('gpt-5.4'):
+        # Determine base limit and buffer based on model family.
+        # gpt-5.5 family has the same 1.05M context window as gpt-5.4, so reuse the
+        # gpt54_max_tokens config until we have a reason to tune it separately.
+        if model.startswith('gpt-5.4') or model.startswith('gpt-5.5'):
             return int(self.gpt54_max_tokens * self.gpt54_token_buffer_percentage)
         elif model.startswith('gpt-5'):
             base_limit = self.gpt5_max_tokens

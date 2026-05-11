@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.5.1] - 2026-05-11
+
+### 🚀 Feature - GPT-5.5 Support
+
+#### Added
+- **`gpt-5.5` added to the model picker** in `/settings` (top of dropdown, above GPT-5.4)
+- **`gpt-5.5` is the new default model** for new users and all existing users
+- **MODEL_KNOWLEDGE_CUTOFFS entry**: `gpt-5.5` → "August 31, 2025"
+- **One-time DB migration**: existing users on any pre-5.5 model are auto-swapped to `gpt-5.5` on first startup. Gated by a `gpt55_migrated` sentinel column so users who later pick another model via `/settings` aren't reset on subsequent restarts.
+
+#### Changed
+- **`GPT_MODEL` env default**: `gpt-5.4` → `gpt-5.5`
+- **API parameter handling**: `gpt-5.5` follows the same hybrid pattern as `gpt-5.4` — supports `temperature`/`top_p` when `reasoning_effort=none`, otherwise forces temp=1.0. Same prompt caching (`prompt_cache_retention: 24h`).
+- **Token limits**: `gpt-5.5` reuses the existing 1.05M context window config (`GPT54_MAX_TOKENS`) since it has the same context size
+
+#### Not supported
+- `gpt-5.5-pro` (different pricing tier, deferred)
+- `gpt-5.5-instant` (ChatGPT-only, not on the API)
+
+#### Cost impact
+GPT-5.5 input pricing is roughly 2× GPT-5.4 ($5 vs $2.50 per 1M tokens). Output is ~1.5× ($30 vs ~$20). Expect API spend per conversation to roughly double after this upgrade.
+
+#### Upgrade Instructions
+Update your `.env`:
+```
+GPT_MODEL=gpt-5.5
+```
+On first startup, watch the logs for the one-time swap:
+```
+DB: One-time migration — swapped N user(s) to gpt-5.5
+```
+Users can still pick `gpt-5.4` (or any older supported model) per-user in `/settings`.
+
 ## [2.5.0] - 2026-05-11
 
 ### 🚀 Feature - GPT Image 2 Support with Per-User Model Picker

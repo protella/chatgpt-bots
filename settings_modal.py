@@ -242,6 +242,7 @@ class SettingsModal(LoggerMixin):
                     "value": selected_model
                 },
                 "options": [
+                    {"text": {"type": "plain_text", "text": "GPT-5.5"}, "value": "gpt-5.5"},
                     {"text": {"type": "plain_text", "text": "GPT-5.4"}, "value": "gpt-5.4"},
                     {"text": {"type": "plain_text", "text": "GPT-5.2"}, "value": "gpt-5.2"},
                     {"text": {"type": "plain_text", "text": "GPT-5.1"}, "value": "gpt-5.1"},
@@ -256,7 +257,8 @@ class SettingsModal(LoggerMixin):
         blocks.append({"type": "divider"})
         
         # Add model-specific settings
-        if selected_model == 'gpt-5.4':
+        # gpt-5.5 shares the same parameter surface as gpt-5.4 (reasoning + optional temp/top_p)
+        if selected_model in ('gpt-5.4', 'gpt-5.5'):
             blocks.extend(self._add_gpt54_settings(settings))
         elif selected_model == 'gpt-5.2':
             blocks.extend(self._add_gpt52_settings(settings))
@@ -1267,12 +1269,12 @@ class SettingsModal(LoggerMixin):
             self.log_info("Auto-upgraded reasoning_effort from minimal to low for web search compatibility")
         
         # Check if both temperature and top_p are changed for models that support them
-        model = validated.get('model', 'gpt-5.4')
-        reasoning_models = ['gpt-5', 'gpt-5.1', 'gpt-5-mini', 'gpt-5.2', 'gpt-5.4']
+        model = validated.get('model', 'gpt-5.5')
+        reasoning_models = ['gpt-5', 'gpt-5.1', 'gpt-5-mini', 'gpt-5.2', 'gpt-5.4', 'gpt-5.5']
 
-        # GPT-5.4 with reasoning=none supports temp/top_p, as do GPT-4/chat models
+        # GPT-5.4 and GPT-5.5 with reasoning=none support temp/top_p, as do GPT-4/chat models
         supports_temp = model not in reasoning_models or (
-            model == 'gpt-5.4' and validated.get('reasoning_effort') == 'none'
+            model in ('gpt-5.4', 'gpt-5.5') and validated.get('reasoning_effort') == 'none'
         )
 
         if supports_temp:
@@ -1288,8 +1290,8 @@ class SettingsModal(LoggerMixin):
 
         # Remove invalid parameters for model type
         if model in reasoning_models:
-            if model == 'gpt-5.4' and validated.get('reasoning_effort') == 'none':
-                # GPT-5.4 with reasoning=none: keep temperature/top_p, keep reasoning params
+            if model in ('gpt-5.4', 'gpt-5.5') and validated.get('reasoning_effort') == 'none':
+                # GPT-5.4 / GPT-5.5 with reasoning=none: keep temperature/top_p, keep reasoning params
                 pass
             else:
                 # Other reasoning models: remove temp/top_p
@@ -1306,6 +1308,7 @@ class SettingsModal(LoggerMixin):
     def _get_model_display_name(self, model: str) -> str:
         """Get user-friendly model name"""
         display_names = {
+            'gpt-5.5': 'GPT-5.5',
             'gpt-5.4': 'GPT-5.4',
             'gpt-5.2': 'GPT-5.2',
             'gpt-5.2-pro': 'GPT-5.2 Pro',
