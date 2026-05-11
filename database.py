@@ -189,7 +189,7 @@ class DatabaseManager(LoggerMixin):
                 slack_email TEXT,
 
                 -- Model settings
-                model TEXT DEFAULT 'gpt-5.4',
+                model TEXT DEFAULT 'gpt-5.5',
                 reasoning_effort TEXT DEFAULT 'low',
                 verbosity TEXT DEFAULT 'low',
                 temperature REAL DEFAULT 0.8,
@@ -338,7 +338,7 @@ class DatabaseManager(LoggerMixin):
                         slack_email TEXT,
                         
                         -- Model settings
-                        model TEXT DEFAULT 'gpt-5.4',
+                        model TEXT DEFAULT 'gpt-5.5',
                         reasoning_effort TEXT DEFAULT 'low',
                         verbosity TEXT DEFAULT 'low',
                         temperature REAL DEFAULT 0.8,
@@ -432,6 +432,27 @@ class DatabaseManager(LoggerMixin):
                 self.log_info(
                     f"DB: Successfully added image_model column and migrated "
                     f"{row_count} existing user(s) to gpt-image-2"
+                )
+
+            # One-time bulk swap: migrate every user still on a pre-5.5 model to gpt-5.5.
+            # Gated by a sentinel migration marker so this runs exactly once even if a
+            # user later picks gpt-5.4 (or earlier) in /settings.
+            cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
+            columns = [col[1] for col in cursor.fetchall()]
+            if 'gpt55_migrated' not in columns:
+                self.conn.execute("""
+                    ALTER TABLE user_preferences
+                    ADD COLUMN gpt55_migrated INTEGER DEFAULT 0
+                """)
+                cursor = self.conn.execute("""
+                    UPDATE user_preferences
+                    SET model = 'gpt-5.5', gpt55_migrated = 1
+                    WHERE gpt55_migrated = 0
+                """)
+                swapped = cursor.rowcount
+                self.conn.commit()
+                self.log_info(
+                    f"DB: One-time migration — swapped {swapped} user(s) to gpt-5.5"
                 )
 
             # One-time backfill: mark long-standing users as settings_completed.
