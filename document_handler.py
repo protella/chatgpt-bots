@@ -11,7 +11,7 @@ import subprocess
 from io import BytesIO
 from typing import Dict, List, Optional, Any
 import pdfplumber
-import PyPDF2
+import pypdf
 from pdf2image import convert_from_bytes
 from docx import Document
 import pandas as pd
@@ -86,7 +86,7 @@ class DocumentHandler(LoggerMixin):
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._parse_pdf_with_pdfplumber, file_data, filename)
     async def _parse_pdf_with_pypdf2_async(self, file_data: bytes, filename: str) -> Dict[str, Any]:
-        """Async wrapper for PDF parsing with PyPDF2"""
+        """Async wrapper for PDF parsing with pypdf"""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._parse_pdf_with_pypdf2, file_data, filename)
     async def _parse_docx_async(self, file_data: bytes, filename: str) -> Dict[str, Any]:
@@ -292,11 +292,11 @@ class DocumentHandler(LoggerMixin):
         Returns:
             Dict with pages, content, and structure info
         """
-        # Try pdfplumber first, then PyPDF2 as fallback
+        # Try pdfplumber first, then pypdf as fallback
         try:
             result = self._parse_pdf_with_pdfplumber(file_data, filename)
         except Exception as e:
-            self.log_warning(f"pdfplumber failed, trying PyPDF2: {e}")
+            self.log_warning(f"pdfplumber failed, trying pypdf: {e}")
             result = self._parse_pdf_with_pypdf2(file_data, filename)
         # Check if PDF is likely image-based (scanned document)
         if result and self._is_image_based_pdf(result):
@@ -389,9 +389,9 @@ class DocumentHandler(LoggerMixin):
             'format': 'pdf'
         }
     def _parse_pdf_with_pypdf2(self, file_data: bytes, filename: str) -> Dict[str, Any]:
-        """Parse PDF using PyPDF2 as fallback"""
+        """Parse PDF using pypdf as fallback"""
         try:
-            reader = PyPDF2.PdfReader(BytesIO(file_data))
+            reader = pypdf.PdfReader(BytesIO(file_data))
             total_pages = len(reader.pages)
             pages = []
             content_parts = []
@@ -421,10 +421,10 @@ class DocumentHandler(LoggerMixin):
                 'total_pages': total_pages,
                 'has_tables': False,
                 'format': 'pdf',
-                'extraction_method': 'PyPDF2_fallback'
+                'extraction_method': 'pypdf_fallback'
             }
         except Exception as e:
-            raise Exception(f"PyPDF2 parsing failed: {e}")
+            raise Exception(f"pypdf parsing failed: {e}")
     def parse_docx_structured(self, file_data: bytes, filename: str) -> Dict[str, Any]:
         """
         Extract Word document content preserving formatting and structure

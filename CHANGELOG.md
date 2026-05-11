@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 🔧 Improvement - Dependency Hygiene
+
+#### Changed
+- **All unpinned deps now have floor versions** (`python-dotenv`, `openai`, `slack_bolt`, `Pillow`, `requests`, `croniter`, `pytz`, `discord`) — improves reproducibility and CVE audit clarity
+- **`openai>=2.0.0`** floor pinned explicitly to lock in Responses-API-compatible SDK family
+- **Bumped floors** to current-installed versions across the board (tiktoken, aiohttp, aiosqlite, pytest, pytest-asyncio, pytest-mock, pytest-env, coverage, pdfplumber, python-docx, pandas)
+- **`PyPDF2` → `pypdf`** migration: PyPDF2 was deprecated in 2022 and replaced by `pypdf` (same `PdfReader` API). Updated imports in `document_handler.py` + tests. `extraction_method` field renamed `PyPDF2_fallback` → `pypdf_fallback`.
+
+#### Removed
+- **`asyncio` from requirements.txt**: it's a stdlib module; the PyPI package is an abandoned 2015 backport that shadows stdlib
+
 ## [2.5.0] - 2026-05-11
 
 ### 🚀 Feature - GPT Image 2 Support with Per-User Model Picker
