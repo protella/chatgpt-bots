@@ -121,6 +121,7 @@ class ImageGenerationMixin:
             try:
                 image_data = await self.openai_client.generate_image(
                     prompt=enhanced_prompt,
+                    model=thread_config.get("image_model"),
                     size=thread_config.get("image_size"),
                     quality=thread_config.get("image_quality"),
                     background=thread_config.get("image_background"),
@@ -189,6 +190,7 @@ class ImageGenerationMixin:
             try:
                 image_data = await self.openai_client.generate_image(
                     prompt=prompt,
+                    model=thread_config.get("image_model"),
                     size=thread_config.get("image_size"),
                     quality=thread_config.get("image_quality"),
                     background=thread_config.get("image_background"),

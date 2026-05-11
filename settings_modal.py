@@ -936,7 +936,28 @@ class SettingsModal(LoggerMixin):
             "type": "section",
             "text": {"type": "mrkdwn", "text": "*Image Generation*"}
         })
-        
+
+        # Image model
+        selected_image_model = settings.get('image_model', config.image_model)
+        blocks.append({
+            "type": "section",
+            "block_id": "image_model_block",
+            "text": {"type": "mrkdwn", "text": "Image model:"},
+            "accessory": {
+                "type": "static_select",
+                "action_id": "image_model",
+                "placeholder": {"type": "plain_text", "text": "Select image model"},
+                "initial_option": {
+                    "text": {"type": "plain_text", "text": self._get_image_model_display_name(selected_image_model)},
+                    "value": selected_image_model
+                },
+                "options": [
+                    {"text": {"type": "plain_text", "text": "GPT Image 2"}, "value": "gpt-image-2"},
+                    {"text": {"type": "plain_text", "text": "GPT Image 1"}, "value": "gpt-image-1"}
+                ]
+            }
+        })
+
         # Image size (orientation)
         blocks.append({
             "type": "section",
@@ -981,7 +1002,21 @@ class SettingsModal(LoggerMixin):
             }
         })
 
-        # Image background
+        # Image background — filter unsupported options based on image model
+        # gpt-image-2 does not support transparent backgrounds
+        is_image_v2 = selected_image_model.startswith('gpt-image-2')
+        background_options = [
+            {"text": {"type": "plain_text", "text": "Auto"}, "value": "auto"},
+            {"text": {"type": "plain_text", "text": "Opaque"}, "value": "opaque"},
+        ]
+        if not is_image_v2:
+            background_options.insert(1, {"text": {"type": "plain_text", "text": "Transparent"}, "value": "transparent"})
+
+        # Coerce saved 'transparent' to 'auto' when v2 is active so initial_option matches a visible option
+        saved_background = settings.get('image_background', 'auto')
+        if is_image_v2 and saved_background == 'transparent':
+            saved_background = 'auto'
+
         blocks.append({
             "type": "section",
             "block_id": "image_background_block",
@@ -991,36 +1026,35 @@ class SettingsModal(LoggerMixin):
                 "action_id": "image_background",
                 "placeholder": {"type": "plain_text", "text": "Select background"},
                 "initial_option": {
-                    "text": {"type": "plain_text", "text": self._get_image_background_display(settings.get('image_background', 'auto'))},
-                    "value": settings.get('image_background', 'auto')
+                    "text": {"type": "plain_text", "text": self._get_image_background_display(saved_background)},
+                    "value": saved_background
                 },
-                "options": [
-                    {"text": {"type": "plain_text", "text": "Auto"}, "value": "auto"},
-                    {"text": {"type": "plain_text", "text": "Transparent"}, "value": "transparent"},
-                    {"text": {"type": "plain_text", "text": "Opaque"}, "value": "opaque"}
-                ]
+                "options": background_options
             }
         })
 
-        # Input fidelity for edits
-        blocks.append({
-            "type": "section",
-            "block_id": "input_fidelity_block",
-            "text": {"type": "mrkdwn", "text": "Image edit style:"},
-            "accessory": {
-                "type": "radio_buttons",
-                "action_id": "input_fidelity",
-                "initial_option": {
-                    "text": {"type": "plain_text", "text": self._get_fidelity_display(settings.get('input_fidelity', 'high'))},
-                    "value": settings.get('input_fidelity', 'high')
-                },
-                "options": [
-                    {"text": {"type": "plain_text", "text": "🎨 Preserve Original Style"}, "value": "high"},
-                    {"text": {"type": "plain_text", "text": "✨ Allow Reinterpretation"}, "value": "low"}
-                ]
-            }
-        })
+        # Input fidelity for edits — hidden on gpt-image-2 (model auto-handles fidelity)
+        if not is_image_v2:
+            blocks.append({
+                "type": "section",
+                "block_id": "input_fidelity_block",
+                "text": {"type": "mrkdwn", "text": "Image edit style:"},
+                "accessory": {
+                    "type": "radio_buttons",
+                    "action_id": "input_fidelity",
+                    "initial_option": {
+                        "text": {"type": "plain_text", "text": self._get_fidelity_display(settings.get('input_fidelity', 'high'))},
+                        "value": settings.get('input_fidelity', 'high')
+                    },
+                    "options": [
+                        {"text": {"type": "plain_text", "text": "🎨 Preserve Original Style"}, "value": "high"},
+                        {"text": {"type": "plain_text", "text": "✨ Allow Reinterpretation"}, "value": "low"}
+                    ]
+                }
+            })
         
+        blocks.append({"type": "divider"})
+
         # Vision detail level
         blocks.append({
             "type": "section",
@@ -1192,6 +1226,12 @@ class SettingsModal(LoggerMixin):
             if selected:
                 extracted['image_background'] = selected['value']
 
+        image_model_block = values.get('image_model_block', {})
+        if 'image_model' in image_model_block:
+            selected = image_model_block['image_model'].get('selected_option')
+            if selected:
+                extracted['image_model'] = selected['value']
+
         fidelity_block = values.get('input_fidelity_block', {})
         if 'input_fidelity' in fidelity_block:
             selected = fidelity_block['input_fidelity'].get('selected_option')
@@ -1344,3 +1384,12 @@ class SettingsModal(LoggerMixin):
             'opaque': 'Opaque'
         }
         return displays.get(background, 'Auto')
+
+    def _get_image_model_display_name(self, model: str) -> str:
+        """Get user-friendly image model name"""
+        displays = {
+            'gpt-image-2': 'GPT Image 2',
+            'gpt-image-1': 'GPT Image 1',
+            'gpt-image-1-mini': 'GPT Image 1 Mini',
+        }
+        return displays.get(model, model)

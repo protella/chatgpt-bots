@@ -177,3 +177,6 @@ mcp_config*.bak
 .channels_cache_v2.json
 .users_cache.json
 extract_metrics.py
+
+# Claude Image Paste screenshots
+.cp-images/

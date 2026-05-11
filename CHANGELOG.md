@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-05-11
+
+### 🚀 Feature - GPT Image 2 Support with Per-User Model Picker
+
+#### Added
+- **gpt-image-2 as default image model**: Latest OpenAI image generation model (released April 21, 2026) with agentic reasoning, near-perfect text rendering, and multilingual support
+- **Image model picker in `/settings`**: Users can toggle between `gpt-image-2` (latest) and `gpt-image-1` (legacy) per-user
+- **`image_model` column in `user_preferences`**: New schema column with automatic migration for existing databases
+- **Model-aware parameter filtering**: Dropdown options dynamically filter based on selected image model — modal rebuilds when picker changes
+
+#### Changed
+- **`GPT_IMAGE_MODEL` env var default**: `gpt-image-1` → `gpt-image-2`
+- **Backend parameter guards**: `gpt-image-2` doesn't support `background=transparent` (coerced to `auto` with warning) and ignores `input_fidelity` (auto-handled by model)
+- **UI behavior on v2 selection**: "Transparent" background option hidden; "Image edit style" radio block hidden (model auto-handles fidelity)
+
+#### Fixed
+- **OpenAIClient wrapper signatures**: Added `model` kwarg to `generate_image()` and `edit_image()` wrapper methods to propagate user selection through to API calls
+
+#### Upgrade Instructions
+Update `.env` to use the new default:
+```
+GPT_IMAGE_MODEL=gpt-image-2
+```
+Database migration runs automatically on next bot startup — adds `image_model` column to `user_preferences` with default `gpt-image-2`. Existing users keep working without intervention; can switch to `gpt-image-1` per-user via `/settings` if needed.
+
 ## [2.4.0] - 2026-03-06
 
 ### 🚀 Feature - GPT-5.4 Support with 1M Context Window

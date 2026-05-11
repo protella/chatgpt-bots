@@ -52,7 +52,7 @@ class BotConfig:
     # Model configuration
     gpt_model: str = field(default_factory=lambda: os.getenv("GPT_MODEL", "gpt-5.4"))
     utility_model: str = field(default_factory=lambda: os.getenv("UTILITY_MODEL", "gpt-5-mini"))
-    image_model: str = field(default_factory=lambda: os.getenv("GPT_IMAGE_MODEL", "gpt-image-1"))
+    image_model: str = field(default_factory=lambda: os.getenv("GPT_IMAGE_MODEL", "gpt-image-2"))
     
     # Default parameters for text generation
     default_temperature: float = field(default_factory=lambda: float(os.getenv("DEFAULT_TEMPERATURE", "0.8")))
@@ -284,8 +284,14 @@ class BotConfig:
                         user_config['slack_streaming'] = bool(user_prefs['enable_streaming'])
                     
                     # Image settings
+                    if user_prefs.get('image_model'):
+                        user_config['image_model'] = user_prefs['image_model']
                     if user_prefs.get('image_size'):
                         user_config['image_size'] = user_prefs['image_size']
+                    if user_prefs.get('image_quality'):
+                        user_config['image_quality'] = user_prefs['image_quality']
+                    if user_prefs.get('image_background'):
+                        user_config['image_background'] = user_prefs['image_background']
                     if user_prefs.get('input_fidelity'):
                         user_config['input_fidelity'] = user_prefs['input_fidelity']
                     if user_prefs.get('vision_detail'):

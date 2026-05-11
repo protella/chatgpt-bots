@@ -201,6 +201,7 @@ class DatabaseManager(LoggerMixin):
                 enable_streaming BOOLEAN DEFAULT 1,
 
                 -- Image settings
+                image_model TEXT DEFAULT 'gpt-image-2',
                 image_size TEXT DEFAULT '1024x1024',
                 image_quality TEXT DEFAULT 'auto',
                 image_background TEXT DEFAULT 'auto',
@@ -211,7 +212,7 @@ class DatabaseManager(LoggerMixin):
                 created_at INTEGER DEFAULT (strftime('%s', 'now')),
                 updated_at INTEGER DEFAULT (strftime('%s', 'now')),
                 settings_completed BOOLEAN DEFAULT 0,
-                
+
                 FOREIGN KEY (slack_user_id) REFERENCES users(user_id)
             )
         """)
@@ -348,6 +349,7 @@ class DatabaseManager(LoggerMixin):
                         enable_streaming BOOLEAN DEFAULT 1,
                         
                         -- Image settings
+                        image_model TEXT DEFAULT 'gpt-image-2',
                         image_size TEXT DEFAULT '1024x1024',
                         image_quality TEXT DEFAULT 'auto',
                         image_background TEXT DEFAULT 'auto',
@@ -407,6 +409,19 @@ class DatabaseManager(LoggerMixin):
                 """)
                 self.conn.commit()
                 self.log_info("DB: Successfully added enable_mcp column")
+
+            # Check if image_model column exists in user_preferences table
+            cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
+            columns = [col[1] for col in cursor.fetchall()]
+
+            if 'image_model' not in columns:
+                self.log_info("DB: Adding image_model column to user_preferences table")
+                self.conn.execute("""
+                    ALTER TABLE user_preferences
+                    ADD COLUMN image_model TEXT DEFAULT 'gpt-image-2'
+                """)
+                self.conn.commit()
+                self.log_info("DB: Successfully added image_model column")
 
             # Check if mcp_tools table exists
             cursor = self.conn.execute("""
@@ -845,6 +860,7 @@ class DatabaseManager(LoggerMixin):
             'top_p': config.default_top_p,
             'enable_web_search': config.enable_web_search,
             'enable_streaming': config.enable_streaming,
+            'image_model': config.image_model,
             'image_size': config.default_image_size,
             'image_quality': config.default_image_quality,
             'image_background': config.default_image_background,
@@ -859,14 +875,15 @@ class DatabaseManager(LoggerMixin):
                 INSERT INTO user_preferences
                 (slack_user_id, slack_email, model, reasoning_effort, verbosity,
                  temperature, top_p, enable_web_search, enable_streaming,
-                 image_size, image_quality, image_background, input_fidelity, vision_detail, settings_completed)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 image_model, image_size, image_quality, image_background, input_fidelity, vision_detail, settings_completed)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 user_id, email, defaults['model'],
                 defaults['reasoning_effort'], defaults['verbosity'],
                 defaults['temperature'], defaults['top_p'],
                 1 if defaults['enable_web_search'] else 0,
                 1 if defaults['enable_streaming'] else 0,
+                defaults['image_model'],
                 defaults['image_size'], defaults['image_quality'],
                 defaults['image_background'], defaults['input_fidelity'],
                 defaults['vision_detail'], 0
@@ -1091,6 +1108,7 @@ class DatabaseManager(LoggerMixin):
             "top_p": config.default_top_p,
             "reasoning_effort": config.default_reasoning_effort,
             "verbosity": config.default_verbosity,
+            "image_model": config.image_model,
             "image_size": config.default_image_size,
             "image_quality": config.default_image_quality,
             "image_background": config.default_image_background,
@@ -1278,6 +1296,7 @@ class DatabaseManager(LoggerMixin):
             "top_p": bot_config.default_top_p,
             "reasoning_effort": bot_config.default_reasoning_effort,
             "verbosity": bot_config.default_verbosity,
+            "image_model": bot_config.image_model,
             "image_size": bot_config.default_image_size,
             "image_quality": bot_config.default_image_quality,
             "image_background": bot_config.default_image_background,
@@ -1885,15 +1904,16 @@ class DatabaseManager(LoggerMixin):
                     model, temperature, top_p,
                     enable_web_search, enable_streaming,
                     reasoning_effort, verbosity,
-                    image_size, image_quality, image_background,
+                    image_model, image_size, image_quality, image_background,
                     input_fidelity, vision_detail
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 user_id, email,
                 config.gpt_model, config.default_temperature, config.default_top_p,
                 1 if config.enable_web_search else 0,
                 1 if config.enable_streaming else 0,
                 config.default_reasoning_effort, config.default_verbosity,
+                config.image_model,
                 config.default_image_size, config.default_image_quality, config.default_image_background,
                 config.default_input_fidelity, config.default_detail_level
             ))
@@ -1982,7 +2002,7 @@ class DatabaseManager(LoggerMixin):
 
             # Handle regular fields
             for field in ['model', 'reasoning_effort', 'verbosity', 'temperature',
-                         'top_p', 'image_size', 'image_quality', 'image_background',
+                         'top_p', 'image_model', 'image_size', 'image_quality', 'image_background',
                          'input_fidelity', 'vision_detail',
                          'slack_email', 'settings_completed', 'custom_instructions']:
                 if field in preferences:
