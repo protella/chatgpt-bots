@@ -10,9 +10,15 @@ from prompts import IMAGE_EDIT_SYSTEM_PROMPT, IMAGE_GEN_SYSTEM_PROMPT
 from ..utilities import ImageData
 
 
+def _is_v2(model_id: str) -> bool:
+    """Return True if model is gpt-image-2 family (different param surface than v1)."""
+    return bool(model_id) and model_id.startswith("gpt-image-2")
+
+
 async def generate_image(
     client,
     prompt: str,
+    model: Optional[str] = None,
     size: Optional[str] = None,
     quality: Optional[str] = None,
     background: Optional[str] = None,
@@ -21,14 +27,16 @@ async def generate_image(
     enhance_prompt: bool = True,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> ImageData:
-    """Generate an image using gpt-image-1.5 model.
+    """Generate an image using OpenAI image model (gpt-image-1, gpt-image-1-mini, gpt-image-2).
 
     Args:
         client: OpenAI client instance
         prompt: Text description of the image to generate
+        model: Image model ID. Defaults to config.image_model.
         size: Image dimensions (1024x1024, 1024x1536, 1536x1024, auto)
         quality: Rendering quality (low, medium, high) - affects cost and detail
-        background: Background type (auto, transparent, opaque)
+        background: Background type (auto, transparent, opaque). gpt-image-2 does NOT
+            support transparent — coerced to auto with a warning.
         format: Output format (png, jpeg, webp)
         compression: Compression level for jpeg/webp (0-100)
         enhance_prompt: Whether to enhance the prompt with AI
@@ -40,21 +48,29 @@ async def generate_image(
     self = client
 
     # Apply defaults from config
+    effective_model = model or config.image_model
     size = size or config.default_image_size
     quality = quality or config.default_image_quality
     background = background or config.default_image_background
+
+    # gpt-image-2 does not support transparent backgrounds — coerce to auto
+    if _is_v2(effective_model) and background == "transparent":
+        self.log_warning(
+            "gpt-image-2 does not support background=transparent; falling back to auto"
+        )
+        background = "auto"
 
     # Enhance prompt if requested
     enhanced_prompt = prompt
     if enhance_prompt:
         enhanced_prompt = await self._enhance_image_prompt(prompt, conversation_history)
 
-    self.log_info(f"Generating image: {prompt[:100]}...")
+    self.log_info(f"Generating image with {effective_model}: {prompt[:100]}...")
 
     try:
         # Build parameters for images.generate
         params = {
-            "model": config.image_model,
+            "model": effective_model,
             "prompt": enhanced_prompt,
             "n": 1,
             "size": size,
@@ -364,6 +380,7 @@ async def edit_image(
     client,
     input_images: List[str],
     prompt: str,
+    model: Optional[str] = None,
     input_mimetypes: Optional[List[str]] = None,
     image_description: Optional[str] = None,
     input_fidelity: str = "low",
@@ -374,7 +391,11 @@ async def edit_image(
     enhance_prompt: bool = True,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> ImageData:
-    """Edit or combine images using gpt-image-1.5 model."""
+    """Edit or combine images using OpenAI image model.
+
+    Supports gpt-image-1, gpt-image-1-mini, gpt-image-2. gpt-image-2 ignores
+    input_fidelity (auto-handled) and rejects background=transparent.
+    """
 
     self = client
     # Limit to 16 images
@@ -382,8 +403,18 @@ async def edit_image(
         self.log_warning(f"Limiting to 16 images for editing (received {len(input_images)})")
         input_images = input_images[:16]
 
+    # Resolve model + apply v2 param guards
+    effective_model = model or config.image_model
+
     # Default background
     background = background or config.default_image_background
+
+    # gpt-image-2 does not support transparent backgrounds
+    if _is_v2(effective_model) and background == "transparent":
+        self.log_warning(
+            "gpt-image-2 does not support background=transparent; falling back to auto"
+        )
+        background = "auto"
 
     # Enhance prompt if requested
     enhanced_prompt = prompt
@@ -399,7 +430,7 @@ async def edit_image(
             # Fallback to regular enhancement if no description
             enhanced_prompt = await self._enhance_image_prompt(prompt, conversation_history)
 
-    self.log_info(f"Editing {len(input_images)} image(s): {prompt[:100]}...")
+    self.log_info(f"Editing {len(input_images)} image(s) with {effective_model}: {prompt[:100]}...")
 
     try:
         # Convert base64 to BytesIO objects with proper file extension
@@ -428,14 +459,19 @@ async def edit_image(
 
         # Build parameters for images.edit
         params = {
-            "model": config.image_model,  # gpt-image-1
+            "model": effective_model,
             "image": image_files if len(image_files) > 1 else image_files[0],
             "prompt": enhanced_prompt,
-            "input_fidelity": input_fidelity,
             "background": background,
             "output_format": output_format,
             "n": 1,
         }
+
+        # input_fidelity is auto-handled on gpt-image-2; only send for v1 family
+        if not _is_v2(effective_model):
+            params["input_fidelity"] = input_fidelity
+        else:
+            self.log_debug("gpt-image-2 auto-handles fidelity; omitting input_fidelity param")
 
         # Only add compression for JPEG/WebP (PNG must be 100)
         if output_format in ["jpeg", "webp"]:

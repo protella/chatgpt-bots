@@ -521,14 +521,16 @@ class SlackSettingsHandlersMixin:
         
         # Register modal action handlers (for dynamic updates)
         @self.app.action("model_select")
+        @self.app.action("image_model")  # Reshapes modal (filters background options, hides input_fidelity on v2)
         async def handle_model_change(ack, body, client):
             """Handle model selection changes for dynamic modal updates"""
             await ack()
-            
+
             user_id = body['user']['id']
+            action_id = body['actions'][0].get('action_id', 'model_select')
             selected_model = body['actions'][0]['selected_option']['value']
-            
-            self.log_info(f"Model selection changed to {selected_model} for user {user_id}")
+
+            self.log_info(f"{action_id} changed to {selected_model} for user {user_id}")
 
             # Get session data from database
             session_data = await self._get_session_data(body)

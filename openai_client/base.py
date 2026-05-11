@@ -437,6 +437,7 @@ class OpenAIClient(LoggerMixin):
     async def generate_image(
         self,
         prompt: str,
+        model: Optional[str] = None,
         size: Optional[str] = None,
         quality: Optional[str] = None,
         background: Optional[str] = None,
@@ -448,6 +449,7 @@ class OpenAIClient(LoggerMixin):
         return await image_api.generate_image(
             self,
             prompt=prompt,
+            model=model,
             size=size,
             quality=quality,
             background=background,
@@ -521,6 +523,7 @@ class OpenAIClient(LoggerMixin):
         self,
         input_images: List[str],
         prompt: str,
+        model: Optional[str] = None,
         input_mimetypes: Optional[List[str]] = None,
         image_description: Optional[str] = None,
         input_fidelity: str = "low",
@@ -535,6 +538,7 @@ class OpenAIClient(LoggerMixin):
             self,
             input_images=input_images,
             prompt=prompt,
+            model=model,
             input_mimetypes=input_mimetypes,
             image_description=image_description,
             input_fidelity=input_fidelity,

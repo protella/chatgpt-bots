@@ -262,6 +262,7 @@ class ImageEditMixin:
                             edited_image = await self.openai_client.edit_image(
                                 input_images=[base64_data],
                                 prompt=enhanced_edit_prompt,
+                                model=thread_config.get("image_model"),
                                 image_description=None,  # Already used for enhancement
                                 input_mimetypes=["image/png"],
                                 input_fidelity=thread_config.get("input_fidelity", "high"),
@@ -292,6 +293,7 @@ class ImageEditMixin:
                         edited_image = await self.openai_client.edit_image(
                             input_images=[base64_data],
                             prompt=text,
+                            model=thread_config.get("image_model"),
                             image_description=image_description,
                             input_mimetypes=["image/png"],
                             input_fidelity=thread_config.get("input_fidelity", "high"),
@@ -604,6 +606,7 @@ class ImageEditMixin:
                     input_images=input_images,
                     input_mimetypes=input_mimetypes,
                     prompt=enhanced_edit_prompt,  # Use the pre-enhanced prompt
+                    model=thread_config.get("image_model"),
                     image_description=None,  # Don't pass description since we already enhanced
                     input_fidelity=thread_config.get("input_fidelity", "high"),
                     background=thread_config.get("image_background", "auto"),
@@ -647,6 +650,7 @@ class ImageEditMixin:
                     input_images=input_images,
                     input_mimetypes=input_mimetypes,
                     prompt=user_edit_request,  # Just the user's request
+                    model=thread_config.get("image_model"),
                     image_description=image_analysis,  # The analyzed description
                     input_fidelity=thread_config.get("input_fidelity", "high"),
                     background=thread_config.get("image_background", "auto"),
