@@ -434,6 +434,26 @@ class DatabaseManager(LoggerMixin):
                     f"{row_count} existing user(s) to gpt-image-2"
                 )
 
+            # One-time backfill: mark long-standing users as settings_completed.
+            # Earlier versions of the bot only flipped settings_completed=True when
+            # the user saved with "global" scope. Users who only ever saved thread-scope
+            # configs kept getting the "Please configure your settings" warning on every
+            # DM. Backfill anyone whose row was created more than 24h ago — if they've
+            # been around that long, they know the bot exists and don't need the gate.
+            cursor = self.conn.execute("""
+                UPDATE user_preferences
+                SET settings_completed = 1
+                WHERE settings_completed = 0
+                  AND created_at IS NOT NULL
+                  AND created_at < (strftime('%s', 'now') - 86400)
+            """)
+            backfilled = cursor.rowcount
+            if backfilled:
+                self.conn.commit()
+                self.log_info(
+                    f"DB: Backfilled settings_completed=1 for {backfilled} pre-existing user(s)"
+                )
+
             # Check if mcp_tools table exists
             cursor = self.conn.execute("""
                 SELECT name FROM sqlite_master
