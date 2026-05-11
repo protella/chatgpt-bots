@@ -315,8 +315,17 @@ class ImageURLHandler:
         failed_urls = []
 
         for url in urls:
-            # Check if this is a Slack file URL that needs auth
-            is_slack_url = 'slack.com/files/' in url or 'slack-files.com' in url
+            # Check if this is a Slack file URL that needs auth.
+            # Parse the hostname instead of substring-matching to avoid attacker URLs
+            # like https://evil.com/slack.com/files/ smuggling the auth token off-platform.
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+            is_slack_url = (
+                host == "slack.com"
+                or host.endswith(".slack.com")
+                or host == "slack-files.com"
+                or host.endswith(".slack-files.com")
+            )
             token_to_use = auth_token if is_slack_url else None
 
             # Debug logging

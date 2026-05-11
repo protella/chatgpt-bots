@@ -171,7 +171,7 @@ def run_comprehensive_test():
     print("INTENT CLASSIFICATION COMPREHENSIVE TEST")
     print("="*80)
     print(f"Using model: {config.utility_model}")
-    print(f"API Key: {config.openai_api_key[:20]}...")
+    print(f"API Key: {'set' if config.openai_api_key else 'MISSING'}")
     print("="*80)
     
     # Initialize client
