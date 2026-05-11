@@ -250,7 +250,13 @@ class SlackSettingsHandlersMixin:
                 channel_id, thread_ts = thread_id.split(':')
                 await self.db.get_or_create_thread_async(thread_id, channel_id)
                 await self.db.save_thread_config_async(thread_id, thread_settings)
-                
+
+                # Also flag the user as onboarded — saving any scope of settings is signal
+                # enough that the user knows about /settings and doesn't need the welcome
+                # warning anymore. Without this, users who only ever save thread-scope
+                # configs keep seeing "Please configure your settings" on every DM.
+                await self.db.update_user_preferences_async(user_id, {'settings_completed': True})
+
                 # Update memory cache immediately if processor is available
                 if hasattr(self, 'processor') and self.processor:
                     try:
@@ -261,7 +267,7 @@ class SlackSettingsHandlersMixin:
                             self.log_debug(f"Thread config updated in memory for {thread_id}")
                     except Exception as e:
                         self.log_debug(f"Could not update thread config in memory: {e}")
-                
+
                 success = True
                 save_location = "thread"
                 self.log_info(f"Thread settings saved for {thread_id}: {thread_settings}")
