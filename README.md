@@ -21,6 +21,25 @@ DEFAULT_IMAGE_BACKGROUND=auto  # Valid values: auto, transparent, opaque
 ```
 The old `DEFAULT_IMAGE_STYLE` setting has been removed (was DALL-E 3 only). Old quality values will cause API errors.
 
+### ⚠️ Important: Upgrading to v2.5.0
+This release introduces three things you need to know about:
+
+1. **Image model defaults to `gpt-image-2`** (latest OpenAI image model). Update your `.env`:
+   ```
+   GPT_IMAGE_MODEL=gpt-image-2
+   ```
+   Existing users are auto-migrated to v2 on first startup. Users can pick `gpt-image-1` per-user in `/settings` if needed.
+
+2. **Dependency layout changed to pip-tools**. Install command:
+   ```bash
+   make install   # NEW canonical command (uses --require-hashes against the lockfile)
+   ```
+   `pip install -r requirements.txt` still works but loses hash verification. See [Installing Dependencies](#installing-dependencies) for the new add/upgrade workflow.
+
+3. **`PyPDF2` replaced with `pypdf`** — same `PdfReader` API, transparent migration. If you patched `document_handler.py` locally, the import is now `import pypdf` and the call is `pypdf.PdfReader(...)`.
+
+Database schema changes (new `image_model` column + `settings_completed` backfill) run automatically on startup. Back up `data/slack.db` before deploying.
+
 ## Getting Started
 
 ### Requirements
