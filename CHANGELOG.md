@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 🐛 Bug Fix - "Please configure your settings" Warning Loop
+
+#### Fixed
+- **Thread-scope save now flags user as onboarded**: Previously, saving `/settings` with scope = "thread" updated only the thread config and never flipped `user_preferences.settings_completed`. Users who only ever saved in-thread kept seeing the "⚠️ Please configure your settings" reminder on every DM, forever. Now any save (thread or global) marks the user as onboarded.
+- **One-time backfill on startup**: Any user whose `user_preferences` row was created more than 24 hours ago is auto-flagged `settings_completed=1`. Long-standing users who got stuck in the warning loop are unstuck immediately on the next deploy. New users (<24h) still see the welcome flow as intended.
+
 ### 🔧 Improvement - Dependency Hygiene + pip-tools Lockfile
 
 #### Added
