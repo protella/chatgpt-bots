@@ -36,9 +36,9 @@ class TestDocumentHandler:
         """Test that PDF parsing libraries are available"""
         # Since we removed dynamic checking, these should always be imported
         import pdfplumber
-        import PyPDF2
+        import pypdf
         assert pdfplumber is not None
-        assert PyPDF2 is not None
+        assert pypdf is not None
     
     def test_docx_parsing_available(self, handler):
         """Test that DOCX parsing libraries are available"""
@@ -224,16 +224,16 @@ class TestDocumentHandlerPDFParsing:
         handler = DocumentHandler()
         return handler
     
-    @patch('document_handler.PyPDF2.PdfReader')
+    @patch('document_handler.pypdf.PdfReader')
     @patch('document_handler.pdfplumber.open')
     def test_parse_pdf_no_libraries(self, mock_pdfplumber_open, mock_pypdf2_reader, handler):
         """Test PDF parsing when no libraries are available"""
         # Make both libraries fail
         mock_pdfplumber_open.side_effect = Exception("pdfplumber not available")
-        mock_pypdf2_reader.side_effect = Exception("PyPDF2 not available")
-        
+        mock_pypdf2_reader.side_effect = Exception("pypdf not available")
+
         # Should raise an exception when both libraries fail
-        with pytest.raises(Exception, match="PyPDF2 parsing failed"):
+        with pytest.raises(Exception, match="pypdf parsing failed"):
             handler.parse_pdf_structured(b'pdf data', 'test.pdf')
     
     @patch('document_handler.pdfplumber.open')
@@ -262,26 +262,26 @@ class TestDocumentHandlerPDFParsing:
         assert 'Sample text from page 1' in result['content']
         assert '[Page 1]' in result['content']
     
-    @patch('document_handler.PyPDF2.PdfReader')
+    @patch('document_handler.pypdf.PdfReader')
     @patch('document_handler.pdfplumber.open')
     def test_parse_pdf_with_pypdf2_fallback(self, mock_pdfplumber_open, mock_pypdf2_reader, handler_with_pypdf2):
-        """Test PDF parsing with PyPDF2 fallback"""
+        """Test PDF parsing with pypdf fallback"""
         # Make pdfplumber fail
         mock_pdfplumber_open.side_effect = Exception("pdfplumber failed")
-        
-        # Mock PyPDF2 objects
+
+        # Mock pypdf objects
         mock_page = Mock()
         mock_page.extract_text.return_value = "Page text"
-        
+
         mock_reader = Mock()
         mock_reader.pages = [mock_page]
-        
+
         mock_pypdf2_reader.return_value = mock_reader
-        
+
         result = handler_with_pypdf2.parse_pdf_structured(b'pdf data', 'test.pdf')
-        
+
         assert result['format'] == 'pdf'
-        assert result['extraction_method'] == 'PyPDF2_fallback'
+        assert result['extraction_method'] == 'pypdf_fallback'
         assert result['has_tables'] is False
         assert 'Page text' in result['content']
     
