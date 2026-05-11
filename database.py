@@ -420,8 +420,19 @@ class DatabaseManager(LoggerMixin):
                     ALTER TABLE user_preferences
                     ADD COLUMN image_model TEXT DEFAULT 'gpt-image-2'
                 """)
+                # Explicitly set all existing rows to gpt-image-2. The DEFAULT clause
+                # above already does this on SQLite, but make the one-time bulk swap
+                # explicit so the intent is unambiguous and the row count gets logged.
+                # This runs exactly once (the surrounding `if` block guarantees it).
+                cursor = self.conn.execute(
+                    "UPDATE user_preferences SET image_model = 'gpt-image-2'"
+                )
+                row_count = cursor.rowcount
                 self.conn.commit()
-                self.log_info("DB: Successfully added image_model column")
+                self.log_info(
+                    f"DB: Successfully added image_model column and migrated "
+                    f"{row_count} existing user(s) to gpt-image-2"
+                )
 
             # Check if mcp_tools table exists
             cursor = self.conn.execute("""
