@@ -114,10 +114,13 @@ def test_system_prompt_no_memory_block_when_absent():
 async def test_build_channel_memory_text_formats_rows():
     proc = _utils()
     proc.db = MagicMock()
-    proc.db.get_channel_memory_async = AsyncMock(return_value=[{"content": "fact one"}, {"content": "fact two"}])
+    proc.db.get_channel_memory_async = AsyncMock(
+        return_value=[{"id": 1, "content": "fact one"}, {"id": 2, "content": "fact two"}]
+    )
     with patch.object(config, "enable_channel_memory", True):
         text = await proc._build_channel_memory_text("C1")
-    assert text == "- fact one\n- fact two"
+    # Phase C: [#id] prefixes so the model can target update_fact/forget_fact
+    assert text == "- [#1] fact one\n- [#2] fact two"
 
 
 async def test_build_channel_memory_text_none_when_empty():
