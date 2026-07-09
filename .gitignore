@@ -180,3 +180,6 @@ extract_metrics.py
 
 # Claude Image Paste screenshots
 .cp-images/
+
+# Slack app manifest (environment-specific; use slack_app_manifest.example.yml as template)
+slack_app_manifest.yml

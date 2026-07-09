@@ -28,13 +28,23 @@ class Message:
 @dataclass
 class Response:
     """Universal response format"""
-    type: str  # 'text', 'image', 'file'
+    type: str  # 'text', 'image', 'file', 'reaction', 'error'
     content: Any
     metadata: Dict[str, Any] = None
-    
+
     def __post_init__(self):
         if self.metadata is None:
             self.metadata = {}
+
+    @classmethod
+    def reaction(cls, emoji: Any, target_ts: Optional[str] = None) -> "Response":
+        """Build a reaction response (Phase 4).
+
+        Args:
+            emoji: an emoji name or list of names (colons optional)
+            target_ts: the message timestamp to react to (defaults to the thread root)
+        """
+        return cls(type="reaction", content=emoji, metadata={"react_ts": target_ts} if target_ts else {})
 
 
 class BaseClient(ABC, LoggerMixin):
@@ -100,6 +110,10 @@ class BaseClient(ABC, LoggerMixin):
 
     async def update_message_async(self, channel_id: str, message_id: str, text: str) -> bool:
         """Update a message (async version - optional)"""
+        return False
+
+    async def react(self, channel_id: str, message_ts: str, emoji: str) -> bool:
+        """Add an emoji reaction to a message (optional capability; default no-op)."""
         return False
 
     @abstractmethod

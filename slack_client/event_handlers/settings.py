@@ -113,6 +113,71 @@ class SlackSettingsHandlersMixin:
                 except Exception:
                     pass
         
+        # --- Phase 7: per-channel settings modal, opened from the response footer button ---
+        # ANY channel member may open Configure and save — no admin gating, no membership lookups.
+        @self.app.action("open_channel_settings")
+        async def handle_open_channel_settings(ack, body, client):
+            """Footer '⚙️ Configure' button → open the per-channel settings modal.
+
+            trigger_ids expire in ~3s, so ack and views_open immediately with no slow work first.
+            """
+            await ack()
+            trigger_id = body.get('trigger_id')
+            channel_id = ((body.get('container') or {}).get('channel_id')
+                          or (body.get('channel') or {}).get('id'))
+            user_id = (body.get('user') or {}).get('id')
+            if not trigger_id or not channel_id or channel_id.startswith('D'):
+                return
+            try:
+                current = await self.db.get_channel_settings_async(channel_id)
+                global_default = getattr(config, 'channel_response_mode', 'tag_only')
+                modal = self.settings_modal.build_channel_settings_modal(channel_id, current, global_default)
+                await client.views_open(trigger_id=trigger_id, view=modal)
+                self.log_info(f"Channel settings modal opened for {channel_id} by {user_id} (footer button)")
+            except Exception as e:
+                self.log_error(f"Error opening channel settings modal from footer: {e}")
+
+        @self.app.view("channel_settings_modal")
+        async def handle_channel_settings_submission(ack, body, view, client):
+            """Persist per-channel settings. 'inherit' clears the override (NULL → global default)."""
+            await ack()
+            user_id = body['user']['id']
+            metadata = json.loads(view.get('private_metadata', '{}'))
+            channel_id = metadata.get('channel_id')
+            if not channel_id:
+                return
+
+            state = view.get('state', {}).get('values', {})
+            sel = state.get('response_mode_block', {}).get('response_mode', {}).get('selected_option') or {}
+            mode_sel = sel.get('value', 'inherit')
+            response_mode = None if mode_sel == 'inherit' else mode_sel
+
+            dir_raw = state.get('directives_block', {}).get('directives', {}).get('value')
+            directives = dir_raw.strip() if dir_raw and dir_raw.strip() else None
+
+            ric_selected = state.get('reply_in_channel_block', {}).get('reply_in_channel', {}).get('selected_options') or []
+            reply_in_channel = len(ric_selected) > 0
+
+            try:
+                await self.db.set_channel_settings_async(
+                    channel_id,
+                    response_mode=response_mode,  # None → clears override
+                    directives=directives,        # None → clears
+                    reply_in_channel=reply_in_channel,
+                    updated_by=user_id,
+                )
+                effective = mode_sel if mode_sel != 'inherit' else f"inherit ({getattr(config, 'channel_response_mode', 'tag_only')})"
+                self.log_info(f"Channel settings saved for {channel_id} by {user_id}: mode={mode_sel}")
+                try:
+                    await client.chat_postEphemeral(
+                        channel=channel_id, user=user_id,
+                        text=f"✅ Channel settings saved. Response mode: *{effective}*."
+                    )
+                except Exception:
+                    pass
+            except Exception as e:
+                self.log_error(f"Error saving channel settings for {channel_id}: {e}")
+
         # Register modal submission handlers
         @self.app.view("settings_modal")
         @self.app.view("welcome_settings_modal")

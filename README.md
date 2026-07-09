@@ -63,11 +63,11 @@ The setup of a Slack or Discord App is out of scope of this README. There's plen
   
 ### Slack quickstart guide: https://api.slack.com/start/quickstart
 
-You can use the included `slack_app_manifest.yml` file to quickly configure your Slack app with all required settings. Simply:
+You can use the included `slack_app_manifest.example.yml` template (copy it to `slack_app_manifest.yml`, which is gitignored, and customize per environment) to quickly configure your Slack app with all required settings. Simply:
 1. Create a new Slack app at https://api.slack.com/apps
 2. Choose "From an app manifest"
 3. Select your workspace
-4. Paste the contents of `slack_app_manifest.yml`
+4. Paste the contents of your customized `slack_app_manifest.yml`
 5. Review and create the app
 6. **Enable Socket Mode** in your app settings (required - no webhook URLs needed)
 7. Generate an App-Level Token with `connections:write` scope
@@ -117,7 +117,7 @@ The bot includes a message shortcut for thread-specific settings:
 - **Where**: Messages -> Message shortcuts menu (three dots on any message)
 
 #### Note on User Scopes:
-The bot uses only **Bot Token** authentication. User scopes listed in `slack_app_manifest.yml` are optional and not utilized by the current implementation. You can safely remove them from your app configuration if desired, or leave them for potential future features.
+The bot uses only **Bot Token** authentication. User scopes listed in the manifest are optional and not utilized by the current implementation. You can safely remove them from your app configuration if desired, or leave them for potential future features.
 
 ---
 

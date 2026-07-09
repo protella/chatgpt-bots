@@ -77,6 +77,51 @@ class SlackUtilitiesMixin:
         if self._session and not self._session.closed:
             await self._session.close()
             self.log_debug("SlackUtilities aiohttp session closed")
+
+    async def _ensure_self_identity(self) -> None:
+        """Resolve and cache the bot's own identity (user_id + bot_id) via auth_test.
+
+        Called once on start. Idempotent and best-effort: failures are logged and leave the
+        identity unset (callers degrade gracefully). app_id is left for opportunistic capture
+        from inbound events (auth.test does not return it)."""
+        if self.bot_user_id:
+            return
+        try:
+            resp = await self.app.client.auth_test()
+            if resp.get("ok"):
+                self.bot_user_id = resp.get("user_id")
+                self.bot_id = resp.get("bot_id")
+                self.log_info(f"Resolved bot self-identity: user_id={self.bot_user_id}, bot_id={self.bot_id}")
+            else:
+                self.log_warning(f"auth_test returned not ok: {resp.get('error')}")
+        except Exception as e:
+            self.log_warning(f"Could not resolve bot self-identity via auth_test: {e}")
+
+    def is_own_message(self, msg: dict) -> bool:
+        """True if a Slack event/history-message dict was posted by this bot itself."""
+        if not isinstance(msg, dict):
+            return False
+        if self.bot_id and msg.get("bot_id") == self.bot_id:
+            return True
+        if self.bot_user_id and msg.get("user") == self.bot_user_id:
+            return True
+        if self.app_id and (msg.get("app_id") == self.app_id or msg.get("api_app_id") == self.app_id):
+            return True
+        return False
+
+    def classify_sender(self, msg: dict) -> str:
+        """Classify a Slack event/history-message dict as 'self', 'other_bot', or 'human'.
+
+        Keys on bot_id/app_id PRESENCE (not subtype == 'bot_message', which misses
+        app-posted messages)."""
+        if not isinstance(msg, dict):
+            return "human"
+        if self.is_own_message(msg):
+            return "self"
+        if msg.get("bot_id") or msg.get("app_id") or msg.get("api_app_id"):
+            return "other_bot"
+        return "human"
+
     async def get_username(self, user_id: str, client) -> str:
         """Get username from user ID, with caching"""
         # Check memory cache first

@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 🤝 Feature - Claude-style Channel Participation (flagged off by default)
+
+#### Added
+- **Channel-wide listening** behind `ENABLE_CHANNEL_LISTENING` (default off) with a wake-classifier gate (respond / react / ignore) and per-channel `tag_only` / `auto_respond` / `off` modes
+- **Emoji reactions** as a response type (`ENABLE_REACTIONS`)
+- **Per-channel settings**: model footer with a ⚙️ Configure button under channel responses opens a channel settings modal (mode, directives, reply placement; "inherit" falls back to global defaults)
+- **Per-channel memory**: bot extracts durable facts after responses and recalls them in later threads in the same channel (`ENABLE_CHANNEL_MEMORY`)
+- **Agent split-view surface**: greeting, suggested prompts, and thread titles in Slack's agent/assistant view
+- **Native status indicator** (`assistant.threads.setStatus`) and a native streaming session capability (`SLACK_NATIVE_STREAMING`, off until validated)
+- **Privacy-scoped Slack history-fetch tool** executor (public or bot-member channels only; model wiring is follow-up)
+- `slack_app_manifest.example.yml` template with the new events/scopes; environment-specific `slack_app_manifest.yml` is now gitignored
+
+#### Fixed
+- **Multi-bot history corruption**: other bots' messages (e.g. Claude) were rebuilt as the bot's own assistant turns; now only our own messages map to assistant
+- **@mention tagging**: inbound mentions are resolved to names and outbound `@Name` references become real clickable mentions
+- **Onboarding nag**: bot-sent messages no longer trigger the "configure your settings" prompt
+
+#### Changed
+- All new behavior is env-flagged with sane defaults, documented in `.env.example`
+- Dependencies upgraded via `make lock-upgrade` (openai 2.44, slack-sdk 3.42, etc.)
+
 ## [2.5.1] - 2026-05-11
 
 ### 🚀 Feature - GPT-5.5 Support
