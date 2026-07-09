@@ -26,31 +26,36 @@ class ThreadState:
     pending_clarification: Optional[Dict[str, Any]] = None
     had_timeout: bool = False  # Track if this thread had a timeout for user notification
     has_trimmed_messages: bool = False  # Track if messages have been trimmed from this thread
+    has_summary_head: bool = False  # Phase S: a compaction summary head message is present
     has_shown_80_percent_warning: bool = False  # Track if we've shown the 80% context warning
     current_model: str = field(default_factory=lambda: config.gpt_model)  # Track current model for token limits
     participants: Dict[str, str] = field(default_factory=dict)  # user_id -> display name, for the @mention roster
     
     def add_message(self, role: str, content: Any, db = None, thread_key: str = None, message_ts: str = None, metadata: Dict[str, Any] = None, token_counter: Optional[TokenCounter] = None, max_tokens: int = None):
-        """Add a message to the thread history with optional metadata and token management"""
+        """Add a message to the thread history with optional metadata and token management.
+
+        Phase S: messages are NOT persisted — Slack is the only transcript and state is
+        rebuilt from conversations.replies on cold load. The db/thread_key params are kept
+        for signature compatibility. message_ts is stamped into the message metadata so
+        hidden-context injection (image analyses) and summary boundaries can key on it.
+        """
         msg = {
             "role": role,
             "content": content
         }
-        
-        # Add metadata if provided
-        if metadata:
-            msg["metadata"] = metadata
-        
+
+        # Add metadata if provided; stamp the Slack ts so in-memory state carries it
+        if metadata or message_ts:
+            msg["metadata"] = dict(metadata) if metadata else {}
+            if message_ts and "ts" not in msg["metadata"]:
+                msg["metadata"]["ts"] = message_ts
+
         self.messages.append(msg)
         self.last_activity = time.time()
-        
+
         # Check token limit and trim if necessary
         if token_counter and max_tokens:
             self._trim_to_token_limit(token_counter, max_tokens, db, thread_key)
-        
-        # Save to database if available (message_ts is only stored in DB for linking)
-        if db and thread_key:
-            db.cache_message(thread_key, role, content, message_ts, metadata)
     
     def _trim_to_token_limit(self, token_counter: TokenCounter, max_tokens: int, db = None, thread_key: str = None):
         """Trim messages to fit within token limit"""
@@ -87,13 +92,7 @@ class ThreadState:
                 logger.warning("Cannot trim further - would remove current message")
                 break
         
-        # Delete from database if available
         if removed_count > 0:
-            if db and thread_key:
-                # Delete the oldest N non-system messages from database
-                db.delete_oldest_messages(thread_key, removed_count)
-                logger.debug(f"Deleted {removed_count} oldest messages from database for thread {thread_key}")
-            
             logger.info(f"Trimmed {removed_count} messages to fit token limit")
     
     def get_recent_messages(self, count: int = 6) -> List[Dict[str, Any]]:
@@ -489,7 +488,9 @@ class ThreadStateManager(LoggerMixin):
                     channel_id=channel_id
                 )
                 
-                # If database available, check for persisted state
+                # If database available, load thread CONFIG only. Phase S: no message
+                # cache — a fresh thread state starts empty and the processor rebuilds
+                # the transcript from Slack (conversations.replies) on first use.
                 if self.db:
                     # Get or create in database
                     self.db.get_or_create_thread(thread_key, channel_id, user_id)
@@ -498,22 +499,7 @@ class ThreadStateManager(LoggerMixin):
                     thread_config = self.db.get_thread_config(thread_key)
                     if thread_config:
                         thread_state.config_overrides = thread_config
-                    
-                    # Load cached messages from database
-                    cached_messages = self.db.get_cached_messages(thread_key)
-                    if cached_messages:
-                        # Convert DB format to thread format
-                        for msg in cached_messages:
-                            message_dict = {
-                                "role": msg["role"],
-                                "content": msg["content"]
-                            }
-                            # Include metadata if present
-                            if msg.get("metadata"):
-                                message_dict["metadata"] = msg["metadata"]
-                            thread_state.messages.append(message_dict)
-                        self.log_debug(f"Loaded {len(cached_messages)} cached messages for {thread_key}")
-                
+
                 self._threads[thread_key] = thread_state
                 self.log_debug(f"Created new thread state for {thread_key}")
             
@@ -847,7 +833,9 @@ class AsyncThreadStateManager(LoggerMixin):
                     channel_id=channel_id
                 )
 
-                # If database available, check for persisted state
+                # If database available, load thread CONFIG only. Phase S: no message
+                # cache — a fresh thread state starts empty and the processor rebuilds
+                # the transcript from Slack (conversations.replies) on first use.
                 if self.db:
                     # Get or create in database
                     self.db.get_or_create_thread(thread_key, channel_id, user_id)
@@ -856,21 +844,6 @@ class AsyncThreadStateManager(LoggerMixin):
                     thread_config = await self.db.get_thread_config_async(thread_key)
                     if thread_config:
                         thread_state.config_overrides = thread_config
-
-                    # Load cached messages from database
-                    cached_messages = await self.db.get_cached_messages_async(thread_key)
-                    if cached_messages:
-                        # Convert DB format to thread format
-                        for msg in cached_messages:
-                            message_dict = {
-                                "role": msg["role"],
-                                "content": msg["content"]
-                            }
-                            # Include metadata if present
-                            if msg.get("metadata"):
-                                message_dict["metadata"] = msg["metadata"]
-                            thread_state.messages.append(message_dict)
-                        self.log_debug(f"Loaded {len(cached_messages)} cached messages for {thread_key}")
 
                 self._threads[thread_key] = thread_state
                 self.log_debug(f"Created new async thread state for {thread_key}")

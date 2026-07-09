@@ -1,4 +1,5 @@
-"""Advanced unit tests for database.py - error handling, edge cases, and backup operations"""
+"""
+# NOTE (Phase S): message-mirror tests removed — the messages table no longer exists.Advanced unit tests for database.py - error handling, edge cases, and backup operations"""
 
 import pytest
 import sqlite3
@@ -99,29 +100,6 @@ class TestDatabaseErrorHandling:
             # Expected error
             pass
     
-    def test_database_lock_timeout(self, db_manager):
-        """Test handling of database lock timeouts"""
-        # Simulate a locked database
-        conn2 = sqlite3.connect(db_manager.db_path)
-        conn2.execute("BEGIN EXCLUSIVE")
-        
-        # Try to write - should handle lock gracefully
-        try:
-            # This might timeout or raise an error
-            result = db_manager.cache_message(
-                thread_id="test:thread",
-                role="user",
-                content="Test message",
-                metadata={}
-            )
-            # If it doesn't raise, it should return False or handle gracefully
-            assert result is None or result is False
-        except sqlite3.OperationalError as e:
-            # Expected - database is locked
-            assert "locked" in str(e).lower() or "database" in str(e).lower()
-        finally:
-            conn2.close()
-    
     def test_corrupt_database_recovery(self, temp_db_path):
         """Test recovery from corrupt database"""
         # Create a corrupt database file
@@ -147,33 +125,6 @@ class TestDatabaseErrorHandling:
         except sqlite3.DatabaseError:
             # This is also acceptable - error was raised
             pass
-    
-    def test_invalid_json_in_metadata(self, db_manager):
-        """Test handling of invalid JSON in metadata fields"""
-        thread_id = "test:invalid_json"
-        
-        # Insert directly with invalid JSON
-        db_manager.conn.execute("""
-            INSERT INTO messages (thread_id, role, content, metadata_json, timestamp)
-            VALUES (?, ?, ?, ?, ?)
-        """, (thread_id, "user", "Test", "{invalid json}", datetime.now().isoformat()))
-        db_manager.conn.commit()
-        
-        # Currently raises JSONDecodeError - this is a known issue
-        # The database module should handle invalid JSON more gracefully
-        with pytest.raises(json.JSONDecodeError):
-            messages = db_manager.get_cached_messages(thread_id)
-    
-    def test_get_cached_messages_with_errors(self, db_manager):
-        """Test get_cached_messages with database errors"""
-        thread_id = "test:thread"
-        
-        # Close the connection to simulate error
-        db_manager.conn.close()
-        
-        # Should raise ProgrammingError when connection is closed
-        with pytest.raises(sqlite3.ProgrammingError):
-            messages = db_manager.get_cached_messages(thread_id)
     
     def test_save_image_metadata_error(self, db_manager):
         """Test error handling in save_image_metadata"""
@@ -208,9 +159,9 @@ class TestDatabaseBackupOperations:
         db.conn.row_factory = sqlite3.Row
         db.init_schema()
         
-        # Add some test data
-        db.cache_message("thread1", "user", "Message 1")
-        db.cache_message("thread1", "assistant", "Response 1")
+        # Add some test data (Phase S: summary row instead of message mirror)
+        db.get_or_create_thread("thread1", "C1")
+        db.save_thread_summary("thread1", "seed summary", "1.0")
         
         # Store backup dir for tests
         db.backup_dir = "data/backups"
@@ -238,13 +189,13 @@ class TestDatabaseBackupOperations:
         assert "test_" in backup_path
         assert backup_path.endswith(".db")
         
-        # Verify backup is valid SQLite database
+        # Verify backup is valid SQLite database (Phase S: check the summary row)
         conn = sqlite3.connect(backup_path)
-        cursor = conn.execute("SELECT COUNT(*) FROM messages")
+        cursor = conn.execute("SELECT COUNT(*) FROM thread_summaries")
         count = cursor.fetchone()[0]
         conn.close()
-        
-        assert count == 2  # Should have the test messages
+
+        assert count == 1  # Should have the seeded summary row
     
     def test_backup_database_no_directory(self, tmp_path):
         """Test backup when directory doesn't exist"""
@@ -325,9 +276,9 @@ class TestDatabaseBackupOperations:
         # Start a transaction
         db_with_backup.conn.execute("BEGIN")
         db_with_backup.conn.execute(
-            "INSERT INTO messages (thread_id, role, content, metadata_json, timestamp) "
-            "VALUES (?, ?, ?, ?, ?)",
-            ("thread2", "user", "Active transaction", "{}", datetime.now().isoformat())
+            "INSERT INTO thread_summaries (thread_id, summary_text, boundary_ts) "
+            "VALUES (?, ?, ?)",
+            ("thread2", "Active transaction", "2.0")
         )
         
         # Backup may fail due to active transaction (WAL checkpoint can be blocked)
@@ -353,128 +304,6 @@ class TestDatabaseEdgeCases:
         db.db_path = str(tmp_path / "test.db")
         # Database is initialized in __init__
         return db
-    
-    def test_very_long_content(self, db_manager):
-        """Test handling of very long message content"""
-        import uuid
-        # Use a unique thread ID to avoid conflicts
-        thread_id = f"test:long_{uuid.uuid4().hex[:8]}"
-        
-        # Create a very long message (1MB)
-        long_content = "x" * (1024 * 1024)
-        
-        # Should handle long content
-        db_manager.cache_message(
-            thread_id=thread_id,
-            role="user",
-            content=long_content
-        )
-        
-        messages = db_manager.get_cached_messages(thread_id)
-        assert len(messages) == 1
-        assert len(messages[0]["content"]) == len(long_content)
-    
-    def test_special_characters_in_content(self, db_manager):
-        """Test handling of special characters and SQL injection attempts"""
-        import uuid
-        # Use unique thread ID
-        thread_id = f"test:special_{uuid.uuid4().hex[:8]}"
-        
-        # Test various special characters
-        special_content = "'; DROP TABLE messages; --"
-        
-        db_manager.cache_message(
-            thread_id=thread_id,
-            role="user",
-            content=special_content
-        )
-        
-        # Should handle safely (parameterized queries)
-        messages = db_manager.get_cached_messages(thread_id)
-        assert len(messages) == 1
-        assert messages[0]["content"] == special_content
-        
-        # Tables should still exist
-        cursor = db_manager.conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        )
-        tables = [row[0] for row in cursor.fetchall()]
-        assert "messages" in tables
-        assert "threads" in tables
-    
-    def test_unicode_and_emoji_content(self, db_manager):
-        """Test handling of Unicode and emoji characters"""
-        import uuid
-        thread_id = f"test:unicode_{uuid.uuid4().hex[:8]}"
-        unicode_content = "Hello 世界 🌍 مرحبا мир 🚀"
-        
-        db_manager.cache_message(
-            thread_id=thread_id,
-            role="user",
-            content=unicode_content
-        )
-        
-        messages = db_manager.get_cached_messages(thread_id)
-        assert len(messages) == 1
-        assert messages[0]["content"] == unicode_content
-        assert messages[0]["content"] == unicode_content
-    
-    def test_null_and_empty_values(self, db_manager):
-        """Test handling of null and empty values"""
-        import uuid
-        thread_id = f"test:null_{uuid.uuid4().hex[:8]}"
-        
-        # Test with empty content
-        db_manager.cache_message(
-            thread_id=thread_id,
-            role="user",
-            content=""
-        )
-        
-        # Test with None metadata
-        db_manager.cache_message(
-            thread_id=thread_id,
-            role="assistant",
-            content="Response"
-        )
-        
-        messages = db_manager.get_cached_messages(thread_id)
-        assert len(messages) == 2
-        assert messages[0]["content"] == ""
-        assert messages[1]["content"] == "Response"
-    
-    def test_message_ordering_with_gaps(self, db_manager):
-        """Test message ordering when there are gaps in insertion order"""
-        import uuid
-        import time
-        # Use unique thread ID to avoid conflicts
-        thread_id = f"test:gaps_{uuid.uuid4().hex[:8]}"
-        
-        # Insert messages with specific timestamps to control order
-        conn = db_manager.conn
-        base_time = datetime.now()
-        for idx in [0, 2, 5, 3, 1]:
-            # Add time offset to ensure proper ordering
-            timestamp = (base_time + timedelta(seconds=idx)).isoformat()
-            conn.execute("""
-                INSERT INTO messages (thread_id, role, content, timestamp)
-                VALUES (?, ?, ?, ?)
-            """, (
-                thread_id,
-                "user" if idx % 2 == 0 else "assistant",
-                f"Message {idx}",
-                timestamp
-            ))
-        conn.commit()
-        
-        # Should return in timestamp order
-        messages = db_manager.get_cached_messages(thread_id, limit=10)
-        assert len(messages) == 5
-        # Messages should be ordered by timestamp (which matches idx order)
-        expected_order = [0, 1, 2, 3, 5]
-        for i, expected_idx in enumerate(expected_order):
-            actual_idx = int(messages[i]["content"].split()[-1])
-            assert actual_idx == expected_idx
     
     def test_concurrent_thread_operations(self, tmp_path):
         """Test concurrent operations on different threads"""
@@ -571,38 +400,6 @@ class TestDatabaseEdgeCases:
         assert saved_config["parameters"]["nested"]["deep"] == "value"
         assert saved_config["array"] == [1, 2, 3]
     
-    def test_cleanup_old_messages_edge_cases(self, db_manager):
-        """Test edge cases in thread cleanup"""
-        thread_key = "test:cleanup_thread"
-        
-        # Create thread
-        db_manager.get_or_create_thread(thread_key, "test_channel", "test_user")
-        
-        # Add many messages
-        for i in range(100):
-            db_manager.cache_message(
-                thread_id=thread_key,
-                role="user" if i % 2 == 0 else "assistant",
-                content=f"Message {i}"
-            )
-        
-        # Make thread old by updating last_activity
-        old_time = datetime.now() - timedelta(days=100)
-        db_manager.conn.execute(
-            "UPDATE threads SET last_activity = ? WHERE thread_id = ?",
-            (old_time.isoformat(), thread_key)
-        )
-        db_manager.conn.commit()
-        
-        # Cleanup old threads (default is 90 days)
-        db_manager.cleanup_old_threads()
-        
-        # Verify thread and messages are gone
-        cursor = db_manager.conn.execute(
-            "SELECT * FROM threads WHERE thread_id = ?", (thread_key,)
-        )
-        assert cursor.fetchone() is None
-    
     def test_get_thread_images_with_invalid_metadata(self, db_manager):
         """Test getting thread images with invalid metadata"""
         import uuid
@@ -644,54 +441,6 @@ class TestDatabasePerformance:
         # Database is initialized in __init__
         return db
     
-    def test_bulk_insert_performance(self, db_manager):
-        """Test performance of bulk inserts"""
-        import uuid
-        thread_key = f"test:perf_{uuid.uuid4().hex[:8]}"
-        start_time = time.time()
-        
-        # Insert many messages
-        for i in range(1000):
-            db_manager.cache_message(
-                thread_id=thread_key,
-                role="user" if i % 2 == 0 else "assistant",
-                content=f"Message {i}"
-            )
-        
-        elapsed = time.time() - start_time
-        
-        # Should complete reasonably quickly (< 10 seconds)
-        # Note: In test environment with debug logging this can take longer
-        assert elapsed < 10.0
-        
-        # Verify all inserted
-        count = db_manager.conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE thread_id = ?",
-            (thread_key,)
-        ).fetchone()[0]
-        assert count == 1000
-    
-    def test_index_effectiveness(self, db_manager):
-        """Test that database indexes are effective"""
-        # Add many threads and messages
-        for i in range(100):
-            thread_key = f"thread:{i}"
-            for j in range(10):
-                db_manager.cache_message(
-                    thread_id=thread_key,
-                    role="user",
-                    content=f"Message {j}"
-                )
-        
-        # Query should be fast due to indexes
-        start_time = time.time()
-        messages = db_manager.get_cached_messages("thread:50", limit=10)
-        elapsed = time.time() - start_time
-        
-        assert len(messages) == 10
-        assert elapsed < 0.1  # Should be very fast with index
-    
-    @pytest.mark.critical
     def test_critical_wal_mode_enabled(self, db_manager):
         """Critical test that WAL mode is enabled for concurrency"""
         cursor = db_manager.conn.execute("PRAGMA journal_mode")
@@ -733,61 +482,3 @@ class TestDatabaseIntegrity:
                     VALUES ('nonexistent:thread', 'user', 'Test', ?)
                 """, (datetime.now().isoformat(),))
     
-    def test_transaction_rollback(self, db_manager):
-        """Test transaction rollback on error"""
-        # First ensure thread exists
-        db_manager.get_or_create_thread("test:thread", "test_channel")
-        
-        try:
-            db_manager.conn.execute("BEGIN")
-            
-            # Insert valid message
-            db_manager.conn.execute("""
-                INSERT INTO messages (thread_id, role, content, timestamp, metadata_json)
-                VALUES (?, ?, ?, ?, ?)
-            """, ("test:thread", "user", "Valid", datetime.now().isoformat(), "{}"))
-            
-            # Force an error with invalid SQL
-            db_manager.conn.execute("INVALID SQL")
-            
-            db_manager.conn.commit()
-        except (sqlite3.OperationalError, sqlite3.Error):
-            db_manager.conn.rollback()
-        
-        # Verify nothing was inserted due to rollback
-        count = db_manager.conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE thread_id = 'test:thread' AND content = 'Valid'"
-        ).fetchone()[0]
-        assert count == 0
-    
-    def test_database_vacuum(self, tmp_path):
-        """Test database vacuum operation"""
-        import os
-        
-        # Create a fresh database for this test
-        db_path = tmp_path / "vacuum_test.db"
-        
-        db = DatabaseManager("test")
-        # Force it to use our test path
-        os.makedirs("data", exist_ok=True)
-        actual_db_path = "data/test.db"
-        
-        # Add and delete many records to create fragmentation
-        for i in range(20):
-            thread_id = f"thread:{i}"
-            db.get_or_create_thread(thread_id, "channel")
-            db.cache_message(thread_id, "user", "Test", metadata={})
-        
-        # Delete half
-        db.conn.execute("DELETE FROM messages WHERE thread_id LIKE 'thread:1%'")
-        db.conn.commit()
-        
-        # Get size before vacuum (use actual path)
-        size_before = os.path.getsize(actual_db_path)
-        
-        # Vacuum database
-        db.conn.execute("VACUUM")
-        
-        # Size should still be valid
-        size_after = os.path.getsize(actual_db_path)
-        assert size_after > 0  # Database still valid

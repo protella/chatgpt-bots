@@ -41,12 +41,13 @@ class TestThreadState:
         assert thread.messages[0]["metadata"] == metadata
     
     def test_add_message_with_db(self):
-        """Test adding message with database"""
+        """Phase S: messages are NOT persisted; the Slack ts is stamped into metadata"""
         mock_db = MagicMock()
         thread = ThreadState(thread_ts="123.456", channel_id="C123")
         thread.add_message("user", "Hello", db=mock_db, thread_key="C123:123.456", message_ts="789.012")
-        
-        mock_db.cache_message.assert_called_once_with("C123:123.456", "user", "Hello", "789.012", None)
+
+        assert thread.messages[0]["metadata"]["ts"] == "789.012"
+        assert not mock_db.method_calls  # no DB writes from add_message
     
     def test_get_recent_messages(self):
         """Test getting recent messages"""
@@ -251,15 +252,13 @@ class TestThreadStateManager:
         mock_db = MagicMock()
         mock_db.get_or_create_thread.return_value = {"id": 1}
         mock_db.get_thread_config.return_value = {"model": "gpt-5"}
-        mock_db.get_cached_messages.return_value = [
-            {"role": "user", "content": "Hello"}
-        ]
-        
+
         manager = ThreadStateManager(db=mock_db)
         thread = manager.get_or_create_thread("123.456", "C123", "U123")
-        
+
         assert thread.config_overrides == {"model": "gpt-5"}
-        assert len(thread.messages) == 1
+        # Phase S: no message-cache load — state starts empty, rebuilt from Slack
+        assert thread.messages == []
         mock_db.get_or_create_thread.assert_called_once_with("C123:123.456", "C123", "U123")
     
     @patch('thread_manager.threading.Thread')
@@ -414,19 +413,16 @@ class TestThreadStateManager:
         mock_db = MagicMock()
         mock_db.get_or_create_thread.return_value = {"id": 1}
         mock_db.get_thread_config.return_value = {"model": "gpt-5"}
-        mock_db.get_cached_messages.return_value = []
-        
+
         manager = ThreadStateManager(db=mock_db)
-        
-        # Create thread and add messages
+
+        # Create thread and add messages — Phase S: in-memory only, no message writes
         thread = manager.get_or_create_thread("123.456", "C123", "U123")
         thread.add_message("user", "Message 1", db=mock_db, thread_key="C123:123.456")
         thread.add_message("assistant", "Response 1", db=mock_db, thread_key="C123:123.456")
-        
-        # Verify DB was called
-        assert mock_db.cache_message.call_count == 2
-        mock_db.cache_message.assert_any_call("C123:123.456", "user", "Message 1", None, None)
-        mock_db.cache_message.assert_any_call("C123:123.456", "assistant", "Response 1", None, None)
+
+        assert [m["content"] for m in thread.messages] == ["Message 1", "Response 1"]
+        assert not any(c[0] == "cache_message" for c in mock_db.method_calls)
     
     @patch('thread_manager.threading.Thread')
     def test_regression_message_limit(self, mock_thread):

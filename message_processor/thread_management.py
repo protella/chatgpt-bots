@@ -226,17 +226,20 @@ class ThreadManagementMixin:
                 return f"[ERROR: Document too large for model context window]\n{content[:1000]}..."
             return content  # Return original if summarization fails for other reasons
 
-    async def _smart_trim_with_summarization(self, thread_state, trim_count: int = None) -> int:
+    async def _smart_trim_with_summarization(self, thread_state, trim_count: int = None,
+                                             collector: Optional[List[Dict]] = None) -> int:
         """Intelligently trim messages, summarizing documents only when they're in the trim list
-        
+
         This method identifies the oldest N messages to be trimmed. If any contain
         unsummarized documents, it summarizes them in place (making them preserved).
         Then it trims any remaining non-preserved messages from the list.
-        
+
         Args:
             thread_state: Thread state object to trim
             trim_count: Number of messages to trim (default from config)
-            
+            collector: Optional list — dropped messages are appended so the caller can
+                summarize the span into thread_summaries (Phase S compaction)
+
         Returns:
             Number of messages actually trimmed or summarized
         """
@@ -348,6 +351,8 @@ class ThreadManagementMixin:
             if idx < len(thread_state.messages):
                 removed_msg = thread_state.messages.pop(idx)
                 messages_trimmed += 1
+                if collector is not None:
+                    collector.append(removed_msg)
                 self.log_debug(f"Trimmed message at index {idx}: {str(removed_msg.get('content', ''))[:50]}...")
         
         if messages_trimmed > 0:
@@ -389,6 +394,208 @@ class ThreadManagementMixin:
             self.log_info(f"Smart-trimmed {trimmed} messages from thread")
         
         return trimmed
+
+    # --- Phase S: chunky compaction + rolling thread summary -------------------------
+
+    SUMMARY_HEAD_MARKER = "thread_summary"
+
+    async def _compact_thread_to_target(self, thread_state, thread_key: str) -> int:
+        """Compact a thread to the configured target in ONE deliberate pass.
+
+        Prompt-cache note: rewriting the head of the conversation is an expected,
+        deliberate prefix-cache bust. That's why compaction is CHUNKY — compact down to
+        token_compaction_target (well under the limit) in one pass, instead of trimming
+        a few messages per turn, which would bust the OpenAI prefix cache every turn.
+
+        Dropped messages are summarized (rolling, via the utility model) into the
+        thread_summaries table, with structured refs preserved, and the summary head
+        message in the live thread state is created/updated in place.
+
+        Returns the number of messages dropped or summarized-in-place.
+        """
+        model = thread_state.current_model or config.gpt_model
+        max_tokens = config.get_model_token_limit(model)
+        target_tokens = int(max_tokens * config.token_compaction_target)
+
+        dropped: List[Dict] = []
+        total_processed = 0
+        current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+
+        while current_tokens > target_tokens:
+            processed = await self._smart_trim_with_summarization(thread_state, collector=dropped)
+            if processed == 0:
+                self.log_warning(
+                    f"Compaction stalled at {current_tokens}/{target_tokens} tokens — "
+                    f"no trimmable messages left"
+                )
+                break
+            total_processed += processed
+            current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+
+        if dropped:
+            await self._write_thread_summary(thread_state, thread_key, dropped)
+
+        if total_processed:
+            self.log_info(
+                f"Compacted thread {thread_key}: {total_processed} message(s) processed, "
+                f"now at {current_tokens}/{target_tokens} target tokens"
+            )
+        return total_processed
+
+    async def _write_thread_summary(self, thread_state, thread_key: str, dropped: List[Dict]):
+        """Fold a dropped span into the rolling thread summary (DB row + in-state head).
+
+        boundary_ts advances to the newest Slack ts in the dropped span. Messages without
+        a known ts (some live assistant turns) are covered by the summary text but can
+        reappear in a cold-rebuild tail — harmless duplication of meaning, never data loss.
+        """
+        if not self.db:
+            return
+
+        # Restore original order (collector receives popped messages newest-first per batch)
+        def _ts_key(m):
+            ts = (m.get("metadata") or {}).get("ts")
+            try:
+                return float(ts)
+            except (TypeError, ValueError):
+                return float("inf")
+        ordered = sorted(dropped, key=_ts_key)
+
+        prior = None
+        try:
+            prior = await self.db.get_thread_summary_async(thread_key)
+        except Exception as e:
+            self.log_warning(f"Could not load prior thread summary: {e}")
+
+        # Boundary: newest known ts among dropped messages; fall back to prior boundary
+        known_ts = [(m.get("metadata") or {}).get("ts") for m in ordered]
+        known_ts = [t for t in known_ts if t]
+        boundary_ts = max(known_ts, key=float) if known_ts else (prior or {}).get("boundary_ts")
+        if not boundary_ts:
+            self.log_warning(
+                f"Compaction dropped {len(dropped)} message(s) with no known ts and no prior "
+                f"summary for {thread_key} — skipping summary write (span lost, as pre-Phase-S)"
+            )
+            return
+
+        span_lines = []
+        for m in ordered:
+            role = m.get("role", "user")
+            text = self._content_to_text(m.get("content"))
+            if len(text) > 2000:
+                text = text[:2000] + " […truncated]"
+            span_lines.append(f"{role}: {text}")
+        span_text = "\n".join(span_lines)
+
+        prior_text = (prior or {}).get("summary_text") or ""
+        try:
+            from prompts import CONVERSATION_SUMMARIZATION_PROMPT
+            user_block = (
+                (f"EXISTING SUMMARY OF OLDER MESSAGES:\n{prior_text}\n\n" if prior_text else "")
+                + f"NEW MESSAGES TO FOLD IN:\n{span_text}"
+            )
+            summary_text = await self.openai_client.create_text_response(
+                messages=[
+                    {"role": "developer", "content": CONVERSATION_SUMMARIZATION_PROMPT},
+                    {"role": "user", "content": user_block},
+                ],
+                model=config.utility_model,
+                temperature=0.3,
+                max_tokens=1200,
+                system_prompt=None
+            )
+            summary_text = (summary_text or "").strip()
+            if not summary_text:
+                raise ValueError("empty summary")
+        except Exception as e:
+            self.log_warning(f"Span summarization failed ({e}) — using deterministic fallback")
+            fallback = "(Earlier messages were removed to manage context length.)"
+            summary_text = f"{prior_text}\n{fallback}".strip() if prior_text else fallback
+
+        # Merge refs: prior refs + refs from the dropped span, deduped, deterministically ordered
+        refs = {(r.get("kind"), r.get("value")): r for r in (prior or {}).get("refs", [])}
+        for r in self._extract_refs_from_messages(ordered):
+            refs.setdefault((r.get("kind"), r.get("value")), r)
+        refs_list = sorted(refs.values(), key=lambda r: (r.get("kind") or "", r.get("value") or ""))
+
+        try:
+            await self.db.save_thread_summary_async(thread_key, summary_text, str(boundary_ts), refs_list)
+        except Exception as e:
+            self.log_error(f"Failed to persist thread summary for {thread_key}: {e}")
+            return
+
+        self._upsert_summary_head_in_state(thread_state, summary_text, refs_list)
+
+    @classmethod
+    def _build_summary_head_content(cls, summary_text: str, refs: Optional[List[Dict]]) -> str:
+        """Render the summary head message. MUST be deterministic for a given DB row —
+        no timestamps or counts — so rebuilds serialize identically (prompt-cache hygiene)."""
+        parts = [
+            "--- SUMMARY OF EARLIER CONVERSATION ---",
+            summary_text,
+        ]
+        if refs:
+            parts.append("References from the summarized span:")
+            for r in refs:
+                kind = r.get("kind") or "link"
+                value = r.get("value") or ""
+                name = r.get("name")
+                parts.append(f"- [{kind}] {name + ': ' if name else ''}{value}")
+        parts.append("--- END SUMMARY ---")
+        return "\n".join(parts)
+
+    def _upsert_summary_head_in_state(self, thread_state, summary_text: str, refs: Optional[List[Dict]]):
+        """Create or update the summary head message at position 0 of the live state."""
+        content = self._build_summary_head_content(summary_text, refs)
+        for msg in thread_state.messages:
+            if (msg.get("metadata") or {}).get("type") == self.SUMMARY_HEAD_MARKER:
+                msg["content"] = content
+                break
+        else:
+            thread_state.messages.insert(0, {
+                "role": "developer",
+                "content": content,
+                "metadata": {"type": self.SUMMARY_HEAD_MARKER},
+            })
+        thread_state.has_summary_head = True
+
+    @staticmethod
+    def _render_reactions_annotation(reactions) -> str:
+        """Render a message's reactions (from conversations.replies) as a compact,
+        DETERMINISTIC annotation line: stable ordering (emoji name, then count), no
+        timestamps — two rebuilds of the same history must serialize identically.
+        Reactor IDs are rendered as <@UID> mentions; the roster maps them to names."""
+        if not reactions:
+            return ""
+        entries = []
+        for r in sorted(reactions, key=lambda r: (r.get("name") or "", r.get("count") or 0)):
+            name = r.get("name")
+            if not name:
+                continue
+            count = r.get("count") or len(r.get("users") or [])
+            users = ", ".join(f"<@{u}>" for u in sorted(r.get("users") or []))
+            entries.append(f":{name}: x{count}" + (f" ({users})" if users else ""))
+        return f"[reactions: {'; '.join(entries)}]" if entries else ""
+
+    @staticmethod
+    def _extract_refs_from_messages(messages: List[Dict]) -> List[Dict]:
+        """Pull structured refs (files/images/links) out of a span of messages."""
+        import re
+        refs = []
+        url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+        for m in messages:
+            meta = m.get("metadata") or {}
+            if meta.get("url"):
+                kind = "image" if str(meta.get("type", "")).startswith("image") else "file"
+                refs.append({"kind": kind, "value": meta["url"], "name": meta.get("filename")})
+            if meta.get("filename") and not meta.get("url"):
+                refs.append({"kind": "file", "value": meta["filename"], "name": meta.get("filename")})
+            text = m.get("content") if isinstance(m.get("content"), str) else ""
+            for url in re.findall(url_pattern, text or ""):
+                kind = "image" if any(ext in url.lower() for ext in
+                                      ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg')) else "link"
+                refs.append({"kind": kind, "value": url, "name": None})
+        return refs
 
     @staticmethod
     def _content_to_text(content) -> str:
@@ -480,32 +687,18 @@ class ThreadManagementMixin:
             current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
             
             if current_tokens > cleanup_threshold:
-                self.log_info(f"Thread at {current_tokens}/{max_tokens} tokens ({current_tokens/max_tokens:.1%}), triggering cleanup")
-                
-                # Use smart trim with summarization for documents
-                trimmed = await self._smart_trim_with_summarization(thread_state)
-                
-                if trimmed > 0:
-                    # Update token count after trimming
+                self.log_info(f"Thread at {current_tokens}/{max_tokens} tokens ({current_tokens/max_tokens:.1%}), triggering compaction")
+
+                # Phase S: one chunky compaction down to the target (not a small per-turn
+                # trim) — dropped span is folded into the rolling thread summary. No DB
+                # message mirror to maintain anymore.
+                processed = await self._compact_thread_to_target(thread_state, thread_key)
+
+                if processed > 0:
                     new_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-                    self.log_info(f"Cleanup complete: {current_tokens} → {new_tokens} tokens ({trimmed} messages removed)")
-                    
-                    # Always update database to maintain sync
-                    if self.db:
-                        # Clear and rebuild cache with current state
-                        # This ensures DB reflects summarizations and removals
-                        await self.db.clear_thread_messages_async(thread_key)
-                        for msg in thread_state.messages:
-                            await self.db.cache_message_async(
-                                thread_key,
-                                msg.get("role"),
-                                msg.get("content"),
-                                message_ts=None,  # Timestamp not needed for cache rebuild
-                                metadata=msg.get("metadata")
-                            )
-                        self.log_debug(f"Database cache rebuilt for thread {thread_key} with {len(thread_state.messages)} messages")
+                    self.log_info(f"Compaction complete: {current_tokens} → {new_tokens} tokens ({processed} messages processed)")
                 else:
-                    self.log_warning("Cleanup triggered but no trimmable messages found")
+                    self.log_warning("Compaction triggered but no trimmable messages found")
             
         except Exception as e:
             self.log_error(f"Error during async cleanup: {e}")
@@ -541,7 +734,32 @@ class ThreadManagementMixin:
         
         if should_rebuild:
             self.log_info(f"Checking thread history for {message.thread_id}")
-            
+
+            # Phase S: Slack is the only transcript. A rebuild always starts from a clean
+            # slate (fresh fetch is authoritative — edited/deleted messages must not
+            # survive from stale in-memory state) and composes:
+            # stored summary head (compacted older span) + fresh conversations.replies tail.
+            if thread_state.messages:
+                thread_state.messages.clear()
+                thread_state.has_summary_head = False
+            thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+            summary_row = None
+            if self.db:
+                try:
+                    summary_row = await self.db.get_thread_summary_async(thread_key)
+                except Exception as e:
+                    self.log_warning(f"Could not load thread summary for rebuild: {e}")
+
+            summary_boundary = None
+            if summary_row:
+                try:
+                    summary_boundary = float(summary_row["boundary_ts"])
+                except (TypeError, ValueError):
+                    summary_boundary = None
+                self._upsert_summary_head_in_state(
+                    thread_state, summary_row["summary_text"], summary_row.get("refs")
+                )
+
             # Get history from platform first to see if there's anything to rebuild
             history = await client.get_thread_history(
                 message.channel_id,
@@ -573,6 +791,16 @@ class ThreadManagementMixin:
                 # Skip the current message being processed
                 if hist_msg.metadata.get("ts") == current_ts:
                     continue
+
+                # Skip messages already covered by the stored summary head (<= boundary).
+                # Anything after the boundary composes the fresh tail — never duplicated.
+                if summary_boundary is not None:
+                    hist_ts = hist_msg.metadata.get("ts")
+                    try:
+                        if hist_ts is not None and float(hist_ts) <= summary_boundary:
+                            continue
+                    except (TypeError, ValueError):
+                        pass
                     
                 # Determine sender and role.
                 # Only OUR OWN messages are assistant turns. Humans AND other bots (e.g. another
@@ -626,6 +854,12 @@ class ThreadManagementMixin:
                     if hist_msg.user_id and hist_msg.user_id not in ("bot", "unknown"):
                         thread_state.participants[hist_msg.user_id] = username
                 
+                # Reactions on this message (from conversations.replies) — deterministic
+                # annotation so the model knows who reacted with what
+                reactions_note = self._render_reactions_annotation(hist_msg.metadata.get("reactions"))
+                if reactions_note:
+                    content = f"{content}\n{reactions_note}" if content else reactions_note
+
                 # Track message metadata for preservation
                 message_metadata = {}
                 
@@ -811,9 +1045,9 @@ class ThreadManagementMixin:
         current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
         
         if current_tokens > max_tokens:
-            self.log_info(f"Thread rebuilt over limit ({current_tokens}/{max_tokens} tokens), applying smart trim")
-            
-            # Update status to show we're trimming
+            self.log_info(f"Thread rebuilt over limit ({current_tokens}/{max_tokens} tokens), compacting")
+
+            # Update status to show we're compacting
             if thinking_id:
                 self._update_status(
                     client,
@@ -822,39 +1056,15 @@ class ThreadManagementMixin:
                     f"Optimizing conversation history ({current_tokens:,}/{max_tokens:,} tokens)...",
                     emoji=config.thinking_emoji
                 )
-            
-            total_trimmed = 0
-            
-            # Keep trimming until we're under the limit
-            while current_tokens > max_tokens:
-                trimmed_count = await self._smart_trim_with_summarization(thread_state)
-                total_trimmed += trimmed_count
-                
-                if trimmed_count == 0:
-                    # No more messages to trim
-                    self.log_warning(f"Cannot trim further during rebuild - still at {current_tokens} tokens")
-                    break
-                
-                # Recalculate tokens after trimming
-                current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-                self.log_debug(f"After trimming {trimmed_count} messages during rebuild, now at {current_tokens}/{max_tokens} tokens")
-            
+
+            # Phase S: one chunky compaction to target; the dropped span rolls into the
+            # thread summary (DB) and the summary head message updates in place.
+            thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+            total_trimmed = await self._compact_thread_to_target(thread_state, thread_key)
+            current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+
             if total_trimmed > 0:
-                self.log_info(f"Smart trim during rebuild complete: {total_trimmed} total messages processed, final: {current_tokens}/{max_tokens} tokens")
-                
-                # Update database with trimmed state
-                if self.db:
-                    thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-                    await self.db.clear_thread_messages_async(thread_key)
-                    for msg in thread_state.messages:
-                        await self.db.cache_message_async(
-                            thread_id=thread_key,
-                            role=msg.get("role"),
-                            content=msg.get("content"),
-                            metadata=msg.get("metadata"),
-                            message_ts=msg.get("metadata", {}).get("ts")
-                        )
-                    self.log_info(f"Updated database with {len(thread_state.messages)} trimmed messages")
+                self.log_info(f"Compaction during rebuild complete: {total_trimmed} messages processed, final: {current_tokens}/{max_tokens} tokens")
         
         # Log final token count
         final_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)

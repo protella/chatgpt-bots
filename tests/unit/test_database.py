@@ -46,8 +46,11 @@ class TestDatabaseManager:
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='threads'")
         assert cursor.fetchone() is not None
         
-        # Check messages table exists
+        # Phase S: the messages mirror is gone; thread_summaries replaces it
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='messages'")
+        assert cursor.fetchone() is None
+
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='thread_summaries'")
         assert cursor.fetchone() is not None
         
         # Check images table exists
@@ -85,38 +88,24 @@ class TestDatabaseManager:
         assert result is not None
         assert result["thread_id"] == thread_id
     
-    def test_cache_message(self, temp_db):
-        """Test caching a message"""
-        thread_id = "C123:456.789"
-        
-        # Create thread first
-        temp_db.get_or_create_thread(thread_id, "C123", "U456")
-        
-        # Cache a message
-        temp_db.cache_message(thread_id, "user", "Hello bot", "789.012")
-        
-        # Verify it was cached
-        messages = temp_db.get_cached_messages(thread_id)
-        assert len(messages) == 1
-        assert messages[0]["role"] == "user"
-        assert messages[0]["content"] == "Hello bot"
-        assert messages[0]["message_ts"] == "789.012"
-    
-    def test_get_cached_messages_limit(self, temp_db):
-        """Test getting cached messages with limit"""
+    def test_thread_summary_roundtrip(self, temp_db):
+        """Phase S: thread summary upsert + read (replaces message-mirror tests)"""
         thread_id = "C123:456.789"
         temp_db.get_or_create_thread(thread_id, "C123", "U456")
-        
-        # Cache multiple messages
-        for i in range(10):
-            temp_db.cache_message(thread_id, "user", f"Message {i}", f"ts_{i}")
-        
-        # Get with limit
-        messages = temp_db.get_cached_messages(thread_id, limit=5)
-        assert len(messages) == 5
-        # Should return 5 messages
-        assert all("Message" in msg["content"] for msg in messages)
-    
+
+        temp_db.save_thread_summary(thread_id, "v1", "100.0",
+                                    refs=[{"kind": "file", "value": "a.pdf", "name": "a.pdf"}])
+        row = temp_db.get_thread_summary(thread_id)
+        assert row["summary_text"] == "v1"
+        assert row["boundary_ts"] == "100.0"
+        assert row["refs"][0]["value"] == "a.pdf"
+
+        # Upsert (rolling)
+        temp_db.save_thread_summary(thread_id, "v2", "200.0")
+        row = temp_db.get_thread_summary(thread_id)
+        assert row["summary_text"] == "v2"
+        assert row["boundary_ts"] == "200.0"
+
     def test_update_thread_config(self, temp_db):
         """Test updating thread configuration"""
         thread_id = "C123:456.789"
@@ -203,19 +192,9 @@ class TestDatabaseManager:
         thread_id = "C123:456.789"
         temp_db.get_or_create_thread(thread_id, "C123", "U456")
         
-        # Add old messages
         cursor = temp_db.conn.cursor()
         old_date = datetime.now() - timedelta(days=100)
-        for i in range(5):
-            cursor.execute("""
-                INSERT INTO messages (thread_id, role, content, timestamp)
-                VALUES (?, ?, ?, ?)
-            """, (thread_id, "user", f"Old message {i}", old_date))
-        
-        # Add recent messages
-        for i in range(3):
-            temp_db.cache_message(thread_id, "user", f"Recent message {i}")
-        
+
         # Set thread last_activity to old date to make it eligible for cleanup
         cursor.execute("""
             UPDATE threads SET last_activity = ? WHERE thread_id = ?
@@ -237,15 +216,15 @@ class TestDatabaseManager:
         """Critical: Ensure data persists correctly"""
         thread_id = "C123:456.789"
         
-        # Create thread with messages
+        # Create thread with config + summary (Phase S: no message mirror)
         temp_db.get_or_create_thread(thread_id, "C123", "U456")
-        temp_db.cache_message(thread_id, "user", "Test message", "msg_123")
+        temp_db.save_thread_summary(thread_id, "persisted summary", "456.789")
         temp_db.save_thread_config(thread_id, {"model": "gpt-5"})
-        
+
         # Verify data exists
-        messages = temp_db.get_cached_messages(thread_id)
-        assert len(messages) == 1
-        
+        row = temp_db.get_thread_summary(thread_id)
+        assert row["summary_text"] == "persisted summary"
+
         config = temp_db.get_thread_config(thread_id)
         assert config["model"] == "gpt-5"
     
@@ -257,12 +236,10 @@ class TestDatabaseManager:
             thread = temp_db.get_or_create_thread("C1:T1", "C1", "U1")
             assert thread is not None
             
-            # Cache message
-            temp_db.cache_message("C1:T1", "user", "Test")
-            
-            # Get messages
-            messages = temp_db.get_cached_messages("C1:T1")
-            assert len(messages) > 0
+            # Thread summary round-trip (Phase S: replaces the message mirror)
+            temp_db.save_thread_summary("C1:T1", "summary", "1.0")
+            row = temp_db.get_thread_summary("C1:T1")
+            assert row["summary_text"] == "summary"
             
         except Exception as e:
             pytest.fail(f"Basic database operations failed: {e}")
@@ -365,7 +342,7 @@ class TestDatabaseBackup:
         """Test database backup creation"""
         # Add some data
         temp_db.get_or_create_thread("C1:T1", "C1", "U1")
-        temp_db.cache_message("C1:T1", "user", "Test message")
+        temp_db.save_thread_summary("C1:T1", "backup me", "1.0")
         
         # Create backup directory if it doesn't exist
         os.makedirs("data/backups", exist_ok=True)
@@ -417,8 +394,8 @@ class TestDatabaseContract:
         """Contract: DatabaseManager must provide expected interface"""
         # Required methods for ThreadStateManager
         assert callable(temp_db.get_or_create_thread)
-        assert callable(temp_db.cache_message)
-        assert callable(temp_db.get_cached_messages)
+        assert callable(temp_db.get_thread_summary)
+        assert callable(temp_db.save_thread_summary)
         assert callable(temp_db.get_thread_config)
         assert callable(temp_db.save_thread_config)
         

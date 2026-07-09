@@ -155,7 +155,12 @@ class BotConfig:
     token_buffer_percentage: float = field(default_factory=lambda: float(os.getenv("TOKEN_BUFFER_PERCENTAGE", "0.875")))
     token_cleanup_threshold: float = field(default_factory=lambda: float(os.getenv("TOKEN_CLEANUP_THRESHOLD", "0.8")))
     token_trim_message_count: int = field(default_factory=lambda: int(os.getenv("TOKEN_TRIM_MESSAGE_COUNT", "5")))
-    
+    # Phase S: chunky compaction target — when over the cleanup threshold, compact down to
+    # this fraction of the model limit in ONE pass (per-turn micro-trims would bust the
+    # OpenAI prefix cache every turn)
+    token_compaction_target: float = field(default_factory=lambda: float(os.getenv("TOKEN_COMPACTION_TARGET", "0.7")))
+
+
     # Streaming configuration
     enable_streaming: bool = field(default_factory=lambda: os.getenv("ENABLE_STREAMING", "true").lower() == "true")
     slack_streaming: bool = field(default_factory=lambda: os.getenv("SLACK_STREAMING", "true").lower() == "true")

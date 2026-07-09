@@ -92,26 +92,25 @@ class DatabaseManager(LoggerMixin):
             ON threads(last_activity)
         """)
         
-        # Messages table (for caching)
+        # NOTE (Phase S): there is deliberately NO messages table. Slack is the only
+        # transcript — context is always rebuilt from conversations.replies. The DB keeps
+        # only what Slack doesn't have: config, memory, derived artifacts (images/documents),
+        # and thread_summaries (compaction state). See Docs/CHANNEL_TEAMMATE_REDESIGN_PLAN.md §5b.
+
+        # Thread summaries table — rolling compaction store for long threads.
+        # summary_text covers everything at or before boundary_ts; refs_json preserves
+        # structured references (files/images/links) from the summarized span.
         self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                thread_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                message_ts TEXT,
-                metadata_json TEXT,
+            CREATE TABLE IF NOT EXISTS thread_summaries (
+                thread_id TEXT PRIMARY KEY,
+                summary_text TEXT NOT NULL,
+                boundary_ts TEXT NOT NULL,
+                refs_json TEXT,
+                updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (thread_id) REFERENCES threads(thread_id) ON DELETE CASCADE
             )
         """)
-        
-        # Create index for messages
-        self.conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_thread_messages 
-            ON messages(thread_id, timestamp)
-        """)
-        
+
         # Images table (no base64 storage)
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS images (
@@ -149,7 +148,6 @@ class DatabaseManager(LoggerMixin):
                 content TEXT NOT NULL,
                 page_structure TEXT,
                 total_pages INTEGER,
-                summary TEXT,
                 metadata_json TEXT,
                 message_ts TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -538,6 +536,37 @@ class DatabaseManager(LoggerMixin):
                     f"DB: Backfilled settings_completed=1 for {backfilled} pre-existing user(s)"
                 )
 
+            # Phase S one-time cleanup: drop the message mirror. Slack is the only
+            # transcript now — context is always rebuilt from conversations.replies.
+            # Guarded on table existence so it runs exactly once per database; the
+            # tagged backup is the rollback path.
+            cursor = self.conn.execute("""
+                SELECT name FROM sqlite_master
+                WHERE type='table' AND name='messages'
+            """)
+            if cursor.fetchone():
+                self.backup_database(tag="pre-v3-mirror-drop")
+                size_before = os.path.getsize(self.db_path)
+                cursor = self.conn.execute("SELECT COUNT(*) FROM messages")
+                row_count = cursor.fetchone()[0]
+                self.conn.execute("DROP TABLE IF EXISTS messages")
+                # Drop the never-read documents.summary column (dead since day one).
+                # ALTER ... DROP COLUMN needs SQLite 3.35+; degrade gracefully below it.
+                try:
+                    cursor = self.conn.execute("PRAGMA table_info(documents)")
+                    doc_columns = [col[1] for col in cursor.fetchall()]
+                    if 'summary' in doc_columns:
+                        self.conn.execute("ALTER TABLE documents DROP COLUMN summary")
+                except Exception as col_err:
+                    self.log_warning(f"DB: Could not drop documents.summary column: {col_err}")
+                self.conn.execute("VACUUM")
+                size_after = os.path.getsize(self.db_path)
+                self.log_info(
+                    f"DB: Mirror-drop migration complete — removed {row_count} cached message "
+                    f"row(s), reclaimed {max(0, size_before - size_after):,} bytes "
+                    f"(backup tagged pre-v3-mirror-drop in {self.db_dir}/backups)"
+                )
+
             # Check if mcp_tools table exists
             cursor = self.conn.execute("""
                 SELECT name FROM sqlite_master
@@ -750,107 +779,51 @@ class DatabaseManager(LoggerMixin):
     
     # Message operations
     
-    def cache_message(self, thread_id: str, role: str, content: str, 
-                     message_ts: Optional[str] = None, metadata: Optional[Dict] = None):
+    # Thread summary operations (Phase S — rolling compaction store)
+    def get_thread_summary(self, thread_id: str) -> Optional[Dict]:
         """
-        Cache a message for a thread.
-        
-        Args:
-            thread_id: Thread identifier
-            role: Message role (user/assistant/developer)
-            content: Message content
-            message_ts: Optional message timestamp
-            metadata: Optional metadata dictionary
-        """
-        self.log_debug(f"DB: Caching message - thread={thread_id}, role={role}, "
-                      f"content_len={len(content) if content else 0}, has_ts={bool(message_ts)}")
-        
-        try:
-            self.conn.execute("""
-                INSERT INTO messages (thread_id, role, content, message_ts, metadata_json)
-                VALUES (?, ?, ?, ?, ?)
-            """, (thread_id, role, content, message_ts, 
-                  json.dumps(metadata) if metadata else None))
-            
-            # Update thread activity
-            self.update_thread_activity(thread_id)
-            
-            self.log_info(f"DB: Successfully cached {role} message for thread {thread_id}")
-            
-        except Exception as e:
-            self.log_error(f"DB: Failed to cache message - {e}", exc_info=True)
-            raise
-    def get_cached_messages(self, thread_id: str, limit: Optional[int] = None) -> List[Dict]:
-        """
-        Get cached messages for a thread.
-        
-        Args:
-            thread_id: Thread identifier
-            limit: Optional limit on number of messages (None = all)
-            
+        Get the compaction summary row for a thread, if one exists.
+
         Returns:
-            List of message dictionaries
+            Dict with summary_text, boundary_ts, refs (parsed list), updated_ts — or None.
         """
-        query = """
-            SELECT * FROM messages 
-            WHERE thread_id = ? 
-            ORDER BY timestamp ASC
-        """
-        
-        if limit:
-            query += f" LIMIT {limit}"
-        
-        cursor = self.conn.execute(query, (thread_id,))
-        messages = []
-        
-        for row in cursor:
-            msg = dict(row)
-            if msg.get("metadata_json"):
-                msg["metadata"] = json.loads(msg["metadata_json"])
-                del msg["metadata_json"]
-            messages.append(msg)
-        
-        return messages
-    
-    def clear_thread_messages(self, thread_id: str):
-        """
-        Clear all cached messages for a thread.
-        
-        Args:
-            thread_id: Thread identifier
-        """
-        self.conn.execute(
-            "DELETE FROM messages WHERE thread_id = ?",
-            (thread_id,)
+        cursor = self.conn.execute(
+            "SELECT * FROM thread_summaries WHERE thread_id = ?", (thread_id,)
         )
-        logger.debug(f"Cleared messages for thread {thread_id}")
-    
-    def delete_oldest_messages(self, thread_id: str, count: int):
+        row = cursor.fetchone()
+        if not row:
+            return None
+        summary = dict(row)
+        summary["refs"] = json.loads(summary["refs_json"]) if summary.get("refs_json") else []
+        return summary
+
+    def save_thread_summary(self, thread_id: str, summary_text: str, boundary_ts: str,
+                            refs: Optional[List[Dict]] = None):
         """
-        Delete the oldest N messages from a thread, preserving system messages.
-        
+        Upsert the compaction summary for a thread (one row per thread, rolling).
+
         Args:
             thread_id: Thread identifier
-            count: Number of messages to delete
+            summary_text: Summary covering everything at or before boundary_ts
+            boundary_ts: Slack ts of the newest message covered by the summary
+            refs: Structured refs (files/images/links) from the summarized span
         """
-        # First get the IDs of non-system messages ordered by timestamp
-        cursor = self.conn.execute("""
-            SELECT id FROM messages 
-            WHERE thread_id = ? AND role NOT IN ('system', 'developer')
-            ORDER BY timestamp ASC
-            LIMIT ?
-        """, (thread_id, count))
-        
-        ids_to_delete = [row['id'] for row in cursor]
-        
-        if ids_to_delete:
-            placeholders = ','.join(['?' for _ in ids_to_delete])
-            self.conn.execute(
-                f"DELETE FROM messages WHERE id IN ({placeholders})",
-                ids_to_delete
-            )
-            logger.debug(f"Deleted {len(ids_to_delete)} oldest messages from thread {thread_id}")
-    
+        self.conn.execute("""
+            INSERT INTO thread_summaries (thread_id, summary_text, boundary_ts, refs_json, updated_ts)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                summary_text = excluded.summary_text,
+                boundary_ts = excluded.boundary_ts,
+                refs_json = excluded.refs_json,
+                updated_ts = CURRENT_TIMESTAMP
+        """, (thread_id, summary_text, boundary_ts,
+              json.dumps(refs) if refs else None))
+        self.log_info(f"DB: Saved thread summary for {thread_id} (boundary_ts={boundary_ts})")
+
+    def delete_thread_summary(self, thread_id: str):
+        """Delete the compaction summary for a thread."""
+        self.conn.execute("DELETE FROM thread_summaries WHERE thread_id = ?", (thread_id,))
+
     # Image operations
     def save_image_metadata(self, thread_id: str, url: str, image_type: str,
                            prompt: Optional[str] = None, analysis: Optional[str] = None,
@@ -1157,22 +1130,23 @@ class DatabaseManager(LoggerMixin):
             content: Full document text content
             page_structure: Optional page/sheet structure info as dict
             total_pages: Total page/sheet count
-            summary: Optional AI-generated summary
+            summary: Accepted for backward compatibility; no longer persisted
+                     (the documents.summary column was dropped — never read)
             metadata: Additional metadata (size, author, etc.)
             message_ts: Message timestamp to link document to specific message
         """
         self.log_debug(f"DB: Saving document - thread={thread_id}, filename={filename}, "
                       f"content_len={len(content) if content else 0}, pages={total_pages}")
-        
+
         try:
             self.conn.execute("""
-                INSERT INTO documents 
-                (thread_id, filename, mime_type, content, page_structure, total_pages, 
-                 summary, metadata_json, message_ts)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO documents
+                (thread_id, filename, mime_type, content, page_structure, total_pages,
+                 metadata_json, message_ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (thread_id, filename, mime_type, content,
                   json.dumps(page_structure) if page_structure else None,
-                  total_pages, summary,
+                  total_pages,
                   json.dumps(metadata) if metadata else None, message_ts))
             
             # Update thread activity
@@ -1702,14 +1676,21 @@ class DatabaseManager(LoggerMixin):
                     self.log_error(f"Failed to delete modal session (async): {e}")
                     return False
 
-    def backup_database(self):
-        """Create timestamped backup of database."""
+    def backup_database(self, tag: Optional[str] = None):
+        """Create timestamped backup of database.
+
+        Args:
+            tag: Optional label inserted before the timestamp (e.g. a migration name),
+                 producing {platform}_{tag}_{timestamp}.db. Kept before the timestamp so
+                 cleanup_old_backups' date parsing (last two underscore parts) still works.
+        """
         # Checkpoint WAL file before backup
         self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
         # Create timestamped backup
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = f"{self.db_dir}/backups/{self.platform}_{timestamp}.db"
+        label = f"{tag}_" if tag else ""
+        backup_path = f"{self.db_dir}/backups/{self.platform}_{label}{timestamp}.db"
         
         # Use SQLite backup API
         backup_conn = sqlite3.connect(backup_path)
@@ -1775,77 +1756,41 @@ class DatabaseManager(LoggerMixin):
         finally:
             self._async_db_semaphore.release()
 
-    async def cache_message_async(self, thread_id: str, role: str, content: str,
-                                 message_ts: Optional[str] = None, metadata: Optional[Dict] = None):
-        """
-        Async version of cache_message.
-
-        Args:
-            thread_id: Thread identifier
-            role: Message role (user/assistant/developer)
-            content: Message content
-            message_ts: Optional message timestamp
-            metadata: Optional metadata dictionary
-        """
-        self.log_debug(f"DB: Async caching message - thread={thread_id}, role={role}, "
-                      f"content_len={len(content) if content else 0}, has_ts={bool(message_ts)}")
-
-        try:
-            async with aiosqlite.connect(self.db_path) as db:
-                db.row_factory = aiosqlite.Row
-                await db.execute("PRAGMA journal_mode=WAL")
-
-                await db.execute("""
-                    INSERT INTO messages (thread_id, role, content, message_ts, metadata_json)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (thread_id, role, content, message_ts,
-                      json.dumps(metadata) if metadata else None))
-
-                await db.commit()
-
-                # Update thread activity
-                await self.update_thread_activity_async(thread_id)
-
-                self.log_info(f"DB: Successfully cached {role} message for thread {thread_id}")
-
-        except Exception as e:
-            self.log_error(f"DB: Failed to cache message async - {e}", exc_info=True)
-            raise
-
-    async def get_cached_messages_async(self, thread_id: str, limit: Optional[int] = None) -> List[Dict]:
-        """
-        Async version of get_cached_messages.
-
-        Args:
-            thread_id: Thread identifier
-            limit: Optional limit on number of messages (None = all)
-
-        Returns:
-            List of message dictionaries
-        """
-        query = """
-            SELECT * FROM messages
-            WHERE thread_id = ?
-            ORDER BY timestamp ASC
-        """
-
-        if limit:
-            query += f" LIMIT {limit}"
-
+    async def get_thread_summary_async(self, thread_id: str) -> Optional[Dict]:
+        """Async version of get_thread_summary."""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA journal_mode=WAL")
 
-            async with db.execute(query, (thread_id,)) as cursor:
-                messages = []
-                async for row in cursor:
-                    msg = dict(row)
-                    if msg.get("metadata_json"):
-                        msg["metadata"] = json.loads(msg["metadata_json"])
-                        del msg["metadata_json"]
-                    messages.append(msg)
+            async with db.execute(
+                "SELECT * FROM thread_summaries WHERE thread_id = ?", (thread_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return None
+                summary = dict(row)
+                summary["refs"] = json.loads(summary["refs_json"]) if summary.get("refs_json") else []
+                return summary
 
-        return messages
+    async def save_thread_summary_async(self, thread_id: str, summary_text: str, boundary_ts: str,
+                                        refs: Optional[List[Dict]] = None):
+        """Async version of save_thread_summary (upsert, rolling)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+
+            await db.execute("""
+                INSERT INTO thread_summaries (thread_id, summary_text, boundary_ts, refs_json, updated_ts)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(thread_id) DO UPDATE SET
+                    summary_text = excluded.summary_text,
+                    boundary_ts = excluded.boundary_ts,
+                    refs_json = excluded.refs_json,
+                    updated_ts = CURRENT_TIMESTAMP
+            """, (thread_id, summary_text, boundary_ts,
+                  json.dumps(refs) if refs else None))
+            await db.commit()
+        self.log_info(f"DB: Saved thread summary for {thread_id} (boundary_ts={boundary_ts}, async)")
 
     async def update_thread_activity_async(self, thread_id: str):
         """
@@ -1865,26 +1810,6 @@ class DatabaseManager(LoggerMixin):
             """, (thread_id,))
 
             await db.commit()
-
-    async def clear_thread_messages_async(self, thread_id: str):
-        """
-        Async version of clear_thread_messages.
-        Clear all cached messages for a thread.
-
-        Args:
-            thread_id: Thread identifier
-        """
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            await db.execute("PRAGMA journal_mode=WAL")
-
-            await db.execute(
-                "DELETE FROM messages WHERE thread_id = ?",
-                (thread_id,)
-            )
-
-            await db.commit()
-            logger.debug(f"Cleared messages for thread {thread_id} (async)")
 
     async def save_image_metadata_async(self, thread_id: str, url: str, image_type: str,
                                        prompt: Optional[str] = None, analysis: Optional[str] = None,
