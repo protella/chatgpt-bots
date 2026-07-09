@@ -379,7 +379,24 @@ class AsyncThreadStateManager(LoggerMixin):
         # releases, so a fast follow-up "edit it" could resolve its target before the
         # new image exists. Editors await the latch before resolving targets.
         self._upload_events: Dict[str, asyncio.Event] = {}
+        # Threads whose warm in-memory state is missing at least one Slack message:
+        # a message busy-rejected by the thread lock never entered the state, so the
+        # next request on that thread must refetch from Slack (the transcript) before
+        # processing. Set on busy rejection; consumed by the rebuild path.
+        self._needs_refresh: set = set()
         self.log_info(f"AsyncThreadStateManager initialized {'with' if db else 'without'} database")
+
+    def mark_needs_refresh(self, thread_key: str):
+        """Flag a thread whose warm state is now incomplete (e.g. a busy-rejected
+        message that Slack has but our in-memory state never saw)."""
+        self._needs_refresh.add(thread_key)
+
+    def consume_needs_refresh(self, thread_key: str) -> bool:
+        """Pop-and-return the refresh flag. True → caller must refetch from Slack."""
+        if thread_key in self._needs_refresh:
+            self._needs_refresh.discard(thread_key)
+            return True
+        return False
 
     def mark_upload_started(self, thread_key: str):
         """Signal that an asset upload for this thread is in flight."""

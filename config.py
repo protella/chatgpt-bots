@@ -247,6 +247,23 @@ class BotConfig:
     # Posted as a separate trailing message, so it never touches the text/split/streaming path.
     enable_response_footer: bool = field(default_factory=lambda: os.getenv("ENABLE_RESPONSE_FOOTER", "true").lower() == "true")
 
+    # --- ParticipationEngine (redesign Phase F) ---
+    # Judgment layer for UNPROMPTED channel participation (judicious/active channels).
+    # Replaces the wake classifier. When false, unaddressed channel messages are ignored
+    # without any model call (every channel behaves like mentions_only/tag_only);
+    # @mentions, name-wakes, 1:1 threads, and DMs are unaffected either way.
+    enable_participation_engine: bool = field(default_factory=lambda: os.getenv("ENABLE_PARTICIPATION_ENGINE", "true").lower() == "true")
+    # Rapid-fire messages in the same channel within this window collapse into ONE engine
+    # evaluation of the latest state (someone typing four short lines ≠ four verdicts).
+    participation_debounce_seconds: float = field(default_factory=lambda: float(os.getenv("PARTICIPATION_DEBOUNCE_SECONDS", "3")))
+    # Hard rail (code, not prompt): max unprompted replies per channel per hour. Over the cap
+    # the engine isn't even called. "active" channels get 2x. Mentions are never throttled.
+    max_unprompted_replies_per_hour: int = field(default_factory=lambda: int(os.getenv("MAX_UNPROMPTED_REPLIES_PER_HOUR", "6")))
+    # "Butt out" snooze: hours of no unprompted participation after a backoff verdict.
+    participation_snooze_hours: float = field(default_factory=lambda: float(os.getenv("PARTICIPATION_SNOOZE_HOURS", "4")))
+    # Emoji used to acknowledge a backoff request without more words.
+    snooze_ack_emoji: str = field(default_factory=lambda: os.getenv("SNOOZE_ACK_EMOJI", "zipper_mouth_face").strip().strip(":"))
+
     # --- Local function-call loop (redesign Phase A) ---
     # Master switch for model-invoked local tools (history fetch, reactions, later search/memory).
     # The loop composes with server-side tools (web_search/MCP) in the same request.

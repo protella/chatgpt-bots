@@ -98,6 +98,13 @@ class MessageProcessor(ThreadManagementMixin,
 
         if not lock_acquired:
             elapsed = time.time() - request_start_time
+            # This message exists in Slack but never enters the warm in-memory state —
+            # flag the thread so the NEXT request refetches the transcript first
+            # (otherwise the rejected message is lost from context until a cold rebuild).
+            try:
+                self.thread_manager.mark_needs_refresh(thread_key)
+            except Exception:
+                pass
             self.log_info("")
             self.log_info("="*100)
             self.log_info(f"REQUEST END | Thread: {thread_key} | Status: BUSY | Time: {elapsed:.2f}s")
