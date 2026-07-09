@@ -433,17 +433,6 @@ class TestMessageProcessorHelpers:
         assert prompt is not None
         assert "Slack" in prompt or "slack" in prompt.lower()
     
-    def test_get_system_prompt_discord(self, processor):
-        """Test getting system prompt for Discord"""
-        mock_client = MagicMock()
-        mock_client.platform = "discord"
-        mock_client.name = "DiscordClient"  # Add name attribute
-        
-        prompt = processor._get_system_prompt(mock_client, "UTC")
-        
-        assert prompt is not None
-        assert "Discord" in prompt or "discord" in prompt.lower()
-    
     def test_format_response_text(self, processor):
         """Test formatting text response"""
         # This method doesn't exist in MessageProcessor, removing test

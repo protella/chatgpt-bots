@@ -122,19 +122,6 @@ class TestSetupLoggerComprehensive:
 
                 assert logger.level == logging.WARNING
 
-    def test_setup_logger_discord_specific_level(self):
-        """Test setup_logger with discord-specific log level"""
-        with patch('logger.config') as mock_config:
-            mock_config.discord_log_level = 'ERROR'
-            mock_config.log_level = 'INFO'
-            mock_config.console_logging_enabled = False
-            mock_config.log_directory = 'test_logs'
-
-            with patch('os.makedirs'), patch('os.path.exists', return_value=True):
-                logger = setup_logger('discord_test_logger')
-
-                assert logger.level == logging.ERROR
-
     def test_setup_logger_utils_specific_level(self):
         """Test setup_logger with utils-specific log level"""
         with patch('logger.config') as mock_config:

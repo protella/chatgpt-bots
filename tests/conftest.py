@@ -21,7 +21,6 @@ def mock_env(monkeypatch):
         'TESTING': 'true',
         'SLACK_BOT_TOKEN': 'xoxb-test-token',
         'SLACK_APP_TOKEN': 'xapp-test-token',
-        'DISCORD_TOKEN': 'discord-test-token',
         'OPENAI_KEY': 'sk-test-key',
         'GPT_MODEL': 'gpt-5',
         'DEFAULT_REASONING_EFFORT': 'medium',

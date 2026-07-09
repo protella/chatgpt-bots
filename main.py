@@ -45,12 +45,6 @@ class ChatBotV2:
             self.processor = MessageProcessor(db=self.client.db)
             # Give the client a reference to the processor for thread state updates
             self.client.processor = self.processor
-        elif self.platform == "discord":
-            # Future: from discordbot import DiscordBot
-            # self.client = DiscordBot(message_handler=self.handle_message)
-            # self.processor = MessageProcessor(db=self.client.db)
-            main_logger.error("Discord platform not yet implemented")
-            sys.exit(1)
         else:
             main_logger.error(f"Unknown platform: {self.platform}")
             sys.exit(1)
@@ -403,10 +397,10 @@ class ChatBotV2:
 async def main():
     """Main entry point"""
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Multi-platform AI Chat Bot")
+    parser = argparse.ArgumentParser(description="ChatGPT Slack Bot")
     parser.add_argument(
         "--platform",
-        choices=["slack", "discord"],
+        choices=["slack"],
         default="slack",
         help="Chat platform to use (default: slack)"
     )
