@@ -353,43 +353,30 @@ class TestBotConfig:
         assert diagnostic_info["temperature"] > 0
         assert diagnostic_info["max_tokens"] > 0
 
-    def test_get_model_token_limit_gpt5(self, mock_env):
-        """Test get_model_token_limit for GPT-5 models"""
+    def test_get_model_token_limit_gpt55(self, mock_env):
+        """gpt-5.5 uses the 1.05M window with its dedicated buffer percentage"""
         config = BotConfig()
 
-        # Test GPT-5 model
-        limit = config.get_model_token_limit("gpt-5")
+        limit = config.get_model_token_limit("gpt-5.5")
+        expected = int(config.gpt54_max_tokens * config.gpt54_token_buffer_percentage)
+        assert limit == expected
+
+    def test_get_model_token_limit_gpt5_mini(self, mock_env):
+        """gpt-5-mini (utility) uses the 400k window with the standard buffer"""
+        config = BotConfig()
+
+        limit = config.get_model_token_limit("gpt-5-mini")
         expected = int(config.gpt5_max_tokens * config.token_buffer_percentage)
         assert limit == expected
 
-        # Test GPT-5 mini
-        limit = config.get_model_token_limit("gpt-5-mini")
-        assert limit == expected
-
-        # Test GPT-5 nano
-        limit = config.get_model_token_limit("gpt-5-nano")
-        assert limit == expected
-
-    def test_get_model_token_limit_gpt4(self, mock_env):
-        """Test get_model_token_limit for GPT-4 models"""
-        config = BotConfig()
-
-        # Test GPT-4.1 model
-        limit = config.get_model_token_limit("gpt-4.1")
-        expected = int(config.gpt4_max_tokens * config.token_buffer_percentage)
-        assert limit == expected
-
-        # Test GPT-4o
-        limit = config.get_model_token_limit("gpt-4o")
-        assert limit == expected
-
     def test_get_model_token_limit_unknown_model(self, mock_env):
-        """Test get_model_token_limit defaults to GPT-4 for unknown models"""
+        """Unknown models fall back to the conservative 400k window"""
         config = BotConfig()
+
+        expected = int(config.gpt5_max_tokens * config.token_buffer_percentage)
 
         # Test unknown model
         limit = config.get_model_token_limit("unknown-model")
-        expected = int(config.gpt4_max_tokens * config.token_buffer_percentage)
         assert limit == expected
 
         # Test empty model name

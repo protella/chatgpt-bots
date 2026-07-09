@@ -179,13 +179,10 @@ async def _enhance_image_edit_prompt(
             "store": False,
         }
 
-        # Check if we're using a GPT-5 reasoning model
-        if config.utility_model.startswith("gpt-5") and "chat" not in config.utility_model.lower():
-            request_params["temperature"] = 1.0
-            request_params["reasoning"] = {"effort": config.utility_reasoning_effort}
-            request_params["text"] = {"verbosity": config.utility_verbosity}
-        else:
-            request_params["temperature"] = 0.7
+        # Utility model is a GPT-5-series reasoning model (gpt-5-mini)
+        request_params["temperature"] = 1.0
+        request_params["reasoning"] = {"effort": config.utility_reasoning_effort}
+        request_params["text"] = {"verbosity": config.utility_verbosity}
 
         # Check if streaming callback provided
         if stream_callback:
@@ -302,20 +299,12 @@ async def _enhance_image_prompt(
                 messages=[{"role": "user", "content": context}],
                 stream_callback=stream_callback,
                 model=config.utility_model,
-                temperature=
-                0.7
-                if "chat" in config.utility_model.lower() or not config.utility_model.startswith("gpt-5")
-                else 1.0,
+                # Utility model is a GPT-5-series reasoning model (gpt-5-mini)
+                temperature=1.0,
                 max_tokens=500,
                 system_prompt=IMAGE_GEN_SYSTEM_PROMPT,
-                reasoning_effort=
-                config.utility_reasoning_effort
-                if config.utility_model.startswith("gpt-5") and "chat" not in config.utility_model.lower()
-                else None,
-                verbosity=
-                config.utility_verbosity
-                if config.utility_model.startswith("gpt-5") and "chat" not in config.utility_model.lower()
-                else None,
+                reasoning_effort=config.utility_reasoning_effort,
+                verbosity=config.utility_verbosity,
                 store=False,
             )
         else:
@@ -331,12 +320,10 @@ async def _enhance_image_prompt(
                 "store": False,
             }
 
-            if config.utility_model.startswith("gpt-5") and "chat" not in config.utility_model.lower():
-                request_params["temperature"] = 1.0
-                request_params["reasoning"] = {"effort": config.utility_reasoning_effort}
-                request_params["text"] = {"verbosity": config.utility_verbosity}
-            else:
-                request_params["temperature"] = 0.7
+            # Utility model is a GPT-5-series reasoning model (gpt-5-mini)
+            request_params["temperature"] = 1.0
+            request_params["reasoning"] = {"effort": config.utility_reasoning_effort}
+            request_params["text"] = {"verbosity": config.utility_verbosity}
 
             response = await self._safe_api_call(
                 self.client.responses.create,
