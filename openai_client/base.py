@@ -384,6 +384,23 @@ class OpenAIClient(LoggerMixin):
             max_retries=max_retries,
         )
 
+    async def classify_wake(
+        self,
+        text: str,
+        signals: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Phase 5 wake classifier: 'respond' | 'react' | 'ignore' (defaults to 'ignore')."""
+        return await responses_api.classify_wake(self, text=text, signals=signals)
+
+    async def extract_memory(
+        self,
+        exchange_text: str,
+        existing_memory: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Phase 9 post-response memory extraction. Returns {"action": "none"|"add"|"update", ...};
+        conservative — any failure → {"action": "none"} (no write)."""
+        return await responses_api.extract_memory(self, exchange_text=exchange_text, existing_memory=existing_memory)
+
     async def _safe_api_call(
         self,
         api_method: Callable,

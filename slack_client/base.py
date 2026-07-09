@@ -11,6 +11,7 @@ from markdown_converter import MarkdownConverter
 from database import DatabaseManager
 from settings_modal import SettingsModal
 from .event_handlers import (
+    SlackAssistantEventsMixin,
     SlackMessageEventsMixin,
     SlackRegistrationMixin,
     SlackSettingsHandlersMixin,
@@ -18,14 +19,17 @@ from .event_handlers import (
 from .utilities import SlackUtilitiesMixin
 from .formatting.text import SlackFormattingMixin
 from .messaging import SlackMessagingMixin
+from .history_tool import SlackHistoryToolMixin
 
 
 class SlackBot(SlackMessageEventsMixin,
                SlackSettingsHandlersMixin,
                SlackRegistrationMixin,
+               SlackAssistantEventsMixin,
                SlackUtilitiesMixin,
                SlackFormattingMixin,
                SlackMessagingMixin,
+               SlackHistoryToolMixin,
                BaseClient):
     """Slack-specific bot implementation"""
     
@@ -39,6 +43,12 @@ class SlackBot(SlackMessageEventsMixin,
         self.message_handler = message_handler  # Callback for processing messages
         self.markdown_converter = MarkdownConverter(platform="slack")
         self.user_cache = {}  # Cache user info to avoid repeated API calls
+
+        # Bot self-identity (populated once via auth_test on start; used to tell our own
+        # messages apart from other bots'/humans' — see classify_sender / is_own_message)
+        self.bot_user_id = None
+        self.bot_id = None
+        self.app_id = None
 
         # Initialize database manager
         self.db = DatabaseManager(platform="slack")

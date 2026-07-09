@@ -101,7 +101,7 @@ class TextHandlerMixin:
         # Pass the model for dynamic knowledge cutoff (respecting user prefs)
         web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
         model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
-        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, thread_state.has_trimmed_messages, thread_config.get('custom_instructions'))
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, thread_state.has_trimmed_messages, thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_directives=getattr(thread_state, 'channel_directives', None))
         
         # Update status before generating
         if failed_mcp_server:
@@ -233,7 +233,8 @@ class TextHandlerMixin:
         
         return Response(
             type="text",
-            content=response_text
+            content=response_text,
+            metadata={"model": thread_config.get("model")}
         )
 
     async def _handle_streaming_text_response(self, user_content: Any, thread_state, client: BaseClient,
@@ -329,7 +330,7 @@ class TextHandlerMixin:
         # Pass the model for dynamic knowledge cutoff (respecting user prefs)
         web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
         model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
-        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, thread_state.has_trimmed_messages, thread_config.get('custom_instructions'))
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, thread_state.has_trimmed_messages, thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_directives=getattr(thread_state, 'channel_directives', None))
         
         # Post an initial message to get the message ID for streaming updates
         # For streaming with potential tools, start with "Working on it"
@@ -981,7 +982,7 @@ class TextHandlerMixin:
             return Response(
                 type="text",
                 content=response_text,
-                metadata={"streamed": True, "message_id": message_id}
+                metadata={"streamed": True, "message_id": message_id, "model": thread_config.get("model")}
             )
             
         except Exception as e:

@@ -15,6 +15,11 @@ from logger import LoggerMixin
 
 logger = logging.getLogger(__name__)
 
+# Sentinel distinguishing "argument omitted → preserve existing value" from an explicit
+# None (→ clear the column to NULL). Used by the channel_settings setters so the settings
+# modal's "inherit from global default" selection stores NULL rather than a literal string.
+_UNSET = object()
+
 
 class DatabaseManager(LoggerMixin):
     """
@@ -264,6 +269,36 @@ class DatabaseManager(LoggerMixin):
             CREATE INDEX IF NOT EXISTS idx_mcp_server_label
             ON mcp_tools(server_label)
         """)
+
+        # Phase 7: per-channel response settings (mode + freeform directives).
+        # No row for a channel => global defaults apply (no behavior change).
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS channel_settings (
+                channel_id TEXT PRIMARY KEY,
+                response_mode TEXT DEFAULT 'tag_only',
+                directives TEXT,
+                reply_in_channel BOOLEAN DEFAULT 0,
+                updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_by TEXT
+            )
+        """)
+
+        # Per-channel durable memory (Phase 9). scope='channel' rows are private to that channel;
+        # scope='workspace' rows are shared (read-mostly, admin/manual writes only).
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS channel_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL,
+                scope TEXT NOT NULL DEFAULT 'channel',
+                content TEXT NOT NULL,
+                author TEXT,
+                created_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_channel_memory_lookup ON channel_memory (scope, channel_id)"
+        )
 
         self.conn.commit()
 
@@ -592,6 +627,86 @@ class DatabaseManager(LoggerMixin):
         
         return None
     
+    def get_channel_settings(self, channel_id: str) -> Optional[Dict]:
+        """Get per-channel settings (Phase 7). Returns a dict or None if the channel has no row."""
+        cursor = self.conn.execute(
+            "SELECT response_mode, directives, reply_in_channel, updated_ts, updated_by "
+            "FROM channel_settings WHERE channel_id = ?",
+            (channel_id,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "response_mode": row["response_mode"],
+            "directives": row["directives"],
+            "reply_in_channel": bool(row["reply_in_channel"]),
+            "updated_ts": row["updated_ts"],
+            "updated_by": row["updated_by"],
+        }
+
+    def set_channel_settings(self, channel_id: str, response_mode=_UNSET,
+                             directives=_UNSET, reply_in_channel=_UNSET,
+                             updated_by: Optional[str] = None):
+        """Upsert per-channel settings (Phase 7).
+
+        Omitted fields are preserved. An explicit value sets it; an explicit None CLEARS it
+        (response_mode/directives → NULL) so the modal's "inherit from global default" stores
+        NULL rather than a literal string (NULL then resolves to the global default at read time).
+        """
+        existing = self.get_channel_settings(channel_id) or {}
+        new_mode = existing.get("response_mode", "tag_only") if response_mode is _UNSET else response_mode
+        new_dir = existing.get("directives") if directives is _UNSET else directives
+        new_ric = existing.get("reply_in_channel", False) if reply_in_channel is _UNSET else reply_in_channel
+        self.conn.execute("""
+            INSERT INTO channel_settings (channel_id, response_mode, directives, reply_in_channel, updated_ts, updated_by)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                response_mode=excluded.response_mode,
+                directives=excluded.directives,
+                reply_in_channel=excluded.reply_in_channel,
+                updated_ts=CURRENT_TIMESTAMP,
+                updated_by=excluded.updated_by
+        """, (channel_id, new_mode, new_dir, 1 if new_ric else 0, updated_by))
+        self.conn.commit()
+        logger.debug(f"Saved channel_settings for {channel_id}: mode={new_mode}")
+
+    # --- Per-channel memory (Phase 9) ---
+    def get_channel_memory(self, channel_id: str) -> List[Dict]:
+        """Return durable memory visible to a channel: its own channel-scope rows + shared
+        workspace-scope rows. A channel NEVER sees another channel's channel-scope rows."""
+        cursor = self.conn.execute(
+            "SELECT id, channel_id, scope, content, author, created_ts, updated_ts "
+            "FROM channel_memory WHERE (scope = 'channel' AND channel_id = ?) OR scope = 'workspace' "
+            "ORDER BY updated_ts ASC",
+            (channel_id,)
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def add_channel_memory(self, channel_id: str, content: str, scope: str = "channel",
+                           author: Optional[str] = None) -> int:
+        """Insert a memory row; returns the new id."""
+        cursor = self.conn.execute(
+            "INSERT INTO channel_memory (channel_id, scope, content, author) VALUES (?, ?, ?, ?)",
+            (channel_id, scope, content, author)
+        )
+        self.conn.commit()
+        logger.debug(f"Added channel_memory for {channel_id} (scope={scope})")
+        return cursor.lastrowid
+
+    def update_channel_memory(self, memory_id: int, content: str):
+        """Update an existing memory row's content (and updated_ts)."""
+        self.conn.execute(
+            "UPDATE channel_memory SET content = ?, updated_ts = CURRENT_TIMESTAMP WHERE id = ?",
+            (content, memory_id)
+        )
+        self.conn.commit()
+
+    def delete_channel_memory(self, memory_id: int):
+        """Delete a memory row (manual forget / cap eviction)."""
+        self.conn.execute("DELETE FROM channel_memory WHERE id = ?", (memory_id,))
+        self.conn.commit()
+
     def update_thread_activity(self, thread_id: str):
         """
         Update thread's last activity timestamp.
@@ -1830,6 +1945,98 @@ class DatabaseManager(LoggerMixin):
 
             await db.commit()
             logger.debug(f"Saved config for thread {thread_id} (async)")
+
+    async def get_channel_settings_async(self, channel_id: str) -> Optional[Dict]:
+        """Async version of get_channel_settings."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(
+                "SELECT response_mode, directives, reply_in_channel, updated_ts, updated_by "
+                "FROM channel_settings WHERE channel_id = ?",
+                (channel_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return None
+                return {
+                    "response_mode": row["response_mode"],
+                    "directives": row["directives"],
+                    "reply_in_channel": bool(row["reply_in_channel"]),
+                    "updated_ts": row["updated_ts"],
+                    "updated_by": row["updated_by"],
+                }
+
+    async def set_channel_settings_async(self, channel_id: str, response_mode=_UNSET,
+                                         directives=_UNSET, reply_in_channel=_UNSET,
+                                         updated_by: Optional[str] = None):
+        """Async version of set_channel_settings.
+
+        Omitted fields are preserved; an explicit None CLEARS the column to NULL (so the modal's
+        "inherit" selection resolves to the global default at read time).
+        """
+        existing = await self.get_channel_settings_async(channel_id) or {}
+        new_mode = existing.get("response_mode", "tag_only") if response_mode is _UNSET else response_mode
+        new_dir = existing.get("directives") if directives is _UNSET else directives
+        new_ric = existing.get("reply_in_channel", False) if reply_in_channel is _UNSET else reply_in_channel
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("""
+                INSERT INTO channel_settings (channel_id, response_mode, directives, reply_in_channel, updated_ts, updated_by)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    response_mode=excluded.response_mode,
+                    directives=excluded.directives,
+                    reply_in_channel=excluded.reply_in_channel,
+                    updated_ts=CURRENT_TIMESTAMP,
+                    updated_by=excluded.updated_by
+            """, (channel_id, new_mode, new_dir, 1 if new_ric else 0, updated_by))
+            await db.commit()
+            logger.debug(f"Saved channel_settings for {channel_id} (async): mode={new_mode}")
+
+    # --- Per-channel memory (Phase 9), async variants ---
+    async def get_channel_memory_async(self, channel_id: str) -> List[Dict]:
+        """Async version of get_channel_memory (channel-scope for this channel + shared workspace)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(
+                "SELECT id, channel_id, scope, content, author, created_ts, updated_ts "
+                "FROM channel_memory WHERE (scope = 'channel' AND channel_id = ?) OR scope = 'workspace' "
+                "ORDER BY updated_ts ASC",
+                (channel_id,)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def add_channel_memory_async(self, channel_id: str, content: str, scope: str = "channel",
+                                       author: Optional[str] = None) -> int:
+        """Async version of add_channel_memory; returns the new id."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            cursor = await db.execute(
+                "INSERT INTO channel_memory (channel_id, scope, content, author) VALUES (?, ?, ?, ?)",
+                (channel_id, scope, content, author)
+            )
+            await db.commit()
+            return cursor.lastrowid
+
+    async def update_channel_memory_async(self, memory_id: int, content: str):
+        """Async version of update_channel_memory."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute(
+                "UPDATE channel_memory SET content = ?, updated_ts = CURRENT_TIMESTAMP WHERE id = ?",
+                (content, memory_id)
+            )
+            await db.commit()
+
+    async def delete_channel_memory_async(self, memory_id: int):
+        """Async version of delete_channel_memory."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("DELETE FROM channel_memory WHERE id = ?", (memory_id,))
+            await db.commit()
 
     async def get_or_create_user_async(self, user_id: str, username: Optional[str] = None) -> Dict:
         """

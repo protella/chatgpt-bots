@@ -16,6 +16,37 @@ from config import config
 from prompts import SLACK_SYSTEM_PROMPT, DISCORD_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT
 
 
+def build_roster_text(participants, user_cache=None, bot_user_id=None):
+    """Build a participant roster block mapping display name -> <@USER_ID> for the system prompt.
+
+    participants: dict of user_id -> display name (thread participants). user_cache (optional)
+    is used to improve names. Returns "" when there is no real participant to tag.
+    """
+    cache = user_cache or {}
+    entries = []
+    seen = set()
+    for uid, name in (participants or {}).items():
+        if not uid or uid in ("bot", "unknown"):
+            continue
+        if bot_user_id and uid == bot_user_id:
+            continue
+        if uid in seen:
+            continue
+        seen.add(uid)
+        info = cache.get(uid)
+        if isinstance(info, dict) and info.get("username"):
+            name = info.get("username")
+        entries.append((name or uid, uid))
+    if not entries:
+        return ""
+    lines = "\n".join(f"- {name} → <@{uid}>" for name, uid in entries)
+    return (
+        "\n\nTHREAD PARTICIPANTS — to mention or tag someone, write their Slack ID in the form "
+        "<@USER_ID> (exactly, with the angle brackets). Never put a person's plain name inside "
+        "angle brackets. Known participants:\n" + lines
+    )
+
+
 class MessageUtilitiesMixin:
     def _format_user_content_with_username(self, content: str, message: Message) -> str:
         """Format user content with username prefix for multi-user context
@@ -669,11 +700,39 @@ class MessageUtilitiesMixin:
         
         return False
 
-    def _get_system_prompt(self, client: BaseClient, user_timezone: str = "UTC", 
+    def _build_participant_roster(self, thread_state, client) -> str:
+        """Build the @mention roster text from thread participants + the client's user cache."""
+        participants = getattr(thread_state, "participants", None) or {}
+        return build_roster_text(
+            participants,
+            user_cache=getattr(client, "user_cache", None),
+            bot_user_id=getattr(client, "bot_user_id", None),
+        )
+
+    def _build_channel_memory_text(self, channel_id: Optional[str]) -> Optional[str]:
+        """Build the CHANNEL MEMORY block from stored durable facts for this channel (Phase 9).
+        Returns None when disabled, no db, or no rows — so the system prompt is unchanged."""
+        if not config.enable_channel_memory or not channel_id:
+            return None
+        db = getattr(self, "db", None)
+        if not db:
+            return None
+        try:
+            rows = db.get_channel_memory(channel_id)
+        except Exception:
+            return None
+        if not rows:
+            return None
+        return "\n".join(f"- {r['content']}" for r in rows)
+
+    def _get_system_prompt(self, client: BaseClient, user_timezone: str = "UTC",
                           user_tz_label: Optional[str] = None, user_real_name: Optional[str] = None,
                           user_email: Optional[str] = None, model: Optional[str] = None,
                           web_search_enabled: bool = True, has_trimmed_messages: bool = False,
-                          custom_instructions: Optional[str] = None) -> str:
+                          custom_instructions: Optional[str] = None,
+                          participant_roster: Optional[str] = None,
+                          channel_directives: Optional[str] = None,
+                          channel_memory: Optional[str] = None) -> str:
         """Get the appropriate system prompt based on the client platform with user's timezone, name, email, model, web search capability, trimming status, and custom instructions"""
         client_name = client.name.lower()
         
@@ -756,10 +815,20 @@ class MessageUtilitiesMixin:
         if custom_instructions:
             custom_instructions_context = f"\n\n--- USER CUSTOM INSTRUCTIONS ---\nThe following are custom instructions provided by the user. These should be followed and may supersede any conflicting default instructions (within legal and ethical boundaries):\n\n{custom_instructions}\n\n--- END OF USER CUSTOM INSTRUCTIONS ---"
 
+        # Phase 7: per-channel ground rules set by an operator (applied when present)
+        channel_directives_context = ""
+        if channel_directives:
+            channel_directives_context = f"\n\n--- CHANNEL GROUND RULES ---\nAn operator has set ground rules for how you should behave in this channel. Follow them:\n\n{channel_directives}\n\n--- END CHANNEL GROUND RULES ---"
+
+        # Phase 9: durable per-channel memory (facts the bot noted in earlier conversations)
+        channel_memory_context = ""
+        if channel_memory:
+            channel_memory_context = f"\n\n--- CHANNEL MEMORY ---\nDurable facts you've noted for this channel in earlier conversations. Use them as background when relevant; do not recite them unprompted:\n\n{channel_memory}\n\n--- END CHANNEL MEMORY ---"
+
         # Format time context - moved to end to maximize prompt caching (date/time changes on every request)
         time_context = f"\n\nToday's date and current time: {current_time.strftime('%A, %B %d, %Y at %I:%M %p')} ({timezone_display})\nIMPORTANT: Always consider the current date and time (w/ timezone offset) and adjust your responses accordingly."
 
-        return base_prompt + user_context + model_context + web_search_context + trimming_context + custom_instructions_context + time_context
+        return base_prompt + user_context + model_context + web_search_context + trimming_context + custom_instructions_context + channel_directives_context + channel_memory_context + (participant_roster or "") + time_context
 
     def _schedule_async_call(self, coro):
         """Helper to schedule async calls from sync contexts"""

@@ -9,6 +9,21 @@ from dataclasses import dataclass, field
 
 load_dotenv()
 
+
+def _env_list(var_name: str, default: list, sep: str = ",") -> list:
+    """Parse a comma-separated env var into a clean list, falling back to `default`.
+
+    Trims whitespace and drops empty entries. If the var is unset or resolves to an
+    empty list, the sane `default` is used.
+    """
+    raw = os.getenv(var_name)
+    if raw is None:
+        return list(default)
+    items = [part.strip() for part in raw.split(sep)]
+    items = [item for item in items if item]
+    return items or list(default)
+
+
 # Model knowledge cutoff dates
 # Supported models: gpt-5.5, gpt-5.4, gpt-5.2, gpt-5.2-pro, gpt-5.2-chat-latest, gpt-5, gpt-5.1, gpt-5-mini, gpt-4.1, gpt-4o
 MODEL_KNOWLEDGE_CUTOFFS = {
@@ -167,7 +182,99 @@ class BotConfig:
     streaming_buffer_size: int = field(default_factory=lambda: int(os.getenv("STREAMING_BUFFER_SIZE", "500")))
     streaming_circuit_breaker_threshold: int = field(default_factory=lambda: int(os.getenv("STREAMING_CIRCUIT_BREAKER_THRESHOLD", "5")))
     streaming_circuit_breaker_cooldown: int = field(default_factory=lambda: int(os.getenv("STREAMING_CIRCUIT_BREAKER_COOLDOWN", "300")))
-    
+
+    # --- Native Slack streaming (Phase 3.1): chat.startStream/appendStream/stopStream ---
+    # Replaces the chat.update edit-loop (Tier-3 rate-limited org-wide) with Slack's native
+    # streaming API. DEFAULT OFF: the capability is built + unit-tested, but the streamed UX
+    # must be verified live on the dev bot before enabling. Flip to true after that.
+    slack_native_streaming: bool = field(default_factory=lambda: os.getenv("SLACK_NATIVE_STREAMING", "false").lower() == "true")
+
+    # --- Assistant status indicator (Phase 3.2): assistant.threads.setStatus ---
+    # Transient "thinking/working" status on the assistant-thread surface. Additive + best-effort:
+    # it no-ops gracefully in plain channels (where the visible progress comes from streaming text).
+    enable_assistant_status: bool = field(default_factory=lambda: os.getenv("ENABLE_ASSISTANT_STATUS", "true").lower() == "true")
+    # Rotating loading messages shown by setStatus (comma-separated env; safe standard-emoji default).
+    # >>> To brand these, set STATUS_LOADING_MESSAGES in .env with REAL Datassential custom-emoji
+    # >>> names, e.g.  STATUS_LOADING_MESSAGES=:datassential: crunching the data…,:datassential: digging in…
+    status_loading_messages: list = field(default_factory=lambda: _env_list("STATUS_LOADING_MESSAGES", [
+        ":mag: crunching the data…",
+        ":bar_chart: digging through the menu…",
+        ":hourglass_flowing_sand: pulling it together…",
+    ]))
+    # Safe standard-emoji status used when no rotating set is desired / as the single status string.
+    status_loading_fallback: str = field(default_factory=lambda: os.getenv("STATUS_LOADING_FALLBACK", ":hourglass_flowing_sand: working on it…"))
+
+    # --- Assistant surface (agent split-view) adapter ---
+    # Greets the user + sets suggested prompts when they open the split view, and titles
+    # assistant threads from the first message. Additive/best-effort; messages themselves
+    # still flow through the normal DM path.
+    enable_assistant_surface: bool = field(default_factory=lambda: os.getenv("ENABLE_ASSISTANT_SURFACE", "true").lower() == "true")
+    assistant_greeting: str = field(default_factory=lambda: os.getenv(
+        "ASSISTANT_GREETING",
+        "👋 Hi! Ask me anything — or pick one of the suggestions below to get started."))
+    # Starter prompts shown in the split view (comma-separated env).
+    assistant_suggested_prompts: list = field(default_factory=lambda: _env_list("ASSISTANT_SUGGESTED_PROMPTS", [
+        "What's trending in food & beverage right now?",
+        "Summarize this document for me",
+        "Generate an image of …",
+    ]))
+
+    # --- Emoji reactions as a response (Phase 4) ---
+    enable_reactions: bool = field(default_factory=lambda: os.getenv("ENABLE_REACTIONS", "true").lower() == "true")
+    # Vetted emoji the bot is allowed to use as a reaction-response (names, no colons).
+    # Env: REACTION_EMOJIS (comma-separated).
+    reaction_emojis: list = field(default_factory=lambda: _env_list("REACTION_EMOJIS", [
+        "thumbsup", "eyes", "white_check_mark", "raised_hands", "tada", "thinking_face", "+1",
+    ]))
+
+    # --- Outbound self-prefix hygiene (Phase 3.4) ---
+    # Leading "Name:" prefixes to strip from the model's reply so it never answers as "ChatGPT: …"
+    # (other bots now appear as "Name:" user turns in history, which the model may try to mimic).
+    # Env: SELF_PREFIX_NAMES (comma-separated).
+    self_prefix_names: list = field(default_factory=lambda: _env_list("SELF_PREFIX_NAMES", ["ChatGPT", "ChatGPT-Dev", "Assistant", "Bot"]))
+
+    # --- Channel listening + wake classifier (Phase 5) ---
+    # MASTER SWITCH (default OFF): when False the bot only acts on @mentions (app_mention) and
+    # DMs, exactly as before — restarting the bot changes nothing. Flip on to let the bot see
+    # and (per channel_response_mode) respond to non-mention public/private channel messages.
+    enable_channel_listening: bool = field(default_factory=lambda: os.getenv("ENABLE_CHANNEL_LISTENING", "false").lower() == "true")
+    # Default response mode for channels (Phase 7 adds per-channel overrides):
+    #   "tag_only"     - respond only when clearly addressed (name / reply in our thread); no LLM. DEFAULT.
+    #   "auto_respond" - a lightweight classifier decides respond/react/ignore per message.
+    #   "off"          - never respond in channels.
+    channel_response_mode: str = field(default_factory=lambda: os.getenv("CHANNEL_RESPONSE_MODE", "tag_only").strip().lower())
+    # Names the bot answers to without an @mention (case-insensitive whole-word match), so
+    # "ChatGPT, can you…" wakes it. Keep in sync with the bot's display name(s).
+    # Env: BOT_NAME_ALIASES (comma-separated) — SET THIS per environment (e.g. "ChatGPT-Dev" in dev).
+    bot_name_aliases: list = field(default_factory=lambda: _env_list("BOT_NAME_ALIASES", ["ChatGPT"]))
+    # Bounded recent-channel-window size for a bare top-level wake (0 = just the triggering
+    # message, which already keys as a length-1 thread). Larger values are a documented follow-up.
+    channel_context_window: int = field(default_factory=lambda: int(os.getenv("CHANNEL_CONTEXT_WINDOW", "0")))
+
+    # --- Response footer (Phase 7 entry point): a small context line + "⚙️ Configure" button
+    # appended under each channel response (any member can open the per-channel settings modal).
+    # Posted as a separate trailing message, so it never touches the text/split/streaming path.
+    enable_response_footer: bool = field(default_factory=lambda: os.getenv("ENABLE_RESPONSE_FOOTER", "true").lower() == "true")
+
+    # --- On-demand Slack history-fetch tools (Phase 8) ---
+    # Read-only + privacy-scoped (public or bot-member channels only), so default ON. NOTE: the
+    # executor + tool schemas below are built and tested, but NOT yet wired to the model — the
+    # Responses API only does server-side tools (web_search/MCP) and there is no local function-call
+    # loop. Wiring these as function tools (incl. the streaming path) is the documented remaining step.
+    enable_history_tools: bool = field(default_factory=lambda: os.getenv("ENABLE_HISTORY_TOOLS", "true").lower() == "true")
+    # Hard cap on messages returned by a single history-fetch tool call (the model's `limit` is
+    # clamped to this regardless of what it asks for).
+    history_tool_max_messages: int = field(default_factory=lambda: int(os.getenv("HISTORY_TOOL_MAX_MESSAGES", "50")))
+
+    # --- Per-channel memory (Phase 9) ---
+    # Read = inject the channel's durable facts into the system prompt on each response.
+    # Write = one lightweight utility-model "is there a durable fact?" call AFTER each response
+    # (no function-call loop needed). Off → no injection, no extraction (unchanged behavior).
+    enable_channel_memory: bool = field(default_factory=lambda: os.getenv("ENABLE_CHANNEL_MEMORY", "true").lower() == "true")
+    # Hard cap on channel-scope memory rows per channel (oldest evicted on overflow) — keeps the
+    # injected block small and bounded; prefer update/supersede over unbounded growth.
+    memory_max_rows: int = field(default_factory=lambda: int(os.getenv("MEMORY_MAX_ROWS", "25")))
+
     def get_model_token_limit(self, model: str) -> int:
         """Get the effective input token limit for a specific model
 

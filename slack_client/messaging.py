@@ -11,11 +11,93 @@ from config import config
 from slack_client.utilities import strip_citations
 
 
+class NativeStreamSession:
+    """Adapter over Slack's native streaming API (chat.startStream/appendStream/stopStream).
+
+    The existing streaming handler thinks in CUMULATIVE text ("everything so far"), while the
+    native API wants DELTAS. This session bridges the two: feed it the cumulative text each tick
+    via ``update()`` and it appends only the new tail. ``finish()`` closes the stream (optionally
+    with blocks, which Slack only allows on stop).
+
+    Fully best-effort: if startStream fails the session is inert (``active`` False) and the caller
+    falls back to the legacy ``update_message_streaming`` path. Any later failure also flips it
+    inert so the caller can recover.
+    """
+
+    def __init__(self, client, channel_id: str, thread_id: str, logger=None):
+        self._client = client
+        self._channel = channel_id
+        self._thread = thread_id
+        self._log = logger
+        self.ts: Optional[str] = None
+        self.active: bool = False
+        self._sent: str = ""
+
+    async def start(self, initial_text: str = "") -> bool:
+        try:
+            resp = await self._client.chat_startStream(
+                channel=self._channel,
+                thread_ts=self._thread,
+                markdown_text=initial_text or None,
+            )
+            self.ts = resp.get("ts")
+            self._sent = initial_text or ""
+            self.active = bool(self.ts)
+            return self.active
+        except Exception as e:  # noqa: BLE001 - best-effort, never fatal
+            if self._log:
+                self._log(f"native stream start failed, will fall back: {e}")
+            self.active = False
+            return False
+
+    async def update(self, cumulative_text: str) -> bool:
+        """Append the new tail of ``cumulative_text`` since the last update."""
+        if not self.active or self.ts is None:
+            return False
+        delta = cumulative_text[len(self._sent):] if cumulative_text.startswith(self._sent) else cumulative_text
+        if not delta:
+            return True
+        try:
+            await self._client.chat_appendStream(channel=self._channel, ts=self.ts, markdown_text=delta)
+            self._sent = cumulative_text
+            return True
+        except Exception as e:  # noqa: BLE001
+            if self._log:
+                self._log(f"native stream append failed: {e}")
+            self.active = False
+            return False
+
+    async def finish(self, final_text: Optional[str] = None, blocks=None) -> bool:
+        if self.ts is None:
+            return False
+        try:
+            kwargs = {"channel": self._channel, "ts": self.ts}
+            if final_text is not None and final_text.startswith(self._sent):
+                tail = final_text[len(self._sent):]
+                if tail:
+                    kwargs["markdown_text"] = tail
+            elif final_text is not None:
+                kwargs["markdown_text"] = final_text
+            if blocks is not None:
+                kwargs["blocks"] = blocks
+            await self._client.chat_stopStream(**kwargs)
+            self.active = False
+            return True
+        except Exception as e:  # noqa: BLE001
+            if self._log:
+                self._log(f"native stream stop failed: {e}")
+            self.active = False
+            return False
+
+
 class SlackMessagingMixin:
     async def start(self):
         """Start the Slack bot"""
         self.handler = AsyncSocketModeHandler(self.app, config.slack_app_token)
         self.log_info("Starting Slack bot in socket mode...")
+
+        # Resolve our own identity up front so we can tell our messages apart from other bots'
+        await self._ensure_self_identity()
 
         # Create a task for start_async that can be cancelled
         self._start_task = asyncio.create_task(self.handler.start_async())
@@ -260,7 +342,13 @@ class SlackMessagingMixin:
             return None
 
     async def send_thinking_indicator(self, channel_id: str, thread_id: str) -> Optional[str]:
-        """Send thinking indicator to Slack"""
+        """Send thinking indicator to Slack.
+
+        Also fires a best-effort assistant.threads.setStatus (Phase 3.2) so the assistant-thread
+        surface shows a rotating branded status. That call is additive and no-ops gracefully in
+        plain channels, where the posted message below is the visible progress cue.
+        """
+        await self.set_assistant_status(channel_id, thread_id)
         try:
             result = await self.app.client.chat_postMessage(
                 channel=channel_id,
@@ -341,10 +429,21 @@ class SlackMessagingMixin:
                     # Skip settings button messages
                     if text == "Settings available":
                         continue
-                    
-                    # Determine role
-                    is_bot = bool(msg.get("bot_id"))
-                    
+                    # Skip response-footer messages (model context line + Configure button) —
+                    # detected by their action block, so a real reply can't false-positive.
+                    if any(
+                        el.get("action_id") == "open_channel_settings"
+                        for b in (msg.get("blocks") or []) if b.get("type") == "actions"
+                        for el in (b.get("elements") or [])
+                    ):
+                        continue
+
+                    # Determine sender: our own bot (-> assistant later), another bot, or a human.
+                    sender_type = self.classify_sender(msg)
+                    is_bot = bool(msg.get("bot_id"))  # kept for existing readers ("any bot")
+                    # Display name for bot authors (used to name-prefix other bots like humans)
+                    bot_name = msg.get("username") or (msg.get("bot_profile") or {}).get("name")
+
                     # Clean text
                     text = msg.get("text", "")
                     if not is_bot:
@@ -373,7 +472,9 @@ class SlackMessagingMixin:
                         attachments=attachments,
                         metadata={
                             "ts": msg.get("ts"),
-                            "is_bot": is_bot
+                            "is_bot": is_bot,
+                            "sender_type": sender_type,
+                            "bot_name": bot_name
                         }
                     ))
                 
@@ -424,6 +525,76 @@ class SlackMessagingMixin:
             "circuit_breaker_cooldown": config.streaming_circuit_breaker_cooldown,
             "platform": "slack"
         }
+
+    def supports_native_streaming(self) -> bool:
+        """True if native Slack streaming (chat.startStream/appendStream/stopStream) is enabled
+        and available on the SDK. Default OFF via config pending live dev-bot verification."""
+        return (
+            config.slack_native_streaming
+            and self.supports_streaming()
+            and hasattr(self.app.client, "chat_startStream")
+        )
+
+    def begin_native_stream(self, channel_id: str, thread_id: str) -> "NativeStreamSession":
+        """Create a (not-yet-started) NativeStreamSession bound to this channel/thread."""
+        return NativeStreamSession(self.app.client, channel_id, thread_id, logger=self.log_debug)
+
+    async def set_assistant_status(self, channel_id: str, thread_id: str,
+                                   status: Optional[str] = None,
+                                   loading_messages: Optional[List[str]] = None) -> bool:
+        """Best-effort assistant.threads.setStatus (Phase 3.2).
+
+        Shows a transient 'thinking/working' status on the assistant-thread surface with a
+        rotating branded loading_messages set; auto-clears when the app replies. Degrades to a
+        silent no-op in plain channels / non-assistant contexts — must never raise.
+        """
+        if not config.enable_assistant_status:
+            return False
+        if not hasattr(self.app.client, "assistant_threads_setStatus"):
+            return False
+        msgs = loading_messages if loading_messages is not None else (config.status_loading_messages or None)
+        status_text = status if status is not None else config.status_loading_fallback
+        try:
+            kwargs = {"channel_id": channel_id, "thread_ts": thread_id, "status": status_text}
+            if msgs:
+                kwargs["loading_messages"] = msgs
+            await self.app.client.assistant_threads_setStatus(**kwargs)
+            return True
+        except SlackApiError as e:
+            # Most common in a plain channel: not an assistant thread -> just skip it.
+            err = e.response.get("error") if getattr(e, "response", None) else e
+            self.log_debug(f"assistant setStatus unavailable here ({err}); continuing without it")
+            return False
+        except Exception as e:  # noqa: BLE001
+            self.log_debug(f"assistant setStatus error: {e}")
+            return False
+
+    async def clear_assistant_status(self, channel_id: str, thread_id: str) -> bool:
+        """Clear the assistant status (empty string). Best-effort; setStatus also auto-clears on reply."""
+        return await self.set_assistant_status(channel_id, thread_id, status="", loading_messages=[])
+
+    async def react(self, channel_id: str, message_ts: str, emoji: str) -> bool:
+        """Add an emoji reaction to a message (Phase 4). ``emoji`` may include or omit colons.
+
+        Best-effort: treats already_reacted as success, never raises.
+        """
+        if not config.enable_reactions:
+            return False
+        name = (emoji or "").strip().strip(":")
+        if not name:
+            return False
+        try:
+            await self.app.client.reactions_add(channel=channel_id, name=name, timestamp=message_ts)
+            return True
+        except SlackApiError as e:
+            err = e.response.get("error") if getattr(e, "response", None) else str(e)
+            if err == "already_reacted":
+                return True  # idempotent: the reaction is already present
+            self.log_warning(f"Could not add reaction :{name}: ({err})")
+            return False
+        except Exception as e:  # noqa: BLE001
+            self.log_error(f"Unexpected error adding reaction :{name}: {e}")
+            return False
 
     async def update_message_streaming(self, channel_id: str, message_id: str, text: str) -> Dict:
         """Updates a message with rate limit awareness"""
@@ -534,6 +705,47 @@ class SlackMessagingMixin:
                 "error": str(e)
             }
 
+    def _build_response_footer_blocks(self, model: str) -> list:
+        """Footer blocks: a context line (model) + a '⚙️ Configure' button that opens the
+        per-channel settings modal (handled by the ``open_channel_settings`` action)."""
+        model_label = model or config.gpt_model
+        return [
+            {"type": "context", "elements": [
+                {"type": "mrkdwn", "text": f":robot_face: {model_label}"}
+            ]},
+            {"type": "actions", "elements": [
+                {"type": "button",
+                 "text": {"type": "plain_text", "text": "⚙️ Configure"},
+                 "action_id": "open_channel_settings"}
+            ]},
+        ]
+
+    async def maybe_post_response_footer(self, message, response) -> None:
+        """Phase 7: post a small footer (model + Configure button) under a channel text response.
+
+        Posted as a SEPARATE trailing message, so it never touches the text/split/streaming path
+        and is inherently attached only after the final part. Fires once, only for text responses,
+        only in channels (not DMs), only when ENABLE_RESPONSE_FOOTER is on. Never raises.
+        """
+        try:
+            if not getattr(config, "enable_response_footer", True):
+                return
+            if not response or getattr(response, "type", None) != "text":
+                return
+            channel_id = getattr(message, "channel_id", None)
+            if not channel_id or channel_id.startswith("D"):
+                return  # per-channel settings don't apply in DMs
+            model = (getattr(response, "metadata", None) or {}).get("model")
+            blocks = self._build_response_footer_blocks(model)
+            await self.app.client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=getattr(message, "thread_id", None),
+                text=(model or config.gpt_model),  # fallback text for notifications
+                blocks=blocks,
+            )
+        except Exception as e:
+            self.log_debug(f"Could not post response footer: {e}")
+
     async def handle_response(self, channel_id: str, thread_id: str, response: Response):
         """Handle a Response object and send to Slack"""
         if response.type == "text":
@@ -553,6 +765,14 @@ class SlackMessagingMixin:
             if file_url:
                 image_data.slack_url = file_url
                 
+        elif response.type == "reaction":
+            # Phase 4: respond with emoji reaction(s) instead of (or before) text.
+            # content is an emoji name or list; metadata.react_ts is the target message
+            # (falls back to the thread root if not provided).
+            target_ts = (response.metadata or {}).get("react_ts") or thread_id
+            emojis = response.content if isinstance(response.content, list) else [response.content]
+            for emoji in emojis:
+                await self.react(channel_id, target_ts, emoji)
         elif response.type == "error":
             formatted_error = self.format_error_message(response.content)
             await self.send_message(channel_id, thread_id, formatted_error)

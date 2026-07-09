@@ -28,6 +28,7 @@ class ThreadState:
     has_trimmed_messages: bool = False  # Track if messages have been trimmed from this thread
     has_shown_80_percent_warning: bool = False  # Track if we've shown the 80% context warning
     current_model: str = field(default_factory=lambda: config.gpt_model)  # Track current model for token limits
+    participants: Dict[str, str] = field(default_factory=dict)  # user_id -> display name, for the @mention roster
     
     def add_message(self, role: str, content: Any, db = None, thread_key: str = None, message_ts: str = None, metadata: Dict[str, Any] = None, token_counter: Optional[TokenCounter] = None, max_tokens: int = None):
         """Add a message to the thread history with optional metadata and token management"""

@@ -1,0 +1,73 @@
+# Sample Slack app manifest for the ChatGPT Slackbot.
+#
+# Copy this to `slack_app_manifest.yml` (gitignored) and customize the app name,
+# bot display name, and slash command for your environment (e.g. use
+# /chatgpt-settings-dev and a "ChatGPT-Dev" bot user for a dev install).
+# Paste the result into https://api.slack.com/apps -> Create New App -> From a manifest.
+#
+# Note: enabling the "Agent" toggle in Slack's app settings UI will rewrite parts
+# of this manifest server-side (agent_view, extra user scopes). That's expected.
+display_information:
+  name: ChatGPT Slackbot
+  description: A Slackbot for ChatGPT integration
+  background_color: "#254d23"
+  long_description: A Python based Slackbot that interfaces with OpenAI's ChatGPT to bring the ChatGPT functionality to your Slack Workspace. Mention the bot, send it a direct message, or let it participate in channels it has been invited to.
+features:
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  bot_user:
+    display_name: ChatGPT
+    always_online: true
+  agent_view:
+    is_enabled: true
+  shortcuts:
+    - name: Thread Settings
+      type: message
+      callback_id: configure_thread_settings
+      description: Configure bot settings for this thread
+  slash_commands:
+    - command: /chatgpt-settings
+      description: Configure ChatGPT bot preferences
+      usage_hint: Opens bot settings modal
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - channels:history
+      - channels:join
+      - channels:read
+      - chat:write
+      - chat:write.customize
+      - commands
+      - files:read
+      - files:write
+      - groups:history
+      - groups:read
+      - im:history
+      - im:read
+      - im:write
+      - mpim:history
+      - mpim:read
+      - reactions:read
+      - reactions:write
+      - users:read
+      - users:read.email
+      - assistant:write
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+      - assistant_thread_started
+      - assistant_thread_context_changed
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
