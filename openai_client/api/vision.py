@@ -47,13 +47,10 @@ async def _enhance_vision_prompt(
             "store": False,
         }
 
-        # Check if we're using a GPT-5 reasoning model
-        if config.utility_model.startswith("gpt-5") and "chat" not in config.utility_model.lower():
-            request_params["temperature"] = 1.0
-            request_params["reasoning"] = {"effort": config.utility_reasoning_effort}
-            request_params["text"] = {"verbosity": config.utility_verbosity}
-        else:
-            request_params["temperature"] = 0.7
+        # Utility model is a GPT-5-series reasoning model (gpt-5-mini)
+        request_params["temperature"] = 1.0
+        request_params["reasoning"] = {"effort": config.utility_reasoning_effort}
+        request_params["text"] = {"verbosity": config.utility_verbosity}
 
         response = await self._safe_api_call(
             self.client.responses.create,
@@ -147,14 +144,12 @@ async def analyze_images(
                 "stream": True,
             }
 
-            if config.gpt_model.startswith("gpt-5") and "chat" not in config.gpt_model.lower():
-                request_params["temperature"] = 1.0
-                request_params["reasoning"] = {"effort": config.analysis_reasoning_effort}
-                request_params["text"] = {"verbosity": config.analysis_verbosity}
-
-                # Add prompt caching for GPT-5.1
-                if config.gpt_model == "gpt-5.1":
-                    request_params["prompt_cache_retention"] = "24h"
+            # Primary model is a GPT-5-series reasoning model (gpt-5.5)
+            request_params["temperature"] = 1.0
+            request_params["reasoning"] = {"effort": config.analysis_reasoning_effort}
+            request_params["text"] = {"verbosity": config.analysis_verbosity}
+            if config.gpt_model.startswith("gpt-5.5"):
+                request_params["prompt_cache_retention"] = "24h"
 
             # Stream the response
             output_text = ""
@@ -227,14 +222,12 @@ async def analyze_images(
                 "store": False,
             }
 
-            if config.gpt_model.startswith("gpt-5") and "chat" not in config.gpt_model.lower():
-                request_params["temperature"] = 1.0
-                request_params["reasoning"] = {"effort": config.analysis_reasoning_effort}
-                request_params["text"] = {"verbosity": config.analysis_verbosity}
-
-                # Add prompt caching for GPT-5.1
-                if config.gpt_model == "gpt-5.1":
-                    request_params["prompt_cache_retention"] = "24h"
+            # Primary model is a GPT-5-series reasoning model (gpt-5.5)
+            request_params["temperature"] = 1.0
+            request_params["reasoning"] = {"effort": config.analysis_reasoning_effort}
+            request_params["text"] = {"verbosity": config.analysis_verbosity}
+            if config.gpt_model.startswith("gpt-5.5"):
+                request_params["prompt_cache_retention"] = "24h"
 
             # API call with enforced timeout wrapper
             response = await self._safe_api_call(

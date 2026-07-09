@@ -80,8 +80,8 @@ make clean   # Remove test artifacts and cache
 - Full message history passed in `input` parameter, not using `previous_response_id` chaining
 - System prompts included in messages as "developer" role
 - Model-specific parameter handling:
-  - GPT-5 reasoning models (`gpt-5-mini`, `gpt-5-nano`): Fixed `temperature=1.0`, no `top_p`, uses `reasoning_effort` and `verbosity`
-  - GPT-5 chat models (`gpt-5-chat-latest`): Standard temperature/top_p support
+  - `gpt-5.5` (only user-facing model): hybrid — supports `temperature`/`top_p` when `reasoning_effort=none`, otherwise forces `temperature=1.0`; uses `reasoning_effort`/`verbosity`; `prompt_cache_retention: 24h`
+  - `gpt-5-mini` (utility model only): reasoning shape — fixed `temperature=1.0`, no `top_p`, uses `reasoning_effort` and `verbosity`
 - See `Docs/RESPONSES_API_IMPLEMENTATION_DETAILS.md` for migration details if switching to `previous_response_id` chaining
 
 ### Threading & State Management
@@ -116,14 +116,16 @@ make clean   # Remove test artifacts and cache
 ## Critical Implementation Notes
 
 ### Model-Specific Parameters
-**GPT-5 Reasoning Models** (gpt-5-mini, gpt-5-nano):
+Supported models: **gpt-5.5** (conversations) and **gpt-5-mini** (utility functions only). All GPT-4-series, gpt-5, gpt-5-nano, gpt-5-chat-*, and gpt-5.1–5.4 support has been removed.
+
+**gpt-5.5** (hybrid):
+- Supports temperature/top_p only when reasoning_effort=none; otherwise temperature forced to 1.0
+- Uses reasoning_effort and verbosity parameters
+
+**gpt-5-mini** (reasoning shape, utility model only):
 - Temperature MUST be 1.0
 - No top_p support
 - Uses reasoning_effort and verbosity parameters
-
-**GPT-5 Chat Models** (gpt-5-chat-*):
-- Standard temperature/top_p support
-- No reasoning_effort/verbosity parameters
 
 ### Image Processing Flow
 1. Intent classification determines image vs text response

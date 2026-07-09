@@ -1,12 +1,16 @@
 # Sample Slack app manifest for the ChatGPT Slackbot.
 #
 # Copy this to `slack_app_manifest.yml` (gitignored) and customize the app name,
-# bot display name, and slash command for your environment (e.g. use
+# bot display name, and slash commands for your environment (e.g. use
 # /chatgpt-settings-dev and a "ChatGPT-Dev" bot user for a dev install).
 # Paste the result into https://api.slack.com/apps -> Create New App -> From a manifest.
 #
-# Note: enabling the "Agent" toggle in Slack's app settings UI will rewrite parts
-# of this manifest server-side (agent_view, extra user scopes). That's expected.
+# Notes:
+# - Enabling the "Agent" toggle in Slack's app settings UI rewrites parts of this
+#   manifest server-side (agent_view fields, extra user scopes). That's expected.
+# - The search:read.* bot scopes power assistant.search.context (bot-token search,
+#   gated on an action token from a triggering message event). Drop the ones you
+#   don't want the bot to be able to search (e.g. search:read.im).
 display_information:
   name: ChatGPT Slackbot
   description: A Slackbot for ChatGPT integration
@@ -21,7 +25,8 @@ features:
     display_name: ChatGPT
     always_online: true
   agent_view:
-    is_enabled: true
+    agent_description: ChatGPT — chat, image generation & editing, vision, and document analysis. Participates in channels it's invited to.
+    suggested_prompts: []
   shortcuts:
     - name: Thread Settings
       type: message
@@ -36,12 +41,14 @@ oauth_config:
   scopes:
     bot:
       - app_mentions:read
+      - assistant:write
       - channels:history
       - channels:join
       - channels:read
       - chat:write
       - chat:write.customize
       - commands
+      - emoji:read
       - files:read
       - files:write
       - groups:history
@@ -53,9 +60,14 @@ oauth_config:
       - mpim:read
       - reactions:read
       - reactions:write
+      - search:read.public
+      - search:read.private
+      - search:read.im
+      - search:read.mpim
+      - search:read.files
+      - search:read.users
       - users:read
       - users:read.email
-      - assistant:write
 settings:
   event_subscriptions:
     bot_events:
@@ -64,8 +76,11 @@ settings:
       - message.groups
       - message.im
       - message.mpim
-      - assistant_thread_started
-      - assistant_thread_context_changed
+      - reaction_added
+      - app_home_opened       # agent_view lifecycle (current)
+      - app_context_changed   # agent_view lifecycle (current)
+      - assistant_thread_started           # legacy agent surface — remove after code migrates
+      - assistant_thread_context_changed   # legacy agent surface — remove after code migrates
   interactivity:
     is_enabled: true
   org_deploy_enabled: false

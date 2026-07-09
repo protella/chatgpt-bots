@@ -470,8 +470,9 @@ class DatabaseManager(LoggerMixin):
                 )
 
             # One-time bulk swap: migrate every user still on a pre-5.5 model to gpt-5.5.
-            # Gated by a sentinel migration marker so this runs exactly once even if a
-            # user later picks gpt-5.4 (or earlier) in /settings.
+            # Gated by a sentinel migration marker so it ran exactly once back when older
+            # models were still selectable. (Superseded by the normalizer below, kept so
+            # the column exists on databases created between the two migrations.)
             cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
             columns = [col[1] for col in cursor.fetchall()]
             if 'gpt55_migrated' not in columns:
@@ -489,6 +490,33 @@ class DatabaseManager(LoggerMixin):
                 self.log_info(
                     f"DB: One-time migration — swapped {swapped} user(s) to gpt-5.5"
                 )
+
+            # Model lineup cleanup: gpt-5.5 is the ONLY supported chat model now.
+            # Normalize any stale selection — user preferences AND per-thread overrides —
+            # on every startup. Idempotent and cheap; no sentinel needed because nothing
+            # can legitimately set a different model anymore (the picker offers only 5.5),
+            # and this guarantees the API layer never receives a dropped model name.
+            cursor = self.conn.execute("""
+                UPDATE user_preferences
+                SET model = 'gpt-5.5'
+                WHERE model IS NOT NULL AND model != 'gpt-5.5'
+            """)
+            if cursor.rowcount:
+                self.log_info(
+                    f"DB: Normalized {cursor.rowcount} user(s) from dropped models to gpt-5.5"
+                )
+            cursor = self.conn.execute("""
+                UPDATE threads
+                SET config_json = json_set(config_json, '$.model', 'gpt-5.5')
+                WHERE config_json IS NOT NULL
+                  AND json_extract(config_json, '$.model') IS NOT NULL
+                  AND json_extract(config_json, '$.model') != 'gpt-5.5'
+            """)
+            if cursor.rowcount:
+                self.log_info(
+                    f"DB: Normalized {cursor.rowcount} thread override(s) to gpt-5.5"
+                )
+            self.conn.commit()
 
             # One-time backfill: mark long-standing users as settings_completed.
             # Earlier versions of the bot only flipped settings_completed=True when
