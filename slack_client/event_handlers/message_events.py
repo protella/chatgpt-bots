@@ -79,7 +79,11 @@ class SlackMessageEventsMixin:
                 "user_real_name": user_real_name,  # Add real name to metadata
                 "user_email": user_email,  # Add email to metadata
                 "user_timezone": user_timezone,  # Add timezone to metadata
-                "user_tz_label": user_tz_label  # Add timezone label (EST, PST, etc.)
+                "user_tz_label": user_tz_label,  # Add timezone label (EST, PST, etc.)
+                # Minted by Slack on message/app_mention events for AI apps; authorizes
+                # assistant.search.context for this interaction. Absent on older/replayed
+                # events — the search tool degrades gracefully (Phase B).
+                "action_token": event.get("action_token")
             }
         )
         return message

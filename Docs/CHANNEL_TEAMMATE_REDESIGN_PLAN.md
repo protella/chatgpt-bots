@@ -381,9 +381,15 @@ Tests: loop round-trip w/ mocked API (single, parallel, cap-hit, timeout, malfor
 history tool dispatch. Live: DM "fetch the last 10 messages from #chatgpt-bot-test and
 summarize". *Replaces parity last-mile #3.*
 
-**B. search_slack** — action_token capture in `_event_to_message`, executor, scope gate,
-manifest scope. Tests: token plumbing, scope-gate refusal, missing-token fallback. Live: "search
-slack for the parity plan discussion".
+**B. search_slack** — ✅ DONE. action_token captured in `_event_to_message` metadata →
+ToolContext; executor in `slack_client/search_tool.py` via raw `api_call("assistant.search.context")`
+(slack-sdk 3.43 has no wrapper method yet); code-level gate is `SEARCH_CHANNEL_TYPES`
+(default public_channel,private_channel — note: this section originally said
+`SLACK_SEARCH_CHANNEL_TYPES` default public-only; the implemented default includes
+private_channel since the API only surfaces content the bot could already access, and
+im/mpim remain excluded); token errors →
+`search_unavailable` fallback (TTL strings TODO live verification). Tests:
+tests/unit/test_search_tool.py. Live: "search slack for the parity plan discussion".
 
 **C. Memory tools** — 3 executors, prompt addendum, extraction fallback flag default-off.
 Tests: cap enforcement, scope restriction, forget. Live: "remember that demos are on Fridays" +

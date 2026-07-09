@@ -255,6 +255,15 @@ class BotConfig:
     # Model-invoked emoji reactions (redesign Phase D) — allowlist still REACTION_EMOJIS.
     enable_react_tool: bool = field(default_factory=lambda: os.getenv("ENABLE_REACT_TOOL", "true").lower() == "true")
 
+    # --- Slack search tool (redesign Phase B) — assistant.search.context ---
+    # Requires an action_token from the triggering event, so the bot can only search in
+    # response to a user interaction. See slack_client/search_tool.py for the privacy model.
+    enable_search_tool: bool = field(default_factory=lambda: os.getenv("ENABLE_SEARCH_TOOL", "true").lower() == "true")
+    # Code-level bound on what the executor will request, regardless of manifest scopes.
+    # Add "im"/"mpim" only if you want the bot searching DMs (needs search:read.im/mpim scopes).
+    search_channel_types: list = field(default_factory=lambda: _env_list(
+        "SEARCH_CHANNEL_TYPES", ["public_channel", "private_channel"]))
+
     # --- On-demand Slack history-fetch tools (Phase 8) ---
     # Read-only + privacy-scoped (public or bot-member channels only), so default ON. Wired to
     # the model through the local function-call loop (ENABLE_TOOL_LOOP).
