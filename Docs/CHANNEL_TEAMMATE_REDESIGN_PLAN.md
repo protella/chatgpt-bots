@@ -391,9 +391,14 @@ im/mpim remain excluded); token errors →
 `search_unavailable` fallback (TTL strings TODO live verification). Tests:
 tests/unit/test_search_tool.py. Live: "search slack for the parity plan discussion".
 
-**C. Memory tools** — 3 executors, prompt addendum, extraction fallback flag default-off.
-Tests: cap enforcement, scope restriction, forget. Live: "remember that demos are on Fridays" +
-implicit save; verify recall in a new thread. *Retires the extractor (kept behind flag).*
+**C. Memory tools** — ✅ IMPLEMENTED 2026-07-09. 3 executors in
+`message_processor/memory_tools.py` (channel-only, DM-refusing, author-attributed via
+ToolContext.user_id; workspace-scope rows readable but write-refused; cap refusal lists the
+oldest 3 rows instead of silently evicting), prompt addendum in LOCAL_TOOLS_GUIDANCE,
+`[#id]`-prefixed deterministic memory rendering (sorted by id), extraction fallback behind
+ENABLE_MEMORY_EXTRACTION_FALLBACK default-off. Tests: tests/unit/test_memory_tools.py.
+Live: "remember that demos are on Fridays" + implicit save; verify recall in a new thread;
+"forget that" deletes. *Retires the extractor (kept behind flag).*
 
 **D. react tool** — executor + allowlist + dedup. Tests: allowlist refusal, default-ts, dedup.
 Live: ask for something and watch for ✅ alongside the reply; DM reactions.
