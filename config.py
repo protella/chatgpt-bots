@@ -231,9 +231,16 @@ class BotConfig:
     # "ChatGPT, can you…" wakes it. Keep in sync with the bot's display name(s).
     # Env: BOT_NAME_ALIASES (comma-separated) — SET THIS per environment (e.g. "ChatGPT-Dev" in dev).
     bot_name_aliases: list = field(default_factory=lambda: _env_list("BOT_NAME_ALIASES", ["ChatGPT"]))
-    # Bounded recent-channel-window size for a bare top-level wake (0 = just the triggering
-    # message, which already keys as a length-1 thread). Larger values are a documented follow-up.
-    channel_context_window: int = field(default_factory=lambda: int(os.getenv("CHANNEL_CONTEXT_WINDOW", "0")))
+    # --- ChannelPulse ambient awareness (redesign Phase E) ---
+    # Per-channel in-memory ring of recent messages (fed by every channel event, even ignored
+    # ones). Powers the wake-classifier context signal and the response envelope. Inert while
+    # ENABLE_CHANNEL_LISTENING is false (no channel events arrive). Supersedes the old
+    # CHANNEL_CONTEXT_WINDOW follow-up.
+    enable_channel_pulse: bool = field(default_factory=lambda: os.getenv("ENABLE_CHANNEL_PULSE", "true").lower() == "true")
+    channel_pulse_size: int = field(default_factory=lambda: int(os.getenv("CHANNEL_PULSE_SIZE", "30")))
+    # Max "[Recent channel activity]" lines injected (at the SUFFIX — volatile, cache hygiene)
+    # when responding in a channel. 0 disables the envelope without disabling the buffer.
+    channel_pulse_envelope_max: int = field(default_factory=lambda: int(os.getenv("CHANNEL_PULSE_ENVELOPE_MAX", "15")))
 
     # --- Response footer (Phase 7 entry point): a small context line + "⚙️ Configure" button
     # appended under each channel response (any member can open the per-channel settings modal).

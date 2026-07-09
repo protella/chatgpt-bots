@@ -817,6 +817,10 @@ async def classify_wake(self, text: str, signals: Optional[Dict[str, Any]] = Non
     if signals.get("directives"):
         signal_lines.append(f"- Operator-set ground rules for this channel (honor them): {signals['directives']}")
     signal_note = ("\n\nSignals:\n" + "\n".join(signal_lines)) if signal_lines else ""
+    # Phase E: peripheral channel context (deterministic envelope from ChannelPulse) so the
+    # verdict can consider what the channel is talking about, not just one message.
+    if signals.get("channel_activity"):
+        signal_note += f"\n\n{signals['channel_activity']}"
 
     conversation_messages = [
         {"role": "developer", "content": WAKE_CLASSIFIER_SYSTEM_PROMPT},
