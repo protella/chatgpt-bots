@@ -252,6 +252,47 @@ New file `slack_client/channel_pulse.py`.
 
 ---
 
+## 5b. Slack-native context: retire the message mirror (user decision 2026-07-09)
+
+**Finding (code trace):** the `messages` table is not a backup — it's a cache-first PRIMARY.
+`get_or_create_thread_async` loads DB rows into thread state (`thread_manager.py:861-873`) and
+`_get_or_rebuild_thread_state` only rebuilds from Slack when that cache is empty
+(`thread_management.py:528`). Consequence: messages edited/deleted in Slack after caching stay
+in context forever (staleness bug). The rate-limit rationale is dead — internal custom apps
+kept Tier 3 (~50 req/min, 1000 msgs/call) after the May-2025 changes.
+
+**New precedence: Slack is the only transcript.** Every context build fetches
+`conversations.replies` fresh (bounded window). No OpenAI-side history either
+(`store=False` stays; no `previous_response_id` chaining — user decision).
+
+**The DB keeps only what Slack doesn't have:**
+- `user_preferences`, `threads.config_json`, `channel_settings`, `channel_memory`,
+  `modal_sessions` — load-bearing config/memory, untouched.
+- `images` — derived hidden context (vision analyses, generation prompts for edit flows).
+  Stays; re-injected on rebuild exactly as today (`_inject_image_analyses`).
+- `documents` — extraction cache (avoid re-download/re-parse per rebuild). Stays, keyed to the
+  Slack file id so a missing file can expire the row. The never-read `documents.summary`
+  column is dropped.
+- **NEW `thread_summaries`** — the compaction store. When a long thread exceeds the token
+  budget, `_smart_trim_with_summarization` writes: `thread_key`, `summary_text`,
+  `boundary_ts` (everything ≤ this ts is covered by the summary), `refs_json` (structured
+  refs to files/images/links inside the summarized span so edit/vision flows still resolve
+  them), `updated_ts`. Rebuild = stored summary head + `conversations.replies(oldest=boundary_ts)`
+  tail + injected hidden context. Re-summarization extends the same row (rolling).
+- Long CHANNELS need no equivalent: ChannelPulse is a bounded window by design, durable facts
+  belong in `channel_memory`, and the tool loop lets the model fetch/search older history
+  on demand.
+
+**Deletions:** `cache_message(_async)` call sites, `get_cached_messages(_async)` reads, the
+DB-first branch in thread rebuild, message-cache rewrite in trim/summarize. `threads` table
+stays (config only).
+
+**Cleanup migration (one-time, on startup):** take a forced pre-migration backup into
+`data/backups/` (tagged `pre-v3-mirror-drop`), then `DROP TABLE IF EXISTS messages`, drop the
+dead `documents.summary` column, `VACUUM` to reclaim space, and log rows removed + bytes
+reclaimed. Idempotent (guarded on table existence). Rollback = restore the tagged backup;
+in-flight conversations are unaffected since context now always comes from Slack.
+
 ## 6. agent_view migration + native streaming
 
 - **Events:** register `app_home_opened` (filter `tab == "messages"`) → existing greeting +
@@ -351,6 +392,17 @@ implicit save; verify recall in a new thread. *Retires the extractor (kept behin
 **D. react tool** — executor + allowlist + dedup. Tests: allowlist refusal, default-ts, dedup.
 Live: ask for something and watch for ✅ alongside the reply; DM reactions.
 
+**S. Slack-native context (drop the message mirror)** — see §5b. Always rebuild from
+`conversations.replies`; add `thread_summaries` (rolling summary + boundary_ts + refs_json);
+delete cache-first reads + cache writes; keep `images`/`documents` as derived caches; drop
+`documents.summary`. Files: `thread_manager.py`, `message_processor/thread_management.py`,
+`database.py`, `message_processor/handlers/vision.py` (unchanged injection path verified).
+Tests: rebuild-always-fetches, summary head + tail composition, refs preserved through
+compaction, edited-message freshness (the old staleness bug as a regression test). Live: long
+thread past the token budget → responses keep file/image awareness; edit a message mid-thread
+→ bot sees the edit. *Fixes the staleness bug; depends on Phase A (tool loop shrinks upfront
+context needs).*
+
 **E. ChannelPulse + response envelope** — buffer, backfill, envelope injection, participation
 stats. Files: `slack_client/channel_pulse.py`, `message_events.py`, `base.py` (processor).
 Tests: ring behavior, backfill-once, envelope rendering, DM exclusion. Live: two unrelated
@@ -376,8 +428,9 @@ status with branded emoji.
 **H. (Optional) feedback_buttons + reaction_added ingestion** — thumbs signal → DB; engine may
 read per-channel feedback ratio later.
 
-Suggested releases: A–D = "the bot can act" (v2.6.0), E–F = "the bot has judgment" (v2.7.0),
-G = "native surface" (v2.7.x or bundled), H opportunistic.
+Suggested releases: this ships as **v3.0.0** (major — model lineup reduction + context
+paradigm change, per user). A–D + S = "the bot can act, statelessly"; E–F = "the bot has
+judgment"; G = "native surface"; H opportunistic. Bundle per user preference at release time.
 
 ## 11. Risks & open questions
 

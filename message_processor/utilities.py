@@ -13,7 +13,7 @@ import pytz
 
 from base_client import BaseClient, Message
 from config import config
-from prompts import SLACK_SYSTEM_PROMPT, DISCORD_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT
+from prompts import SLACK_SYSTEM_PROMPT, DISCORD_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, LOCAL_TOOLS_GUIDANCE
 
 
 def build_roster_text(participants, user_cache=None, bot_user_id=None):
@@ -825,10 +825,17 @@ class MessageUtilitiesMixin:
         if channel_memory:
             channel_memory_context = f"\n\n--- CHANNEL MEMORY ---\nDurable facts you've noted for this channel in earlier conversations. Use them as background when relevant; do not recite them unprompted:\n\n{channel_memory}\n\n--- END CHANNEL MEMORY ---"
 
+        # Phase A: local tool etiquette (static text — safe for prompt caching) when the
+        # client exposes function tools through the loop
+        local_tools_context = ""
+        tool_registry = getattr(client, "tool_registry", None)
+        if config.enable_tool_loop and tool_registry is not None and tool_registry.has_tools():
+            local_tools_context = LOCAL_TOOLS_GUIDANCE
+
         # Format time context - moved to end to maximize prompt caching (date/time changes on every request)
         time_context = f"\n\nToday's date and current time: {current_time.strftime('%A, %B %d, %Y at %I:%M %p')} ({timezone_display})\nIMPORTANT: Always consider the current date and time (w/ timezone offset) and adjust your responses accordingly."
 
-        return base_prompt + user_context + model_context + web_search_context + trimming_context + custom_instructions_context + channel_directives_context + channel_memory_context + (participant_roster or "") + time_context
+        return base_prompt + user_context + model_context + web_search_context + local_tools_context + trimming_context + custom_instructions_context + channel_directives_context + channel_memory_context + (participant_roster or "") + time_context
 
     def _schedule_async_call(self, coro):
         """Helper to schedule async calls from sync contexts"""
