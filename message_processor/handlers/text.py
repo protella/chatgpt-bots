@@ -139,13 +139,16 @@ class TextHandlerMixin:
         model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
         system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_directives=getattr(thread_state, 'channel_directives', None))
 
-        # Prompt-cache hygiene: minute-precision time rides at the SUFFIX (last message),
-        # never in the system prompt, so the cached prefix survives across turns.
+        # Prompt-cache hygiene: volatile context (minute-precision time + channel-activity
+        # envelope) rides at the SUFFIX (last message), never in the system prompt, so the
+        # cached prefix survives across turns.
         messages_for_api = messages_for_api + [{
             "role": "developer",
-            "content": self._build_time_suffix_context(user_timezone, user_tz_label),
+            "content": self._build_suffix_context(client, message.channel_id,
+                                                  thread_state.thread_ts,
+                                                  user_timezone, user_tz_label),
         }]
-        
+
         # Update status before generating
         if failed_mcp_server:
             self._update_status(client, message.channel_id, thinking_id,
@@ -438,13 +441,16 @@ class TextHandlerMixin:
         model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
         system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_directives=getattr(thread_state, 'channel_directives', None))
 
-        # Prompt-cache hygiene: minute-precision time rides at the SUFFIX (last message),
-        # never in the system prompt, so the cached prefix survives across turns.
+        # Prompt-cache hygiene: volatile context (minute-precision time + channel-activity
+        # envelope) rides at the SUFFIX (last message), never in the system prompt, so the
+        # cached prefix survives across turns.
         messages_for_api = messages_for_api + [{
             "role": "developer",
-            "content": self._build_time_suffix_context(user_timezone, user_tz_label),
+            "content": self._build_suffix_context(client, message.channel_id,
+                                                  thread_state.thread_ts,
+                                                  user_timezone, user_tz_label),
         }]
-        
+
         # Post an initial message to get the message ID for streaming updates
         # For streaming with potential tools, start with "Working on it"
         # (will be overridden if tools are used)

@@ -145,11 +145,13 @@ class VisionHandlerMixin:
             # Pre-trim messages to fit within context window
             enhanced_messages = await self._pre_trim_messages_for_api(enhanced_messages, model=thread_state.current_model)
 
-            # Prompt-cache hygiene: minute-precision time at the suffix (system prompt
-            # carries only the date)
+            # Prompt-cache hygiene: volatile context (minute-precision time + channel
+            # envelope) at the suffix (system prompt carries only the date)
             enhanced_messages = enhanced_messages + [{
                 "role": "developer",
-                "content": self._build_time_suffix_context(user_timezone, user_tz_label),
+                "content": self._build_suffix_context(client, thread_state.channel_id,
+                                                      thread_state.thread_ts,
+                                                      user_timezone, user_tz_label),
             }]
 
             # Update status to show we're preparing the analysis

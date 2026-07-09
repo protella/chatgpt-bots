@@ -55,17 +55,27 @@ class ChatBotV2:
         
         main_logger.info("Initialization complete")
     
-    async def _classify_wake(self, message: Message) -> str:
+    async def _classify_wake(self, message: Message, client: BaseClient) -> str:
         """Phase 5 wake gate: ask the lightweight classifier whether to respond/react/ignore.
         Conservative — any failure returns 'ignore' so the bot never spams a channel."""
         try:
             ts = message.metadata.get("ts")
             is_thread_reply = bool(ts and message.thread_id and message.thread_id != ts)
+            # Phase E: give the verdict peripheral vision — same deterministic envelope
+            # the responder sees (here without excluding the triggering thread).
+            channel_activity = None
+            pulse = getattr(client, "channel_pulse", None)
+            if pulse is not None:
+                channel_activity = pulse.render_envelope(
+                    message.channel_id, exclude_thread_ts=None,
+                    max_lines=config.channel_pulse_envelope_max,
+                ) or None
             return await self.processor.openai_client.classify_wake(
                 message.text,
                 signals={
                     "is_thread_reply": is_thread_reply,
                     "directives": message.metadata.get("channel_directives"),
+                    "channel_activity": channel_activity,
                 },
             )
         except Exception as e:
@@ -77,7 +87,7 @@ class ChatBotV2:
         # Phase 5 wake gate: for channel messages routed in auto_respond mode, a lightweight
         # classifier decides respond/react/ignore BEFORE anything is posted (so 'ignore' is silent).
         if message.metadata.get("wake_classify") is True:
-            decision = await self._classify_wake(message)
+            decision = await self._classify_wake(message, client)
             if decision == "ignore":
                 main_logger.debug("Wake gate: ignore — staying silent")
                 return
@@ -106,6 +116,21 @@ class ChatBotV2:
             if thinking_id and not (response and response.metadata.get("streamed")):
                 await client.delete_message(message.channel_id, thinking_id)
             
+            # Phase E/F: participation stats — count replies the bot volunteered
+            # (wake-gate 'respond' verdicts) so the engine can self-throttle later.
+            if (response and message.channel_id and not message.channel_id.startswith("D")
+                    and getattr(client, "channel_pulse", None) is not None):
+                posted = (response.metadata.get("streamed")
+                          or (response.type == "text" and (response.content or "").strip()))
+                if posted:
+                    try:
+                        client.channel_pulse.record_bot_reply(
+                            message.channel_id, message.metadata.get("ts"),
+                            unprompted=message.metadata.get("wake_classify") is True,
+                        )
+                    except Exception as e:
+                        main_logger.debug(f"participation stat record failed: {e}")
+
             # Handle the response
             if response:
                 if response.type == "busy":

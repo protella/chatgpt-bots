@@ -858,6 +858,40 @@ class MessageUtilitiesMixin:
         return (f"[Current date and time: {current_time.strftime('%A, %B %d, %Y at %I:%M %p')} "
                 f"({timezone_display}) — consider this when answering time-sensitive questions.]")
 
+    def _build_pulse_envelope(self, client, channel_id: Optional[str],
+                              thread_ts: Optional[str]) -> Optional[str]:
+        """Phase E: '[Recent channel activity]' envelope for CHANNEL responses.
+
+        VOLATILE by nature (the buffer changes with every channel message), so the
+        caller must inject it at the SUFFIX alongside the time context — never the
+        system prompt (cache hygiene, plan §5b). Excludes the current thread: those
+        messages are already the model's full context. Returns None for DMs, when
+        the pulse is disabled/absent, or when there's nothing to show."""
+        try:
+            pulse = getattr(client, "channel_pulse", None)
+            if pulse is None or not channel_id or channel_id.startswith("D"):
+                return None
+            envelope = pulse.render_envelope(
+                channel_id,
+                exclude_thread_ts=thread_ts,
+                max_lines=config.channel_pulse_envelope_max,
+            )
+            return envelope or None
+        except Exception as e:
+            self.log_debug(f"pulse envelope build failed: {e}")
+            return None
+
+    def _build_suffix_context(self, client, channel_id: Optional[str],
+                              thread_ts: Optional[str], user_timezone: str = "UTC",
+                              user_tz_label: Optional[str] = None) -> str:
+        """All volatile per-request context, injected as the LAST payload message:
+        minute-precision time + the channel-activity envelope (channels only)."""
+        parts = [self._build_time_suffix_context(user_timezone, user_tz_label)]
+        envelope = self._build_pulse_envelope(client, channel_id, thread_ts)
+        if envelope:
+            parts.append(envelope)
+        return "\n\n".join(parts)
+
     def _schedule_async_call(self, coro):
         """Schedule a fire-and-forget coroutine safely.
 
