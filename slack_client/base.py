@@ -20,6 +20,7 @@ from .utilities import SlackUtilitiesMixin
 from .formatting.text import SlackFormattingMixin
 from .messaging import SlackMessagingMixin
 from .history_tool import SlackHistoryToolMixin
+from .search_tool import SlackSearchToolMixin
 from tool_registry import ToolRegistry
 
 
@@ -31,6 +32,7 @@ class SlackBot(SlackMessageEventsMixin,
                SlackFormattingMixin,
                SlackMessagingMixin,
                SlackHistoryToolMixin,
+               SlackSearchToolMixin,
                BaseClient):
     """Slack-specific bot implementation"""
     
@@ -75,6 +77,8 @@ class SlackBot(SlackMessageEventsMixin,
             )
         if config.enable_reactions and config.enable_react_tool and config.reaction_emojis:
             registry.register(self.get_react_tool_schema(), self.execute_react_tool)
+        if config.enable_search_tool:
+            registry.register(self.get_search_tool_schema(), self.execute_search_tool)
         return registry
 
     # Async versions required by BaseClient

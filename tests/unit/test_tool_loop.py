@@ -451,12 +451,13 @@ class TestProcessorGlue:
             h, {"enable_web_search": True, "enable_mcp": False}, "gpt-5.5")
         assert tools == [{"type": "web_search"}]
 
-    def test_registry_builder_registers_history_and_react(self, monkeypatch):
+    def test_registry_builder_registers_history_react_and_search(self, monkeypatch):
         from slack_client.base import SlackBot
         monkeypatch.setattr(config, "enable_history_tools", True)
         monkeypatch.setattr(config, "enable_reactions", True)
         monkeypatch.setattr(config, "enable_react_tool", True)
         monkeypatch.setattr(config, "reaction_emojis", ["thumbsup"])
+        monkeypatch.setattr(config, "enable_search_tool", True)
         s = MagicMock()
         s.get_history_tools_for_openai.return_value = [
             {"type": "function", "name": "fetch_channel_history", "parameters": {}},
@@ -464,9 +465,22 @@ class TestProcessorGlue:
         ]
         s.get_react_tool_schema.return_value = {
             "type": "function", "name": "react_to_message", "parameters": {}}
+        s.get_search_tool_schema.return_value = {
+            "type": "function", "name": "search_slack", "parameters": {}}
         registry = SlackBot._build_tool_registry(s)
         names = {t["name"] for t in registry.schemas()}
-        assert names == {"fetch_channel_history", "fetch_thread_messages", "react_to_message"}
+        assert names == {"fetch_channel_history", "fetch_thread_messages",
+                         "react_to_message", "search_slack"}
+
+    def test_registry_builder_search_gated_off(self, monkeypatch):
+        from slack_client.base import SlackBot
+        monkeypatch.setattr(config, "enable_history_tools", False)
+        monkeypatch.setattr(config, "enable_reactions", False)
+        monkeypatch.setattr(config, "enable_search_tool", False)
+        s = MagicMock()
+        s.get_history_tools_for_openai.return_value = []
+        registry = SlackBot._build_tool_registry(s)
+        assert "search_slack" not in {t["name"] for t in registry.schemas()}
 
     @pytest.mark.asyncio
     async def test_registry_history_executor_routes_by_name(self, monkeypatch):
