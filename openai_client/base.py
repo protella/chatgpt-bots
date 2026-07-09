@@ -448,8 +448,16 @@ class OpenAIClient(LoggerMixin):
         text: str,
         signals: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Phase 5 wake classifier: 'respond' | 'react' | 'ignore' (defaults to 'ignore')."""
+        """DEPRECATED (Phase F): use classify_participation. Kept one release for rollback."""
         return await responses_api.classify_wake(self, text=text, signals=signals)
+
+    async def classify_participation(
+        self,
+        text: str,
+        signals: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Phase F participation judgment: raw JSON verdict dict (fail-safe {'action':'ignore'})."""
+        return await responses_api.classify_participation(self, text=text, signals=signals)
 
     async def extract_memory(
         self,

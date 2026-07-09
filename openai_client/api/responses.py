@@ -6,7 +6,8 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from config import config
-from prompts import IMAGE_INTENT_SYSTEM_PROMPT, MEMORY_EXTRACTION_SYSTEM_PROMPT, WAKE_CLASSIFIER_SYSTEM_PROMPT
+from prompts import (IMAGE_INTENT_SYSTEM_PROMPT, MEMORY_EXTRACTION_SYSTEM_PROMPT,
+                     PARTICIPATION_SYSTEM_PROMPT, WAKE_CLASSIFIER_SYSTEM_PROMPT)
 
 
 def _capture_usage(usage_sink, response):
@@ -806,8 +807,10 @@ async def create_streaming_response_with_tools(
         raise
 
 async def classify_wake(self, text: str, signals: Optional[Dict[str, Any]] = None) -> str:
-    """Lightweight 'should the bot respond?' classifier for channel auto_respond mode.
+    """DEPRECATED (Phase F): superseded by classify_participation below. Kept one release
+    for rollback; no runtime call sites remain.
 
+    Lightweight 'should the bot respond?' classifier for channel auto_respond mode.
     Returns 'respond' | 'react' | 'ignore'. Best-effort and CONSERVATIVE: any failure or
     unrecognized output defaults to 'ignore' (never spam a channel)."""
     signals = signals or {}
@@ -861,6 +864,82 @@ async def classify_wake(self, text: str, signals: Optional[Dict[str, Any]] = Non
     except Exception as e:
         self.log_warning(f"Wake classification failed ({e}); defaulting to ignore")
         return "ignore"
+
+
+async def classify_participation(self, text: str, signals: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Phase F participation judgment — ONE utility-model call, strict JSON out.
+
+    Returns the raw verdict dict {"action", "emoji", "placement", "reason"}; the caller
+    (ParticipationEngine.validate_verdict) coerces/validates it. Best-effort and
+    CONSERVATIVE: any failure or unparseable output returns {"action": "ignore"}.
+
+    Prompt construction is deterministic: signal lines render in a fixed order so
+    identical inputs produce identical payloads."""
+    signals = signals or {}
+    lines = []
+    if signals.get("sender_name"):
+        lines.append(f"- Sender: {signals['sender_name']}")
+    if signals.get("is_thread_reply"):
+        lines.append("- This is a reply inside a thread the assistant can see.")
+    lines.append(f"- Strictness: {signals.get('strictness') or 'judicious'}")
+    lines.append(
+        f"- Assistant's unprompted replies in this channel in the last hour: "
+        f"{int(signals.get('unprompted_last_hour') or 0)} (self-throttle cap: "
+        f"{int(signals.get('hourly_cap') or 0)})"
+    )
+    allow = list(getattr(config, "reaction_emojis", None) or ["eyes"])
+    lines.append(f"- Allowed reaction emoji: {', '.join(allow)}")
+    if signals.get("directives"):
+        lines.append(f"- Channel ground rules (honor them): {signals['directives']}")
+    facts = signals.get("memory_facts") or []
+    if facts:
+        rendered = "; ".join(
+            f"[#{f.get('id')}] {f.get('content')}" for f in sorted(facts, key=lambda f: f.get("id") or 0)
+        )
+        lines.append(f"- Channel memory (may be stale): {rendered}")
+    signal_note = "\n\nSignals:\n" + "\n".join(lines)
+    if signals.get("channel_activity"):
+        signal_note += f"\n\n{signals['channel_activity']}"
+
+    conversation_messages = [
+        {"role": "developer", "content": PARTICIPATION_SYSTEM_PROMPT},
+        {"role": "user", "content": f"Latest message:\n{text}{signal_note}\n\nRespond with ONLY the JSON verdict object."},
+    ]
+
+    request_params = {
+        "model": config.utility_model,
+        "input": conversation_messages,
+        "max_output_tokens": config.utility_max_tokens,
+        "store": False,
+    }
+    # Utility model is a GPT-5-series reasoning model (gpt-5-mini)
+    request_params["temperature"] = 1.0
+    request_params["reasoning"] = {"effort": config.utility_reasoning_effort}
+    request_params["text"] = {"verbosity": config.utility_verbosity}
+
+    try:
+        response = await self._safe_api_call(
+            self.client.responses.create,
+            operation_type="intent_classification",
+            **request_params,
+        )
+        result = ""
+        if response.output:
+            for item in response.output:
+                if hasattr(item, "content") and item.content:
+                    for content in item.content:
+                        if hasattr(content, "text"):
+                            result += content.text
+        result = result.strip()
+        self.log_debug(f"Participation verdict raw: '{result[:200]}' for: '{text[:60]}...'")
+        # Tolerate code fences / stray prose around the JSON object.
+        start, end = result.find("{"), result.rfind("}")
+        if start == -1 or end <= start:
+            return {"action": "ignore"}
+        return json.loads(result[start:end + 1])
+    except Exception as e:
+        self.log_warning(f"Participation classification failed ({e}); defaulting to ignore")
+        return {"action": "ignore"}
 
 
 async def extract_memory(self, exchange_text: str, existing_memory: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:

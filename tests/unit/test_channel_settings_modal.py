@@ -45,21 +45,22 @@ class TestChannelSettingsModal:
         view = modal.build_channel_settings_modal("C1", None, "tag_only")
         assert view["callback_id"] == "channel_settings_modal"
         assert json.loads(view["private_metadata"])["channel_id"] == "C1"
-        assert self._block(view, "response_mode_block")["element"]["initial_option"]["value"] == "inherit"
+        assert self._block(view, "participation_block")["element"]["initial_option"]["value"] == "inherit"
         assert self._block(view, "directives_block")["element"]["initial_value"] == ""
         # reply-in-channel unchecked → no initial_options
         assert "initial_options" not in self._block(view, "reply_in_channel_block")["element"]
 
     def test_prefill_from_row(self, modal):
+        # Legacy row (response_mode only) maps to its participation-level equivalent.
         cs = {"response_mode": "auto_respond", "directives": "only deploys", "reply_in_channel": True}
         view = modal.build_channel_settings_modal("C2", cs, "tag_only")
-        assert self._block(view, "response_mode_block")["element"]["initial_option"]["value"] == "auto_respond"
+        assert self._block(view, "participation_block")["element"]["initial_option"]["value"] == "judicious"
         assert self._block(view, "directives_block")["element"]["initial_value"] == "only deploys"
         assert self._block(view, "reply_in_channel_block")["element"].get("initial_options")
 
     def test_null_mode_treated_as_inherit(self, modal):
         view = modal.build_channel_settings_modal("C3", {"response_mode": None}, "off")
-        assert self._block(view, "response_mode_block")["element"]["initial_option"]["value"] == "inherit"
+        assert self._block(view, "participation_block")["element"]["initial_option"]["value"] == "inherit"
 
 
 # --------------------------------------------------------------------------- footer blocks

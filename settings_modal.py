@@ -115,22 +115,33 @@ class SettingsModal(LoggerMixin):
         inherits the global default; that is represented by the "inherit" option here, and the
         submission handler stores None (NULL) for it so the global default keeps applying.
         """
+        from message_processor.participation import MODE_TO_LEVEL, VALID_LEVELS, is_snoozed
+
         cs = current_settings or {}
-        current_mode = cs.get("response_mode")
         directives_value = cs.get("directives") or ""
         reply_in_channel = bool(cs.get("reply_in_channel", False))
 
+        # Phase F: one Participation select replaces the old response-mode select.
+        # Legacy rows with only response_mode map cleanly (off≡off, tag_only≡mentions_only,
+        # auto_respond≡judicious); submission writes BOTH columns in lockstep.
+        global_default_level = MODE_TO_LEVEL.get((global_default_mode or "tag_only").lower(), "mentions_only")
         mode_options = [
-            {"text": {"type": "plain_text", "text": f"Use default (inherit — currently: {global_default_mode})"},
+            {"text": {"type": "plain_text", "text": f"Use default (inherit — currently: {global_default_level})"},
              "value": "inherit"},
-            {"text": {"type": "plain_text", "text": "Tag-only — reply only when clearly addressed"},
-             "value": "tag_only"},
-            {"text": {"type": "plain_text", "text": "Auto-respond — classifier decides per message"},
-             "value": "auto_respond"},
+            {"text": {"type": "plain_text", "text": "Mentions only — reply only when clearly addressed"},
+             "value": "mentions_only"},
+            {"text": {"type": "plain_text", "text": "Judicious — chime in when clearly valuable (recommended)"},
+             "value": "judicious"},
+            {"text": {"type": "plain_text", "text": "Active — participate more freely (higher reply cap)"},
+             "value": "active"},
             {"text": {"type": "plain_text", "text": "Off — never respond in this channel"},
              "value": "off"},
         ]
-        selected_value = current_mode if current_mode in ("tag_only", "auto_respond", "off") else "inherit"
+        current_level = cs.get("participation_level")
+        if current_level not in VALID_LEVELS:
+            # Fall back to the legacy column when only response_mode was ever set.
+            current_level = MODE_TO_LEVEL.get(cs.get("response_mode") or "", None)
+        selected_value = current_level if current_level in VALID_LEVELS else "inherit"
         initial_mode_option = next(o for o in mode_options if o["value"] == selected_value)
 
         reply_option = {
@@ -149,11 +160,12 @@ class SettingsModal(LoggerMixin):
             {"type": "section", "text": {"type": "mrkdwn",
              "text": f"*Channel settings* for <#{channel_id}>\nHow I participate in this channel. "
                      f"Global defaults come from the bot's configuration; these override them here."}},
-            {"type": "input", "block_id": "response_mode_block",
-             "element": {"type": "static_select", "action_id": "response_mode",
+            {"type": "input", "block_id": "participation_block",
+             "element": {"type": "static_select", "action_id": "participation_level",
                          "options": mode_options, "initial_option": initial_mode_option},
-             "label": {"type": "plain_text", "text": "Response mode"},
-             "hint": {"type": "plain_text", "text": f"'Inherit' uses the global default ({global_default_mode})."}},
+             "label": {"type": "plain_text", "text": "Participation"},
+             "hint": {"type": "plain_text",
+                      "text": f"How proactively I join conversations. 'Inherit' uses the global default ({global_default_level})."}},
             {"type": "input", "block_id": "directives_block", "optional": True,
              "element": {"type": "plain_text_input", "action_id": "directives", "multiline": True,
                          "initial_value": directives_value, "max_length": 1000,
@@ -163,10 +175,26 @@ class SettingsModal(LoggerMixin):
              "hint": {"type": "plain_text", "text": "Extra instructions for how I behave in this channel."}},
             {"type": "input", "block_id": "reply_in_channel_block", "optional": True,
              "element": reply_element,
-             "label": {"type": "plain_text", "text": "Reply placement (not yet active)"},
+             "label": {"type": "plain_text", "text": "Reply placement"},
              "hint": {"type": "plain_text",
-                      "text": "Stored for when top-level posting ships; replies are threaded for now."}},
+                      "text": "When checked, answers to top-level messages post at channel level instead of in a thread."}},
         ]
+
+        # Phase F: while snoozed ("butt out"), offer an early resume.
+        if is_snoozed(cs):
+            snooze_option = {
+                "text": {"type": "plain_text", "text": "Resume unprompted participation now"},
+                "value": "clear_snooze",
+            }
+            blocks.append(
+                {"type": "input", "block_id": "snooze_block", "optional": True,
+                 "element": {"type": "checkboxes", "action_id": "clear_snooze",
+                             "options": [snooze_option]},
+                 "label": {"type": "plain_text", "text": "Snoozed"},
+                 "hint": {"type": "plain_text",
+                          "text": f"The channel asked me to pipe down (until {cs.get('snoozed_until')} UTC). "
+                                  f"@mentions still work while snoozed."}}
+            )
 
         return {
             "type": "modal",

@@ -189,8 +189,12 @@ class SlackMessageEventsMixin:
 
         channel_id = event.get("channel")
         cs = await self._get_channel_settings(channel_id)
-        mode = self._resolve_mode(cs)
-        if mode == "off":
+        # Phase F: participation levels (off / mentions_only / judicious / active).
+        # participation_level wins over the legacy response_mode; both map cleanly
+        # (off≡off, tag_only≡mentions_only, auto_respond≡judicious).
+        from message_processor.participation import is_snoozed, resolve_participation_level
+        level = resolve_participation_level(cs)
+        if level == "off":
             return
 
         text = event.get("text", "") or ""
@@ -213,13 +217,19 @@ class SlackMessageEventsMixin:
             if bot_present and (human_count <= 1 or addressed):
                 addressed = True
 
-        # Decide.
-        wake_classify = False
+        # Decide (Phase F): addressed → respond directly, never via the engine;
+        # judicious/active → ParticipationEngine judges (in handle_message);
+        # mentions_only (or engine disabled) → ignore, zero model cost.
+        participation_check = False
         if addressed:
             pass  # respond directly
-        elif mode == "auto_respond":
-            wake_classify = True  # let the wake classifier (in handle_message) make the call
-        else:  # tag_only and not addressed
+        elif level in ("judicious", "active") and getattr(config, "enable_participation_engine", True):
+            # Snooze prefilter: a backoff verdict silences UNPROMPTED engagement only —
+            # told to be quiet ≠ deaf, so the addressed path above never checks this.
+            if is_snoozed(cs):
+                return
+            participation_check = True
+        else:
             return
 
         # Phase E: first wake in this channel since startup seeds the pulse ring
@@ -233,9 +243,9 @@ class SlackMessageEventsMixin:
         # Phase 6: reply in-thread by default (a top-level message keys as its own length-1 thread).
         message.thread_id = thread_ts or ts
         message.metadata["channel_listen"] = True
-        message.metadata["channel_mode"] = mode
-        if wake_classify:
-            message.metadata["wake_classify"] = True
+        message.metadata["participation_level"] = level
+        if participation_check:
+            message.metadata["participation_check"] = True
         # Phase 7: carry per-channel ground rules + placement into the response pipeline.
         if cs:
             if cs.get("directives"):
@@ -244,8 +254,8 @@ class SlackMessageEventsMixin:
                 message.metadata["reply_in_channel"] = True
 
         self.log_debug(
-            f"Channel message dispatch: channel={channel_id}, ts={ts}, mode={mode}, "
-            f"addressed={addressed}, wake_classify={wake_classify}"
+            f"Channel message dispatch: channel={channel_id}, ts={ts}, level={level}, "
+            f"addressed={addressed}, participation_check={participation_check}"
         )
         if self.message_handler:
             await self.message_handler(message, self)

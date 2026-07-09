@@ -147,10 +147,15 @@ class SlackSettingsHandlersMixin:
             if not channel_id:
                 return
 
+            from message_processor.participation import LEVEL_TO_MODE, MODE_TO_LEVEL
+
             state = view.get('state', {}).get('values', {})
-            sel = state.get('response_mode_block', {}).get('response_mode', {}).get('selected_option') or {}
-            mode_sel = sel.get('value', 'inherit')
-            response_mode = None if mode_sel == 'inherit' else mode_sel
+            sel = state.get('participation_block', {}).get('participation_level', {}).get('selected_option') or {}
+            level_sel = sel.get('value', 'inherit')
+            # Dual-write (Phase F): participation_level is authoritative; response_mode is
+            # kept in lockstep so legacy readers stay consistent. 'inherit' clears BOTH.
+            participation_level = None if level_sel == 'inherit' else level_sel
+            response_mode = None if participation_level is None else LEVEL_TO_MODE.get(participation_level)
 
             dir_raw = state.get('directives_block', {}).get('directives', {}).get('value')
             directives = dir_raw.strip() if dir_raw and dir_raw.strip() else None
@@ -158,16 +163,23 @@ class SlackSettingsHandlersMixin:
             ric_selected = state.get('reply_in_channel_block', {}).get('reply_in_channel', {}).get('selected_options') or []
             reply_in_channel = len(ric_selected) > 0
 
+            # Snooze early-resume (checkbox only rendered while snoozed).
+            snooze_selected = state.get('snooze_block', {}).get('clear_snooze', {}).get('selected_options') or []
+            extra = {"snoozed_until": None} if len(snooze_selected) > 0 else {}
+
             try:
                 await self.db.set_channel_settings_async(
                     channel_id,
-                    response_mode=response_mode,  # None → clears override
-                    directives=directives,        # None → clears
+                    response_mode=response_mode,          # None → clears override
+                    directives=directives,                # None → clears
                     reply_in_channel=reply_in_channel,
+                    participation_level=participation_level,  # None → clears override
                     updated_by=user_id,
+                    **extra,
                 )
-                effective = mode_sel if mode_sel != 'inherit' else f"inherit ({getattr(config, 'channel_response_mode', 'tag_only')})"
-                self.log_info(f"Channel settings saved for {channel_id} by {user_id}: mode={mode_sel}")
+                default_level = MODE_TO_LEVEL.get(getattr(config, 'channel_response_mode', 'tag_only'), 'mentions_only')
+                effective = level_sel if level_sel != 'inherit' else f"inherit ({default_level})"
+                self.log_info(f"Channel settings saved for {channel_id} by {user_id}: participation={level_sel}")
                 try:
                     await client.chat_postEphemeral(
                         channel=channel_id, user=user_id,

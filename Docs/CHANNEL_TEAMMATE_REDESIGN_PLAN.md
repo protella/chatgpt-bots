@@ -434,15 +434,30 @@ Tests: ring behavior, backfill-once, envelope rendering, DM exclusion. Live: two
 top-level questions; second answer shouldn't bleed the first's thread but engine should show
 awareness.
 
-**F. ParticipationEngine** — new prompt + JSON verdict, debounce, placement, throttle, backoff +
-snooze + modal participation control; delete `classify_wake` call sites (keep fn one release).
-Files: `message_processor/participation.py`, `prompts.py`, `main.py` (gate swap),
-`message_events.py`, `database.py` (2 columns), `settings_modal.py`, `settings.py`. Tests:
-verdict parsing/fallback, throttle math, snooze lifecycle, backoff writes, placement wiring,
-tag_only-never-calls-engine. Live: auto_respond in test channel — the full etiquette script
+**F. ParticipationEngine** — ✅ IMPLEMENTED 2026-07-09. `message_processor/participation.py`
+(engine + debounce + level/snooze helpers), PARTICIPATION_SYSTEM_PROMPT +
+`classify_participation` (strict-JSON utility call, fail-safe ignore), main.py gate swap
+(`_run_participation_gate` + `_apply_backoff`), message_events prefilters (level resolution,
+snooze short-circuit, mentions_only zero-cost), channel_settings `participation_level` +
+`snoozed_until` columns (migration), modal Participation select + snooze early-resume,
+`reply_in_channel` placement finally wired (top-level triggers only; footer skipped there).
+`classify_wake`/WAKE_CLASSIFIER kept one release, deprecated, no runtime call sites.
+DEVIATIONS from §4 (coordinator directives win): participation levels are
+`off/mentions_only/judicious/active` (not quiet/normal/chatty) and the modal's single
+Participation select REPLACES the response-mode select, dual-writing `response_mode` in
+lockstep for legacy readers; debounce is `PARTICIPATION_DEBOUNCE_SECONDS=3` (not
+WAKE_DEBOUNCE_SECONDS=0.8) implemented in the engine, superseded evaluations return silent;
+the hourly throttle SKIPS the engine call entirely instead of downgrading verdicts (cheaper,
+same outcome); snooze column is `snoozed_until` (directive spelling) and the env is
+`PARTICIPATION_SNOOZE_HOURS`; placement authority is images>reply_in_channel-setting>thread
+(the engine's placement verdict is logged, not authoritative — §4a's "setting AND verdict"
+tightened per directive "setting wins"). Also fixed here (coordinator addendum): busy-rejected
+messages are no longer lost from warm context — `mark_needs_refresh`/`consume_needs_refresh`
+on the state manager force a Slack refetch on the thread's next request.
+Tests: `tests/unit/test_participation_engine.py` + rewritten `test_wake_classifier.py`, updated
+`test_channel_listening.py`. Live: auto_respond etiquette script
 (answerable question → respond; human-to-human → silent; "thanks" → react; "chatgpt butt out" →
-🤐 + snooze; @mention while snoozed → answers). **This phase rewrites
-`test_wake_classifier.py` / parts of `test_channel_listening.py`.**
+🤐 + snooze; @mention while snoozed → answers).
 
 **G. agent_view migration + native streaming flip** — events, manifest, setStatus guard, stream
 sink wiring, live validation, then `SLACK_NATIVE_STREAMING=true` in dev. *Absorbs parity

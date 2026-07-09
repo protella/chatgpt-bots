@@ -110,7 +110,7 @@ async def test_tag_only_name_addressed_responds(tag_only):
     bot.message_handler.assert_called_once()
     msg = bot.message_handler.call_args[0][0]
     assert msg.metadata.get("channel_listen") is True
-    assert msg.metadata.get("wake_classify") is not True  # addressed → no classifier needed
+    assert msg.metadata.get("participation_check") is not True  # addressed → no engine needed
 
 
 @pytest.mark.asyncio
@@ -122,14 +122,65 @@ async def test_explicit_mention_is_deduped(tag_only):
 
 
 @pytest.mark.asyncio
-async def test_auto_respond_sets_wake_classify_for_unaddressed(monkeypatch):
+async def test_auto_respond_sets_participation_check_for_unaddressed(monkeypatch):
     monkeypatch.setattr(config, "channel_response_mode", "auto_respond", raising=False)
     monkeypatch.setattr(config, "bot_name_aliases", ["ChatGPT"], raising=False)
+    monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
     bot = _make_bot()
     await bot._handle_channel_message(_evt(text="anyone know the q3 numbers?"), bot.app.client)
     bot.message_handler.assert_called_once()
     msg = bot.message_handler.call_args[0][0]
-    assert msg.metadata.get("wake_classify") is True
+    assert msg.metadata.get("participation_check") is True
+    assert msg.metadata.get("participation_level") == "judicious"  # auto_respond ≡ judicious
+
+
+@pytest.mark.asyncio
+async def test_engine_disabled_makes_auto_respond_mentions_only(monkeypatch):
+    monkeypatch.setattr(config, "channel_response_mode", "auto_respond", raising=False)
+    monkeypatch.setattr(config, "bot_name_aliases", ["ChatGPT"], raising=False)
+    monkeypatch.setattr(config, "enable_participation_engine", False, raising=False)
+    bot = _make_bot()
+    # unaddressed → ignored with zero model cost
+    await bot._handle_channel_message(_evt(text="anyone know the q3 numbers?"), bot.app.client)
+    bot.message_handler.assert_not_called()
+    # addressed by name → still responds directly (pre-F tag_only behavior preserved)
+    await bot._handle_channel_message(_evt(ts="101.1", text="ChatGPT what's up?"), bot.app.client)
+    bot.message_handler.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_snoozed_channel_skips_unprompted_but_not_addressed(monkeypatch):
+    from message_processor.participation import snooze_expiry_iso
+    monkeypatch.setattr(config, "channel_response_mode", "auto_respond", raising=False)
+    monkeypatch.setattr(config, "bot_name_aliases", ["ChatGPT"], raising=False)
+    monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
+    bot = _make_bot()
+    snoozed = {"response_mode": "auto_respond", "snoozed_until": snooze_expiry_iso(hours=1)}
+
+    async def _cs(channel_id):
+        return snoozed
+
+    bot._get_channel_settings = _cs
+    # unprompted while snoozed → silent, no dispatch
+    await bot._handle_channel_message(_evt(text="anyone know the q3 numbers?"), bot.app.client)
+    bot.message_handler.assert_not_called()
+    # name-addressed while snoozed → still answered (told to be quiet ≠ deaf)
+    await bot._handle_channel_message(_evt(ts="102.1", text="ChatGPT you there?"), bot.app.client)
+    bot.message_handler.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_participation_level_off_row_silences_channel(monkeypatch):
+    monkeypatch.setattr(config, "channel_response_mode", "auto_respond", raising=False)
+    monkeypatch.setattr(config, "bot_name_aliases", ["ChatGPT"], raising=False)
+    bot = _make_bot()
+
+    async def _cs(channel_id):
+        return {"response_mode": "auto_respond", "participation_level": "off"}
+
+    bot._get_channel_settings = _cs
+    await bot._handle_channel_message(_evt(text="ChatGPT help"), bot.app.client)
+    bot.message_handler.assert_not_called()
 
 
 @pytest.mark.asyncio
