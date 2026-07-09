@@ -26,11 +26,11 @@ class TestChatBotV2Initialization:
         assert bot.sigint_count == 0
         assert bot.last_sigint_time == 0
     
-    def test_init_with_discord_platform(self):
-        """Test initialization with Discord platform"""
-        bot = ChatBotV2(platform="discord")
+    def test_init_with_other_platform(self):
+        """Test initialization stores an arbitrary platform string"""
+        bot = ChatBotV2(platform="matrix")
         
-        assert bot.platform == "discord"
+        assert bot.platform == "matrix"
     
     def test_init_platform_lowercase(self):
         """Test platform name is converted to lowercase"""
@@ -75,11 +75,11 @@ class TestChatBotV2Initialization:
     
     @patch('main.config')
     @pytest.mark.asyncio
-    async def test_initialize_discord_not_implemented(self, mock_config):
-        """Test Discord platform not yet implemented"""
+    async def test_initialize_unsupported_platform_exits(self, mock_config):
+        """Test unsupported platform names exit with an error"""
         mock_config.validate.return_value = None
 
-        bot = ChatBotV2(platform="discord")
+        bot = ChatBotV2(platform="matrix")
 
         with pytest.raises(SystemExit):
             await bot.initialize()
@@ -629,20 +629,6 @@ class TestMainFunction:
         await main()
 
         mock_chatbot_class.assert_called_once_with(platform="slack")
-        mock_bot.run.assert_called_once()
-    
-    @patch('main.ChatBotV2')
-    @patch('sys.argv', ['main.py', '--platform', 'discord'])
-    @pytest.mark.asyncio
-    async def test_main_discord_platform(self, mock_chatbot_class):
-        """Test main with Discord platform argument"""
-        mock_bot = Mock()
-        mock_bot.run = AsyncMock()
-        mock_chatbot_class.return_value = mock_bot
-
-        await main()
-
-        mock_chatbot_class.assert_called_once_with(platform="discord")
         mock_bot.run.assert_called_once()
     
     @patch('sys.argv', ['main.py'])

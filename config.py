@@ -47,10 +47,6 @@ class BotConfig:
     slack_bot_token: str = field(default_factory=lambda: os.getenv("SLACK_BOT_TOKEN", ""))
     slack_app_token: str = field(default_factory=lambda: os.getenv("SLACK_APP_TOKEN", ""))
     
-    # Discord credentials
-    discord_token: str = field(default_factory=lambda: os.getenv("DISCORD_TOKEN", ""))
-    discord_allowed_channels: str = field(default_factory=lambda: os.getenv("DISCORD_ALLOWED_CHANNEL_IDS", ""))
-    
     # OpenAI credentials
     openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_KEY", ""))
     
@@ -121,7 +117,6 @@ class BotConfig:
     # Logging configuration
     log_level: str = field(default_factory=lambda: os.getenv("BOT_LOG_LEVEL", "INFO"))
     slack_log_level: str = field(default_factory=lambda: os.getenv("SLACK_LOG_LEVEL", "INFO"))
-    discord_log_level: str = field(default_factory=lambda: os.getenv("DISCORD_LOG_LEVEL", "INFO"))
     utils_log_level: str = field(default_factory=lambda: os.getenv("UTILS_LOG_LEVEL", "INFO"))
     console_logging_enabled: bool = field(default_factory=lambda: os.getenv("CONSOLE_LOGGING_ENABLED", "TRUE").upper() == "TRUE")
     log_directory: str = field(default_factory=lambda: os.getenv("LOG_DIRECTORY", "logs"))

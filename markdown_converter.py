@@ -30,8 +30,6 @@ class MarkdownConverter(LoggerMixin):
         # Route to platform-specific converter
         if self.platform == "slack":
             return self._convert_to_slack(text)
-        elif self.platform == "discord":
-            return self._convert_to_discord(text)
         else:
             # Return original markdown for unknown platforms
             return text
@@ -55,23 +53,6 @@ class MarkdownConverter(LoggerMixin):
         
         # Restore code blocks
         text = self._restore_code_blocks_slack(text, code_blocks)
-        
-        # Clean up extra whitespace
-        text = self._clean_whitespace(text)
-        
-        return text
-    
-    def _convert_to_discord(self, text: str) -> str:
-        """Convert Markdown for Discord (Discord supports standard Markdown)"""
-        # Discord supports standard markdown, so minimal conversion needed
-        # Just ensure proper formatting
-        
-        # Discord supports:
-        # - **bold**, *italic*, __underline__, ~~strikethrough~~
-        # - # Headers (all levels)
-        # - ```code blocks``` with language hints
-        # - > blockquotes
-        # - [links](url)
         
         # Clean up extra whitespace
         text = self._clean_whitespace(text)

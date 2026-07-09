@@ -13,7 +13,7 @@ import pytz
 
 from base_client import BaseClient, Message
 from config import config
-from prompts import SLACK_SYSTEM_PROMPT, DISCORD_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, LOCAL_TOOLS_GUIDANCE
+from prompts import SLACK_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, LOCAL_TOOLS_GUIDANCE
 
 
 def build_roster_text(participants, user_cache=None, bot_user_id=None):
@@ -586,7 +586,7 @@ class MessageUtilitiesMixin:
                 image_count += 1
                 self.log_info(f"Added image from URL {image_count}/{max_images}: {img_data['url']}")
                 
-                # Store the image data for potential upload to Slack/Discord later
+                # Store the image data for potential upload to Slack later
                 # This will be handled by the AssetLedger tracking
                 if hasattr(message, 'url_images'):
                     message.url_images.append(img_data)
@@ -751,8 +751,6 @@ class MessageUtilitiesMixin:
                 base_prompt += f"\n\nThe company's name is {company_name}."
             elif company_website:
                 base_prompt += f"\n\nThe company's website is {company_website}."
-        elif "discord" in client_name:
-            base_prompt = DISCORD_SYSTEM_PROMPT
         else:
             # Default/CLI prompt
             base_prompt = CLI_SYSTEM_PROMPT

@@ -18,8 +18,6 @@ class TestBotConfig:
         assert config.slack_bot_token == 'xoxb-test-token'
         assert config.slack_app_token == 'xapp-test-token'
         
-        # Check Discord credentials
-        assert config.discord_token == 'discord-test-token'
         
         # Check OpenAI credentials
         assert config.openai_api_key == 'sk-test-key'

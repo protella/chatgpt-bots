@@ -1,10 +1,8 @@
-# ChatGPT Bots V2
-Python-based AI assistant for Slack using OpenAI's Responses API
+# ChatGPT Slack Bot
+Python-based ChatGPT Slack bot using OpenAI's Responses API
 
 ## Description
 A production-ready Slack bot built with Python and OpenAI's Responses API (not Chat Completions). Features intelligent intent classification, image generation/editing, vision analysis, document processing, and user-specific settings with thread-level customization. The architecture is stateless with Slack as the source of truth, rebuilding context from platform history on demand.
-
-**Note:** Discord support is temporarily unavailable while V2 development focuses on Slack. Discord V2 will be released in a future update.
 
 ## Recent Changes
 
@@ -54,7 +52,7 @@ Database schema changes (new `image_model` column + `settings_completed` backfil
 - **Image Generation**: `gpt-image-2`
 - **Utility Model**: `gpt-5-mini` for intent classification and helper functions (not user-selectable)
 
-The setup of a Slack or Discord App is out of scope of this README. There's plenty of documentation online detailing these processes.
+The setup of a Slack App is out of scope of this README. There's plenty of documentation online detailing these processes.
   
 ### Slack quickstart guide: https://api.slack.com/start/quickstart
 
@@ -116,8 +114,6 @@ The bot uses only **Bot Token** authentication. User scopes listed in the manife
 
 ---
 
-### Discord OAuth2 
-<img src="Docs/Discord_OAuth2.png" alt="image" width="40%" height="auto">
 
 ---
 
@@ -343,7 +339,6 @@ The bot will automatically create necessary directories on first startup:
 **Start the bot:**
 - `python3 slackbot.py` - Run Slack bot
 - `python3 main.py --platform slack` - Alternative with platform parameter
-- Discord support temporarily unavailable in V2
 
 The bot will connect via Socket Mode and start processing messages immediately.
 

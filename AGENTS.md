@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `main.py` orchestrates bot services; interface-specific runners live in `slackbot.py`, `discordbot.py`, and `settings_modal.py` for modal UX.
+- `main.py` orchestrates bot services; the Slack runner is `slackbot.py`; `settings_modal.py` builds the modal UX.
 - Core functionality lives in focused modules: `message_processor.py`, `document_handler.py`, `thread_manager.py`, and `openai_client.py`. Shared utilities (logging, token math) sit alongside them in the root for easy reuse.
 - Persistent assets reside in `data/` and `Docs/`; generated artifacts such as logs and coverage reports land in `logs/` and `htmlcov/`.
 - Tests are split by scope under `tests/unit/` and `tests/integration/`, with fixtures configured in `tests/conftest.py`.
@@ -29,7 +29,7 @@
 - Request at least one review, ensure CI passes, and note any follow-up tasks or feature flags in the PR description.
 
 ## Configuration & Secrets
-- Copy `.env.example` when onboarding; never commit secrets. Required keys include `OPENAI_API_KEY` plus platform tokens for Slack or Discord.
+- Copy `.env.example` when onboarding; never commit secrets. Required keys include `OPENAI_API_KEY` plus the Slack tokens.
 - Use the provided `slack_app_manifest.example.yml` and README quickstart to sync scopes and slash commands across environments.
 - If a local virtual environment exists (e.g., `.venv/`), activate it before running Python commands: `source .venv/bin/activate`.
 

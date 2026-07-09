@@ -75,8 +75,6 @@ def setup_logger(
         if level is None:
             if "slack" in name.lower():
                 level = config.slack_log_level
-            elif "discord" in name.lower():
-                level = config.discord_log_level
             elif "utils" in name.lower() or "openai" in name.lower():
                 level = config.utils_log_level
             else:

@@ -1,6 +1,5 @@
 # Core dependencies
 python-dotenv>=1.0.0
-discord>=2.3.0
 openai>=2.0.0
 slack_bolt>=1.27.0
 Pillow>=11.0.0

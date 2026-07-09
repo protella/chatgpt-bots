@@ -13,10 +13,10 @@ class TestMarkdownConverter:
         converter = MarkdownConverter("slack")
         assert converter.platform == "slack"
     
-    def test_initialization_discord(self):
-        """Test initialization with Discord platform"""
-        converter = MarkdownConverter("discord")
-        assert converter.platform == "discord"
+    def test_initialization_other_platform(self):
+        """Test initialization stores an arbitrary platform string"""
+        converter = MarkdownConverter("matrix")
+        assert converter.platform == "matrix"
     
     def test_initialization_case_insensitive(self):
         """Test platform name is case insensitive"""
@@ -245,51 +245,6 @@ def hello():
         assert "***" not in result
 
 
-class TestDiscordConversion:
-    """Test Discord-specific markdown conversion"""
-
-    def setup_method(self):
-        """Setup test fixtures"""
-        self.converter = MarkdownConverter("discord")
-
-    def test_discord_preserves_standard_markdown(self):
-        """Test that Discord preserves standard markdown"""
-        text = "**bold** *italic* ~~strikethrough~~"
-        result = self.converter.convert(text)
-        # Discord supports standard markdown, so should be preserved
-        assert "**bold**" in result
-        assert "*italic*" in result
-        assert "~~strikethrough~~" in result
-
-    def test_discord_headers_preserved(self):
-        """Test that Discord headers are preserved"""
-        text = "# Header 1\n## Header 2"
-        result = self.converter.convert(text)
-        assert "# Header 1" in result
-        assert "## Header 2" in result
-
-    def test_discord_code_blocks_preserved(self):
-        """Test that Discord code blocks are preserved"""
-        text = "```python\nprint('hello')\n```"
-        result = self.converter.convert(text)
-        assert "```python" in result
-        assert "print('hello')" in result
-
-    def test_discord_links_preserved(self):
-        """Test that Discord links are preserved"""
-        text = "[Google](https://google.com)"
-        result = self.converter.convert(text)
-        assert "[Google](https://google.com)" in result
-
-    def test_discord_whitespace_cleanup(self):
-        """Test Discord whitespace cleanup"""
-        text = "Line 1\n\n\n\nLine 2   "
-        result = self.converter.convert(text)
-        # Should still clean up excess whitespace
-        assert result.count('\n\n\n') == 0
-        assert not result.endswith(' ')
-
-
 class TestCodeBlockExtraction:
     """Test code block extraction and restoration"""
 
@@ -375,17 +330,17 @@ class TestMarkdownConverterCritical:
     def test_critical_platform_routing(self):
         """Critical test for platform-specific routing"""
         slack_converter = MarkdownConverter("slack")
-        discord_converter = MarkdownConverter("discord")
+        passthrough_converter = MarkdownConverter("unknown")
 
         text = "**bold** text"
 
         slack_result = slack_converter.convert(text)
-        discord_result = discord_converter.convert(text)
+        passthrough_result = passthrough_converter.convert(text)
 
         # Results should be different for different platforms
-        assert slack_result != discord_result
+        assert slack_result != passthrough_result
         assert "*bold*" in slack_result  # Slack format
-        assert "**bold**" in discord_result  # Discord preserves standard
+        assert "**bold**" in passthrough_result  # unknown platforms pass markdown through
 
     def test_critical_code_preservation(self):
         """Critical test that code blocks are not corrupted during conversion"""
@@ -429,7 +384,7 @@ class TestMarkdownConverterSmoke:
 
     def test_smoke_all_platforms(self):
         """Smoke test for all supported platforms"""
-        for platform in ["slack", "discord", "unknown"]:
+        for platform in ["slack", "unknown"]:
             converter = MarkdownConverter(platform)
             result = converter.convert("**test**")
             assert isinstance(result, str)
@@ -516,32 +471,6 @@ class TestMarkdownConverterSmoke:
         assert "\n\n\n\n" not in result
         # Should remove trailing spaces
         assert "Line 2   " not in result
-
-
-class TestDiscordConversion:
-    """Test Discord-specific markdown conversion"""
-    
-    def setup_method(self):
-        """Setup test fixtures"""
-        self.converter = MarkdownConverter("discord")
-    
-    def test_discord_preserves_standard_markdown(self):
-        """Test that Discord preserves standard markdown"""
-        text = "# Header\n**bold** *italic* ~~strike~~ `code`"
-        result = self.converter.convert(text)
-        # Discord supports standard markdown, so it should be mostly unchanged
-        assert "# Header" in result
-        assert "**bold**" in result
-        assert "*italic*" in result
-        assert "~~strike~~" in result
-        assert "`code`" in result
-    
-    def test_discord_clean_whitespace(self):
-        """Test that Discord conversion cleans whitespace"""
-        text = "Line 1\n\n\n\nLine 2   "
-        result = self.converter.convert(text)
-        assert "\n\n\n\n" not in result
-        assert result.endswith("Line 2")
 
 
 class TestCodeBlockHandling:
@@ -689,14 +618,14 @@ class TestContractInterface:
         assert result_none == ""
     
     def test_contract_platform_support(self):
-        """Contract: Must support slack and discord platforms"""
+        """Contract: slack converts; unknown platforms pass through"""
         # Slack converter should work
         slack_conv = MarkdownConverter("slack")
         assert slack_conv.platform == "slack"
         
-        # Discord converter should work
-        discord_conv = MarkdownConverter("discord")
-        assert discord_conv.platform == "discord"
+        # Unknown platforms still construct and pass text through
+        other_conv = MarkdownConverter("unknown")
+        assert other_conv.platform == "unknown"
         
         # Unknown platform should not crash
         unknown_conv = MarkdownConverter("unknown")

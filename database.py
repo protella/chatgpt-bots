@@ -32,7 +32,7 @@ class DatabaseManager(LoggerMixin):
         Initialize database connection for the specified platform.
 
         Args:
-            platform: Platform name (slack, discord, etc.)
+            platform: Platform name (e.g. "slack")
         """
         self.platform = platform
 

@@ -1,6 +1,6 @@
 """
 Base Client Abstract Class
-Defines the interface that all chat clients (Slack, Discord, etc.) must implement
+Defines the interface that all chat clients must implement
 """
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Optional

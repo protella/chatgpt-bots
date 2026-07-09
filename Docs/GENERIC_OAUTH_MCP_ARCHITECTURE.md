@@ -198,7 +198,7 @@ class OAuthProviderManager:
 
 ```sql
 CREATE TABLE oauth_tokens (
-    user_id TEXT NOT NULL,              -- Slack/Discord user ID
+    user_id TEXT NOT NULL,              -- Slack user ID
     provider TEXT NOT NULL,             -- Provider ID from config
     access_token TEXT NOT NULL,         -- Encrypted access token
     refresh_token TEXT,                 -- Encrypted refresh token
@@ -237,7 +237,7 @@ class DatabaseManager:
    - Verifies state token
    - Exchanges code for tokens
    - Stores encrypted tokens in database
-   - Notifies user in Slack/Discord
+   - Notifies user in Slack
 
 **State Management:**
 - Temporary storage of OAuth state (Redis recommended, in-memory for MVP)

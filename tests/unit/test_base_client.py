@@ -362,12 +362,11 @@ class TestBaseClientContract:
     
     def test_contract_platform_implementations(self):
         """Contract: Platform implementations must follow BaseClient interface"""
-        # This test would verify that SlackClient and DiscordClient
+        # This test would verify that platform clients
         # properly implement the BaseClient interface
         
         # Import statements would be here if we were testing actual implementations
         # from slack_client import SlackClient
-        # from discord_client import DiscordClient
         
         # For now, just test that our mock follows the contract
         client = TestBaseClient.MockClient()
