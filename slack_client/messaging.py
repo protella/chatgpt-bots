@@ -474,7 +474,10 @@ class SlackMessagingMixin:
                             "ts": msg.get("ts"),
                             "is_bot": is_bot,
                             "sender_type": sender_type,
-                            "bot_name": bot_name
+                            "bot_name": bot_name,
+                            # Raw reactions from conversations.replies (name/users/count) —
+                            # rendered into rebuilt context as a deterministic annotation
+                            "reactions": msg.get("reactions") or None
                         }
                     ))
                 

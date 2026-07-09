@@ -201,6 +201,10 @@ Directories:
 - `data/` - SQLite databases (created at runtime)
 - `logs/` - Application logs (created at runtime)
 
+## Live Dev-Bot Testing (authorized)
+
+Claude is authorized to test against real Slack using the DEV bot credentials (`.env` `SLACK_BOT_TOKEN`, dev app): sending messages, reactions, API calls, and verifying bot behavior in the test channel **C04QDHE8W8M** (`#chatgpt-bot-test`). Keep tests confined to that channel and DMs with the dev bot. Claude may also manage the DEV bot process (kill/restart/start it) as needed for testing (authorization 2026-07-09; supersedes pitfall #8 for the dev bot — prod remains hands-off).
+
 ## Development Workflow
 
 1. **Before making changes**: Run `make test` to ensure tests pass

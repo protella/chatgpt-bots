@@ -20,6 +20,7 @@ async def create_text_response(
     reasoning_effort: Optional[str] = None,
     verbosity: Optional[str] = None,
     store: bool = False,  # Don't store by default for stateless operation
+    prompt_cache_key: Optional[str] = None,
 ) -> str:
     """
     Create a text response using the Responses API
@@ -81,9 +82,12 @@ async def create_text_response(
     else:
         request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
 
-    # Prompt caching (gpt-5.5)
+    # Prompt caching (gpt-5.5): 24h retention + a per-thread cache key so repeat
+    # calls for the same thread route to the same cache shard (prefix-cache hygiene)
     if model.startswith("gpt-5.5"):
         request_params["prompt_cache_retention"] = "24h"
+        if prompt_cache_key:
+            request_params["prompt_cache_key"] = prompt_cache_key
 
     self.log_debug(f"Creating text response with model {model}, temp {temperature}")
 
@@ -129,7 +133,8 @@ async def create_text_response_with_tools(
     store: bool = False,
     return_metadata: bool = False,
     function_call_sink: Optional[List[Dict[str, Any]]] = None,
-    tool_choice: Optional[str] = None
+    tool_choice: Optional[str] = None,
+    prompt_cache_key: Optional[str] = None
 ) -> str:
     """
     Create text response with tools (e.g., web search)
@@ -191,6 +196,13 @@ async def create_text_response_with_tools(
         request_params["top_p"] = top_p
     else:
         request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
+
+    # Prompt caching (gpt-5.5): 24h retention + a per-thread cache key so repeat
+    # calls for the same thread route to the same cache shard (prefix-cache hygiene)
+    if model.startswith("gpt-5.5"):
+        request_params["prompt_cache_retention"] = "24h"
+        if prompt_cache_key:
+            request_params["prompt_cache_key"] = prompt_cache_key
 
     self.log_debug(f"Creating text response with tools using model {model}, tools: {tools}")
 
@@ -272,6 +284,7 @@ async def create_streaming_response(
     verbosity: Optional[str] = None,
     store: bool = False,
     tool_callback: Optional[Callable[[str, str], Any]] = None,
+    prompt_cache_key: Optional[str] = None,
 ) -> str:
     """
     Create a streaming text response using the Responses API
@@ -336,9 +349,12 @@ async def create_streaming_response(
     else:
         request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
 
-    # Prompt caching (gpt-5.5)
+    # Prompt caching (gpt-5.5): 24h retention + a per-thread cache key so repeat
+    # calls for the same thread route to the same cache shard (prefix-cache hygiene)
     if model.startswith("gpt-5.5"):
         request_params["prompt_cache_retention"] = "24h"
+        if prompt_cache_key:
+            request_params["prompt_cache_key"] = prompt_cache_key
 
     self.log_debug(f"Creating streaming response with model {model}, temp {temperature}")
 
@@ -499,7 +515,8 @@ async def create_streaming_response_with_tools(
     store: bool = False,
     tool_callback: Optional[Callable[[str, str], Any]] = None,
     function_call_sink: Optional[List[Dict[str, Any]]] = None,
-    tool_choice: Optional[str] = None
+    tool_choice: Optional[str] = None,
+    prompt_cache_key: Optional[str] = None
 ) -> str:
     """
     Create streaming text response with tools (e.g., web search)
@@ -568,6 +585,13 @@ async def create_streaming_response_with_tools(
         request_params["top_p"] = top_p
     else:
         request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
+
+    # Prompt caching (gpt-5.5): 24h retention + a per-thread cache key so repeat
+    # calls for the same thread route to the same cache shard (prefix-cache hygiene)
+    if model.startswith("gpt-5.5"):
+        request_params["prompt_cache_retention"] = "24h"
+        if prompt_cache_key:
+            request_params["prompt_cache_key"] = prompt_cache_key
 
     self.log_debug(f"Creating streaming response with tools using model {model}")
 
