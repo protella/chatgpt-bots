@@ -289,6 +289,15 @@ Do NOT include any disclaimers, notes, or additional commentary.
 Simply output the prompt text that should be sent directly to the image generation model."""
 
 # Document Summarization Prompt
+CONVERSATION_SUMMARIZATION_PROMPT = """You maintain a rolling summary of the OLDER portion of a Slack conversation between users and an AI assistant. You will receive the existing summary (if any) plus a span of new messages that are being removed from the live context. Produce ONE updated summary that folds the new span into the existing summary.
+
+Requirements:
+- Preserve decisions, facts, names, numbers, links, filenames, and unresolved questions
+- Keep who-said-what attribution when it matters
+- Be concise: aim for well under 500 words even for long histories; compress older material harder than newer material
+- Plain factual prose, no headers, no commentary, no "In summary"
+- Never invent content; if the new span is trivial (greetings, acknowledgments), the summary may barely change"""
+
 DOCUMENT_SUMMARIZATION_PROMPT = """Summarize the document content below into 2-3 concise paragraphs.
 
 Requirements:

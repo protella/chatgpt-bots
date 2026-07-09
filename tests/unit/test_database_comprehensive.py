@@ -206,93 +206,6 @@ class TestDatabaseManagerComprehensive:
         row = cursor.fetchone()
         assert row is not None
 
-    def test_cache_message_with_metadata(self, temp_db):
-        """Test caching message with metadata"""
-        thread_id = "C123:1234567890.123"
-        role = "user"
-        content = "Hello world"
-        message_ts = "1234567890.123"
-        metadata = {"test": "value"}
-
-        temp_db.cache_message(
-            thread_id, role, content,
-            timestamp=datetime.now(),
-            message_ts=message_ts,
-            metadata=metadata
-        )
-
-        # Verify message was cached
-        messages = temp_db.get_cached_messages(thread_id)
-        assert len(messages) == 1
-        assert messages[0]['role'] == role
-        assert messages[0]['content'] == content
-        assert messages[0]['message_ts'] == message_ts
-        assert messages[0]['metadata'] == metadata
-
-    def test_cache_message_without_metadata(self, temp_db):
-        """Test caching message without optional parameters"""
-        thread_id = "C123:1234567890.123"
-        role = "assistant"
-        content = "Response content"
-
-        temp_db.cache_message(thread_id, role, content)
-
-        # Verify message was cached
-        messages = temp_db.get_cached_messages(thread_id)
-        assert len(messages) == 1
-        assert messages[0]['role'] == role
-        assert messages[0]['content'] == content
-        assert messages[0]['message_ts'] is None
-
-    def test_get_cached_messages_with_limit(self, temp_db):
-        """Test getting cached messages with limit"""
-        thread_id = "C123:1234567890.123"
-
-        # Cache multiple messages
-        for i in range(5):
-            temp_db.cache_message(thread_id, "user", f"Message {i}")
-
-        # Get limited messages
-        messages = temp_db.get_cached_messages(thread_id, limit=3)
-        assert len(messages) == 3
-
-        # Get all messages
-        all_messages = temp_db.get_cached_messages(thread_id)
-        assert len(all_messages) == 5
-
-    def test_clear_thread_messages(self, temp_db):
-        """Test clearing all messages for a thread"""
-        thread_id = "C123:1234567890.123"
-
-        # Cache some messages
-        temp_db.cache_message(thread_id, "user", "Message 1")
-        temp_db.cache_message(thread_id, "assistant", "Response 1")
-
-        # Clear messages
-        temp_db.clear_thread_messages(thread_id)
-
-        # Verify messages are cleared
-        messages = temp_db.get_cached_messages(thread_id)
-        assert len(messages) == 0
-
-    def test_delete_oldest_messages(self, temp_db):
-        """Test deleting oldest messages from thread"""
-        thread_id = "C123:1234567890.123"
-
-        # Cache multiple messages with different timestamps
-        for i in range(5):
-            temp_db.cache_message(
-                thread_id, "user", f"Message {i}",
-                timestamp=datetime.now() - timedelta(minutes=i)
-            )
-
-        # Delete oldest 2 messages
-        temp_db.delete_oldest_messages(thread_id, 2)
-
-        # Verify only 3 messages remain
-        messages = temp_db.get_cached_messages(thread_id)
-        assert len(messages) == 3
-
     def test_save_image_metadata_complete(self, temp_db):
         """Test saving complete image metadata"""
         thread_id = "C123:1234567890.123"
@@ -559,21 +472,6 @@ class TestDatabaseManagerComprehensive:
         latest = temp_db.get_latest_thread_image(thread_id)
         assert latest is not None
         assert latest['metadata'] == metadata
-
-    def test_message_caching_with_json_metadata(self, temp_db):
-        """Test message caching with JSON metadata handling"""
-        thread_id = "C123:1234567890.123"
-        metadata = {"type": "system", "flags": ["important"]}
-
-        temp_db.cache_message(
-            thread_id, "assistant", "Response",
-            metadata=metadata
-        )
-
-        messages = temp_db.get_cached_messages(thread_id)
-        assert len(messages) == 1
-        assert messages[0]['metadata'] == metadata
-
 
 @pytest.mark.critical
 class TestDatabaseManagerCritical:

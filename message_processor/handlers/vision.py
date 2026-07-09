@@ -12,62 +12,60 @@ from prompts import IMAGE_ANALYSIS_PROMPT
 
 class VisionHandlerMixin:
     def _inject_image_analyses(self, messages: List[Dict], thread_state) -> List[Dict]:
-        """Inject stored image analyses into conversation for context"""
+        """Inject stored image analyses into conversation for context.
+
+        Keys on the Slack ts stamped into each message's metadata (Phase S — there is no
+        DB message mirror to pair against). Injection content and position are functions
+        of the message ts and the stored image rows only, so two rebuilds of the same
+        thread serialize identically — required for OpenAI prefix-cache stability.
+        """
         if not self.db:
             return messages
-            
+
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-        
-        # Get all messages from DB with their timestamps
-        cached_messages = self.db.get_cached_messages(thread_key)
-        
+
         enhanced_messages = []
-        
-        # Match messages by position and content to get timestamps
+
         for i, msg in enumerate(messages):
             # Add the original message
             enhanced_messages.append(msg)
-            
+
             # Only inject after user messages
             if msg.get("role") == "user":
-                # Find corresponding cached message to get timestamp
-                # Match by position and content (messages are in order)
-                if i < len(cached_messages):
-                    cached_msg = cached_messages[i]
-                    msg_ts = cached_msg.get("message_ts")
-                    
-                    if msg_ts:
-                        # Get images associated with this specific message
-                        images_for_message = self.db.get_images_by_message(thread_key, msg_ts)
-                        
-                        for img_data in images_for_message:
-                            analysis = img_data.get("analysis")
-                            url = img_data.get("url")
-                            image_type = img_data.get("image_type", "image")
-                            
-                            # Inject image context - either analysis or just URL info
-                            if analysis:
-                                # Full analysis available
-                                enhanced_messages.append({
-                                    "role": "developer",
-                                    "content": f"[Visual context for {image_type}]:\n{analysis}\n[End of visual context]"
-                                })
-                                self.log_debug(f"Injected analysis for message at position {i}")
-                            elif url:
-                                # No analysis but we have the URL - inject basic info
-                                context_msg = f"[Image context: {image_type} at {url}]"
-                                if image_type == "generated":
-                                    context_msg = f"[Bot generated an image and posted it at: {url}]"
-                                elif image_type == "uploaded":
-                                    context_msg = f"[User uploaded an image at: {url}]"
-                                elif image_type == "edited":
-                                    context_msg = f"[Bot edited an image and posted it at: {url}]"
-                                    
-                                enhanced_messages.append({
-                                    "role": "developer",
-                                    "content": context_msg
-                                })
-                                self.log_debug(f"Injected URL context for {image_type} at position {i}")
+                msg_ts = (msg.get("metadata") or {}).get("ts")
+
+                if msg_ts:
+                    # Get images associated with this specific message
+                    images_for_message = self.db.get_images_by_message(thread_key, msg_ts)
+
+                    for img_data in images_for_message:
+                        analysis = img_data.get("analysis")
+                        url = img_data.get("url")
+                        image_type = img_data.get("image_type", "image")
+
+                        # Inject image context - either analysis or just URL info
+                        if analysis:
+                            # Full analysis available
+                            enhanced_messages.append({
+                                "role": "developer",
+                                "content": f"[Visual context for {image_type}]:\n{analysis}\n[End of visual context]"
+                            })
+                            self.log_debug(f"Injected analysis for message at position {i}")
+                        elif url:
+                            # No analysis but we have the URL - inject basic info
+                            context_msg = f"[Image context: {image_type} at {url}]"
+                            if image_type == "generated":
+                                context_msg = f"[Bot generated an image and posted it at: {url}]"
+                            elif image_type == "uploaded":
+                                context_msg = f"[User uploaded an image at: {url}]"
+                            elif image_type == "edited":
+                                context_msg = f"[Bot edited an image and posted it at: {url}]"
+
+                            enhanced_messages.append({
+                                "role": "developer",
+                                "content": context_msg
+                            })
+                            self.log_debug(f"Injected URL context for {image_type} at position {i}")
         
         if len(enhanced_messages) > len(messages):
             self.log_info(f"Enhanced conversation with {len(enhanced_messages) - len(messages)} image context entries")
@@ -130,7 +128,7 @@ class VisionHandlerMixin:
                 db=self.db
             )
             web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
-            system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"], web_search_enabled, thread_state.has_trimmed_messages, thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_directives=getattr(thread_state, 'channel_directives', None))
+            system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"], web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_directives=getattr(thread_state, 'channel_directives', None))
             
             # Use the user's question directly - it will be enhanced for natural conversation
             # If no text provided with image, let the model infer from full conversation context
@@ -146,7 +144,14 @@ class VisionHandlerMixin:
             
             # Pre-trim messages to fit within context window
             enhanced_messages = await self._pre_trim_messages_for_api(enhanced_messages, model=thread_state.current_model)
-            
+
+            # Prompt-cache hygiene: minute-precision time at the suffix (system prompt
+            # carries only the date)
+            enhanced_messages = enhanced_messages + [{
+                "role": "developer",
+                "content": self._build_time_suffix_context(user_timezone, user_tz_label),
+            }]
+
             # Update status to show we're preparing the analysis
             self._update_status(client, channel_id, thinking_id, "Preparing analysis...", emoji=config.analyze_emoji)
             

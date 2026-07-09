@@ -135,7 +135,14 @@ class TextHandlerMixin:
         # Pass the model for dynamic knowledge cutoff (respecting user prefs)
         web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
         model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
-        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, thread_state.has_trimmed_messages, thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_directives=getattr(thread_state, 'channel_directives', None))
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_directives=getattr(thread_state, 'channel_directives', None))
+
+        # Prompt-cache hygiene: minute-precision time rides at the SUFFIX (last message),
+        # never in the system prompt, so the cached prefix survives across turns.
+        messages_for_api = messages_for_api + [{
+            "role": "developer",
+            "content": self._build_time_suffix_context(user_timezone, user_tz_label),
+        }]
         
         # Update status before generating
         if failed_mcp_server:
@@ -191,7 +198,8 @@ class TextHandlerMixin:
                     system_prompt=system_prompt,
                     reasoning_effort=thread_config.get("reasoning_effort"),
                     verbosity=thread_config.get("verbosity"),
-                    store=False
+                    store=False,
+                    prompt_cache_key=thread_key
                 )
                 response_text = result["text"]
                 tools_actually_used = result["tools_used"]
@@ -226,7 +234,8 @@ class TextHandlerMixin:
                         reasoning_effort=thread_config.get("reasoning_effort"),
                         verbosity=thread_config.get("verbosity"),
                         store=False,  # Match the existing behavior
-                        return_metadata=True
+                        return_metadata=True,
+                        prompt_cache_key=thread_key
                     )
                     response_text = result["text"]
                     tools_actually_used = result["tools_used"]
@@ -252,7 +261,8 @@ class TextHandlerMixin:
                         max_tokens=thread_config["max_tokens"],
                         system_prompt=system_prompt,
                         reasoning_effort=thread_config.get("reasoning_effort"),
-                        verbosity=thread_config.get("verbosity")
+                        verbosity=thread_config.get("verbosity"),
+                        prompt_cache_key=thread_key
                     )
         finally:
             # Cancel progress updater when API call completes
@@ -401,7 +411,14 @@ class TextHandlerMixin:
         # Pass the model for dynamic knowledge cutoff (respecting user prefs)
         web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
         model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
-        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, thread_state.has_trimmed_messages, thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_directives=getattr(thread_state, 'channel_directives', None))
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_directives=getattr(thread_state, 'channel_directives', None))
+
+        # Prompt-cache hygiene: minute-precision time rides at the SUFFIX (last message),
+        # never in the system prompt, so the cached prefix survives across turns.
+        messages_for_api = messages_for_api + [{
+            "role": "developer",
+            "content": self._build_time_suffix_context(user_timezone, user_tz_label),
+        }]
         
         # Post an initial message to get the message ID for streaming updates
         # For streaming with potential tools, start with "Working on it"
@@ -922,7 +939,8 @@ class TextHandlerMixin:
                     system_prompt=system_prompt,
                     reasoning_effort=thread_config.get("reasoning_effort"),
                     verbosity=thread_config.get("verbosity"),
-                    store=False
+                    store=False,
+                    prompt_cache_key=thread_key
                 )
                 response_text = loop_result["text"]
                 local_tool_calls = loop_result["local_tool_calls"]
@@ -943,7 +961,8 @@ class TextHandlerMixin:
                     system_prompt=system_prompt,
                     reasoning_effort=thread_config.get("reasoning_effort"),
                     verbosity=thread_config.get("verbosity"),
-                    store=False  # Match the existing behavior
+                    store=False,  # Match the existing behavior
+                    prompt_cache_key=thread_key
                 )
             else:
                 # Generate response without tools
@@ -956,7 +975,8 @@ class TextHandlerMixin:
                     max_tokens=thread_config["max_tokens"],
                     system_prompt=system_prompt,
                     reasoning_effort=thread_config.get("reasoning_effort"),
-                    verbosity=thread_config.get("verbosity")
+                    verbosity=thread_config.get("verbosity"),
+                    prompt_cache_key=thread_key
                 )
 
             # Ensure progress updater is cancelled if still running

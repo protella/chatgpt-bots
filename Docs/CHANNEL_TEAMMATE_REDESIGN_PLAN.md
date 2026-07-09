@@ -392,7 +392,10 @@ implicit save; verify recall in a new thread. *Retires the extractor (kept behin
 **D. react tool** — executor + allowlist + dedup. Tests: allowlist refusal, default-ts, dedup.
 Live: ask for something and watch for ✅ alongside the reply; DM reactions.
 
-**S. Slack-native context (drop the message mirror)** — see §5b. Always rebuild from
+**S. Slack-native context (drop the message mirror)** — ✅ IMPLEMENTED 2026-07-09 (with
+prompt-cache hygiene addendum: date-only prefix + suffix time injection, prompt_cache_key
+per thread, chunky compaction to TOKEN_COMPACTION_TARGET, deterministic rebuild
+serialization, reactions annotations in rebuilt context). See §5b. Always rebuild from
 `conversations.replies`; add `thread_summaries` (rolling summary + boundary_ts + refs_json);
 delete cache-first reads + cache writes; keep `images`/`documents` as derived caches; drop
 `documents.summary`. Files: `thread_manager.py`, `message_processor/thread_management.py`,

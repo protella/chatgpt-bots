@@ -28,25 +28,6 @@ class TestDatabaseMoreMethods:
         # No error means success
         assert True
     
-    def test_cache_message_and_retrieve(self, db):
-        """Test caching and retrieving messages"""
-        import uuid
-        thread_id = f"C123:cache_{uuid.uuid4().hex[:8]}"
-        
-        # Create thread
-        db.get_or_create_thread(thread_id, "C123", "U789")
-        
-        # Cache messages
-        db.cache_message(thread_id, "user", "Hello", "msg1")
-        db.cache_message(thread_id, "assistant", "Hi there", "msg2")
-        
-        # Retrieve
-        messages = db.get_cached_messages(thread_id)
-        
-        assert len(messages) == 2
-        assert messages[0]["content"] == "Hello"
-        assert messages[1]["content"] == "Hi there"
-    
     def test_save_and_get_thread_config(self, db):
         """Test thread config save and retrieve"""
         import uuid

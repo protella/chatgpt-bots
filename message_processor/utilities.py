@@ -805,10 +805,11 @@ class MessageUtilitiesMixin:
             settings_command = config.settings_slash_command if hasattr(config, 'settings_slash_command') else '/chatgpt-settings'
             web_search_context = f"\n\nWeb search is currently disabled. If a user asks for current information or recent events beyond your knowledge cutoff, provide what you know but mention that web search is disabled in their user settings. They can enable it using `{settings_command}`."
 
-        # Add trimming notification if messages have been removed
+        # Phase S: summary-head note. Wording is deliberately stable/deterministic (no
+        # counts, no timestamps) — this text lives in the cached prefix.
         trimming_context = ""
         if has_trimmed_messages:
-            trimming_context = "\n\nNote: Some older messages have been removed from this conversation to manage context length."
+            trimming_context = "\n\nNote: The beginning of this conversation has been summarized in a summary message above; file/image references from that summarized span remain available."
 
         # Add custom instructions if provided
         custom_instructions_context = ""
@@ -832,10 +833,30 @@ class MessageUtilitiesMixin:
         if config.enable_tool_loop and tool_registry is not None and tool_registry.has_tools():
             local_tools_context = LOCAL_TOOLS_GUIDANCE
 
-        # Format time context - moved to end to maximize prompt caching (date/time changes on every request)
-        time_context = f"\n\nToday's date and current time: {current_time.strftime('%A, %B %d, %Y at %I:%M %p')} ({timezone_display})\nIMPORTANT: Always consider the current date and time (w/ timezone offset) and adjust your responses accordingly."
+        # Prompt-cache hygiene: the system prompt is the START of every request payload,
+        # so anything volatile here busts the OpenAI prefix cache for the whole thread.
+        # Only the DATE lives here (one bust per day). The minute-precision time is
+        # injected at the message SUFFIX instead (see _build_time_suffix_context).
+        # channel_memory / roster / directives change rarely — acceptable in the prefix.
+        time_context = f"\n\nToday's date: {current_time.strftime('%A, %B %d, %Y')} ({timezone_display})\nThe precise current time is provided at the end of the conversation."
 
         return base_prompt + user_context + model_context + web_search_context + local_tools_context + trimming_context + custom_instructions_context + channel_directives_context + channel_memory_context + (participant_roster or "") + time_context
+
+    def _build_time_suffix_context(self, user_timezone: str = "UTC",
+                                   user_tz_label: Optional[str] = None) -> str:
+        """Minute-precision time context, injected as the LAST message of the payload.
+
+        Lives at the suffix so it never busts the OpenAI prefix cache (the system prompt
+        carries only the date). Appended fresh on every request."""
+        try:
+            user_tz = pytz.timezone(user_timezone)
+            current_time = datetime.datetime.now(pytz.UTC).astimezone(user_tz)
+            timezone_display = user_tz_label or current_time.strftime('%Z') or user_tz.zone
+        except Exception:
+            current_time = datetime.datetime.now(pytz.UTC)
+            timezone_display = "UTC"
+        return (f"[Current date and time: {current_time.strftime('%A, %B %d, %Y at %I:%M %p')} "
+                f"({timezone_display}) — consider this when answering time-sensitive questions.]")
 
     def _schedule_async_call(self, coro):
         """Helper to schedule async calls from sync contexts"""
