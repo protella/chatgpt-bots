@@ -125,8 +125,11 @@ class ChatBotV2:
                             response.content
                         )
                 elif response.type == "text":
+                    # Reaction-only turns (react tool, empty text) post no message at all
+                    if not (response.content or "").strip():
+                        main_logger.debug("Empty text response (reaction-only) — nothing to post")
                     # If streaming was used, the message is already displayed
-                    if not response.metadata.get("streamed"):
+                    elif not response.metadata.get("streamed"):
                         # Format and send text
                         formatted_text = client.format_text(response.content)
                         await client.send_message(

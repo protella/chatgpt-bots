@@ -239,11 +239,24 @@ class BotConfig:
     # Posted as a separate trailing message, so it never touches the text/split/streaming path.
     enable_response_footer: bool = field(default_factory=lambda: os.getenv("ENABLE_RESPONSE_FOOTER", "true").lower() == "true")
 
+    # --- Local function-call loop (redesign Phase A) ---
+    # Master switch for model-invoked local tools (history fetch, reactions, later search/memory).
+    # The loop composes with server-side tools (web_search/MCP) in the same request.
+    enable_tool_loop: bool = field(default_factory=lambda: os.getenv("ENABLE_TOOL_LOOP", "true").lower() == "true")
+    # Runaway caps: max loop rounds per response / max total local calls per response. On cap,
+    # one final round runs with tool_choice="none" so the model answers with what it has.
+    max_tool_rounds: int = field(default_factory=lambda: int(os.getenv("MAX_TOOL_ROUNDS", "4")))
+    max_tool_calls_per_turn: int = field(default_factory=lambda: int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "8")))
+    # Per-executor timeout (seconds); a timed-out tool returns an error result to the model.
+    tool_call_timeout: float = field(default_factory=lambda: float(os.getenv("TOOL_CALL_TIMEOUT", "20")))
+    # Truncation cap on a single tool result fed back to the model (characters).
+    tool_result_max_chars: int = field(default_factory=lambda: int(os.getenv("TOOL_RESULT_MAX_CHARS", "20000")))
+    # Model-invoked emoji reactions (redesign Phase D) — allowlist still REACTION_EMOJIS.
+    enable_react_tool: bool = field(default_factory=lambda: os.getenv("ENABLE_REACT_TOOL", "true").lower() == "true")
+
     # --- On-demand Slack history-fetch tools (Phase 8) ---
-    # Read-only + privacy-scoped (public or bot-member channels only), so default ON. NOTE: the
-    # executor + tool schemas below are built and tested, but NOT yet wired to the model — the
-    # Responses API only does server-side tools (web_search/MCP) and there is no local function-call
-    # loop. Wiring these as function tools (incl. the streaming path) is the documented remaining step.
+    # Read-only + privacy-scoped (public or bot-member channels only), so default ON. Wired to
+    # the model through the local function-call loop (ENABLE_TOOL_LOOP).
     enable_history_tools: bool = field(default_factory=lambda: os.getenv("ENABLE_HISTORY_TOOLS", "true").lower() == "true")
     # Hard cap on messages returned by a single history-fetch tool call (the model's `limit` is
     # clamped to this regardless of what it asks for).

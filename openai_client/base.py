@@ -12,6 +12,7 @@ from logger import LoggerMixin
 
 from .api import images as image_api
 from .api import responses as responses_api
+from .api import tool_loop as tool_loop_api
 from .api import vision as vision_api
 from .utilities import ImageData
 
@@ -367,6 +368,48 @@ class OpenAIClient(LoggerMixin):
             verbosity=verbosity,
             store=store,
             tool_callback=tool_callback,
+        )
+
+    async def create_text_response_with_tool_loop(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        registry: Any,
+        tool_context: Any,
+        **params: Any,
+    ) -> Dict[str, Any]:
+        """Phase A: non-streaming response with local function-call execution.
+        Returns {"text", "tools_used", "local_tool_calls"}."""
+        return await tool_loop_api.create_text_response_with_tool_loop(
+            self,
+            messages=messages,
+            tools=tools,
+            registry=registry,
+            tool_context=tool_context,
+            **params,
+        )
+
+    async def create_streaming_response_with_tool_loop(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        registry: Any,
+        tool_context: Any,
+        stream_callback: Callable[[Optional[str]], Any],
+        tool_callback: Optional[Callable[[str, str], Any]] = None,
+        **params: Any,
+    ) -> Dict[str, Any]:
+        """Phase A: streaming response with local function-call execution.
+        Returns {"text", "tools_used", "local_tool_calls"}."""
+        return await tool_loop_api.create_streaming_response_with_tool_loop(
+            self,
+            messages=messages,
+            tools=tools,
+            registry=registry,
+            tool_context=tool_context,
+            stream_callback=stream_callback,
+            tool_callback=tool_callback,
+            **params,
         )
 
     async def classify_intent(

@@ -127,11 +127,13 @@ async def create_text_response_with_tools(
     reasoning_effort: Optional[str] = None,
     verbosity: Optional[str] = None,
     store: bool = False,
-    return_metadata: bool = False
+    return_metadata: bool = False,
+    function_call_sink: Optional[List[Dict[str, Any]]] = None,
+    tool_choice: Optional[str] = None
 ) -> str:
     """
     Create text response with tools (e.g., web search)
-    
+
     Args:
         messages: Conversation messages
         tools: List of tools to enable (e.g., [{"type": "web_search"}])
@@ -143,7 +145,10 @@ async def create_text_response_with_tools(
         reasoning_effort: Reasoning effort for GPT-5 reasoning models
         verbosity: Output verbosity for GPT-5 reasoning models
         store: Whether to store the response
-    
+        function_call_sink: Optional list; completed local function_call items
+            ({"call_id","name","arguments"}) are appended for the tool loop
+        tool_choice: Optional tool_choice override (e.g. "none" when the loop caps out)
+
     Returns:
         Generated text response
     """
@@ -151,17 +156,25 @@ async def create_text_response_with_tools(
     temperature = temperature if temperature is not None else config.default_temperature
     max_tokens = max_tokens or config.default_max_tokens
     top_p = top_p if top_p is not None else config.default_top_p
-    
-    # Build request parameters
+
+    # Build request parameters. Raw Responses-API items (function_call /
+    # function_call_output from the tool loop) carry a "type" and pass through as-is.
     request_params = {
         "model": model,
-        "input": [{"role": msg["role"], "content": msg["content"]} for msg in messages],
+        "input": [msg if "type" in msg else {"role": msg["role"], "content": msg["content"]}
+                  for msg in messages],
         "tools": tools,
         "temperature": temperature,
         "max_output_tokens": max_tokens,
         "store": store,
     }
-    
+    if tool_choice is not None:
+        request_params["tool_choice"] = tool_choice
+    if function_call_sink is not None:
+        # Stateless tool loop: reasoning items must round-trip between rounds, which
+        # requires their encrypted content when store=False
+        request_params["include"] = ["reasoning.encrypted_content"]
+
     # Add system prompt if provided
     if system_prompt:
         request_params["instructions"] = system_prompt
@@ -211,6 +224,21 @@ async def create_text_response_with_tools(
                 elif item_type == "web_search_call":
                     if "web_search" not in tools_actually_used:
                         tools_actually_used.append("web_search")
+                elif item_type == "function_call" and function_call_sink is not None:
+                    # Local function call — collected for the tool loop, not part of the text
+                    function_call_sink.append({
+                        "type": "function_call",
+                        "call_id": getattr(item, "call_id", None),
+                        "name": getattr(item, "name", None),
+                        "arguments": getattr(item, "arguments", None) or "{}",
+                    })
+                elif item_type == "reasoning" and function_call_sink is not None:
+                    # Reasoning items must be replayed with their function_call in the next
+                    # round (stateless store=False requires encrypted reasoning round-trip)
+                    function_call_sink.append({
+                        "type": "reasoning",
+                        "item": item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else None,
+                    })
 
                 # Extract text content
                 if hasattr(item, "content") and item.content:
@@ -469,11 +497,13 @@ async def create_streaming_response_with_tools(
     reasoning_effort: Optional[str] = None,
     verbosity: Optional[str] = None,
     store: bool = False,
-    tool_callback: Optional[Callable[[str, str], Any]] = None
+    tool_callback: Optional[Callable[[str, str], Any]] = None,
+    function_call_sink: Optional[List[Dict[str, Any]]] = None,
+    tool_choice: Optional[str] = None
 ) -> str:
     """
     Create streaming text response with tools (e.g., web search)
-    
+
     Args:
         messages: Conversation messages
         tools: List of tools to enable (e.g., [{"type": "web_search"}])
@@ -487,7 +517,13 @@ async def create_streaming_response_with_tools(
         verbosity: Output verbosity for GPT-5 reasoning models
         store: Whether to store the response
         tool_callback: Optional callback for tool events (event_type, status)
-    
+        function_call_sink: Optional list; completed local function_call items are
+            appended for the tool loop. When the round contains function calls, its
+            text deltas are suppressed (they're pre-tool preamble, not the answer)
+            and the completion flush (stream_callback(None)) is skipped so the loop
+            can run another round.
+        tool_choice: Optional tool_choice override (e.g. "none" when the loop caps out)
+
     Returns:
         Complete generated text response
     """
@@ -495,11 +531,13 @@ async def create_streaming_response_with_tools(
     temperature = temperature if temperature is not None else config.default_temperature
     max_tokens = max_tokens or config.default_max_tokens
     top_p = top_p if top_p is not None else config.default_top_p
-    
-    # Build request parameters
+
+    # Build request parameters. Raw Responses-API items (function_call /
+    # function_call_output from the tool loop) carry a "type" and pass through as-is.
     request_params = {
         "model": model,
-        "input": [{"role": msg["role"], "content": msg["content"]} for msg in messages],
+        "input": [msg if "type" in msg else {"role": msg["role"], "content": msg["content"]}
+                  for msg in messages],
         "tools": tools,
         "temperature": temperature,
         "max_output_tokens": max_tokens,
@@ -507,7 +545,13 @@ async def create_streaming_response_with_tools(
         "stream": True,  # Enable streaming
         "parallel_tool_calls": True,  # Allow parallel tool execution
     }
-    
+    if tool_choice is not None:
+        request_params["tool_choice"] = tool_choice
+    if function_call_sink is not None:
+        # Stateless tool loop: reasoning items must round-trip between rounds, which
+        # requires their encrypted content when store=False
+        request_params["include"] = ["reasoning.encrypted_content"]
+
     # Add system prompt if provided
     if system_prompt:
         request_params["instructions"] = system_prompt
@@ -542,23 +586,29 @@ async def create_streaming_response_with_tools(
         )
 
         complete_text = ""
+        # Tool-loop round state: once a local function_call appears in this round, further
+        # text deltas are preamble ("let me check…") — don't stream them to the user.
+        saw_function_call = False
 
         # Process streaming events with timeout protection
         async for event in self._safe_stream_iteration(response, operation_type):
             try:
-                
+
                 # Get event type
                 event_type = getattr(event, 'type', 'unknown')
-                
+
                 if event_type == "response.created":
                     self.log_info("Stream started")
                     continue
                 elif event_type == "response.output_item.added":
+                    if (function_call_sink is not None and hasattr(event, 'item')
+                            and getattr(event.item, 'type', None) == 'function_call'):
+                        saw_function_call = True
                     continue  # Skip without logging
                 elif event_type in ["response.output_item.delta", "response.output_text.delta"]:
                     # Extract text from delta event
                     text_chunk = None
-                    
+
                     # For response.output_text.delta, the text is directly in event.delta
                     if event_type == "response.output_text.delta" and hasattr(event, 'delta'):
                         text_chunk = event.delta
@@ -569,8 +619,11 @@ async def create_streaming_response_with_tools(
                                 if hasattr(content, 'text') and content.text:
                                     text_chunk = content.text
                                     break
-                    
-                    # If we found text, process it
+
+                    # If we found text, process it (unless this round is a tool round —
+                    # then the text is pre-tool preamble and the loop discards it)
+                    if text_chunk and saw_function_call:
+                        continue
                     if text_chunk:
                         complete_text += text_chunk
                         try:
@@ -599,9 +652,31 @@ async def create_streaming_response_with_tools(
                                         await result
                                 except Exception as e:
                                     self.log_warning(f"Tool callback error for MCP completion: {e}")
+                        elif item_type == 'function_call' and function_call_sink is not None:
+                            # Completed local function call — hand to the tool loop
+                            saw_function_call = True
+                            function_call_sink.append({
+                                "type": "function_call",
+                                "call_id": getattr(item, 'call_id', None),
+                                "name": getattr(item, 'name', None),
+                                "arguments": getattr(item, 'arguments', None) or "{}",
+                            })
+                        elif item_type == 'reasoning' and function_call_sink is not None:
+                            # Reasoning items must be replayed with their function_call in
+                            # the next round (stateless store=False encrypted round-trip)
+                            function_call_sink.append({
+                                "type": "reasoning",
+                                "item": item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else None,
+                            })
                     continue
                 elif event_type in ["response.done", "response.completed"]:
                     self.log_info("Stream completed")
+                    # When the round produced local function calls, the tool loop will run
+                    # another round — don't signal completion to the buffer yet.
+                    # (Keyed on actual function calls; reasoning-only sink entries must
+                    # not suppress the final flush.)
+                    if saw_function_call:
+                        break
                     # Signal the callback that streaming is complete with None
                     # This allows it to flush any remaining buffered text
                     try:
@@ -1124,7 +1199,9 @@ async def _create_text_response_with_tools_with_timeout(
     verbosity: Optional[str] = None,
     store: bool = False,
     timeout_seconds: float = 60.0,
-    return_metadata: bool = False
+    return_metadata: bool = False,
+    function_call_sink: Optional[List[Dict[str, Any]]] = None,
+    tool_choice: Optional[str] = None
 ) -> str:
     """
     Create text response with tools and custom timeout (for retry scenarios)
@@ -1150,15 +1227,23 @@ async def _create_text_response_with_tools_with_timeout(
     max_tokens = max_tokens or config.default_max_tokens
     top_p = top_p if top_p is not None else config.default_top_p
 
-    # Build request parameters
+    # Build request parameters. Raw Responses-API items (function_call /
+    # function_call_output from the tool loop) carry a "type" and pass through as-is.
     request_params = {
         "model": model,
-        "input": [{"role": msg["role"], "content": msg["content"]} for msg in messages],
+        "input": [msg if "type" in msg else {"role": msg["role"], "content": msg["content"]}
+                  for msg in messages],
         "tools": tools,
         "temperature": temperature,
         "max_output_tokens": max_tokens,
         "store": store,
     }
+    if tool_choice is not None:
+        request_params["tool_choice"] = tool_choice
+    if function_call_sink is not None:
+        # Stateless tool loop: reasoning items must round-trip between rounds, which
+        # requires their encrypted content when store=False
+        request_params["include"] = ["reasoning.encrypted_content"]
 
     # Add system prompt if provided
     if system_prompt:
@@ -1210,6 +1295,21 @@ async def _create_text_response_with_tools_with_timeout(
                 elif item_type == "web_search_call":
                     if "web_search" not in tools_actually_used:
                         tools_actually_used.append("web_search")
+                elif item_type == "function_call" and function_call_sink is not None:
+                    # Local function call — collected for the tool loop, not part of the text
+                    function_call_sink.append({
+                        "type": "function_call",
+                        "call_id": getattr(item, "call_id", None),
+                        "name": getattr(item, "name", None),
+                        "arguments": getattr(item, "arguments", None) or "{}",
+                    })
+                elif item_type == "reasoning" and function_call_sink is not None:
+                    # Reasoning items must be replayed with their function_call in the next
+                    # round (stateless store=False requires encrypted reasoning round-trip)
+                    function_call_sink.append({
+                        "type": "reasoning",
+                        "item": item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else None,
+                    })
 
                 # Extract text content
                 if hasattr(item, "content") and item.content:

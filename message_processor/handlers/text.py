@@ -8,9 +8,43 @@ from openai import APIError, APIStatusError
 from base_client import BaseClient, Message, Response
 from config import config
 from streaming import FenceHandler, RateLimitManager, StreamingBuffer
+from tool_registry import ToolContext
 
 
 class TextHandlerMixin:
+    def _get_tool_registry(self, client: BaseClient, thread_config: dict):
+        """The client's local-tool registry, or None when the loop can't/shouldn't run."""
+        if not config.enable_tool_loop:
+            return None
+        registry = getattr(client, "tool_registry", None)
+        if registry is None or not registry.has_tools(thread_config):
+            return None
+        return registry
+
+    def _build_tool_context(self, message: Message, client: BaseClient) -> ToolContext:
+        """Per-request context handed to local tool executors."""
+        meta = message.metadata or {}
+        channel_id = message.channel_id
+        return ToolContext(
+            channel_id=channel_id,
+            thread_ts=message.thread_id,
+            trigger_ts=meta.get("ts"),
+            action_token=meta.get("action_token"),
+            client=client,
+            db=self.db,
+            is_dm=bool(channel_id and str(channel_id).startswith("D")),
+        )
+
+    @staticmethod
+    def _is_reaction_only(response_text: str, local_tool_calls: Optional[List[dict]]) -> bool:
+        """True when the model reacted (successfully) and deliberately returned no text."""
+        if (response_text or "").strip():
+            return False
+        return any(
+            c.get("name") == "react_to_message" and c.get("ok")
+            for c in (local_tool_calls or [])
+        )
+
     async def _handle_text_response(self, user_content: Any, thread_state, client: BaseClient,
                               message: Message, thinking_id: Optional[str] = None,
                               attachment_urls: Optional[List[str]] = None,
@@ -120,8 +154,12 @@ class TextHandlerMixin:
         model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
 
         # Build tools array (includes web_search and/or MCP tools based on config)
-        # Exclude any MCP server that failed in a previous attempt
-        tools = self._build_tools_array(thread_config, model, exclude_mcp_server=failed_mcp_server)
+        # Exclude any MCP server that failed in a previous attempt.
+        # Local tools ride along via the registry — but not on the timeout-retry path,
+        # which calls the plain (loop-less) API and couldn't execute them.
+        registry = None if retry_timeout else self._get_tool_registry(client, thread_config)
+        tools = self._build_tools_array(thread_config, model,
+                                        exclude_mcp_server=failed_mcp_server, registry=registry)
 
         # Start progress updater for fallback/retry scenarios (streaming already has one)
         # This provides the cycling status messages during long-running API calls
@@ -137,8 +175,28 @@ class TextHandlerMixin:
 
         # Generate response with or without tools
         tools_actually_used = []  # Track which tools were actually invoked
+        local_tool_calls = []     # [{"name","ok"}] record of local tool executions
         try:
-            if tools:
+            if tools and registry is not None:
+                # Local tools present — run the function-call loop (composes with
+                # web_search/MCP in the same tools array)
+                result = await self.openai_client.create_text_response_with_tool_loop(
+                    messages=messages_for_api,
+                    tools=tools,
+                    registry=registry,
+                    tool_context=self._build_tool_context(message, client),
+                    model=model,
+                    temperature=thread_config["temperature"],
+                    max_tokens=thread_config["max_tokens"],
+                    system_prompt=system_prompt,
+                    reasoning_effort=thread_config.get("reasoning_effort"),
+                    verbosity=thread_config.get("verbosity"),
+                    store=False
+                )
+                response_text = result["text"]
+                tools_actually_used = result["tools_used"]
+                local_tool_calls = result["local_tool_calls"]
+            elif tools:
                 # Generate response with tools
                 if retry_timeout:
                     # Use shorter timeout for retry via direct _safe_api_call
@@ -207,6 +265,19 @@ class TextHandlerMixin:
                 self.log_debug("Cancelled progress updater - API call completed")
         
         # Build unified tools attribution at the end of response
+        # Reaction-only turn: the model reacted via the react tool and deliberately
+        # returned no text — post nothing (main.py skips empty sends; footer skips too).
+        if self._is_reaction_only(response_text, local_tool_calls):
+            self.log_info("Reaction-only response (react tool) — no message will be posted")
+            return Response(
+                type="text",
+                content="",
+                metadata={"model": thread_config.get("model"), "reaction_only": True}
+            )
+
+        # A reaction is visible on the message itself — don't list it in Used Tools
+        tools_actually_used = [t for t in tools_actually_used if t != "react_to_message"]
+
         # Use the actual tools that were invoked (from response metadata)
         if tools_actually_used or failed_mcp_server:
             # Add unified tools note at the END
@@ -226,11 +297,11 @@ class TextHandlerMixin:
         # Add assistant response to thread state
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
         self._add_message_with_token_management(thread_state, "assistant", response_text, db=self.db, thread_key=thread_key)
-        
+
         # Schedule async cleanup after response
         cleanup_coro = self._async_post_response_cleanup(thread_state, thread_key)
         self._schedule_async_call(cleanup_coro)
-        
+
         return Response(
             type="text",
             content=response_text,
@@ -365,6 +436,7 @@ class TextHandlerMixin:
 
         # Track which MCP servers were used
         mcp_servers_used = set()
+        local_tools_used = []  # non-reaction local tools (history fetch, …) for attribution
 
         # Define tool event callback
         async def tool_callback(tool_type: str, status: str):
@@ -422,6 +494,22 @@ class TextHandlerMixin:
                             self.log_warning(f"Failed to update image gen status: {result.get('error', 'Unknown error')}")
                     except Exception as e:
                         self.log_error(f"Error updating image gen status: {e}")
+                elif tool_type.startswith("local:"):
+                    # Local function-call-loop tools (history fetch, reactions, …)
+                    tool_name = tool_type[6:]
+                    local_status_labels = {
+                        "fetch_channel_history": "Reading channel history",
+                        "fetch_thread_messages": "Reading a thread",
+                    }
+                    label = local_status_labels.get(tool_name)
+                    if label:  # instant tools (e.g. reactions) don't need a status line
+                        status_msg = f"{config.circle_loader_emoji} {label}..."
+                        try:
+                            result = await client.update_message_streaming(message.channel_id, message_id, status_msg)
+                            if not result["success"]:
+                                self.log_warning(f"Failed to update local tool status: {result.get('error', 'Unknown error')}")
+                        except Exception as e:
+                            self.log_error(f"Error updating local tool status: {e}")
             elif tool_type == "mcp" or tool_type.startswith("mcp:"):
                 # MCP has its own status values (not "started")
                 # tool_type can be "mcp" or "mcp:server_label" (e.g., "mcp:context7")
@@ -811,10 +899,38 @@ class TextHandlerMixin:
             model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
 
             # Build tools array (includes web_search and/or MCP tools based on config)
-            # Exclude any MCP server that failed in a previous attempt
-            tools = self._build_tools_array(thread_config, model, exclude_mcp_server=exclude_mcp_server)
+            # Exclude any MCP server that failed in a previous attempt.
+            # Local tools ride along via the registry (function-call loop).
+            registry = self._get_tool_registry(client, thread_config)
+            tools = self._build_tools_array(thread_config, model,
+                                            exclude_mcp_server=exclude_mcp_server, registry=registry)
 
-            if tools:
+            local_tool_calls = []  # [{"name","ok"}] record of local tool executions
+            if tools and registry is not None:
+                # Local tools present — streaming function-call loop (intermediate tool
+                # rounds don't stream text; the final round streams normally)
+                loop_result = await self.openai_client.create_streaming_response_with_tool_loop(
+                    messages=messages_for_api,
+                    tools=tools,
+                    registry=registry,
+                    tool_context=self._build_tool_context(message, client),
+                    stream_callback=stream_callback,
+                    tool_callback=tool_callback,
+                    model=model,
+                    temperature=thread_config["temperature"],
+                    max_tokens=thread_config["max_tokens"],
+                    system_prompt=system_prompt,
+                    reasoning_effort=thread_config.get("reasoning_effort"),
+                    verbosity=thread_config.get("verbosity"),
+                    store=False
+                )
+                response_text = loop_result["text"]
+                local_tool_calls = loop_result["local_tool_calls"]
+                # Local tools that aren't reactions join the attribution list
+                for name in loop_result["tools_used"]:
+                    if name != "react_to_message" and name not in mcp_servers_used:
+                        local_tools_used.append(name)
+            elif tools:
                 # Generate response with tools (web_search and/or MCP)
                 response_text = await self.openai_client.create_streaming_response_with_tools(
                     messages=messages_for_api,
@@ -848,6 +964,21 @@ class TextHandlerMixin:
                 progress_task.cancel()
                 self.log_debug("Cancelled progress updater after API call completed")
 
+            # Reaction-only turn: the model reacted via the react tool and deliberately
+            # returned no text — delete the placeholder and post nothing.
+            if self._is_reaction_only(response_text, local_tool_calls):
+                self.log_info("Reaction-only streamed response (react tool) — removing placeholder")
+                try:
+                    await client.delete_message(message.channel_id, current_message_id)
+                except Exception as e:
+                    self.log_warning(f"Could not delete placeholder for reaction-only response: {e}")
+                return Response(
+                    type="text",
+                    content="",
+                    metadata={"streamed": True, "reaction_only": True,
+                              "model": thread_config.get("model")}
+                )
+
             # Build list of tools used (unified attribution)
             tools_used = []
             if search_counts["web_search"] > 0:
@@ -859,6 +990,9 @@ class TextHandlerMixin:
             elif search_counts["mcp"] > 0:
                 # Fallback to generic "MCP" if server names weren't tracked
                 tools_used.append("MCP")
+            for name in local_tools_used:
+                if name not in tools_used:
+                    tools_used.append(name)
 
             # Add unified tools note at the END if any tools were used
             # This works for both paginated and non-paginated responses
@@ -1045,23 +1179,34 @@ class TextHandlerMixin:
             )
 
     def _build_tools_array(self, thread_config: dict, model: str,
-                           exclude_mcp_server: Optional[str] = None) -> Optional[List[dict]]:
+                           exclude_mcp_server: Optional[str] = None,
+                           registry=None) -> Optional[List[dict]]:
         """
         Build tools array for OpenAI API based on user preferences and model.
 
         Includes:
         - web_search if enabled in user preferences
         - MCP tools if enabled AND model is GPT-5 AND MCP servers are configured
+        - local function tools from the registry (only pass one when the calling
+          path runs the function-call loop and can execute them)
 
         Args:
             thread_config: Thread configuration with user preferences
             model: Model being used for the request
             exclude_mcp_server: Optional MCP server label to exclude (e.g., if it failed)
+            registry: Optional ToolRegistry whose enabled schemas are appended
 
         Returns:
             List of tool definitions, or None if no tools enabled
         """
         tools = []
+
+        # Local function tools (executed by the tool loop, not by OpenAI)
+        if registry is not None:
+            local_schemas = registry.schemas(thread_config)
+            if local_schemas:
+                tools.extend(local_schemas)
+                self.log_debug(f"Added {len(local_schemas)} local tool(s) to tools array")
 
         # Add web_search if enabled
         web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)

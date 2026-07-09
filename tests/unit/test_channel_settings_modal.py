@@ -64,16 +64,18 @@ class TestChannelSettingsModal:
 
 # --------------------------------------------------------------------------- footer blocks
 class TestFooterBlocks:
-    def test_structure_and_button(self):
+    def test_single_compact_row(self):
+        """One actions block only — a single button carrying the model name (no context row)."""
         blocks = SlackMessagingMixin._build_response_footer_blocks(MagicMock(), "gpt-5.5")
-        assert blocks[0]["type"] == "context"
-        assert "gpt-5.5" in blocks[0]["elements"][0]["text"]
-        assert blocks[1]["type"] == "actions"
-        assert blocks[1]["elements"][0]["action_id"] == "open_channel_settings"
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "actions"
+        button = blocks[0]["elements"][0]
+        assert button["action_id"] == "open_channel_settings"
+        assert "gpt-5.5" in button["text"]["text"]
 
     def test_model_fallback(self):
         blocks = SlackMessagingMixin._build_response_footer_blocks(MagicMock(), None)
-        assert config.gpt_model in blocks[0]["elements"][0]["text"]
+        assert config.gpt_model in blocks[0]["elements"][0]["text"]["text"]
 
 
 # --------------------------------------------------------------------------- footer gating
@@ -95,7 +97,17 @@ class TestFooterPosting:
         s.app.client.chat_postMessage.assert_awaited_once()
         kwargs = s.app.client.chat_postMessage.await_args.kwargs
         assert kwargs["channel"] == "C1"
-        assert kwargs["blocks"][1]["elements"][0]["action_id"] == "open_channel_settings"
+        assert kwargs["blocks"][0]["elements"][0]["action_id"] == "open_channel_settings"
+
+    @pytest.mark.asyncio
+    async def test_skips_empty_content(self, monkeypatch):
+        """Reaction-only turns (empty text) post no message, so no footer either."""
+        monkeypatch.setattr(config, "enable_response_footer", True)
+        s = self._fake_self()
+        msg = Message(text="hi", user_id="U1", channel_id="C1", thread_id="T1")
+        resp = Response(type="text", content="", metadata={"reaction_only": True})
+        await SlackMessagingMixin.maybe_post_response_footer(s, msg, resp)
+        s.app.client.chat_postMessage.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_skips_dm(self, monkeypatch):

@@ -124,17 +124,28 @@ async def test_get_thread_history_sets_sender_metadata():
 
 
 @pytest.mark.asyncio
-async def test_get_thread_history_skips_response_footer():
-    """The Configure footer (a separate own-bot message) must not enter rebuilt history,
-    or every channel exchange would gain a bogus assistant turn saying just the model name."""
-    b = _Bot()
-    footer_blocks = [
+@pytest.mark.parametrize("footer_blocks", [
+    # Current compact footer: single actions row, model name inside the button
+    [
+        {"type": "actions", "elements": [
+            {"type": "button", "text": {"type": "plain_text", "text": "⚙️ gpt-5.5"},
+             "action_id": "open_channel_settings"},
+        ]},
+    ],
+    # Legacy two-row footer (context line + Configure button) — still present in old
+    # channel history, must stay skipped
+    [
         {"type": "context", "elements": [{"type": "mrkdwn", "text": ":robot_face: gpt-5.5"}]},
         {"type": "actions", "elements": [
             {"type": "button", "text": {"type": "plain_text", "text": "⚙️ Configure"},
              "action_id": "open_channel_settings"},
         ]},
-    ]
+    ],
+])
+async def test_get_thread_history_skips_response_footer(footer_blocks):
+    """The Configure footer (a separate own-bot message) must not enter rebuilt history,
+    or every channel exchange would gain a bogus assistant turn saying just the model name."""
+    b = _Bot()
     messages = [
         {"ts": "1", "user": "U07HUMAN", "text": "what model are you?"},
         {"ts": "2", "bot_id": SELF_BOT_ID, "user": SELF_USER_ID, "text": "I'm running gpt-5.5."},

@@ -20,6 +20,7 @@ from .utilities import SlackUtilitiesMixin
 from .formatting.text import SlackFormattingMixin
 from .messaging import SlackMessagingMixin
 from .history_tool import SlackHistoryToolMixin
+from tool_registry import ToolRegistry
 
 
 class SlackBot(SlackMessageEventsMixin,
@@ -56,8 +57,25 @@ class SlackBot(SlackMessageEventsMixin,
         # Initialize settings modal handler
         self.settings_modal = SettingsModal(self.db)
 
+        # Local tools the model can call through the function-call loop (Phase A).
+        # Flags are read at construction — flipping them requires a restart, like all env config.
+        self.tool_registry = self._build_tool_registry()
+
         # Register Slack event handlers
         self._register_handlers()
+
+    def _build_tool_registry(self) -> ToolRegistry:
+        """Register Slack's local tools: history fetch (privacy-gated) + emoji reactions."""
+        registry = ToolRegistry()
+        for schema in self.get_history_tools_for_openai():  # [] when ENABLE_HISTORY_TOOLS is off
+            name = schema["name"]
+            registry.register(
+                schema,
+                lambda ctx, args, _name=name: self.dispatch_history_tool_call(_name, args),
+            )
+        if config.enable_reactions and config.enable_react_tool and config.reaction_emojis:
+            registry.register(self.get_react_tool_schema(), self.execute_react_tool)
+        return registry
 
     # Async versions required by BaseClient
     async def send_message_async(self, channel_id: str, thread_id: str, text: str) -> bool:
