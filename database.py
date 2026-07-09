@@ -276,6 +276,8 @@ class DatabaseManager(LoggerMixin):
                 response_mode TEXT DEFAULT 'tag_only',
                 directives TEXT,
                 reply_in_channel BOOLEAN DEFAULT 0,
+                participation_level TEXT,
+                snoozed_until TEXT,
                 updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_by TEXT
             )
@@ -306,6 +308,18 @@ class DatabaseManager(LoggerMixin):
     def _run_migrations(self):
         """Run database migrations to update schema for existing databases."""
         try:
+            # Phase F: participation_level + snoozed_until on channel_settings
+            cursor = self.conn.execute("PRAGMA table_info(channel_settings)")
+            cs_columns = [col[1] for col in cursor.fetchall()]
+            if cs_columns and 'participation_level' not in cs_columns:
+                self.log_info("DB: Adding participation_level column to channel_settings")
+                self.conn.execute("ALTER TABLE channel_settings ADD COLUMN participation_level TEXT")
+                self.conn.commit()
+            if cs_columns and 'snoozed_until' not in cs_columns:
+                self.log_info("DB: Adding snoozed_until column to channel_settings")
+                self.conn.execute("ALTER TABLE channel_settings ADD COLUMN snoozed_until TEXT")
+                self.conn.commit()
+
             # Check if message_ts column exists in images table
             cursor = self.conn.execute("PRAGMA table_info(images)")
             columns = [col[1] for col in cursor.fetchall()]
@@ -687,7 +701,8 @@ class DatabaseManager(LoggerMixin):
     def get_channel_settings(self, channel_id: str) -> Optional[Dict]:
         """Get per-channel settings (Phase 7). Returns a dict or None if the channel has no row."""
         cursor = self.conn.execute(
-            "SELECT response_mode, directives, reply_in_channel, updated_ts, updated_by "
+            "SELECT response_mode, directives, reply_in_channel, participation_level, "
+            "snoozed_until, updated_ts, updated_by "
             "FROM channel_settings WHERE channel_id = ?",
             (channel_id,)
         )
@@ -698,35 +713,44 @@ class DatabaseManager(LoggerMixin):
             "response_mode": row["response_mode"],
             "directives": row["directives"],
             "reply_in_channel": bool(row["reply_in_channel"]),
+            "participation_level": row["participation_level"],
+            "snoozed_until": row["snoozed_until"],
             "updated_ts": row["updated_ts"],
             "updated_by": row["updated_by"],
         }
 
     def set_channel_settings(self, channel_id: str, response_mode=_UNSET,
                              directives=_UNSET, reply_in_channel=_UNSET,
+                             participation_level=_UNSET, snoozed_until=_UNSET,
                              updated_by: Optional[str] = None):
-        """Upsert per-channel settings (Phase 7).
+        """Upsert per-channel settings (Phase 7; Phase F adds participation_level/snoozed_until).
 
         Omitted fields are preserved. An explicit value sets it; an explicit None CLEARS it
-        (response_mode/directives → NULL) so the modal's "inherit from global default" stores
-        NULL rather than a literal string (NULL then resolves to the global default at read time).
+        (→ NULL) so the modal's "inherit from global default" stores NULL rather than a literal
+        string (NULL then resolves to the global default at read time). snoozed_until=None
+        clears an active snooze.
         """
         existing = self.get_channel_settings(channel_id) or {}
         new_mode = existing.get("response_mode", "tag_only") if response_mode is _UNSET else response_mode
         new_dir = existing.get("directives") if directives is _UNSET else directives
         new_ric = existing.get("reply_in_channel", False) if reply_in_channel is _UNSET else reply_in_channel
+        new_level = existing.get("participation_level") if participation_level is _UNSET else participation_level
+        new_snooze = existing.get("snoozed_until") if snoozed_until is _UNSET else snoozed_until
         self.conn.execute("""
-            INSERT INTO channel_settings (channel_id, response_mode, directives, reply_in_channel, updated_ts, updated_by)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+            INSERT INTO channel_settings (channel_id, response_mode, directives, reply_in_channel,
+                                          participation_level, snoozed_until, updated_ts, updated_by)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
             ON CONFLICT(channel_id) DO UPDATE SET
                 response_mode=excluded.response_mode,
                 directives=excluded.directives,
                 reply_in_channel=excluded.reply_in_channel,
+                participation_level=excluded.participation_level,
+                snoozed_until=excluded.snoozed_until,
                 updated_ts=CURRENT_TIMESTAMP,
                 updated_by=excluded.updated_by
-        """, (channel_id, new_mode, new_dir, 1 if new_ric else 0, updated_by))
+        """, (channel_id, new_mode, new_dir, 1 if new_ric else 0, new_level, new_snooze, updated_by))
         self.conn.commit()
-        logger.debug(f"Saved channel_settings for {channel_id}: mode={new_mode}")
+        logger.debug(f"Saved channel_settings for {channel_id}: mode={new_mode}, level={new_level}")
 
     # --- Per-channel memory (Phase 9) ---
     def get_channel_memory(self, channel_id: str) -> List[Dict]:
@@ -1905,7 +1929,8 @@ class DatabaseManager(LoggerMixin):
             db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA journal_mode=WAL")
             async with db.execute(
-                "SELECT response_mode, directives, reply_in_channel, updated_ts, updated_by "
+                "SELECT response_mode, directives, reply_in_channel, participation_level, "
+                "snoozed_until, updated_ts, updated_by "
                 "FROM channel_settings WHERE channel_id = ?",
                 (channel_id,)
             ) as cursor:
@@ -1916,36 +1941,45 @@ class DatabaseManager(LoggerMixin):
                     "response_mode": row["response_mode"],
                     "directives": row["directives"],
                     "reply_in_channel": bool(row["reply_in_channel"]),
+                    "participation_level": row["participation_level"],
+                    "snoozed_until": row["snoozed_until"],
                     "updated_ts": row["updated_ts"],
                     "updated_by": row["updated_by"],
                 }
 
     async def set_channel_settings_async(self, channel_id: str, response_mode=_UNSET,
                                          directives=_UNSET, reply_in_channel=_UNSET,
+                                         participation_level=_UNSET, snoozed_until=_UNSET,
                                          updated_by: Optional[str] = None):
-        """Async version of set_channel_settings.
+        """Async version of set_channel_settings (Phase F adds participation_level/snoozed_until).
 
         Omitted fields are preserved; an explicit None CLEARS the column to NULL (so the modal's
-        "inherit" selection resolves to the global default at read time).
+        "inherit" selection resolves to the global default at read time; snoozed_until=None
+        clears an active snooze).
         """
         existing = await self.get_channel_settings_async(channel_id) or {}
         new_mode = existing.get("response_mode", "tag_only") if response_mode is _UNSET else response_mode
         new_dir = existing.get("directives") if directives is _UNSET else directives
         new_ric = existing.get("reply_in_channel", False) if reply_in_channel is _UNSET else reply_in_channel
+        new_level = existing.get("participation_level") if participation_level is _UNSET else participation_level
+        new_snooze = existing.get("snoozed_until") if snoozed_until is _UNSET else snoozed_until
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("""
-                INSERT INTO channel_settings (channel_id, response_mode, directives, reply_in_channel, updated_ts, updated_by)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                INSERT INTO channel_settings (channel_id, response_mode, directives, reply_in_channel,
+                                              participation_level, snoozed_until, updated_ts, updated_by)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
                 ON CONFLICT(channel_id) DO UPDATE SET
                     response_mode=excluded.response_mode,
                     directives=excluded.directives,
                     reply_in_channel=excluded.reply_in_channel,
+                    participation_level=excluded.participation_level,
+                    snoozed_until=excluded.snoozed_until,
                     updated_ts=CURRENT_TIMESTAMP,
                     updated_by=excluded.updated_by
-            """, (channel_id, new_mode, new_dir, 1 if new_ric else 0, updated_by))
+            """, (channel_id, new_mode, new_dir, 1 if new_ric else 0, new_level, new_snooze, updated_by))
             await db.commit()
-            logger.debug(f"Saved channel_settings for {channel_id} (async): mode={new_mode}")
+            logger.debug(f"Saved channel_settings for {channel_id} (async): mode={new_mode}, level={new_level}")
 
     # --- Per-channel memory (Phase 9), async variants ---
     async def get_channel_memory_async(self, channel_id: str) -> List[Dict]:

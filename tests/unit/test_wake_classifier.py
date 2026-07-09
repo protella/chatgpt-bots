@@ -1,11 +1,16 @@
-"""Phase 5 — wake classifier (classify_wake) output mapping + conservative failure default."""
+"""Phase F — classify_participation contract: strict-JSON verdict parsing and the
+conservative fail-safe (any failure → {"action": "ignore"}).
+
+Rewritten from the Phase-5 classify_wake tests (that classifier is deprecated and has
+no runtime call sites; engine-level behavior lives in test_participation_engine.py).
+"""
 from __future__ import annotations
 
 from unittest.mock import MagicMock
 
 import pytest
 
-from openai_client.api.responses import classify_wake
+from openai_client.api.responses import classify_participation
 
 
 class _FakeContent:
@@ -24,16 +29,18 @@ class _FakeResp:
 
 
 class _FakeLLM:
-    """Stands in for the OpenAIClient `self` that classify_wake is bound to."""
+    """Stands in for the OpenAIClient `self` that classify_participation is bound to."""
 
     def __init__(self, text=None, exc=None):
         self._text = text
         self._exc = exc
         self.client = MagicMock()
+        self.captured_input = None
 
     async def _safe_api_call(self, *a, **k):
         if self._exc:
             raise self._exc
+        self.captured_input = k.get("input")
         return _FakeResp(self._text)
 
     def log_debug(self, *a, **k):
@@ -44,28 +51,59 @@ class _FakeLLM:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("raw,expected", [
-    ("respond", "respond"),
-    ("react", "react"),
-    ("ignore", "ignore"),
-    ("RESPOND", "respond"),
-    ("  Ignore  ", "ignore"),
-    ("I would respond to this", "respond"),
-    ("", "ignore"),
-    ("banana", "ignore"),  # unrecognized → conservative ignore
+@pytest.mark.parametrize("raw,expected_action", [
+    ('{"action": "respond", "placement": "thread", "reason": "asked us"}', "respond"),
+    ('{"action": "react", "emoji": "thumbsup"}', "react"),
+    ('{"action": "ignore"}', "ignore"),
+    ('{"action": "backoff", "reason": "told to chill"}', "backoff"),
+    # code fences / surrounding prose are tolerated
+    ('```json\n{"action": "respond"}\n```', "respond"),
+    ('Sure! Here is the verdict: {"action": "react", "emoji": "eyes"} hope that helps', "react"),
 ])
-async def test_classify_wake_mapping(raw, expected):
+async def test_classify_participation_json_parsing(raw, expected_action):
     llm = _FakeLLM(text=raw)
-    assert await classify_wake(llm, "some channel message") == expected
+    verdict = await classify_participation(llm, "some channel message")
+    assert verdict["action"] == expected_action
 
 
 @pytest.mark.asyncio
-async def test_classify_wake_defaults_to_ignore_on_error():
+@pytest.mark.parametrize("raw", ["", "banana", "respond", "{not json}", "[]"])
+async def test_classify_participation_garbage_defaults_ignore(raw):
+    llm = _FakeLLM(text=raw)
+    verdict = await classify_participation(llm, "anything")
+    assert verdict == {"action": "ignore"}
+
+
+@pytest.mark.asyncio
+async def test_classify_participation_api_error_defaults_ignore():
+    llm = _FakeLLM(exc=RuntimeError("api down"))
+    assert await classify_participation(llm, "anything") == {"action": "ignore"}
+
+
+@pytest.mark.asyncio
+async def test_signals_render_into_prompt_deterministically():
+    llm = _FakeLLM(text='{"action": "ignore"}')
+    signals = {
+        "sender_name": "Peter", "is_thread_reply": True, "strictness": "active",
+        "directives": "only deploys", "unprompted_last_hour": 3, "hourly_cap": 12,
+        "memory_facts": [{"id": 2, "content": "demos are Fridays"},
+                         {"id": 1, "content": "Peter owns deploys"}],
+        "channel_activity": "[Recent channel activity]\n- Peter (top-level): hi",
+    }
+    await classify_participation(llm, "msg", signals=dict(signals))
+    first = llm.captured_input[1]["content"]
+    await classify_participation(llm, "msg", signals=dict(signals))
+    assert llm.captured_input[1]["content"] == first  # deterministic given same inputs
+    assert "Sender: Peter" in first
+    assert "Strictness: active" in first
+    assert "only deploys" in first
+    assert "[#1] Peter owns deploys; [#2] demos are Fridays" in first  # id-sorted
+    assert "[Recent channel activity]" in first
+
+
+@pytest.mark.asyncio
+async def test_deprecated_classify_wake_still_importable():
+    # Kept one release for rollback; no runtime call sites.
+    from openai_client.api.responses import classify_wake
     llm = _FakeLLM(exc=RuntimeError("api down"))
     assert await classify_wake(llm, "anything") == "ignore"
-
-
-@pytest.mark.asyncio
-async def test_classify_wake_accepts_thread_signal():
-    llm = _FakeLLM(text="respond")
-    assert await classify_wake(llm, "hi", signals={"is_thread_reply": True}) == "respond"

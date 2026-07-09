@@ -746,6 +746,14 @@ class ThreadManagementMixin:
         # If thread has no messages, rebuild from platform
         # Also rebuild if we have messages but no images in DB (to extract image URLs)
         should_rebuild = not thread_state.messages
+        # A busy-rejected message never entered this warm state — Slack has it, we
+        # don't. Full refetch (Slack is the transcript; same path as a cold rebuild,
+        # so ts-dedup and summary-head composition behave identically).
+        refresh_key = f"{message.channel_id}:{message.thread_id}"
+        if not should_rebuild and self.thread_manager.consume_needs_refresh(refresh_key):
+            self.log_info(f"Warm thread {refresh_key} flagged needs_refresh (busy-rejected "
+                          f"message) — refetching transcript from Slack")
+            should_rebuild = True
         if not should_rebuild and self.db:
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
             db_images = await self.db.find_thread_images_async(thread_key)

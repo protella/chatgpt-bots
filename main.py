@@ -11,6 +11,8 @@ from typing import Optional
 from config import config
 from logger import log_session_start, log_session_end, main_logger
 from message_processor.base import MessageProcessor
+from message_processor.participation import (ParticipationEngine, resolve_participation_level,
+                                             snooze_expiry_iso)
 from base_client import BaseClient, Message
 
 
@@ -21,6 +23,7 @@ class ChatBotV2:
         self.platform = platform.lower()
         self.client: Optional[BaseClient] = None
         self.processor = None  # Will be initialized after client
+        self.participation_engine = None  # Phase F; set in initialize()
         self.cleanup_task = None
         self.running = False
         self.sigint_count = 0  # Track number of SIGINT received
@@ -45,6 +48,8 @@ class ChatBotV2:
             self.processor = MessageProcessor(db=self.client.db)
             # Give the client a reference to the processor for thread state updates
             self.client.processor = self.processor
+            # Phase F: judgment layer for unprompted channel participation.
+            self.participation_engine = ParticipationEngine(self.processor.openai_client)
         else:
             main_logger.error(f"Unknown platform: {self.platform}")
             sys.exit(1)
@@ -55,57 +60,141 @@ class ChatBotV2:
         
         main_logger.info("Initialization complete")
     
-    async def _classify_wake(self, message: Message, client: BaseClient) -> str:
-        """Phase 5 wake gate: ask the lightweight classifier whether to respond/react/ignore.
-        Conservative — any failure returns 'ignore' so the bot never spams a channel."""
+    async def _run_participation_gate(self, message: Message, client: BaseClient):
+        """Phase F gate for UNPROMPTED channel messages: hard rails → debounce →
+        ONE engine call → act. Returns a verdict only for action='respond';
+        every other outcome (ignore / react / backoff / superseded / any failure)
+        is handled here and returns None so the caller stays silent."""
+        engine = self.participation_engine
+        if engine is None or not getattr(config, "enable_participation_engine", True):
+            return None  # engine off → unaddressed messages stay unanswered (mentions_only behavior)
         try:
-            ts = message.metadata.get("ts")
-            is_thread_reply = bool(ts and message.thread_id and message.thread_id != ts)
-            # Phase E: give the verdict peripheral vision — same deterministic envelope
-            # the responder sees (here without excluding the triggering thread).
-            channel_activity = None
+            channel_id = message.channel_id
+            ts = message.metadata.get("ts") or message.thread_id
+            level = message.metadata.get("participation_level") or "judicious"
             pulse = getattr(client, "channel_pulse", None)
+
+            # Hard rail BEFORE any model call. Mentions never route through this gate,
+            # so the throttle can't silence an addressed message.
+            if engine.over_throttle(pulse, channel_id, level):
+                main_logger.debug(f"Participation gate: hourly cap reached in {channel_id} — silent")
+                return None
+
+            channel_activity = None
+            unprompted = 0
             if pulse is not None:
                 channel_activity = pulse.render_envelope(
-                    message.channel_id, exclude_thread_ts=None,
+                    channel_id, exclude_thread_ts=None,
                     max_lines=config.channel_pulse_envelope_max,
                 ) or None
-            return await self.processor.openai_client.classify_wake(
-                message.text,
-                signals={
-                    "is_thread_reply": is_thread_reply,
-                    "directives": message.metadata.get("channel_directives"),
-                    "channel_activity": channel_activity,
-                },
+                unprompted = pulse.unprompted_count_last_hour(channel_id)
+
+            memory_facts = []
+            try:
+                if getattr(config, "enable_channel_memory", True) and self.processor.db:
+                    memory_facts = await self.processor.db.get_channel_memory_async(channel_id)
+            except Exception:
+                memory_facts = []
+
+            is_thread_reply = bool(ts and message.thread_id and message.thread_id != ts)
+            verdict = await engine.evaluate(
+                channel_id=channel_id, ts=ts, text=message.text,
+                sender_name=message.metadata.get("user_real_name") or message.metadata.get("username"),
+                is_thread_reply=is_thread_reply, level=level,
+                directives=message.metadata.get("channel_directives"),
+                memory_facts=memory_facts, channel_activity=channel_activity,
+                unprompted_last_hour=unprompted,
             )
+            if verdict is None:  # superseded by a newer message during debounce
+                main_logger.debug("Participation gate: superseded during debounce — silent")
+                return None
+            main_logger.debug(f"Participation verdict: {verdict.action} ({verdict.reason})")
+
+            if verdict.action == "react":
+                react_ts = message.metadata.get("ts") or message.thread_id
+                if hasattr(client, "react"):
+                    try:
+                        await client.react(channel_id, react_ts, verdict.emoji)
+                    except Exception as e:
+                        main_logger.debug(f"Participation react failed: {e}")
+                return None
+            if verdict.action == "backoff":
+                await self._apply_backoff(message, client)
+                return None
+            if verdict.action == "respond":
+                return verdict
+            return None  # ignore
         except Exception as e:
-            main_logger.warning(f"Wake classification error: {e}; ignoring")
-            return "ignore"
+            # Fail-safe stays silence: worst failure mode is a missed reply, never spam.
+            main_logger.warning(f"Participation gate error: {e}; staying silent")
+            return None
+
+    async def _apply_backoff(self, message: Message, client: BaseClient):
+        """'Butt out' loop: ack with an emoji (no more words), snooze unprompted
+        participation for PARTICIPATION_SNOOZE_HOURS, and leave a durable memory
+        fact so the preference outlives the snooze. Mentions keep working."""
+        channel_id = message.channel_id
+        react_ts = message.metadata.get("ts") or message.thread_id
+        if hasattr(client, "react"):
+            try:
+                await client.react(channel_id, react_ts, config.snooze_ack_emoji)
+            except Exception as e:
+                main_logger.debug(f"Backoff ack react failed: {e}")
+        try:
+            expiry = snooze_expiry_iso()
+            await self.processor.db.set_channel_settings_async(
+                channel_id, snoozed_until=expiry, updated_by="participation_engine")
+            main_logger.info(f"Participation backoff: {channel_id} snoozed until {expiry}")
+        except Exception as e:
+            main_logger.warning(f"Backoff snooze write failed: {e}")
+        try:
+            if getattr(config, "enable_channel_memory", True) and self.processor.db:
+                import datetime
+                day = datetime.datetime.fromtimestamp(
+                    float(react_ts), tz=datetime.timezone.utc).date().isoformat()
+                await self.processor.db.add_channel_memory_async(
+                    channel_id,
+                    f"On {day} the channel asked for less unprompted participation from the assistant.",
+                    author="participation_engine",
+                )
+        except Exception as e:
+            main_logger.debug(f"Backoff memory write failed: {e}")
 
     async def handle_message(self, message: Message, client: BaseClient):
         """Handle incoming message from any platform"""
-        # Phase 5 wake gate: for channel messages routed in auto_respond mode, a lightweight
-        # classifier decides respond/react/ignore BEFORE anything is posted (so 'ignore' is silent).
-        if message.metadata.get("wake_classify") is True:
-            decision = await self._classify_wake(message, client)
-            if decision == "ignore":
-                main_logger.debug("Wake gate: ignore — staying silent")
+        # Phase F participation gate: for UNPROMPTED channel messages (judicious/active
+        # levels) the engine decides respond/react/ignore/backoff BEFORE anything is
+        # posted. Only action='respond' falls through.
+        placement_verdict = None
+        if message.metadata.get("participation_check") is True:
+            verdict = await self._run_participation_gate(message, client)
+            if verdict is None:
                 return
-            if decision == "react":
-                react_ts = message.metadata.get("ts") or message.thread_id
-                emoji = (config.reaction_emojis or ["eyes"])[0]
-                if hasattr(client, "react"):
-                    try:
-                        await client.react(message.channel_id, react_ts, emoji)
-                    except Exception as e:
-                        main_logger.debug(f"Wake-gate react failed: {e}")
-                return
-            # decision == "respond" → fall through to normal handling
+            placement_verdict = verdict.placement
 
-        # Send initial thinking indicator
+        # Phase F placement (plan §4a): a genuine top-level reply happens only when the
+        # channel's reply_in_channel setting is ON (the setting wins over the engine's
+        # placement verdict, which is logged but not authoritative) AND the trigger was
+        # itself top-level. Everything else threads. Images always thread (enforced in
+        # the image branch, which keys off message.thread_id regardless).
+        is_top_level_trigger = message.metadata.get("ts") == message.thread_id
+        place_in_channel = (
+            bool(message.metadata.get("reply_in_channel")) and is_top_level_trigger
+            and bool(message.channel_id) and not message.channel_id.startswith("D")
+        )
+        if placement_verdict:
+            main_logger.debug(
+                f"Placement: verdict={placement_verdict}, reply_in_channel_setting="
+                f"{bool(message.metadata.get('reply_in_channel'))} → "
+                f"{'channel' if place_in_channel else 'thread'}"
+            )
+        post_thread_id = None if place_in_channel else message.thread_id
+
+        # Send initial thinking indicator (streamed replies grow inside this message,
+        # so placement is decided here).
         thinking_id = await client.send_thinking_indicator(
             message.channel_id,
-            message.thread_id
+            post_thread_id
         )
 
         try:
@@ -126,7 +215,7 @@ class ChatBotV2:
                     try:
                         client.channel_pulse.record_bot_reply(
                             message.channel_id, message.metadata.get("ts"),
-                            unprompted=message.metadata.get("wake_classify") is True,
+                            unprompted=message.metadata.get("participation_check") is True,
                         )
                     except Exception as e:
                         main_logger.debug(f"participation stat record failed: {e}")
@@ -149,17 +238,19 @@ class ChatBotV2:
                         main_logger.debug("Empty text response (reaction-only) — nothing to post")
                     # If streaming was used, the message is already displayed
                     elif not response.metadata.get("streamed"):
-                        # Format and send text
+                        # Format and send text (top-level when placement chose channel)
                         formatted_text = client.format_text(response.content)
                         await client.send_message(
                             message.channel_id,
-                            message.thread_id,
+                            post_thread_id,
                             formatted_text
                         )
                     # Phase 7: append a Configure footer under the response (channels only, any
                     # member can open settings). Separate trailing message → safe for streamed too.
                     # Best-effort: a cosmetic footer must never break message handling.
-                    if hasattr(client, "maybe_post_response_footer"):
+                    # Skipped for top-level placement — it would land as ANOTHER top-level
+                    # message and read as spam.
+                    if hasattr(client, "maybe_post_response_footer") and not place_in_channel:
                         try:
                             await client.maybe_post_response_footer(message, response)
                         except Exception as e:
