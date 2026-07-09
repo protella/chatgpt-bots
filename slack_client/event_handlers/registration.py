@@ -36,5 +36,11 @@ class SlackRegistrationMixin:
         async def handle_assistant_thread_context_changed(event):
             await self._handle_assistant_thread_context_changed(event)
 
+        @self.app.event("reaction_added")
+        async def handle_reaction_added(event):
+            # Subscribed for the future decision engine (Phase H ingestion);
+            # acked here so Bolt doesn't log every reaction as unhandled.
+            pass
+
         # Register settings-related handlers
         self._register_settings_handlers()

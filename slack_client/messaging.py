@@ -596,6 +596,64 @@ class SlackMessagingMixin:
             self.log_error(f"Unexpected error adding reaction :{name}: {e}")
             return False
 
+    # --- react_to_message local tool (redesign Phase D) ---
+
+    def get_react_tool_schema(self) -> dict:
+        """Function-tool schema for model-invoked reactions. The emoji enum is the
+        REACTION_EMOJIS allowlist, so the model can only pick vetted (on-brand) emoji."""
+        allowed = [e.strip().strip(":") for e in (config.reaction_emojis or []) if e and e.strip().strip(":")]
+        return {
+            "type": "function",
+            "name": "react_to_message",
+            "description": (
+                "Add an emoji reaction to a Slack message, like a human colleague would — "
+                "sparingly and tastefully (an acknowledgment, a ✅ on a completed request, a "
+                "celebration). If a reaction alone fully answers the message, react and reply "
+                "with empty text. Defaults to the message you are answering."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "emoji": {"type": "string", "enum": allowed,
+                              "description": "Reaction emoji name (no colons)."},
+                    "ts": {"type": "string",
+                           "description": "Optional ts of another recent message in this channel to react to."},
+                },
+                "required": ["emoji"],
+            },
+        }
+
+    async def execute_react_tool(self, ctx, args: dict) -> dict:
+        """Executor for react_to_message. Allowlist + one-bot-reaction-per-message dedup;
+        never raises (returns {"ok": False, ...} on any refusal/failure)."""
+        if not (config.enable_reactions and config.enable_react_tool):
+            return {"ok": False, "error": "disabled", "message": "Reactions are disabled."}
+        emoji = (args.get("emoji") or "").strip().strip(":")
+        allowed = {e.strip().strip(":") for e in (config.reaction_emojis or [])}
+        if not emoji or emoji not in allowed:
+            return {"ok": False, "error": "emoji_not_allowed", "allowed": sorted(allowed)}
+        channel_id = getattr(ctx, "channel_id", None)
+        ts = (args.get("ts") or "").strip() or getattr(ctx, "trigger_ts", None) or getattr(ctx, "thread_ts", None)
+        if not channel_id or not ts:
+            return {"ok": False, "error": "no_target", "message": "No message to react to."}
+
+        # At most one bot reaction per message (bounded in-memory guard)
+        reacted = getattr(self, "_tool_reacted_ts", None)
+        if reacted is None:
+            reacted = self._tool_reacted_ts = set()
+        key = f"{channel_id}:{ts}"
+        if key in reacted:
+            return {"ok": False, "error": "already_reacted",
+                    "message": "Already reacted to that message — one reaction per message."}
+
+        ok = await self.react(channel_id, ts, emoji)
+        if ok:
+            reacted.add(key)
+            if len(reacted) > 5000:
+                reacted.clear()  # crude bound; dedup is best-effort, Slack dedups same-emoji anyway
+            return {"ok": True, "emoji": emoji, "ts": ts}
+        return {"ok": False, "error": "reaction_failed", "message": f"Could not add :{emoji}:."}
+
     async def update_message_streaming(self, channel_id: str, message_id: str, text: str) -> Dict:
         """Updates a message with rate limit awareness"""
         try:
@@ -706,16 +764,13 @@ class SlackMessagingMixin:
             }
 
     def _build_response_footer_blocks(self, model: str) -> list:
-        """Footer blocks: a context line (model) + a '⚙️ Configure' button that opens the
-        per-channel settings modal (handled by the ``open_channel_settings`` action)."""
+        """Footer: a single compact row — one small button carrying the model name that opens
+        the per-channel settings modal (handled by the ``open_channel_settings`` action)."""
         model_label = model or config.gpt_model
         return [
-            {"type": "context", "elements": [
-                {"type": "mrkdwn", "text": f":robot_face: {model_label}"}
-            ]},
             {"type": "actions", "elements": [
                 {"type": "button",
-                 "text": {"type": "plain_text", "text": "⚙️ Configure"},
+                 "text": {"type": "plain_text", "text": f"⚙️ {model_label}"},
                  "action_id": "open_channel_settings"}
             ]},
         ]
@@ -731,6 +786,9 @@ class SlackMessagingMixin:
             if not getattr(config, "enable_response_footer", True):
                 return
             if not response or getattr(response, "type", None) != "text":
+                return
+            # Reaction-only turns post no message — nothing to hang a footer under
+            if not (getattr(response, "content", None) or "").strip():
                 return
             channel_id = getattr(message, "channel_id", None)
             if not channel_id or channel_id.startswith("D"):

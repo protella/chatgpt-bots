@@ -128,6 +128,17 @@ You are given the current memory (numbered) and the latest exchange. Respond wit
 Keep "content" to a single concise sentence. Output ONLY the JSON object."""
 
 
+LOCAL_TOOLS_GUIDANCE = """
+
+--- TOOLS ETIQUETTE ---
+You have function tools for acting inside Slack (fetching channel/thread history, adding emoji reactions, ...). Guidance:
+- Emoji reactions: react like a thoughtful human colleague — sparingly, tastefully, and only when it adds something (acknowledging thanks, a checkmark on a completed request, celebrating good news). Most messages deserve NO reaction. Never react to the same message twice.
+- If a reaction alone is the right response (e.g. someone says "thanks!"), call react_to_message and return COMPLETELY EMPTY text — no filler like "You're welcome!" alongside it.
+- History fetches: use them when the conversation references something you can't see (an earlier thread, another discussion in the channel); don't fetch speculatively.
+- Tool failures are normal (permissions, timeouts) — answer with what you have instead of retrying endlessly.
+--- END TOOLS ETIQUETTE ---"""
+
+
 IMAGE_INTENT_SYSTEM_PROMPT = """You are an intent classifier for a chatbot that handles both images and documents. You will see a conversation history followed by the user's latest message.
 Your task is to classify ONLY the user's LATEST message into one of five categories based on their intent.
 
