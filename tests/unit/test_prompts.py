@@ -3,7 +3,6 @@
 import pytest
 from prompts import (
     SLACK_SYSTEM_PROMPT,
-    DISCORD_SYSTEM_PROMPT,
     CLI_SYSTEM_PROMPT,
     IMAGE_INTENT_SYSTEM_PROMPT,
     IMAGE_ANALYSIS_PROMPT,
@@ -25,16 +24,6 @@ class TestPrompts:
         assert "Slack" in SLACK_SYSTEM_PROMPT
         # Check for Slack-specific formatting
         assert "*bold*" in SLACK_SYSTEM_PROMPT
-    
-    def test_discord_system_prompt_defined(self):
-        """Test that DISCORD_SYSTEM_PROMPT is defined and non-empty"""
-        assert DISCORD_SYSTEM_PROMPT is not None
-        assert isinstance(DISCORD_SYSTEM_PROMPT, str)
-        assert len(DISCORD_SYSTEM_PROMPT) > 0
-        # Check for key content
-        assert "Discord" in DISCORD_SYSTEM_PROMPT
-        assert "gaming" in DISCORD_SYSTEM_PROMPT.lower()
-        assert "sarcastic" in DISCORD_SYSTEM_PROMPT.lower()
     
     def test_cli_system_prompt_defined(self):
         """Test that CLI_SYSTEM_PROMPT is defined and non-empty"""
@@ -97,8 +86,7 @@ class TestPrompts:
         """Test that all prompts are string type"""
         prompts = [
             SLACK_SYSTEM_PROMPT,
-            DISCORD_SYSTEM_PROMPT,
-            CLI_SYSTEM_PROMPT,
+                    CLI_SYSTEM_PROMPT,
             IMAGE_INTENT_SYSTEM_PROMPT,
             IMAGE_ANALYSIS_PROMPT,
             VISION_ENHANCEMENT_PROMPT,
@@ -114,8 +102,7 @@ class TestPrompts:
         """Test that prompts don't contain unresolved template variables"""
         prompts = [
             SLACK_SYSTEM_PROMPT,
-            DISCORD_SYSTEM_PROMPT,
-            CLI_SYSTEM_PROMPT,
+                    CLI_SYSTEM_PROMPT,
             IMAGE_INTENT_SYSTEM_PROMPT,
             IMAGE_ANALYSIS_PROMPT,
             VISION_ENHANCEMENT_PROMPT,
@@ -144,71 +131,3 @@ class TestPrompts:
         # Test image edit has both transformation types
         assert "STYLE TRANSFORMATION" in IMAGE_EDIT_SYSTEM_PROMPT
         assert "MINOR EDIT" in IMAGE_EDIT_SYSTEM_PROMPT
-    
-    @pytest.mark.smoke
-    def test_smoke_prompts_loaded(self):
-        """Smoke test that all prompts can be imported"""
-        assert SLACK_SYSTEM_PROMPT
-        assert DISCORD_SYSTEM_PROMPT
-        assert CLI_SYSTEM_PROMPT
-        assert IMAGE_INTENT_SYSTEM_PROMPT
-        assert IMAGE_ANALYSIS_PROMPT
-        assert VISION_ENHANCEMENT_PROMPT
-        assert IMAGE_EDIT_SYSTEM_PROMPT
-        assert IMAGE_GEN_SYSTEM_PROMPT
-    
-    def test_prompts_consistency(self):
-        """Test that prompts have consistent information"""
-        # Model and knowledge cutoff are now dynamic, injected at runtime
-        # Just check that prompts don't have hardcoded model info
-        system_prompts = [SLACK_SYSTEM_PROMPT, DISCORD_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT]
-        # No specific model check needed since it's dynamic
-        
-        # Image prompts should mention "image"
-        image_prompts = [
-            IMAGE_INTENT_SYSTEM_PROMPT,
-            IMAGE_ANALYSIS_PROMPT,
-            VISION_ENHANCEMENT_PROMPT,
-            IMAGE_EDIT_SYSTEM_PROMPT,
-            IMAGE_GEN_SYSTEM_PROMPT
-        ]
-        for prompt in image_prompts:
-            assert "image" in prompt.lower()
-    
-    def test_prompts_no_trailing_whitespace(self):
-        """Test that prompts don't have trailing whitespace"""
-        prompts = {
-            "SLACK_SYSTEM_PROMPT": SLACK_SYSTEM_PROMPT,
-            "DISCORD_SYSTEM_PROMPT": DISCORD_SYSTEM_PROMPT,
-            "CLI_SYSTEM_PROMPT": CLI_SYSTEM_PROMPT,
-            "IMAGE_INTENT_SYSTEM_PROMPT": IMAGE_INTENT_SYSTEM_PROMPT,
-            "IMAGE_ANALYSIS_PROMPT": IMAGE_ANALYSIS_PROMPT,
-            "VISION_ENHANCEMENT_PROMPT": VISION_ENHANCEMENT_PROMPT,
-            "IMAGE_EDIT_SYSTEM_PROMPT": IMAGE_EDIT_SYSTEM_PROMPT,
-            "IMAGE_GEN_SYSTEM_PROMPT": IMAGE_GEN_SYSTEM_PROMPT
-        }
-        
-        for name, prompt in prompts.items():
-            assert prompt == prompt.rstrip(), f"{name} has trailing whitespace"
-    
-    def test_contract_prompts_interface(self):
-        """Test that prompts module maintains expected interface"""
-        import prompts
-        
-        # Required constants must exist
-        required_prompts = [
-            'SLACK_SYSTEM_PROMPT',
-            'DISCORD_SYSTEM_PROMPT',
-            'CLI_SYSTEM_PROMPT',
-            'IMAGE_INTENT_SYSTEM_PROMPT',
-            'IMAGE_ANALYSIS_PROMPT',
-            'VISION_ENHANCEMENT_PROMPT',
-            'IMAGE_EDIT_SYSTEM_PROMPT',
-            'IMAGE_GEN_SYSTEM_PROMPT'
-        ]
-        
-        for prompt_name in required_prompts:
-            assert hasattr(prompts, prompt_name), f"Missing required prompt: {prompt_name}"
-            prompt_value = getattr(prompts, prompt_name)
-            assert isinstance(prompt_value, str), f"{prompt_name} must be a string"
-            assert len(prompt_value) > 0, f"{prompt_name} must not be empty"

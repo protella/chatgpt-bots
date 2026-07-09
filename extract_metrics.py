@@ -2,6 +2,11 @@
 """
 Production metrics extraction script for Slack bot usage.
 Generates CSV reports with user-friendly names and comprehensive analytics.
+
+BROKEN as of v3 (2026-07): this script queries the `messages` table, which was
+removed when the DB message mirror was retired (Slack is now the only
+transcript — see Docs/CHANNEL_TEAMMATE_REDESIGN_PLAN.md §5b). Kept per user
+decision pending a rewrite that captures metrics a different way.
 """
 
 import sqlite3

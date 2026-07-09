@@ -58,7 +58,7 @@ make test
         /\
        /  \        E2E Tests (Optional)
       /    \       - Full bot running
-     /------\      - Real Slack/Discord
+     /------\      - Real Slack
     /        \     
    /----------\    Integration Tests (20-30%)
   /            \   - Component interactions

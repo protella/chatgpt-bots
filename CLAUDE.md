@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Python-based chatbot system supporting Slack and Discord platforms using OpenAI's Responses API (not Chat Completions). The architecture is stateless, with platforms as the source of truth, rebuilding context from platform history on demand.
+Python-based ChatGPT Slack bot using OpenAI's Responses API (not Chat Completions). The architecture is stateless, with Slack as the source of truth, rebuilding context from platform history on demand.
 
 ## Key Commands
 
@@ -39,7 +39,6 @@ Dependabot reads `requirements.in` as the manifest and opens PRs against `requir
 ### Running the Bot
 ```bash
 python3 slackbot.py          # Slack bot
-python3 discordbot.py         # Discord bot (V2 under development)
 python3 main.py --platform slack  # Alternative method
 ```
 
@@ -82,23 +81,25 @@ make clean   # Remove test artifacts and cache
 - Model-specific parameter handling:
   - `gpt-5.5` (only user-facing model): hybrid — supports `temperature`/`top_p` when `reasoning_effort=none`, otherwise forces `temperature=1.0`; uses `reasoning_effort`/`verbosity`; `prompt_cache_retention: 24h`
   - `gpt-5-mini` (utility model only): reasoning shape — fixed `temperature=1.0`, no `top_p`, uses `reasoning_effort` and `verbosity`
-- See `Docs/RESPONSES_API_IMPLEMENTATION_DETAILS.md` for migration details if switching to `previous_response_id` chaining
 
 ### Threading & State Management
 - `ThreadStateManager` maintains conversation state per thread in memory
 - Thread key format: `channel_id:thread_ts` (critical: watch for colon delimiter issues in DB)
 - Thread locks prevent concurrent processing of same thread
-- State is rebuilt from Slack/Discord history after restarts
+- State is rebuilt from Slack history after restarts
 - `AssetLedger` tracks generated images per thread (base64 data, prompts, URLs)
 - All state lost on restart - must rebuild from platform APIs
 
 ### SQLite Persistence Layer
-- Separate databases: `data/slack.db`, `data/discord.db`
-- WAL mode enabled for concurrency
-- Schema includes: threads, messages, images, users tables
+- Database: `data/slack.db`; WAL mode enabled for concurrency
+- Slack is the only transcript: conversation history is NEVER stored in the DB
+  (the old `messages` mirror was removed in v3 — see
+  `Docs/CHANNEL_TEAMMATE_REDESIGN_PLAN.md` §5b)
+- The DB holds only what Slack doesn't: config (users/threads/channel_settings),
+  channel memory, derived artifacts (image analyses/prompts, document
+  extractions), and thread compaction summaries (`thread_summaries`)
 - Automatic backups to `data/backups/` with 7-day retention
 - Image metadata stored in DB, NOT base64 data (memory optimization)
-- Full implementation plan in `Docs/sqlite-integration-plan.md`
 
 ### Message Processing Pipeline
 1. `BaseClient.handle_event()` receives platform event
@@ -194,8 +195,7 @@ Core modules:
 - `image_url_handler.py` - Image URL processing and validation
 
 Directories:
-- `streaming/` - Experimental streaming support (not active)
-- `legacy/` - Previous bot version (reference only)
+- `streaming/` - Streaming buffer/config used by the text, vision, and image handlers
 - `Docs/` - Technical documentation and plans
 - `tests/` - Test suite with unit and integration tests
 - `data/` - SQLite databases (created at runtime)

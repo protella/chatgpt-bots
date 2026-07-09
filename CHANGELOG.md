@@ -25,6 +25,20 @@ All notable changes to this project will be documented in this file.
 - All new behavior is env-flagged with sane defaults, documented in `.env.example`
 - Dependencies upgraded via `make lock-upgrade` (openai 2.44, slack-sdk 3.42, etc.)
 
+### 🧹 Removed - Discord scaffolding, legacy code & tiktoken
+
+- **Discord support removed**: the V2 Discord bot was never built (the launcher was a "Coming Soon" stub). All Discord scaffolding is gone — stub launcher, config vars, prompts, markdown branch, and the `discord` dependency. The bot is Slack-only.
+- **`legacy/` (V1 bots) deleted** — still available in early git history
+- **tiktoken dependency removed**: token budgeting now uses exact counts from API responses instead of local tokenization
+
+#### Upgrade Instructions
+You can delete these now-unused lines from your `.env`:
+```
+DISCORD_TOKEN=...
+DISCORD_ALLOWED_CHANNEL_IDS=...
+DISCORD_LOG_LEVEL=...
+```
+
 ### 🔧 Cleanup - Model lineup reduced to GPT-5.5
 
 #### Removed
