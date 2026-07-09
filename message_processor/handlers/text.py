@@ -49,10 +49,11 @@ class TextHandlerMixin:
                               message: Message, thinking_id: Optional[str] = None,
                               attachment_urls: Optional[List[str]] = None,
                               retry_count: int = 0,
-                              failed_mcp_server: Optional[str] = None) -> Response:
+                              failed_mcp_server: Optional[str] = None,
+                              _context_retry: bool = False) -> Response:
         """Handle text-only response generation"""
         # Get thread config (with user preferences)
-        thread_config = config.get_thread_config(
+        thread_config = await config.get_thread_config_async(
             overrides=thread_state.config_overrides,
             user_id=message.user_id,
             db=self.db
@@ -108,7 +109,7 @@ class TextHandlerMixin:
             messages_for_api = thread_state.messages
         
         # Inject stored image analyses into the conversation for full context
-        messages_for_api = self._inject_image_analyses(messages_for_api, thread_state)
+        messages_for_api = await self._inject_image_analyses(messages_for_api, thread_state)
 
         # Strip tools attribution from assistant messages before sending to API
         # (keeps user-visible context clean while preventing metadata pollution)
@@ -120,7 +121,7 @@ class TextHandlerMixin:
         messages_for_api = await self._pre_trim_messages_for_api(messages_for_api, model=thread_state.current_model)
         
         # Get thread config (with user preferences)
-        thread_config = config.get_thread_config(
+        thread_config = await config.get_thread_config_async(
             overrides=thread_state.config_overrides,
             user_id=message.user_id,
             db=self.db
@@ -183,6 +184,7 @@ class TextHandlerMixin:
         # Generate response with or without tools
         tools_actually_used = []  # Track which tools were actually invoked
         local_tool_calls = []     # [{"name","ok"}] record of local tool executions
+        usage_info = {}           # response.usage lands here (usage-driven budgeting)
         try:
             if tools and registry is not None:
                 # Local tools present — run the function-call loop (composes with
@@ -199,7 +201,8 @@ class TextHandlerMixin:
                     reasoning_effort=thread_config.get("reasoning_effort"),
                     verbosity=thread_config.get("verbosity"),
                     store=False,
-                    prompt_cache_key=thread_key
+                    prompt_cache_key=thread_key,
+                    usage_sink=usage_info
                 )
                 response_text = result["text"]
                 tools_actually_used = result["tools_used"]
@@ -235,7 +238,8 @@ class TextHandlerMixin:
                         verbosity=thread_config.get("verbosity"),
                         store=False,  # Match the existing behavior
                         return_metadata=True,
-                        prompt_cache_key=thread_key
+                        prompt_cache_key=thread_key,
+                        usage_sink=usage_info
                     )
                     response_text = result["text"]
                     tools_actually_used = result["tools_used"]
@@ -262,8 +266,24 @@ class TextHandlerMixin:
                         system_prompt=system_prompt,
                         reasoning_effort=thread_config.get("reasoning_effort"),
                         verbosity=thread_config.get("verbosity"),
-                        prompt_cache_key=thread_key
+                        prompt_cache_key=thread_key,
+                        usage_sink=usage_info
                     )
+        except Exception as api_error:
+            # Usage-estimator backstop: the API is the final authority on context
+            # size. On a context-window rejection, compact once and retry.
+            if self._is_context_length_error(api_error) and not _context_retry:
+                self.log_warning("Context window exceeded — compacting thread and retrying once")
+                await self._compact_thread_to_target(thread_state, thread_key)
+                # The user message added this attempt gets re-added by the retry
+                if thread_state.messages and thread_state.messages[-1].get("role") == "user":
+                    thread_state.messages.pop()
+                return await self._handle_text_response(
+                    user_content, thread_state, client, message, thinking_id,
+                    attachment_urls, retry_count=retry_count,
+                    failed_mcp_server=failed_mcp_server, _context_retry=True
+                )
+            raise
         finally:
             # Cancel progress updater when API call completes
             if progress_task and not progress_task.done():
@@ -274,6 +294,10 @@ class TextHandlerMixin:
                     pass
                 self.log_debug("Cancelled progress updater - API call completed")
         
+        # Record the API's authoritative context size on the thread
+        thread_state.record_usage(usage_info.get("input_tokens", 0),
+                                  usage_info.get("output_tokens", 0))
+
         # Build unified tools attribution at the end of response
         # Reaction-only turn: the model reacted via the react tool and deliberately
         # returned no text — post nothing (main.py skips empty sends; footer skips too).
@@ -384,7 +408,7 @@ class TextHandlerMixin:
             messages_for_api = thread_state.messages
         
         # Inject stored image analyses into the conversation for full context
-        messages_for_api = self._inject_image_analyses(messages_for_api, thread_state)
+        messages_for_api = await self._inject_image_analyses(messages_for_api, thread_state)
 
         # Strip tools attribution from assistant messages before sending to API
         # (keeps user-visible context clean while preventing metadata pollution)
@@ -396,7 +420,7 @@ class TextHandlerMixin:
         messages_for_api = await self._pre_trim_messages_for_api(messages_for_api, model=thread_state.current_model)
         
         # Get thread config (with user preferences)
-        thread_config = config.get_thread_config(
+        thread_config = await config.get_thread_config_async(
             overrides=thread_state.config_overrides,
             user_id=message.user_id,
             db=self.db
@@ -923,6 +947,7 @@ class TextHandlerMixin:
                                             exclude_mcp_server=exclude_mcp_server, registry=registry)
 
             local_tool_calls = []  # [{"name","ok"}] record of local tool executions
+            usage_info = {}        # response.usage lands here (usage-driven budgeting)
             if tools and registry is not None:
                 # Local tools present — streaming function-call loop (intermediate tool
                 # rounds don't stream text; the final round streams normally)
@@ -940,7 +965,8 @@ class TextHandlerMixin:
                     reasoning_effort=thread_config.get("reasoning_effort"),
                     verbosity=thread_config.get("verbosity"),
                     store=False,
-                    prompt_cache_key=thread_key
+                    prompt_cache_key=thread_key,
+                    usage_sink=usage_info
                 )
                 response_text = loop_result["text"]
                 local_tool_calls = loop_result["local_tool_calls"]
@@ -962,7 +988,8 @@ class TextHandlerMixin:
                     reasoning_effort=thread_config.get("reasoning_effort"),
                     verbosity=thread_config.get("verbosity"),
                     store=False,  # Match the existing behavior
-                    prompt_cache_key=thread_key
+                    prompt_cache_key=thread_key,
+                    usage_sink=usage_info
                 )
             else:
                 # Generate response without tools
@@ -976,8 +1003,13 @@ class TextHandlerMixin:
                     system_prompt=system_prompt,
                     reasoning_effort=thread_config.get("reasoning_effort"),
                     verbosity=thread_config.get("verbosity"),
-                    prompt_cache_key=thread_key
+                    prompt_cache_key=thread_key,
+                    usage_sink=usage_info
                 )
+
+            # Record the API's authoritative context size on the thread
+            thread_state.record_usage(usage_info.get("input_tokens", 0),
+                                      usage_info.get("output_tokens", 0))
 
             # Ensure progress updater is cancelled if still running
             if progress_task and not progress_task.done():
@@ -1140,6 +1172,16 @@ class TextHandlerMixin:
             )
             
         except Exception as e:
+            # Usage-estimator backstop: on a context-window rejection, compact the
+            # thread before the standard non-streaming fallback retries below.
+            if self._is_context_length_error(e):
+                self.log_warning("Context window exceeded during streaming — compacting before fallback")
+                try:
+                    await self._compact_thread_to_target(
+                        thread_state, f"{thread_state.channel_id}:{thread_state.thread_ts}")
+                except Exception as compact_err:
+                    self.log_error(f"Compaction after context error failed: {compact_err}")
+
             # Check if this is an MCP connection error first (before logging)
             # Streaming throws APIError, non-streaming throws APIStatusError with code 424
             failed_mcp_server = None

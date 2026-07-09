@@ -3,6 +3,7 @@ Shared Message Processor
 Client-agnostic message processing logic
 """
 import asyncio
+import logging
 import time
 from typing import Optional
 from base_client import BaseClient, Message, Response
@@ -131,7 +132,7 @@ class MessageProcessor(ThreadManagementMixin,
             # Note: 80% context warning moved to after response generation
             
             # Get thread config to determine model (with user preferences)
-            thread_config = config.get_thread_config(
+            thread_config = await config.get_thread_config_async(
                 overrides=thread_state.config_overrides,
                 user_id=message.user_id,
                 db=self.db
@@ -156,7 +157,7 @@ class MessageProcessor(ThreadManagementMixin,
             # Phase 7: per-channel ground rules ride on the message metadata into the prompt
             thread_state.channel_directives = message.metadata.get("channel_directives") if message.metadata else None
             # Phase 9: inject this channel's durable memory (None when disabled/empty → prompt unchanged)
-            channel_memory_text = self._build_channel_memory_text(message.channel_id)
+            channel_memory_text = await self._build_channel_memory_text(message.channel_id)
             thread_state.system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"], web_search_enabled, thread_state.has_trimmed_messages, thread_config.get('custom_instructions'), participant_roster=participant_roster, channel_directives=thread_state.channel_directives, channel_memory=channel_memory_text)
             
             # Process any attachments (images, documents, and other files)
@@ -544,7 +545,7 @@ class MessageProcessor(ThreadManagementMixin,
             # Handle ambiguous intent
             if intent == "ambiguous_image":
                 # Check if there are recent images to clarify about
-                has_recent_image = self._has_recent_image(thread_state)
+                has_recent_image = await self._has_recent_image(thread_state)
                 
                 if has_recent_image:
                     # Store the pending clarification
@@ -662,9 +663,13 @@ class MessageProcessor(ThreadManagementMixin,
                                                                client, message.channel_id, thinking_id, message)
                 else:
                     # Vision-related question but no images or documents - try to find previous images
+                    # NOTE: effectively unreachable via classification — the intent prompt only
+                    # emits "vision" when files are attached, so past-image questions route to
+                    # the text path (which injects stored analyses). Kept pending a prompts
+                    # pass that either exposes or removes it.
                     self.log_debug("Vision intent detected but no files attached - searching for previous images")
                     response = await self._handle_vision_without_upload(
-                        message.text,
+                        self._format_user_content_with_username(message.text, message),
                         thread_state,
                         client,
                         message.channel_id,
@@ -674,23 +679,19 @@ class MessageProcessor(ThreadManagementMixin,
             else:
                 response = await self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0)
             
-            # DEBUG: Print conversation history after processing (with truncated content)
-            import json
-            print("\n" + "="*100)
-            print("DEBUG: CONVERSATION HISTORY (TRUNCATED)")
-            print("="*100)
-            
-            # Create a truncated version for debugging
-            truncated_messages = []
-            for msg in thread_state.messages:
-                truncated_msg = msg.copy()
-                content = str(truncated_msg.get("content", ""))
-                if len(content) > 100:
-                    truncated_msg["content"] = content[:100] + f"... [truncated {len(content) - 100} chars]"
-                truncated_messages.append(truncated_msg)
-            
-            print(json.dumps(truncated_messages, indent=2))
-            print("="*100 + "\n")
+            # DEBUG: log conversation history after processing (with truncated content).
+            # log_debug, not print — conversation content must not leak to stdout
+            # unconditionally, and the json.dumps is only worth building at debug level.
+            if self.logger.isEnabledFor(logging.DEBUG):
+                import json
+                truncated_messages = []
+                for msg in thread_state.messages:
+                    truncated_msg = msg.copy()
+                    content = str(truncated_msg.get("content", ""))
+                    if len(content) > 100:
+                        truncated_msg["content"] = content[:100] + f"... [truncated {len(content) - 100} chars]"
+                    truncated_messages.append(truncated_msg)
+                self.log_debug("CONVERSATION HISTORY (TRUNCATED):\n" + json.dumps(truncated_messages, indent=2))
             
             elapsed = time.time() - request_start_time
             response_type = response.type if response else "None"
@@ -763,7 +764,10 @@ class MessageProcessor(ThreadManagementMixin,
             should_retry = (
                 operation_type in ['text_normal', 'intent_classification']
                 and not already_retried
-                and 'intent' not in locals()  # Don't retry if we're already in intent classification
+                # Only intent-classification retries need the "intent already assigned" guard;
+                # for text_normal timeouts `intent` is ALWAYS in locals (routing requires it),
+                # so applying the guard there made the text retry branch unreachable.
+                and (operation_type != 'intent_classification' or 'intent' not in locals())
             )
 
             if should_retry:
