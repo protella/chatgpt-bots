@@ -30,6 +30,7 @@ class TextHandlerMixin:
             thread_ts=message.thread_id,
             trigger_ts=meta.get("ts"),
             action_token=meta.get("action_token"),
+            user_id=message.user_id,
             client=client,
             db=self.db,
             is_dm=bool(channel_id and str(channel_id).startswith("D")),

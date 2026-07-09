@@ -458,6 +458,7 @@ class TestProcessorGlue:
         monkeypatch.setattr(config, "enable_react_tool", True)
         monkeypatch.setattr(config, "reaction_emojis", ["thumbsup"])
         monkeypatch.setattr(config, "enable_search_tool", True)
+        monkeypatch.setattr(config, "enable_channel_memory", True)
         s = MagicMock()
         s.get_history_tools_for_openai.return_value = [
             {"type": "function", "name": "fetch_channel_history", "parameters": {}},
@@ -470,7 +471,8 @@ class TestProcessorGlue:
         registry = SlackBot._build_tool_registry(s)
         names = {t["name"] for t in registry.schemas()}
         assert names == {"fetch_channel_history", "fetch_thread_messages",
-                         "react_to_message", "search_slack"}
+                         "react_to_message", "search_slack",
+                         "remember_fact", "update_fact", "forget_fact"}
 
     def test_registry_builder_search_gated_off(self, monkeypatch):
         from slack_client.base import SlackBot

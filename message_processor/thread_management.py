@@ -693,12 +693,14 @@ class ThreadManagementMixin:
             thread_state: Thread state to potentially clean up
             thread_key: Thread identifier for database operations
         """
-        # Phase 9: extract durable channel memory from this exchange (best-effort; isolated so a
-        # failure here never affects token cleanup, and vice versa).
-        try:
-            await self._async_extract_channel_memory(thread_state)
-        except Exception as e:
-            self.log_debug(f"Channel memory extraction skipped: {e}")
+        # Memory writes are model-invoked tools now (Phase C); the post-response extractor
+        # survives one release behind ENABLE_MEMORY_EXTRACTION_FALLBACK (default off) in case
+        # tool-driven writes under-perform. Best-effort; isolated from token cleanup.
+        if config.enable_memory_extraction_fallback:
+            try:
+                await self._async_extract_channel_memory(thread_state)
+            except Exception as e:
+                self.log_debug(f"Channel memory extraction skipped: {e}")
 
         try:
             # Get current model's token limit

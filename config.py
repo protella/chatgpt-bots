@@ -274,12 +274,16 @@ class BotConfig:
 
     # --- Per-channel memory (Phase 9) ---
     # Read = inject the channel's durable facts into the system prompt on each response.
-    # Write = one lightweight utility-model "is there a durable fact?" call AFTER each response
-    # (no function-call loop needed). Off → no injection, no extraction (unchanged behavior).
+    # Write = model-invoked remember/update/forget tools during the response (Phase C).
+    # Off → no injection, no tools, no extraction (unchanged behavior).
     enable_channel_memory: bool = field(default_factory=lambda: os.getenv("ENABLE_CHANNEL_MEMORY", "true").lower() == "true")
-    # Hard cap on channel-scope memory rows per channel (oldest evicted on overflow) — keeps the
-    # injected block small and bounded; prefer update/supersede over unbounded growth.
+    # Hard cap on channel-scope memory rows per channel — keeps the injected block small and
+    # bounded; at the cap the remember tool refuses and points at the oldest rows instead.
     memory_max_rows: int = field(default_factory=lambda: int(os.getenv("MEMORY_MAX_ROWS", "25")))
+    # Legacy post-response extraction pass (pre-Phase-C write path). Kept one release as a
+    # fallback in case tool-driven memory writes under-perform; costs one utility-model call
+    # per exchange when on. Default OFF now that the model writes memory via tools.
+    enable_memory_extraction_fallback: bool = field(default_factory=lambda: os.getenv("ENABLE_MEMORY_EXTRACTION_FALLBACK", "false").lower() == "true")
 
     def get_model_token_limit(self, model: str) -> int:
         """Get the effective input token limit for a specific model

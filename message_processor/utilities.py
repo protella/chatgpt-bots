@@ -723,7 +723,9 @@ class MessageUtilitiesMixin:
             return None
         if not rows:
             return None
-        return "\n".join(f"- {r['content']}" for r in rows)
+        # [#id] prefixes let the model target update_fact/forget_fact; sorted by id
+        # (not updated_ts) so the rendering is deterministic for prompt-cache hygiene.
+        return "\n".join(f"- [#{r['id']}] {r['content']}" for r in sorted(rows, key=lambda r: r["id"]))
 
     def _get_system_prompt(self, client: BaseClient, user_timezone: str = "UTC",
                           user_tz_label: Optional[str] = None, user_real_name: Optional[str] = None,

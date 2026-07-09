@@ -27,6 +27,7 @@ class ToolContext:
     thread_ts: Optional[str] = None
     trigger_ts: Optional[str] = None      # ts of the message we're answering
     action_token: Optional[str] = None    # from the triggering Slack event (search API)
+    user_id: Optional[str] = None         # triggering user (provenance for memory writes)
     client: Any = None                    # platform client (e.g. SlackBot)
     db: Any = None
     is_dm: bool = False
