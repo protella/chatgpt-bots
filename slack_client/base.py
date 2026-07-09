@@ -21,6 +21,7 @@ from .formatting.text import SlackFormattingMixin
 from .messaging import SlackMessagingMixin
 from .history_tool import SlackHistoryToolMixin
 from .search_tool import SlackSearchToolMixin
+from .channel_pulse import ChannelPulse
 from tool_registry import ToolRegistry
 from message_processor.memory_tools import register_memory_tools
 
@@ -63,6 +64,10 @@ class SlackBot(SlackMessageEventsMixin,
         # Local tools the model can call through the function-call loop (Phase A).
         # Flags are read at construction — flipping them requires a restart, like all env config.
         self.tool_registry = self._build_tool_registry()
+
+        # Phase E: per-channel ambient-awareness ring buffer (process-lifetime, no DB).
+        # None when disabled so consumers can simply `getattr(client, "channel_pulse", None)`.
+        self.channel_pulse = ChannelPulse(size=config.channel_pulse_size) if config.enable_channel_pulse else None
 
         # Register Slack event handlers
         self._register_handlers()

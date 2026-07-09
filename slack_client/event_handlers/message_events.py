@@ -141,6 +141,35 @@ class SlackMessageEventsMixin:
                     humans.add(uid)
         return (bot_present, len(humans))
 
+    async def _feed_channel_pulse(self, event: Dict[str, Any]) -> None:
+        """Phase E: feed EVERY real channel message into the ambient ring buffer —
+        including our own posts and messages we go on to ignore. Awareness first,
+        gating later. Best-effort; never blocks dispatch."""
+        pulse = getattr(self, "channel_pulse", None)
+        if pulse is None:
+            return
+        try:
+            sender_type = self.classify_sender(event)
+            user_id = event.get("user")
+            display_name = event.get("username")
+            if not display_name and user_id:
+                if user_id == getattr(self, "bot_user_id", None):
+                    display_name = (config.bot_name_aliases or ["bot"])[0]
+                elif user_id in self.user_cache:
+                    display_name = self.user_cache[user_id].get("real_name")
+            pulse.record(
+                event.get("channel"),
+                ts=event.get("ts"),
+                thread_ts=event.get("thread_ts"),
+                user_id=user_id,
+                display_name=display_name,
+                sender_type=sender_type,
+                text=event.get("text", ""),
+                is_bot=sender_type != "human",
+            )
+        except Exception as e:
+            self.log_debug(f"channel_pulse feed failed: {e}")
+
     async def _handle_channel_message(self, event: Dict[str, Any], client):
         """Phase 5: decide whether to respond to a NON-mention channel message, then dispatch.
 
@@ -150,6 +179,10 @@ class SlackMessageEventsMixin:
         # Ignore non-real messages (edits, deletes, joins, message_changed, etc.)
         if event.get("subtype"):
             return
+        # Phase E: awareness BEFORE any gate — ignored messages (and our own) still
+        # update the channel's peripheral vision. This path only runs when channel
+        # listening is on, so the pulse is inert otherwise by construction.
+        await self._feed_channel_pulse(event)
         # Loop guard FIRST: never act on our own posts.
         if self.is_own_message(event):
             return
@@ -189,6 +222,12 @@ class SlackMessageEventsMixin:
         else:  # tag_only and not addressed
             return
 
+        # Phase E: first wake in this channel since startup seeds the pulse ring
+        # (one conversations.history call, once per channel per process).
+        pulse = getattr(self, "channel_pulse", None)
+        if pulse is not None:
+            await pulse.ensure_backfill(channel_id, self.app.client, self)
+
         # Build the universal message (no onboarding side effects) and dispatch.
         message = await self._event_to_message(event, client)
         # Phase 6: reply in-thread by default (a top-level message keys as its own length-1 thread).
@@ -220,6 +259,14 @@ class SlackMessageEventsMixin:
 
         message = await self._event_to_message(event, client)
         user_id = event.get("user")
+
+        # Phase E: an @mention in a channel is also a wake — seed the pulse ring so the
+        # response envelope has content. Gated on channel listening: with it off no live
+        # events feed the ring, and a backfill-only window would just go stale.
+        pulse = getattr(self, "channel_pulse", None)
+        if (pulse is not None and config.enable_channel_listening
+                and message.channel_id and not message.channel_id.startswith("D")):
+            await pulse.ensure_backfill(message.channel_id, self.app.client, self)
 
         # Phase 7: surface per-channel ground rules (in-channel only) and skip the
         # settings-modal onboarding for BOT senders — a bot can't click the modal

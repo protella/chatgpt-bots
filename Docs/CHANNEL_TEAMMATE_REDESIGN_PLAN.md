@@ -417,7 +417,18 @@ thread past the token budget → responses keep file/image awareness; edit a mes
 → bot sees the edit. *Fixes the staleness bug; depends on Phase A (tool loop shrinks upfront
 context needs).*
 
-**E. ChannelPulse + response envelope** — buffer, backfill, envelope injection, participation
+**E. ChannelPulse + response envelope** — ✅ IMPLEMENTED 2026-07-09. `slack_client/channel_pulse.py`
+ring buffer (CHANNEL_PULSE_SIZE=30) fed by every channel event BEFORE any gate (own posts and
+ignored messages included); once-per-process conversations.history backfill on first wake
+(also on @mentions while listening is on); participation stats (`record_bot_reply` /
+`unprompted_count_last_hour`) recorded from main.py for Phase F. DEVIATION from this section's
+original text: the envelope is injected at the SUFFIX (composited with the Phase-S time
+suffix via `_build_suffix_context`), NOT the system prompt — it's volatile and would bust the
+prefix cache (§5b); it also renders for thread replies in channels (current thread excluded),
+not just top-level wakes. The wake classifier receives the same envelope as a signal.
+`CHANNEL_CONTEXT_WINDOW` (unused, default 0) was removed in favor of
+CHANNEL_PULSE_ENVELOPE_MAX=15 — this resolves the parity last-mile recent-channel-window item.
+Tests: tests/unit/test_channel_pulse.py. — buffer, backfill, envelope injection, participation
 stats. Files: `slack_client/channel_pulse.py`, `message_events.py`, `base.py` (processor).
 Tests: ring behavior, backfill-once, envelope rendering, DM exclusion. Live: two unrelated
 top-level questions; second answer shouldn't bleed the first's thread but engine should show
