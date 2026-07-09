@@ -390,6 +390,68 @@ class ThreadManagementMixin:
         
         return trimmed
 
+    @staticmethod
+    def _content_to_text(content) -> str:
+        """Flatten a message content value (str or multimodal list of parts) to plain text."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    txt = part.get("text")
+                    if txt:
+                        parts.append(txt)
+                elif isinstance(part, str):
+                    parts.append(part)
+            return " ".join(parts)
+        return str(content) if content is not None else ""
+
+    async def _async_extract_channel_memory(self, thread_state):
+        """Phase 9: after a response is sent, run ONE lightweight utility-model call to decide whether
+        the latest exchange holds a durable channel fact, and persist/update it. Best-effort, runs
+        post-response (never blocks the reply), only writes channel-scope rows, enforces the row cap."""
+        if not config.enable_channel_memory:
+            return
+        channel_id = getattr(thread_state, "channel_id", None)
+        db = getattr(self, "db", None)
+        openai_client = getattr(self, "openai_client", None)
+        if not channel_id or not db or not openai_client:
+            return
+
+        msgs = getattr(thread_state, "messages", None) or []
+        last_user = next((m for m in reversed(msgs) if m.get("role") == "user"), None)
+        last_assistant = next((m for m in reversed(msgs) if m.get("role") == "assistant"), None)
+        if not last_user or not last_assistant:
+            return
+        exchange = (
+            f"User: {self._content_to_text(last_user.get('content'))}\n"
+            f"Assistant: {self._content_to_text(last_assistant.get('content'))}"
+        )
+
+        try:
+            existing = db.get_channel_memory(channel_id)
+        except Exception:
+            existing = []
+        existing_min = [{"id": r["id"], "content": r["content"]} for r in existing]
+
+        decision = await openai_client.extract_memory(exchange, existing_min)
+        action = (decision or {}).get("action", "none")
+
+        if action == "add" and decision.get("content"):
+            # Enforce per-channel cap by evicting oldest channel-scope rows first.
+            chan_rows = [r for r in existing if r.get("scope") == "channel"]
+            cap = max(1, config.memory_max_rows)
+            while len(chan_rows) >= cap:
+                oldest = min(chan_rows, key=lambda r: r.get("updated_ts") or "")
+                db.delete_channel_memory(oldest["id"])
+                chan_rows.remove(oldest)
+            db.add_channel_memory(channel_id, decision["content"], scope="channel")
+            self.log_info(f"Channel memory: recorded a durable fact for {channel_id}")
+        elif action == "update" and decision.get("id") is not None and decision.get("content"):
+            db.update_channel_memory(decision["id"], decision["content"])
+            self.log_info(f"Channel memory: updated fact {decision['id']} for {channel_id}")
+
     async def _async_post_response_cleanup(self, thread_state, thread_key: str):
         """Asynchronously clean up thread after response is sent
         
@@ -401,6 +463,13 @@ class ThreadManagementMixin:
             thread_state: Thread state to potentially clean up
             thread_key: Thread identifier for database operations
         """
+        # Phase 9: extract durable channel memory from this exchange (best-effort; isolated so a
+        # failure here never affects token cleanup, and vice versa).
+        try:
+            await self._async_extract_channel_memory(thread_state)
+        except Exception as e:
+            self.log_debug(f"Channel memory extraction skipped: {e}")
+
         try:
             # Get current model's token limit
             model = thread_state.current_model or config.gpt_model
@@ -505,38 +574,57 @@ class ThreadManagementMixin:
                 if hist_msg.metadata.get("ts") == current_ts:
                     continue
                     
-                # Determine role based on metadata
+                # Determine sender and role.
+                # Only OUR OWN messages are assistant turns. Humans AND other bots (e.g. another
+                # AI bot sharing the thread) are user turns — otherwise another bot's messages get
+                # replayed to the model as if we had said them.
                 is_bot = hist_msg.metadata.get("is_bot", False)
-                role = "assistant" if is_bot else "user"
-                
+                sender_type = hist_msg.metadata.get("sender_type")
+                if sender_type is None:
+                    # Back-compat for history captured before sender_type existed
+                    sender_type = "self" if is_bot else "human"
+                is_self = (sender_type == "self")
+                role = "assistant" if is_self else "user"
+
                 # Build content with attachment info
                 content = hist_msg.text
-                
-                # For user messages, prefix with username
-                if not is_bot:
-                    # Get username from metadata (should be populated by client)
-                    username = hist_msg.metadata.get("username") if hist_msg.metadata else None
-                    
-                    # If no username in metadata, fetch it from user_id
-                    if not username and hist_msg.user_id:
-                        # Use client's get_username method if available
-                        if hasattr(client, 'get_username'):
-                            # Get the slack_client from metadata if available
-                            slack_client = hist_msg.metadata.get("slack_client") if hist_msg.metadata else None
-                            if slack_client:
-                                username = await client.get_username(hist_msg.user_id, slack_client)
+
+                # For non-self messages, prefix with a display name (humans by username,
+                # other bots by their bot name) so the model knows who is speaking.
+                if not is_self:
+                    if sender_type == "other_bot":
+                        username = (hist_msg.metadata.get("bot_name")
+                                    or hist_msg.metadata.get("username")
+                                    or "Bot")
+                    else:
+                        # Get username from metadata (should be populated by client)
+                        username = hist_msg.metadata.get("username") if hist_msg.metadata else None
+
+                        # If no username in metadata, fetch it from user_id
+                        if not username and hist_msg.user_id:
+                            # Use client's get_username method if available
+                            if hasattr(client, 'get_username'):
+                                # Get the slack_client from metadata if available
+                                slack_client = hist_msg.metadata.get("slack_client") if hist_msg.metadata else None
+                                if slack_client:
+                                    username = await client.get_username(hist_msg.user_id, slack_client)
+                                else:
+                                    # Try without slack_client
+                                    username = hist_msg.user_id  # Fallback to user_id
                             else:
-                                # Try without slack_client
                                 username = hist_msg.user_id  # Fallback to user_id
-                        else:
-                            username = hist_msg.user_id  # Fallback to user_id
-                    
-                    # Default to "User" if still no username
-                    if not username:
-                        username = "User"
-                    
+
+                        # Default to "User" if still no username
+                        if not username:
+                            username = "User"
+
                     # Format content with username
                     content = f"{username}: {content}" if content else f"{username}:"
+
+                    # Track real participants for the @mention roster (other bots use the
+                    # placeholder "bot"/"unknown" user_id and are skipped here)
+                    if hist_msg.user_id and hist_msg.user_id not in ("bot", "unknown"):
+                        thread_state.participants[hist_msg.user_id] = username
                 
                 # Track message metadata for preservation
                 message_metadata = {}

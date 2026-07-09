@@ -103,7 +103,78 @@ class SettingsModal(LoggerMixin):
             "private_metadata": json.dumps(metadata)
         }
     
-    def _build_modal_blocks(self, settings: Dict, selected_model: str, 
+    def build_channel_settings_modal(self, channel_id: str, current_settings: Optional[Dict],
+                                     global_default_mode: str) -> Dict:
+        """Build the per-channel settings modal (Phase 7).
+
+        `current_settings` is the DB row (or None). A NULL/absent response_mode means the channel
+        inherits the global default; that is represented by the "inherit" option here, and the
+        submission handler stores None (NULL) for it so the global default keeps applying.
+        """
+        cs = current_settings or {}
+        current_mode = cs.get("response_mode")
+        directives_value = cs.get("directives") or ""
+        reply_in_channel = bool(cs.get("reply_in_channel", False))
+
+        mode_options = [
+            {"text": {"type": "plain_text", "text": f"Use default (inherit — currently: {global_default_mode})"},
+             "value": "inherit"},
+            {"text": {"type": "plain_text", "text": "Tag-only — reply only when clearly addressed"},
+             "value": "tag_only"},
+            {"text": {"type": "plain_text", "text": "Auto-respond — classifier decides per message"},
+             "value": "auto_respond"},
+            {"text": {"type": "plain_text", "text": "Off — never respond in this channel"},
+             "value": "off"},
+        ]
+        selected_value = current_mode if current_mode in ("tag_only", "auto_respond", "off") else "inherit"
+        initial_mode_option = next(o for o in mode_options if o["value"] == selected_value)
+
+        reply_option = {
+            "text": {"type": "plain_text", "text": "Reply at top level instead of in a thread"},
+            "value": "reply_in_channel",
+        }
+        reply_element = {
+            "type": "checkboxes",
+            "action_id": "reply_in_channel",
+            "options": [reply_option],
+        }
+        if reply_in_channel:
+            reply_element["initial_options"] = [reply_option]
+
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn",
+             "text": f"*Channel settings* for <#{channel_id}>\nHow I participate in this channel. "
+                     f"Global defaults come from the bot's configuration; these override them here."}},
+            {"type": "input", "block_id": "response_mode_block",
+             "element": {"type": "static_select", "action_id": "response_mode",
+                         "options": mode_options, "initial_option": initial_mode_option},
+             "label": {"type": "plain_text", "text": "Response mode"},
+             "hint": {"type": "plain_text", "text": f"'Inherit' uses the global default ({global_default_mode})."}},
+            {"type": "input", "block_id": "directives_block", "optional": True,
+             "element": {"type": "plain_text_input", "action_id": "directives", "multiline": True,
+                         "initial_value": directives_value, "max_length": 1000,
+                         "placeholder": {"type": "plain_text",
+                                         "text": "e.g. Only jump in on deploy failures; otherwise stay quiet."}},
+             "label": {"type": "plain_text", "text": "Channel ground rules (optional)"},
+             "hint": {"type": "plain_text", "text": "Extra instructions for how I behave in this channel."}},
+            {"type": "input", "block_id": "reply_in_channel_block", "optional": True,
+             "element": reply_element,
+             "label": {"type": "plain_text", "text": "Reply placement (not yet active)"},
+             "hint": {"type": "plain_text",
+                      "text": "Stored for when top-level posting ships; replies are threaded for now."}},
+        ]
+
+        return {
+            "type": "modal",
+            "callback_id": "channel_settings_modal",
+            "title": {"type": "plain_text", "text": "Channel Settings"},
+            "submit": {"type": "plain_text", "text": "Save"},
+            "close": {"type": "plain_text", "text": "Cancel"},
+            "private_metadata": json.dumps({"channel_id": channel_id}),
+            "blocks": blocks,
+        }
+
+    def _build_modal_blocks(self, settings: Dict, selected_model: str,
                            is_new_user: bool = False, in_thread: bool = False,
                            scope: str = None) -> List[Dict]:
         """Build the modal blocks based on current settings and model selection

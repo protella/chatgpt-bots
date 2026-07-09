@@ -146,7 +146,18 @@ class MessageProcessor(ThreadManagementMixin,
             user_real_name = message.metadata.get("user_real_name", None) if message.metadata else None
             user_email = message.metadata.get("user_email", None) if message.metadata else None
             web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
-            thread_state.system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"], web_search_enabled, thread_state.has_trimmed_messages, thread_config.get('custom_instructions'))
+            # Ensure the current requester is in the @mention roster, then build it
+            if message.user_id:
+                thread_state.participants.setdefault(
+                    message.user_id,
+                    user_real_name or (message.metadata.get("username") if message.metadata else None) or message.user_id,
+                )
+            participant_roster = self._build_participant_roster(thread_state, client)
+            # Phase 7: per-channel ground rules ride on the message metadata into the prompt
+            thread_state.channel_directives = message.metadata.get("channel_directives") if message.metadata else None
+            # Phase 9: inject this channel's durable memory (None when disabled/empty → prompt unchanged)
+            channel_memory_text = self._build_channel_memory_text(message.channel_id)
+            thread_state.system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"], web_search_enabled, thread_state.has_trimmed_messages, thread_config.get('custom_instructions'), participant_roster=participant_roster, channel_directives=thread_state.channel_directives, channel_memory=channel_memory_text)
             
             # Process any attachments (images, documents, and other files)
             image_inputs, document_inputs, unsupported_files = await self._process_attachments(message, client, thinking_id)

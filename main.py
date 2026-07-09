@@ -61,8 +61,43 @@ class ChatBotV2:
         
         main_logger.info("Initialization complete")
     
+    async def _classify_wake(self, message: Message) -> str:
+        """Phase 5 wake gate: ask the lightweight classifier whether to respond/react/ignore.
+        Conservative — any failure returns 'ignore' so the bot never spams a channel."""
+        try:
+            ts = message.metadata.get("ts")
+            is_thread_reply = bool(ts and message.thread_id and message.thread_id != ts)
+            return await self.processor.openai_client.classify_wake(
+                message.text,
+                signals={
+                    "is_thread_reply": is_thread_reply,
+                    "directives": message.metadata.get("channel_directives"),
+                },
+            )
+        except Exception as e:
+            main_logger.warning(f"Wake classification error: {e}; ignoring")
+            return "ignore"
+
     async def handle_message(self, message: Message, client: BaseClient):
         """Handle incoming message from any platform"""
+        # Phase 5 wake gate: for channel messages routed in auto_respond mode, a lightweight
+        # classifier decides respond/react/ignore BEFORE anything is posted (so 'ignore' is silent).
+        if message.metadata.get("wake_classify") is True:
+            decision = await self._classify_wake(message)
+            if decision == "ignore":
+                main_logger.debug("Wake gate: ignore — staying silent")
+                return
+            if decision == "react":
+                react_ts = message.metadata.get("ts") or message.thread_id
+                emoji = (config.reaction_emojis or ["eyes"])[0]
+                if hasattr(client, "react"):
+                    try:
+                        await client.react(message.channel_id, react_ts, emoji)
+                    except Exception as e:
+                        main_logger.debug(f"Wake-gate react failed: {e}")
+                return
+            # decision == "respond" → fall through to normal handling
+
         # Send initial thinking indicator
         thinking_id = await client.send_thinking_indicator(
             message.channel_id,
@@ -99,6 +134,14 @@ class ChatBotV2:
                             message.thread_id,
                             formatted_text
                         )
+                    # Phase 7: append a Configure footer under the response (channels only, any
+                    # member can open settings). Separate trailing message → safe for streamed too.
+                    # Best-effort: a cosmetic footer must never break message handling.
+                    if hasattr(client, "maybe_post_response_footer"):
+                        try:
+                            await client.maybe_post_response_footer(message, response)
+                        except Exception as e:
+                            main_logger.debug(f"Response footer skipped: {e}")
                 elif response.type == "image":
                     # Show uploading status 
                     upload_status_id = None

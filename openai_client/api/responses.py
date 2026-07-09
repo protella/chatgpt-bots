@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any, Callable, Dict, List, Optional
 
 from config import config
-from prompts import IMAGE_INTENT_SYSTEM_PROMPT
+from prompts import IMAGE_INTENT_SYSTEM_PROMPT, MEMORY_EXTRACTION_SYSTEM_PROMPT, WAKE_CLASSIFIER_SYSTEM_PROMPT
 
 
 async def create_text_response(
@@ -729,6 +730,124 @@ async def create_streaming_response_with_tools(
             # Unexpected errors - log as ERROR with stack trace
             self.log_error(f"Error creating streaming response with tools: {e}", exc_info=True)
         raise
+
+async def classify_wake(self, text: str, signals: Optional[Dict[str, Any]] = None) -> str:
+    """Lightweight 'should the bot respond?' classifier for channel auto_respond mode.
+
+    Returns 'respond' | 'react' | 'ignore'. Best-effort and CONSERVATIVE: any failure or
+    unrecognized output defaults to 'ignore' (never spam a channel)."""
+    signals = signals or {}
+    signal_lines = []
+    if signals.get("is_thread_reply"):
+        signal_lines.append("- This is a reply inside a thread the assistant is part of.")
+    if signals.get("directives"):
+        signal_lines.append(f"- Operator-set ground rules for this channel (honor them): {signals['directives']}")
+    signal_note = ("\n\nSignals:\n" + "\n".join(signal_lines)) if signal_lines else ""
+
+    conversation_messages = [
+        {"role": "developer", "content": WAKE_CLASSIFIER_SYSTEM_PROMPT},
+        {"role": "user", "content": f"Message:\n{text}{signal_note}\n\nRespond with ONLY one word: respond, react, or ignore."},
+    ]
+
+    request_params = {
+        "model": config.utility_model,
+        "input": conversation_messages,
+        "max_output_tokens": config.utility_max_tokens,
+        "store": False,
+    }
+    if config.utility_model.startswith("gpt-5") and "chat" not in config.utility_model.lower():
+        request_params["temperature"] = 1.0
+        request_params["reasoning"] = {"effort": config.utility_reasoning_effort}
+        request_params["text"] = {"verbosity": config.utility_verbosity}
+        if config.utility_model.startswith("gpt-5.1") or config.utility_model.startswith("gpt-5.2"):
+            request_params["prompt_cache_retention"] = "24h"
+    else:
+        request_params["temperature"] = 0.3
+
+    try:
+        response = await self._safe_api_call(
+            self.client.responses.create,
+            operation_type="intent_classification",
+            **request_params,
+        )
+        result = ""
+        if response.output:
+            for item in response.output:
+                if hasattr(item, "content") and item.content:
+                    for content in item.content:
+                        if hasattr(content, "text"):
+                            result += content.text
+        result = result.strip().lower()
+        self.log_debug(f"Wake classifier raw result: '{result}' for: '{text[:60]}...'")
+        if "respond" in result:
+            return "respond"
+        if "react" in result:
+            return "react"
+        return "ignore"
+    except Exception as e:
+        self.log_warning(f"Wake classification failed ({e}); defaulting to ignore")
+        return "ignore"
+
+
+async def extract_memory(self, exchange_text: str, existing_memory: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Post-response memory extraction (Phase 9). Given the latest exchange + current channel
+    memory, decide whether to record a durable fact. Returns a dict:
+        {"action": "none"} | {"action": "add", "content": str} | {"action": "update", "id": int, "content": str}
+    Best-effort and CONSERVATIVE: any failure / unparseable output → {"action": "none"} (never write)."""
+    existing_memory = existing_memory or []
+    mem_lines = "\n".join(f"{m['id']}. {m['content']}" for m in existing_memory) or "(empty)"
+
+    conversation_messages = [
+        {"role": "developer", "content": MEMORY_EXTRACTION_SYSTEM_PROMPT},
+        {"role": "user", "content": f"Current memory:\n{mem_lines}\n\nLatest exchange:\n{exchange_text}\n\nRespond with ONLY the JSON object."},
+    ]
+
+    # Memory extraction emits a small JSON object (and reasoning models spend tokens before output),
+    # so give it more room than the one-word wake classifier's tiny utility_max_tokens.
+    request_params = {
+        "model": config.utility_model,
+        "input": conversation_messages,
+        "max_output_tokens": max(512, config.utility_max_tokens),
+        "store": False,
+    }
+    if config.utility_model.startswith("gpt-5") and "chat" not in config.utility_model.lower():
+        request_params["temperature"] = 1.0
+        request_params["reasoning"] = {"effort": config.utility_reasoning_effort}
+        request_params["text"] = {"verbosity": config.utility_verbosity}
+        if config.utility_model.startswith("gpt-5.1") or config.utility_model.startswith("gpt-5.2"):
+            request_params["prompt_cache_retention"] = "24h"
+    else:
+        request_params["temperature"] = 0.3
+
+    try:
+        response = await self._safe_api_call(
+            self.client.responses.create,
+            operation_type="intent_classification",
+            **request_params,
+        )
+        result = ""
+        if response.output:
+            for item in response.output:
+                if hasattr(item, "content") and item.content:
+                    for content in item.content:
+                        if hasattr(content, "text"):
+                            result += content.text
+        result = result.strip()
+        # Extract the JSON object defensively (model may wrap it in prose/fences).
+        start, end = result.find("{"), result.rfind("}")
+        if start == -1 or end == -1 or end < start:
+            return {"action": "none"}
+        parsed = json.loads(result[start:end + 1])
+        action = str(parsed.get("action", "none")).lower()
+        if action == "add" and parsed.get("content"):
+            return {"action": "add", "content": str(parsed["content"]).strip()}
+        if action == "update" and parsed.get("id") is not None and parsed.get("content"):
+            return {"action": "update", "id": int(parsed["id"]), "content": str(parsed["content"]).strip()}
+        return {"action": "none"}
+    except Exception as e:
+        self.log_warning(f"Memory extraction failed ({e}); skipping write")
+        return {"action": "none"}
+
 
 async def classify_intent(
     self,
