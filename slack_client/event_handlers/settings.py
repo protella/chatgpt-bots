@@ -269,43 +269,13 @@ class SlackSettingsHandlersMixin:
             # Validate settings
             validated_settings = self.settings_modal.validate_settings(form_values)
             
-            # Check for model switch warning (GPT-5 -> GPT-4)
-            model_switch_warning = ""
-            if selected_scope == 'thread' and thread_id:
-                # For thread settings, get the current thread config from DB to check for model switch
-                try:
-                    current_thread_config = await self.db.get_thread_config_async(thread_id)
-                    if current_thread_config:
-                        old_model = current_thread_config.get('model')
-                        new_model = validated_settings.get('model')
-                        
-                        # Check if switching from GPT-5 family to GPT-4 family
-                        if old_model and new_model:
-                            if old_model.startswith('gpt-5') and new_model.startswith('gpt-4'):
-                                model_switch_warning = "\n\n⚠️ **Important:** Switching to GPT-4 may require removing some older messages from long conversations due to its smaller context window (128k vs 400k tokens). Recent messages and important content like images will be preserved."
-                except Exception as e:
-                    self.log_debug(f"Could not check for model switch: {e}")
-            else:
-                # For global settings, check current default
-                user_prefs = await self.db.get_user_preferences_async(user_id) if self.db else None
-                old_model = user_prefs.get('model') if user_prefs else config.gpt_model
-                new_model = validated_settings.get('model')
-                
-                if old_model and new_model:
-                    if old_model.startswith('gpt-5') and new_model.startswith('gpt-4'):
-                        model_switch_warning = "\n\n⚠️ **Note:** You're switching to GPT-4 which has a smaller context window than GPT-5 (128k vs 400k tokens). Long conversations may have older messages automatically removed to fit within the limit."
-            
             # Check for temperature/top_p warning
             warning_message = ""
-            if validated_settings.get('model') not in ['gpt-5', 'gpt-5-mini', 'gpt-5-nano']:
-                temp_changed = validated_settings.get('temperature', config.default_temperature) != config.default_temperature
-                top_p_changed = validated_settings.get('top_p', config.default_top_p) != config.default_top_p
-                
-                if temp_changed and top_p_changed:
-                    warning_message = "\n⚠️ Note: You've changed both Temperature and Top P. OpenAI recommends using only one for best results."
-            
-            # Combine warnings
-            warning_message = warning_message + model_switch_warning
+            temp_changed = validated_settings.get('temperature', config.default_temperature) != config.default_temperature
+            top_p_changed = validated_settings.get('top_p', config.default_top_p) != config.default_top_p
+
+            if temp_changed and top_p_changed:
+                warning_message = "\n⚠️ Note: You've changed both Temperature and Top P. OpenAI recommends using only one for best results."
             
             # Save to appropriate location based on selected scope
             if selected_scope == 'thread' and thread_id:
@@ -729,16 +699,9 @@ class SlackSettingsHandlersMixin:
                         # Web search is on and wasn't minimal - keep the stored value
                         merged_settings['reasoning_effort'] = reasoning_from_stored
                 else:
-                    # No stored value either - use a safe default based on model
-                    model = merged_settings.get('model', 'gpt-5')
-                    if web_search_enabled:
-                        merged_settings['reasoning_effort'] = 'low'
-                    else:
-                        # Use model-specific default when web search is off
-                        if model == 'gpt-5.1':
-                            merged_settings['reasoning_effort'] = 'none'  # GPT-5.1 default
-                        else:
-                            merged_settings['reasoning_effort'] = 'minimal'  # GPT-5/GPT-5-mini default
+                    # No stored value either - use a safe default (gpt-5.5 only)
+                    model = merged_settings.get('model', 'gpt-5.5')
+                    merged_settings['reasoning_effort'] = 'low' if web_search_enabled else 'none'
                     self.log_debug(f"No reasoning in form or stored, defaulting to {merged_settings['reasoning_effort']} for model {model}")
             
             # Debug logging

@@ -50,14 +50,9 @@ Database schema changes (new `image_model` column + `settings_completed` backfil
 **V2 Architecture**: Uses OpenAI's Responses API exclusively
 
 **Supported Models:**
-- **GPT-5.2** (`gpt-5.2`) - Latest reasoning model with enhanced prompt caching and improved performance
-- **GPT-5.1** (`gpt-5.1`) - Reasoning model with adaptive reasoning and 24-hour prompt caching
-- **GPT-5** (`gpt-5`) - Reasoning model with web search capability
-- **GPT-5 Mini** (`gpt-5-mini`) - Faster reasoning model
-- **GPT-4.1** (`gpt-4.1`) - Latest GPT-4 variant
-- **GPT-4o** (`gpt-4o`) - Optimized GPT-4 model
-- **Image Generation**: `gpt-image-1`
-- **Utility Model**: `gpt-5-mini` (default) or `gpt-4.1-mini` for intent classification  
+- **GPT-5.5** (`gpt-5.5`) - Reasoning model with 1.05M context window, 24-hour prompt caching, and web search
+- **Image Generation**: `gpt-image-2`
+- **Utility Model**: `gpt-5-mini` for intent classification and helper functions (not user-selectable)
 
 The setup of a Slack or Discord App is out of scope of this README. There's plenty of documentation online detailing these processes.
   
@@ -187,10 +182,10 @@ See [.env.example](.env.example) for all available configuration options and det
 
 ### Key Configuration Options
 
-- **Models**: Configure GPT-5.2, GPT-5.1, GPT-5, GPT-5 Mini, GPT-4.1, or GPT-4o as your primary model
+- **Models**: GPT-5.5 is the supported primary model
 - **User Settings**: Users can customize their experience via `/chatgpt-settings` command
 - **Thread Settings**: Different settings per conversation thread
-- **Web Search**: Available with GPT-5 models (GPT-5 requires reasoning_effort >= low; GPT-5.1+ works with all levels)
+- **Web Search**: Available with all reasoning levels
 - **Streaming**: Real-time response streaming with configurable update intervals
 - **Token Management**: Automatic context window management with configurable buffer
 - **Logging**: Comprehensive logging with rotation at 10MB, configurable levels per component
@@ -199,8 +194,7 @@ See [.env.example](.env.example) for all available configuration options and det
 The bot manages context window usage automatically using a buffer system:
 
 - `TOKEN_BUFFER_PERCENTAGE` - Percentage of model's context limit to use (default: 0.875 = 87.5%)
-  - GPT-5 (400k): 87.5% = 350k usable tokens
-  - GPT-4 (128k): 87.5% = 112k usable tokens
+  - Applies to the utility model window (gpt-5-mini, 400k); GPT-5.5 uses `GPT54_TOKEN_BUFFER_PERCENTAGE`
   - Lower values (e.g., 0.675 = 67.5%) provide more headroom for system prompts, tools, and reasoning
   - Higher values maximize context retention but may hit limits with complex tool use or reasoning
 
@@ -220,7 +214,7 @@ The bot manages context window usage automatically using a buffer system:
 - **Image Generation & Editing**: Create and modify images with natural language
 - **Vision Analysis**: Analyze uploaded images and compare multiple images
 - **Document Processing**: Extract and analyze text from PDFs, Office files, and code
-- **Web Search**: Current information retrieval (GPT-5 models only)
+- **Web Search**: Current information retrieval
 - **Streaming Responses**: Real-time message updates as responses generate
 
 #### User Experience
@@ -249,7 +243,7 @@ Model Context Protocol is a standardized way to connect AI applications to exter
 
 #### Requirements
 
-- **GPT-5 Model**: MCP tools only work with GPT-5.2, GPT-5.1, GPT-5, or GPT-5 Mini
+- **GPT-5 Model**: MCP tools require a GPT-5 series model (GPT-5.5)
 - **HTTP/SSE Transport**: Bot uses OpenAI's native MCP support (stdio not supported)
 
 #### Setup
@@ -304,7 +298,7 @@ The bot will automatically load and connect to your configured MCP servers on st
 Users can enable/disable MCP access via the settings modal:
 1. Type `/chatgpt-settings` in Slack
 2. Check/uncheck "MCP Servers" in the Features section
-3. Note: Enabling MCP requires selecting a GPT-5 series model (GPT-5.2, GPT-5.1, GPT-5, or GPT-5 Mini)
+3. Note: MCP requires a GPT-5 series model (GPT-5.5)
 
 #### Finding MCP Servers
 
@@ -325,7 +319,7 @@ Users can enable/disable MCP access via the settings modal:
 - Verify `mcp_config.json` exists and is valid JSON
 - Check bot logs for MCP initialization errors
 - Ensure user has MCP enabled in settings
-- Confirm model is GPT-5.2, GPT-5.1, GPT-5, or GPT-5 Mini
+- Confirm model is GPT-5.5
 
 **MCP server connection errors:**
 - Check `server_url` is correct and accessible

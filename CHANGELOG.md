@@ -25,6 +25,25 @@ All notable changes to this project will be documented in this file.
 - All new behavior is env-flagged with sane defaults, documented in `.env.example`
 - Dependencies upgraded via `make lock-upgrade` (openai 2.44, slack-sdk 3.42, etc.)
 
+### 🔧 Cleanup - Model lineup reduced to GPT-5.5
+
+#### Removed
+- **Dropped model support**: GPT-4 series (`gpt-4o`, `gpt-4.1`), `gpt-5`, `gpt-5-nano`, `gpt-5-chat-*`, `gpt-5.1`, `gpt-5.2` (incl. `-pro`/`-chat-latest`), `gpt-5.3`, `gpt-5.4`. The model picker now offers **GPT-5.5 only**. `gpt-5-mini` remains supported as the utility model only (not user-selectable).
+- **Dead API branches**: GPT-4 parameter shaping, `gpt-5-chat-*` handling, per-model prompt-cache lists, and the GPT-5.1/5.2/5.4 special cases in the OpenAI client, settings modal, and settings handlers
+- **Obsolete one-off migration scripts**: `migrate_to_gpt54.py`, `scripts/migrate_users_to_gpt51.py`, `scripts/update_gpt51_reasoning.py`
+
+#### Added
+- **Startup normalization migration**: any user preference or per-thread override still on a dropped model is automatically swapped to `gpt-5.5` on startup (idempotent, runs every boot, logs the count)
+- Unit tests for the migration and the reduced model surface (`tests/unit/test_model_cleanup.py`)
+
+#### Upgrade Instructions
+You can delete these now-unused lines from your `.env`:
+```
+GPT4_MAX_TOKENS=...
+THREAD_MAX_TOKEN_COUNT=...
+```
+`GPT54_MAX_TOKENS` / `GPT54_TOKEN_BUFFER_PERCENTAGE` keep their names (they now describe GPT-5.5's 1.05M window); `GPT5_MAX_TOKENS` now describes the `gpt-5-mini` utility window. Watch startup logs for `DB: Normalized N user(s) ... to gpt-5.5`.
+
 ## [2.5.1] - 2026-05-11
 
 ### 🚀 Feature - GPT-5.5 Support
