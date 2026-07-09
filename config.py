@@ -2,6 +2,7 @@
 Configuration module for Slack Bot V2
 Handles all environment variables and default settings
 """
+import logging
 import os
 from dotenv import load_dotenv
 from typing import Optional, Dict, Any
@@ -304,19 +305,9 @@ class BotConfig:
             raise ValueError("OPENAI_KEY is required")
         return True
     
-    def get_thread_config(self, overrides: Optional[Dict[str, Any]] = None, user_id: Optional[str] = None, db = None) -> Dict[str, Any]:
-        """Get configuration for a specific thread with settings hierarchy:
-        1. System defaults (from .env)
-        2. User preferences (from database)
-        3. Thread overrides (passed as parameter)
-        
-        Args:
-            overrides: Thread-specific overrides
-            user_id: User ID to fetch preferences for
-            db: Database connection to fetch user preferences
-        """
-        # Start with system defaults
-        config = {
+    def _default_thread_config(self) -> Dict[str, Any]:
+        """System-default thread config (hierarchy level 1)."""
+        return {
             # Text generation
             "model": self.gpt_model,
             "temperature": self.default_temperature,
@@ -355,64 +346,87 @@ class BotConfig:
             "enable_mcp": self.mcp_enabled_default,
         }
         
-        # Apply user preferences if available
+    @staticmethod
+    def _map_user_prefs(user_prefs: Dict[str, Any]) -> Dict[str, Any]:
+        """Map database user-preference fields to config keys (hierarchy level 2)."""
+        user_config = {}
+
+        # Model and generation settings
+        if user_prefs.get('model'):
+            user_config['model'] = user_prefs['model']
+        if user_prefs.get('reasoning_effort'):
+            user_config['reasoning_effort'] = user_prefs['reasoning_effort']
+        if user_prefs.get('verbosity'):
+            user_config['verbosity'] = user_prefs['verbosity']
+        if user_prefs.get('temperature') is not None:
+            user_config['temperature'] = user_prefs['temperature']
+        if user_prefs.get('top_p') is not None:
+            user_config['top_p'] = user_prefs['top_p']
+
+        # Feature toggles
+        if user_prefs.get('enable_web_search') is not None:
+            user_config['enable_web_search'] = bool(user_prefs['enable_web_search'])
+        if user_prefs.get('enable_mcp') is not None:
+            user_config['enable_mcp'] = bool(user_prefs['enable_mcp'])
+        if user_prefs.get('enable_streaming') is not None:
+            user_config['enable_streaming'] = bool(user_prefs['enable_streaming'])
+            user_config['slack_streaming'] = bool(user_prefs['enable_streaming'])
+
+        # Image settings
+        if user_prefs.get('image_model'):
+            user_config['image_model'] = user_prefs['image_model']
+        if user_prefs.get('image_size'):
+            user_config['image_size'] = user_prefs['image_size']
+        if user_prefs.get('image_quality'):
+            user_config['image_quality'] = user_prefs['image_quality']
+        if user_prefs.get('image_background'):
+            user_config['image_background'] = user_prefs['image_background']
+        if user_prefs.get('input_fidelity'):
+            user_config['input_fidelity'] = user_prefs['input_fidelity']
+        if user_prefs.get('vision_detail'):
+            user_config['detail_level'] = user_prefs['vision_detail']
+
+        # Custom instructions
+        if user_prefs.get('custom_instructions'):
+            user_config['custom_instructions'] = user_prefs['custom_instructions']
+
+        return user_config
+
+    def _compose_thread_config(self, user_prefs: Optional[Dict[str, Any]],
+                               overrides: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Compose the config hierarchy: defaults <- user prefs <- thread overrides."""
+        config = self._default_thread_config()
+        if user_prefs:
+            config.update(self._map_user_prefs(user_prefs))
+        if overrides:
+            config.update(overrides)
+        return config
+
+    def get_thread_config(self, overrides: Optional[Dict[str, Any]] = None, user_id: Optional[str] = None, db = None) -> Dict[str, Any]:
+        """Get configuration for a specific thread with settings hierarchy:
+        1. System defaults (from .env)
+        2. User preferences (from database)
+        3. Thread overrides (passed as parameter)
+        """
+        user_prefs = None
         if user_id and db:
             try:
                 user_prefs = db.get_user_preferences(user_id)
-                if user_prefs:
-                    # Map database fields to config keys
-                    user_config = {}
-                    
-                    # Model and generation settings
-                    if user_prefs.get('model'):
-                        user_config['model'] = user_prefs['model']
-                    if user_prefs.get('reasoning_effort'):
-                        user_config['reasoning_effort'] = user_prefs['reasoning_effort']
-                    if user_prefs.get('verbosity'):
-                        user_config['verbosity'] = user_prefs['verbosity']
-                    if user_prefs.get('temperature') is not None:
-                        user_config['temperature'] = user_prefs['temperature']
-                    if user_prefs.get('top_p') is not None:
-                        user_config['top_p'] = user_prefs['top_p']
-                    
-                    # Feature toggles
-                    if user_prefs.get('enable_web_search') is not None:
-                        user_config['enable_web_search'] = bool(user_prefs['enable_web_search'])
-                    if user_prefs.get('enable_mcp') is not None:
-                        user_config['enable_mcp'] = bool(user_prefs['enable_mcp'])
-                    if user_prefs.get('enable_streaming') is not None:
-                        user_config['enable_streaming'] = bool(user_prefs['enable_streaming'])
-                        user_config['slack_streaming'] = bool(user_prefs['enable_streaming'])
-                    
-                    # Image settings
-                    if user_prefs.get('image_model'):
-                        user_config['image_model'] = user_prefs['image_model']
-                    if user_prefs.get('image_size'):
-                        user_config['image_size'] = user_prefs['image_size']
-                    if user_prefs.get('image_quality'):
-                        user_config['image_quality'] = user_prefs['image_quality']
-                    if user_prefs.get('image_background'):
-                        user_config['image_background'] = user_prefs['image_background']
-                    if user_prefs.get('input_fidelity'):
-                        user_config['input_fidelity'] = user_prefs['input_fidelity']
-                    if user_prefs.get('vision_detail'):
-                        user_config['detail_level'] = user_prefs['vision_detail']
-                    
-                    # Custom instructions
-                    if user_prefs.get('custom_instructions'):
-                        user_config['custom_instructions'] = user_prefs['custom_instructions']
-                    
-                    # Apply user config over system defaults
-                    config.update(user_config)
             except Exception as e:
-                # Log error but continue with defaults
-                print(f"Error fetching user preferences: {e}")
-        
-        # Finally apply thread overrides (highest priority)
-        if overrides:
-            config.update(overrides)
-        
-        return config
+                logging.getLogger("bot.config").warning(f"Error fetching user preferences: {e}")
+        return self._compose_thread_config(user_prefs, overrides)
+
+    async def get_thread_config_async(self, overrides: Optional[Dict[str, Any]] = None,
+                                      user_id: Optional[str] = None, db = None) -> Dict[str, Any]:
+        """Async get_thread_config — awaits the aiosqlite preference read instead of
+        blocking the event loop with sync sqlite on every message."""
+        user_prefs = None
+        if user_id and db:
+            try:
+                user_prefs = await db.get_user_preferences_async(user_id)
+            except Exception as e:
+                logging.getLogger("bot.config").warning(f"Error fetching user preferences: {e}")
+        return self._compose_thread_config(user_prefs, overrides)
 
 
 # Global config instance

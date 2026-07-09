@@ -11,7 +11,7 @@ from prompts import IMAGE_ANALYSIS_PROMPT
 
 
 class VisionHandlerMixin:
-    def _inject_image_analyses(self, messages: List[Dict], thread_state) -> List[Dict]:
+    async def _inject_image_analyses(self, messages: List[Dict], thread_state) -> List[Dict]:
         """Inject stored image analyses into conversation for context.
 
         Keys on the Slack ts stamped into each message's metadata (Phase S — there is no
@@ -36,7 +36,7 @@ class VisionHandlerMixin:
 
                 if msg_ts:
                     # Get images associated with this specific message
-                    images_for_message = self.db.get_images_by_message(thread_key, msg_ts)
+                    images_for_message = await self.db.get_images_by_message_async(thread_key, msg_ts)
 
                     for img_data in images_for_message:
                         analysis = img_data.get("analysis")
@@ -122,7 +122,7 @@ class VisionHandlerMixin:
             user_real_name = message.metadata.get("user_real_name", None) if message.metadata else None
             user_email = message.metadata.get("user_email", None) if message.metadata else None
             # Use thread config model for vision analysis (with user preferences)
-            thread_config = config.get_thread_config(
+            thread_config = await config.get_thread_config_async(
                 overrides=thread_state.config_overrides,
                 user_id=message.user_id,
                 db=self.db
@@ -140,7 +140,7 @@ class VisionHandlerMixin:
                 user_question = user_text
             
             # Inject stored image analyses for better context
-            enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state)
+            enhanced_messages = await self._inject_image_analyses(thread_state.messages, thread_state)
             
             # Pre-trim messages to fit within context window
             enhanced_messages = await self._pre_trim_messages_for_api(enhanced_messages, model=thread_state.current_model)
@@ -484,7 +484,7 @@ class VisionHandlerMixin:
                     
                     # Save comprehensive vision analysis for URL images
                     if self.db:
-                        self.db.save_image_metadata(
+                        await self.db.save_image_metadata_async(
                             thread_id=thread_key,
                             url=url_img["original_url"],
                             image_type="url",
@@ -501,7 +501,7 @@ class VisionHandlerMixin:
                     # Only save actual images, not PDFs or other documents
                     if att.get("url") and att.get("type") == "image":
                         # Save the comprehensive vision analysis to database
-                        self.db.save_image_metadata(
+                        await self.db.save_image_metadata_async(
                             thread_id=thread_key,
                             url=att["url"],
                             image_type="uploaded",
@@ -681,7 +681,7 @@ class VisionHandlerMixin:
         
         # Check if we have any images in the conversation that provide context
         image_registry = self._extract_image_registry(thread_state)
-        has_images = bool(image_registry) or self._has_recent_image(thread_state)
+        has_images = bool(image_registry) or await self._has_recent_image(thread_state)
         
         # Check if we have documents in the conversation
         document_ledger = self.thread_manager.get_document_ledger(thread_state.thread_ts)

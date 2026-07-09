@@ -2148,6 +2148,97 @@ class DatabaseManager(LoggerMixin):
                     return prefs
                 return {}
 
+    async def find_thread_images_async(self, thread_id: str, image_type: Optional[str] = None) -> List[Dict]:
+        """Async version of find_thread_images."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+
+            if image_type:
+                query = ("SELECT * FROM images WHERE thread_id = ? AND image_type = ? "
+                         "ORDER BY created_at ASC")
+                params = (thread_id, image_type)
+            else:
+                query = "SELECT * FROM images WHERE thread_id = ? ORDER BY created_at ASC"
+                params = (thread_id,)
+
+            async with db.execute(query, params) as cursor:
+                images = []
+                async for row in cursor:
+                    img = dict(row)
+                    if img.get("metadata_json"):
+                        img["metadata"] = json.loads(img["metadata_json"])
+                        del img["metadata_json"]
+                    images.append(img)
+                return images
+
+    async def get_images_by_message_async(self, thread_id: str, message_ts: str) -> List[Dict]:
+        """Async version of get_images_by_message."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+
+            async with db.execute(
+                "SELECT * FROM images WHERE thread_id = ? AND message_ts = ? ORDER BY created_at ASC",
+                (thread_id, message_ts)
+            ) as cursor:
+                images = []
+                async for row in cursor:
+                    img = dict(row)
+                    if img.get("metadata_json"):
+                        img["metadata"] = json.loads(img["metadata_json"])
+                        del img["metadata_json"]
+                    images.append(img)
+                return images
+
+    async def get_thread_documents_async(self, thread_id: str, limit: Optional[int] = None) -> List[Dict]:
+        """Async version of get_thread_documents."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+
+            query = "SELECT * FROM documents WHERE thread_id = ? ORDER BY created_at ASC"
+            if limit:
+                query += f" LIMIT {int(limit)}"
+
+            async with db.execute(query, (thread_id,)) as cursor:
+                documents = []
+                async for row in cursor:
+                    doc = dict(row)
+                    if doc.get("page_structure"):
+                        doc["page_structure"] = json.loads(doc["page_structure"])
+                    if doc.get("metadata_json"):
+                        doc["metadata"] = json.loads(doc["metadata_json"])
+                        del doc["metadata_json"]
+                    documents.append(doc)
+                return documents
+
+    async def get_or_create_thread_async(self, thread_id: str, channel_id: str,
+                                         user_id: Optional[str] = None) -> Dict:
+        """Async wrapper for get_or_create_thread.
+
+        The sync method is multi-step (lookup, activity touch, user-config copy,
+        insert, recursive re-read); duplicating it in aiosqlite risks divergence,
+        so it runs unchanged on a worker thread (the shared connection is created
+        with check_same_thread=False and WAL handles concurrency).
+        """
+        return await asyncio.to_thread(self.get_or_create_thread, thread_id, channel_id, user_id)
+
+    async def cleanup_old_modal_sessions_async(self, hours: int = 24):
+        """Async version of cleanup_old_modal_sessions."""
+        try:
+            cutoff = int((datetime.now() - timedelta(hours=hours)).timestamp())
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("PRAGMA journal_mode=WAL")
+                cursor = await db.execute(
+                    "DELETE FROM modal_sessions WHERE created_at < ?", (cutoff,)
+                )
+                await db.commit()
+                if cursor.rowcount > 0:
+                    self.log_info(f"Cleaned up {cursor.rowcount} modal sessions older than {hours} hours")
+        except Exception as e:
+            self.log_error(f"Failed to cleanup modal sessions: {e}")
+
     async def get_user_timezone_async(self, user_id: str) -> Optional[str]:
         """
         Async version of get_user_timezone.

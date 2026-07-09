@@ -15,11 +15,17 @@ class ImageEditMixin:
     async def _find_target_image(self, user_text: str, thread_state, client: BaseClient) -> Optional[str]:
         """Find the target image URL based on user's reference using DB"""
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-        
+
+        # If a just-generated image's upload is still in flight (it lands after the
+        # thread lock releases), wait for its DB row so "edit it" targets the NEW
+        # image instead of silently editing the previous one.
+        if hasattr(self.thread_manager, "wait_for_uploads"):
+            await self.thread_manager.wait_for_uploads(thread_key)
+
         # Get all images from DB for this thread
         all_available_images = []
         if self.db:
-            db_images = self.db.find_thread_images(thread_key)
+            db_images = await self.db.find_thread_images_async(thread_key)
             for img in db_images:
                 all_available_images.append({
                     "url": img.get("url"),
@@ -161,14 +167,14 @@ class ImageEditMixin:
                     self.log_info(f"Editing existing image with request: {text}")
                     
                     # Get thread config (with user preferences)
-                    thread_config = config.get_thread_config(
+                    thread_config = await config.get_thread_config_async(
                         overrides=thread_state.config_overrides,
                         user_id=message.user_id,
                         db=self.db
                     )
                     
                     # Inject stored image analyses for style matching
-                    enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state)
+                    enhanced_messages = await self._inject_image_analyses(thread_state.messages, thread_state)
                     
                     # Pre-trim messages to fit within context window
                     enhanced_messages = await self._pre_trim_messages_for_api(enhanced_messages, model=thread_state.current_model)
@@ -341,7 +347,7 @@ class ImageEditMixin:
                     # Clean up any status messages
                     if "status_message_id" in response_metadata:
                         if hasattr(client, 'delete_message'):
-                            client.delete_message(channel_id, response_metadata["status_message_id"])
+                            await client.delete_message(channel_id, response_metadata["status_message_id"])
                     
                     # Add user-friendly explanation to thread
                     moderation_msg = (
@@ -366,7 +372,7 @@ class ImageEditMixin:
                 if "status_message_id" in response_metadata:
                     # Delete the "Editing your image..." message
                     if hasattr(client, 'delete_message'):
-                        client.delete_message(channel_id, response_metadata["status_message_id"])
+                        await client.delete_message(channel_id, response_metadata["status_message_id"])
                 elif thinking_id and not response_metadata.get("prompt_message_id"):
                     # Update the thinking message to show we're generating instead
                     self._update_status(client, channel_id, thinking_id, 
@@ -441,11 +447,11 @@ class ImageEditMixin:
         self._update_status(client, channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
         
         # Log the analysis prompt
-        print("\n" + "="*100)
-        print("DEBUG: IMAGE EDIT FLOW - STEP 1: ANALYZE IMAGE")
-        print("="*100)
-        print(f"Analysis Question: {IMAGE_ANALYSIS_PROMPT}")
-        print("="*100)
+        self.log_debug("\n" + "="*100)
+        self.log_debug("DEBUG: IMAGE EDIT FLOW - STEP 1: ANALYZE IMAGE")
+        self.log_debug("="*100)
+        self.log_debug(f"Analysis Question: {IMAGE_ANALYSIS_PROMPT}")
+        self.log_debug("="*100)
         
         # Start progress updater for analysis
         progress_task = None
@@ -467,11 +473,11 @@ class ImageEditMixin:
             )
 
             # Log the full analysis result
-            print("\n" + "="*100)
-            print("DEBUG: IMAGE EDIT FLOW - STEP 2: ANALYSIS RESULT")
-            print("="*100)
-            print(f"Image Description (Full):\n{image_description}")
-            print("="*100)
+            self.log_debug("\n" + "="*100)
+            self.log_debug("DEBUG: IMAGE EDIT FLOW - STEP 2: ANALYSIS RESULT")
+            self.log_debug("="*100)
+            self.log_debug(f"Image Description (Full):\n{image_description}")
+            self.log_debug("="*100)
 
             # Don't show the analysis - just update status to show we're editing
             # The analysis is only used internally for better edit quality
@@ -486,12 +492,12 @@ class ImageEditMixin:
             self.log_warning(f"Failed to analyze images, continuing without context: {e}")
             image_analysis = None
             user_edit_request = text
-            print("\n" + "="*100)
-            print("DEBUG: IMAGE EDIT FLOW - ANALYSIS FAILED")
-            print("="*100)
-            print(f"Error: {e}")
-            print(f"Falling back to user prompt only: {text}")
-            print("="*100)
+            self.log_debug("\n" + "="*100)
+            self.log_debug("DEBUG: IMAGE EDIT FLOW - ANALYSIS FAILED")
+            self.log_debug("="*100)
+            self.log_debug(f"Error: {e}")
+            self.log_debug(f"Falling back to user prompt only: {text}")
+            self.log_debug("="*100)
         finally:
             # Cancel progress updater
             if progress_task and not progress_task.done():
@@ -499,14 +505,14 @@ class ImageEditMixin:
                 self.log_debug("Cancelled progress updater after image analysis")
         
         # Get thread config for settings (with user preferences)
-        thread_config = config.get_thread_config(
+        thread_config = await config.get_thread_config_async(
             overrides=thread_state.config_overrides,
             user_id=message.user_id,
                 db=self.db
         )
         
         # Inject stored image analyses for style matching
-        enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state) if thread_state.messages else None
+        enhanced_messages = await self._inject_image_analyses(thread_state.messages, thread_state) if thread_state.messages else None
         
         # Pre-trim messages to fit within context window if we have messages
         if enhanced_messages:

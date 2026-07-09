@@ -9,6 +9,17 @@ from config import config
 from prompts import IMAGE_INTENT_SYSTEM_PROMPT, MEMORY_EXTRACTION_SYSTEM_PROMPT, WAKE_CLASSIFIER_SYSTEM_PROMPT
 
 
+def _capture_usage(usage_sink, response):
+    """Copy response.usage into the caller's sink (usage-driven context budgeting)."""
+    if usage_sink is None or response is None:
+        return
+    usage = getattr(response, "usage", None)
+    if not usage:
+        return
+    usage_sink["input_tokens"] = getattr(usage, "input_tokens", 0) or 0
+    usage_sink["output_tokens"] = getattr(usage, "output_tokens", 0) or 0
+
+
 async def create_text_response(
     self,
     messages: List[Dict[str, Any]],
@@ -21,6 +32,7 @@ async def create_text_response(
     verbosity: Optional[str] = None,
     store: bool = False,  # Don't store by default for stateless operation
     prompt_cache_key: Optional[str] = None,
+    usage_sink: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Create a text response using the Responses API
@@ -103,6 +115,8 @@ async def create_text_response(
             **request_params
         )
         
+        _capture_usage(usage_sink, response)
+
         # Extract text from response
         output_text = ""
         if response.output:
@@ -134,7 +148,8 @@ async def create_text_response_with_tools(
     return_metadata: bool = False,
     function_call_sink: Optional[List[Dict[str, Any]]] = None,
     tool_choice: Optional[str] = None,
-    prompt_cache_key: Optional[str] = None
+    prompt_cache_key: Optional[str] = None,
+    usage_sink: Optional[Dict[str, Any]] = None
 ) -> str:
     """
     Create text response with tools (e.g., web search)
@@ -218,6 +233,8 @@ async def create_text_response_with_tools(
             **request_params
         )
         
+        _capture_usage(usage_sink, response)
+
         # Extract text from response and detect tool usage
         output_text = ""
         tools_actually_used = []
@@ -285,6 +302,7 @@ async def create_streaming_response(
     store: bool = False,
     tool_callback: Optional[Callable[[str, str], Any]] = None,
     prompt_cache_key: Optional[str] = None,
+    usage_sink: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Create a streaming text response using the Responses API
@@ -429,6 +447,7 @@ async def create_streaming_response(
                                     self.log_warning(f"Tool callback error for MCP completion: {e}")
                     continue
                 elif event_type in ["response.done", "response.completed"]:
+                    _capture_usage(usage_sink, getattr(event, "response", None))
                     self.log_info("Stream completed")
                     # Signal the callback that streaming is complete with None
                     # This allows it to flush any remaining buffered text
@@ -516,7 +535,8 @@ async def create_streaming_response_with_tools(
     tool_callback: Optional[Callable[[str, str], Any]] = None,
     function_call_sink: Optional[List[Dict[str, Any]]] = None,
     tool_choice: Optional[str] = None,
-    prompt_cache_key: Optional[str] = None
+    prompt_cache_key: Optional[str] = None,
+    usage_sink: Optional[Dict[str, Any]] = None
 ) -> str:
     """
     Create streaming text response with tools (e.g., web search)
@@ -694,6 +714,7 @@ async def create_streaming_response_with_tools(
                             })
                     continue
                 elif event_type in ["response.done", "response.completed"]:
+                    _capture_usage(usage_sink, getattr(event, "response", None))
                     self.log_info("Stream completed")
                     # When the round produced local function calls, the tool loop will run
                     # another round — don't signal completion to the buffer yet.
@@ -1041,7 +1062,7 @@ async def classify_intent(
         for retry in range(1, max_retries + 1):
             wait_time = 2 ** (retry - 1)  # 1s, 2s, 4s...
             self.log_warning(f"Intent classification timeout (attempt {retry}/{max_retries}), retrying in {wait_time}s...")
-            time.sleep(wait_time)
+            await asyncio.sleep(wait_time)
 
             try:
                 # Retry the classification with shorter timeout
