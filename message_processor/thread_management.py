@@ -435,6 +435,10 @@ class ThreadManagementMixin:
         if dropped:
             await self._write_thread_summary(thread_state, thread_key, dropped)
 
+        # Re-baseline the tracked context size from the compacted messages; the next
+        # API call's usage replaces this with the exact number.
+        thread_state.reset_context_estimate(self.thread_manager._token_counter)
+
         if total_processed:
             self.log_info(
                 f"Compacted thread {thread_key}: {total_processed} message(s) processed, "
@@ -559,6 +563,25 @@ class ThreadManagementMixin:
             })
         thread_state.has_summary_head = True
 
+    def _tracked_context_tokens(self, thread_state):
+        """The usage-tracked context size as an int, or None when unavailable
+        (falls back to a chars/4 estimate at the call site)."""
+        try:
+            value = int(getattr(thread_state, "context_tokens", 0))
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    @staticmethod
+    def _is_context_length_error(e) -> bool:
+        """Detect the API's context-window-exceeded error (backstop for the chars/4
+        estimator — compact + retry once instead of failing the response)."""
+        s = str(e).lower()
+        return ("context_length_exceeded" in s
+                or "maximum context length" in s
+                or "context window" in s
+                or getattr(e, "code", None) == "context_length_exceeded")
+
     @staticmethod
     def _render_reactions_annotation(reactions) -> str:
         """Render a message's reactions (from conversations.replies) as a compact,
@@ -637,7 +660,7 @@ class ThreadManagementMixin:
         )
 
         try:
-            existing = db.get_channel_memory(channel_id)
+            existing = await db.get_channel_memory_async(channel_id)
         except Exception:
             existing = []
         existing_min = [{"id": r["id"], "content": r["content"]} for r in existing]
@@ -651,12 +674,12 @@ class ThreadManagementMixin:
             cap = max(1, config.memory_max_rows)
             while len(chan_rows) >= cap:
                 oldest = min(chan_rows, key=lambda r: r.get("updated_ts") or "")
-                db.delete_channel_memory(oldest["id"])
+                await db.delete_channel_memory_async(oldest["id"])
                 chan_rows.remove(oldest)
-            db.add_channel_memory(channel_id, decision["content"], scope="channel")
+            await db.add_channel_memory_async(channel_id, decision["content"], scope="channel")
             self.log_info(f"Channel memory: recorded a durable fact for {channel_id}")
         elif action == "update" and decision.get("id") is not None and decision.get("content"):
-            db.update_channel_memory(decision["id"], decision["content"])
+            await db.update_channel_memory_async(decision["id"], decision["content"])
             self.log_info(f"Channel memory: updated fact {decision['id']} for {channel_id}")
 
     async def _async_post_response_cleanup(self, thread_state, thread_key: str):
@@ -683,9 +706,11 @@ class ThreadManagementMixin:
             max_tokens = config.get_model_token_limit(model)
             cleanup_threshold = int(max_tokens * config.token_cleanup_threshold)
             
-            # Check current token usage
-            current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-            
+            # Usage-driven budgeting: the tracked number (API usage + increment
+            # estimates) is authoritative; fall back to a fresh estimate if unset.
+            current_tokens = self._tracked_context_tokens(thread_state) or \
+                self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+
             if current_tokens > cleanup_threshold:
                 self.log_info(f"Thread at {current_tokens}/{max_tokens} tokens ({current_tokens/max_tokens:.1%}), triggering compaction")
 
@@ -721,7 +746,7 @@ class ThreadManagementMixin:
         should_rebuild = not thread_state.messages
         if not should_rebuild and self.db:
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-            db_images = self.db.find_thread_images(thread_key)
+            db_images = await self.db.find_thread_images_async(thread_key)
             if not db_images and thread_state.messages:
                 # We have messages but no images - check if there should be images
                 for msg in thread_state.messages:
@@ -877,7 +902,7 @@ class ThreadManagementMixin:
                                     # Determine image type from content
                                     image_type = "generated" if "Generated image:" in content else "edited" if "Edited image:" in content else "assistant"
                                     try:
-                                        self.db.save_image_metadata(
+                                        await self.db.save_image_metadata_async(
                                             thread_id=f"{thread_state.channel_id}:{thread_state.thread_ts}",
                                             url=url,
                                             image_type=image_type,
@@ -924,7 +949,7 @@ class ThreadManagementMixin:
                                 
                                 if self.db:
                                     try:
-                                        self.db.save_image_metadata(
+                                        await self.db.save_image_metadata_async(
                                             thread_id=f"{thread_state.channel_id}:{thread_state.thread_ts}",
                                             url=att_url,
                                             image_type="uploaded",
@@ -952,7 +977,7 @@ class ThreadManagementMixin:
                                     
                                     if document_data and self.document_handler:
                                         # Extract document content
-                                        extracted_content = self.document_handler.safe_extract_content(
+                                        extracted_content = await self.document_handler.safe_extract_content_async(
                                             document_data, mimetype, filename
                                         )
                                         
@@ -1010,7 +1035,7 @@ class ThreadManagementMixin:
                                 try:
                                     # Update the existing image metadata with the analysis
                                     self.log_debug(f"Storing analysis for: {image_url}")
-                                    self.db.save_image_metadata(
+                                    await self.db.save_image_metadata_async(
                                         thread_id=f"{thread_state.channel_id}:{thread_state.thread_ts}",
                                         url=image_url,
                                         image_type="uploaded",
@@ -1039,10 +1064,18 @@ class ThreadManagementMixin:
             
             self.log_info(f"Rebuilt thread with {len(thread_state.messages)} messages")
         
-        # Apply smart trimming recursively if needed after rebuild
+        # Pre-flight compaction decision after rebuild. Cold rebuild has no usage
+        # number yet — the whole assembled context is ESTIMATED at chars/4 (crude is
+        # fine under TOKEN_BUFFER_PERCENTAGE headroom; the context_length_exceeded
+        # backstop catches estimator edge cases like document-heavy rebuilds).
         model = thread_state.current_model or config.gpt_model
         max_tokens = config.get_model_token_limit(model)
-        current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+        try:
+            thread_state.reset_context_estimate(self.thread_manager._token_counter)
+        except Exception:
+            pass  # non-standard thread_state (tests); estimate below regardless
+        current_tokens = self._tracked_context_tokens(thread_state) or \
+            self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
         
         if current_tokens > max_tokens:
             self.log_info(f"Thread rebuilt over limit ({current_tokens}/{max_tokens} tokens), compacting")

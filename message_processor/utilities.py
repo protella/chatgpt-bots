@@ -296,7 +296,7 @@ class MessageUtilitiesMixin:
                                               emoji=config.analyze_emoji)
                         
                         # Extract document content using DocumentHandler
-                        extracted_content = self.document_handler.safe_extract_content(
+                        extracted_content = await self.document_handler.safe_extract_content_async(
                             document_data, mimetype, file_name
                         )
                         
@@ -466,7 +466,7 @@ class MessageUtilitiesMixin:
                                                       emoji=config.analyze_emoji)
                                 
                                 # Extract content
-                                extracted_content = self.document_handler.safe_extract_content(
+                                extracted_content = await self.document_handler.safe_extract_content_async(
                                     file_data, mimetype, file_name
                                 )
                                 
@@ -654,12 +654,12 @@ class MessageUtilitiesMixin:
         
         return image_registry
 
-    def _has_recent_image(self, thread_state) -> bool:
+    async def _has_recent_image(self, thread_state) -> bool:
         """Check if there are recent images in the conversation"""
         # First check the database for ALL images in this thread (no limit)
         if self.db:
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-            thread_images = self.db.find_thread_images(thread_key)
+            thread_images = await self.db.find_thread_images_async(thread_key)
             if thread_images:
                 self.log_debug(f"Found {len(thread_images)} images in DB for thread {thread_key}")
                 return True
@@ -709,7 +709,7 @@ class MessageUtilitiesMixin:
             bot_user_id=getattr(client, "bot_user_id", None),
         )
 
-    def _build_channel_memory_text(self, channel_id: Optional[str]) -> Optional[str]:
+    async def _build_channel_memory_text(self, channel_id: Optional[str]) -> Optional[str]:
         """Build the CHANNEL MEMORY block from stored durable facts for this channel (Phase 9).
         Returns None when disabled, no db, or no rows — so the system prompt is unchanged."""
         if not config.enable_channel_memory or not channel_id:
@@ -718,7 +718,7 @@ class MessageUtilitiesMixin:
         if not db:
             return None
         try:
-            rows = db.get_channel_memory(channel_id)
+            rows = await db.get_channel_memory_async(channel_id)
         except Exception:
             return None
         if not rows:
@@ -859,20 +859,34 @@ class MessageUtilitiesMixin:
                 f"({timezone_display}) — consider this when answering time-sensitive questions.]")
 
     def _schedule_async_call(self, coro):
-        """Helper to schedule async calls from sync contexts"""
+        """Schedule a fire-and-forget coroutine safely.
+
+        Keeps a strong reference (bare create_task results can be GC'd mid-flight)
+        and logs exceptions via a done-callback — otherwise background failures
+        (e.g. channel-memory extraction) vanish silently.
+        """
         import asyncio
         try:
-            # Try to get the current event loop, if one exists
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # We're in an async context, schedule as task
-                return asyncio.create_task(coro)
-            else:
-                # No running loop, run the coroutine
-                return asyncio.run(coro)
+            asyncio.get_running_loop()
         except RuntimeError:
-            # No event loop, create one
+            # No running loop (sync/test context) — run to completion
             return asyncio.run(coro)
+
+        task = asyncio.create_task(coro)
+        if not hasattr(self, "_background_tasks"):
+            self._background_tasks = set()
+        self._background_tasks.add(task)
+
+        def _log_result(t):
+            self._background_tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                self.log_error(f"Background task failed: {exc!r}")
+
+        task.add_done_callback(_log_result)
+        return task
 
     def _update_message_streaming_sync(self, client, channel_id: str, message_id: str, text: str):
         """Wrapper for calling async update_message_streaming from sync contexts
@@ -1177,15 +1191,28 @@ class MessageUtilitiesMixin:
                         thread_key = f"{channel_id}:{thread_id}"
                         image_type = "generated" if metadata.get("type") == "image_generation" else "edited"
                         prompt = metadata.get("prompt", "")
-                        
+
+                        # Carry the vision analysis into the DB row (edits stash it in
+                        # message metadata; the ledger is the fallback). Without this,
+                        # live-session images persist with empty analysis and natural-
+                        # language targeting ("the dog one") degrades until a cold rebuild.
+                        original_analysis = metadata.get("original_analysis") or ""
+                        analysis = metadata.get("analysis") or original_analysis
+                        if not analysis:
+                            ledger = self.thread_manager.get_asset_ledger(thread_state.thread_ts)
+                            # Only the newest entry can correspond to this upload —
+                            # scanning older entries would attach the wrong image's analysis.
+                            if ledger and ledger.images and ledger.images[-1].get("analysis"):
+                                analysis = ledger.images[-1]["analysis"]
+
                         # Save the image metadata to DB
                         await self.db.save_image_metadata_async(
                             thread_id=thread_key,
                             url=url,
                             image_type=image_type,
                             prompt=prompt,
-                            analysis="",  # No analysis for generated images
-                            original_analysis=""
+                            analysis=analysis or "",
+                            original_analysis=original_analysis
                         )
                         self.log_info(f"Saved {image_type} image to DB: {url}")
                     break

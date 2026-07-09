@@ -154,18 +154,18 @@ async def _enhance_image_edit_prompt(
         context += f"\nImage Description:\n{image_description}\n\nUser Edit Request:\n{user_request}"
 
     # Log the enhancement input
-    print("\n" + "=" * 80)
-    print("DEBUG: IMAGE EDIT FLOW - STEP 4: EDIT PROMPT ENHANCEMENT")
-    print("=" * 80)
-    print(f"User Request: {user_request}")
-    print(
+    self.log_debug("\n" + "=" * 80)
+    self.log_debug("DEBUG: IMAGE EDIT FLOW - STEP 4: EDIT PROMPT ENHANCEMENT")
+    self.log_debug("=" * 80)
+    self.log_debug(f"User Request: {user_request}")
+    self.log_debug(
         f"Image Description: {image_description[:200]}..."
         if len(image_description) > 200
         else f"Image Description: {image_description}"
     )
     if conversation_history and len(conversation_history) > 0:
-        print(f"Including {len(conversation_history)} conversation messages for context")
-    print("=" * 80)
+        self.log_debug(f"Including {len(conversation_history)} conversation messages for context")
+    self.log_debug("=" * 80)
 
     try:
         # Build request parameters with edit-specific system prompt
@@ -236,11 +236,11 @@ async def _enhance_image_edit_prompt(
         enhanced = enhanced.strip()
 
         # Log the enhanced result
-        print("\n" + "=" * 80)
-        print("DEBUG: IMAGE EDIT FLOW - STEP 5: ENHANCED EDIT PROMPT")
-        print("=" * 80)
-        print(f"Final Enhanced Edit Prompt:\n{enhanced}")
-        print("=" * 80)
+        self.log_debug("\n" + "=" * 80)
+        self.log_debug("DEBUG: IMAGE EDIT FLOW - STEP 5: ENHANCED EDIT PROMPT")
+        self.log_debug("=" * 80)
+        self.log_debug(f"Final Enhanced Edit Prompt:\n{enhanced}")
+        self.log_debug("=" * 80)
 
         if enhanced and len(enhanced) > 10:
             return enhanced
@@ -284,12 +284,12 @@ async def _enhance_image_prompt(
     context += f"\nCurrent User Request: {prompt}"
 
     # Log the prompt enhancement input
-    print("\n" + "=" * 80)
-    print("DEBUG: IMAGE EDIT FLOW - STEP 4: PROMPT ENHANCEMENT INPUT")
-    print("=" * 80)
-    print(f"Original Prompt to Enhance:\n{prompt}")
-    print(f"\nFull Context Sent to Enhancer:\n{context}")
-    print("=" * 80)
+    self.log_debug("\n" + "=" * 80)
+    self.log_debug("DEBUG: IMAGE EDIT FLOW - STEP 4: PROMPT ENHANCEMENT INPUT")
+    self.log_debug("=" * 80)
+    self.log_debug(f"Original Prompt to Enhance:\n{prompt}")
+    self.log_debug(f"\nFull Context Sent to Enhancer:\n{context}")
+    self.log_debug("=" * 80)
 
     try:
         # If streaming callback provided, use streaming response
@@ -342,20 +342,20 @@ async def _enhance_image_prompt(
             enhanced = enhanced.strip()
 
         # Log the enhanced prompt result
-        print("\n" + "=" * 80)
-        print("DEBUG: IMAGE EDIT FLOW - STEP 5: ENHANCED PROMPT OUTPUT")
-        print("=" * 80)
-        print(f"Final Enhanced Prompt:\n{enhanced}")
-        print("=" * 80)
+        self.log_debug("\n" + "=" * 80)
+        self.log_debug("DEBUG: IMAGE EDIT FLOW - STEP 5: ENHANCED PROMPT OUTPUT")
+        self.log_debug("=" * 80)
+        self.log_debug(f"Final Enhanced Prompt:\n{enhanced}")
+        self.log_debug("=" * 80)
 
         # Make sure we got a valid enhancement
         if enhanced and len(enhanced) > 10:
             self.log_debug(f"Enhanced prompt: {enhanced[:100]}...")
             return enhanced
         else:
-            print("\n" + "=" * 80)
-            print("DEBUG: Enhancement failed or too short, using original")
-            print("=" * 80)
+            self.log_debug("\n" + "=" * 80)
+            self.log_debug("DEBUG: Enhancement failed or too short, using original")
+            self.log_debug("=" * 80)
             return prompt
 
     except Exception as e:

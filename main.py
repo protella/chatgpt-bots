@@ -146,7 +146,13 @@ class ChatBotV2:
                         except Exception as e:
                             main_logger.debug(f"Response footer skipped: {e}")
                 elif response.type == "image":
-                    # Show uploading status 
+                    # Latch: the upload + DB row land after the thread lock released, so a
+                    # fast follow-up "edit it" must wait for this to finish (or time out).
+                    upload_thread_key = f"{message.channel_id}:{message.thread_id}"
+                    upload_manager = getattr(self.processor, "thread_manager", None)
+                    if upload_manager and hasattr(upload_manager, "mark_upload_started"):
+                        upload_manager.mark_upload_started(upload_thread_key)
+                    # Show uploading status
                     upload_status_id = None
                     # Use the client's name (e.g., "SlackBot") or extract platform name
                     platform_name = client.name.replace("Bot", "") if hasattr(client, 'name') else "system"
@@ -169,24 +175,30 @@ class ChatBotV2:
                         if upload_status_id and hasattr(client, 'update_message'):
                             await client.update_message(message.channel_id, upload_status_id, upload_status)
                     
-                    # Send image
-                    image_data = response.content
-                    file_url = await client.send_image(
-                        message.channel_id,
-                        message.thread_id,
-                        image_data.to_bytes(),
-                        f"generated_image.{image_data.format}",
-                        ""  # No caption - prompt already displayed via streaming
-                    )
-                    
-                    # Update thread state with the URL
-                    if file_url:
-                        await self.processor.update_last_image_url(
+                    try:
+                        # Send image
+                        image_data = response.content
+                        file_url = await client.send_image(
                             message.channel_id,
                             message.thread_id,
-                            file_url
+                            image_data.to_bytes(),
+                            f"generated_image.{image_data.format}",
+                            ""  # No caption - prompt already displayed via streaming
                         )
-                    
+
+                        # Update thread state with the URL
+                        if file_url:
+                            await self.processor.update_last_image_url(
+                                message.channel_id,
+                                message.thread_id,
+                                file_url
+                            )
+                    finally:
+                        # Always release the latch — a wedged latch would stall the next
+                        # edit for the full wait timeout.
+                        if upload_manager and hasattr(upload_manager, "mark_upload_finished"):
+                            upload_manager.mark_upload_finished(upload_thread_key)
+
                     # Wait 4 seconds then handle cleanup
                     if upload_status_id:
                         await asyncio.sleep(4)
@@ -296,7 +308,7 @@ class ChatBotV2:
 
                         # Also clean up old modal sessions (24 hours old)
                         if hasattr(self.processor, 'db') and self.processor.db:
-                            self.processor.db.cleanup_old_modal_sessions(hours=24)
+                            await self.processor.db.cleanup_old_modal_sessions_async(hours=24)
                             main_logger.info("Cleaned up old modal sessions")
 
                         stats = self.processor.get_stats()

@@ -55,6 +55,15 @@ def _incoming(ts="200.0", text="latest question"):
                    attachments=[], metadata={"ts": ts})
 
 
+async def _inject(proc, messages, state):
+    """Call _inject_image_analyses tolerating both sync and async signatures
+    (a parallel async-audit workstream is converting mixin methods)."""
+    result = proc._inject_image_analyses(messages, state)
+    if hasattr(result, "__await__"):
+        result = await result
+    return result
+
+
 def _client_with_history(history):
     client = MagicMock()
     client.get_thread_history = AsyncMock(return_value=history)
@@ -268,7 +277,8 @@ def test_mirror_drop_migration(tmp_path, monkeypatch):
 
 # ------------------------------------------------- image injection via metadata ts
 
-def test_image_injection_uses_message_ts_metadata(temp_db):
+@pytest.mark.asyncio
+async def test_image_injection_uses_message_ts_metadata(temp_db):
     thread_key = "C1:100.0"
     temp_db.get_or_create_thread(thread_key, "C1")
     temp_db.save_image_metadata(thread_id=thread_key, url="https://img/cat.png",
@@ -280,7 +290,7 @@ def test_image_injection_uses_message_ts_metadata(temp_db):
         {"role": "user", "content": "look at this", "metadata": {"ts": "101.0"}},
         {"role": "assistant", "content": "Nice cat!", "metadata": {"ts": "102.0"}},
     ]
-    enhanced = proc._inject_image_analyses(messages, state)
+    enhanced = await _inject(proc, messages, state)
     assert len(enhanced) == 3
     assert enhanced[1]["role"] == "developer"
     assert "A tabby cat on a desk." in enhanced[1]["content"]
@@ -312,7 +322,7 @@ async def test_two_rebuilds_serialize_identically(temp_db):
     async def one_rebuild():
         proc = _Proc(db=temp_db)
         state = await proc._get_or_rebuild_thread_state(_incoming(), _client_with_history(fixtures()))
-        injected = proc._inject_image_analyses(state.messages, state)
+        injected = await _inject(proc, state.messages, state)
         return json.dumps(injected, sort_keys=True)
 
     assert await one_rebuild() == await one_rebuild()
@@ -339,6 +349,124 @@ async def test_rebuild_includes_reactions_annotation(temp_db):
     state = await proc._get_or_rebuild_thread_state(_incoming(), _client_with_history(history))
     joined = json.dumps([m.get("content") for m in state.messages])
     assert ":tada: x1 (<@U9>)" in joined
+
+
+# --------------------------------------------- usage-driven token budgeting
+
+def test_estimator_is_chars_over_four_no_tiktoken():
+    import token_counter as tc
+    assert not hasattr(tc, "tiktoken")
+    counter = tc.TokenCounter("gpt-5.5")
+    assert counter.count_tokens("x" * 400) == 100
+    msg = {"role": "user", "content": "x" * 400}
+    assert counter.count_message_tokens(msg) == 100 + 4 + 1  # content + overhead + role
+    assert counter.count_thread_tokens([msg, msg]) == 2 * 105 + 3
+
+
+def test_thread_state_usage_tracking():
+    state = ThreadState(thread_ts="1.0", channel_id="C1")
+    assert state.context_tokens == 0
+
+    # Estimates accumulate as messages are added
+    state.add_message("user", "x" * 400)
+    est_after_one = state.context_tokens
+    assert est_after_one > 0
+    state.add_message("assistant", "y" * 400)
+    assert state.context_tokens > est_after_one
+
+    # The API's usage number REPLACES the estimate
+    state.record_usage(input_tokens=5000, output_tokens=300)
+    assert state.context_tokens == 5300
+
+    # Next message increments on top of the authoritative number
+    state.add_message("user", "z" * 400)
+    assert state.context_tokens > 5300
+
+    # Zero/None usage never wipes the tracked number
+    state.record_usage(0, 0)
+    assert state.context_tokens > 5300
+
+
+@pytest.mark.asyncio
+async def test_cleanup_trigger_uses_tracked_usage(temp_db):
+    """The compaction trigger reads thread_state.context_tokens (usage-driven),
+    not a recount of the messages."""
+    thread_key = "C1:100.0"
+    temp_db.get_or_create_thread(thread_key, "C1")
+    proc = _Proc(db=temp_db, openai_client=_mock_openai())
+    state = ThreadState(thread_ts="100.0", channel_id="C1")
+    for i in range(10):
+        # ~100 estimated tokens per message so the estimator agrees content exists
+        state.messages.append({"role": "user", "content": f"msg {i} " + "x" * 390,
+                               "metadata": {"ts": f"10{i}.0"}})
+
+    with patch.object(config, "get_model_token_limit", return_value=1000), \
+         patch.object(config, "token_cleanup_threshold", 0.9), \
+         patch.object(config, "token_compaction_target", 0.7):
+        # Tracked usage (authoritative) says we're tiny -> NO compaction, even
+        # though a recount of the messages would say ~1000 tokens. This is the
+        # trigger reading the tracked number, not recounting.
+        state.context_tokens = 100
+        await proc._async_post_response_cleanup(state, thread_key)
+        assert temp_db.get_thread_summary(thread_key) is None
+        assert len(state.messages) == 10
+
+        # Tracked usage over threshold -> compaction runs and writes the summary
+        state.context_tokens = 950
+        await proc._async_post_response_cleanup(state, thread_key)
+        assert temp_db.get_thread_summary(thread_key) is not None
+        assert len(state.messages) < 10
+
+
+def test_capture_usage_helper():
+    from openai_client.api.responses import _capture_usage
+
+    class _U:
+        input_tokens = 1234
+        output_tokens = 56
+
+    class _R:
+        usage = _U()
+
+    sink = {}
+    _capture_usage(sink, _R())
+    assert sink == {"input_tokens": 1234, "output_tokens": 56}
+
+    # None sink / response / usage are all safe no-ops
+    _capture_usage(None, _R())
+    sink2 = {}
+    _capture_usage(sink2, None)
+    _capture_usage(sink2, type("X", (), {"usage": None})())
+    assert sink2 == {}
+
+
+def test_context_length_error_detection():
+    is_err = ThreadManagementMixin._is_context_length_error
+    assert is_err(Exception("Error code: 400 - context_length_exceeded"))
+    assert is_err(Exception("This model's maximum context length is 400000 tokens"))
+    assert is_err(Exception("Input exceeds the context window of this model"))
+    assert not is_err(Exception("rate_limit_exceeded"))
+    assert not is_err(Exception("timeout"))
+
+
+@pytest.mark.asyncio
+async def test_compaction_rebaselines_tracked_estimate(temp_db):
+    thread_key = "C1:100.0"
+    temp_db.get_or_create_thread(thread_key, "C1")
+    proc = _Proc(db=temp_db, openai_client=_mock_openai())
+    state = ThreadState(thread_ts="100.0", channel_id="C1")
+    for i in range(20):
+        state.messages.append({"role": "user", "content": "filler " * 50,
+                               "metadata": {"ts": f"10{i}.0"}})
+    state.context_tokens = 999_999  # stale huge number
+
+    with patch.object(config, "get_model_token_limit", return_value=1000), \
+         patch.object(config, "token_compaction_target", 0.7):
+        await proc._compact_thread_to_target(state, thread_key)
+
+    # Tracked number was re-baselined from the compacted messages, not left stale
+    assert state.context_tokens < 999_999
+    assert state.context_tokens == proc.thread_manager._token_counter.count_thread_tokens(state.messages)
 
 
 # ------------------------------------ system prompt: date-only prefix, time suffix

@@ -135,8 +135,8 @@ class TestThreadManagerMoreMethods:
     
     @pytest.fixture
     def manager(self):
-        from thread_manager import ThreadStateManager
-        return ThreadStateManager()
+        from thread_manager import AsyncThreadStateManager
+        return AsyncThreadStateManager()
     
     @pytest.mark.skip(reason="Stats structure differs")
     def test_get_stats(self, manager):

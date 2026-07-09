@@ -25,14 +25,14 @@ class ImageGenerationMixin:
         response_metadata = {}
         
         # Get thread config (with user preferences)
-        thread_config = config.get_thread_config(
+        thread_config = await config.get_thread_config_async(
             overrides=thread_state.config_overrides,
             user_id=message.user_id,
             db=self.db
         )
         
         # Inject stored image analyses for style consistency
-        enhanced_messages = self._inject_image_analyses(thread_state.messages, thread_state)
+        enhanced_messages = await self._inject_image_analyses(thread_state.messages, thread_state)
         
         # Pre-trim messages to fit within context window
         enhanced_messages = await self._pre_trim_messages_for_api(enhanced_messages)

@@ -268,6 +268,7 @@ class OpenAIClient(LoggerMixin):
         verbosity: Optional[str] = None,
         store: bool = False,
         prompt_cache_key: Optional[str] = None,
+        usage_sink: Optional[Dict[str, Any]] = None,
     ) -> str:
         return await responses_api.create_text_response(
             self,
@@ -281,6 +282,7 @@ class OpenAIClient(LoggerMixin):
             verbosity=verbosity,
             store=store,
             prompt_cache_key=prompt_cache_key,
+            usage_sink=usage_sink,
         )
 
     async def create_text_response_with_tools(
@@ -297,6 +299,7 @@ class OpenAIClient(LoggerMixin):
         store: bool = False,
         return_metadata: bool = False,
         prompt_cache_key: Optional[str] = None,
+        usage_sink: Optional[Dict[str, Any]] = None,
     ) -> str:
         return await responses_api.create_text_response_with_tools(
             self,
@@ -312,6 +315,7 @@ class OpenAIClient(LoggerMixin):
             store=store,
             return_metadata=return_metadata,
             prompt_cache_key=prompt_cache_key,
+            usage_sink=usage_sink,
         )
 
     async def create_streaming_response(
@@ -328,6 +332,7 @@ class OpenAIClient(LoggerMixin):
         store: bool = False,
         tool_callback: Optional[Callable[[str, str], Any]] = None,
         prompt_cache_key: Optional[str] = None,
+        usage_sink: Optional[Dict[str, Any]] = None,
     ) -> str:
         return await responses_api.create_streaming_response(
             self,
@@ -343,6 +348,7 @@ class OpenAIClient(LoggerMixin):
             store=store,
             tool_callback=tool_callback,
             prompt_cache_key=prompt_cache_key,
+            usage_sink=usage_sink,
         )
 
     async def create_streaming_response_with_tools(
@@ -360,6 +366,7 @@ class OpenAIClient(LoggerMixin):
         store: bool = False,
         tool_callback: Optional[Callable[[str, str], Any]] = None,
         prompt_cache_key: Optional[str] = None,
+        usage_sink: Optional[Dict[str, Any]] = None,
     ) -> str:
         return await responses_api.create_streaming_response_with_tools(
             self,
@@ -376,6 +383,7 @@ class OpenAIClient(LoggerMixin):
             store=store,
             tool_callback=tool_callback,
             prompt_cache_key=prompt_cache_key,
+            usage_sink=usage_sink,
         )
 
     async def create_text_response_with_tool_loop(

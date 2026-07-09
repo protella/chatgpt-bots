@@ -111,36 +111,36 @@ def test_system_prompt_no_memory_block_when_absent():
     assert "CHANNEL MEMORY" not in out
 
 
-def test_build_channel_memory_text_formats_rows():
+async def test_build_channel_memory_text_formats_rows():
     proc = _utils()
     proc.db = MagicMock()
-    proc.db.get_channel_memory.return_value = [{"content": "fact one"}, {"content": "fact two"}]
+    proc.db.get_channel_memory_async = AsyncMock(return_value=[{"content": "fact one"}, {"content": "fact two"}])
     with patch.object(config, "enable_channel_memory", True):
-        text = proc._build_channel_memory_text("C1")
+        text = await proc._build_channel_memory_text("C1")
     assert text == "- fact one\n- fact two"
 
 
-def test_build_channel_memory_text_none_when_empty():
+async def test_build_channel_memory_text_none_when_empty():
     proc = _utils()
     proc.db = MagicMock()
-    proc.db.get_channel_memory.return_value = []
+    proc.db.get_channel_memory_async = AsyncMock(return_value=[])
     with patch.object(config, "enable_channel_memory", True):
-        assert proc._build_channel_memory_text("C1") is None
+        assert await proc._build_channel_memory_text("C1") is None
 
 
-def test_build_channel_memory_text_none_when_flag_off():
+async def test_build_channel_memory_text_none_when_flag_off():
     proc = _utils()
     proc.db = MagicMock()
-    proc.db.get_channel_memory.return_value = [{"content": "fact"}]
+    proc.db.get_channel_memory_async = AsyncMock(return_value=[{"content": "fact"}])
     with patch.object(config, "enable_channel_memory", False):
-        assert proc._build_channel_memory_text("C1") is None
+        assert await proc._build_channel_memory_text("C1") is None
 
 
-def test_build_channel_memory_text_none_without_db():
+async def test_build_channel_memory_text_none_without_db():
     proc = _utils()
     proc.db = None
     with patch.object(config, "enable_channel_memory", True):
-        assert proc._build_channel_memory_text("C1") is None
+        assert await proc._build_channel_memory_text("C1") is None
 
 
 # --------------------------------------------------------------------------- post-response extraction
@@ -148,7 +148,10 @@ def test_build_channel_memory_text_none_without_db():
 def _proc(decision):
     proc = ThreadManagementMixin.__new__(type("P", (ThreadManagementMixin,), {}))
     proc.db = MagicMock()
-    proc.db.get_channel_memory.return_value = []
+    proc.db.get_channel_memory_async = AsyncMock(return_value=[])
+    proc.db.add_channel_memory_async = AsyncMock()
+    proc.db.update_channel_memory_async = AsyncMock()
+    proc.db.delete_channel_memory_async = AsyncMock()
     proc.openai_client = MagicMock()
     proc.openai_client.extract_memory = AsyncMock(return_value=decision)
     proc.log_info = MagicMock()
@@ -178,8 +181,8 @@ async def test_extraction_add_writes_row():
     proc = _proc({"action": "add", "content": "ships from release branch"})
     with patch.object(config, "enable_channel_memory", True), patch.object(config, "memory_max_rows", 25):
         await proc._async_extract_channel_memory(_state())
-    proc.db.add_channel_memory.assert_called_once()
-    args, kwargs = proc.db.add_channel_memory.call_args
+    proc.db.add_channel_memory_async.assert_called_once()
+    args, kwargs = proc.db.add_channel_memory_async.call_args
     assert args[0] == "C1" and args[1] == "ships from release branch"
     assert kwargs.get("scope") == "channel"
 
@@ -188,35 +191,35 @@ async def test_extraction_none_writes_nothing():
     proc = _proc({"action": "none"})
     with patch.object(config, "enable_channel_memory", True):
         await proc._async_extract_channel_memory(_state())
-    proc.db.add_channel_memory.assert_not_called()
-    proc.db.update_channel_memory.assert_not_called()
+    proc.db.add_channel_memory_async.assert_not_called()
+    proc.db.update_channel_memory_async.assert_not_called()
 
 
 async def test_extraction_update_updates_row():
     proc = _proc({"action": "update", "id": 7, "content": "revised"})
     with patch.object(config, "enable_channel_memory", True):
         await proc._async_extract_channel_memory(_state())
-    proc.db.update_channel_memory.assert_called_once_with(7, "revised")
+    proc.db.update_channel_memory_async.assert_called_once_with(7, "revised")
 
 
 async def test_extraction_none_decision_object_safe():
     proc = _proc(None)  # extractor returned None
     with patch.object(config, "enable_channel_memory", True):
         await proc._async_extract_channel_memory(_state())
-    proc.db.add_channel_memory.assert_not_called()
+    proc.db.add_channel_memory_async.assert_not_called()
 
 
 async def test_extraction_cap_evicts_oldest():
     proc = _proc({"action": "add", "content": "newest fact"})
-    proc.db.get_channel_memory.return_value = [
+    proc.db.get_channel_memory_async = AsyncMock(return_value=[
         {"id": 1, "content": "old", "scope": "channel", "updated_ts": "2026-06-01"},
         {"id": 2, "content": "mid", "scope": "channel", "updated_ts": "2026-06-02"},
         {"id": 3, "content": "recent", "scope": "channel", "updated_ts": "2026-06-03"},
-    ]
+    ])
     with patch.object(config, "enable_channel_memory", True), patch.object(config, "memory_max_rows", 3):
         await proc._async_extract_channel_memory(_state())
-    proc.db.delete_channel_memory.assert_called_once_with(1)  # oldest evicted
-    proc.db.add_channel_memory.assert_called_once()
+    proc.db.delete_channel_memory_async.assert_called_once_with(1)  # oldest evicted
+    proc.db.add_channel_memory_async.assert_called_once()
 
 
 async def test_extraction_flag_off_short_circuits():
