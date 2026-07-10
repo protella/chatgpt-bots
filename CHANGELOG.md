@@ -310,12 +310,11 @@ DMs behave as before.
 
 - When the bot joins a channel conversation on its own (not @-mentioned or DMed), it can
   now decide that silence is the right move — the message wasn't for it, someone already
-  answered, or a reaction says enough — instead of always producing a reply. These
-  self-started turns also no longer stream partial text; they post once, complete, or not
-  at all, so you never see a half-sentence that then vanishes. **Behavior change:**
-  self-started (unprompted) channel replies no longer stream incrementally — they appear
-  in one piece when finished. Directly addressed messages (mentions, DMs, 1:1 threads) are
-  unchanged and still stream as before. Toggle with `ENABLE_NO_REPLY_TOOL` (default on).
+  answered, or a reaction says enough — instead of always producing a reply. Self-started
+  replies stream live just like every other reply; the "should I stay silent?" decision is
+  made before any text appears, and once the bot has begun a visible reply it always
+  finishes it rather than vanishing mid-sentence. Toggle with `ENABLE_NO_REPLY_TOOL`
+  (default on).
 - Fixed: a channel turn that ended in only an emoji reaction could still count against the
   bot's hourly self-started-reply budget — reactions and deliberate silence no longer burn
   that budget.
@@ -346,9 +345,11 @@ DMs behave as before.
 ### 🎉 Feature - The bot can add several reactions when you ask for them
 
 - Asking the bot for multiple emoji reactions on a message now works — previously it would
-  add only one, because it was hard-limited to a single reaction per message. It still
-  reacts sparingly by default (most messages get none), but when you explicitly ask for
-  several distinct emoji it adds them, up to a safety cap. Set the cap with
+  add only one (and could even follow up by claiming it was "showing restraint"), because
+  it was hard-limited to a single reaction per message on several layers, including the
+  quick-decision path that sometimes answered such a request with a lone auto-reaction. It
+  still reacts sparingly by default (most messages get none), but when you explicitly ask
+  for several distinct emoji it adds them, up to a safety cap. Set the cap with
   `REACTION_MAX_PER_MESSAGE` (default 4). Reacting with the same emoji twice remains a
   harmless no-op.
 

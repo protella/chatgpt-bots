@@ -503,6 +503,29 @@ class TestReactTool:
         assert schema["name"] == "react_to_message"
         assert schema["parameters"]["properties"]["emoji"]["enum"] == ["thumbsup", "eyes"]
 
+    @pytest.mark.asyncio
+    async def test_gate_react_consumes_a_guard_slot(self, monkeypatch):
+        # F6 addendum: the participation gate reacts via _reserve_and_react, so a later
+        # main-model turn on the same message honestly sees the slot consumed.
+        monkeypatch.setattr(config, "enable_reactions", True)
+        monkeypatch.setattr(config, "enable_react_tool", True)
+        monkeypatch.setattr(config, "reaction_emojis", ["eyes", "tada"])
+        monkeypatch.setattr(config, "reaction_max_per_message", 1)
+        s = _react_self()
+        gate = await s._reserve_and_react("C1", "123.4", "eyes")
+        assert gate["ok"] is True
+        out = await s.execute_react_tool(
+            ToolContext(channel_id="C1", trigger_ts="123.4"), {"emoji": "tada"})
+        assert out["ok"] is False and out["error"] == "reaction_cap"
+
+
+def test_participation_prompt_routes_explicit_reaction_requests_to_respond():
+    # F6 addendum: an explicit "add some reactions" request must NOT die at the gate's
+    # single-emoji react verdict — route it to respond so the main model places them.
+    from prompts import PARTICIPATION_SYSTEM_PROMPT
+    assert "EXPLICITLY asks the assistant to add a reaction" in PARTICIPATION_SYSTEM_PROMPT
+    assert 'choose "respond"' in PARTICIPATION_SYSTEM_PROMPT
+
 
 # --------------------------------------------------------------------------- processor glue
 

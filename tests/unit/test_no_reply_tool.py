@@ -3,7 +3,8 @@
 Covers the tool-exposure gate (unprompted-only, config-off), the once-materialized
 request config (shared dict never mutated), the tool-loop terminal semantics (ends the
 loop, executes only sibling react, suppresses other siblings, sanitizes the reason), and
-the deferred-output routing that keeps unprompted turns off the streaming path.
+the F2-revision committed-text contract for streaming (no_response_needed honored only
+while no visible text has streamed; rejected-and-completed once a reply has begun).
 """
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -191,6 +192,86 @@ async def test_tool_loop_no_reply_reason_sanitized(monkeypatch):
     reason = result["reason"]
     assert "\n" not in reason and "\t" not in reason
     assert len(reason) <= 300
+
+
+# ---------------------------------------------- F2 revision: streaming committed-text
+
+class _RecordingSelf(_LoopSelf):
+    def __init__(self):
+        self.warnings = []
+
+    def log_warning(self, msg, *a, **k):
+        self.warnings.append(str(msg))
+
+
+def _streaming_fake(rounds):
+    """Fake create_streaming_response_with_tools driven by a list of (text, calls)."""
+    state = {"n": 0}
+
+    async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                             function_call_sink=None, tool_choice=None, **params):
+        text, calls = rounds[min(state["n"], len(rounds) - 1)]
+        state["n"] += 1
+        if tool_choice != "none" and function_call_sink is not None:
+            function_call_sink.extend(calls)
+        return text
+
+    return fake_streaming
+
+
+@pytest.mark.asyncio
+async def test_streaming_no_reply_honored_when_no_text_committed(monkeypatch):
+    # Round 1 calls no_response_needed with NO streamed text → silence is honored.
+    from openai_client.api import tool_loop
+    rounds = [("", [_fc("no_response_needed", "1", '{"reason": "not for me"}')])]
+    monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                        _streaming_fake(rounds))
+    out = await tool_loop.create_streaming_response_with_tool_loop(
+        _LoopSelf(), messages=[], tools=[], registry=_FakeRegistry([]),
+        tool_context=None, stream_callback=lambda c: None)
+    assert out["terminal_action"] == "no_reply"
+    assert out["text"] == ""
+
+
+@pytest.mark.asyncio
+async def test_streaming_no_reply_rejected_after_committed_text(monkeypatch):
+    # Round 1 streams a visible preamble AND calls no_response_needed → INVALID: the call is
+    # rejected, the loop continues, and round 2 completes the reply. WARNING logged.
+    from openai_client.api import tool_loop
+    rounds = [
+        ("Sure, here's the answer", [_fc("no_response_needed", "1", '{"reason": "oops"}')]),
+        (" — all done.", []),
+    ]
+    monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                        _streaming_fake(rounds))
+    host = _RecordingSelf()
+    out = await tool_loop.create_streaming_response_with_tool_loop(
+        host, messages=[], tools=[], registry=_FakeRegistry([]),
+        tool_context=None, stream_callback=lambda c: None)
+    assert out.get("terminal_action") is None          # NOT silenced
+    assert out["text"] == " — all done."               # completing round's reply
+    assert {"name": "no_response_needed", "ok": False} in out["local_tool_calls"]
+    assert any("after visible text" in w for w in host.warnings)
+
+
+@pytest.mark.asyncio
+async def test_streaming_no_reply_with_committed_text_runs_react_sibling(monkeypatch):
+    # A react sibling in the rejected round still executes; the reply then completes.
+    from openai_client.api import tool_loop
+    rounds = [
+        ("partial", [_fc("no_response_needed", "1", '{"reason": "x"}'),
+                     _fc("react_to_message", "2", '{"emoji": "eyes"}')]),
+        ("done", []),
+    ]
+    monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                        _streaming_fake(rounds))
+    dispatched = []
+    out = await tool_loop.create_streaming_response_with_tool_loop(
+        _RecordingSelf(), messages=[], tools=[], registry=_FakeRegistry(dispatched),
+        tool_context=None, stream_callback=lambda c: None)
+    assert out["text"] == "done"
+    assert "react_to_message" in dispatched            # sibling ran
+    assert "no_response_needed" not in dispatched       # rejected via override, not dispatched
 
 
 # --------------------------------------------------------------- contract paragraph

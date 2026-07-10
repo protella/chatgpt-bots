@@ -189,6 +189,8 @@ def _make_app(verdict, pulse=None, engine_enabled=True, monkeypatch=None):
     client = MagicMock()
     client.channel_pulse = pulse
     client.react = AsyncMock()
+    # F6 addendum: the gate's react verdict routes through _reserve_and_react (guard-aware).
+    client._reserve_and_react = AsyncMock(return_value={"ok": True})
     return app, client, fake
 
 
@@ -230,7 +232,8 @@ class TestGateWiring:
         monkeypatch.setattr(config, "reaction_emojis", ["eyes"], raising=False)
         app, client, _ = _make_app({"action": "react", "emoji": "eyes"})
         assert await app._run_participation_gate(_channel_msg(), client) is None
-        client.react.assert_awaited_once_with("C1", "10.0", "eyes")
+        # F6 addendum: routed through the guard-aware reservation, not the raw react.
+        client._reserve_and_react.assert_awaited_once_with("C1", "10.0", "eyes")
 
     @pytest.mark.asyncio
     async def test_backoff_snoozes_reacts_and_writes_memory(self, monkeypatch):

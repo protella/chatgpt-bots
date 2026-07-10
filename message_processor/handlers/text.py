@@ -103,17 +103,13 @@ class TextHandlerMixin:
                           and client.supports_native_streaming())
         can_stream = (hasattr(client, 'supports_streaming') and client.supports_streaming() and
                      streaming_enabled and (thinking_id is not None or native_capable))
-        # F2 buffered output (defer_visible_output): on an UNPROMPTED turn where the
-        # no_response_needed contract is active, visible text must never post before the
-        # terminal verdict is known. We realize that by NOT streaming at all — the
-        # non-streaming path accumulates the full reply and posts it once at the end (or
-        # nothing on a no_reply outcome), which strictly guarantees no partial post and
-        # sidesteps every streaming escape hatch. Prompted/config-off turns are unchanged.
-        unprompted_turn = bool((message.metadata or {}).get("participation_check") is True)
-        defer_visible_output = unprompted_turn and config.enable_no_reply_tool
+        # F2 (revised 2026-07-10): unprompted turns stream just like prompted turns. The
+        # no_response_needed contract is now enforced by a COMMITTED-TEXT rule in the
+        # streaming tool loop (a no-reply call is honored only while no visible text has
+        # streamed; once a reply has begun the call is rejected and the model completes it),
+        # so streaming no longer risks orphaning a partial reply.
         # Stream on first attempt OR on MCP-failure retry (streaming itself didn't fail)
-        should_stream = (can_stream and (retry_count == 0 or failed_mcp_server is not None)
-                         and not defer_visible_output)
+        should_stream = can_stream and (retry_count == 0 or failed_mcp_server is not None)
         if should_stream:
             return await self._handle_streaming_text_response(
                 user_content, thread_state, client, message, thinking_id, attachment_urls,
@@ -549,15 +545,26 @@ class TextHandlerMixin:
         model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
         system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_directives=getattr(thread_state, 'channel_directives', None), channel_info=await self._build_channel_info(client, message.channel_id))
 
+        # F2: resolve this turn's tool exposure ONCE. Streaming retries fall back to the
+        # non-streaming path, so tools are never disabled here (tools_disabled=False).
+        # request_config carries the per-turn _unprompted_turn flag that exposes
+        # no_response_needed; no_reply_available drives the contract suffix — both mirror
+        # the non-streaming path so unprompted streamed turns get the same contract.
+        registry, request_config, no_reply_available = self._materialize_request_tools(
+            client, thread_config, message, tools_disabled=False)
+
         # Prompt-cache hygiene: volatile context (minute-precision time + channel-activity
         # envelope) rides at the SUFFIX (last message), never in the system prompt, so the
-        # cached prefix survives across turns.
+        # cached prefix survives across turns. F2's contract paragraph rides the same slot.
+        suffix = self._build_suffix_context(client, message.channel_id,
+                                            thread_state.thread_ts,
+                                            user_timezone, user_tz_label,
+                                            message=message, thread_state=thread_state)
+        if no_reply_available:
+            suffix = f"{suffix}\n\n{NO_REPLY_CONTRACT_SUFFIX}"
         messages_for_api = messages_for_api + [{
             "role": "developer",
-            "content": self._build_suffix_context(client, message.channel_id,
-                                                  thread_state.thread_ts,
-                                                  user_timezone, user_tz_label,
-                                                  message=message, thread_state=thread_state),
+            "content": suffix,
         }]
 
         # Post an initial message to get the message ID for streaming updates.
@@ -1166,14 +1173,17 @@ class TextHandlerMixin:
 
             # Build tools array (includes web_search and/or MCP tools based on config)
             # Exclude any MCP server that failed in a previous attempt.
-            # Local tools ride along via the registry (function-call loop).
-            registry = self._get_tool_registry(client, thread_config)
-            tools = self._build_tools_array(thread_config, model,
+            # Local tools ride along via the registry (function-call loop). registry +
+            # request_config were resolved once above (F2) so no_response_needed is exposed
+            # on unprompted streamed turns.
+            tools = self._build_tools_array(request_config, model,
                                             exclude_mcp_server=exclude_mcp_server, registry=registry)
 
             local_tool_calls = []  # [{"name","ok"}] record of local tool executions
             usage_info = {}        # response.usage lands here (usage-driven budgeting)
             mcp_discovered = {}    # mcp_list_tools payloads land here (discovery cache)
+            terminal_action = None  # F2: "no_reply" when the loop honored no_response_needed
+            no_reply_reason = None
             if tools and registry is not None:
                 # Local tools present — streaming function-call loop (intermediate tool
                 # rounds don't stream text; the final round streams normally)
@@ -1197,6 +1207,8 @@ class TextHandlerMixin:
                 )
                 response_text = loop_result["text"]
                 local_tool_calls = loop_result["local_tool_calls"]
+                terminal_action = loop_result.get("terminal_action")
+                no_reply_reason = loop_result.get("reason")
                 # Only EXTERNAL names (web_search/MCP) join the attribution list —
                 # local tool executions are recorded in local_tool_calls, not shown
                 local_names = {c.get("name") for c in local_tool_calls if c.get("name")}
@@ -1249,6 +1261,27 @@ class TextHandlerMixin:
             if progress_task and not progress_task.done():
                 progress_task.cancel()
                 self.log_debug("Cancelled progress updater after API call completed")
+
+            # F2: honored no_reply outcome — the loop deemed silence valid because NO
+            # visible text had streamed yet (a committed reply would have been rejected and
+            # completed instead). Abandon any empty native stream / delete the placeholder
+            # and post nothing.
+            if terminal_action == "no_reply":
+                self.log_info(f"no_response_needed (streamed) — ending turn silently: {no_reply_reason!r}")
+                if native_coord is not None and native_coord.started:
+                    await native_coord.abandon()
+                if current_message_id:
+                    try:
+                        await client.delete_message(message.channel_id, current_message_id)
+                    except Exception as e:
+                        self.log_warning(f"Could not delete placeholder for no_reply: {e}")
+                return Response(
+                    type="text",
+                    content="",
+                    metadata={"streamed": True, "terminal_action": "no_reply",
+                              "reason": no_reply_reason,
+                              "model": thread_config.get("model"), "posted": False}
+                )
 
             # Reaction-only turn: the model reacted via the react tool and deliberately
             # returned no text — delete the placeholder and post nothing.
