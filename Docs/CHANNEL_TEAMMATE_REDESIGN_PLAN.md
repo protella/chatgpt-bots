@@ -463,7 +463,10 @@ Tests: `tests/unit/test_participation_engine.py` + rewritten `test_wake_classifi
 sink wiring, live validation, then `SLACK_NATIVE_STREAMING=true` in dev. *Absorbs parity
 last-mile #2/#7 and the branded-emoji fill-in (#1, user action).* Tests: sink selection +
 fallback, app_home_opened tab filter. Live: split-view greeting, streamed reply rendering,
-status with branded emoji.
+status with branded emoji. NOTE (pagination-fix wave): shared continuation-marker +
+fence/entity-safe split helpers now live in `message_markers.py` — the native streaming path
+MUST reuse them (the rebuild-side merge in `_merge_continuation_history` recognizes exactly
+those shapes; drifting from them re-introduces the R2 context-pollution bug).
 
 **Q. Conversational queueing (user decision 2026-07-09: retire busy rejection everywhere)** ✅
 *Implemented. Deviations: the drain loop is emergent rather than explicit — the finishing turn

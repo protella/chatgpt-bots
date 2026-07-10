@@ -274,9 +274,11 @@ class TestDOCXAlternativeParsing:
         
         result = handler.parse_docx_alternative(invalid_data, 'test.docx')
         
-        # Should return an error for invalid format
+        # Non-ZIP data is treated as a legacy .doc (unsupported since the
+        # no-disk rule removed docx2txt) with a re-save hint
         assert 'error' in result
-        assert 'Unrecognized file format' in result['content'] or 'not appear to be a valid' in result['error']
+        assert 'not supported' in result['content']
+        assert 're-save' in result['content']
     
     def test_parse_docx_alternative_missing_document_xml(self, handler):
         """Test handling of ZIP without document.xml"""
@@ -295,9 +297,10 @@ class TestDOCXAlternativeParsing:
     @patch('subprocess.run')
     def test_parse_docx_textract_fallback_pandoc_success(self, mock_run, handler):
         """Test pandoc fallback for DOCX extraction"""
+        # Binary mode: bytes are piped via stdin, stdout comes back as bytes
         mock_run.return_value = Mock(
             returncode=0,
-            stdout="Document content extracted by pandoc"
+            stdout=b"Document content extracted by pandoc"
         )
         
         result = handler.parse_docx_textract_fallback(b'docx data', 'test.docx')

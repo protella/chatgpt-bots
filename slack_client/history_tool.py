@@ -119,7 +119,8 @@ class SlackHistoryToolMixin:
                 resp = await self.app.client.conversations_replies(channel=channel_id, ts=thread_ts, limit=n)
             else:
                 resp = await self.app.client.conversations_history(channel=channel_id, limit=n)
-            raw = (resp.get("messages") or [])[:n]
+            all_messages = resp.get("messages") or []
+            raw = all_messages[:n]
             messages = [
                 {
                     "user": m.get("user") or m.get("username") or ("bot" if m.get("bot_id") else "unknown"),
@@ -128,13 +129,24 @@ class SlackHistoryToolMixin:
                 }
                 for m in raw
             ]
-            return {
+            # R5: tell the model whether it saw a window or everything — otherwise
+            # "50 messages" is indistinguishable from "the newest 50 of 5,000".
+            has_more = bool(
+                (resp.get("response_metadata") or {}).get("next_cursor")
+                or resp.get("has_more")
+                or len(all_messages) > n
+            )
+            result: Dict[str, Any] = {
                 "ok": True,
                 "channel": channel_id,
                 "thread_ts": thread_ts,
                 "count": len(messages),
+                "has_more": has_more,
                 "messages": messages,
             }
+            if has_more:
+                result["note"] = "Only the newest window was returned; older history exists beyond this."
+            return result
         except SlackApiError as e:
             err = e.response.get("error", "unknown") if getattr(e, "response", None) else str(e)
             self.log_warning(f"history_tool: fetch failed for {channel_id}: {err}")

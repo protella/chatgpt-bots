@@ -7,6 +7,12 @@ from openai import APIError, APIStatusError
 
 from base_client import BaseClient, Message, Response
 from config import config
+from message_markers import (
+    CONTINUATION_HEAD,
+    continuation_trailer,
+    entity_safe_cut,
+    part_prefix,
+)
 from streaming import FenceHandler, RateLimitManager, StreamingBuffer
 from tool_registry import ToolContext
 
@@ -604,7 +610,7 @@ class TextHandlerMixin:
         current_message_id = message_id
         current_part = 1
         overflow_buffer = ""
-        continuation_msg = "\n\n*Continued in next message...*"
+        continuation_msg = continuation_trailer()  # shared marker (message_markers)
         # Reserve space for: continuation msg (~40), part prefix (~30), tools attribution (~100), markdown expansion (~400)
         # CRITICAL: The messaging layer (update_message_streaming) has a backup truncation at 3700 chars
         # that adds "continued" but doesn't create Part 2. We must trigger overflow BEFORE that.
@@ -651,7 +657,7 @@ class TextHandlerMixin:
 
                     # Preserve part number prefix for overflow messages in final flush
                     if current_part > 1:
-                        final_text = f"*Part {current_part} (continued)*\n\n{final_text}"
+                        final_text = f"{part_prefix(current_part)}{final_text}"
 
                     try:
                         result = await client.update_message_streaming(message.channel_id, current_message_id, final_text)
@@ -695,13 +701,14 @@ class TextHandlerMixin:
                             if last_newline > 0:
                                 split_point = last_newline + 1
                             else:
-                                # Priority 4: At least don't split a word
+                                # Priority 4: At least don't split a word — and never
+                                # inside a <@mention>/<url> entity (W3)
                                 last_space = raw_text.rfind(' ', search_start, message_char_limit)
                                 if last_space > 0:
-                                    split_point = last_space + 1
+                                    split_point = entity_safe_cut(raw_text, last_space + 1)
                                 else:
-                                    # Last resort: hard cut at limit
-                                    split_point = message_char_limit
+                                    # Last resort: hard cut at limit, entity-safe
+                                    split_point = entity_safe_cut(raw_text, message_char_limit)
                     
                     # Split the RAW text at the chosen point
                     first_part_raw = raw_text[:split_point]
@@ -754,7 +761,7 @@ class TextHandlerMixin:
                             fence_handler_continuation.update_text(overflow_with_fence)
                             continuation_display = fence_handler_continuation.get_display_safe_text()
                             
-                            continuation_text = f"*Part {current_part} (continued)*\n\n{continuation_display} {config.loading_ellipse_emoji}"
+                            continuation_text = f"{part_prefix(current_part)}{continuation_display} {config.loading_ellipse_emoji}"
 
                             # Send new message and get its ID
                             new_msg_result = await client.send_message_get_ts(message.channel_id, thinking_id, continuation_text)
@@ -795,7 +802,7 @@ class TextHandlerMixin:
 
                     # Preserve part number prefix for overflow messages
                     if current_part > 1:
-                        display_text_with_indicator = f"*Part {current_part} (continued)*\n\n{display_text} {config.loading_ellipse_emoji}"
+                        display_text_with_indicator = f"{part_prefix(current_part)}{display_text} {config.loading_ellipse_emoji}"
                     else:
                         display_text_with_indicator = f"{display_text} {config.loading_ellipse_emoji}"
 
@@ -1102,8 +1109,26 @@ class TextHandlerMixin:
                             self.log_debug(f"Added tools attribution to overflow part {current_part}")
 
                         # Add the part indicator
-                        final_part_text = f"*Part {current_part} (continued)*\n\n{final_part_text}"
-                        final_result = await client.update_message_streaming(message.channel_id, current_message_id, final_part_text)
+                        final_part_text = f"{part_prefix(current_part)}{final_part_text}"
+
+                        # W1: the buffer can outgrow the limit between the last
+                        # mid-stream update and completion. Without this check the
+                        # messaging layer's backup truncation adds a "continued"
+                        # marker and the remainder never posts.
+                        if len(final_part_text) > 3900:
+                            cut = entity_safe_cut(final_part_text, 3800)
+                            truncated = final_part_text[:cut].rstrip()
+                            if truncated.count('```') % 2 == 1:
+                                truncated += '\n```'
+                            truncated += continuation_msg
+                            final_result = await client.update_message_streaming(
+                                message.channel_id, current_message_id, truncated)
+                            overflow_text = final_part_text[cut:].lstrip()
+                            await client.send_message(
+                                message.channel_id, message.thread_id,
+                                f"{CONTINUATION_HEAD}\n\n{overflow_text}")
+                        else:
+                            final_result = await client.update_message_streaming(message.channel_id, current_message_id, final_part_text)
                         if not final_result["success"]:
                             self.log_error(f"Failed to remove indicator from part {current_part}: {final_result.get('error', 'Unknown error')}")
                 except Exception as e:
@@ -1138,13 +1163,17 @@ class TextHandlerMixin:
                         # Check if message is too long for a single update
                         if len(response_text) > 3900:  # Slack's approximate limit
                             # This shouldn't happen if streaming overflow worked correctly
-                            # But handle it as a fallback
-                            truncated_text = response_text[:3800] + "\n\n*Continued in next message...*"
+                            # But handle it as a fallback (entity-safe cut, shared markers)
+                            cut = entity_safe_cut(response_text, 3800)
+                            truncated_text = response_text[:cut].rstrip()
+                            if truncated_text.count('```') % 2 == 1:
+                                truncated_text += '\n```'
+                            truncated_text += continuation_msg
                             final_result = await client.update_message_streaming(message.channel_id, message_id, truncated_text)
 
                             # Send the rest as new messages
-                            overflow_text = response_text[3800:]
-                            await client.send_message(message.channel_id, message.thread_id, f"*...continued*\n\n{overflow_text}")
+                            overflow_text = response_text[cut:].lstrip()
+                            await client.send_message(message.channel_id, message.thread_id, f"{CONTINUATION_HEAD}\n\n{overflow_text}")
                             
                             if not final_result["success"]:
                                 self.log_error(f"Final truncated update failed: {final_result.get('error', 'Unknown error')}")

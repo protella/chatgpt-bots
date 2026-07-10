@@ -47,6 +47,15 @@ class Response:
         return cls(type="reaction", content=emoji, metadata={"react_ts": target_ts} if target_ts else {})
 
 
+class HistoryFetchError(Exception):
+    """Platform history could not be fetched (e.g. persistent rate limiting).
+
+    Distinct from an empty thread: raised so the processor can fail the turn
+    loudly instead of answering with amnesia — since Phase S the platform is
+    the ONLY transcript, so a failed fetch means we have no context at all.
+    """
+
+
 class BaseClient(ABC, LoggerMixin):
     """Abstract base class for all chat clients"""
     
@@ -117,12 +126,19 @@ class BaseClient(ABC, LoggerMixin):
         return False
 
     @abstractmethod
-    def get_thread_history(self, channel_id: str, thread_id: str, limit: int = None) -> List[Message]:
-        """Get message history for a thread - fetches ALL messages by default"""
+    def get_thread_history(self, channel_id: str, thread_id: str, limit: int = None,
+                           oldest: Optional[str] = None) -> List[Message]:
+        """Get message history for a thread - fetches ALL messages by default.
+
+        `oldest` (platform ts) fetches only messages strictly after it (Phase S
+        summary-tail optimization). Raises HistoryFetchError on terminal fetch
+        failure — an empty thread returns [] instead.
+        """
         pass
 
     @abstractmethod
-    async def get_thread_history_async(self, channel_id: str, thread_id: str, limit: int = None) -> List[Message]:
+    async def get_thread_history_async(self, channel_id: str, thread_id: str, limit: int = None,
+                                       oldest: Optional[str] = None) -> List[Message]:
         """Get message history for a thread (async version)"""
         pass
 

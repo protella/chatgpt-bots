@@ -8,28 +8,47 @@ import re
 import base64
 import asyncio
 import subprocess
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from typing import Dict, List, Optional, Any
 import pdfplumber
 import pypdf
 from pdf2image import convert_from_bytes
 from docx import Document
+from pptx import Presentation
 import pandas as pd
 from logger import LoggerMixin
+
+# Hard rule: file processing never touches disk — all extraction operates on
+# in-memory bytes/BytesIO only. (Known exception OUTSIDE this module: pdf2image's
+# poppler backend uses its own internal temp files for the scanned-PDF OCR path;
+# that path is slated for retirement with native PDF input.)
+
+# Per-file extraction timeout. Module constant for now; can move to env config
+# once config.py is available to this layer's changes.
+EXTRACTION_TIMEOUT_SECONDS = 30
+# Office XML formats are ZIP archives; refuse anything that would decompress
+# past this (zip-bomb guard).
+MAX_OFFICE_DECOMPRESSED_BYTES = 200 * 1024 * 1024
+# Dedicated bounded pool so a slow parse can't exhaust the default executor.
+# NOTE: a timed-out parse keeps its worker thread until it finishes — the pool
+# being bounded (2) caps how many can be stuck at once.
+_EXTRACTION_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="doc-extract")
 # Supported document MIME types
 SUPPORTED_DOCUMENT_MIMETYPES = {
     # PDF documents
     "application/pdf",
-    # Word documents
+    # Word documents (.doc legacy binary removed: its only extractor, docx2txt,
+    # requires a real file path, which the no-disk rule forbids)
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # .docx
-    "application/msword",  # .doc
     # Excel/Spreadsheet documents
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # .xlsx
     "application/vnd.ms-excel",  # .xls
     "text/csv",  # .csv
-    # PowerPoint documents
+    # PowerPoint documents (.ppt legacy binary is not parseable by python-pptx
+    # and is deliberately unsupported so users get the proper warning)
     "application/vnd.openxmlformats-officedocument.presentationml.presentation",  # .pptx
-    "application/vnd.ms-powerpoint",  # .ppt
     # Text documents
     "text/plain",  # .txt
     "text/markdown",  # .md
@@ -47,7 +66,7 @@ SUPPORTED_DOCUMENT_MIMETYPES = {
 }
 # Document file extensions
 DOCUMENT_EXTENSIONS = {
-    '.pdf', '.docx', '.doc', '.xlsx', '.xls', '.csv', '.pptx', '.ppt',
+    '.pdf', '.docx', '.xlsx', '.xls', '.csv', '.pptx',
     '.txt', '.md', '.rtf', '.py', '.js', '.json', '.sql', '.yaml', '.yml',
     '.xml', '.html', '.htm', '.log', '.out'
 }
@@ -55,7 +74,7 @@ DOCUMENT_EXTENSIONS = {
 MIME_TYPE_HANDLERS = {
     'application/pdf': 'parse_pdf_structured',
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'parse_docx_structured',
-    'application/msword': 'parse_docx_structured',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'parse_pptx_structured',
     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'parse_excel_adaptive',
     'application/vnd.ms-excel': 'parse_excel_adaptive',
     'text/csv': 'parse_excel_adaptive',
@@ -80,99 +99,35 @@ class DocumentHandler(LoggerMixin):
             max_document_size: Maximum document size in bytes (default 50MB)
         """
         self.max_document_size = max_document_size
-    # Async wrapper methods for blocking operations
-    async def _parse_pdf_with_pdfplumber_async(self, file_data: bytes, filename: str) -> Dict[str, Any]:
-        """Async wrapper for PDF parsing with pdfplumber"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._parse_pdf_with_pdfplumber, file_data, filename)
-    async def _parse_pdf_with_pypdf2_async(self, file_data: bytes, filename: str) -> Dict[str, Any]:
-        """Async wrapper for PDF parsing with pypdf"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._parse_pdf_with_pypdf2, file_data, filename)
-    async def _parse_docx_async(self, file_data: bytes, filename: str) -> Dict[str, Any]:
-        """Async wrapper for DOCX parsing"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._parse_docx, file_data, filename)
-    async def _parse_excel_async(self, file_data: bytes, filename: str) -> Dict[str, Any]:
-        """Async wrapper for Excel parsing"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._parse_excel, file_data, filename)
-    async def _parse_csv_async(self, file_data: bytes, filename: str, text_data: str) -> Dict[str, Any]:
-        """Async wrapper for CSV parsing"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._parse_csv, file_data, filename, text_data)
-    async def _convert_pdf_to_images_async(self, file_data: bytes) -> List[str]:
-        """Async wrapper for PDF to images conversion"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._convert_pdf_to_images, file_data)
-    async def _convert_with_pandoc_async(self, file_data: bytes, input_format: str, output_format: str = "markdown") -> str:
-        """Async wrapper for pandoc conversion"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._convert_with_pandoc, file_data, input_format, output_format)
+    # Async entry point (single implementation; per-parser async wrappers were
+    # phantoms referencing methods that never existed and have been removed)
     async def safe_extract_content_async(self, file_data: bytes, mime_type: str, filename: str) -> Dict[str, Any]:
-        """Async version of safe_extract_content - safely extract document content with comprehensive error recovery"""
-        # Validate file size
-        if len(file_data) > self.max_document_size:
-            return {
-                'content': f'[Document {filename} too large: {len(file_data) / 1024 / 1024:.1f}MB (max: {self.max_document_size / 1024 / 1024:.1f}MB)]',
-                'error': 'Document exceeds size limit',
-                'format': 'error'
-            }
+        """Async entry point for document extraction.
+
+        Deliberately a thin executor wrapper around the SYNC safe_extract_content:
+        a previous hand-rolled async router drifted from the sync routing table
+        (missing text types, a phantom CSV handler, no sanitization, no metadata,
+        no fallback chain). One implementation, one behavior — the parity unit
+        test enforces the routing table itself.
+        """
+        loop = asyncio.get_running_loop()
         try:
-            # Route to appropriate async parser based on mime type
-            if mime_type == 'application/pdf':
-                return await self.parse_pdf_structured_async(file_data, filename)
-            elif mime_type in ['application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/msword']:
-                return await self.parse_docx_structured_async(file_data, filename)
-            elif mime_type in ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'application/vnd.ms-excel']:
-                return await self.parse_excel_adaptive_async(file_data, filename)
-            elif mime_type == 'text/csv':
-                text_data = file_data.decode('utf-8', errors='replace')
-                return await self._parse_csv_async(file_data, filename, text_data)
-            elif mime_type in ['text/plain', 'text/markdown', 'text/x-python', 'application/javascript', 'application/json', 'text/x-sql', 'application/x-yaml']:
-                # Text files can be processed synchronously
-                loop = asyncio.get_event_loop()
-                return await loop.run_in_executor(None, self.parse_text, file_data, filename)
-            else:
-                # Try to determine by filename
-                filename_lower = filename.lower()
-                if filename_lower.endswith('.pdf'):
-                    return await self.parse_pdf_structured_async(file_data, filename)
-                elif filename_lower.endswith(('.docx', '.doc')):
-                    return await self.parse_docx_structured_async(file_data, filename)
-                elif filename_lower.endswith(('.xlsx', '.xls')):
-                    return await self.parse_excel_adaptive_async(file_data, filename)
-                elif filename_lower.endswith('.csv'):
-                    text_data = file_data.decode('utf-8', errors='replace')
-                    return await self._parse_csv_async(file_data, filename, text_data)
-                elif filename_lower.endswith(('.txt', '.md', '.py', '.js', '.json', '.sql', '.yaml', '.yml')):
-                    loop = asyncio.get_event_loop()
-                    return await loop.run_in_executor(None, self.parse_text, file_data, filename)
-                else:
-                    return {
-                        'content': f'[Unsupported document type: {mime_type} for file {filename}]',
-                        'error': f'Unsupported mime type: {mime_type}',
-                        'format': 'unsupported'
-                    }
-        except Exception as e:
-            self.log_error(f"Error extracting content from {filename}: {e}", exc_info=True)
+            return await asyncio.wait_for(
+                loop.run_in_executor(
+                    _EXTRACTION_EXECUTOR, self.safe_extract_content, file_data, mime_type, filename
+                ),
+                timeout=EXTRACTION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            self.log_error(f"Extraction timed out after {EXTRACTION_TIMEOUT_SECONDS}s for {filename}")
             return {
-                'content': f'[Error processing document {filename}: {str(e)}]',
-                'error': str(e),
-                'format': 'error'
+                'content': f'[Unable to parse {filename} - extraction timed out]',
+                'filename': filename,
+                'mime_type': mime_type,
+                'size_bytes': len(file_data),
+                'error': f'Extraction timed out after {EXTRACTION_TIMEOUT_SECONDS}s',
+                'format': 'error',
             }
-    async def parse_pdf_structured_async(self, file_data: bytes, filename: str) -> Dict[str, Any]:
-        """Async version of parse_pdf_structured"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.parse_pdf_structured, file_data, filename)
-    async def parse_docx_structured_async(self, file_data: bytes, filename: str) -> Dict[str, Any]:
-        """Async version of parse_docx_structured"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.parse_docx_structured, file_data, filename)
-    async def parse_excel_adaptive_async(self, file_data: bytes, filename: str) -> Dict[str, Any]:
-        """Async version of parse_excel_adaptive"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.parse_excel_adaptive, file_data, filename)
     def is_document_file(self, filename: str, mimetype: Optional[str] = None) -> bool:
         """
         Check if a file is a supported document type
@@ -212,12 +167,27 @@ class DocumentHandler(LoggerMixin):
                 filename_lower = filename.lower()
                 if filename_lower.endswith('.pdf'):
                     handler_name = 'parse_pdf_structured'
-                elif filename_lower.endswith(('.docx', '.doc')):
+                elif filename_lower.endswith('.docx'):
                     handler_name = 'parse_docx_structured'
+                elif filename_lower.endswith('.pptx'):
+                    handler_name = 'parse_pptx_structured'
                 elif filename_lower.endswith(('.xlsx', '.xls', '.csv')):
                     handler_name = 'parse_excel_adaptive'
                 else:
                     handler_name = 'parse_text'
+            # Zip-bomb guard for office-XML formats (they are ZIP archives)
+            if handler_name in ('parse_docx_structured', 'parse_pptx_structured', 'parse_excel_adaptive') \
+                    and file_data[:2] == b'PK' and not self._office_zip_within_limits(file_data):
+                self.log_error(f"Refusing {filename}: decompressed size exceeds "
+                               f"{MAX_OFFICE_DECOMPRESSED_BYTES // (1024 * 1024)}MB (zip-bomb guard)")
+                return {
+                    'content': f'[Unable to parse {filename} - archive decompresses beyond safe limits]',
+                    'filename': filename,
+                    'mime_type': mime_type,
+                    'size_bytes': len(file_data),
+                    'error': 'Decompressed size exceeds safety limit',
+                    'format': 'error',
+                }
             # Get the parser method
             parser_method = getattr(self, handler_name)
             result = parser_method(file_data, filename)
@@ -425,6 +395,61 @@ class DocumentHandler(LoggerMixin):
             }
         except Exception as e:
             raise Exception(f"pypdf parsing failed: {e}")
+    def _office_zip_within_limits(self, file_data: bytes) -> bool:
+        """Probe an office-XML ZIP's declared decompressed size without extracting."""
+        try:
+            with zipfile.ZipFile(BytesIO(file_data)) as zf:
+                total = sum(info.file_size for info in zf.infolist())
+            return total <= MAX_OFFICE_DECOMPRESSED_BYTES
+        except zipfile.BadZipFile:
+            # Not actually a ZIP despite the PK prefix — let the parser's own
+            # error recovery handle it.
+            return True
+
+    def parse_pptx_structured(self, file_data: bytes, filename: str) -> Dict[str, Any]:
+        """
+        Extract PowerPoint (.pptx) content: slide text, tables, and speaker notes.
+        BytesIO-fed only — no disk access.
+        """
+        prs = Presentation(BytesIO(file_data))
+        content_blocks = []
+        tables_found = False
+        for slide_num, slide in enumerate(prs.slides, start=1):
+            slide_blocks = []
+            for shape in slide.shapes:
+                if getattr(shape, 'has_text_frame', False) and shape.text_frame:
+                    text = '\n'.join(
+                        run.text for para in shape.text_frame.paragraphs
+                        for run in para.runs if run.text
+                    ).strip()
+                    if not text:
+                        # Some decks put text directly on paragraphs without runs
+                        text = shape.text_frame.text.strip()
+                    if text:
+                        slide_blocks.append(text)
+                if getattr(shape, 'has_table', False) and shape.has_table:
+                    rows = [
+                        [cell.text.strip() for cell in row.cells]
+                        for row in shape.table.rows
+                    ]
+                    table_md = self.flexible_table_to_markdown(rows)
+                    if table_md:
+                        slide_blocks.append(table_md)
+                        tables_found = True
+            if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                notes = slide.notes_slide.notes_text_frame.text.strip()
+                if notes:
+                    slide_blocks.append(f"Speaker notes: {notes}")
+            if slide_blocks:
+                content_blocks.append(f"## Slide {slide_num}\n" + '\n\n'.join(slide_blocks))
+        full_content = '\n\n'.join(content_blocks)
+        return {
+            'content': full_content or '[No text content found in presentation]',
+            'format': 'pptx',
+            'total_slides': len(prs.slides),
+            'has_tables': tables_found,
+        }
+
     def parse_docx_structured(self, file_data: bytes, filename: str) -> Dict[str, Any]:
         """
         Extract Word document content preserving formatting and structure
@@ -487,8 +512,14 @@ class DocumentHandler(LoggerMixin):
             # First check if this is actually a ZIP file
             if not file_data.startswith(b'PK'):  # ZIP files start with 'PK'
                 self.log_error(f"File {filename} does not appear to be a ZIP/DOCX file. First bytes: {file_data[:4]}")
-                # Could be an old .doc format
-                return self.parse_doc_legacy(file_data, filename)
+                # Likely a legacy .doc (OLE2 binary). Unsupported: its only
+                # extractor (docx2txt) requires a temp file on disk, which the
+                # no-disk rule forbids. Users should re-save as .docx.
+                return {
+                    'content': f'[{filename} appears to be a legacy .doc file, which is not supported - please re-save it as .docx]',
+                    'format': 'doc',
+                    'error': 'Legacy .doc format not supported',
+                }
             # DOCX files are ZIP archives
             with zipfile.ZipFile(BytesIO(file_data)) as zip_file:
                 # Debug: log what's in the ZIP file
@@ -550,89 +581,27 @@ class DocumentHandler(LoggerMixin):
             self.log_error(f"Alternative DOCX parsing also failed: {e}")
             # Final fallback - try to extract any text using textract or similar
             return self.parse_docx_textract_fallback(file_data, filename)
-    def parse_doc_legacy(self, file_data: bytes, filename: str) -> Dict[str, Any]:
-        """
-        Parse legacy .doc files (pre-2007 Word format)
-        """
-        try:
-            # Check if it's actually a .doc file (OLE2 format)
-            if file_data.startswith(b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1'):
-                self.log_info(f"Detected legacy .doc format for {filename}")
-                # Try using python-docx2txt or other libraries
-                try:
-                    import docx2txt
-                    # Save to temp file since docx2txt needs a file path
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(suffix='.doc', delete=False) as tmp:
-                        tmp.write(file_data)
-                        tmp_path = tmp.name
-                    try:
-                        text = docx2txt.process(tmp_path)
-                        return {
-                            'content': text or '[No text content found]',
-                            'format': 'doc',
-                            'extraction_method': 'docx2txt',
-                            'warning': 'Legacy .doc format - formatting simplified'
-                        }
-                    finally:
-                        import os
-                        os.unlink(tmp_path)
-                except ImportError:
-                    self.log_warning("docx2txt not available for .doc parsing")
-                # Fallback to basic text extraction
-                return {
-                    'content': '[Legacy .doc format detected - cannot extract content without additional tools]',
-                    'format': 'doc',
-                    'extraction_method': 'none',
-                    'error': 'Legacy Word format requires additional tools like docx2txt or antiword'
-                }
-            else:
-                # Not a recognized format
-                return {
-                    'content': f'[Unrecognized file format for {filename}]',
-                    'format': 'unknown',
-                    'error': f'File does not appear to be a valid Word document. First bytes: {file_data[:4].hex()}'
-                }
-        except Exception as e:
-            self.log_error(f"Legacy doc parsing failed: {e}")
-            return {
-                'content': f'[Unable to parse {filename}]',
-                'format': 'doc',
-                'error': str(e)
-            }
     def parse_docx_textract_fallback(self, file_data: bytes, filename: str) -> Dict[str, Any]:
         """
-        Final fallback using system tools or basic extraction
+        Final DOCX fallback: pandoc reading the document from STDIN.
+        No disk access - the file bytes are piped straight to the subprocess.
         """
         try:
-            # Save temporarily and use pandoc or other system tools if available
-            import tempfile
-            import subprocess
-            with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp:
-                tmp.write(file_data)
-                tmp_path = tmp.name
-            try:
-                # Try pandoc if available
-                result = subprocess.run(
-                    ['pandoc', '-f', 'docx', '-t', 'plain', tmp_path],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                if result.returncode == 0 and result.stdout:
-                    return {
-                        'content': result.stdout,
-                        'format': 'docx',
-                        'extraction_method': 'pandoc',
-                        'warning': 'Document extracted using pandoc - formatting simplified'
-                    }
-            except (subprocess.SubprocessError, FileNotFoundError):
-                pass
-            finally:
-                import os
-                os.unlink(tmp_path)
-        except Exception as e:
-            self.log_error(f"Textract fallback failed: {e}")
+            result = subprocess.run(
+                ['pandoc', '-f', 'docx', '-t', 'plain'],
+                input=file_data,
+                capture_output=True,
+                timeout=10
+            )
+            if result.returncode == 0 and result.stdout:
+                return {
+                    'content': result.stdout.decode('utf-8', errors='replace'),
+                    'format': 'docx',
+                    'extraction_method': 'pandoc',
+                    'warning': 'Document extracted using pandoc - formatting simplified'
+                }
+        except (subprocess.SubprocessError, FileNotFoundError) as e:
+            self.log_error(f"Pandoc fallback failed: {e}")
         # Absolute final fallback
         return {
             'content': f'[Unable to extract content from {filename} - document format is not supported or file is corrupted]',

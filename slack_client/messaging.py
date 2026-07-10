@@ -6,9 +6,26 @@ from typing import Dict, List, Optional
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_sdk.errors import SlackApiError
 
-from base_client import Message, Response
+from base_client import HistoryFetchError, Message, Response
 from config import config
+from message_markers import (
+    CONTINUATION_HEAD,
+    continuation_trailer,
+    fence_safe_chunks,
+)
 from slack_client.utilities import strip_citations
+
+import re as _re
+
+# Own-message placeholder/status filters for history rebuild (R3): only messages
+# shaped like ":emoji: Status text" AND carrying a known transient marker are
+# skipped — a human message merely containing the word "Thinking" is kept.
+_SELF_STATUS_RE = _re.compile(r"^:[a-z0-9_+\-]+:\s")
+_SELF_STATUS_MARKERS = (
+    "Thinking...",
+    "Rebuilding thread history",
+    "Catching up on",
+)
 
 
 class NativeStreamSession:
@@ -243,53 +260,42 @@ class SlackMessagingMixin:
                     text=formatted_text
                 )
             else:
-                # Split into multiple messages
+                # Split into multiple messages, "Continued..." style (shared markers so
+                # the rebuild-side stripper always recognizes them). One chunk failing
+                # must not abort the rest.
                 chunks = self._split_message(formatted_text)
-                for i, chunk in enumerate(chunks, 1):
-                    # Add pagination indicator
-                    paginated_chunk = f"*Part {i}/{len(chunks)}*\n\n{chunk}"
-                    await self.app.client.chat_postMessage(
-                        channel=channel_id,
-                        thread_ts=thread_id,
-                        text=paginated_chunk
-                    )
+                last = len(chunks) - 1
+                sent_any = False
+                for i, chunk in enumerate(chunks):
+                    body = chunk
+                    if i > 0:
+                        body = f"{CONTINUATION_HEAD}\n\n{body}"
+                    if i < last:
+                        body = f"{body}{continuation_trailer()}"
+                    try:
+                        await self.app.client.chat_postMessage(
+                            channel=channel_id,
+                            thread_ts=thread_id,
+                            text=body
+                        )
+                        sent_any = True
+                    except SlackApiError as chunk_error:
+                        self.log_error(f"Error sending message chunk {i + 1}/{last + 1}: {chunk_error}")
+                return sent_any if last > 0 else True
             return True
         except SlackApiError as e:
             self.log_error(f"Error sending message: {e}")
             return False
 
     def _split_message(self, text: str) -> List[str]:
-        """Split a long message into chunks that fit within Slack's limit"""
-        # Account for pagination indicator overhead (~20 chars)
-        chunk_size = self.MAX_MESSAGE_LENGTH - 50
-        chunks = []
-        
-        # Try to split on paragraph boundaries first
-        paragraphs = text.split('\n\n')
-        current_chunk = ""
-        
-        for para in paragraphs:
-            # If a single paragraph is too long, split it by sentences
-            if len(para) > chunk_size:
-                sentences = para.replace('. ', '.\n').split('\n')
-                for sentence in sentences:
-                    if len(current_chunk) + len(sentence) + 2 <= chunk_size:
-                        current_chunk += sentence + " "
-                    else:
-                        if current_chunk:
-                            chunks.append(current_chunk.strip())
-                        current_chunk = sentence + " "
-            elif len(current_chunk) + len(para) + 2 <= chunk_size:
-                current_chunk += para + "\n\n"
-            else:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                current_chunk = para + "\n\n"
-        
-        if current_chunk:
-            chunks.append(current_chunk.strip())
-        
-        return chunks
+        """Split a long message into chunks that fit within Slack's limit.
+
+        Fence-aware (code blocks are closed and reopened across the seam) and
+        entity-safe; oversized single fragments are hard-wrapped instead of
+        being sent as-is (which used to msg_too_long and abort the remainder).
+        Margin covers the continuation markers + fence reopen prefix.
+        """
+        return fence_safe_chunks(text, self.MAX_MESSAGE_LENGTH - 150)
 
     async def send_message_get_ts(self, channel_id: str, thread_id: str, text: str) -> Dict:
         """Send a message and return the response including timestamp"""
@@ -388,30 +394,68 @@ class SlackMessagingMixin:
             self.log_error(f"Could not update message: {e}")
             return False
 
-    async def get_thread_history(self, channel_id: str, thread_id: str, limit: int = None) -> List[Message]:
-        """Get COMPLETE thread history from Slack - fetches ALL messages by default"""
+    async def _replies_page_with_retry(self, kwargs: Dict, attempts: int = 3):
+        """One conversations.replies page, honoring Retry-After on 429s (R1).
+
+        Retries only rate-limit errors; anything else propagates immediately.
+        """
+        for attempt in range(attempts):
+            try:
+                return await self.app.client.conversations_replies(**kwargs)
+            except SlackApiError as e:
+                err = e.response.get("error") if getattr(e, "response", None) else None
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if (err == "ratelimited" or status == 429) and attempt < attempts - 1:
+                    headers = getattr(getattr(e, "response", None), "headers", None) or {}
+                    try:
+                        delay = float(headers.get("Retry-After") or 1)
+                    except (TypeError, ValueError):
+                        delay = 1.0
+                    delay = min(max(delay, 0.5), 30.0)
+                    self.log_warning(
+                        f"conversations.replies rate-limited (attempt {attempt + 1}/{attempts}), "
+                        f"retrying in {delay}s"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+
+    async def get_thread_history(self, channel_id: str, thread_id: str, limit: int = None,
+                                 oldest: str = None) -> List[Message]:
+        """Get COMPLETE thread history from Slack - fetches ALL messages by default.
+
+        `oldest` (Slack ts) fetches only messages strictly after it (Slack's default
+        inclusive=false) — used by the Phase S summary-tail rebuild so a compacted
+        1500-message thread doesn't refetch the summarized head.
+
+        Raises HistoryFetchError on terminal fetch failure. Since Phase S, Slack is
+        the ONLY transcript — returning [] here would make the bot answer with
+        amnesia, silently. An actually-empty thread still returns [] normally.
+        """
         messages = []
-        
+
         try:
             # Fetch ALL messages using pagination
             cursor = None
             total_fetched = 0
-            
+
             while True:
                 # Slack's max per request is 1000
                 per_request_limit = 1000
                 if limit and limit - total_fetched < 1000:
                     per_request_limit = limit - total_fetched
-                
+
                 kwargs = {
                     "channel": channel_id,
                     "ts": thread_id,
                     "limit": per_request_limit
                 }
+                if oldest:
+                    kwargs["oldest"] = oldest
                 if cursor:
                     kwargs["cursor"] = cursor
-                
-                result = await self.app.client.conversations_replies(**kwargs)
+
+                result = await self._replies_page_with_retry(kwargs)
                 slack_messages = result.get("messages", [])
                 
                 if not slack_messages:
@@ -419,16 +463,24 @@ class SlackMessagingMixin:
                     
                 # Process messages from this batch
                 for msg in slack_messages:
-                    # Skip loading indicators and system messages
                     text = msg.get("text", "")
-                    if "Thinking" in text:
-                        continue
-                    # Skip busy/processing messages
-                    if ":warning:" in text and "currently processing" in text:
-                        continue
-                    # Skip settings button messages
-                    if text == "Settings available":
-                        continue
+                    # Determine sender up front — the placeholder/status filters below
+                    # must only ever skip OUR OWN messages (R3: a human saying
+                    # "Thinking about the Q3 plan" is real context, not a placeholder).
+                    sender_type = self.classify_sender(msg)
+                    if sender_type == "self":
+                        # Our transient placeholders/status lines: ":emoji: Thinking..."
+                        # and status updates that share that shape. Precise-match only.
+                        if _SELF_STATUS_RE.match(text) and any(
+                            marker in text for marker in _SELF_STATUS_MARKERS
+                        ):
+                            continue
+                        # Legacy busy/processing notices
+                        if ":warning:" in text and "currently processing" in text:
+                            continue
+                        # Settings button messages
+                        if text == "Settings available":
+                            continue
                     # Skip response-footer messages (model context line + Configure button) —
                     # detected by their action block, so a real reply can't false-positive.
                     if any(
@@ -438,8 +490,7 @@ class SlackMessagingMixin:
                     ):
                         continue
 
-                    # Determine sender: our own bot (-> assistant later), another bot, or a human.
-                    sender_type = self.classify_sender(msg)
+                    # sender_type computed above (drives both the self-only filters and metadata)
                     is_bot = bool(msg.get("bot_id"))  # kept for existing readers ("any bot")
                     # Display name for bot authors (used to name-prefix other bots like humans)
                     bot_name = msg.get("username") or (msg.get("bot_profile") or {}).get("name")
@@ -502,8 +553,13 @@ class SlackMessagingMixin:
             return messages
             
         except SlackApiError as e:
+            # Terminal failure (rate-limit retries exhausted or a hard API error).
+            # Do NOT return [] — Slack is the only transcript, and an empty result
+            # here would silently rebuild the thread with no context (R1).
             self.log_error(f"Error getting thread history: {e}")
-            return []
+            raise HistoryFetchError(
+                f"Could not fetch thread history for {channel_id}:{thread_id}: {e}"
+            ) from e
 
     def supports_streaming(self) -> bool:
         """Returns True if streaming is enabled for Slack"""
@@ -676,7 +732,7 @@ class SlackMessagingMixin:
                 if truncated.count('```') % 2 == 1:
                     truncated += '\n```'
                 
-                formatted_text = truncated + "\n\n*...continued in next message...*"
+                formatted_text = truncated + continuation_trailer()
             
             # Call Slack API's chat_update method
             result = await self.app.client.chat_update(
