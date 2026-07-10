@@ -30,6 +30,16 @@ from typing import Any, Dict, List, Optional
 
 from config import config
 
+def _ts_key(ts: Any) -> tuple:
+    """Numeric (seconds, microseconds) sort key for a Slack ts — never lexical, so
+    '9.0' sorts before '10.0' (F5 fix f)."""
+    try:
+        s, _, frac = str(ts).partition(".")
+        return (int(s or 0), int((frac + "000000")[:6]))
+    except (ValueError, TypeError):
+        return (0, 0)
+
+
 VALID_ACTIONS = ("respond", "react", "ignore", "backoff")
 VALID_PLACEMENTS = ("thread", "channel")
 VALID_LEVELS = ("off", "mentions_only", "judicious", "active")
@@ -98,6 +108,18 @@ class ParticipationEngine:
         # channel -> newest pending message ts (debounce supersession marker)
         self._latest: Dict[str, str] = {}
 
+    def note_arrival(self, channel_id: str, ts: Optional[str]) -> None:
+        """Register a message's ts as the channel's newest — MONOTONICALLY (F5 fix b).
+
+        Called at gate entry, BEFORE any await, so an older event delayed by memory/topic
+        I/O can never overwrite a newer event's marker and win the debounce. Only a
+        genuinely newer Slack ts advances the marker."""
+        if not channel_id or not ts:
+            return
+        current = self._latest.get(channel_id)
+        if current is None or _ts_key(ts) > _ts_key(current):
+            self._latest[channel_id] = ts
+
     # ---------------------------------------------------------------- rails
 
     def hourly_cap(self, level: str) -> int:
@@ -128,16 +150,28 @@ class ParticipationEngine:
                        name_hit: bool = False,
                        snoozed: bool = False,
                        sender_is_bot: bool = False,
-                       channel_topic: Optional[str] = None) -> Optional[ParticipationVerdict]:
+                       channel_topic: Optional[str] = None,
+                       pulse: Any = None,
+                       thread_root_ts: Optional[str] = None) -> Optional[ParticipationVerdict]:
         """Debounced judgment. Returns None when superseded — a newer message in
         the same channel arrived during the debounce window, and ITS evaluation
         (whose envelope includes this message) covers the batch."""
-        self._latest[channel_id] = ts
+        self.note_arrival(channel_id, ts)  # monotonic; a stale caller can't clobber a newer marker
         wait = max(0.0, float(getattr(config, "participation_debounce_seconds", 3.0)))
         if wait:
             await asyncio.sleep(wait)
         if self._latest.get(channel_id) != ts:
             return None
+
+        # F5: render the thread tail HERE (after the debounce + supersession check) —
+        # pure in-memory, zero latency, reflecting thread state at classification time.
+        thread_tail = None
+        if pulse is not None and thread_root_ts:
+            try:
+                thread_tail = pulse.render_thread_tail(
+                    channel_id, thread_root_ts, before_ts=ts) or None
+            except Exception:
+                thread_tail = None
 
         signals = {
             "sender_name": sender_name,
@@ -146,6 +180,7 @@ class ParticipationEngine:
             "directives": directives,
             "memory_facts": memory_facts or [],
             "channel_activity": channel_activity,
+            "thread_tail": thread_tail,
             "unprompted_last_hour": int(unprompted_last_hour),
             "hourly_cap": self.hourly_cap(level),
             "name_hit": bool(name_hit),

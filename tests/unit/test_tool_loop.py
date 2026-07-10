@@ -353,8 +353,9 @@ def _react_self():
     s.react = AsyncMock(return_value=True)
     s.get_react_tool_schema = SlackMessagingMixin.get_react_tool_schema.__get__(s)
     s.execute_react_tool = SlackMessagingMixin.execute_react_tool.__get__(s)
-    # start with no dedup memory
-    s._tool_reacted_ts = set()
+    s._reserve_and_react = SlackMessagingMixin._reserve_and_react.__get__(s)
+    # start with no reservation guard (None so the executor initializes it)
+    s._reaction_guard = None
     return s
 
 
@@ -393,15 +394,99 @@ class TestReactTool:
         s.react.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_dedup_one_reaction_per_message(self, monkeypatch):
+    async def test_two_distinct_emoji_both_land(self, monkeypatch):
+        # F6: a user asking for several distinct emoji on one message gets several.
         monkeypatch.setattr(config, "enable_reactions", True)
         monkeypatch.setattr(config, "enable_react_tool", True)
         monkeypatch.setattr(config, "reaction_emojis", ["thumbsup", "tada"])
+        monkeypatch.setattr(config, "reaction_max_per_message", 4)
         s = _react_self()
         assert (await s.execute_react_tool(self.ctx, {"emoji": "thumbsup"}))["ok"] is True
-        out = await s.execute_react_tool(self.ctx, {"emoji": "tada"})
-        assert out["ok"] is False and out["error"] == "already_reacted"
-        assert s.react.await_count == 1
+        assert (await s.execute_react_tool(self.ctx, {"emoji": "tada"}))["ok"] is True
+        assert s.react.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_duplicate_emoji_idempotent_no_slot(self, monkeypatch):
+        # Same emoji twice: idempotent success, no second Slack call, no slot consumed.
+        monkeypatch.setattr(config, "enable_reactions", True)
+        monkeypatch.setattr(config, "enable_react_tool", True)
+        monkeypatch.setattr(config, "reaction_emojis", ["thumbsup", "tada"])
+        monkeypatch.setattr(config, "reaction_max_per_message", 1)
+        s = _react_self()
+        assert (await s.execute_react_tool(self.ctx, {"emoji": "thumbsup"}))["ok"] is True
+        out = await s.execute_react_tool(self.ctx, {"emoji": "thumbsup"})
+        assert out["ok"] is True and out.get("idempotent") is True
+        assert s.react.await_count == 1  # cap=1 not consumed by the duplicate
+
+    @pytest.mark.asyncio
+    async def test_cap_refusal_at_n_plus_1(self, monkeypatch):
+        monkeypatch.setattr(config, "enable_reactions", True)
+        monkeypatch.setattr(config, "enable_react_tool", True)
+        monkeypatch.setattr(config, "reaction_emojis", ["thumbsup", "tada", "eyes"])
+        monkeypatch.setattr(config, "reaction_max_per_message", 2)
+        s = _react_self()
+        assert (await s.execute_react_tool(self.ctx, {"emoji": "thumbsup"}))["ok"] is True
+        assert (await s.execute_react_tool(self.ctx, {"emoji": "tada"}))["ok"] is True
+        out = await s.execute_react_tool(self.ctx, {"emoji": "eyes"})
+        assert out["ok"] is False and out["error"] == "reaction_cap"
+        assert "2" in out["message"]
+        assert s.react.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_failed_react_rolls_back_reservation(self, monkeypatch):
+        # A failed Slack call must free its slot so a later distinct emoji can still land.
+        monkeypatch.setattr(config, "enable_reactions", True)
+        monkeypatch.setattr(config, "enable_react_tool", True)
+        monkeypatch.setattr(config, "reaction_emojis", ["thumbsup", "tada"])
+        monkeypatch.setattr(config, "reaction_max_per_message", 1)
+        s = _react_self()
+        s.react = AsyncMock(side_effect=[False, True])
+        assert (await s.execute_react_tool(self.ctx, {"emoji": "thumbsup"}))["ok"] is False
+        # reservation rolled back → cap slot free again
+        assert (await s.execute_react_tool(self.ctx, {"emoji": "tada"}))["ok"] is True
+
+    @pytest.mark.asyncio
+    async def test_concurrent_distinct_emoji_respect_cap(self, monkeypatch):
+        # Siblings dispatched concurrently (as dispatch_all does) can't both pass a cap of 1.
+        monkeypatch.setattr(config, "enable_reactions", True)
+        monkeypatch.setattr(config, "enable_react_tool", True)
+        monkeypatch.setattr(config, "reaction_emojis", ["thumbsup", "tada"])
+        monkeypatch.setattr(config, "reaction_max_per_message", 1)
+        s = _react_self()
+
+        async def _slow_react(*a, **k):
+            await asyncio.sleep(0)
+            return True
+        s.react = AsyncMock(side_effect=_slow_react)
+        results = await asyncio.gather(
+            s.execute_react_tool(self.ctx, {"emoji": "thumbsup"}),
+            s.execute_react_tool(self.ctx, {"emoji": "tada"}),
+        )
+        oks = [r["ok"] for r in results]
+        assert oks.count(True) == 1 and oks.count(False) == 1
+        assert next(r for r in results if not r["ok"])["error"] == "reaction_cap"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_identical_emoji_first_fails(self, monkeypatch):
+        # Two concurrent identical-emoji calls where the OWNER fails: the duplicate must
+        # NOT report success (round-2 fix a).
+        monkeypatch.setattr(config, "enable_reactions", True)
+        monkeypatch.setattr(config, "enable_react_tool", True)
+        monkeypatch.setattr(config, "reaction_emojis", ["thumbsup"])
+        monkeypatch.setattr(config, "reaction_max_per_message", 4)
+        s = _react_self()
+        started = asyncio.Event()
+
+        async def _fail_react(*a, **k):
+            started.set()
+            await asyncio.sleep(0.01)
+            return False
+        s.react = AsyncMock(side_effect=_fail_react)
+        results = await asyncio.gather(
+            s.execute_react_tool(self.ctx, {"emoji": "thumbsup"}),
+            s.execute_react_tool(self.ctx, {"emoji": "thumbsup"}),
+        )
+        assert all(r["ok"] is False for r in results)
 
     @pytest.mark.asyncio
     async def test_gating(self, monkeypatch):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+from collections import OrderedDict
 from typing import Dict, List, Optional
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -310,6 +311,24 @@ class SlackMessagingMixin:
             except Exception as e:
                 self.log_warning(f"Error cleaning up utilities session: {e}")
 
+    def _record_own_reply_pulse(self, channel_id: str, thread_id: Optional[str],
+                                ts: Optional[str], text: str) -> None:
+        """F5 fix (a): record the bot's OWN final reply into the pulse at send time.
+
+        The clean, complete reply text keyed on its real ts — the authoritative source for
+        the assistant's own turns in the classifier's thread tail (echoed placeholders /
+        footers / native-stream edits are unreliable). Chrome and empty text are skipped.
+        Best-effort; never breaks sending."""
+        pulse = getattr(self, "channel_pulse", None)
+        if pulse is None or not ts:
+            return
+        if not (text or "").strip() or is_checklist_status_text(text):
+            return
+        try:
+            pulse.record_own_reply(channel_id, thread_ts=thread_id, ts=ts, text=text)
+        except Exception as e:
+            self.log_debug(f"own-reply pulse record failed: {e}")
+
     async def send_message(self, channel_id: str, thread_id: str, text: str) -> bool:
         """Send a text message to Slack, splitting if needed"""
         try:
@@ -317,15 +336,16 @@ class SlackMessagingMixin:
             text = strip_citations(text)
             # Format text for Slack
             formatted_text = self.format_text(text)
-            
+
             # Check if we need to split the message
             if len(formatted_text) <= self.MAX_MESSAGE_LENGTH:
                 # Single message
-                await self.app.client.chat_postMessage(
+                result = await self.app.client.chat_postMessage(
                     channel=channel_id,
                     thread_ts=thread_id,
                     text=formatted_text
                 )
+                self._record_own_reply_pulse(channel_id, thread_id, result.get("ts"), text)
             else:
                 # Split into multiple messages, "Continued..." style (shared markers so
                 # the rebuild-side stripper always recognizes them). One chunk failing
@@ -333,6 +353,7 @@ class SlackMessagingMixin:
                 chunks = self._split_message(formatted_text)
                 last = len(chunks) - 1
                 sent_any = False
+                first_ts = None
                 for i, chunk in enumerate(chunks):
                     body = chunk
                     if i > 0:
@@ -340,14 +361,18 @@ class SlackMessagingMixin:
                     if i < last:
                         body = f"{body}{continuation_trailer()}"
                     try:
-                        await self.app.client.chat_postMessage(
+                        result = await self.app.client.chat_postMessage(
                             channel=channel_id,
                             thread_ts=thread_id,
                             text=body
                         )
                         sent_any = True
+                        if first_ts is None:
+                            first_ts = result.get("ts")
                     except SlackApiError as chunk_error:
                         self.log_error(f"Error sending message chunk {i + 1}/{last + 1}: {chunk_error}")
+                # Record the full reply once, keyed on the first chunk's ts.
+                self._record_own_reply_pulse(channel_id, thread_id, first_ts, text)
                 return sent_any if last > 0 else True
             return True
         except SlackApiError as e:
@@ -771,7 +796,8 @@ class SlackMessagingMixin:
                 "Add an emoji reaction to a Slack message, like a human colleague would — "
                 "sparingly and tastefully (an acknowledgment, a ✅ on a completed request, a "
                 "celebration). If a reaction alone fully answers the message, react and reply "
-                "with empty text. Defaults to the message you are answering."
+                "with empty text. Defaults to the message you are answering. Call once per "
+                "emoji when asked for multiple."
             ),
             "parameters": {
                 "type": "object",
@@ -786,8 +812,9 @@ class SlackMessagingMixin:
         }
 
     async def execute_react_tool(self, ctx, args: dict) -> dict:
-        """Executor for react_to_message. Allowlist + one-bot-reaction-per-message dedup;
-        never raises (returns {"ok": False, ...} on any refusal/failure)."""
+        """Executor for react_to_message. Allowlist + per-message cap
+        (REACTION_MAX_PER_MESSAGE distinct emoji); never raises (returns
+        {"ok": False, ...} on any refusal/failure)."""
         if not (config.enable_reactions and config.enable_react_tool):
             return {"ok": False, "error": "disabled", "message": "Reactions are disabled."}
         emoji = (args.get("emoji") or "").strip().strip(":")
@@ -798,23 +825,74 @@ class SlackMessagingMixin:
         ts = (args.get("ts") or "").strip() or getattr(ctx, "trigger_ts", None) or getattr(ctx, "thread_ts", None)
         if not channel_id or not ts:
             return {"ok": False, "error": "no_target", "message": "No message to react to."}
+        return await self._reserve_and_react(channel_id, ts, emoji)
 
-        # At most one bot reaction per message (bounded in-memory guard)
-        reacted = getattr(self, "_tool_reacted_ts", None)
-        if reacted is None:
-            reacted = self._tool_reacted_ts = set()
-        key = f"{channel_id}:{ts}"
-        if key in reacted:
-            return {"ok": False, "error": "already_reacted",
-                    "message": "Already reacted to that message — one reaction per message."}
+    async def _reserve_and_react(self, channel_id: str, ts: str, emoji: str) -> dict:
+        """F6: atomic per-message reservation with rollback.
 
-        ok = await self.react(channel_id, ts, emoji)
-        if ok:
-            reacted.add(key)
-            if len(reacted) > 5000:
-                reacted.clear()  # crude bound; dedup is best-effort, Slack dedups same-emoji anyway
-            return {"ok": True, "emoji": emoji, "ts": ts}
-        return {"ok": False, "error": "reaction_failed", "message": f"Could not add :{emoji}:."}
+        Guard: bounded LRU map (channel, ts) -> {emoji: Future(pending) | True(committed)}.
+        Distinct emoji up to REACTION_MAX_PER_MESSAGE land; a duplicate emoji is idempotent
+        success WITHOUT consuming a slot. Because dispatch_all runs sibling calls
+        concurrently, the slot is reserved SYNCHRONOUSLY (before the first await) so N+1
+        distinct reactions can't all pass the cap; a failed/cancelled Slack call rolls the
+        reservation back in `finally`. A duplicate whose in-flight owner FAILS must not
+        report success (round-2 fix a)."""
+        cap = max(1, int(getattr(config, "reaction_max_per_message", 4)))
+        guard = getattr(self, "_reaction_guard", None)
+        if guard is None:
+            guard = self._reaction_guard = OrderedDict()  # (channel, ts) -> {emoji: Future|True}
+        key = (channel_id, ts)
+        slots = guard.get(key)
+        if slots is None:
+            slots = guard[key] = {}
+        guard.move_to_end(key)  # LRU recency refresh
+        while len(guard) > 2000:  # whole-message eviction, oldest first
+            guard.popitem(last=False)
+
+        existing = slots.get(emoji)
+        if existing is not None:
+            # Duplicate emoji — idempotent, no new slot consumed.
+            if existing is True:  # already committed
+                return {"ok": True, "emoji": emoji, "ts": ts, "idempotent": True}
+            # In-flight: await the owner's real outcome (shield so our cancellation
+            # doesn't cancel theirs). Must NOT report success if the owner failed.
+            try:
+                ok = await asyncio.shield(existing)
+            except Exception:
+                ok = False
+            if ok:
+                return {"ok": True, "emoji": emoji, "ts": ts, "idempotent": True}
+            return {"ok": False, "error": "reaction_failed", "message": f"Could not add :{emoji}:."}
+
+        # New emoji — enforce the cap over committed + pending distinct emoji.
+        if len(slots) >= cap:
+            return {"ok": False, "error": "reaction_cap",
+                    "message": f"Already at the max of {cap} reactions on that message."}
+
+        # Reserve synchronously (before any await) so concurrent siblings see the slot.
+        fut = asyncio.get_event_loop().create_future()
+        slots[emoji] = fut
+        committed = False
+        try:
+            ok = await self.react(channel_id, ts, emoji)
+            if ok:
+                slots[emoji] = True  # commit
+                committed = True
+                if not fut.done():
+                    fut.set_result(True)
+                return {"ok": True, "emoji": emoji, "ts": ts}
+            if not fut.done():
+                fut.set_result(False)
+            return {"ok": False, "error": "reaction_failed", "message": f"Could not add :{emoji}:."}
+        finally:
+            if not committed:
+                # Roll back the reservation — covers failure, timeout, and cancellation.
+                if slots.get(emoji) is fut:
+                    del slots[emoji]
+                if not fut.done():
+                    fut.set_result(False)
+                if not slots:
+                    guard.pop(key, None)
 
     def get_no_reply_tool_schema(self) -> dict:
         """Function-tool schema for the F2 terminal no-reply action (unprompted turns only)."""

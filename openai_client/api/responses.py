@@ -994,6 +994,10 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
         )
         lines.append(f"- Channel memory (may be stale): {rendered}")
     signal_note = "\n\nSignals:\n" + "\n".join(lines)
+    # F5: the current thread's recent exchange is the AUTHORITATIVE evidence for
+    # addressee resolution — render it above the peripheral channel envelope.
+    if signals.get("thread_tail"):
+        signal_note += f"\n\n{signals['thread_tail']}"
     if signals.get("channel_activity"):
         signal_note += f"\n\n{signals['channel_activity']}"
 

@@ -155,22 +155,39 @@ class SlackMessageEventsMixin:
                 other_bots.add(m.get("bot_id") or m.get("user") or "bot")
         return (bot_present, len(humans), len(other_bots))
 
+    # Slack subtypes that are NOT semantic messages (edits/deletes/membership/topic
+    # churn) — excluded from the pulse. Everything else, INCLUDING bot_message and
+    # ordinary content subtypes (file_share, thread_broadcast), is real awareness.
+    _PULSE_FEED_SKIP_SUBTYPES = frozenset({
+        "message_changed", "message_deleted", "message_replied",
+        "channel_join", "channel_leave", "channel_topic", "channel_purpose",
+        "channel_name", "channel_archive", "channel_unarchive",
+        "group_join", "group_leave", "bot_add", "bot_remove",
+        "tombstone", "reminder_add", "pinned_item", "unpinned_item",
+    })
+
     async def _feed_channel_pulse(self, event: Dict[str, Any]) -> None:
-        """Phase E: feed EVERY real channel message into the ambient ring buffer —
-        including our own posts and messages we go on to ignore. Awareness first,
-        gating later. Best-effort; never blocks dispatch."""
+        """F5 fix (a): the single reliable semantic feed into the ambient ring buffer.
+        Covers channel message events (including other apps' `bot_message` posts) and
+        app_mention events; excludes edits/deletes/membership churn and our OWN posts —
+        the bot's own final replies are recorded cleanly at the messaging layer
+        (record_own_reply), so the echoed placeholder/footer/streamed-edit chrome must
+        not leak in here. Best-effort; never blocks dispatch."""
         pulse = getattr(self, "channel_pulse", None)
         if pulse is None:
             return
         try:
+            if event.get("subtype") in self._PULSE_FEED_SKIP_SUBTYPES:
+                return
+            if self.is_own_message(event):
+                return  # recorded at the messaging layer with clean final text
+            if not (event.get("text") or "").strip():
+                return  # nothing to add (e.g. a bare file share with no comment)
             sender_type = self.classify_sender(event)
             user_id = event.get("user")
             display_name = event.get("username")
-            if not display_name and user_id:
-                if user_id == getattr(self, "bot_user_id", None):
-                    display_name = (config.bot_name_aliases or ["bot"])[0]
-                elif user_id in self.user_cache:
-                    display_name = self.user_cache[user_id].get("real_name")
+            if not display_name and user_id and user_id in self.user_cache:
+                display_name = self.user_cache[user_id].get("real_name")
             pulse.record(
                 event.get("channel"),
                 ts=event.get("ts"),
@@ -190,13 +207,15 @@ class SlackMessageEventsMixin:
         SAFE BY DEFAULT — the caller already gated on config.enable_channel_listening. Honors
         channel_response_mode (default 'tag_only'); short-circuits our own posts; de-dups against
         the app_mention event; and bypasses the welcome/settings onboarding flow entirely."""
-        # Ignore non-real messages (edits, deletes, joins, message_changed, etc.)
-        if event.get("subtype"):
-            return
-        # Phase E: awareness BEFORE any gate — ignored messages (and our own) still
-        # update the channel's peripheral vision. This path only runs when channel
+        # Phase E / F5: awareness BEFORE any gate — feed EVERY semantic message (incl.
+        # other apps' bot_message posts and ones we go on to ignore) into the pulse. The
+        # feed does its own subtype/own-message filtering. This path only runs when channel
         # listening is on, so the pulse is inert otherwise by construction.
         await self._feed_channel_pulse(event)
+        # Ignore non-real messages (edits, deletes, joins, message_changed, etc.) for the
+        # RESPONSE gate — they never drive a reply (awareness already captured above).
+        if event.get("subtype"):
+            return
         # Loop guard FIRST: never act on our own posts.
         if self.is_own_message(event):
             return
@@ -238,6 +257,13 @@ class SlackMessageEventsMixin:
             bot_present, human_count, other_bots = await self._thread_participation(channel_id, thread_ts)
             if bot_present and human_count <= 1 and other_bots == 0:
                 direct_continuation = True
+                # F5 fix (b): the replies fast path only scans the oldest page (limit=50)
+                # and can miss a SECOND bot later in a long thread. The pulse tail holds
+                # recent senders — if it shows another agent, drop the deterministic
+                # continuation and let the engine judge (a bot may be the real addressee).
+                pulse = getattr(self, "channel_pulse", None)
+                if pulse is not None and pulse.thread_has_other_bot(channel_id, thread_ts):
+                    direct_continuation = False
 
         # Decide (Phase F, revised): 1:1 thread continuation → respond directly;
         # judicious/active → engine judges every message; mentions_only → engine
@@ -330,6 +356,9 @@ class SlackMessageEventsMixin:
         pulse = getattr(self, "channel_pulse", None)
         if (pulse is not None and config.enable_channel_listening
                 and message.channel_id and not message.channel_id.startswith("D")):
+            # F5 fix (a): an @mention is a semantic message too — feed it (idempotent with
+            # the parallel `message` event via record()'s (channel, ts) dedup).
+            await self._feed_channel_pulse(event)
             await pulse.ensure_backfill(message.channel_id, self.app.client, self)
 
         # Phase 7: surface per-channel ground rules (in-channel only) and skip the

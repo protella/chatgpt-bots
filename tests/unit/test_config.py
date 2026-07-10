@@ -84,6 +84,24 @@ class TestBotConfig:
         assert config.api_timeout_image == 300.0
         assert config.api_timeout_image > config.api_timeout_read
 
+    def test_thread_tail_defaults(self, mock_env):
+        """F5 thread-tail knobs default to 6 / 50 / 30."""
+        config = BotConfig()
+        assert config.participation_thread_tail == 6
+        assert config.pulse_thread_tails_max == 50
+        assert config.pulse_thread_tail_channels_max == 30
+
+    @patch.dict(os.environ, {"PARTICIPATION_THREAD_TAIL": "0"})
+    def test_thread_tail_disabled(self, mock_env):
+        """PARTICIPATION_THREAD_TAIL=0 disables the tail recording + signal."""
+        config = BotConfig()
+        assert config.participation_thread_tail == 0
+
+    def test_reaction_max_per_message_default(self, mock_env):
+        """F6 per-message reaction cap defaults to 4."""
+        config = BotConfig()
+        assert config.reaction_max_per_message == 4
+
     def test_no_reply_tool_default_enabled(self, mock_env):
         """ENABLE_NO_REPLY_TOOL defaults to True"""
         config = BotConfig()

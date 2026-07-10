@@ -127,13 +127,23 @@ async def _handle_no_reply_terminal(
     terminal_call: Dict[str, Any],
     tools_used_all: List[str],
     local_tool_calls: List[Dict[str, Any]],
+    remaining_budget: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Terminal round: no_response_needed ends the turn. Only sibling react_to_message
     calls execute (filtered BEFORE dispatch — dispatch_all runs a round concurrently);
     other side-effect calls are suppressed with a logged skip. Returns a no_reply outcome
-    with the (sanitized) reason; nothing is posted."""
-    exec_calls = [c for c in calls if c.get("name") in (_NO_REPLY_TOOL, _REACT_TOOL)]
-    skipped = [c.get("name") for c in calls if c not in exec_calls]
+    with the (sanitized) reason; nothing is posted.
+
+    F6 fix (b): react siblings still count against MAX_TOOL_CALLS_PER_TURN — the terminal
+    branch runs before the loop's own cap check, so apply the remaining global budget to
+    the react calls here."""
+    react_calls = [c for c in calls if c.get("name") == _REACT_TOOL]
+    budget = len(react_calls) if remaining_budget is None else max(0, int(remaining_budget))
+    allowed_react_ids = {id(c) for c in react_calls[:budget]}
+    exec_calls = [c for c in calls
+                  if c.get("name") == _NO_REPLY_TOOL or id(c) in allowed_react_ids]
+    exec_ids = {id(c) for c in exec_calls}
+    skipped = [c.get("name") for c in calls if id(c) not in exec_ids]
     if skipped:
         self.log_info(f"{_NO_REPLY_TOOL} terminal — suppressing sibling calls: {skipped}")
     results = await registry.dispatch_all(tool_context, exec_calls)
@@ -197,7 +207,8 @@ async def create_text_response_with_tool_loop(
         if terminal_call is not None:
             return await _handle_no_reply_terminal(
                 self, registry, tool_context, calls, terminal_call,
-                tools_used_all, local_tool_calls)
+                tools_used_all, local_tool_calls,
+                remaining_budget=config.max_tool_calls_per_turn - total_calls)
 
         rounds += 1
         total_calls += len(calls)
@@ -258,7 +269,8 @@ async def create_streaming_response_with_tool_loop(
         if terminal_call is not None:
             return await _handle_no_reply_terminal(
                 self, registry, tool_context, calls, terminal_call,
-                tools_used_all, local_tool_calls)
+                tools_used_all, local_tool_calls,
+                remaining_budget=config.max_tool_calls_per_turn - total_calls)
 
         rounds += 1
         total_calls += len(calls)
