@@ -42,14 +42,17 @@ async def _run_tool_round(
     input_items: List[Dict[str, Any]],
     local_tool_calls: List[Dict[str, Any]],
     tool_callback: Optional[Callable[[str, str], Any]] = None,
-    result_overrides: Optional[Dict[str, Any]] = None,
+    result_overrides: Optional[Dict[int, Any]] = None,
 ) -> None:
     """Dispatch one round's calls, then replay the round's items (reasoning items in
     place, each function_call followed by its function_call_output) onto the input.
 
-    ``result_overrides`` (call_id -> result) short-circuits specific calls: they are NOT
+    ``result_overrides`` (id(call) -> result) short-circuits specific calls: they are NOT
     dispatched and their given result is fed back instead — used to reject an invalid
-    no_response_needed (F2) while still running its siblings."""
+    no_response_needed (F2) while still running its siblings. Keyed by OBJECT IDENTITY, not
+    call_id: OpenAI normally returns a unique non-empty call_id per function_call, but a
+    degenerate/malformed round could repeat or omit them, which would misroute the override
+    to a sibling; identity is always exact (the same call dicts flow through `sink`)."""
 
     async def _notify(tool_id: str, status: str) -> None:
         if not tool_callback:
@@ -68,13 +71,13 @@ async def _run_tool_round(
     for call in calls:
         await _notify(f"local:{call.get('name')}", "started")
 
-    dispatch_calls = [c for c in calls if c.get("call_id") not in overrides]
+    dispatch_calls = [c for c in calls if id(c) not in overrides]
     dispatched = await registry.dispatch_all(tool_context, dispatch_calls)
     dispatched_by_id = {id(c): r for c, r in zip(dispatch_calls, dispatched)}
     result_by_id = {}
     for call in calls:
-        cid = call.get("call_id")
-        result = overrides[cid] if cid in overrides else dispatched_by_id.get(id(call))
+        oid = id(call)
+        result = overrides[oid] if oid in overrides else dispatched_by_id.get(oid)
         ok = _call_ok(result)
         # F7: capture a short arg-derived gist alongside name/ok (provenance; no results).
         local_tool_calls.append({"name": call.get("name"), "ok": ok,
@@ -204,12 +207,18 @@ async def create_text_response_with_tool_loop(
     tools: List[Dict[str, Any]],
     registry: ToolRegistry,
     tool_context: ToolContext,
+    prior_committed: bool = False,
     **params: Any,
 ) -> Dict[str, Any]:
     """Non-streaming response with local tool execution.
 
     Returns {"text", "tools_used", "local_tool_calls"} — ``local_tool_calls`` is the
     ordered [{"name", "ok"}] record of every local call (e.g. for reaction-only detection).
+
+    ``prior_committed`` (F8): True when an EARLIER attempt this turn (e.g. a streaming
+    attempt that failed mid-reply) already exposed visible text. A no_response_needed on
+    this attempt would then orphan that partial as fake silence, so it is REJECTED and the
+    model is forced to finish the reply — mirroring the streaming loop's committed-text rule.
     """
     input_items: List[Dict[str, Any]] = list(messages)
     tools_used_all: List[str] = []
@@ -241,10 +250,28 @@ async def create_text_response_with_tool_loop(
 
         terminal_call = _no_reply_call(calls)
         if terminal_call is not None:
-            return await _handle_no_reply_terminal(
-                self, registry, tool_context, calls, terminal_call,
-                tools_used_all, local_tool_calls,
-                remaining_budget=config.max_tool_calls_per_turn - total_calls)
+            if not prior_committed:
+                return await _handle_no_reply_terminal(
+                    self, registry, tool_context, calls, terminal_call,
+                    tools_used_all, local_tool_calls,
+                    remaining_budget=config.max_tool_calls_per_turn - total_calls)
+            # A prior attempt already exposed visible text — honoring silence now would
+            # orphan it. Reject the terminal (feed an error back), run any siblings, and
+            # continue so the model completes the reply.
+            self.log_warning(
+                f"{_NO_REPLY_TOOL} called after a prior attempt already exposed text — "
+                "rejecting; model must complete the reply")
+            rounds += 1
+            total_calls += len(calls)
+            await _run_tool_round(
+                self, registry, tool_context, sink, input_items, local_tool_calls,
+                result_overrides={id(terminal_call): _INVALID_NO_REPLY_RESULT})
+            _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")])
+            if rounds >= config.max_tool_rounds or total_calls >= config.max_tool_calls_per_turn:
+                self.log_warning(
+                    f"Tool loop cap hit ({rounds} rounds / {total_calls} calls) — forcing final answer")
+                tool_choice = "none"
+            continue
 
         rounds += 1
         total_calls += len(calls)
@@ -266,12 +293,18 @@ async def create_streaming_response_with_tool_loop(
     tool_context: ToolContext,
     stream_callback: Callable[[Optional[str]], Any],
     tool_callback: Optional[Callable[[str, str], Any]] = None,
+    prior_committed: bool = False,
     **params: Any,
 ) -> Dict[str, Any]:
     """Streaming response with local tool execution.
 
     Returns {"text", "tools_used", "local_tool_calls"}. Intermediate (tool) rounds don't
     stream text to the user; the final round streams normally and fires the completion flush.
+
+    ``prior_committed`` (F8): seeds the committed-text signal True when an EARLIER attempt
+    this turn already exposed visible text (e.g. an MCP-failure retry after a partial
+    reply), so a no_response_needed on this attempt is rejected rather than orphaning that
+    partial as fake silence.
     """
     input_items: List[Dict[str, Any]] = list(messages)
     tools_used_all: List[str] = []
@@ -282,8 +315,9 @@ async def create_streaming_response_with_tool_loop(
     # F2: track whether any visible reply text has streamed to Slack this turn. The round's
     # returned text is exactly what was forwarded to the stream callback (pre-tool-call
     # preamble is committed; post-call text is suppressed), so this is the committed-text
-    # signal that decides whether a no_response_needed call is valid.
-    visible_committed = False
+    # signal that decides whether a no_response_needed call is valid. Seeded by
+    # prior_committed so a cross-attempt partial (F8) also counts as committed.
+    visible_committed = bool(prior_committed)
 
     while True:
         sink: List[Dict[str, Any]] = []
@@ -326,7 +360,7 @@ async def create_streaming_response_with_tool_loop(
             total_calls += len(calls)
             await _run_tool_round(
                 self, registry, tool_context, sink, input_items, local_tool_calls, tool_callback,
-                result_overrides={terminal_call.get("call_id"): _INVALID_NO_REPLY_RESULT})
+                result_overrides={id(terminal_call): _INVALID_NO_REPLY_RESULT})
             _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")])
             if rounds >= config.max_tool_rounds or total_calls >= config.max_tool_calls_per_turn:
                 self.log_warning(

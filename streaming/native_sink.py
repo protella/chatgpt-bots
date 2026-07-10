@@ -181,11 +181,17 @@ class NativeStreamCoordinator:
             self.failed = True
             return False
 
-    async def abandon(self) -> None:
-        """Stop the stream without appending anything (e.g. reaction-only turns)."""
+    async def abandon(self) -> bool:
+        """Stop the stream without appending anything (e.g. reaction-only turns).
+
+        Returns False if the stop call failed (the caller should treat the stream message
+        as possibly-lingering and fall back to an explicit delete)."""
+        ok = True
         if self.session is not None and self.session.active:
             try:
-                await self.session.finish()
+                ok = await self.session.finish()
             except Exception as e:  # noqa: BLE001
                 self._log(f"native coordinator abandon error: {e}")
+                ok = False
         self.finished = True
+        return ok

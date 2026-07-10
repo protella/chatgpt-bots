@@ -47,18 +47,34 @@ class SocketLivenessMonitor:
         # One log per episode; a warning→error escalation logs once more; recovery resets.
         self._episode: Optional[str] = None
         self._task: Optional[asyncio.Task] = None
+        # The listeners list we appended our callback to, kept so stop() can detach it
+        # (an un-removed listener would leak and keep firing after the monitor is gone).
+        self._listeners: Optional[list] = None
+
+    @staticmethod
+    def _safe_log(fn: Callable[[str], None], msg: str) -> None:
+        """Call a logger, swallowing any error — logging must never raise into the socket
+        client's envelope path (record_event fires from _on_message)."""
+        try:
+            fn(msg)
+        except Exception:
+            pass
 
     # --- envelope seam ---
     def attach(self) -> bool:
         """Append the envelope listener to the socket client's message_listeners.
 
-        Returns False when the client exposes no such seam (older/mocked clients) — the
-        monitor then simply never sees fresh events and stays quiet unless started."""
+        No-op (returns False) when the monitor is DISABLED (timeout <= 0) — a disabled
+        monitor must not install a listener at all — or when the client exposes no such
+        seam (older/mocked clients), in which case the monitor stays quiet unless started."""
+        if self._timeout is None or self._timeout <= 0:
+            return False
         client = self._client
         listeners = getattr(client, "message_listeners", None)
         if listeners is None or not hasattr(listeners, "append"):
             return False
         listeners.append(self._on_message)
+        self._listeners = listeners
         return True
 
     async def _on_message(self, *args: Any, **kwargs: Any) -> None:
@@ -69,7 +85,7 @@ class SocketLivenessMonitor:
     def record_event(self) -> None:
         self.last_event_monotonic = time.monotonic()
         if self._episode is not None:
-            self._log_info("socket liveness recovered — envelopes resumed")
+            self._safe_log(self._log_info, "socket liveness recovered — envelopes resumed")
             self._episode = None
 
     # --- monitor task ---
@@ -124,7 +140,7 @@ class SocketLivenessMonitor:
                     f"(passively indistinguishable)")
 
     async def stop(self) -> None:
-        """Cancel the monitor task (best-effort)."""
+        """Cancel the monitor task and detach the envelope listener (best-effort)."""
         if self._task is not None and not self._task.done():
             self._task.cancel()
             try:
@@ -132,3 +148,11 @@ class SocketLivenessMonitor:
             except asyncio.CancelledError:
                 pass
         self._task = None
+        # Detach our listener so it stops firing and doesn't leak after teardown.
+        if self._listeners is not None:
+            try:
+                if self._on_message in self._listeners:
+                    self._listeners.remove(self._on_message)
+            except (ValueError, TypeError):
+                pass
+            self._listeners = None

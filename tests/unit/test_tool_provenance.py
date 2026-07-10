@@ -74,12 +74,25 @@ def _provenance_on(monkeypatch):
 # ------------------------------------------------------------------ pure helpers
 
 def test_gist_from_arguments_scalars_and_containers():
+    # Structural allowlisted keys keep their value (numbers always; strings for keys like
+    # limit/before/oldest that describe call shape, not content).
     assert tp.gist_from_arguments('{"limit": 50, "before": "abc"}') == "limit=50, before=abc"
-    assert tp.gist_from_arguments('{"q": "hi", "opts": {"a": 1}}') == "q=hi, opts={1}"
     assert tp.gist_from_arguments('{"ids": [1, 2, 3]}') == "ids=[3]"
     assert tp.gist_from_arguments("{}") == ""
     assert tp.gist_from_arguments("not json") == ""
     assert tp.gist_from_arguments(None) == ""
+
+
+def test_gist_never_leaks_opaque_string_values():
+    # F6: a non-allowlisted string value is user content (query/prompt/URL/token) and must
+    # NEVER be persisted verbatim — only that a value was present (`<str>`).
+    assert tp.gist_from_arguments('{"query": "secret search terms"}') == "query=<str>"
+    assert tp.gist_from_arguments('{"emoji": "eyes"}') == "emoji=<str>"
+    assert tp.gist_from_arguments('{"url": "https://x/y?token=abc"}') == "url=<str>"
+    # Container shapes still summarize by kind+size (no leak).
+    assert tp.gist_from_arguments('{"q": "hi", "opts": {"a": 1}}') == "q=<str>, opts={1}"
+    # Numbers and booleans are always safe regardless of key.
+    assert tp.gist_from_arguments('{"top_k": 5, "stream": true}') == "top_k=5, stream=True"
 
 
 def test_gist_is_length_capped():
@@ -132,11 +145,22 @@ async def test_db_save_and_get_roundtrip(temp_db):
 
 
 @pytest.mark.asyncio
-async def test_db_save_is_idempotent_upsert(temp_db):
+async def test_db_save_merges_not_last_write_wins(temp_db):
+    # A re-persist for the same reply MERGES (union by tool_name) rather than clobbering,
+    # so a second pass can't drop tools recorded by the first (one row, both tools).
     await temp_db.save_tool_usage_async("C1", "101.0", "C1:100.0", [{"tool_name": "a", "gist": ""}])
     await temp_db.save_tool_usage_async("C1", "101.0", "C1:100.0", [{"tool_name": "b", "gist": ""}])
     got = await temp_db.get_thread_tool_usage_async("C1:100.0")
-    assert got == {"101.0": [{"tool_name": "b", "gist": ""}]}  # last write wins, one row
+    assert got == {"101.0": [{"tool_name": "a", "gist": ""}, {"tool_name": "b", "gist": ""}]}
+
+
+@pytest.mark.asyncio
+async def test_db_save_merge_upgrades_empty_gist(temp_db):
+    # An empty gist for a tool is upgraded when a later pass supplies a non-empty one.
+    await temp_db.save_tool_usage_async("C1", "101.0", "C1:100.0", [{"tool_name": "a", "gist": ""}])
+    await temp_db.save_tool_usage_async("C1", "101.0", "C1:100.0", [{"tool_name": "a", "gist": "limit=5"}])
+    got = await temp_db.get_thread_tool_usage_async("C1:100.0")
+    assert got == {"101.0": [{"tool_name": "a", "gist": "limit=5"}]}
 
 
 @pytest.mark.asyncio
