@@ -175,6 +175,7 @@ tests/
 4. **Message history is rebuilt from Slack** - Don't rely on in-memory state persisting
 5. **Utility functions should use utility env vars** - Not default reasoning/verbosity
 6. **Image data storage** - Never store base64 image data in DB, only URLs and metadata
+6a. **Files/docs never persist** - The DB must not hold file or document content (metadata + summary + Slack CDN ref only), and file processing must never touch disk: download to memory and process via BytesIO for the duration of extraction only. Slack is the source of truth for all files.
 7. **SQLite concurrency** - Use WAL mode and be careful with `check_same_thread=False`
 8. **Never start the bot during testing** - User manages running state
 9. **ALWAYS include full context** in API calls - never limit to "x" previous messages

@@ -5,6 +5,11 @@ from typing import Any, Dict, List, Optional
 
 from base_client import BaseClient, Message
 from config import config
+from message_markers import (
+    ends_with_continuation,
+    starts_as_continuation,
+    strip_continuation_markers,
+)
 
 
 class ThreadManagementMixin:
@@ -731,6 +736,53 @@ class ThreadManagementMixin:
             self.log_error(f"Error during async cleanup: {e}")
             # Don't let cleanup errors affect the main flow
 
+    @staticmethod
+    def _history_sender_type(msg: Message) -> str:
+        """sender_type with the same back-compat fallback the rebuild loop uses."""
+        st = (msg.metadata or {}).get("sender_type")
+        if st is None:
+            st = "self" if (msg.metadata or {}).get("is_bot") else "human"
+        return st
+
+    def _merge_continuation_history(self, history: List[Message]) -> List[Message]:
+        """Collapse a split bot reply (part 1 + 'Continued...' parts) into ONE message.
+
+        Consecutive own-bot messages are merged when the earlier ends with a
+        continuation trailer or the later starts as a continuation part; markers
+        are stripped everywhere on own-bot messages so rebuilt assistant turns
+        never contain them (R2 — the model would imitate markers it sees itself
+        emitting). The merged message keeps the FIRST part's ts; attachments and
+        reactions from all parts are combined deterministically (part order).
+        """
+        merged: List[Message] = []
+        for msg in history:
+            if merged and self._history_sender_type(msg) == "self":
+                prev = merged[-1]
+                if self._history_sender_type(prev) == "self" and (
+                    ends_with_continuation(prev.text) or starts_as_continuation(msg.text)
+                ):
+                    prev_text = strip_continuation_markers(prev.text)
+                    cur_text = strip_continuation_markers(msg.text)
+                    prev.text = f"{prev_text}\n\n{cur_text}".strip() if prev_text and cur_text \
+                        else (prev_text or cur_text)
+                    prev.attachments = (prev.attachments or []) + (msg.attachments or [])
+                    prev_reactions = (prev.metadata or {}).get("reactions") or []
+                    cur_reactions = (msg.metadata or {}).get("reactions") or []
+                    if prev_reactions or cur_reactions:
+                        prev.metadata["reactions"] = prev_reactions + cur_reactions
+                    continue
+            merged.append(msg)
+
+        # Stray markers on unmerged own-bot messages (e.g. only the tail part is inside
+        # the fetch window, or a part-1 whose continuation never posted) still get
+        # stripped so they can't leak into assistant turns.
+        for msg in merged:
+            if self._history_sender_type(msg) == "self" and msg.text:
+                stripped = strip_continuation_markers(msg.text)
+                if stripped != msg.text:
+                    msg.text = stripped
+        return merged
+
     async def _get_or_rebuild_thread_state(
         self,
         message: Message,
@@ -795,11 +847,21 @@ class ThreadManagementMixin:
                     thread_state, summary_row["summary_text"], summary_row.get("refs")
                 )
 
-            # Get history from platform first to see if there's anything to rebuild
+            # Get history from platform first to see if there's anything to rebuild.
+            # With a valid summary boundary, fetch only the tail (strictly after the
+            # boundary — Slack's default inclusive=false); the Python <= filter below
+            # stays as belt-and-suspenders for the seam. A HistoryFetchError propagates
+            # up so the turn fails loudly instead of answering with amnesia (R1).
             history = await client.get_thread_history(
                 message.channel_id,
-                message.thread_id
+                message.thread_id,
+                oldest=(summary_row["boundary_ts"] if summary_boundary is not None else None)
             )
+
+            # Merge split bot replies ("Continued..." parts) back into single turns and
+            # strip the markers — otherwise the model sees itself emitting continuation
+            # markers and may imitate them (R2).
+            history = self._merge_continuation_history(history)
             
             # Only show rebuilding status if there's actual history (excluding current message)
             current_ts = message.metadata.get("ts")
