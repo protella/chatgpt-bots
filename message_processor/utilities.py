@@ -902,6 +902,17 @@ class MessageUtilitiesMixin:
         # (not updated_ts) so the rendering is deterministic for prompt-cache hygiene.
         return "\n".join(f"- [#{r['id']}] {r['content']}" for r in sorted(rows, key=lambda r: r["id"]))
 
+    async def _build_channel_info(self, client, channel_id: Optional[str]) -> Optional[dict]:
+        """Fetch this channel's name/topic/purpose via the client's cached lookup.
+        Returns None for DMs, non-Slack clients, or on any failure — prompt unchanged."""
+        fetch = getattr(client, "get_channel_context", None)
+        if not fetch or not channel_id:
+            return None
+        try:
+            return await fetch(channel_id)
+        except Exception:
+            return None
+
     def _get_system_prompt(self, client: BaseClient, user_timezone: str = "UTC",
                           user_tz_label: Optional[str] = None, user_real_name: Optional[str] = None,
                           user_email: Optional[str] = None, model: Optional[str] = None,
@@ -909,7 +920,8 @@ class MessageUtilitiesMixin:
                           custom_instructions: Optional[str] = None,
                           participant_roster: Optional[str] = None,
                           channel_directives: Optional[str] = None,
-                          channel_memory: Optional[str] = None) -> str:
+                          channel_memory: Optional[str] = None,
+                          channel_info: Optional[dict] = None) -> str:
         """Get the appropriate system prompt based on the client platform with user's timezone, name, email, model, web search capability, trimming status, and custom instructions"""
         client_name = client.name.lower()
         
@@ -1000,6 +1012,19 @@ class MessageUtilitiesMixin:
         if custom_instructions:
             custom_instructions_context = f"\n\n--- USER CUSTOM INSTRUCTIONS ---\nThe following are custom instructions provided by the user. These should be followed and may supersede any conflicting default instructions (within legal and ethical boundaries):\n\n{custom_instructions}\n\n--- END OF USER CUSTOM INSTRUCTIONS ---"
 
+        # Where the conversation lives: channel name + topic + purpose (cached lookup;
+        # None in DMs). Topics often carry load-bearing facts (links, owners, norms).
+        channel_info_context = ""
+        if channel_info and (channel_info.get("name") or channel_info.get("topic") or channel_info.get("purpose")):
+            info_lines = []
+            if channel_info.get("name"):
+                info_lines.append(f"This conversation is in the #{channel_info['name']} channel.")
+            if channel_info.get("topic"):
+                info_lines.append(f"Channel topic: {channel_info['topic']}")
+            if channel_info.get("purpose"):
+                info_lines.append(f"Channel description: {channel_info['purpose']}")
+            channel_info_context = "\n\n--- CHANNEL CONTEXT ---\n" + "\n".join(info_lines) + "\n--- END CHANNEL CONTEXT ---"
+
         # Phase 7: per-channel ground rules set by an operator (applied when present)
         channel_directives_context = ""
         if channel_directives:
@@ -1024,7 +1049,7 @@ class MessageUtilitiesMixin:
         # channel_memory / roster / directives change rarely — acceptable in the prefix.
         time_context = f"\n\nToday's date: {current_time.strftime('%A, %B %d, %Y')} ({timezone_display})\nThe precise current time is provided at the end of the conversation."
 
-        return base_prompt + user_context + model_context + web_search_context + local_tools_context + trimming_context + custom_instructions_context + channel_directives_context + channel_memory_context + (participant_roster or "") + time_context
+        return base_prompt + user_context + model_context + web_search_context + local_tools_context + trimming_context + custom_instructions_context + channel_info_context + channel_directives_context + channel_memory_context + (participant_roster or "") + time_context
 
     def _build_time_suffix_context(self, user_timezone: str = "UTC",
                                    user_tz_label: Optional[str] = None) -> str:
