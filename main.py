@@ -232,6 +232,7 @@ class ChatBotV2:
                 except Exception as e:
                     main_logger.debug(f"Catch-up status update failed: {e}")
 
+        response = None
         try:
             # Process the message and get intent
             response = await self.processor.process_message(message, client, thinking_id)
@@ -377,7 +378,20 @@ class ChatBotV2:
                 )
             except Exception as notify_error:
                 main_logger.error(f"Failed to send error notice: {notify_error}")
-    
+        finally:
+            # Native-streamed replies don't trip Slack's "auto-clear status on reply"
+            # (it keys on chat.postMessage, not chat.stopStream), so a status-only turn
+            # left the working bubble spinning forever (user report 2026-07-10).
+            # Explicit best-effort clear. Skipped for queued turns — their status
+            # belongs to the in-flight request that will answer them.
+            if (thinking_id is None
+                    and not (response is not None and response.type == "queued")
+                    and hasattr(client, "clear_assistant_status")):
+                try:
+                    await client.clear_assistant_status(message.channel_id, post_thread_id)
+                except Exception as clear_error:
+                    main_logger.debug(f"Assistant status clear failed: {clear_error}")
+
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals - double Ctrl-C for force exit"""
         import os

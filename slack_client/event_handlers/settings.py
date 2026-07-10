@@ -463,9 +463,8 @@ class SlackSettingsHandlersMixin:
                                         "type": "button",
                                         "text": {
                                             "type": "plain_text",
-                                            "text": "Open Settings"
+                                            "text": f"⚙️ {validated_settings.get('model') or config.gpt_model}"
                                         },
-                                        "style": "primary",
                                         "action_id": "open_global_settings_dm"
                                     }
                                 ]
@@ -504,22 +503,14 @@ class SlackSettingsHandlersMixin:
                             text="Settings available",
                             blocks=[
                                 {
-                                    "type": "section",
-                                    "text": {
-                                        "type": "mrkdwn",
-                                        "text": "⚙️ *Quick Settings Access*"
-                                    }
-                                },
-                                {
                                     "type": "actions",
                                     "elements": [
                                         {
                                             "type": "button",
                                             "text": {
                                                 "type": "plain_text",
-                                                "text": "Settings"
+                                                "text": f"⚙️ {validated_settings.get('model') or config.gpt_model}"
                                             },
-                                            "style": "primary",
                                             "action_id": "open_welcome_settings",
                                             "value": json.dumps({
                                                 "channel_id": welcome_info['channel'],
@@ -650,9 +641,8 @@ class SlackSettingsHandlersMixin:
                                     "type": "button",
                                     "text": {
                                         "type": "plain_text",
-                                        "text": "Open Settings"
+                                        "text": f"⚙️ {validated_settings.get('model') or config.gpt_model}"
                                     },
-                                    "style": "primary",
                                     "action_id": "open_global_settings_dm"
                                 }
                             ]
