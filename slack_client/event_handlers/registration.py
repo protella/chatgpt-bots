@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from config import config
+from slack_client.event_handlers import feedback as feedback_handlers
 
 
 class SlackRegistrationMixin:
@@ -51,9 +52,17 @@ class SlackRegistrationMixin:
 
         @self.app.event("reaction_added")
         async def handle_reaction_added(event):
-            # Subscribed for the future decision engine (Phase H ingestion);
-            # acked here so Bolt doesn't log every reaction as unhandled.
-            pass
+            # Phase H: passive feedback ingestion — thumbs reactions on OUR OWN
+            # messages land in the response_feedback sink. Strictly recording:
+            # no LLM call, no reply, never raises. Everything else is ignored
+            # (acked so Bolt doesn't log every reaction as unhandled).
+            await feedback_handlers.ingest_reaction(self, event)
+
+        # Phase H: native feedback buttons (context_actions block on DM/assistant
+        # responses) arrive as ordinary block_actions.
+        @self.app.action(feedback_handlers.FEEDBACK_ACTION_ID)
+        async def handle_response_feedback(ack, body):
+            await feedback_handlers.handle_feedback_action(self, ack, body)
 
         # Register settings-related handlers
         self._register_settings_handlers()
