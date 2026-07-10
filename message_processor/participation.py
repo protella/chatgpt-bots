@@ -124,7 +124,9 @@ class ParticipationEngine:
                        directives: Optional[str] = None,
                        memory_facts: Optional[List[Dict[str, Any]]] = None,
                        channel_activity: Optional[str] = None,
-                       unprompted_last_hour: int = 0) -> Optional[ParticipationVerdict]:
+                       unprompted_last_hour: int = 0,
+                       name_hit: bool = False,
+                       snoozed: bool = False) -> Optional[ParticipationVerdict]:
         """Debounced judgment. Returns None when superseded — a newer message in
         the same channel arrived during the debounce window, and ITS evaluation
         (whose envelope includes this message) covers the batch."""
@@ -144,6 +146,8 @@ class ParticipationEngine:
             "channel_activity": channel_activity,
             "unprompted_last_hour": int(unprompted_last_hour),
             "hourly_cap": self.hourly_cap(level),
+            "name_hit": bool(name_hit),
+            "snoozed": bool(snoozed),
         }
         try:
             raw = await self.openai_client.classify_participation(text=text, signals=signals)
