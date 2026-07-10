@@ -121,6 +121,8 @@ class TestFooterPosting:
         blocks = str(s.app.client.chat_postMessage.await_args.kwargs.get("blocks", ""))
         assert "response_feedback" in blocks
         assert "open_channel_settings" not in blocks
+        # Phase H+: the strip also carries the "⚙️ <model>" user-settings button.
+        assert "open_user_settings" in blocks
 
     @pytest.mark.asyncio
     async def test_skips_when_flag_off(self, monkeypatch):
