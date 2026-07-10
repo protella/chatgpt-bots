@@ -129,13 +129,10 @@ async def test_settings_button_posted_for_new_thread(slack_client):
     # Call the method
     await slack_client._post_settings_button_if_new_thread(message, mock_client, user_prefs)
 
-    # Verify message was posted
-    mock_client.chat_postMessage.assert_called_once()
-    call_args = mock_client.chat_postMessage.call_args
-    
-    # Check that it's a compact message for completed users
-    assert "Quick Settings Access" in str(call_args)
-    assert "actions" in str(call_args)  # Compact format uses actions block
+    # Existing users get NO chrome: the per-thread "Quick Settings Access"
+    # button is retired (settings live in the slash command, channel footer,
+    # and the Configure icon-button on DM responses).
+    mock_client.chat_postMessage.assert_not_called()
 
 @pytest.mark.asyncio
 async def test_welcome_message_for_new_users(slack_client):
