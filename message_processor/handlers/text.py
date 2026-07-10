@@ -63,7 +63,8 @@ class TextHandlerMixin:
         thread_config = await config.get_thread_config_async(
             overrides=thread_state.config_overrides,
             user_id=message.user_id,
-            db=self.db
+            db=self.db,
+            channel_id=message.channel_id
         )
         
         # Check if streaming is enabled and supported (respecting user prefs)
@@ -136,7 +137,8 @@ class TextHandlerMixin:
         thread_config = await config.get_thread_config_async(
             overrides=thread_state.config_overrides,
             user_id=message.user_id,
-            db=self.db
+            db=self.db,
+            channel_id=message.channel_id
         )
         
         # Use thread's system prompt (which is now platform-specific)
@@ -450,7 +452,8 @@ class TextHandlerMixin:
         thread_config = await config.get_thread_config_async(
             overrides=thread_state.config_overrides,
             user_id=message.user_id,
-            db=self.db
+            db=self.db,
+            channel_id=message.channel_id
         )
         
         # Use thread's system prompt (which is now platform-specific)
