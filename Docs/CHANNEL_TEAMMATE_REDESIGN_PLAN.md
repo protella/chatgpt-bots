@@ -6,7 +6,8 @@ context (pulling older Slack history/search on demand), takes "butt out" feedbac
 threads its replies appropriately, and reacts tastefully. DMs keep today's experience, plus
 reactions and the streaming/status upgrades. Nothing here changes prod until flags are flipped.
 
-**Builds on** the parity work committed at `57abc54` (see `Docs/SLACKBOT_PARITY_PLAN.md`).
+**Builds on** the parity work committed at `57abc54` (its plan doc, `Docs/SLACKBOT_PARITY_PLAN.md`,
+was fully implemented and has been removed — see git history at that commit).
 This plan REPLACES the parity plan's "remaining last-mile work" list — every deferred item is
 absorbed into a phase below.
 
@@ -270,9 +271,11 @@ kept Tier 3 (~50 req/min, 1000 msgs/call) after the May-2025 changes.
   `modal_sessions` — load-bearing config/memory, untouched.
 - `images` — derived hidden context (vision analyses, generation prompts for edit flows).
   Stays; re-injected on rebuild exactly as today (`_inject_image_analyses`).
-- `documents` — extraction cache (avoid re-download/re-parse per rebuild). Stays, keyed to the
-  Slack file id so a missing file can expire the row. The never-read `documents.summary`
-  column is dropped.
+- `documents` — summary + metadata + Slack CDN ref ONLY (Phase D2 superseded the original
+  extraction-cache design here: the `content` column is dropped, full text never persists,
+  and re-parsing happens on demand via the `read_document` tool — BytesIO in memory,
+  process-lifetime LRU). Keyed to the Slack file id so a deleted file removes the content
+  from the bot's reach.
 - **NEW `thread_summaries`** — the compaction store. When a long thread exceeds the token
   budget, `_smart_trim_with_summarization` writes: `thread_key`, `summary_text`,
   `boundary_ts` (everything ≤ this ts is covered by the summary), `refs_json` (structured
