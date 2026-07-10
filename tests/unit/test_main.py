@@ -181,38 +181,42 @@ class TestChatBotV2MessageHandling:
         client.send_message.assert_not_called()
     
     @pytest.mark.asyncio
-    async def test_handle_message_busy_response(self, bot):
-        """Test handling busy response"""
-        message = Mock(channel_id="C123", thread_id="thread_123")
-        client = Mock()
-        client.send_thinking_indicator = AsyncMock(return_value="thinking_123")
-        client.delete_message = AsyncMock()
-        client.send_busy_message = AsyncMock()
-
-        response = Mock(type="busy", content="Thread is busy")
-        bot.processor.process_message = AsyncMock(return_value=response)
-
-        await bot.handle_message(message, client)
-
-        client.send_busy_message.assert_called_once_with("C123", "thread_123")
-    
-    @pytest.mark.asyncio
-    async def test_handle_message_busy_fallback(self, bot):
-        """Test busy message fallback when method not available"""
+    async def test_handle_message_queued_response_posts_nothing(self, bot):
+        """Phase Q: a queued response posts NO message (no busy reply — retired)."""
         message = Mock(channel_id="C123", thread_id="thread_123")
         client = Mock(spec=['send_thinking_indicator', 'delete_message', 'send_message'])
         client.send_thinking_indicator = AsyncMock(return_value="thinking_123")
+        client.delete_message = AsyncMock()
         client.send_message = AsyncMock()
 
-        response = Mock(type="busy", content="Thread is busy")
+        response = Mock(type="queued", content="", metadata={})
         bot.processor.process_message = AsyncMock(return_value=response)
 
         await bot.handle_message(message, client)
 
-        # Should fallback to send_message
-        client.send_message.assert_called_once_with(
-            "C123", "thread_123", "Thread is busy"
-        )
+        # Nothing posted; the (raced) thinking indicator is cleaned up.
+        client.send_message.assert_not_called()
+        client.delete_message.assert_called_once_with("C123", "thinking_123")
+
+    @pytest.mark.asyncio
+    async def test_handle_message_skips_indicator_when_conversation_busy(self, bot):
+        """Phase Q: no thinking indicator flashes for a message that will queue."""
+        message = Mock(channel_id="C123", thread_id="thread_123")
+        client = Mock(spec=['send_thinking_indicator', 'delete_message', 'send_message'])
+        client.send_thinking_indicator = AsyncMock(return_value="thinking_123")
+        client.delete_message = AsyncMock()
+        client.send_message = AsyncMock()
+
+        bot.processor.thread_manager = Mock()
+        bot.processor.thread_manager.is_thread_processing = Mock(return_value=True)
+        response = Mock(type="queued", content="", metadata={})
+        bot.processor.process_message = AsyncMock(return_value=response)
+
+        await bot.handle_message(message, client)
+
+        client.send_thinking_indicator.assert_not_called()
+        client.send_message.assert_not_called()
+        client.delete_message.assert_not_called()
     
     @patch('main.asyncio.sleep')
     @pytest.mark.asyncio

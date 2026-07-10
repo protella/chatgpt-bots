@@ -505,14 +505,6 @@ class SlackMessagingMixin:
             self.log_error(f"Error getting thread history: {e}")
             return []
 
-    async def send_busy_message(self, channel_id: str, thread_id: str):
-        """Send a busy message"""
-        await self.send_message(
-            channel_id,
-            thread_id,
-            ":warning: `This thread is currently processing another request. Please wait a moment and try again.`"
-        )
-
     def supports_streaming(self) -> bool:
         """Returns True if streaming is enabled for Slack"""
         return config.enable_streaming and config.slack_streaming

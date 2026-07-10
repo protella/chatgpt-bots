@@ -465,6 +465,29 @@ last-mile #2/#7 and the branded-emoji fill-in (#1, user action).* Tests: sink se
 fallback, app_home_opened tab filter. Live: split-view greeting, streamed reply rendering,
 status with branded emoji.
 
+**Q. Conversational queueing (user decision 2026-07-09: retire busy rejection everywhere)** ✅
+*Implemented. Deviations: the drain loop is emergent rather than explicit — the finishing turn
+lingers (lock held, so stragglers join the pop and nothing jumps the queue), pops one batch,
+and re-dispatches it through `client.message_handler` as a normal turn whose own finally-hook
+drains the remainder; earlier batch messages are appended to warm state individually and the
+LAST message is the trigger (intent classification sees the combined content via thread
+context); a full pending queue drops with a needs_refresh flag so Slack recovers the message.*
+—
+messages arriving while a conversation is mid-processing are QUEUED, never rejected. The
+per-thread lock stays as a serializer (one in-flight response per conversation) but loses its
+fail-fast face: on contention the message appends to a per-thread-key pending queue and the
+handler returns silently (no busy reply). When the in-flight turn completes, the worker drains
+the queue as ONE batch turn (all pending messages compose the next input, plus a
+`QUEUE_DRAIN_LINGER_SECONDS` (~1s) linger for stragglers), looping until empty — one coherent
+catch-up reply addressing everyone, not N stale replies. `Response(type="busy")` +
+`send_busy_message` + the timeout=0 fail-fast contract retire. Phase F's needs_refresh stays as
+the crash/restart safety net. Deferred deliberately: mid-stream interruption/cancel on
+superseding input. Files: `thread_manager.py` (queue + drain loop on the state manager),
+`message_processor/base.py` (lock flow), `main.py` (busy branch removal), tests. Tests: queue
+capture during processing, single-batch drain w/ multiple senders, drain loop on sustained
+burst, linger, DM + thread + channel parity, no busy message posted, ordering, needs_refresh
+interplay. Live: send 3 messages fast in a DM — one combined reply, none dropped.
+
 **H. (Optional) feedback_buttons + reaction_added ingestion** — thumbs signal → DB; engine may
 read per-channel feedback ratio later.
 

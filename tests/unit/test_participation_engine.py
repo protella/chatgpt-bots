@@ -405,11 +405,17 @@ class TestNeedsRefresh:
         assert AsyncThreadStateManager.consume_needs_refresh(mgr, "C1:10.0") is False  # cleared
         assert AsyncThreadStateManager.consume_needs_refresh(mgr, "C2:1.0") is False  # cold thread unaffected
 
-    def test_busy_branch_marks_refresh(self):
+    def test_contention_branch_queues_not_rejects(self):
+        """Phase Q: lock contention enqueues (no busy rejection); needs_refresh is
+        reserved for the loss paths (queue overflow / enqueue failure)."""
         from message_processor import base as mp_base
         src = inspect.getsource(mp_base.MessageProcessor.process_message)
-        busy_idx = src.index('type="busy"')
-        assert "mark_needs_refresh" in src[:busy_idx]
+        assert 'type="busy"' not in src
+        queued_idx = src.index('type="queued"')
+        assert "enqueue_pending" in src[:queued_idx]
+        # overflow/failure still flags a transcript refetch
+        from thread_manager import AsyncThreadStateManager
+        assert "mark_needs_refresh" in inspect.getsource(AsyncThreadStateManager.enqueue_pending)
 
     def test_rebuild_consumes_refresh_flag(self):
         from message_processor import thread_management as tm

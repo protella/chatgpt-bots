@@ -97,23 +97,28 @@ class MessageProcessor(ThreadManagementMixin,
             raise
 
         if not lock_acquired:
+            # Phase Q: conversational queueing — never reject. The message joins the
+            # conversation's pending queue and the in-flight turn's drain hook answers
+            # it (batched with any siblings) as one catch-up turn. Only messages that
+            # were already going to be processed reach this point: the participation
+            # gate (unprompted channel messages) runs BEFORE process_message, so
+            # gate-ignored messages never queue. If the queue is full, enqueue_pending
+            # drops the message and flags a transcript refetch (Slack still has it).
             elapsed = time.time() - request_start_time
-            # This message exists in Slack but never enters the warm in-memory state —
-            # flag the thread so the NEXT request refetches the transcript first
-            # (otherwise the rejected message is lost from context until a cold rebuild).
             try:
-                self.thread_manager.mark_needs_refresh(thread_key)
-            except Exception:
-                pass
+                self.thread_manager.enqueue_pending(thread_key, message)
+            except Exception as queue_error:
+                self.log_error(f"Enqueue failed for {thread_key}: {queue_error}", exc_info=True)
+                try:
+                    self.thread_manager.mark_needs_refresh(thread_key)
+                except Exception:
+                    pass
             self.log_info("")
             self.log_info("="*100)
-            self.log_info(f"REQUEST END | Thread: {thread_key} | Status: BUSY | Time: {elapsed:.2f}s")
+            self.log_info(f"REQUEST END | Thread: {thread_key} | Status: QUEUED | Time: {elapsed:.2f}s")
             self.log_info("="*100)
             self.log_info("")
-            return Response(
-                type="busy",
-                content="Thread is currently processing another request"
-            )
+            return Response(type="queued", content="")
         
         try:
             # Get or rebuild thread state
@@ -707,7 +712,7 @@ class MessageProcessor(ThreadManagementMixin,
             final_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
             
             # Check if we should show the 80% context warning AFTER the response
-            if not thread_state.has_shown_80_percent_warning and response and response.type not in ["error", "busy"]:
+            if not thread_state.has_shown_80_percent_warning and response and response.type not in ["error", "queued"]:
                 # Get current model's token limit and check usage
                 model = thread_state.current_model or config.gpt_model
                 max_tokens = config.get_model_token_limit(model)
@@ -978,6 +983,14 @@ class MessageProcessor(ThreadManagementMixin,
                 content=error_message
             )
         finally:
+            # Phase Q drain hook — runs while we STILL HOLD the lock so that (a) no new
+            # message can jump ahead of the queued backlog and (b) stragglers arriving
+            # during the linger enqueue (lock held) and join the same batch. Must never
+            # prevent the lock release below.
+            try:
+                await self._dispatch_pending_batch(message, client, thread_key)
+            except Exception as drain_error:
+                self.log_error(f"Pending-queue drain failed for {thread_key}: {drain_error}", exc_info=True)
             # Always release the thread lock, even on timeout
             try:
                 await self.thread_manager.release_thread_lock(
@@ -987,6 +1000,76 @@ class MessageProcessor(ThreadManagementMixin,
             except Exception as lock_error:
                 # Even if release fails, log it but don't crash
                 self.log_error(f"Error releasing thread lock for {thread_key}: {lock_error}", exc_info=True)
+
+    async def _dispatch_pending_batch(self, finished_message: Message, client: BaseClient, thread_key: str):
+        """Phase Q: after a turn finishes (lock still held), drain the conversation's
+        pending queue into ONE batched catch-up turn and re-dispatch it through the
+        normal message pipeline.
+
+        Mechanics:
+        - Linger QUEUE_DRAIN_LINGER_SECONDS while still holding the lock: stragglers
+          arriving now enqueue (the lock is held) and are included in the pop below.
+        - Pop up to QUEUE_MAX_BATCH messages atomically. All but the last are appended
+          to thread state individually (attributed, ts-stamped) so history is correct
+          and the intent classifier — which sees recent thread context — effectively
+          classifies the combined content. The LAST message becomes the trigger for
+          the re-dispatched turn (its ts/attachments drive ToolContext, reactions,
+          and any image/vision routing — a documented simplification: attachments on
+          earlier batch messages are represented in text only until a rebuild).
+        - The re-dispatch is a background task through client.message_handler (the
+          same entry Slack events use), so the batch turn gets the full normal flow:
+          thinking indicator, streaming, footer, participation stats. It starts after
+          this turn releases the lock; if a brand-new message wins the lock race
+          first, the batch trigger simply re-enqueues — nothing is ever lost.
+        - Messages left beyond QUEUE_MAX_BATCH drain on the following turn via this
+          same hook (loop-until-empty is emergent, no dedicated loop needed).
+        """
+        manager = self.thread_manager
+        if manager.pending_count(thread_key) == 0:
+            return
+
+        linger = max(0.0, float(getattr(config, "queue_drain_linger_seconds", 1.0)))
+        if linger:
+            await asyncio.sleep(linger)
+
+        batch = manager.pop_pending_batch(thread_key, int(getattr(config, "queue_max_batch", 10)))
+        if not batch:
+            return
+
+        handler = getattr(client, "message_handler", None)
+        if handler is None:
+            # No re-dispatch path (exotic client) — the messages exist in Slack;
+            # flag a transcript refetch so the next turn recovers them in context.
+            manager.mark_needs_refresh(thread_key)
+            self.log_warning(f"No message_handler to drain {len(batch)} queued message(s) on {thread_key}")
+            return
+
+        trigger = batch[-1]
+        if len(batch) > 1:
+            # Append the earlier messages to warm state now (we hold the lock, the
+            # state is current). The trigger message is NOT appended — its own turn
+            # does that, exactly like any normal message.
+            thread_state = await manager.get_thread_async(
+                finished_message.thread_id, finished_message.channel_id
+            )
+            if thread_state is not None:
+                for queued_msg in batch[:-1]:
+                    try:
+                        content = self._format_user_content_with_username(queued_msg.text or "", queued_msg)
+                        self._add_message_with_token_management(
+                            thread_state, "user", content,
+                            db=self.db, thread_key=thread_key,
+                            message_ts=(queued_msg.metadata or {}).get("ts"),
+                        )
+                    except Exception as append_error:
+                        self.log_warning(f"Failed to append queued message to state: {append_error}")
+        # Mark the trigger so the UI can show a catch-up status for multi-message batches.
+        if trigger.metadata is None:
+            trigger.metadata = {}
+        trigger.metadata["queued_batch_size"] = len(batch)
+
+        self.log_info(f"Draining {len(batch)} queued message(s) on {thread_key} into one catch-up turn")
+        self._schedule_async_call(handler(trigger, client))
 
     async def cleanup(self):
         """Clean up resources and close clients."""

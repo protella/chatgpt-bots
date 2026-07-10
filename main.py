@@ -190,12 +190,37 @@ class ChatBotV2:
             )
         post_thread_id = None if place_in_channel else message.thread_id
 
+        # Phase Q: if this conversation is mid-processing, the message is about to be
+        # queued (not answered now) — skip the thinking indicator so nothing flashes.
+        # Advisory peek only: losing the race just means a briefly-posted indicator
+        # that the queued short-circuit below deletes.
+        # `is True` (not truthiness): same hardening as the wake gate — mocked or
+        # malformed managers must never silently suppress the indicator.
+        thread_manager = getattr(self.processor, "thread_manager", None)
+        already_processing = (
+            thread_manager is not None
+            and hasattr(thread_manager, "is_thread_processing")
+            and thread_manager.is_thread_processing(message.thread_id, message.channel_id) is True
+        )
+
         # Send initial thinking indicator (streamed replies grow inside this message,
         # so placement is decided here).
-        thinking_id = await client.send_thinking_indicator(
-            message.channel_id,
-            post_thread_id
-        )
+        thinking_id = None
+        if not already_processing:
+            thinking_id = await client.send_thinking_indicator(
+                message.channel_id,
+                post_thread_id
+            )
+            # Batched catch-up turn (drained queue): make the status say so.
+            batch_size = message.metadata.get("queued_batch_size", 0)
+            if thinking_id and isinstance(batch_size, int) and batch_size > 1 and hasattr(client, "update_message"):
+                try:
+                    await client.update_message(
+                        message.channel_id, thinking_id,
+                        f"{config.thinking_emoji} Catching up on {batch_size} messages..."
+                    )
+                except Exception as e:
+                    main_logger.debug(f"Catch-up status update failed: {e}")
 
         try:
             # Process the message and get intent
@@ -222,16 +247,11 @@ class ChatBotV2:
 
             # Handle the response
             if response:
-                if response.type == "busy":
-                    # Special handling for busy state
-                    if hasattr(client, 'send_busy_message'):
-                        await client.send_busy_message(message.channel_id, message.thread_id)
-                    else:
-                        await client.send_message(
-                            message.channel_id,
-                            message.thread_id,
-                            response.content
-                        )
+                if response.type == "queued":
+                    # Phase Q: the message joined its conversation's pending queue and
+                    # will be answered by the in-flight turn's batched catch-up. Nothing
+                    # to post (the indicator, if any, was already deleted above).
+                    main_logger.debug(f"Message queued behind in-flight turn for {message.channel_id}:{message.thread_id}")
                 elif response.type == "text":
                     # Reaction-only turns (react tool, empty text) post no message at all
                     if not (response.content or "").strip():
