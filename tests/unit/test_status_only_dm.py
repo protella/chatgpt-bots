@@ -302,27 +302,26 @@ class TestStatusPlainText:
         assert _status_plain_text("") == "working on it…"
 
     @pytest.mark.asyncio
-    async def test_explicit_phase_status_replaces_rotation_with_itself(self, monkeypatch):
-        # Slack renders status (composer bar) and loading_messages (in-thread bubble)
-        # as two surfaces, and the bubble RETAINS old rotation frames when a call
-        # omits loading_messages. A phase status therefore sends itself as the single
-        # loading message so both surfaces show the same current text.
+    async def test_explicit_phase_status_is_bubble_only(self, monkeypatch):
+        # The composer bottom-bar line is retired: the status field goes out EMPTY
+        # (the API requires it) and the phase text rides as the single loading
+        # message, replacing any stored bubble rotation.
         from config import config
         monkeypatch.setattr(config, "enable_assistant_status", True)
-        monkeypatch.setattr(config, "status_loading_messages", [":mag: one…", ":datassential: two…"])
         host = _MsgClient(SimpleNamespace(assistant_threads_setStatus=AsyncMock()))
         await host.set_assistant_status("D1", "1.0", status=":hourglass_flowing_sand: pulling it together…")
         kwargs = host.app.client.assistant_threads_setStatus.await_args.kwargs
-        assert kwargs["status"] == "⏳ pulling it together…"
+        assert kwargs["status"] == ""
         assert kwargs["loading_messages"] == ["⏳ pulling it together…"]
 
     @pytest.mark.asyncio
-    async def test_initial_indicator_sends_rotation_sanitized(self, monkeypatch):
+    async def test_initial_indicator_samples_pool_sanitized(self, monkeypatch):
         from config import config
         monkeypatch.setattr(config, "enable_assistant_status", True)
+        monkeypatch.setattr(config, "status_loading_messages_inline", True)
         monkeypatch.setattr(config, "status_loading_messages", [":mag: one…", ":datassential: two…"])
         host = _MsgClient(SimpleNamespace(assistant_threads_setStatus=AsyncMock()))
         await host.set_assistant_status("D1", "1.0")
         kwargs = host.app.client.assistant_threads_setStatus.await_args.kwargs
-        assert kwargs["loading_messages"] == ["🔍 one…", "two…"]
-        assert ":hourglass" not in kwargs["status"]
+        assert sorted(kwargs["loading_messages"]) == ["two…", "🔍 one…"]
+        assert kwargs["status"] == ""

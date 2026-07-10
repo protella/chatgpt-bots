@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 import time
 
 from base_client import BaseClient, Message, Response
-from config import config
+from config import config, pipeline_status
 from message_markers import continuation_trailer, part_prefix
 from prompts import IMAGE_ANALYSIS_PROMPT, VISION_DEFAULT_QUESTION
 
@@ -184,7 +184,7 @@ class VisionHandlerMixin:
             }]
 
             # Update status to show we're preparing the analysis
-            self._update_status(client, channel_id, thinking_id, "Preparing analysis...", emoji=config.analyze_emoji, thread_id=thread_state.thread_ts)
+            self._update_status(client, channel_id, thinking_id, pipeline_status("analyzing_image", "Preparing analysis…"), emoji=config.analyze_emoji, thread_id=thread_state.thread_ts)
             
             # Extract filenames from attachments for context
             filenames = []
@@ -204,9 +204,9 @@ class VisionHandlerMixin:
             
             # Update status to show we're analyzing the image(s)
             if len(images_to_analyze) == 1:
-                status_msg = "Analyzing your image..."
+                status_msg = pipeline_status("analyzing_image", "Analyzing your image…")
             else:
-                status_msg = f"Analyzing {len(images_to_analyze)} images..."
+                status_msg = pipeline_status("analyzing_images", f"Analyzing {len(images_to_analyze)} images…", count=len(images_to_analyze))
             self._update_status(client, channel_id, thinking_id, status_msg, emoji=config.analyze_emoji, thread_id=thread_state.thread_ts)
             
             # Check if streaming is supported and enabled (respecting user prefs).
@@ -698,7 +698,7 @@ class VisionHandlerMixin:
         """
         try:
             # Step 1: Analyze images with vision model using IMAGE_ANALYSIS_PROMPT
-            self._update_status(client, channel_id, thinking_id, "Analyzing images...", emoji=config.analyze_emoji, thread_id=thread_state.thread_ts)
+            self._update_status(client, channel_id, thinking_id, pipeline_status("analyzing_image", "Analyzing images…"), emoji=config.analyze_emoji, thread_id=thread_state.thread_ts)
             
             # Extract base64 data from image inputs
             images_to_analyze = []
@@ -722,7 +722,7 @@ class VisionHandlerMixin:
             self.log_info(f"Image analysis completed: {len(image_analysis)} chars")
             
             # Step 2: Build comprehensive context with image analysis and documents
-            self._update_status(client, channel_id, thinking_id, "Combining analysis with documents...", emoji=config.analyze_emoji, thread_id=thread_state.thread_ts)
+            self._update_status(client, channel_id, thinking_id, pipeline_status("combining_documents", "Combining analysis with documents…"), emoji=config.analyze_emoji, thread_id=thread_state.thread_ts)
             
             # Build enhanced message with all context
             context_parts = []
@@ -770,7 +770,7 @@ class VisionHandlerMixin:
             combined_context = "\n".join(str_context_parts)
             
             # Step 3: Send to text model for final analysis
-            self._update_status(client, channel_id, thinking_id, "Generating comprehensive response...", emoji=config.thinking_emoji, thread_id=thread_state.thread_ts)
+            self._update_status(client, channel_id, thinking_id, pipeline_status("generating_response", "Generating comprehensive response…"), emoji=config.thinking_emoji, thread_id=thread_state.thread_ts)
             
             # Use text response handler with the combined context
             return await self._handle_text_response(combined_context, thread_state, client, message, thinking_id, retry_count=0)

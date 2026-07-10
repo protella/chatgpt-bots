@@ -183,3 +183,6 @@ extract_metrics.py
 
 # Slack app manifest (environment-specific; use slack_app_manifest.example.yml as template)
 slack_app_manifest.yml
+
+# Company-branded loading messages stay local (like .env) — the generic set is the committed default
+status_messages/loading_messages.datassential.txt

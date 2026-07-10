@@ -4,6 +4,8 @@ Handles all environment variables and default settings
 """
 import logging
 import os
+import random
+from functools import lru_cache
 from dotenv import load_dotenv
 from typing import Optional, Dict, Any
 from dataclasses import dataclass, field
@@ -23,6 +25,78 @@ def _env_list(var_name: str, default: list, sep: str = ",") -> list:
     items = [part.strip() for part in raw.split(sep)]
     items = [item for item in items if item]
     return items or list(default)
+
+
+def _resolve_repo_path(path: str) -> str:
+    """Resolve a relative path against the repo root (this file's directory)."""
+    if os.path.isabs(path):
+        return path
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+
+
+@lru_cache(maxsize=8)
+def _load_message_file(path: str) -> tuple:
+    """Load a message file: one message per line, '#' comments and blanks skipped.
+
+    Returns a tuple (hashable for the cache); empty on any read problem — callers
+    fall back to their defaults, a missing file must never break the bot.
+    """
+    try:
+        with open(_resolve_repo_path(path), encoding="utf-8") as f:
+            return tuple(
+                line.strip() for line in f
+                if line.strip() and not line.strip().startswith("#")
+            )
+    except OSError:
+        return ()
+
+
+@lru_cache(maxsize=8)
+def _load_stage_map(path: str) -> dict:
+    """Parse a [stage]-sectioned message file into {stage: (variants...)}."""
+    stages: Dict[str, list] = {}
+    current: Optional[str] = None
+    for line in _load_message_file(path):
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1].strip()
+            stages.setdefault(current, [])
+        elif current:
+            stages[current].append(line)
+    return {k: tuple(v) for k, v in stages.items() if v}
+
+
+def pipeline_status_markers() -> tuple:
+    """Every pipeline variant text, for recognizing our own transient status lines
+    when rebuilding history (templated variants truncated at their first
+    placeholder; very short prefixes dropped — too generic to match on).
+    """
+    try:
+        stage_map = _load_stage_map(config.pipeline_messages_file)
+        markers = (
+            v.split("{", 1)[0].strip() if "{" in v else v
+            for variants in stage_map.values() for v in variants
+        )
+        return tuple(m for m in markers if len(m) >= 8)
+    except Exception:
+        return ()
+
+
+def pipeline_status(stage: str, default: str, **fmt) -> str:
+    """Pick a random status variant for a pipeline stage.
+
+    Variants come from config.pipeline_messages_file ([stage] sections); `fmt`
+    fills {placeholders} in the chosen variant. Any problem — unknown stage,
+    unreadable file, placeholder mismatch — falls back to `default` (which the
+    caller passes already formatted).
+    """
+    try:
+        variants = _load_stage_map(config.pipeline_messages_file).get(stage)
+        if not variants:
+            return default
+        text = random.choice(variants)
+        return text.format(**fmt) if fmt else text
+    except Exception:
+        return default
 
 
 # Model knowledge cutoff dates
@@ -109,7 +183,7 @@ class BotConfig:
     analysis_verbosity: str = field(default_factory=lambda: os.getenv("ANALYSIS_VERBOSITY", "medium"))
     vision_max_tokens: int = field(default_factory=lambda: int(os.getenv("VISION_MAX_TOKENS", "8192")))
     
-    # Image generation parameters (gpt-image-1.5)
+    # Image generation parameters (gpt-image-2 / gpt-image-1)
     default_image_size: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_SIZE", "1024x1024"))
     default_image_quality: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_QUALITY", "auto"))  # auto, low, medium, high
     default_image_background: str = field(default_factory=lambda: os.getenv("DEFAULT_IMAGE_BACKGROUND", "auto"))  # transparent, opaque, auto
@@ -155,12 +229,7 @@ class BotConfig:
     utils_log_level: str = field(default_factory=lambda: os.getenv("UTILS_LOG_LEVEL", "INFO"))
     console_logging_enabled: bool = field(default_factory=lambda: os.getenv("CONSOLE_LOGGING_ENABLED", "TRUE").upper() == "TRUE")
     log_directory: str = field(default_factory=lambda: os.getenv("LOG_DIRECTORY", "logs"))
-    debug_mode: bool = field(default_factory=lambda: os.getenv("DEBUG_MODE", "false").lower() == "true")
-    
-    # Performance settings
-    max_concurrent_threads: int = field(default_factory=lambda: int(os.getenv("MAX_CONCURRENT_THREADS", "10")))
-    message_timeout: int = field(default_factory=lambda: int(os.getenv("MESSAGE_TIMEOUT", "60")))
-    
+
     # Cleanup settings
     cleanup_schedule: str = field(default_factory=lambda: os.getenv("CLEANUP_SCHEDULE", "0 0 * * 0"))  # Default: midnight Sunday (weekly)
     cleanup_max_age_hours: float = field(default_factory=lambda: float(os.getenv("CLEANUP_MAX_AGE_HOURS", "24")))
@@ -216,19 +285,34 @@ class BotConfig:
     # Transient "thinking/working" status on the assistant-thread surface. Additive + best-effort:
     # it no-ops gracefully in plain channels (where the visible progress comes from streaming text).
     enable_assistant_status: bool = field(default_factory=lambda: os.getenv("ENABLE_ASSISTANT_STATUS", "true").lower() == "true")
-    # Rotating loading messages shown by setStatus (comma-separated env; safe standard-emoji default).
-    # >>> To brand these, set STATUS_LOADING_MESSAGES in .env. NOTE: the assistant
-    # >>> composer-status surface renders PLAIN TEXT — :shortcodes: are converted to
-    # >>> Unicode where possible and stripped otherwise (workspace custom emoji like
-    # >>> :datassential: have no Unicode form and will NOT render there; they still
-    # >>> render in posted channel status messages).
+    # Rotating loading messages shown in the assistant thread's transient bubble.
+    # Sourced from a message file (one per line, # comments ok) — see
+    # status_messages/loading_messages.generic.txt. Brand them by pointing
+    # STATUS_LOADING_MESSAGES_FILE at your own file; an explicit inline
+    # STATUS_LOADING_MESSAGES (comma-separated) takes precedence over the file.
+    # NOTE: the surface renders PLAIN TEXT — no emoji/:shortcodes: (known
+    # shortcodes auto-convert to Unicode, unknown ones are stripped).
+    status_loading_messages_file: str = field(default_factory=lambda: os.getenv(
+        "STATUS_LOADING_MESSAGES_FILE", "status_messages/loading_messages.generic.txt"))
+    status_loading_messages_inline: bool = field(default_factory=lambda: bool(os.getenv("STATUS_LOADING_MESSAGES")))
     status_loading_messages: list = field(default_factory=lambda: _env_list("STATUS_LOADING_MESSAGES", [
-        ":mag: crunching the data…",
-        ":bar_chart: digging through the menu…",
-        ":hourglass_flowing_sand: pulling it together…",
+        "crunching the data…",
+        "connecting the dots…",
+        "pulling it together…",
     ]))
-    # Safe standard-emoji status used when no rotating set is desired / as the single status string.
-    status_loading_fallback: str = field(default_factory=lambda: os.getenv("STATUS_LOADING_FALLBACK", ":hourglass_flowing_sand: working on it…"))
+    # Last-resort single status text when no pool resolves (plain text, no emoji).
+    status_loading_fallback: str = field(default_factory=lambda: os.getenv("STATUS_LOADING_FALLBACK", "working on it…"))
+    # Stage-keyed pipeline status variants ([stage] sections, one variant per line).
+    pipeline_messages_file: str = field(default_factory=lambda: os.getenv(
+        "PIPELINE_MESSAGES_FILE", "status_messages/pipeline_messages.txt"))
+
+    def get_loading_messages(self) -> list:
+        """Resolve the loading-message pool: inline env wins, then the file, then defaults."""
+        if not self.status_loading_messages_inline and self.status_loading_messages_file:
+            msgs = _load_message_file(self.status_loading_messages_file)
+            if msgs:
+                return list(msgs)
+        return self.status_loading_messages
 
     # --- Assistant surface (agent split-view) adapter ---
     # Greets the user + sets suggested prompts when they open the split view, and titles

@@ -7,7 +7,7 @@ import re
 import time
 
 from base_client import BaseClient, Message, Response
-from config import config
+from config import config, pipeline_status
 from prompts import IMAGE_ANALYSIS_PROMPT
 
 
@@ -121,11 +121,11 @@ class ImageEditMixin:
         
         if target_url:
             # Found an image to edit - update status
-            self._update_status(client, channel_id, thinking_id, "Finding the image to edit...", emoji=config.web_search_emoji, thread_id=thread_state.thread_ts)
+            self._update_status(client, channel_id, thinking_id, pipeline_status("finding_image", "Finding the image to edit…"), emoji=config.web_search_emoji, thread_id=thread_state.thread_ts)
             
             # Download the image from Slack
             self.log_info(f"Found target image URL: {target_url}")
-            self._update_status(client, channel_id, thinking_id, "Downloading the image...", thread_id=thread_state.thread_ts)
+            self._update_status(client, channel_id, thinking_id, pipeline_status("downloading_image", "Downloading the image…"), thread_id=thread_state.thread_ts)
             
             try:
                 # Download the image
@@ -138,7 +138,7 @@ class ImageEditMixin:
                     
                     # Analyze the image first
                     self.log_debug("Analyzing image for context")
-                    self._update_status(client, channel_id, thinking_id, "Analyzing the image...", emoji=config.analyze_emoji, thread_id=thread_state.thread_ts)
+                    self._update_status(client, channel_id, thinking_id, pipeline_status("analyzing_image", "Analyzing the image…"), emoji=config.analyze_emoji, thread_id=thread_state.thread_ts)
 
                     # Start progress updater for analysis
                     progress_task = None
@@ -244,7 +244,7 @@ class ImageEditMixin:
                         # Create a NEW message for editing status - don't touch the enhanced prompt!
                         editing_id = await client.send_thinking_indicator(channel_id, thread_state.thread_ts)
                         self._update_status(client, channel_id, editing_id,
-                                          "Editing your image. This may take a minute...",
+                                          pipeline_status("editing_image", "Editing your image. This may take a minute…"),
                                           emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
                         # Track the status message ID
                         if editing_id:  # status-only DMs return no ts — never store a None id
@@ -273,6 +273,7 @@ class ImageEditMixin:
                                 image_description=None,  # Already used for enhancement
                                 input_mimetypes=["image/png"],
                                 input_fidelity=thread_config.get("input_fidelity", "high"),
+                                quality=thread_config.get("image_quality"),
                                 background=thread_config.get("image_background", "auto"),
                                 output_format=thread_config.get("image_format", "png"),
                                 output_compression=thread_config.get("image_compression", 100),
@@ -294,8 +295,8 @@ class ImageEditMixin:
                             raise
                     else:
                         # Non-streaming fallback
-                        self._update_status(client, channel_id, thinking_id, "Enhancing your edit request...", thread_id=thread_state.thread_ts)
-                        self._update_status(client, channel_id, thinking_id, "Editing your image. This may take a minute...", emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
+                        self._update_status(client, channel_id, thinking_id, pipeline_status("enhancing_prompt", "Enhancing your edit request…"), thread_id=thread_state.thread_ts)
+                        self._update_status(client, channel_id, thinking_id, pipeline_status("editing_image", "Editing your image. This may take a minute…"), emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
                         
                         edited_image = await self.openai_client.edit_image(
                             input_images=[base64_data],
@@ -304,6 +305,7 @@ class ImageEditMixin:
                             image_description=image_description,
                             input_mimetypes=["image/png"],
                             input_fidelity=thread_config.get("input_fidelity", "high"),
+                            quality=thread_config.get("image_quality"),
                             background=thread_config.get("image_background", "auto"),
                             output_format=thread_config.get("image_format", "png"),
                             output_compression=thread_config.get("image_compression", 100),
@@ -442,9 +444,9 @@ class ImageEditMixin:
         self.log_debug("Analyzing uploaded images for context")
         # Update status with proper pluralization
         if len(input_images) == 1:
-            status_msg = "Analyzing your uploaded image..."
+            status_msg = pipeline_status("analyzing_image", "Analyzing your uploaded image…")
         else:
-            status_msg = f"Analyzing {len(input_images)} uploaded images..."
+            status_msg = pipeline_status("analyzing_images", f"Analyzing {len(input_images)} uploaded images…", count=len(input_images))
         self._update_status(client, channel_id, thinking_id, status_msg, emoji=config.analyze_emoji, thread_id=thread_state.thread_ts)
         
         # Log the analysis prompt
@@ -483,7 +485,7 @@ class ImageEditMixin:
             # Don't show the analysis - just update status to show we're editing
             # The analysis is only used internally for better edit quality
             if thinking_id:
-                self._update_status(client, channel_id, thinking_id, "Editing your image. This may take a minute...", emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
+                self._update_status(client, channel_id, thinking_id, pipeline_status("editing_image", "Editing your image. This may take a minute…"), emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
 
             # Store the description and user request separately for clean enhancement
             image_analysis = image_description
@@ -588,7 +590,7 @@ class ImageEditMixin:
             # Create a NEW message for editing status - don't touch the enhanced prompt!
             editing_id = await client.send_thinking_indicator(channel_id, thread_state.thread_ts)
             self._update_status(client, channel_id, editing_id,
-                              "Generating edited image. This may take a minute...",
+                              pipeline_status("editing_image", "Generating edited image. This may take a minute…"),
                               emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
             # Track the status message ID
             if editing_id:  # status-only DMs return no ts — never store a None id
@@ -617,6 +619,7 @@ class ImageEditMixin:
                     model=thread_config.get("image_model"),
                     image_description=None,  # Don't pass description since we already enhanced
                     input_fidelity=thread_config.get("input_fidelity", "high"),
+                    quality=thread_config.get("image_quality"),
                     background=thread_config.get("image_background", "auto"),
                     output_format=thread_config.get("image_format", "png"),
                     output_compression=thread_config.get("image_compression", 100),
@@ -661,6 +664,7 @@ class ImageEditMixin:
                     model=thread_config.get("image_model"),
                     image_description=image_analysis,  # The analyzed description
                     input_fidelity=thread_config.get("input_fidelity", "high"),
+                    quality=thread_config.get("image_quality"),
                     background=thread_config.get("image_background", "auto"),
                     output_format=thread_config.get("image_format", "png"),
                     output_compression=thread_config.get("image_compression", 100),
