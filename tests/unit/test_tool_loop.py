@@ -194,7 +194,7 @@ class TestToolLoop:
         assert replayed[0]["id"] == "rs_1"
         assert replayed[1]["call_id"] == "c1" and replayed[2]["call_id"] == "c1"
         # reasoning entries don't count as tool executions (F7 also captures an arg gist)
-        assert out["local_tool_calls"] == [{"name": "echo", "ok": True, "gist": "x=1"}]
+        assert out["local_tool_calls"] == [{"name": "echo", "ok": True, "gist": "x=<str>"}]
 
     @pytest.mark.asyncio
     async def test_tool_error_fed_back_not_raised(self, monkeypatch):
@@ -206,7 +206,7 @@ class TestToolLoop:
             _Client(), messages=[], tools=[], registry=_registry_with(executor=boom),
             tool_context=ToolContext())
         assert out["text"] == "answered anyway"
-        assert out["local_tool_calls"] == [{"name": "echo", "ok": False, "gist": "x=1"}]
+        assert out["local_tool_calls"] == [{"name": "echo", "ok": False, "gist": "x=<str>"}]
         # The error result still went back to the model as a function_call_output
         output_item = fake.invocations[1]["messages"][-1]
         assert output_item["type"] == "function_call_output" and "execution_error" in output_item["output"]
@@ -354,8 +354,12 @@ def _react_self():
     s.get_react_tool_schema = SlackMessagingMixin.get_react_tool_schema.__get__(s)
     s.execute_react_tool = SlackMessagingMixin.execute_react_tool.__get__(s)
     s._reserve_and_react = SlackMessagingMixin._reserve_and_react.__get__(s)
+    s._trim_reaction_guard = SlackMessagingMixin._trim_reaction_guard.__get__(s)
+    s._REACTION_GUARD_MAX = SlackMessagingMixin._REACTION_GUARD_MAX
+    s._REACTION_GUARD_RECENCY_S = SlackMessagingMixin._REACTION_GUARD_RECENCY_S
     # start with no reservation guard (None so the executor initializes it)
     s._reaction_guard = None
+    s._reaction_guard_ts = None
     return s
 
 
@@ -489,12 +493,13 @@ class TestReactTool:
         assert all(r["ok"] is False for r in results)
 
     @pytest.mark.asyncio
-    async def test_pending_reservation_never_evicted(self, monkeypatch):
-        # F3 (BLOCKER): LRU eviction must NEVER remove an entry that still holds a
-        # pending reservation — evicting it and recreating the key later lets the
-        # evicted owner's finally delete the replacement. Pinned entries are skipped;
-        # a committed entry is evicted instead.
+    async def test_recent_entries_pinned_stale_evicted(self, monkeypatch):
+        # Round-3: eviction PINS entries touched within the recency window — both a fresh
+        # PENDING reservation AND the active turn's COMMITTED slots (so a burst of 2000+
+        # reactions on other messages can't resurrect a message's consumed slots). Stale
+        # committed entries are the ones evicted.
         from collections import OrderedDict
+        import time as _time
         monkeypatch.setattr(config, "enable_reactions", True)
         monkeypatch.setattr(config, "enable_react_tool", True)
         monkeypatch.setattr(config, "reaction_emojis", ["thumbsup"])
@@ -502,20 +507,56 @@ class TestReactTool:
         s = _react_self()
         s.react = AsyncMock(return_value=True)
 
+        now = _time.monotonic()
         guard = s._reaction_guard = OrderedDict()
-        # Oldest entry holds a PENDING reservation (a not-yet-resolved future).
-        pending_fut = asyncio.get_event_loop().create_future()
-        guard[("C1", "pinned")] = {"eyes": pending_fut}
-        # Fill to the eviction threshold with committed entries.
+        ts_map = s._reaction_guard_ts = {}
+        stale = now - s._REACTION_GUARD_RECENCY_S - 10  # outside the recency window
+
+        fresh_pending = asyncio.get_event_loop().create_future()
+        guard[("C1", "fresh_pending")] = {"eyes": fresh_pending}
+        ts_map[("C1", "fresh_pending")] = now
+        guard[("C1", "recent_committed")] = {"thumbsup": True}
+        ts_map[("C1", "recent_committed")] = now
         for i in range(2000):
             guard[("C1", f"c{i}")] = {"thumbsup": True}
+            ts_map[("C1", f"c{i}")] = stale
 
-        # A fresh reservation pushes the guard over 2000 and triggers eviction.
-        await s._reserve_and_react("C1", "fresh", "thumbsup")
+        await s._reserve_and_react("C1", "brandnew", "thumbsup")
 
-        assert ("C1", "pinned") in guard          # pinned (pending) survived
-        assert len(guard) <= 2000                 # committed entries evicted instead
-        pending_fut.set_result(False)             # cleanup
+        assert ("C1", "fresh_pending") in guard       # fresh pending pinned
+        assert ("C1", "recent_committed") in guard     # active-turn committed pinned (no resurrection)
+        assert len(guard) <= 2000                       # stale committed evicted instead
+        fresh_pending.set_result(False)
+
+    @pytest.mark.asyncio
+    async def test_stale_pending_future_is_evictable(self, monkeypatch):
+        # Bounded expiry: a pending future untouched for the whole recency window is
+        # abandoned and becomes evictable, so a never-resolving Future can't pin forever.
+        from collections import OrderedDict
+        import time as _time
+        monkeypatch.setattr(config, "enable_reactions", True)
+        monkeypatch.setattr(config, "enable_react_tool", True)
+        monkeypatch.setattr(config, "reaction_emojis", ["thumbsup"])
+        monkeypatch.setattr(config, "reaction_max_per_message", 4)
+        s = _react_self()
+        s.react = AsyncMock(return_value=True)
+
+        now = _time.monotonic()
+        guard = s._reaction_guard = OrderedDict()
+        ts_map = s._reaction_guard_ts = {}
+        stale = now - s._REACTION_GUARD_RECENCY_S - 10
+
+        abandoned = asyncio.get_event_loop().create_future()
+        guard[("C1", "abandoned")] = {"eyes": abandoned}
+        ts_map[("C1", "abandoned")] = stale
+        for i in range(2000):
+            guard[("C1", f"c{i}")] = {"thumbsup": True}
+            ts_map[("C1", f"c{i}")] = now  # fresh committed → pinned
+
+        await s._reserve_and_react("C1", "brandnew", "thumbsup")
+
+        assert ("C1", "abandoned") not in guard  # abandoned stale pending evicted
+        abandoned.set_result(False)
 
     @pytest.mark.asyncio
     async def test_rollback_is_identity_conditional(self, monkeypatch):

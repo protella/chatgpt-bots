@@ -103,9 +103,10 @@ class SlackBot(SlackMessageEventsMixin,
 
     # Async versions required by BaseClient
     async def send_message_async(self, channel_id: str, thread_id: str, text: str,
-                                 blocks: Optional[list] = None) -> Optional[str]:
-        """Send a text message (async version); forwards footer blocks to send_message."""
-        return await self.send_message(channel_id, thread_id, text, blocks=blocks)
+                                 blocks: Optional[list] = None,
+                                 meta_out: Optional[dict] = None) -> Optional[str]:
+        """Send a text message (async version); forwards footer blocks + meta_out to send_message."""
+        return await self.send_message(channel_id, thread_id, text, blocks=blocks, meta_out=meta_out)
 
     async def send_image_async(self, channel_id: str, thread_id: str, image_data: bytes, filename: str, caption: str = "") -> Optional[str]:
         """Send an image (async version)"""

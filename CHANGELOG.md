@@ -381,14 +381,17 @@ DMs behave as before.
 
 ### 🩹 Fixed - Reliability hardening for the new channel/image features
 
-- **Streaming into Slack's native message surface works again.** Slack now requires a
-  workspace id to open a streamed reply, which every attempt was missing — so native
-  streaming failed on every turn and quietly fell back to the classic edit loop. The
-  bot now supplies it; when it can't, it still falls back cleanly instead of erroring.
+- **Streaming into Slack's native message surface works again.** Slack now requires both a
+  workspace id and the asking user's id to open a streamed reply in a channel, and every
+  attempt was missing them — so native streaming failed on every turn and quietly fell
+  back to the classic edit loop. The bot now supplies both; when either is unavailable it
+  still falls back cleanly instead of erroring.
 - The bot now reliably remembers its **own** streamed replies and which tools it used on
   them, so a moment later it can refer back to what it just said and did instead of
-  denying it. (Previously these were filed under a placeholder that no longer existed,
-  so they silently vanished.)
+  denying it. It also now treats its own recorded "used tools" note as the authoritative
+  record of what it did, so it no longer second-guesses or denies a tool it actually ran.
+  (Previously these were filed under a placeholder that no longer existed, so they
+  silently vanished; and even when present, the bot sometimes contradicted them.)
 - **Replies with the settings footer show the full answer again.** On some non-streamed
   replies the message could render as *only* the ⚙️ settings button, hiding the actual
   answer — the reply text now always rides the message, with the button beneath it.

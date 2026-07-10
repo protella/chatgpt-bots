@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 from collections import OrderedDict
 from typing import Dict, List, Optional
 
@@ -102,15 +103,17 @@ class NativeStreamSession:
     """
 
     def __init__(self, client, channel_id: str, thread_id: str, logger=None,
-                 team_id: Optional[str] = None):
+                 team_id: Optional[str] = None, user_id: Optional[str] = None):
         self._client = client
         self._channel = channel_id
         self._thread = thread_id
         self._log = logger
-        # Workspace team_id — chat.startStream requires recipient_team_id for channel
-        # streaming (Slack: "missing_recipient_team_id"). appendStream/stopStream key off
-        # the returned ts and need no team_id.
+        # chat.startStream requires BOTH recipient_team_id (workspace) and
+        # recipient_user_id (the triggering user) for channel streaming — missing either
+        # 400s (missing_recipient_team_id / missing_recipient_user_id). appendStream/
+        # stopStream key off the returned ts and need neither.
         self._team_id = team_id
+        self._user_id = user_id
         self.ts: Optional[str] = None
         self.active: bool = False
         self._sent: str = ""
@@ -124,13 +127,14 @@ class NativeStreamSession:
                 self._log("native streaming requires a thread — top-level reply falls back to legacy")
             self.active = False
             return False
-        if not self._team_id:
-            # chat.startStream now REQUIRES recipient_team_id for channel streaming
-            # (Slack: "missing_recipient_team_id"). Without a resolved workspace
-            # team_id the call is guaranteed to fail — skip it and let the caller
-            # fall back to legacy streaming (never crash).
+        if not self._team_id or not self._user_id:
+            # chat.startStream now REQUIRES recipient_team_id AND recipient_user_id for
+            # channel streaming (Slack: "missing_recipient_team_id" /
+            # "missing_recipient_user_id"). Without both the call is guaranteed to fail —
+            # skip it and let the caller fall back to legacy streaming (never crash).
             if self._log:
-                self._log("native streaming requires a workspace team_id — falling back to legacy")
+                missing = "team_id" if not self._team_id else "user_id"
+                self._log(f"native streaming requires a {missing} — falling back to legacy")
             self.active = False
             return False
         try:
@@ -139,6 +143,7 @@ class NativeStreamSession:
                 thread_ts=self._thread,
                 markdown_text=initial_text or None,
                 recipient_team_id=self._team_id,
+                recipient_user_id=self._user_id,
             )
             self.ts = resp.get("ts")
             self._sent = initial_text or ""
@@ -210,8 +215,10 @@ class SlackMessagingMixin:
             self._socket_liveness.attach()
             self._socket_liveness.start()
         except Exception as e:
+            # Partial start (e.g. attach() installed the listener but start() failed): stop
+            # the monitor so we never leave a dangling listener behind.
             self.log_warning(f"Could not start socket-liveness monitor: {e}")
-            self._socket_liveness = None
+            await self._stop_socket_liveness_quietly()
 
         # Resolve our own identity up front so we can tell our messages apart from other bots'
         await self._ensure_self_identity()
@@ -223,10 +230,22 @@ class SlackMessagingMixin:
             await self._start_task
         except asyncio.CancelledError:
             self.log_info("Slack bot start task cancelled")
+            await self._stop_socket_liveness_quietly()  # detach before propagating
             raise
         except Exception as e:
             self.log_error(f"Error in Slack bot start: {e}")
+            await self._stop_socket_liveness_quietly()  # detach before propagating
             raise
+
+    async def _stop_socket_liveness_quietly(self) -> None:
+        """Stop + detach the socket-liveness monitor, swallowing errors and clearing the ref."""
+        monitor = getattr(self, "_socket_liveness", None)
+        self._socket_liveness = None
+        if monitor is not None:
+            try:
+                await monitor.stop()
+            except Exception as e:
+                self.log_debug(f"Error stopping socket-liveness monitor: {e}")
 
     async def stop(self):
         """Stop the Slack bot"""
@@ -422,9 +441,11 @@ class SlackMessagingMixin:
                 if composed is not None:
                     # text stays as the notification fallback; blocks carry the visible reply.
                     post_kwargs["blocks"] = composed
-                _set_attached(composed is not None)
                 result = await self.app.client.chat_postMessage(**post_kwargs)
                 posted_ts = result.get("ts")
+                # Report footer attachment only AFTER Slack returns a ts — a post that never
+                # landed hasn't attached anything, and the separate footer must still fire.
+                _set_attached(composed is not None and bool(posted_ts))
                 self._record_own_reply_pulse(channel_id, thread_id, posted_ts, text)
                 return posted_ts
             else:
@@ -769,14 +790,16 @@ class SlackMessagingMixin:
             and hasattr(self.app.client, "chat_startStream")
         )
 
-    def begin_native_stream(self, channel_id: str, thread_id: str) -> "NativeStreamSession":
+    def begin_native_stream(self, channel_id: str, thread_id: str,
+                            user_id: Optional[str] = None) -> "NativeStreamSession":
         """Create a (not-yet-started) NativeStreamSession bound to this channel/thread.
 
-        Passes the workspace team_id (resolved once via auth.test in _ensure_self_identity)
-        as chat.startStream now requires it as recipient_team_id for channel streaming."""
+        chat.startStream requires recipient_team_id (workspace, resolved once via auth.test
+        in _ensure_self_identity) AND recipient_user_id (the triggering user, plumbed in by
+        the handler) for channel streaming — both are threaded onto the session here."""
         return NativeStreamSession(
             self.app.client, channel_id, thread_id, logger=self.log_debug,
-            team_id=getattr(self, "self_team_id", None))
+            team_id=getattr(self, "self_team_id", None), user_id=user_id)
 
     async def set_assistant_status(self, channel_id: str, thread_id: str,
                                    status: Optional[str] = None,
@@ -911,49 +934,69 @@ class SlackMessagingMixin:
             return {"ok": False, "error": "no_target", "message": "No message to react to."}
         return await self._reserve_and_react(channel_id, ts, emoji)
 
+    # Reaction-guard eviction tuning. Entries touched within the recency window are PINNED
+    # (never evicted) — this covers both the committed slots of an ACTIVE turn (so a burst
+    # of 2000+ reactions on other messages can't resurrect a message's consumed slots) and
+    # fresh pending reservations. A pending future untouched for the whole window is treated
+    # as abandoned and becomes evictable (bounded expiry for a never-resolving Future).
+    _REACTION_GUARD_MAX = 2000
+    _REACTION_GUARD_RECENCY_S = 120.0
+
+    def _trim_reaction_guard(self, guard, ts_map, now, keep=None) -> None:
+        """Evict oldest guard entries beyond the cap, pinning anything touched within the
+        recency window (and always ``keep``)."""
+        if len(guard) <= self._REACTION_GUARD_MAX:
+            return
+        cutoff = now - self._REACTION_GUARD_RECENCY_S
+        for k in list(guard.keys()):
+            if len(guard) <= self._REACTION_GUARD_MAX:
+                break
+            entry = guard.get(k)
+            if entry is keep:
+                continue
+            if ts_map.get(k, 0.0) >= cutoff:
+                continue  # recently touched → pinned (active-turn committed or fresh pending)
+            del guard[k]
+            ts_map.pop(k, None)
+
     async def _reserve_and_react(self, channel_id: str, ts: str, emoji: str) -> dict:
         """F6: atomic per-message reservation with rollback.
 
-        Guard: bounded LRU map (channel, ts) -> {emoji: Future(pending) | True(committed)}.
-        Distinct emoji up to REACTION_MAX_PER_MESSAGE land; a duplicate emoji is idempotent
-        success WITHOUT consuming a slot. Because dispatch_all runs sibling calls
-        concurrently, the slot is reserved SYNCHRONOUSLY (before the first await) so N+1
-        distinct reactions can't all pass the cap; a failed/cancelled Slack call rolls the
-        reservation back in `finally`. A duplicate whose in-flight owner FAILS must not
-        report success (round-2 fix a)."""
+        Guard: bounded LRU map (channel, ts) -> {emoji: Future(pending) | True(committed)},
+        plus a parallel (channel, ts) -> monotonic touch time. Distinct emoji up to
+        REACTION_MAX_PER_MESSAGE land; a duplicate emoji is idempotent success WITHOUT
+        consuming a slot. Because dispatch_all runs sibling calls concurrently, the slot is
+        reserved SYNCHRONOUSLY (before the first await) so N+1 distinct reactions can't all
+        pass the cap; a failed/cancelled Slack call rolls the reservation back in `finally`.
+        A duplicate whose in-flight owner FAILS must not report success (round-2 fix a).
+        Eviction pins recently-touched entries (committed or pending) so consumed slots
+        can't resurrect mid-turn; a duplicate's wait on an in-flight owner is time-bounded."""
+        now = time.monotonic()
         cap = max(1, int(getattr(config, "reaction_max_per_message", 4)))
         guard = getattr(self, "_reaction_guard", None)
         if guard is None:
             guard = self._reaction_guard = OrderedDict()  # (channel, ts) -> {emoji: Future|True}
+        ts_map = getattr(self, "_reaction_guard_ts", None)
+        if ts_map is None:
+            ts_map = self._reaction_guard_ts = {}       # (channel, ts) -> monotonic touch time
         key = (channel_id, ts)
         slots = guard.get(key)
         if slots is None:
             slots = guard[key] = {}
         guard.move_to_end(key)  # LRU recency refresh
-        # Whole-message LRU eviction, oldest first — but NEVER evict an entry that still
-        # holds a pending reservation (a slot value that isn't the committed sentinel
-        # True). Evicting a pinned entry then recreating the key later would let the
-        # evicted owner's `finally` delete the replacement dict (identity race). Pinned
-        # entries are skipped here; they're removed by their own finally on resolution.
-        if len(guard) > 2000:
-            for k in list(guard.keys()):
-                if len(guard) <= 2000:
-                    break
-                entry = guard.get(k)
-                if entry is slots:
-                    continue  # never evict the entry we're about to use
-                if entry is None or all(v is True for v in entry.values()):
-                    del guard[k]
+        ts_map[key] = now
+        self._trim_reaction_guard(guard, ts_map, now, keep=slots)
 
         existing = slots.get(emoji)
         if existing is not None:
             # Duplicate emoji — idempotent, no new slot consumed.
             if existing is True:  # already committed
                 return {"ok": True, "emoji": emoji, "ts": ts, "idempotent": True}
-            # In-flight: await the owner's real outcome (shield so our cancellation
-            # doesn't cancel theirs). Must NOT report success if the owner failed.
+            # In-flight: await the owner's real outcome (shield so our cancellation doesn't
+            # cancel theirs), but time-bounded so a never-resolving owner can't hang us.
+            wait_bound = max(1.0, float(getattr(config, "tool_call_timeout", 20)))
             try:
-                ok = await asyncio.shield(existing)
+                ok = await asyncio.wait_for(asyncio.shield(existing), timeout=wait_bound)
             except Exception:
                 ok = False
             if ok:
@@ -992,6 +1035,10 @@ class SlackMessagingMixin:
                 # different dict, which we must not delete).
                 if not slots and guard.get(key) is slots:
                     guard.pop(key, None)
+                    ts_map.pop(key, None)
+            # Retrim after settlement: a burst may have blown past the cap with everything
+            # pending (nothing evictable then); now that this call resolved, sweep again.
+            self._trim_reaction_guard(guard, ts_map, time.monotonic())
 
     def get_no_reply_tool_schema(self) -> dict:
         """Function-tool schema for the F2 terminal no-reply action (unprompted turns only)."""

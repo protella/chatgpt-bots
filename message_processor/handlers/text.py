@@ -24,17 +24,19 @@ from message_processor.tool_provenance import (
 
 
 def _delivered_stream_ts(native_coord, native_finalized: bool,
-                         current_message_id: Optional[str]) -> Optional[str]:
+                         current_message_id: Optional[str],
+                         content_delivered: bool) -> Optional[str]:
     """The ACTUAL delivered message ts for a streamed reply — the key F5/F7 must use.
 
     NOT the original placeholder `message_id` (None on native status-only streams, a
     DELETED placeholder on native fallback). Native path (finalize confirmed): the native
-    stream's current ts. Legacy/fallback path: the final `current_message_id` from the
-    update loop (which already tracks the native ts whenever the stream ran). Returns None
-    when nothing was delivered — callers must then skip the pulse/provenance record."""
+    stream's current ts. Legacy/fallback path: the final `current_message_id` — but ONLY
+    when ``content_delivered`` is True. A placeholder/current id can exist even though
+    EVERY content flush failed; returning it then would fake a delivery (phantom
+    posted=True + pulse/provenance). Returns None when nothing visible actually landed."""
     if native_coord is not None and native_finalized:
         return native_coord.current_ts
-    return current_message_id
+    return current_message_id if content_delivered else None
 
 
 class TextHandlerMixin:
@@ -814,6 +816,17 @@ class TextHandlerMixin:
         # Track current streaming message and overflow
         current_message_id = message_id
         current_part = 1
+        # M4 / delivered-ts: MONOTONIC "any visible content actually reached Slack this
+        # turn" flag. Set once at every confirmed content delivery (native append/roll,
+        # legacy edit, final flush/correction, fresh post) and NEVER cleared — a native
+        # roll resets the buffer to a newline-only remainder, so buffer.has_content() can't
+        # be trusted. Seeds the retry commitment (a late no_reply after ANY delivered text
+        # is rejected) and gates delivered-ts/posted (a placeholder id is not delivery).
+        visible_content_delivered = bool(visible_already_committed)
+        # Split-reply provenance: the rebuild merges continuation parts under the FIRST
+        # part's ts, so F7 must persist there (last-part keying vanishes on rebuild). Captured
+        # at the first confirmed content delivery (== part 1's message in either path).
+        first_delivered_ts = None
         overflow_buffer = ""
         continuation_msg = continuation_trailer()  # shared marker (message_markers)
         # Reserve space for: continuation msg (~40), part prefix (~30), tools attribution (~100), markdown expansion (~400)
@@ -844,6 +857,7 @@ class TextHandlerMixin:
                 client, message.channel_id,
                 None if place_in_channel else message.thread_id,
                 char_limit=message_char_limit, logger=self.log_debug,
+                user_id=message.user_id,
             )
 
         # Start progress updater task (will be cancelled when streaming starts)
@@ -853,7 +867,7 @@ class TextHandlerMixin:
         # Define the streaming callback
         async def stream_callback(text_chunk: str):
             """Callback function called with each text chunk from OpenAI"""
-            nonlocal current_message_id, current_part, overflow_buffer, progress_task, first_chunk_received, streaming_aborted
+            nonlocal current_message_id, current_part, overflow_buffer, progress_task, first_chunk_received, streaming_aborted, visible_content_delivered, first_delivered_ts
 
             # If we've aborted, ignore further chunks
             if streaming_aborted:
@@ -894,16 +908,25 @@ class TextHandlerMixin:
                     buffer.add_chunk(text_chunk)
                     if buffer.should_update() and rate_limiter.can_make_request():
                         rate_limiter.record_request_attempt()
-                        ok, overflow = await native_coord.update(buffer.get_complete_text())
+                        cumulative = buffer.get_complete_text()
+                        ok, overflow = await native_coord.update(cumulative)
                         if overflow is not None:
-                            # Part rolled: markers were appended by the coordinator
-                            # (message_markers shapes); buffer restarts from the overflow.
+                            # Part rolled: the just-closed part's visible text was delivered
+                            # (M4 — the buffer is about to be reset to the newline-stripped
+                            # remainder, so record delivery NOW before it's lost).
+                            visible_content_delivered = True
+                            # markers were appended by the coordinator (message_markers
+                            # shapes); buffer restarts from the overflow.
                             buffer.reset()
                             buffer.add_chunk(overflow)
                             buffer.mark_updated()
                             current_part = native_coord.part
                         if ok:
                             rate_limiter.record_success()
+                            if cumulative.strip():
+                                visible_content_delivered = True
+                                if first_delivered_ts is None:
+                                    first_delivered_ts = native_coord.current_ts or current_message_id
                             if overflow is None:
                                 buffer.mark_updated()
                             buffer.update_interval_setting(rate_limiter.get_current_interval())
@@ -951,6 +974,8 @@ class TextHandlerMixin:
                         if result["success"]:
                             rate_limiter.record_success()
                             buffer.mark_updated()
+                            if final_text.strip():
+                                visible_content_delivered = True
                     except Exception as e:
                         self.log_error(f"Error flushing final text: {e}")
                 return
@@ -1032,6 +1057,10 @@ class TextHandlerMixin:
                                 return  # Exit callback
 
                         if result["success"]:
+                            # The first part's visible text was just delivered (M4).
+                            visible_content_delivered = True
+                            if first_delivered_ts is None:
+                                first_delivered_ts = current_message_id
                             # Prepare overflow text with proper fence opening if needed
                             if was_in_code_block:
                                 # Re-open the code block on the new page
@@ -1100,6 +1129,10 @@ class TextHandlerMixin:
                         if result["success"]:
                             rate_limiter.record_success()
                             buffer.mark_updated()
+                            if display_text.strip():
+                                visible_content_delivered = True
+                                if first_delivered_ts is None:
+                                    first_delivered_ts = current_message_id
                             buffer.update_interval_setting(rate_limiter.get_current_interval())
                         else:
                             # Update failed - this is CRITICAL, we must not lose text!
@@ -1440,7 +1473,7 @@ class TextHandlerMixin:
             # Note: current_message_id might be different from message_id if we overflowed
             # We need to update the current message (which might be part 2, 3, etc)
             if native_finalized:
-                pass  # native stopStream delivered the final text (+ attribution)
+                visible_content_delivered = True  # native stopStream delivered the final text (+ attribution)
             elif current_message_id is None:
                 # Status-only DM where neither the native stream nor the lazy legacy
                 # seed ever produced a message (e.g. zero chunks before completion).
@@ -1454,6 +1487,7 @@ class TextHandlerMixin:
                     posted_ts = await client.send_message(message.channel_id, message.thread_id, response_text)
                     if posted_ts:
                         current_message_id = posted_ts
+                        visible_content_delivered = True
                 except Exception as e:
                     self.log_error(f"Error posting final response directly: {e}")
             elif current_part > 1:
@@ -1496,7 +1530,9 @@ class TextHandlerMixin:
                                 f"{CONTINUATION_HEAD}\n\n{overflow_text}")
                         else:
                             final_result = await client.update_message_streaming(message.channel_id, current_message_id, final_part_text)
-                        if not final_result["success"]:
+                        if final_result["success"]:
+                            visible_content_delivered = True
+                        else:
                             self.log_error(f"Failed to remove indicator from part {current_part}: {final_result.get('error', 'Unknown error')}")
                 except Exception as e:
                     self.log_error(f"Error removing indicator from overflow message: {e}")
@@ -1541,12 +1577,16 @@ class TextHandlerMixin:
                             # Send the rest as new messages
                             overflow_text = response_text[cut:].lstrip()
                             await client.send_message(message.channel_id, message.thread_id, f"{CONTINUATION_HEAD}\n\n{overflow_text}")
-                            
-                            if not final_result["success"]:
+
+                            if final_result["success"]:
+                                visible_content_delivered = True
+                            else:
                                 self.log_error(f"Final truncated update failed: {final_result.get('error', 'Unknown error')}")
                         else:
                             final_result = await client.update_message_streaming(message.channel_id, current_message_id, response_text)
-                            if not final_result["success"]:
+                            if final_result["success"]:
+                                visible_content_delivered = True
+                            else:
                                 self.log_error(f"Final correction update failed: {final_result.get('error', 'Unknown error')}")
                     except Exception as e:
                         self.log_error(f"Error in final correction update: {e}")
@@ -1573,12 +1613,22 @@ class TextHandlerMixin:
             # delivered message ts — NOT the original `message_id` (None on native
             # status-only streams, a deleted placeholder on native fallback). Persist/record
             # ONLY on confirmed delivery — a None ts means nothing was delivered, skip.
-            delivered_ts = _delivered_stream_ts(native_coord, native_finalized, current_message_id)
+            delivered_ts = _delivered_stream_ts(
+                native_coord, native_finalized, current_message_id, visible_content_delivered)
 
-            # F7: persist keyed on the reply's real ts (same ts the pulse records).
-            # Skipped silently when no message was delivered.
+            # F7: persist under the FIRST delivered part's ts, since the history rebuild
+            # merges continuation parts under it — keying on the last part makes provenance
+            # vanish on rebuild. Native: the first native message; legacy: the first message
+            # that received content; single-part / no-split: the delivered ts.
+            provenance_ts = delivered_ts
+            if native_coord is not None and native_coord.part_ts:
+                provenance_ts = native_coord.part_ts[0]
+            elif first_delivered_ts:
+                provenance_ts = first_delivered_ts
+            if not visible_content_delivered:
+                provenance_ts = None  # nothing landed — don't persist a phantom
             self._persist_tool_provenance(
-                thread_state.channel_id, delivered_ts, thread_key, tool_provenance)
+                thread_state.channel_id, provenance_ts, thread_key, tool_provenance)
 
             # F5 fix (a): record the bot's own streamed final reply into the pulse — native
             # stream edits never echo back as a clean event, so this is their only capture.
@@ -1689,14 +1739,15 @@ class TextHandlerMixin:
             # Pass retry_count=1 to prevent re-entering streaming after timeout
             # Also pass the accumulated exclusion set so the retry drops ALL
             # servers that have failed so far, not just the latest one.
-            # F8: if THIS attempt already exposed partial visible text (it was left in the
-            # message above), tell the retry so a no_response_needed on it is rejected
-            # rather than orphaning that partial as fake silence.
-            partial_exposed = visible_already_committed or buffer.has_content()
+            # F8/M4: seed the retry from the MONOTONIC content-delivery flag, NOT the buffer
+            # (a native roll resets the buffer to a newline-only remainder, so
+            # buffer.has_content() would falsely read empty even after a part was delivered).
+            # Once any visible text landed this turn, a no_response_needed on the retry is
+            # rejected rather than orphaning that partial as fake silence.
             return await self._handle_text_response(
                 user_content, thread_state, client, message, thinking_id,
                 attachment_urls, retry_count=1, failed_mcp_server=failed_mcp_servers,
-                visible_already_committed=partial_exposed
+                visible_already_committed=visible_content_delivered
             )
 
     @staticmethod

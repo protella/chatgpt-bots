@@ -74,9 +74,9 @@ def _provenance_on(monkeypatch):
 # ------------------------------------------------------------------ pure helpers
 
 def test_gist_from_arguments_scalars_and_containers():
-    # Structural allowlisted keys keep their value (numbers always; strings for keys like
-    # limit/before/oldest that describe call shape, not content).
-    assert tp.gist_from_arguments('{"limit": 50, "before": "abc"}') == "limit=50, before=abc"
+    # COUNT keys keep numeric values; TS keys keep Slack-ts / plain-number values.
+    assert tp.gist_from_arguments('{"limit": 50, "before": "169.5"}') == "limit=50, before=169.5"
+    assert tp.gist_from_arguments('{"oldest": "1690000000.000100"}') == "oldest=1690000000.000100"
     assert tp.gist_from_arguments('{"ids": [1, 2, 3]}') == "ids=[3]"
     assert tp.gist_from_arguments("{}") == ""
     assert tp.gist_from_arguments("not json") == ""
@@ -84,14 +84,19 @@ def test_gist_from_arguments_scalars_and_containers():
 
 
 def test_gist_never_leaks_opaque_string_values():
-    # F6: a non-allowlisted string value is user content (query/prompt/URL/token) and must
-    # NEVER be persisted verbatim — only that a value was present (`<str>`).
+    # M3/F6: a non-allowlisted value is user content (query/prompt/URL/token) and must NEVER
+    # be persisted verbatim — only that a value was present (`<str>`). This holds even for
+    # NUMBERS on non-allowlisted keys (a numeric token would otherwise leak) and for
+    # allowlisted keys whose value fails its per-key validator.
     assert tp.gist_from_arguments('{"query": "secret search terms"}') == "query=<str>"
     assert tp.gist_from_arguments('{"emoji": "eyes"}') == "emoji=<str>"
     assert tp.gist_from_arguments('{"url": "https://x/y?token=abc"}') == "url=<str>"
+    assert tp.gist_from_arguments('{"token": 123456}') == "token=<str>"          # numeric leak blocked
+    assert tp.gist_from_arguments('{"before": "https://x/?t=secret"}') == "before=<str>"  # ts key, bad value
+    assert tp.gist_from_arguments('{"limit": "50; DROP"}') == "limit=<str>"       # count key, non-numeric
     # Container shapes still summarize by kind+size (no leak).
     assert tp.gist_from_arguments('{"q": "hi", "opts": {"a": 1}}') == "q=<str>, opts={1}"
-    # Numbers and booleans are always safe regardless of key.
+    # Numbers on COUNT keys and booleans anywhere are always safe.
     assert tp.gist_from_arguments('{"top_k": 5, "stream": true}') == "top_k=5, stream=True"
 
 
@@ -163,6 +168,26 @@ async def test_db_save_merge_upgrades_empty_gist(temp_db):
     assert got == {"101.0": [{"tool_name": "a", "gist": "limit=5"}]}
 
 
+def test_merge_preserves_multiple_executions_dedupes_exact_only():
+    from database import DatabaseManager as DM
+    # Same tool, DIFFERENT gists = two real executions → both kept (ordered).
+    out = DM._merge_tool_provenance(
+        [{"tool_name": "fetch", "gist": "limit=5"}],
+        [{"tool_name": "fetch", "gist": "limit=10"}])
+    assert out == [{"tool_name": "fetch", "gist": "limit=5"},
+                   {"tool_name": "fetch", "gist": "limit=10"}]
+    # EXACT duplicate (same name AND gist) → deduped to one.
+    out = DM._merge_tool_provenance(
+        [{"tool_name": "fetch", "gist": "limit=5"}],
+        [{"tool_name": "fetch", "gist": "limit=5"}])
+    assert out == [{"tool_name": "fetch", "gist": "limit=5"}]
+    # Empty-gist placeholder upgraded in place; a later empty is absorbed by the non-empty.
+    out = DM._merge_tool_provenance(
+        [{"tool_name": "fetch", "gist": ""}],
+        [{"tool_name": "fetch", "gist": "limit=5"}, {"tool_name": "fetch", "gist": ""}])
+    assert out == [{"tool_name": "fetch", "gist": "limit=5"}]
+
+
 @pytest.mark.asyncio
 async def test_db_age_sweep_deletes_old_rows(temp_db):
     await temp_db.save_tool_usage_async("C1", "101.0", "C1:100.0", [{"tool_name": "a", "gist": ""}])
@@ -188,25 +213,30 @@ def test_delivered_ts_native_path_uses_native_current_ts():
     from types import SimpleNamespace
     native = SimpleNamespace(current_ts="999.9")
     # Native finalize confirmed → the native stream's own message ts, NOT the (stale)
-    # legacy current_message_id.
-    assert _delivered_stream_ts(native, True, "111.1") == "999.9"
+    # legacy current_message_id. (native_finalized already implies content delivery.)
+    assert _delivered_stream_ts(native, True, "111.1", True) == "999.9"
 
 
 def test_delivered_ts_legacy_path_uses_current_message_id():
     from message_processor.handlers.text import _delivered_stream_ts
     from types import SimpleNamespace
     # Native ran but did NOT finalize (fell back to legacy edits) → the final
-    # current_message_id from the update loop.
+    # current_message_id from the update loop — but ONLY when content was delivered.
     native = SimpleNamespace(current_ts="999.9")
-    assert _delivered_stream_ts(native, False, "222.2") == "222.2"
+    assert _delivered_stream_ts(native, False, "222.2", True) == "222.2"
     # No native coordinator at all (pure legacy streaming).
-    assert _delivered_stream_ts(None, False, "333.3") == "333.3"
+    assert _delivered_stream_ts(None, False, "333.3", True) == "333.3"
 
 
-def test_delivered_ts_none_when_nothing_delivered():
+def test_delivered_ts_none_when_content_not_delivered():
     from message_processor.handlers.text import _delivered_stream_ts
-    # Status-only stream where no message was ever delivered → None (caller skips).
-    assert _delivered_stream_ts(None, False, None) is None
+    from types import SimpleNamespace
+    # A placeholder/current id exists but EVERY content flush failed → not a real delivery,
+    # so the legacy path returns None (no phantom posted/pulse/provenance).
+    assert _delivered_stream_ts(None, False, "333.3", False) is None
+    assert _delivered_stream_ts(SimpleNamespace(current_ts="9"), False, "333.3", False) is None
+    # Nothing delivered at all → None.
+    assert _delivered_stream_ts(None, False, None, False) is None
 
 
 # ------------------------------------------------------------------ persistence seam

@@ -27,16 +27,42 @@ MAX_PROVENANCE_ENTRIES = 8
 MAX_GIST_CHARS = 80
 MAX_ANNOTATION_CHARS = 160
 
-# Allowlist of STRUCTURAL arg keys whose scalar values describe the SHAPE of a call
-# (pagination / sizing / time-window) and are safe to persist verbatim. Every other
-# string value is user content — search queries, prompts, URLs, potential tokens — and
-# is NEVER persisted (rendered as `<str>`), per the derived-artifacts rule (CLAUDE.md).
-# Numbers and booleans are always safe regardless of key.
-_SAFE_GIST_KEYS = frozenset({
+# Structural arg keys whose values describe the SHAPE of a call (pagination/sizing/
+# time-window) and are safe to persist — but ONLY when the value passes a per-key type
+# check, so a caller can't smuggle content through a whitelisted key (e.g.
+# before="https://x/?token=secret"). Every other value — non-allowlisted keys of ANY type
+# (incl. numbers like token=123456), or allowlisted keys failing validation — is redacted
+# to `<str>`, per the derived-artifacts rule (CLAUDE.md). Booleans are always safe.
+#   * COUNT keys: value must be a real number (int/float, not bool).
+#   * TS keys: value must look like a Slack ts / plain number (^\d+(\.\d+)?$).
+_COUNT_GIST_KEYS = frozenset({
     "limit", "count", "max", "max_results", "n", "top_k", "k", "size", "num", "num_results",
-    "days", "hours", "minutes", "page", "offset", "oldest", "latest", "before", "after",
-    "since", "until", "depth", "start", "end",
+    "days", "hours", "minutes", "page", "offset", "depth",
 })
+_TS_GIST_KEYS = frozenset({
+    "oldest", "latest", "before", "after", "since", "until", "start", "end",
+})
+_TS_VALUE_RE = re.compile(r"^\d+(\.\d+)?$")
+
+
+def _gist_render_value(key: str, value: Any) -> str:
+    """Render ONE arg value for the gist, redacting anything that could carry content.
+
+    Booleans and validated structural values pass through; everything else → `<str>`."""
+    k = str(key).lower()
+    if isinstance(value, bool):
+        return str(value)  # booleans never carry content
+    if isinstance(value, dict):
+        return f"{{{len(value)}}}"
+    if isinstance(value, list):
+        return f"[{len(value)}]"
+    if k in _COUNT_GIST_KEYS and isinstance(value, (int, float)):
+        return str(value)  # count-like: only a real number is safe
+    if k in _TS_GIST_KEYS and _TS_VALUE_RE.match(str(value)):
+        return str(value)  # ts-like: only Slack-ts / plain-number shape is safe
+    # Non-allowlisted key (any type, incl. numeric tokens), or an allowlisted key whose
+    # value failed validation → NEVER the value itself.
+    return "<str>"
 
 
 def strip_used_tools_footer(content: Any) -> Any:
@@ -66,21 +92,7 @@ def gist_from_arguments(arguments: Any) -> str:
         return ""
     parts: List[str] = []
     for key, value in arguments.items():
-        if isinstance(value, bool) or isinstance(value, (int, float)):
-            # Numbers/booleans never carry user content — safe to keep verbatim.
-            rendered = str(value)
-        elif isinstance(value, dict):
-            rendered = f"{{{len(value)}}}"
-        elif isinstance(value, list):
-            rendered = f"[{len(value)}]"
-        elif str(key).lower() in _SAFE_GIST_KEYS:
-            # An allowlisted structural key (e.g. oldest="169…", a Slack ts) — the value
-            # describes call shape, not content, so it's safe to keep (still per-value capped).
-            rendered = str(value).replace("\n", " ").replace("\r", " ").strip()
-        else:
-            # Any other string value is opaque user content (query/prompt/URL/token) —
-            # record only that a value was present, NEVER the value itself.
-            rendered = "<str>"
+        rendered = _gist_render_value(key, value).replace("\n", " ").replace("\r", " ").strip()
         if len(rendered) > 30:
             rendered = rendered[:27] + "…"
         parts.append(f"{key}={rendered}")

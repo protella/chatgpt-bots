@@ -350,8 +350,11 @@ class ChatBotV2:
                     # message and read as spam.
                     # No footer under an empty turn (F2 no_reply / reaction-only) — there is
                     # no message for it to sit under.
+                    # Also skip when the reply didn't actually post (posted is explicitly
+                    # False) — a footer under a message that never landed reads as orphaned.
                     if (hasattr(client, "maybe_post_response_footer") and not place_in_channel
-                            and (response.content or "").strip()):
+                            and (response.content or "").strip()
+                            and (response.metadata or {}).get("posted") is not False):
                         try:
                             await client.maybe_post_response_footer(message, response)
                         except Exception as e:

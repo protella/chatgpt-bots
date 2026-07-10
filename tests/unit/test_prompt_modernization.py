@@ -184,3 +184,15 @@ def test_teammate_batch_brevity_lines_present():
     assert "offer to expand in a thread" in SLACK_SYSTEM_PROMPT
     assert "several queued messages" in SLACK_SYSTEM_PROMPT
     assert "emoji reaction is your entire response" in SLACK_SYSTEM_PROMPT
+
+
+def test_tool_provenance_ground_truth_instruction_present():
+    # M2: the model must treat its own "[used tools: …]" annotations as authoritative
+    # ground truth about its past actions and never deny them (it was denying its own
+    # verified tool use even with the annotation in context).
+    assert "[used tools:" in SLACK_SYSTEM_PROMPT
+    assert "ground truth" in SLACK_SYSTEM_PROMPT
+    lowered = SLACK_SYSTEM_PROMPT.lower()
+    assert "authoritative" in lowered
+    # Absence of an annotation must be interpreted as "no local tools ran".
+    assert "no such line means you used no local tools" in SLACK_SYSTEM_PROMPT

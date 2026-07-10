@@ -92,12 +92,12 @@ class SocketLivenessMonitor:
     def start(self) -> None:
         """Start the periodic monitor task. No-op when disabled (timeout <= 0)."""
         if self._timeout is None or self._timeout <= 0:
-            self._log_info("Socket-liveness monitor disabled (SOCKET_LIVENESS_TIMEOUT=0)")
+            self._safe_log(self._log_info, "Socket-liveness monitor disabled (SOCKET_LIVENESS_TIMEOUT=0)")
             return
         if self._task is not None and not self._task.done():
             return
         self._task = asyncio.create_task(self._run())
-        self._log_info(
+        self._safe_log(self._log_info,
             f"Socket-liveness monitor started (window {self._timeout:.0f}s, "
             f"check every {self._check_interval:.0f}s, detection-only)")
 
@@ -109,7 +109,7 @@ class SocketLivenessMonitor:
             except asyncio.CancelledError:
                 break
             except Exception as e:  # noqa: BLE001 — the monitor must never crash
-                self._log_warning(f"socket-liveness monitor cycle error (continuing): {e}")
+                self._safe_log(self._log_warning, f"socket-liveness monitor cycle error (continuing): {e}")
 
     def _check(self) -> None:
         now = time.monotonic()
@@ -127,14 +127,14 @@ class SocketLivenessMonitor:
                 self._episode = "error"
                 ping_desc = (f"frozen {ping_idle:.0f}s" if ping_idle is not None
                              else "never observed")
-                self._log_error(
+                self._safe_log(self._log_error,
                     f"socket presumed dead (no events {events_idle:.0f}s, "
                     f"ping-pong {ping_desc}) — restart likely required")
         else:
             # Idle or half-open — passively indistinguishable. One WARNING per episode.
             if self._episode is None:
                 self._episode = "warning"
-                self._log_warning(
+                self._safe_log(self._log_warning,
                     f"socket event drought: no envelopes for {events_idle:.0f}s, but "
                     f"ping-pong fresh ({ping_idle:.0f}s ago) — idle or half-open "
                     f"(passively indistinguishable)")
