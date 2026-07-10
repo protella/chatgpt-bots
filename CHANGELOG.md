@@ -4,102 +4,229 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### 🔌 Improvement - MCP Hardening
+> Shipping as **v3.0.0** — a major release. The three headlines: a new model lineup
+> (GPT-5.6 Sol/Terra/Luna), the bot can now act like a real channel teammate
+> (off by default), and conversation history now lives in Slack, not the database.
+> Follow the Upgrade Instructions below in order; total hands-on time is a few minutes.
+
+### 📦 Upgrade Instructions (start here)
+
+**1. Update dependencies**
+```bash
+make install   # pip install --require-hashes -r requirements.txt (openai >= 2.45.0)
+```
+
+**2. Update your `.env`** — compare against the reorganized `.env.example`. Everything new has a sane default if omitted; the items that matter:
+
+Changed values (update if you set them explicitly):
+```
+GPT_MODEL=gpt-5.6-sol            # was gpt-5.5
+UTILITY_MODEL=gpt-5.6-luna       # was gpt-5-mini
+UTILITY_REASONING_EFFORT=none    # was minimal ("minimal" is rejected by 5.6 models)
+```
+
+Delete (no longer used):
+```
+DISCORD_TOKEN / DISCORD_ALLOWED_CHANNEL_IDS / DISCORD_LOG_LEVEL
+GPT4_MAX_TOKENS
+THREAD_MAX_TOKEN_COUNT
+```
+
+New keys worth a decision (see `.env.example` for the full annotated list — there's a
+whole new "Channel participation & UX" section at the bottom):
+- `ENABLE_CHANNEL_LISTENING=false` — the master switch for teammate behavior in channels.
+  **Off by default: the bot behaves exactly as before (mentions + DMs) until you flip it.**
+- `BOT_NAME_ALIASES=ChatGPT` — set per environment (e.g. `ChatGPT-Dev` for a dev bot)
+- `STATUS_LOADING_MESSAGES` — optional branded loading messages; set your workspace's
+  custom emoji names (unset = safe standard-emoji default)
+- `SLACK_NATIVE_STREAMING=false` — native streaming is built and tested but ships off;
+  validate live in your workspace before enabling
+- `ENABLE_FEEDBACK_BUTTONS=true` — 👍/👎 under DM/assistant responses
+
+**3. Migrate `mcp_config.json` secrets (recommended, not breaking)** — literal keys still
+work, but you can now keep them in `.env`:
+```
+"X-API-Key": "${YOUR_VAR}"     # in mcp_config.json (any var name you like)
+YOUR_VAR=sk-...                # in .env
+```
+Also new: per-server `"enabled": false`, and auth uses the `headers` object shape
+(see README — the previously documented `authorization` shape never worked).
+
+**4. Rebuild your Slack app manifest and reinstall.** Copy
+`slack_app_manifest.example.yml` over your environment copy (keep your names/commands)
+and reinstall the app. New since v2.5: `agent_view` block, bot scopes
+`search:read.public/private/im/mpim/files/users`, `reactions:read`, `emoji:read`,
+`assistant:write`, and events `reaction_added`, `app_home_opened`,
+`app_context_changed` (legacy `assistant_thread_*` events stay during the transition).
+Optional: subscribe `reaction_removed` if you want thumb reactions un-counted when removed.
+
+**5. First startup runs three automatic DB migrations** — each takes a tagged backup
+into `data/backups/` first (your rollback path). Watch for these log lines:
+- `DB: Mirror-drop migration complete — removed N cached message rows` (backup tagged
+  `pre-v3-mirror-drop`) — the DB no longer stores conversation transcripts
+- `DB: Doc-content-drop migration complete` (backup tagged `pre-v3-doc-content-drop`)
+  — the DB no longer stores document content
+- `DB: One-time GPT-5.6 migration — swapped N user(s) to gpt-5.6-sol with medium reasoning`
+  — everyone moves to the new default; users can re-pick model/effort globally,
+  per channel, and per thread afterward
+
+### 🚀 Feature - GPT-5.6 model family (Sol / Terra / Luna)
 
 #### Added
-- **Secrets out of `mcp_config.json`**: header values support `${VAR_NAME}` placeholders expanded from `.env` at load; a server with unresolved variables is skipped with a warning
-- **Per-server `"enabled": false`** to turn off one server without deleting its config
-- **Startup health probe**: one log line per MCP server (reachable/unreachable) plus its discovered tools
-- Tool discovery from conversations now populates the informational MCP tools cache
-
-#### Fixed
-- MCP failover survives multiple failing servers: exclusions accumulate across retries (previously two broken servers could retry forever), and failures are detected from structured error codes first with message-text matching as fallback
-- A config requesting `require_approval` other than "never" now logs a clear warning instead of being silently ignored
-
-#### Upgrade Instructions
-If your `mcp_config.json` contains literal API keys, move them to `.env` and reference them as `"X-API-Key": "${YOUR_VAR}"`.
-
-### 🤝 Feature - Claude-style Channel Participation (flagged off by default)
-
-#### Added
-- **Channel-wide listening** behind `ENABLE_CHANNEL_LISTENING` (default off) with a wake-classifier gate (respond / react / ignore) and per-channel `tag_only` / `auto_respond` / `off` modes
-- **Emoji reactions** as a response type (`ENABLE_REACTIONS`)
-- **Per-channel settings**: model footer with a ⚙️ Configure button under channel responses opens a channel settings modal (mode, directives, reply placement; "inherit" falls back to global defaults)
-- **Per-channel memory**: bot extracts durable facts after responses and recalls them in later threads in the same channel (`ENABLE_CHANNEL_MEMORY`)
-- **Agent split-view surface**: greeting, suggested prompts, and thread titles in Slack's agent/assistant view
-- **Native status indicator** (`assistant.threads.setStatus`) and a native streaming session capability (`SLACK_NATIVE_STREAMING`, off until validated)
-- **Privacy-scoped Slack history-fetch tool** executor (public or bot-member channels only; model wiring is follow-up)
-- `slack_app_manifest.example.yml` template with the new events/scopes; environment-specific `slack_app_manifest.yml` is now gitignored
-
-#### Fixed
-- **Multi-bot history corruption**: other bots' messages (e.g. Claude) were rebuilt as the bot's own assistant turns; now only our own messages map to assistant
-- **@mention tagging**: inbound mentions are resolved to names and outbound `@Name` references become real clickable mentions
-- **Onboarding nag**: bot-sent messages no longer trigger the "configure your settings" prompt
+- **Model picker now offers four models**: GPT-5.6 Sol (flagship, new default),
+  GPT-5.6 Terra (balanced), GPT-5.6 Luna (fast), and GPT-5.5
+- **New `max` reasoning effort** on all GPT-5.6 models (the effort list in settings
+  adapts to the selected model)
+- **One-time migration**: all users move to `gpt-5.6-sol` with `medium` reasoning;
+  a startup normalizer also clamps any stored model/effort a model no longer accepts,
+  so stale settings can never cause API errors
 
 #### Changed
-- All new behavior is env-flagged with sane defaults, documented in `.env.example`
-- Dependencies upgraded via `make lock-upgrade` (openai 2.44, slack-sdk 3.42, etc.)
+- **Utility functions** (intent classification, summaries) now run on `gpt-5.6-luna`
+  instead of `gpt-5-mini`
+- Prompt caching on 5.6 models is automatic (no cache-retention parameter needed);
+  GPT-5.5 keeps its 24-hour retention behavior
+
+#### Removed
+- **All pre-5.5 model support**: GPT-4 series, `gpt-5`, `gpt-5-nano`, `gpt-5-chat-*`,
+  and `gpt-5.1`–`gpt-5.4`, plus their dead API branches and one-off migration scripts.
+  `gpt-5-mini` is no longer used anywhere.
+
+### 🤝 Feature - The bot can be a channel teammate (off by default)
+
+Everything here is inert until you flip `ENABLE_CHANNEL_LISTENING=true`; mentions and
+DMs behave as before.
+
+#### Added
+- **Channel-wide listening with judgment**: a lightweight participation engine sees
+  channel messages and decides — respond, react with an emoji, stay silent, or back
+  off. Hard rails included: a per-channel hourly cap on unprompted replies
+  (`MAX_UNPROMPTED_REPLIES_PER_HOUR`), rapid-fire debouncing, and "ignore" as the
+  default verdict.
+- **Per-channel participation levels** — off / mentions-only / judicious / active —
+  set by anyone via the **⚙️ Configure** button under bot responses (plus channel
+  directives and reply placement, as before)
+- **"Quiet down" works like you'd hope**: telling the bot to pipe down gets a 🤐 and
+  snoozes unprompted participation for 4 hours (mentions still answered). Standing
+  feedback ("stay out of here unless tagged", "keep answers short in this channel")
+  is remembered durably as a channel preference.
+- **Per-channel memory, model-managed**: the bot decides what's durable
+  (decisions, conventions, preferences) and remembers/updates/forgets it via its own
+  tools; facts are recalled in future conversations in that channel
+- **On-demand context tools**: the bot can fetch older thread/channel history and
+  search the workspace (`assistant.search.context`) when a conversation references
+  something it can't see — instead of guessing. Search is permission-gated in code
+  (public/private channels only by default) and only possible while handling a real
+  triggering message.
+- **Emoji reactions** as a response type, both engine-chosen and model-invoked
+  (allowlisted via `REACTION_EMOJIS`)
+
+#### Changed
+- **No more "busy" rejections anywhere**: messages arriving while the bot is working
+  are queued and answered together in one coherent catch-up reply (DMs, threads, and
+  channels). The old "I'm busy, try again" behavior is retired.
+- **Replies thread by default** in channels; genuine top-level replies are reserved
+  for answers the whole channel needs
+
+### 🗄️ Changed - Slack is now the only transcript
+
+- **The database no longer mirrors conversations.** Context is rebuilt from Slack
+  history on demand; long threads are compacted into rolling summaries (file and
+  image references preserved) instead of trimmed silently. What the DB still holds:
+  settings, per-channel memory, derived artifacts (image analyses, document
+  summaries), and thread summaries.
+- **Token budgeting is usage-driven** (exact counts from API responses); the tiktoken
+  dependency is gone
+- One-time cleanup migration drops the old message mirror (tagged backup first — see
+  Upgrade Instructions)
+
+### 📄 Feature - Smarter, lighter document handling
+
+#### Added
+- **Documents no longer flood the conversation**: uploads inject a concise summary
+  (spreadsheets show sheets/columns/sample rows); when you ask for specifics, the bot
+  re-reads the original file on demand instead of guessing from the summary
+- **PDFs are read natively by the model** (`ENABLE_NATIVE_FILE_INPUT`, on by default):
+  tables, charts, and scanned pages are actually visible to it now
+- **Privacy**: document content is never stored and never touches disk — the bot keeps
+  only a summary and a reference to the file in Slack, and processes files in memory.
+  Deleting a file from Slack removes its content from the bot's reach entirely.
+
+### 👍 Feature - Response feedback
+
+- **Feedback buttons** (👍/👎) under DM and assistant-surface responses
+  (`ENABLE_FEEDBACK_BUTTONS`, on by default; channels stay clean)
+- **Thumbs-up/down reactions on the bot's messages are recorded** as the same signal —
+  passively, with zero model cost
+- Feedback lands in a local table for future tuning; nothing leaves your workspace
+
+### 🖥️ Changed - Slack agent surface & native streaming
+
+- Migrated to Slack's current agent view (June 2026): greeting and suggested prompts
+  now ride the new `app_home_opened` surface; legacy events remain subscribed during
+  the transition
+- **Native streaming** (`chat.startStream`/`appendStream`/`stopStream`) is fully wired
+  behind `SLACK_NATIVE_STREAMING` — **ships off** pending live validation in your
+  workspace; the classic edit-loop streaming remains the default and the automatic
+  fallback
+- The status indicator only appears once the bot has actually decided to respond
+  (the new surface auto-opens threads on status, so no more speculative indicators)
+
+### 🔌 Improvement - MCP hardening
+
+#### Added
+- **Secrets out of `mcp_config.json`**: header values support `${VAR_NAME}`
+  placeholders expanded from `.env` at load; a server with unresolved variables is
+  skipped with a warning naming them
+- **Per-server `"enabled": false`** to turn off one server without deleting its config
+- **Startup health probe**: one log line per MCP server (reachable/unreachable) plus
+  its discovered tools
+
+#### Fixed
+- MCP failover survives multiple failing servers: exclusions accumulate across retries
+  (previously two broken servers could retry each other forever), and failures are
+  detected from structured error codes first with message-text matching as fallback
+- A config requesting `require_approval` other than "never" now logs a clear warning
+  instead of being silently ignored
+- README documented an `authorization` config shape that never worked — corrected to
+  the real `headers` shape
 
 ### ✨ Improvement - Prompts modernized for current models
 
-- **Snappier, channel-appropriate replies**: the bot now behaves like a teammate — brief and conversational at channel top level, fuller detail in threads, and it offers to expand in a thread instead of posting walls of text. The old always-use-section-headers formatting rule (which made every reply memo-shaped) is gone.
-- **Faster vision responses**: the extra "question enhancement" model call before every image analysis is now off by default (`ENABLE_VISION_ENHANCEMENT=false`) — it re-sent the full conversation history to a second model and added 1–2s latency. Current models answer the question directly.
-- **More literal image edits**: the edit-prompt instructions no longer mandate re-describing the whole scene (a source of unwanted "re-imagining" drift); edits state exactly what changes and preserve everything else. Generation prompts now preserve your explicit specifications verbatim.
-- **Lower cost per message**: the intent classifier prompt was trimmed ~60% (it runs on every responded message), and in multi-user threads the system prompt no longer changes per speaker — restoring prompt-cache hits that were silently lost on every speaker change.
+- **Snappier, channel-appropriate replies**: brief and conversational at channel top
+  level, fuller detail in threads; the old always-use-section-headers rule (which made
+  every reply memo-shaped) is gone
+- **Faster vision responses**: the extra "question enhancement" model call before every
+  image analysis is off by default (`ENABLE_VISION_ENHANCEMENT=false`) — it added 1–2s
+  latency; current models answer the question directly
+- **More literal image edits**: edits state exactly what changes and preserve
+  everything else; generation prompts preserve your explicit specifications verbatim
+- **Lower cost per message**: the intent classifier prompt was trimmed ~60%, and
+  multi-user threads no longer lose prompt-cache hits on every speaker change
 
-### 📄 Feature - Smarter, Lighter Document Handling
+### 🩹 Fixed - Error messages that respect the reader
 
-#### Added
-- **Documents no longer flood the conversation**: uploading a document now injects a concise summary (spreadsheets show their sheets/columns/sample rows); the bot pulls exact figures, quotes, and sections from the original file on demand when you ask for specifics
-- **PDFs are read natively by the model** (`ENABLE_NATIVE_FILE_INPUT`, on by default): tables, charts, and scanned pages are actually visible to it now — no more mangled text extraction for PDFs within API limits
-- **Privacy**: document content is never stored — the bot keeps only a summary and a reference to the file in Slack. Deleting a file from Slack removes its content from the bot's reach entirely
+- **No more raw error dumps in Slack**: the old `Error Code / Type / Details` code-block
+  scaffold is retired; every user-facing error is now one friendly line with a clear
+  next step, and technical details stay in the logs
+- **Nothing fails silently anymore**: a file that couldn't be downloaded says so
+  ("couldn't download report.pdf — try re-uploading") instead of being ignored;
+  a failed catch-up on queued messages asks you to re-send; a Configure button that
+  couldn't open the settings modal tells you
+- Fixed an orphaned "Generating image…" indicator when image generation was blocked
+  by moderation
 
-#### Changed
-- One-time automatic migration on first startup (a tagged backup lands in `data/backups/` first); existing document references keep working
+### 🧹 Removed - Discord scaffolding & legacy code
 
-#### Upgrade Instructions
-Add to your `.env` (all default on/sane if omitted):
-```
-ENABLE_NATIVE_FILE_INPUT=true
-NATIVE_FILE_MAX_PAGES=100
-NATIVE_FILE_MAX_MB=32
-ENABLE_READ_DOCUMENT_TOOL=true
-DOC_EXTRACTION_CACHE_SIZE=20
-```
-Watch startup logs for `DB: Doc-content-drop migration complete`.
-
-### 🧹 Removed - Discord scaffolding, legacy code & tiktoken
-
-- **Discord support removed**: the V2 Discord bot was never built (the launcher was a "Coming Soon" stub). All Discord scaffolding is gone — stub launcher, config vars, prompts, markdown branch, and the `discord` dependency. The bot is Slack-only.
+- **Discord support removed**: the V2 Discord bot was never built (the launcher was a
+  "Coming Soon" stub). The bot is Slack-only.
 - **`legacy/` (V1 bots) deleted** — still available in early git history
-- **tiktoken dependency removed**: token budgeting now uses exact counts from API responses instead of local tokenization
 
-#### Upgrade Instructions
-You can delete these now-unused lines from your `.env`:
-```
-DISCORD_TOKEN=...
-DISCORD_ALLOWED_CHANNEL_IDS=...
-DISCORD_LOG_LEVEL=...
-```
+### 🧪 Changed - Test suite restored
 
-### 🔧 Cleanup - Model lineup reduced to GPT-5.5
-
-#### Removed
-- **Dropped model support**: GPT-4 series (`gpt-4o`, `gpt-4.1`), `gpt-5`, `gpt-5-nano`, `gpt-5-chat-*`, `gpt-5.1`, `gpt-5.2` (incl. `-pro`/`-chat-latest`), `gpt-5.3`, `gpt-5.4`. The model picker now offers **GPT-5.5 only**. `gpt-5-mini` remains supported as the utility model only (not user-selectable).
-- **Dead API branches**: GPT-4 parameter shaping, `gpt-5-chat-*` handling, per-model prompt-cache lists, and the GPT-5.1/5.2/5.4 special cases in the OpenAI client, settings modal, and settings handlers
-- **Obsolete one-off migration scripts**: `migrate_to_gpt54.py`, `scripts/migrate_users_to_gpt51.py`, `scripts/update_gpt51_reasoning.py`
-
-#### Added
-- **Startup normalization migration**: any user preference or per-thread override still on a dropped model is automatically swapped to `gpt-5.5` on startup (idempotent, runs every boot, logs the count)
-- Unit tests for the migration and the reduced model surface (`tests/unit/test_model_cleanup.py`)
-
-#### Upgrade Instructions
-You can delete these now-unused lines from your `.env`:
-```
-GPT4_MAX_TOKENS=...
-THREAD_MAX_TOKEN_COUNT=...
-```
-`GPT54_MAX_TOKENS` / `GPT54_TOKEN_BUFFER_PERCENTAGE` keep their names (they now describe GPT-5.5's 1.05M window); `GPT5_MAX_TOKENS` now describes the `gpt-5-mini` utility window. Watch startup logs for `DB: Normalized N user(s) ... to gpt-5.5`.
+- The unit suite is fully green again (1,185 tests, 0 failures) after years of rot;
+  `make test` now runs the entire suite instead of stopping at the first failure.
+  Stale tests of removed behavior were deleted; tests of real behavior were repaired.
 
 ## [2.5.1] - 2026-05-11
 

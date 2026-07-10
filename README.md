@@ -2,41 +2,32 @@
 Python-based ChatGPT Slack bot using OpenAI's Responses API
 
 ## Description
-A production-ready Slack bot built with Python and OpenAI's Responses API (not Chat Completions). Features intelligent intent classification, image generation/editing, vision analysis, document processing, and user-specific settings with thread-level customization. The architecture is stateless with Slack as the source of truth, rebuilding context from platform history on demand.
+A production-ready Slack bot built with Python and OpenAI's Responses API (not Chat Completions). Features intelligent intent classification, image generation/editing, vision analysis, document processing, user-specific settings with thread-level customization, and an optional channel-teammate mode where the bot participates thoughtfully in channels it's invited to. The architecture is stateless with Slack as the source of truth, rebuilding context from platform history on demand.
 
 ## Recent Changes
 
 For a detailed list of recent changes and improvements, please see the [CHANGELOG.md](CHANGELOG.md) file.
 
-### ⚠️ Important: Timeout Configuration Update
-**Breaking change for streaming responses:** The timeout behavior has been updated to improve reliability. If you previously had `API_TIMEOUT_STREAMING_CHUNK` set to a low value (e.g., 30 seconds), you must increase it to at least 270 seconds to avoid premature stream termination. Check the updated `.env.example` for recommended values and update your `.env` file accordingly. Low timeout values will cause responses to drop mid-stream.
+### ⚠️ Important: Upgrading to v3.0.0
 
-### ⚠️ Important: Image Settings Update (v2.3.4)
-**Breaking change for image generation:** The image model has been updated to `gpt-image-1.5` which uses different quality values. If you have `DEFAULT_IMAGE_QUALITY` set to `hd` or `standard` in your `.env`, you must update it:
-```
-DEFAULT_IMAGE_QUALITY=auto  # Valid values: auto, low, medium, high
-DEFAULT_IMAGE_BACKGROUND=auto  # Valid values: auto, transparent, opaque
-```
-The old `DEFAULT_IMAGE_STYLE` setting has been removed (was DALL-E 3 only). Old quality values will cause API errors.
+v3 is a major release: the **GPT-5.6 model family** (Sol/Terra/Luna) replaces the old
+lineup, the bot can act as a **channel teammate** (off by default — no behavior change
+until you enable it), and **conversation history now lives in Slack, not the database**.
 
-### ⚠️ Important: Upgrading to v2.5.0
-This release introduces three things you need to know about:
+The short version of the upgrade:
+1. `make install` (dependencies)
+2. Update `.env` — three changed values (`GPT_MODEL=gpt-5.6-sol`,
+   `UTILITY_MODEL=gpt-5.6-luna`, `UTILITY_REASONING_EFFORT=none`), a few deletions,
+   and a new optional "Channel participation & UX" section (all sane defaults)
+3. Optionally move MCP API keys from `mcp_config.json` into `.env` (`${VAR}` placeholders)
+4. Rebuild your Slack app manifest from `slack_app_manifest.example.yml` and reinstall
+5. Start the bot — three automatic DB migrations run once, each taking a tagged
+   backup into `data/backups/` first
 
-1. **Image model defaults to `gpt-image-2`** (latest OpenAI image model). Update your `.env`:
-   ```
-   GPT_IMAGE_MODEL=gpt-image-2
-   ```
-   Existing users are auto-migrated to v2 on first startup. Users can pick `gpt-image-1` per-user in `/settings` if needed.
-
-2. **Dependency layout changed to pip-tools**. Install command:
-   ```bash
-   make install   # NEW canonical command (uses --require-hashes against the lockfile)
-   ```
-   `pip install -r requirements.txt` still works but loses hash verification. See [Installing Dependencies](#installing-dependencies) for the new add/upgrade workflow.
-
-3. **`PyPDF2` replaced with `pypdf`** — same `PdfReader` API, transparent migration. If you patched `document_handler.py` locally, the import is now `import pypdf` and the call is `pypdf.PdfReader(...)`.
-
-Database schema changes (new `image_model` column + `settings_completed` backfill) run automatically on startup. Back up `data/slack.db` before deploying.
+The full step-by-step list (including exact `.env` keys, manifest deltas, and the
+migration log lines to watch for) is in the
+[CHANGELOG's Upgrade Instructions](CHANGELOG.md). Upgrading from before v2.5?
+Read the older upgrade callouts in the CHANGELOG history first.
 
 ## Getting Started
 
@@ -45,12 +36,19 @@ Database schema changes (new `image_model` column + `settings_completed` backfil
 - `SQLite 3.35+` for JSON support and WAL mode (usually included with Python)
 
 ### Model Support
-**V2 Architecture**: Uses OpenAI's Responses API exclusively
+**V3 Architecture**: Uses OpenAI's Responses API exclusively
 
-**Supported Models:**
-- **GPT-5.5** (`gpt-5.5`) - Reasoning model with 1.05M context window, 24-hour prompt caching, and web search
+**Supported Models** (all with a 1.05M context window and prompt caching):
+- **GPT-5.6 Sol** (`gpt-5.6-sol`) - Flagship reasoning model, the default
+- **GPT-5.6 Terra** (`gpt-5.6-terra`) - Balanced tier
+- **GPT-5.6 Luna** (`gpt-5.6-luna`) - Fast/light tier; also runs the bot's internal
+  utility functions (intent classification, summaries)
+- **GPT-5.5** (`gpt-5.5`) - Previous flagship, still selectable
 - **Image Generation**: `gpt-image-2`
-- **Utility Model**: `gpt-5-mini` for intent classification and helper functions (not user-selectable)
+
+Users pick their model and reasoning effort in `/chatgpt-settings`, and can override
+both per channel and per thread. The `max` reasoning effort is available on the 5.6
+family; the settings modal adapts the effort list to the selected model.
 
 The setup of a Slack App is out of scope of this README. There's plenty of documentation online detailing these processes.
   
@@ -67,30 +65,25 @@ You can use the included `slack_app_manifest.example.yml` template (copy it to `
 8. Install to your workspace and copy both tokens to your `.env` file:
    - `SLACK_BOT_TOKEN` (starts with `xoxb-`)
    - `SLACK_APP_TOKEN` (starts with `xapp-`)
-#### The Slack event subscriptions and scope are as follows:
+#### Slack events and scopes
 
-| Event Name  	| Description                                                       	| Required Scope    	|
-|-------------	|-------------------------------------------------------------------	|-------------------	|
-| app_mention 	| Subscribe to only the message events that mention your app or bot 	| app_mentions:read 	|
-| message.im  	| A message was posted in a direct message channel                  	| im:history        	|    
-    
-#### Slack Bot Token Scopes:
-| Scope                	| Description | Usage |
-|----------------------	|------------- |-------|
-| app_mentions:read    	| Read messages that mention the bot | Required for @mentions |
-| channels:history     	| View messages in public channels | Required for conversations_history/replies |
-| channels:join        	| Join public channels | Allows bot to be invited to channels |
-| chat:write           	| Send messages as the bot | Required for all message sending |
-| chat:write.customize 	| Send messages with custom username/avatar | Reserved for future use |
-| commands             	| Add and respond to slash commands | Required for /chatgpt-settings |
-| files:read           	| Access files shared in channels | Required for downloading user uploads |
-| files:write          	| Upload and modify files | Required for image generation |
-| groups:history       	| View messages in private channels | Required for private channel history |
-| im:history           	| View direct message history | Required for DM conversations |
-| im:read              	| View direct messages | Required to access DMs |
-| im:write             	| Send direct messages | Required to send DM responses |
-| users:read           	| View people in workspace | Required for user info (display names, timezones) |
-| users:read.email     	| View email addresses | Used for user preferences |
+The manifest template is the authoritative list — it carries everything the bot can
+use. The highlights, grouped by what they power:
+
+| Capability | Events | Scopes |
+|---|---|---|
+| Mentions & DMs (core) | `app_mention`, `message.im` | `app_mentions:read`, `im:history`, `im:read`, `im:write`, `chat:write` |
+| Channel listening (optional, flag-gated) | `message.channels`, `message.groups`, `message.mpim` | `channels:history`, `groups:history`, `mpim:history`, `channels:read`, `groups:read`, `mpim:read` |
+| Reactions (give + observe) | `reaction_added` | `reactions:write`, `reactions:read`, `emoji:read` |
+| Agent/assistant surface | `app_home_opened`, `app_context_changed` (legacy `assistant_thread_*` kept during transition) | `assistant:write` |
+| Workspace search tool | — | `search:read.public`, `search:read.private` (plus `.im`/`.mpim`/`.files`/`.users` if you widen the search surface) |
+| Files, settings, misc | — | `files:read`, `files:write`, `commands`, `users:read`, `users:read.email`, `channels:join`, `chat:write.customize` |
+
+Optional: subscribe `reaction_removed` if you want 👍/👎 reactions un-counted from
+feedback when someone removes one.
+
+Don't want a capability? Drop its scopes/events from your manifest — everything
+channel-teammate-related is also feature-flagged in `.env` and off by default.
 
 #### Slack Slash Commands:
 Configure the following slash command in your Slack app:
@@ -178,24 +171,28 @@ See [.env.example](.env.example) for all available configuration options and det
 
 ### Key Configuration Options
 
-- **Models**: GPT-5.5 is the supported primary model
+- **Models**: GPT-5.6 Sol is the default; Terra, Luna, and GPT-5.5 are selectable
 - **User Settings**: Users can customize their experience via `/chatgpt-settings` command
 - **Thread Settings**: Different settings per conversation thread
+- **Channel participation**: `ENABLE_CHANNEL_LISTENING` (default **off**) is the master
+  switch for teammate behavior; per-channel levels via the ⚙️ Configure button. See the
+  "Channel participation & UX" section of `.env.example` for the full knob list.
 - **Web Search**: Available with all reasoning levels
 - **Streaming**: Real-time response streaming with configurable update intervals
-- **Token Management**: Automatic context window management with configurable buffer
+  (native Slack streaming is built in behind `SLACK_NATIVE_STREAMING`, off by default)
+- **Token Management**: Automatic context management with rolling thread compaction
 - **Logging**: Comprehensive logging with rotation at 10MB, configurable levels per component
 
 #### Token Buffer Configuration
 The bot manages context window usage automatically using a buffer system:
 
 - `TOKEN_BUFFER_PERCENTAGE` - Percentage of model's context limit to use (default: 0.875 = 87.5%)
-  - Applies to the utility model window (gpt-5-mini, 400k); GPT-5.5 uses `GPT54_TOKEN_BUFFER_PERCENTAGE`
+  - Applies to the legacy utility model window (`GPT5_MAX_TOKENS`); the chat models use `GPT54_TOKEN_BUFFER_PERCENTAGE` (name kept for compatibility — it describes the 1.05M window)
   - Lower values (e.g., 0.675 = 67.5%) provide more headroom for system prompts, tools, and reasoning
   - Higher values maximize context retention but may hit limits with complex tool use or reasoning
 
-- `TOKEN_CLEANUP_THRESHOLD` - When to start trimming old messages (default: 0.8 = 80% of buffered limit)
-- `TOKEN_TRIM_MESSAGE_COUNT` - Messages to remove per cleanup (default: 5)
+- `TOKEN_CLEANUP_THRESHOLD` - When to start compacting the thread (default: 0.8 = 80% of buffered limit)
+- `TOKEN_COMPACTION_TARGET` - How far a compaction pass shrinks the thread (default: 0.7 = down to 70% of the limit). Compacted spans roll into a summary that preserves file and image references — nothing is silently dropped.
 
 **Trade-offs:**
 - **Higher buffer** (0.875): More conversation history retained, better context continuity
@@ -209,9 +206,19 @@ The bot manages context window usage automatically using a buffer system:
 - **Intelligent Intent Classification**: Automatically determines whether to generate images, analyze uploads, or provide text responses
 - **Image Generation & Editing**: Create and modify images with natural language
 - **Vision Analysis**: Analyze uploaded images and compare multiple images
-- **Document Processing**: Extract and analyze text from PDFs, Office files, and code
+- **Document Processing**: Uploads become concise summaries in the conversation; the bot re-reads the original from Slack on demand when asked for specifics. Document content is never stored and never touches disk — delete a file in Slack and it's genuinely gone from the bot's reach.
 - **Web Search**: Current information retrieval
 - **Streaming Responses**: Real-time message updates as responses generate
+- **On-Demand Context**: The bot can fetch older history and search the workspace (permission-scoped) when a conversation references something it can't see
+
+#### Channel Teammate (optional, off by default)
+Flip `ENABLE_CHANNEL_LISTENING=true` and the bot behaves like a thoughtful colleague
+in channels it's invited to:
+- **Knows when to speak**: responds when it can genuinely help, reacts with an emoji when words would be noise, and stays out of human-to-human conversation — with a hard hourly cap on unprompted replies
+- **Takes feedback**: "quiet down" earns a 🤐 and a 4-hour snooze (mentions still work); standing preferences like "stay out unless tagged" are remembered durably
+- **Per-channel control for everyone**: any member can set the participation level (off / mentions-only / judicious / active), channel directives, and reply placement via the ⚙️ Configure button under bot responses
+- **Per-channel memory**: durable facts (decisions, conventions, preferences) remembered and recalled in later conversations — managed by the bot's own judgment, viewable and correctable
+- **No busy rejections**: messages that arrive mid-response are queued and answered together in one catch-up reply
 
 #### User Experience
 - **Settings Modal**: Interactive configuration UI with `/chatgpt-settings`
@@ -219,6 +226,7 @@ The bot manages context window usage automatically using a buffer system:
 - **Thread-Specific Settings**: Different configurations per conversation via message shortcuts
 - **Custom Instructions**: Personalized response styles per user
 - **Multi-User Context**: Maintains separate contexts in shared conversations
+- **Feedback Buttons**: 👍/👎 under DM responses (and thumbs reactions on any bot message count too) — recorded locally for tuning
 - **Persistent Settings**: User preferences saved to SQLite database
 - **Smart Message Routing**: Ephemeral messages and DMs for settings, keeping channels clean
 
@@ -239,8 +247,8 @@ Model Context Protocol is a standardized way to connect AI applications to exter
 
 #### Requirements
 
-- **GPT-5 Model**: MCP tools require a GPT-5 series model (GPT-5.5)
 - **HTTP/SSE Transport**: Bot uses OpenAI's native MCP support (stdio not supported)
+- All supported chat models can use MCP tools
 
 #### Setup
 
@@ -297,7 +305,6 @@ The bot loads your configured MCP servers on startup, runs a background reachabi
 Users can enable/disable MCP access via the settings modal:
 1. Type `/chatgpt-settings` in Slack
 2. Check/uncheck "MCP Servers" in the Features section
-3. Note: MCP requires a GPT-5 series model (GPT-5.5)
 
 #### Finding MCP Servers
 
@@ -316,9 +323,9 @@ Users can enable/disable MCP access via the settings modal:
 
 **Bot not using MCP tools:**
 - Verify `mcp_config.json` exists and is valid JSON
-- Check bot logs for MCP initialization errors
+- Check bot logs for MCP initialization errors and the startup health-probe lines
 - Ensure user has MCP enabled in settings
-- Confirm model is GPT-5.5
+- If a server was skipped at load, the log names the unresolved `${VAR}` — add it to `.env`
 
 **MCP server connection errors:**
 - Check `server_url` is correct and accessible
