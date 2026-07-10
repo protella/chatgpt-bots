@@ -74,13 +74,21 @@ class BaseClient(ABC, LoggerMixin):
         pass
     
     @abstractmethod
-    def send_message(self, channel_id: str, thread_id: str, text: str) -> bool:
-        """Send a text message"""
+    def send_message(self, channel_id: str, thread_id: str, text: str,
+                     blocks: Optional[list] = None) -> Optional[str]:
+        """Send a text message. Returns the posted message ts (truthy on success) or None
+        on failure.
+
+        `blocks`: optional platform chrome (e.g. a settings-footer actions row) to attach
+        to the message itself; implementations that don't support blocks may ignore the
+        kwarg (it always defaults to None, so callers passing blocks=None never break a
+        non-Slack impl)."""
         pass
 
     @abstractmethod
-    async def send_message_async(self, channel_id: str, thread_id: str, text: str) -> bool:
-        """Send a text message (async version)"""
+    async def send_message_async(self, channel_id: str, thread_id: str, text: str,
+                                 blocks: Optional[list] = None) -> Optional[str]:
+        """Send a text message (async version). See send_message for the blocks contract."""
         pass
 
     @abstractmethod

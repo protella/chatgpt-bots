@@ -135,10 +135,19 @@ class ChatBotV2:
                 # later main-model turn on this message honestly sees the slot consumed
                 # (and won't double-add the same emoji). Falls back to the raw react.
                 try:
+                    # Bound the gate's own react by the configured tool-call timeout so a
+                    # wedged Slack call can't stall the turn (the model-invoked react tool
+                    # is already timeout-guarded by the tool loop; this direct path wasn't).
                     if hasattr(client, "_reserve_and_react"):
-                        await client._reserve_and_react(channel_id, react_ts, verdict.emoji)
+                        await asyncio.wait_for(
+                            client._reserve_and_react(channel_id, react_ts, verdict.emoji),
+                            timeout=config.tool_call_timeout)
                     elif hasattr(client, "react"):
-                        await client.react(channel_id, react_ts, verdict.emoji)
+                        await asyncio.wait_for(
+                            client.react(channel_id, react_ts, verdict.emoji),
+                            timeout=config.tool_call_timeout)
+                except asyncio.TimeoutError:
+                    main_logger.debug("Participation react timed out")
                 except Exception as e:
                     main_logger.debug(f"Participation react failed: {e}")
                 return None
@@ -308,18 +317,22 @@ class ChatBotV2:
                             except Exception as e:
                                 main_logger.debug(f"Footer block build failed: {e}")
                                 footer_blocks = None
+                        send_meta = {}
                         sent_ts = await client.send_message(
                             message.channel_id,
                             post_thread_id,
                             formatted_text,
                             blocks=footer_blocks,
+                            meta_out=send_meta,
                         )
                         # Honest accounting: the ACTUAL send result decides `posted` (a
                         # failed send must not burn the hourly unprompted quota).
                         if isinstance(response.metadata, dict):
                             response.metadata["posted"] = bool(sent_ts)
-                            # Chrome rode the message — tell the separate footer to stand down.
-                            if footer_blocks and sent_ts:
+                            # Only stand the separate footer down when the chrome ACTUALLY
+                            # rode the message (a split/too-long reply doesn't attach it, so
+                            # the separate footer post must still happen).
+                            if sent_ts and send_meta.get("footer_attached"):
                                 response.metadata["footer_attached"] = True
                         # F7: persist tool-use provenance keyed on the reply's real ts.
                         if sent_ts:

@@ -1519,14 +1519,14 @@ class DatabaseManager(LoggerMixin):
         """Delete tool-use provenance rows older than `days` (F7 retention sweep).
 
         The ON DELETE CASCADE path is dead (PRAGMA foreign_keys is never enabled), so
-        message_tool_usage gets this explicit age sweep instead — modeled on
-        delete_old_documents and wired into the scheduled cleanup worker."""
-        cutoff = datetime.now() - timedelta(days=days)
-
+        message_tool_usage gets this explicit age sweep instead, wired into the scheduled
+        cleanup worker. created_at defaults to CURRENT_TIMESTAMP (UTC), so the cutoff is
+        computed in SQL with datetime('now', …) — a Python datetime.now() cutoff would be
+        LOCAL time and skew the retention window on non-UTC hosts."""
         cursor = self.conn.execute("""
             DELETE FROM message_tool_usage
-            WHERE created_at < ?
-        """, (cutoff,))
+            WHERE created_at < datetime('now', ?)
+        """, (f"-{int(days)} days",))
 
         if cursor.rowcount > 0:
             self.log_info(f"DB: Cleaned up {cursor.rowcount} tool-usage rows older than {days} days")
@@ -2156,16 +2156,58 @@ class DatabaseManager(LoggerMixin):
             self.log_error(f"DB: Failed to save image metadata async - {e}", exc_info=True)
             raise
 
+    @staticmethod
+    def _merge_tool_provenance(existing: List[Dict], new: List[Dict]) -> List[Dict]:
+        """Union two provenance lists by tool_name (existing first, then new tools).
+
+        Preserves existing entries and upgrades an empty gist to a later non-empty one; a
+        re-persist for the same reply thus only ever ACCUMULATES tools, never drops them.
+        Capped at 8 entries (MAX_PROVENANCE_ENTRIES)."""
+        merged: List[Dict] = []
+        by_name: Dict[str, Dict] = {}
+        for entry in list(existing or []) + list(new or []):
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("tool_name")
+            if not name:
+                continue
+            gist = entry.get("gist") or ""
+            if name in by_name:
+                cur = by_name[name]
+                if not (cur.get("gist") or "").strip() and gist.strip():
+                    cur["gist"] = gist  # upgrade empty -> non-empty
+            else:
+                e = {"tool_name": name, "gist": gist}
+                by_name[name] = e
+                merged.append(e)
+        return merged[:8]
+
     async def save_tool_usage_async(self, channel_id: str, message_ts: str,
                                     thread_key: str, tools: List[Dict]) -> None:
         """Persist a reply's tool-use provenance (F7), keyed by channel+ts.
 
         `tools` is the compact [{"tool_name","gist"}] record (names + arg gists only).
-        Idempotent on (channel_id, message_ts): a re-persist overwrites. Best-effort —
-        the caller wraps this so a DB failure never blocks the reply."""
+        Idempotent on (channel_id, message_ts): a re-persist MERGES with the existing row
+        (union by tool_name, preferring a non-empty gist) rather than last-write-wins, so a
+        second pass can't drop tools recorded by the first. Best-effort — the caller wraps
+        this so a DB failure never blocks the reply."""
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute("PRAGMA journal_mode=WAL")
+                existing: List[Dict] = []
+                async with db.execute(
+                    "SELECT tools_json FROM message_tool_usage WHERE channel_id = ? AND message_ts = ?",
+                    (channel_id, message_ts)
+                ) as cur:
+                    row = await cur.fetchone()
+                if row and row[0]:
+                    try:
+                        parsed = json.loads(row[0])
+                        if isinstance(parsed, list):
+                            existing = parsed
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        existing = []
+                merged = self._merge_tool_provenance(existing, tools)
                 await db.execute("""
                     INSERT INTO message_tool_usage
                         (channel_id, message_ts, thread_key, tools_json)
@@ -2173,7 +2215,7 @@ class DatabaseManager(LoggerMixin):
                     ON CONFLICT(channel_id, message_ts) DO UPDATE SET
                         thread_key = excluded.thread_key,
                         tools_json = excluded.tools_json
-                """, (channel_id, message_ts, thread_key, json.dumps(tools)))
+                """, (channel_id, message_ts, thread_key, json.dumps(merged)))
                 await db.commit()
         except Exception as e:
             self.log_debug(f"DB: save_tool_usage_async failed (non-fatal): {e}")

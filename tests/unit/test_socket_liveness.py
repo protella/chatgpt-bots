@@ -47,6 +47,36 @@ def test_attach_gracefully_handles_missing_seam():
     assert m.attach() is False
 
 
+def test_attach_skips_when_disabled():
+    # A disabled monitor (timeout 0) must NOT install a listener at all.
+    client = SimpleNamespace(message_listeners=[], last_ping_pong_time=time.time())
+    m, _ = _monitor(client, timeout=0)
+    assert m.attach() is False
+    assert client.message_listeners == []
+
+
+def test_stop_detaches_listener():
+    import asyncio
+    client = SimpleNamespace(message_listeners=[], last_ping_pong_time=time.time())
+    m, _ = _monitor(client)
+    assert m.attach() is True
+    assert len(client.message_listeners) == 1
+    asyncio.run(m.stop())
+    assert client.message_listeners == []       # listener removed
+    assert m._listeners is None
+
+
+def test_record_event_recovery_log_never_raises():
+    # Logging from the envelope path must never raise into the socket client.
+    client = SimpleNamespace(message_listeners=[], last_ping_pong_time=time.time())
+    boom = MagicMock(side_effect=RuntimeError("log sink down"))
+    m = SocketLivenessMonitor(client, timeout=600, log_info=boom,
+                              log_warning=MagicMock(), log_error=MagicMock())
+    m._episode = "warning"  # pretend a drought is active so recovery tries to log
+    m.record_event()        # must not raise despite the failing logger
+    assert m._episode is None
+
+
 # --------------------------------------------------------------- check logic
 
 def test_healthy_when_events_fresh():
