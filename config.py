@@ -302,6 +302,11 @@ class BotConfig:
     # message instead of a single replaced status line + rotating "still working"
     # strings. Off → today's single-line _update_status/rotator behavior.
     enable_progress_checklist: bool = field(default_factory=lambda: os.getenv("ENABLE_PROGRESS_CHECKLIST", "true").lower() == "true")
+    # Image-pipeline checklists post a real visible thread message even where Slack's
+    # assistant-status surface is available (dual display: persistent checklist message +
+    # live composer status). Off → status-only surfaces degrade to the composer status line
+    # alone (the pre-2026-07 behavior). Only meaningful when enable_progress_checklist is on.
+    progress_checklist_prefer_message: bool = field(default_factory=lambda: os.getenv("PROGRESS_CHECKLIST_PREFER_MESSAGE", "true").lower() == "true")
     # --- Wake envelope (F3) ---
     # Compact "[Wake context]" block in the volatile developer suffix telling the model
     # WHY it woke (trigger reason, sender role, bot-vs-human). Text-handler turns only;
