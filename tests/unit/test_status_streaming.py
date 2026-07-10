@@ -86,14 +86,12 @@ async def test_set_assistant_status_success(monkeypatch):
     assert await host.set_assistant_status("C1", "T1") is True
     _, kwargs = client.assistant_threads_setStatus.call_args
     assert kwargs["channel_id"] == "C1" and kwargs["thread_ts"] == "T1"
-    # Composer line retired: status goes out empty, the bubble carries a random
-    # sample (max 5) from the configured pool, sanitized for the plain-text surface.
+    # One random pool message rides in BOTH fields (a non-empty status is what
+    # renders; "" is the clear signal), sanitized for the plain-text surface.
     from slack_client.messaging import _status_plain_text
-    assert kwargs["status"] == ""
     pool = {_status_plain_text(m) for m in config.get_loading_messages()}
-    sent = kwargs["loading_messages"]
-    assert 1 <= len(sent) <= 5 and len(set(sent)) == len(sent)
-    assert set(sent) <= pool
+    assert kwargs["status"] in pool
+    assert kwargs["loading_messages"] == [kwargs["status"]]
 
 
 @pytest.mark.asyncio
