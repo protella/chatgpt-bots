@@ -37,8 +37,10 @@ whole new "Channel participation & UX" section at the bottom):
 - `ENABLE_CHANNEL_LISTENING=false` — the master switch for teammate behavior in channels.
   **Off by default: the bot behaves exactly as before (mentions + DMs) until you flip it.**
 - `BOT_NAME_ALIASES=ChatGPT` — set per environment (e.g. `ChatGPT-Dev` for a dev bot)
-- `STATUS_LOADING_MESSAGES` — optional branded loading messages; set your workspace's
-  custom emoji names (unset = safe standard-emoji default)
+- `STATUS_LOADING_MESSAGES_FILE` — optional branded "working…" messages for the
+  thread status indicator: point it at your own text file, one message per line,
+  plain text (no emoji — the status surface doesn't render them). Unset = a bundled
+  set of 100 generic ones (`status_messages/loading_messages.generic.txt`).
 - `SLACK_NATIVE_STREAMING=false` — native streaming is built and tested but ships off;
   validate live in your workspace before enabling
 - `ENABLE_FEEDBACK_BUTTONS=true` — 👍/👎 under DM/assistant responses
@@ -176,6 +178,21 @@ DMs behave as before.
   fallback
 - The status indicator only appears once the bot has actually decided to respond
   (the new surface auto-opens threads on status, so no more speculative indicators)
+- **One clean "working" indicator**: progress renders as Slack's single in-thread
+  status bubble (the animated agent name) — no placeholder messages to edit/delete,
+  no duplicate status line under the composer
+- **Loading messages with personality**: while thinking, the bubble rotates through
+  a random sample from a 100-message pool (bundled generic set included; brand it
+  with `STATUS_LOADING_MESSAGES_FILE` — one message per line, plain text). Inline
+  `STATUS_LOADING_MESSAGES` still works for short custom lists and wins when set.
+- **Pipeline stage updates get variety too**: each stage (generating a response,
+  creating/editing an image, reading a document, …) picks a random phrasing from
+  `status_messages/pipeline_messages.txt` (`[stage]` sections; override the path
+  with `PIPELINE_MESSAGES_FILE`). Missing files or stages fall back to the built-in
+  texts — a broken file can never break the bot.
+- **Quieter DM surface**: the greeting only posts in genuinely empty conversations,
+  the feedback strip (👍/👎 + settings button) appears once per thread instead of
+  under every reply, and the old "Quick Settings Access" notice is retired
 
 ### 🔌 Improvement - MCP hardening
 

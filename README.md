@@ -180,6 +180,9 @@ See [.env.example](.env.example) for all available configuration options and det
 - **Web Search**: Available with all reasoning levels
 - **Streaming**: Real-time response streaming with configurable update intervals
   (native Slack streaming is built in behind `SLACK_NATIVE_STREAMING`, off by default)
+- **Status messages**: while the bot works, the thread status bubble rotates through
+  loading messages and per-stage progress texts — both customizable, see
+  "Customizing status messages" below
 - **Token Management**: Automatic context management with rolling thread compaction
 - **Logging**: Comprehensive logging with rotation at 10MB, configurable levels per component
 
@@ -199,6 +202,27 @@ The bot manages context window usage automatically using a buffer system:
 - **Lower buffer** (0.675): More reliable with MCP tools, web search, and high reasoning efforts
 
 **Recommendation:** Start with 0.875 and lower if you experience token limit errors with tools enabled.
+
+#### Customizing status messages
+While working, the bot shows Slack's native status bubble in the thread and rotates
+through short "working…" messages. Everything is plain text (the status surface
+doesn't render emoji or `:shortcodes:`) and safe to customize:
+
+- **Loading messages** (shown while thinking): a bundled pool of 100 generic ones ships
+  in `status_messages/loading_messages.generic.txt`. To brand them, copy that file,
+  rewrite the lines (one message per line, `#` comments allowed), and point
+  `STATUS_LOADING_MESSAGES_FILE` in `.env` at your copy. Keep company-specific files
+  out of git if your repo is shared — add them to `.gitignore` like `.env`.
+  For a short list without a file, set `STATUS_LOADING_MESSAGES=msg one…,msg two…`
+  inline instead (it takes precedence over the file).
+- **Pipeline stage messages** (shown during specific steps like generating an image or
+  reading a document): `status_messages/pipeline_messages.txt` holds several phrasings
+  per `[stage]` section and the bot picks one at random each time. Edit in place or
+  point `PIPELINE_MESSAGES_FILE` at your own copy. `{file_name}`/`{count}` placeholders
+  are filled in automatically where a stage uses them.
+
+Misconfigured or missing files never break anything — the bot falls back to its
+built-in texts.
 
 ### Features
 
@@ -226,7 +250,8 @@ in channels it's invited to:
 - **Thread-Specific Settings**: Different configurations per conversation via message shortcuts
 - **Custom Instructions**: Personalized response styles per user
 - **Multi-User Context**: Maintains separate contexts in shared conversations
-- **Feedback Buttons**: 👍/👎 under DM responses (and thumbs reactions on any bot message count too) — recorded locally for tuning
+- **Feedback Buttons**: 👍/👎 under DM responses (once per thread; thumbs reactions on any bot message count too) — recorded locally for tuning
+- **Personable Progress**: a single native status bubble with rotating, customizable loading messages and varied per-stage progress texts (see "Customizing status messages")
 - **Persistent Settings**: User preferences saved to SQLite database
 - **Smart Message Routing**: Ephemeral messages and DMs for settings, keeping channels clean
 
