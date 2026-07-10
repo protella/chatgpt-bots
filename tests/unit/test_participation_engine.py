@@ -302,6 +302,30 @@ class TestPlacement:
         client.maybe_post_response_footer.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_engine_thread_verdict_overrides_reply_in_channel(self):
+        # reply_in_channel is an ALLOWANCE: when the engine judges the answer is
+        # worth a thread, the reply threads even with the setting on.
+        app, client = self._app_with_processor(self._resp())
+        app.participation_engine = MagicMock()
+        verdict = ParticipationVerdict(action="respond", emoji="", placement="thread", reason="long answer")
+        app._run_participation_gate = AsyncMock(return_value=verdict)
+        msg = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
+                      metadata={"ts": "10.0", "reply_in_channel": True, "participation_check": True})
+        await app.handle_message(msg, client)
+        assert client.send_message.await_args.args[1] == "10.0"  # threaded
+
+    @pytest.mark.asyncio
+    async def test_engine_channel_verdict_honored_with_setting_on(self):
+        app, client = self._app_with_processor(self._resp())
+        app.participation_engine = MagicMock()
+        verdict = ParticipationVerdict(action="respond", emoji="", placement="channel", reason="quick answer")
+        app._run_participation_gate = AsyncMock(return_value=verdict)
+        msg = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
+                      metadata={"ts": "10.0", "reply_in_channel": True, "participation_check": True})
+        await app.handle_message(msg, client)
+        assert client.send_message.await_args.args[1] is None  # top-level
+
+    @pytest.mark.asyncio
     async def test_thread_reply_never_moves_top_level_despite_setting(self):
         app, client = self._app_with_processor(self._resp())
         msg = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",

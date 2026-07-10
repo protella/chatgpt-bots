@@ -287,6 +287,43 @@ class SlackSettingsHandlersMixin:
             except Exception as e:
                 self.log_error(f"Error saving channel settings for {channel_id}: {e}")
 
+        @self.app.action("channel_model")
+        async def handle_channel_model_change(ack, body, client):
+            """Rebuild the channel modal when the model changes so the effort ladder
+            matches the selected model (gpt-5.5 has no `max`). Live form selections
+            are overlaid on the DB row so nothing the user set is lost."""
+            await ack()
+            view = body.get('view') or {}
+            metadata = json.loads(view.get('private_metadata', '{}'))
+            channel_id = metadata.get('channel_id')
+            if not channel_id:
+                return
+            try:
+                state = view.get('state', {}).get('values', {})
+
+                def _sel(block, action):
+                    opt = state.get(block, {}).get(action, {}).get('selected_option') or {}
+                    val = opt.get('value', 'inherit')
+                    return None if val == 'inherit' else val
+
+                row = await self.db.get_channel_settings_async(channel_id) or {}
+                cs = dict(row)
+                cs['model'] = _sel('channel_model_block', 'channel_model')
+                cs['reasoning_effort'] = _sel('channel_effort_block', 'channel_reasoning_effort')
+                cs['verbosity'] = _sel('channel_verbosity_block', 'channel_verbosity')
+                cs['participation_level'] = _sel('participation_block', 'participation_level')
+                dir_raw = state.get('directives_block', {}).get('directives', {}).get('value')
+                cs['directives'] = dir_raw if dir_raw else cs.get('directives')
+                ric = state.get('reply_in_channel_block', {}).get('reply_in_channel', {}).get('selected_options') or []
+                cs['reply_in_channel'] = len(ric) > 0
+
+                global_default = getattr(config, 'channel_response_mode', 'tag_only')
+                modal = self.settings_modal.build_channel_settings_modal(channel_id, cs, global_default)
+                await client.views_update(view_id=view.get('id'), view=modal)
+                self.log_debug(f"Channel modal rebuilt for model change in {channel_id}")
+            except Exception as e:
+                self.log_error(f"Error rebuilding channel modal on model change: {e}")
+
         # Register modal submission handlers
         @self.app.view("settings_modal")
         @self.app.view("welcome_settings_modal")

@@ -47,8 +47,14 @@ class TestChannelSettingsModal:
         assert json.loads(view["private_metadata"])["channel_id"] == "C1"
         assert self._block(view, "participation_block")["element"]["initial_option"]["value"] == "inherit"
         assert self._block(view, "directives_block")["element"]["initial_value"] == ""
-        # reply-in-channel unchecked → no initial_options
-        assert "initial_options" not in self._block(view, "reply_in_channel_block")["element"]
+        # No saved row → checkbox mirrors the global default (REPLY_IN_CHANNEL_DEFAULT,
+        # default true: top-level replies allowed, engine judges placement per message)
+        element = self._block(view, "reply_in_channel_block")["element"]
+        from config import config as _cfg
+        if _cfg.reply_in_channel_default:
+            assert element.get("initial_options")
+        else:
+            assert "initial_options" not in element
 
     def test_prefill_from_row(self, modal):
         # Legacy row (response_mode only) maps to its participation-level equivalent.
