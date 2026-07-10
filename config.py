@@ -320,6 +320,13 @@ class BotConfig:
                 return list(msgs)
         return self.status_loading_messages
 
+    def random_loading_message(self) -> str:
+        """One random pick from the loading pool (fallback text if the pool is empty).
+        Placeholder messages use this so every waiting surface draws from the same
+        variance pool as the native status."""
+        msgs = self.get_loading_messages()
+        return random.choice(msgs) if msgs else self.status_loading_fallback
+
     # --- Assistant surface (agent split-view) adapter ---
     # Greets the user + sets suggested prompts when they open the split view, and titles
     # assistant threads from the first message. Additive/best-effort; messages themselves
