@@ -113,6 +113,7 @@ class VisionHandlerMixin:
         # Extract base64 data from image inputs and track URL images
         images_to_analyze = []
         url_images = []  # Track URL-sourced images
+        footer_attached = False  # set by the native-stream finalize when chrome rides the message
         
         for img_input in image_inputs:
             if img_input.get("type") == "input_image":
@@ -268,7 +269,7 @@ class VisionHandlerMixin:
                 first_chunk_received = False
 
                 async def stream_callback(chunk: str):
-                    nonlocal current_message_id, current_part, progress_task, first_chunk_received, streaming_aborted
+                    nonlocal current_message_id, current_part, progress_task, first_chunk_received, streaming_aborted, footer_attached
 
                     # If we've aborted, ignore further chunks
                     if streaming_aborted:
@@ -292,7 +293,18 @@ class VisionHandlerMixin:
                             # Completion: append the tail and stop the stream; legacy
                             # edit on the native ts if the stop itself fails.
                             if native_coord.started:
-                                finalized = await native_coord.finalize(buffer.get_complete_text())
+                                # Settings chrome rides the last part (same rule as the
+                                # text handler): never on top-level place-in-channel
+                                # replies; helper returns None when the footer is off.
+                                footer_blocks = None
+                                if (native_coord.thread_ts is not None
+                                        and hasattr(client, "attachable_footer_blocks")):
+                                    footer_blocks = client.attachable_footer_blocks(
+                                        channel_id, thread_config.get("model"))
+                                finalized = await native_coord.finalize(
+                                    buffer.get_complete_text(), blocks=footer_blocks)
+                                if finalized and footer_blocks:
+                                    footer_attached = True
                                 current_message_id = native_coord.current_ts or current_message_id
                                 current_part = native_coord.part
                                 if not finalized and current_message_id:
@@ -674,7 +686,9 @@ class VisionHandlerMixin:
         if (hasattr(client, 'supports_streaming') and client.supports_streaming() and
             streaming_enabled and (thinking_id is not None or native_capable)):
             response_metadata["streamed"] = True
-        
+        if footer_attached:
+            response_metadata["footer_attached"] = True  # chrome rode the message; no separate footer
+
         return Response(
             type="text",
             content=analysis_result,
