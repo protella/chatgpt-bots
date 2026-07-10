@@ -74,12 +74,29 @@ async def test_channel_always_posts_placeholder(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_channel_even_with_status_success_posts_placeholder(monkeypatch):
-    """Belt-and-braces: if setStatus somehow succeeds outside a DM, the channel
-    still gets its visible message indicator."""
+async def test_channel_with_status_success_is_status_only(monkeypatch):
+    """The June-2026 agent surface renders the composer status in CHANNEL threads
+    too (verified live 2026-07-09) — wherever setStatus succeeds, it is the sole
+    indicator; no placeholder message."""
     monkeypatch.setattr(config, "enable_assistant_status", True)
     client = SimpleNamespace(
         assistant_threads_setStatus=AsyncMock(),
+        chat_postMessage=AsyncMock(return_value={"ts": "3.3"}),
+    )
+    host = _MsgClient(client)
+    ts = await host.send_thinking_indicator("C123", "T1")
+    assert ts is None
+    client.chat_postMessage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_channel_with_status_failure_posts_placeholder(monkeypatch):
+    """Non-agent contexts where setStatus fails keep the visible message indicator."""
+    monkeypatch.setattr(config, "enable_assistant_status", True)
+    from slack_sdk.errors import SlackApiError
+    err = SlackApiError("nope", response={"error": "not_allowed"})
+    client = SimpleNamespace(
+        assistant_threads_setStatus=AsyncMock(side_effect=err),
         chat_postMessage=AsyncMock(return_value={"ts": "3.3"}),
     )
     host = _MsgClient(client)
@@ -130,14 +147,16 @@ def test_update_status_none_ts_dm_routes_to_set_assistant_status():
     assert len(host.scheduled) == 1
 
 
-def test_update_status_none_ts_channel_is_noop():
+def test_update_status_none_ts_channel_routes_to_status():
+    # A None ts means the turn is status-only — which can now be a channel
+    # thread on the agent surface, not just a DM. Phase updates follow setStatus.
     host = _ProcHost()
     client = MagicMock()
     client.set_assistant_status = MagicMock(side_effect=lambda *a, **k: _dummy_coro())
     host._update_status(client, "C1", None, "Understanding your request...",
                         thread_id="T1")
-    client.set_assistant_status.assert_not_called()
-    assert host.scheduled == []
+    client.set_assistant_status.assert_called_once()
+    assert len(host.scheduled) == 1
 
 
 def test_update_status_none_ts_without_thread_id_is_noop():

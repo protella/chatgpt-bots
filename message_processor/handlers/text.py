@@ -497,10 +497,12 @@ class TextHandlerMixin:
         
         async def stream_status_update(status_msg: str) -> dict:
             """Tool/phase status during streaming: edit the placeholder when one
-            exists; on status-only DMs (no placeholder) route to the native
+            exists; on status-only turns (no placeholder — setStatus is the visible
+            cue, DMs and agent-surface channel threads alike) route to the native
             composer status instead of editing a message."""
             if message_id:
-                return await stream_status_update(status_msg)
+                # Original pre-status-only path: rate-limited streaming edit.
+                return await client.update_message_streaming(message.channel_id, message_id, status_msg)
             if hasattr(client, "set_assistant_status"):
                 try:
                     await client.set_assistant_status(message.channel_id, message.thread_id, status=status_msg)
