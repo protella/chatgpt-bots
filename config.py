@@ -217,8 +217,11 @@ class BotConfig:
     # it no-ops gracefully in plain channels (where the visible progress comes from streaming text).
     enable_assistant_status: bool = field(default_factory=lambda: os.getenv("ENABLE_ASSISTANT_STATUS", "true").lower() == "true")
     # Rotating loading messages shown by setStatus (comma-separated env; safe standard-emoji default).
-    # >>> To brand these, set STATUS_LOADING_MESSAGES in .env with REAL Datassential custom-emoji
-    # >>> names, e.g.  STATUS_LOADING_MESSAGES=:datassential: crunching the data…,:datassential: digging in…
+    # >>> To brand these, set STATUS_LOADING_MESSAGES in .env. NOTE: the assistant
+    # >>> composer-status surface renders PLAIN TEXT — :shortcodes: are converted to
+    # >>> Unicode where possible and stripped otherwise (workspace custom emoji like
+    # >>> :datassential: have no Unicode form and will NOT render there; they still
+    # >>> render in posted channel status messages).
     status_loading_messages: list = field(default_factory=lambda: _env_list("STATUS_LOADING_MESSAGES", [
         ":mag: crunching the data…",
         ":bar_chart: digging through the menu…",

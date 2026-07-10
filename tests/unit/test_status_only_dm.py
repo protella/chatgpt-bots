@@ -263,3 +263,32 @@ def test_image_handlers_guard_status_message_id():
                 assert "if generating_id" in window or "if editing_id" in window, (
                     f"{mod.__name__}: status_message_id stored without a None guard"
                 )
+
+
+# --------------------------------------------------------------------------- status text sanitization
+class TestStatusPlainText:
+    def test_known_shortcodes_become_unicode(self):
+        from slack_client.messaging import _status_plain_text
+        assert _status_plain_text(":hourglass_flowing_sand: working on it…") == "⏳ working on it…"
+        assert _status_plain_text(":mag: crunching the data…") == "🔍 crunching the data…"
+
+    def test_unknown_and_custom_shortcodes_are_stripped(self):
+        from slack_client.messaging import _status_plain_text
+        # Workspace custom emoji have no Unicode form — strip, don't show ":datassential:" literally.
+        assert _status_plain_text(":datassential: digging in…") == "digging in…"
+
+    def test_all_shortcode_string_falls_back(self):
+        from slack_client.messaging import _status_plain_text
+        assert _status_plain_text(":datassential:") == "working on it…"
+        assert _status_plain_text("") == "working on it…"
+
+    @pytest.mark.asyncio
+    async def test_set_assistant_status_sends_sanitized_text(self, monkeypatch):
+        from config import config
+        monkeypatch.setattr(config, "enable_assistant_status", True)
+        monkeypatch.setattr(config, "status_loading_messages", [":mag: one…", ":datassential: two…"])
+        host = _MsgClient(SimpleNamespace(assistant_threads_setStatus=AsyncMock()))
+        await host.set_assistant_status("D1", "1.0", status=":hourglass_flowing_sand: pulling it together…")
+        kwargs = host.app.client.assistant_threads_setStatus.await_args.kwargs
+        assert kwargs["status"] == "⏳ pulling it together…"
+        assert kwargs["loading_messages"] == ["🔍 one…", "two…"]
