@@ -264,24 +264,6 @@ class ChatBotV2:
             elif thinking_id and not response:
                 await client.delete_message(message.channel_id, thinking_id)
 
-            # Phase E/F: participation stats — count replies the bot volunteered
-            # (wake-gate 'respond' verdicts) so the engine can self-throttle later.
-            # Image/background turns are NOT counted here — the delivery seam
-            # (publish_image) accounts on the real posted image (F1).
-            if (response and message.channel_id and not message.channel_id.startswith("D")
-                    and getattr(client, "channel_pulse", None) is not None):
-                posted = (response.type == "text"
-                          and (response.metadata.get("streamed")
-                               or (response.content or "").strip()))
-                if posted:
-                    try:
-                        client.channel_pulse.record_bot_reply(
-                            message.channel_id, message.metadata.get("ts"),
-                            unprompted=message.metadata.get("participation_check") is True,
-                        )
-                    except Exception as e:
-                        main_logger.debug(f"participation stat record failed: {e}")
-
             # Handle the response
             if response:
                 if response.type == "queued":
@@ -310,7 +292,10 @@ class ChatBotV2:
                     # Best-effort: a cosmetic footer must never break message handling.
                     # Skipped for top-level placement — it would land as ANOTHER top-level
                     # message and read as spam.
-                    if hasattr(client, "maybe_post_response_footer") and not place_in_channel:
+                    # No footer under an empty turn (F2 no_reply / reaction-only) — there is
+                    # no message for it to sit under.
+                    if (hasattr(client, "maybe_post_response_footer") and not place_in_channel
+                            and (response.content or "").strip()):
                         try:
                             await client.maybe_post_response_footer(message, response)
                         except Exception as e:
@@ -396,6 +381,40 @@ class ChatBotV2:
                         message.thread_id,
                         response.content
                     )
+
+            # Phase E/F participation stats (F2: accounted AFTER delivery, honest posted).
+            # Count a reply only when visible content actually went out on an unprompted
+            # (wake-gate) channel turn. Image/background turns account in publish_image.
+            if (response and message.channel_id and not message.channel_id.startswith("D")
+                    and getattr(client, "channel_pulse", None) is not None):
+                terminal = (response.metadata or {}).get("terminal_action")
+                if terminal == "no_reply":
+                    main_logger.info(
+                        f"no_response_needed — no reply posted "
+                        f"(reason: {response.metadata.get('reason')!r})")
+                else:
+                    posted = response.metadata.get("posted")
+                    if posted is None:
+                        # Non-streaming handlers can't know; derive from the outcome.
+                        posted = bool(
+                            response.type == "text"
+                            and (response.metadata.get("streamed")
+                                 or (response.content or "").strip()))
+                    if posted:
+                        try:
+                            client.channel_pulse.record_bot_reply(
+                                message.channel_id, message.metadata.get("ts"),
+                                unprompted=message.metadata.get("participation_check") is True,
+                            )
+                        except Exception as e:
+                            main_logger.debug(f"participation stat record failed: {e}")
+                    elif (response.type == "text"
+                          and not (response.content or "").strip()
+                          and not response.metadata.get("reaction_only")):
+                        # Bare empty text without the terminal tool: contract violation.
+                        # Fail-safe silence, no quota burn, no re-prompt this phase.
+                        main_logger.warning(
+                            "Empty text response without a terminal action — posting nothing")
 
         except Exception as e:
             main_logger.error(f"Error handling message: {e}", exc_info=True)

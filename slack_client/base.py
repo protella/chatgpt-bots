@@ -84,6 +84,12 @@ class SlackBot(SlackMessageEventsMixin,
             )
         if config.enable_reactions and config.enable_react_tool and config.reaction_emojis:
             registry.register(self.get_react_tool_schema(), self.execute_react_tool)
+        # F2: no_response_needed is exposed only on unprompted turns (participation_check),
+        # via the per-request _unprompted_turn flag the text handler sets in a COPIED config.
+        registry.register(
+            self.get_no_reply_tool_schema(), self.execute_no_reply_tool,
+            enabled=lambda cfg: config.enable_no_reply_tool and bool(cfg.get("_unprompted_turn")),
+        )
         if config.enable_search_tool:
             registry.register(self.get_search_tool_schema(), self.execute_search_tool)
         if config.enable_channel_memory:
