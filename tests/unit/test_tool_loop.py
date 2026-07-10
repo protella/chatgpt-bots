@@ -193,8 +193,8 @@ class TestToolLoop:
         assert [m.get("type") for m in replayed] == ["reasoning", "function_call", "function_call_output"]
         assert replayed[0]["id"] == "rs_1"
         assert replayed[1]["call_id"] == "c1" and replayed[2]["call_id"] == "c1"
-        # reasoning entries don't count as tool executions
-        assert out["local_tool_calls"] == [{"name": "echo", "ok": True}]
+        # reasoning entries don't count as tool executions (F7 also captures an arg gist)
+        assert out["local_tool_calls"] == [{"name": "echo", "ok": True, "gist": "x=1"}]
 
     @pytest.mark.asyncio
     async def test_tool_error_fed_back_not_raised(self, monkeypatch):
@@ -206,7 +206,7 @@ class TestToolLoop:
             _Client(), messages=[], tools=[], registry=_registry_with(executor=boom),
             tool_context=ToolContext())
         assert out["text"] == "answered anyway"
-        assert out["local_tool_calls"] == [{"name": "echo", "ok": False}]
+        assert out["local_tool_calls"] == [{"name": "echo", "ok": False, "gist": "x=1"}]
         # The error result still went back to the model as a function_call_output
         output_item = fake.invocations[1]["messages"][-1]
         assert output_item["type"] == "function_call_output" and "execution_error" in output_item["output"]

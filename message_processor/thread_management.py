@@ -10,6 +10,10 @@ from message_markers import (
     starts_as_continuation,
     strip_continuation_markers,
 )
+from message_processor.tool_provenance import (
+    render_used_tools_annotation,
+    strip_used_tools_footer,
+)
 
 
 class ThreadManagementMixin:
@@ -937,6 +941,17 @@ class ThreadManagementMixin:
             pending_image_urls = []
             pending_image_metadata = {}  # Store additional metadata per URL
 
+            # F7: batch-fetch this thread's tool-use provenance once, keyed by reply ts, to
+            # reinject "[used tools: …]" onto matching assistant turns during the loop below.
+            # Messages at/behind the summary boundary are already skipped, so nothing behind
+            # a compaction boundary is ever annotated.
+            tool_usage_by_ts: Dict[str, list] = {}
+            if config.enable_tool_provenance and self.db:
+                try:
+                    tool_usage_by_ts = await self.db.get_thread_tool_usage_async(thread_key)
+                except Exception as e:
+                    self.log_debug(f"tool-usage fetch for rebuild failed: {e}")
+
             # Convert to thread state messages
             for hist_msg in history:
                 # Skip the current message being processed
@@ -1005,6 +1020,18 @@ class ThreadManagementMixin:
                     if hist_msg.user_id and hist_msg.user_id not in ("bot", "unknown"):
                         thread_state.participants[hist_msg.user_id] = username
                 
+                # F7: for OUR OWN turns, strip the external _Used Tools:_ footer (never model
+                # context) then append the deterministic [used tools: …] annotation from the
+                # persisted rows — pinned order: footer-strip → used-tools → reactions, so no
+                # trailing annotation can shield the footer from stripping. Guarded by the
+                # flag so config-off leaves rebuilt content exactly as today.
+                if config.enable_tool_provenance and is_self:
+                    content = strip_used_tools_footer(content)
+                    used_note = render_used_tools_annotation(
+                        tool_usage_by_ts.get(hist_msg.metadata.get("ts")))
+                    if used_note:
+                        content = f"{content}\n{used_note}" if content else used_note
+
                 # Reactions on this message (from conversations.replies) — deterministic
                 # annotation so the model knows who reacted with what
                 reactions_note = self._render_reactions_annotation(hist_msg.metadata.get("reactions"))

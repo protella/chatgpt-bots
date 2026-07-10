@@ -16,6 +16,11 @@ from message_markers import (
 )
 from streaming import FenceHandler, NativeStreamCoordinator, RateLimitManager, StreamingBuffer
 from tool_registry import ToolContext
+from message_processor.tool_provenance import (
+    build_provenance,
+    render_used_tools_annotation,
+    strip_used_tools_footer,
+)
 
 
 class TextHandlerMixin:
@@ -159,7 +164,7 @@ class TextHandlerMixin:
         # (keeps user-visible context clean while preventing metadata pollution)
         for msg in messages_for_api:
             if msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
-                msg["content"] = re.sub(r'\n\n_Used Tools:.+?_$', '', msg["content"])
+                msg["content"] = strip_used_tools_footer(msg["content"])
 
         # Pre-trim messages to fit within context window
         messages_for_api = await self._pre_trim_messages_for_api(messages_for_api, model=thread_state.current_model)
@@ -431,9 +436,22 @@ class TextHandlerMixin:
             response_text = response_text + tools_note
             self.log_info(f"Added tools attribution: {', '.join(tools_actually_used) if tools_actually_used else 'none'}{' with failure note' if failed_mcp_server else ''}")
 
+        # F7: build tool-use provenance (local calls with gists + external names) and, when
+        # any tools ran, warm-annotate the STORED assistant turn with "[used tools: …]" so
+        # the model recalls its own tool use without a rebuild. The footer is stripped first
+        # (external chrome never enters model context, and can't shield the annotation). The
+        # posted/returned content keeps the footer and carries no annotation.
+        tool_provenance = []
+        stored_content = response_text
+        if config.enable_tool_provenance:
+            tool_provenance = build_provenance(local_tool_calls, tools_actually_used)
+            annotation = render_used_tools_annotation(tool_provenance)
+            if annotation:
+                stored_content = f"{strip_used_tools_footer(response_text)}\n{annotation}"
+
         # Add assistant response to thread state
         thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-        self._add_message_with_token_management(thread_state, "assistant", response_text, db=self.db, thread_key=thread_key)
+        self._add_message_with_token_management(thread_state, "assistant", stored_content, db=self.db, thread_key=thread_key)
 
         # Schedule async cleanup after response
         cleanup_coro = self._async_post_response_cleanup(thread_state, thread_key)
@@ -442,7 +460,8 @@ class TextHandlerMixin:
         return Response(
             type="text",
             content=response_text,
-            metadata={"model": thread_config.get("model")}
+            metadata={"model": thread_config.get("model"),
+                      "tool_provenance": tool_provenance}
         )
 
     async def _handle_streaming_text_response(self, user_content: Any, thread_state, client: BaseClient,
@@ -521,7 +540,7 @@ class TextHandlerMixin:
         # (keeps user-visible context clean while preventing metadata pollution)
         for msg in messages_for_api:
             if msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
-                msg["content"] = re.sub(r'\n\n_Used Tools:.+?_$', '', msg["content"])
+                msg["content"] = strip_used_tools_footer(msg["content"])
 
         # Pre-trim messages to fit within context window
         messages_for_api = await self._pre_trim_messages_for_api(messages_for_api, model=thread_state.current_model)
@@ -1489,9 +1508,25 @@ class TextHandlerMixin:
             # Note: To properly detect if web search was used, we'd need to track
             # tool events during streaming. The presence of URLs doesn't mean web search was used.
             
+            # F7: tool-use provenance — warm-annotate the STORED turn with "[used tools: …]"
+            # (footer stripped first) and persist it keyed on the reply's ts so a later
+            # rebuild reproduces it. The posted/returned content is untouched.
+            tool_provenance = []
+            stored_content = response_text
+            if config.enable_tool_provenance:
+                tool_provenance = build_provenance(local_tool_calls, tools_used)
+                annotation = render_used_tools_annotation(tool_provenance)
+                if annotation:
+                    stored_content = f"{strip_used_tools_footer(response_text)}\n{annotation}"
+
             # Add assistant response to thread state
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-            self._add_message_with_token_management(thread_state, "assistant", response_text, db=self.db, thread_key=thread_key)
+            self._add_message_with_token_management(thread_state, "assistant", stored_content, db=self.db, thread_key=thread_key)
+
+            # F7: persist keyed on the reply's real ts (same ts the pulse records; the
+            # native stream's own message). Skipped silently when no message exists.
+            self._persist_tool_provenance(
+                thread_state.channel_id, message_id, thread_key, tool_provenance)
 
             # F5 fix (a): record the bot's own streamed final reply into the pulse — native
             # stream edits never echo back as a clean event, so this is their only capture.

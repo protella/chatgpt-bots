@@ -249,7 +249,14 @@ class BotConfig:
     # BOTH as the outer asyncio.wait_for and as a per-request SDK timeout (the AsyncOpenAI
     # client is built with api_timeout_read, so wait_for alone can't extend past it).
     api_timeout_image: float = field(default_factory=lambda: float(os.getenv("API_TIMEOUT_IMAGE", "300")))
-    
+    # --- Socket-liveness monitor (F9, detection-only) ---
+    # Seconds without ANY inbound Socket Mode envelope before the liveness monitor speaks
+    # up: if slack_sdk's ping-pong is ALSO frozen for the same window it logs an ERROR
+    # (unambiguous half-open death — restart likely required); if pings are still fresh it
+    # logs ONE WARNING per drought episode (idle or half-open, passively indistinguishable).
+    # Detection only — the monitor NEVER touches the socket. 0 disables the monitor.
+    socket_liveness_timeout: int = field(default_factory=lambda: int(os.getenv("SOCKET_LIVENESS_TIMEOUT", "600")))
+
     # Model token limits (verified 2026-07-09 against developers.openai.com/api/docs/models/*)
     # GPT-5.6 family (sol/terra/luna) AND GPT-5.5: 1,050,000 total context window,
     #   128,000 max output tokens (window is shared between input, output, and reasoning)
@@ -480,6 +487,14 @@ class BotConfig:
     # model can end without posting instead of emitting filler. Off → tool hidden, suffix
     # paragraph absent, behavior as today (the honest-accounting fix is unconditional).
     enable_no_reply_tool: bool = field(default_factory=lambda: os.getenv("ENABLE_NO_REPLY_TOOL", "true").lower() == "true")
+
+    # --- Tool-use provenance (F7) ---
+    # Capture the tools the bot invoked on each turn (names + short arg-derived gists,
+    # never results/content), persist them keyed by the reply's Slack ts, and reinject a
+    # deterministic "[used tools: …]" annotation onto the matching assistant message on
+    # warm append + rebuild — so the model can recall its own past tool use instead of
+    # confabulating. Off → nothing captured, nothing persisted, no annotation.
+    enable_tool_provenance: bool = field(default_factory=lambda: os.getenv("ENABLE_TOOL_PROVENANCE", "true").lower() == "true")
 
     # --- Slack search tool (redesign Phase B) — assistant.search.context ---
     # Requires an action_token from the triggering event, so the bot can only search in

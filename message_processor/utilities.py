@@ -1222,6 +1222,25 @@ class MessageUtilitiesMixin:
         task.add_done_callback(_log_result)
         return task
 
+    def _persist_tool_provenance(self, channel_id: Optional[str], message_ts: Optional[str],
+                                 thread_key: Optional[str], provenance) -> None:
+        """F7: best-effort persist of a reply's tool-use provenance, keyed by the reply's
+        Slack ts. No-ops when the feature is off, the ts/db is missing, or no tools ran
+        (reaction-only / no-tool turns leave no row). Fire-and-forget so a DB hiccup never
+        blocks or delays the reply."""
+        if not config.enable_tool_provenance:
+            return
+        if not message_ts or not provenance:
+            return
+        db = getattr(self, "db", None)
+        if db is None or not channel_id:
+            return
+        try:
+            self._schedule_async_call(
+                db.save_tool_usage_async(channel_id, message_ts, thread_key or "", provenance))
+        except Exception as e:  # noqa: BLE001 — provenance persistence is never load-bearing
+            self.log_debug(f"tool-provenance persist skipped: {e}")
+
     def _update_message_streaming_sync(self, client, channel_id: str, message_id: str, text: str):
         """Wrapper for calling async update_message_streaming from sync contexts
 

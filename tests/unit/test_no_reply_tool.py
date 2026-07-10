@@ -143,7 +143,7 @@ async def test_tool_loop_no_reply_ends_and_suppresses_siblings(monkeypatch):
     assert result["text"] == ""
     # Only the terminal + sibling react ran; the memory write was suppressed.
     assert set(dispatched) == {"no_response_needed", "react_to_message"}
-    assert result["local_tool_calls"] == [{"name": "react_to_message", "ok": True}]
+    assert result["local_tool_calls"] == [{"name": "react_to_message", "ok": True, "gist": "emoji=eyes"}]
 
 
 @pytest.mark.asyncio
@@ -250,7 +250,7 @@ async def test_streaming_no_reply_rejected_after_committed_text(monkeypatch):
         tool_context=None, stream_callback=lambda c: None)
     assert out.get("terminal_action") is None          # NOT silenced
     assert out["text"] == " — all done."               # completing round's reply
-    assert {"name": "no_response_needed", "ok": False} in out["local_tool_calls"]
+    assert {"name": "no_response_needed", "ok": False, "gist": "reason=oops"} in out["local_tool_calls"]
     assert any("after visible text" in w for w in host.warnings)
 
 
