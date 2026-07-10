@@ -238,10 +238,11 @@ class TestBotConfig:
         config = BotConfig()
         mock_db = Mock()
         
-        # Mock user preferences from database
+        # Mock user preferences from database (legacy stored model — the
+        # compose-time clamp coerces the effort against whatever model wins)
         mock_db.get_user_preferences.return_value = {
             'model': 'gpt-5-nano',
-            'reasoning_effort': 'maximal',
+            'reasoning_effort': 'high',
             'verbosity': 'high',
             'temperature': 0.5,
             'top_p': 0.9,
@@ -258,9 +259,10 @@ class TestBotConfig:
             user_id='U123'
         )
         
-        # Verify user preferences are applied
+        # Verify user preferences are applied ('high' is valid on every family,
+        # so it survives the compose-time clamp)
         assert thread_config["model"] == 'gpt-5-nano'
-        assert thread_config["reasoning_effort"] == 'maximal'
+        assert thread_config["reasoning_effort"] == 'high'
         assert thread_config["verbosity"] == 'high'
         assert thread_config["temperature"] == 0.5
         assert thread_config["top_p"] == 0.9

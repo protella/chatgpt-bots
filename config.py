@@ -599,41 +599,79 @@ class BotConfig:
 
         return user_config
 
+    # Channel-shared override keys: the only channel_settings columns that join the
+    # generation-config hierarchy (level 2.5). Everything else in channel_settings is
+    # participation/UX config consumed elsewhere.
+    _CHANNEL_OVERRIDE_KEYS = ("model", "reasoning_effort", "verbosity")
+
+    def _map_channel_settings(self, channel_settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Extract the shared generation overrides from a channel_settings row
+        (NULL columns = inherit → omitted)."""
+        if not channel_settings:
+            return {}
+        return {k: channel_settings[k] for k in self._CHANNEL_OVERRIDE_KEYS
+                if channel_settings.get(k)}
+
     def _compose_thread_config(self, user_prefs: Optional[Dict[str, Any]],
-                               overrides: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        """Compose the config hierarchy: defaults <- user prefs <- thread overrides."""
+                               overrides: Optional[Dict[str, Any]],
+                               channel_settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Compose the config hierarchy:
+        defaults <- user prefs <- channel shared settings <- thread overrides.
+
+        Channel settings beat personal prefs (a channel behaves the same for
+        everyone in it); an explicit thread override still wins. The composed
+        reasoning_effort is clamped against the composed model so a cross-layer
+        mix (e.g. channel model gpt-5.5 + user effort max) can never 400."""
         config = self._default_thread_config()
         if user_prefs:
             config.update(self._map_user_prefs(user_prefs))
+        config.update(self._map_channel_settings(channel_settings))
         if overrides:
             config.update(overrides)
+        config["reasoning_effort"] = clamp_effort(config.get("model", self.gpt_model),
+                                                  config.get("reasoning_effort"))
         return config
 
-    def get_thread_config(self, overrides: Optional[Dict[str, Any]] = None, user_id: Optional[str] = None, db = None) -> Dict[str, Any]:
+    def get_thread_config(self, overrides: Optional[Dict[str, Any]] = None, user_id: Optional[str] = None,
+                          db = None, channel_id: Optional[str] = None) -> Dict[str, Any]:
         """Get configuration for a specific thread with settings hierarchy:
         1. System defaults (from .env)
         2. User preferences (from database)
-        3. Thread overrides (passed as parameter)
+        3. Channel shared settings (model/effort/verbosity — anyone in the channel can set them)
+        4. Thread overrides (passed as parameter)
         """
         user_prefs = None
+        channel_settings = None
         if user_id and db:
             try:
                 user_prefs = db.get_user_preferences(user_id)
             except Exception as e:
                 logging.getLogger("bot.config").warning(f"Error fetching user preferences: {e}")
-        return self._compose_thread_config(user_prefs, overrides)
+        if channel_id and db:
+            try:
+                channel_settings = db.get_channel_settings(channel_id)
+            except Exception as e:
+                logging.getLogger("bot.config").warning(f"Error fetching channel settings: {e}")
+        return self._compose_thread_config(user_prefs, overrides, channel_settings)
 
     async def get_thread_config_async(self, overrides: Optional[Dict[str, Any]] = None,
-                                      user_id: Optional[str] = None, db = None) -> Dict[str, Any]:
-        """Async get_thread_config — awaits the aiosqlite preference read instead of
+                                      user_id: Optional[str] = None, db = None,
+                                      channel_id: Optional[str] = None) -> Dict[str, Any]:
+        """Async get_thread_config — awaits the aiosqlite reads instead of
         blocking the event loop with sync sqlite on every message."""
         user_prefs = None
+        channel_settings = None
         if user_id and db:
             try:
                 user_prefs = await db.get_user_preferences_async(user_id)
             except Exception as e:
                 logging.getLogger("bot.config").warning(f"Error fetching user preferences: {e}")
-        return self._compose_thread_config(user_prefs, overrides)
+        if channel_id and db:
+            try:
+                channel_settings = await db.get_channel_settings_async(channel_id)
+            except Exception as e:
+                logging.getLogger("bot.config").warning(f"Error fetching channel settings: {e}")
+        return self._compose_thread_config(user_prefs, overrides, channel_settings)
 
 
 # Global config instance
