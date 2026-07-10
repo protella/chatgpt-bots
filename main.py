@@ -96,6 +96,15 @@ class ChatBotV2:
             except Exception:
                 memory_facts = []
 
+            channel_topic = None
+            fetch_ctx = getattr(client, "get_channel_context", None)
+            if fetch_ctx:
+                try:
+                    ctx = await fetch_ctx(channel_id)
+                    channel_topic = (ctx or {}).get("topic") or None
+                except Exception:
+                    channel_topic = None
+
             is_thread_reply = bool(ts and message.thread_id and message.thread_id != ts)
             verdict = await engine.evaluate(
                 channel_id=channel_id, ts=ts, text=message.text,
@@ -107,6 +116,7 @@ class ChatBotV2:
                 name_hit=message.metadata.get("participation_name_hit") is True,
                 snoozed=message.metadata.get("participation_snoozed") is True,
                 sender_is_bot=message.metadata.get("participation_sender_bot") is True,
+                channel_topic=channel_topic,
             )
             if verdict is None:  # superseded by a newer message during debounce
                 main_logger.debug("Participation gate: superseded during debounce — silent")

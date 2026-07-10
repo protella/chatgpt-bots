@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import aiohttp
 import re
+import time
 from typing import Optional
 
 from slack_sdk.errors import SlackApiError
@@ -121,6 +122,44 @@ class SlackUtilitiesMixin:
         if msg.get("bot_id") or msg.get("app_id") or msg.get("api_app_id"):
             return "other_bot"
         return "human"
+
+    async def get_channel_context(self, channel_id: Optional[str]) -> Optional[dict]:
+        """Cached channel metadata (name/topic/purpose) for prompt context.
+
+        Returns {"name", "topic", "purpose"} for real channels, None for DMs/MPIMs
+        or on any failure. TTL-cached per channel so this costs one conversations.info
+        call per channel per window — topic edits arrive with a subtype and never
+        reach the dispatch path, so a short TTL is the refresh mechanism."""
+        if not channel_id:
+            return None
+        cache = getattr(self, "_channel_ctx_cache", None)
+        if cache is None:
+            cache = {}
+            self._channel_ctx_cache = cache
+        now = time.monotonic()
+        hit = cache.get(channel_id)
+        if hit and hit[0] > now:
+            return hit[1]
+        try:
+            resp = await self.app.client.conversations_info(channel=channel_id)
+            ch = (resp.get("channel") or {}) if resp else {}
+            if ch.get("is_im") or ch.get("is_mpim"):
+                data = None
+            else:
+                # Slack HTML-escapes &/</> in these fields; undo it for the prompt
+                def _clean(s: str) -> str:
+                    return s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").strip()
+                data = {
+                    "name": ch.get("name") or "",
+                    "topic": _clean((ch.get("topic") or {}).get("value") or ""),
+                    "purpose": _clean((ch.get("purpose") or {}).get("value") or ""),
+                }
+            cache[channel_id] = (now + 900, data)  # 15 min
+            return data
+        except Exception as e:
+            self.log_debug(f"channel context fetch failed for {channel_id}: {e}")
+            cache[channel_id] = (now + 60, None)  # brief negative cache; don't hammer on errors
+            return None
 
     async def get_username(self, user_id: str, client) -> str:
         """Get username from user ID, with caching"""
