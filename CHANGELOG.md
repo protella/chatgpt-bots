@@ -353,6 +353,32 @@ DMs behave as before.
   `REACTION_MAX_PER_MESSAGE` (default 4). Reacting with the same emoji twice remains a
   harmless no-op.
 
+### 🧠 Feature - The bot now remembers which tools it used
+
+- When you ask the bot how it arrived at something ("did you actually look that up, or
+  guess?"), it now knows — each reply quietly records the tools it ran that turn (a
+  history lookup, a web search, a reaction) and reinjects that as a compact note the next
+  time it reads the thread. Previously those actions left no trace in the rebuilt
+  conversation, so the bot would confidently make up a wrong answer about its own past
+  behavior and then contradict itself when corrected. Only tool names and a short hint of
+  their arguments are kept — never their results or your content — and old records age out
+  on their own. Turn it off with `ENABLE_TOOL_PROVENANCE=false`.
+
+### ⚙️ Fixed - The settings button is back on the message
+
+- The "⚙️ <model>" Configure button now rides the reply message itself on non-streamed
+  replies too (fallback and config-off paths), instead of arriving as a separate little
+  message underneath. Streamed replies already did this; now every reply is consistent.
+
+### 🔌 Feature - A clear alarm if the Slack connection silently dies
+
+- Very rarely a Slack socket connection can go "half-open" — the process looks healthy but
+  quietly stops receiving any messages until it's restarted. The bot now watches for this
+  and, if it ever happens, logs a clear error ("socket presumed dead — restart likely
+  required") so the cause is obvious instead of a mystery. It only reports the problem (no
+  automatic reconnection); tune or disable the watchdog with `SOCKET_LIVENESS_TIMEOUT`
+  (default 600 seconds; 0 disables).
+
 ### 🩹 Fixed - Reliability hardening for the new channel/image features
 
 - Live progress checklists now also appear when the bot **edits** an image (not just when

@@ -181,6 +181,23 @@ class SlackMessagingMixin:
         self.handler = AsyncSocketModeHandler(self.app, config.slack_app_token)
         self.log_info("Starting Slack bot in socket mode...")
 
+        # F9: detection-only socket-liveness monitor. Hook every inbound envelope on the
+        # async socket client and start the 60s watchdog (never touches the socket).
+        try:
+            from slack_client.socket_liveness import SocketLivenessMonitor
+            self._socket_liveness = SocketLivenessMonitor(
+                getattr(self.handler, "client", None),
+                timeout=config.socket_liveness_timeout,
+                log_info=self.log_info,
+                log_warning=self.log_warning,
+                log_error=self.log_error,
+            )
+            self._socket_liveness.attach()
+            self._socket_liveness.start()
+        except Exception as e:
+            self.log_warning(f"Could not start socket-liveness monitor: {e}")
+            self._socket_liveness = None
+
         # Resolve our own identity up front so we can tell our messages apart from other bots'
         await self._ensure_self_identity()
 
@@ -198,6 +215,15 @@ class SlackMessagingMixin:
 
     async def stop(self):
         """Stop the Slack bot"""
+        # F9: stop the liveness monitor first (independent of the handler teardown below).
+        monitor = getattr(self, "_socket_liveness", None)
+        if monitor is not None:
+            try:
+                await monitor.stop()
+            except Exception as e:
+                self.log_debug(f"Error stopping socket-liveness monitor: {e}")
+            self._socket_liveness = None
+
         if self.handler:
             self.log_info("Stopping Slack bot...")
 
@@ -329,8 +355,18 @@ class SlackMessagingMixin:
         except Exception as e:
             self.log_debug(f"own-reply pulse record failed: {e}")
 
-    async def send_message(self, channel_id: str, thread_id: str, text: str) -> bool:
-        """Send a text message to Slack, splitting if needed"""
+    async def send_message(self, channel_id: str, thread_id: str, text: str,
+                           blocks: Optional[list] = None) -> Optional[str]:
+        """Send a text message to Slack, splitting if needed.
+
+        Returns the posted message ts (the FIRST chunk's ts when split), or None on
+        failure. Truthy-on-success, so legacy `if await send_message(...)` callers keep
+        working while F7 can key tool-use provenance on the returned ts.
+
+        `blocks` (F8): when provided AND the message fits one part, they attach to the
+        chat.postMessage (the settings-footer chrome rides the message itself instead of a
+        separate trailing post). Split messages ignore blocks and fall back to the separate
+        footer post — attaching chrome mid-thread would misplace it."""
         try:
             # Strip MCP citations from text before sending to Slack
             text = strip_citations(text)
@@ -340,19 +376,19 @@ class SlackMessagingMixin:
             # Check if we need to split the message
             if len(formatted_text) <= self.MAX_MESSAGE_LENGTH:
                 # Single message
-                result = await self.app.client.chat_postMessage(
-                    channel=channel_id,
-                    thread_ts=thread_id,
-                    text=formatted_text
-                )
-                self._record_own_reply_pulse(channel_id, thread_id, result.get("ts"), text)
+                post_kwargs = dict(channel=channel_id, thread_ts=thread_id, text=formatted_text)
+                if blocks:
+                    post_kwargs["blocks"] = blocks
+                result = await self.app.client.chat_postMessage(**post_kwargs)
+                posted_ts = result.get("ts")
+                self._record_own_reply_pulse(channel_id, thread_id, posted_ts, text)
+                return posted_ts
             else:
                 # Split into multiple messages, "Continued..." style (shared markers so
                 # the rebuild-side stripper always recognizes them). One chunk failing
                 # must not abort the rest.
                 chunks = self._split_message(formatted_text)
                 last = len(chunks) - 1
-                sent_any = False
                 first_ts = None
                 for i, chunk in enumerate(chunks):
                     body = chunk
@@ -366,18 +402,16 @@ class SlackMessagingMixin:
                             thread_ts=thread_id,
                             text=body
                         )
-                        sent_any = True
                         if first_ts is None:
                             first_ts = result.get("ts")
                     except SlackApiError as chunk_error:
                         self.log_error(f"Error sending message chunk {i + 1}/{last + 1}: {chunk_error}")
                 # Record the full reply once, keyed on the first chunk's ts.
                 self._record_own_reply_pulse(channel_id, thread_id, first_ts, text)
-                return sent_any if last > 0 else True
-            return True
+                return first_ts
         except SlackApiError as e:
             self.log_error(f"Error sending message: {e}")
-            return False
+            return None
 
     def _split_message(self, text: str) -> List[str]:
         """Split a long message into chunks that fit within Slack's limit.

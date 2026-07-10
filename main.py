@@ -295,15 +295,38 @@ class ChatBotV2:
                     elif not response.metadata.get("streamed"):
                         # Format and send text (top-level when placement chose channel)
                         formatted_text = client.format_text(response.content)
-                        sent_ok = await client.send_message(
+                        # F8: attach the settings-footer chrome to the message itself (same
+                        # as the native-streaming path's stopStream blocks) instead of a
+                        # separate trailing post. Suppressed for top-level channel placement
+                        # (same rule as the separate footer below) and when block-building is
+                        # unavailable — those fall back to maybe_post_response_footer.
+                        footer_blocks = None
+                        if not place_in_channel and hasattr(client, "attachable_footer_blocks"):
+                            try:
+                                footer_blocks = client.attachable_footer_blocks(
+                                    message.channel_id, response.metadata.get("model"))
+                            except Exception as e:
+                                main_logger.debug(f"Footer block build failed: {e}")
+                                footer_blocks = None
+                        sent_ts = await client.send_message(
                             message.channel_id,
                             post_thread_id,
-                            formatted_text
+                            formatted_text,
+                            blocks=footer_blocks,
                         )
                         # Honest accounting: the ACTUAL send result decides `posted` (a
                         # failed send must not burn the hourly unprompted quota).
                         if isinstance(response.metadata, dict):
-                            response.metadata["posted"] = bool(sent_ok)
+                            response.metadata["posted"] = bool(sent_ts)
+                            # Chrome rode the message — tell the separate footer to stand down.
+                            if footer_blocks and sent_ts:
+                                response.metadata["footer_attached"] = True
+                        # F7: persist tool-use provenance keyed on the reply's real ts.
+                        if sent_ts:
+                            self.processor._persist_tool_provenance(
+                                message.channel_id, sent_ts,
+                                f"{message.channel_id}:{message.thread_id}",
+                                (response.metadata or {}).get("tool_provenance"))
                     # Phase 7: Configure footer under the response (channels only, any
                     # member can open settings). Native-streamed responses attach the
                     # chrome to the message itself on stopStream (footer_attached
@@ -558,6 +581,14 @@ class ChatBotV2:
                         if hasattr(self.processor, 'db') and self.processor.db:
                             await self.processor.db.cleanup_old_modal_sessions_async(hours=24)
                             main_logger.info("Cleaned up old modal sessions")
+
+                            # F7: sweep aged tool-use provenance rows (no FK cascade —
+                            # PRAGMA foreign_keys is never enabled, so these need their own
+                            # age sweep, same as documents).
+                            try:
+                                self.processor.db.delete_old_tool_usage()
+                            except Exception as e:
+                                main_logger.debug(f"Tool-usage sweep skipped: {e}")
 
                         stats = self.processor.get_stats()
                         main_logger.info(f"Cleanup complete. Stats: {stats}")

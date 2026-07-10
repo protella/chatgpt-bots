@@ -171,10 +171,36 @@ class DatabaseManager(LoggerMixin):
             ON documents(filename)
         """)
         self.conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_document_message 
+            CREATE INDEX IF NOT EXISTS idx_document_message
             ON documents(message_ts)
         """)
-        
+
+        # Tool-use provenance (F7): compact per-reply record of the tools the bot invoked
+        # (names + arg-derived gists only, NO results/content), keyed by the reply's Slack
+        # ts. Reinjected as a "[used tools: …]" annotation on rebuild so the model can
+        # recall its own past tool use. Deliberately NO foreign key: the ON DELETE CASCADE
+        # path is dead (PRAGMA foreign_keys is never enabled) — rows are swept by age via
+        # delete_old_tool_usage() instead. UNIQUE(channel, ts) makes re-persist idempotent.
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS message_tool_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL,
+                message_ts TEXT NOT NULL,
+                thread_key TEXT NOT NULL,
+                tools_json TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(channel_id, message_ts)
+            )
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tool_usage_thread
+            ON message_tool_usage(thread_key)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tool_usage_created
+            ON message_tool_usage(created_at)
+        """)
+
         # Users table with timezone support
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -1488,7 +1514,23 @@ class DatabaseManager(LoggerMixin):
         
         if cursor.rowcount > 0:
             self.log_info(f"DB: Cleaned up {cursor.rowcount} documents older than {days} days")
-    
+
+    def delete_old_tool_usage(self, days: int = 90):
+        """Delete tool-use provenance rows older than `days` (F7 retention sweep).
+
+        The ON DELETE CASCADE path is dead (PRAGMA foreign_keys is never enabled), so
+        message_tool_usage gets this explicit age sweep instead — modeled on
+        delete_old_documents and wired into the scheduled cleanup worker."""
+        cutoff = datetime.now() - timedelta(days=days)
+
+        cursor = self.conn.execute("""
+            DELETE FROM message_tool_usage
+            WHERE created_at < ?
+        """, (cutoff,))
+
+        if cursor.rowcount > 0:
+            self.log_info(f"DB: Cleaned up {cursor.rowcount} tool-usage rows older than {days} days")
+
     # User operations
     
     def get_or_create_user(self, user_id: str, username: Optional[str] = None) -> Dict:
@@ -2113,6 +2155,53 @@ class DatabaseManager(LoggerMixin):
         except Exception as e:
             self.log_error(f"DB: Failed to save image metadata async - {e}", exc_info=True)
             raise
+
+    async def save_tool_usage_async(self, channel_id: str, message_ts: str,
+                                    thread_key: str, tools: List[Dict]) -> None:
+        """Persist a reply's tool-use provenance (F7), keyed by channel+ts.
+
+        `tools` is the compact [{"tool_name","gist"}] record (names + arg gists only).
+        Idempotent on (channel_id, message_ts): a re-persist overwrites. Best-effort —
+        the caller wraps this so a DB failure never blocks the reply."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("PRAGMA journal_mode=WAL")
+                await db.execute("""
+                    INSERT INTO message_tool_usage
+                        (channel_id, message_ts, thread_key, tools_json)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(channel_id, message_ts) DO UPDATE SET
+                        thread_key = excluded.thread_key,
+                        tools_json = excluded.tools_json
+                """, (channel_id, message_ts, thread_key, json.dumps(tools)))
+                await db.commit()
+        except Exception as e:
+            self.log_debug(f"DB: save_tool_usage_async failed (non-fatal): {e}")
+
+    async def get_thread_tool_usage_async(self, thread_key: str) -> Dict[str, List[Dict]]:
+        """Batch-fetch a thread's tool-use provenance for rebuild reinjection (F7).
+
+        Returns {message_ts: [{"tool_name","gist"}, …]}. Empty on any error so a missing
+        table / read failure degrades to no annotations rather than breaking the rebuild."""
+        result: Dict[str, List[Dict]] = {}
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                await db.execute("PRAGMA journal_mode=WAL")
+                async with db.execute(
+                    "SELECT message_ts, tools_json FROM message_tool_usage WHERE thread_key = ?",
+                    (thread_key,)
+                ) as cursor:
+                    async for row in cursor:
+                        try:
+                            parsed = json.loads(row["tools_json"])
+                        except (json.JSONDecodeError, TypeError, ValueError):
+                            continue
+                        if isinstance(parsed, list):
+                            result[row["message_ts"]] = parsed
+        except Exception as e:
+            self.log_debug(f"DB: get_thread_tool_usage_async failed (non-fatal): {e}")
+        return result
 
     async def get_thread_config_async(self, thread_id: str) -> Optional[Dict]:
         """

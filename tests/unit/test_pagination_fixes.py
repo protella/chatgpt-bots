@@ -312,12 +312,13 @@ async def test_send_message_split_uses_continued_markers_and_isolates_failures()
         calls.append(text)
         if len(calls) == 2:
             raise _slack_error(error="msg_too_long", status=400)
-        return {"ok": True}
+        return {"ok": True, "ts": f"ts{len(calls)}"}
 
     b.app.client.chat_postMessage = AsyncMock(side_effect=post)
     long_text = ("para " * 300 + "\n\n") * 8  # ~12k chars -> 4 chunks
     ok = await b.send_message("C1", "1", long_text)
-    assert ok is True  # some chunks landed despite chunk-2 failure
+    # send_message now returns the first landed chunk's ts (truthy) instead of a bool.
+    assert ok == "ts1"  # some chunks landed despite chunk-2 failure
     assert len(calls) >= 3, "failure on chunk 2 must not abort later chunks"
     assert calls[0].rstrip().endswith(CONTINUATION_TRAILER)
     assert calls[1].startswith(CONTINUATION_HEAD)
