@@ -56,6 +56,17 @@ class TestBotConfig:
         config = BotConfig()
         assert config.enable_progress_checklist is False
 
+    def test_progress_checklist_prefer_message_default_enabled(self, mock_env):
+        """PROGRESS_CHECKLIST_PREFER_MESSAGE defaults to True"""
+        config = BotConfig()
+        assert config.progress_checklist_prefer_message is True
+
+    @patch.dict(os.environ, {"PROGRESS_CHECKLIST_PREFER_MESSAGE": "false"})
+    def test_progress_checklist_prefer_message_disabled(self, mock_env):
+        """PROGRESS_CHECKLIST_PREFER_MESSAGE=false reverts to status-only degradation"""
+        config = BotConfig()
+        assert config.progress_checklist_prefer_message is False
+
     def test_background_image_gen_default_enabled(self, mock_env):
         """ENABLE_BACKGROUND_IMAGE_GEN defaults to True"""
         config = BotConfig()

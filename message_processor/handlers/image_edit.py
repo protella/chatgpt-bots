@@ -267,7 +267,8 @@ class ImageEditMixin:
                             # The checklist owns the editing-status message; the legacy
                             # rotator would overwrite its steps, so it is NOT started (F4).
                             checklist = ProgressChecklist(client, channel_id, thread_state.thread_ts,
-                                                          message_id=editing_id)
+                                                          message_id=editing_id,
+                                                          prefer_message=config.progress_checklist_prefer_message)
                             await checklist.step(
                                 pipeline_status("editing_image", "Editing your image. This may take a minute…"),
                                 done_text="Edited image",
@@ -325,7 +326,8 @@ class ImageEditMixin:
                         # Non-streaming fallback
                         if config.enable_progress_checklist:
                             checklist = ProgressChecklist(client, channel_id, thread_state.thread_ts,
-                                                          message_id=thinking_id)
+                                                          message_id=thinking_id,
+                                                          prefer_message=config.progress_checklist_prefer_message)
                             await checklist.step(
                                 pipeline_status("enhancing_prompt", "Enhancing your edit request…"),
                                 done_text="Enhanced prompt",
@@ -653,7 +655,8 @@ class ImageEditMixin:
                 # The checklist owns the editing-status message; the legacy rotator
                 # would overwrite its steps, so it is NOT started here (F4).
                 checklist = ProgressChecklist(client, channel_id, thread_state.thread_ts,
-                                              message_id=editing_id)
+                                              message_id=editing_id,
+                                              prefer_message=config.progress_checklist_prefer_message)
                 await checklist.step(
                     pipeline_status("editing_image", "Generating edited image. This may take a minute…"),
                     done_text="Edited image",
@@ -727,7 +730,8 @@ class ImageEditMixin:
                 # F4 on the non-streaming edit path too — own the thinking message so the
                 # edit step shows and gets completed by the delivery seam.
                 checklist = ProgressChecklist(client, channel_id, thread_state.thread_ts,
-                                              message_id=thinking_id)
+                                              message_id=thinking_id,
+                                              prefer_message=config.progress_checklist_prefer_message)
                 await checklist.step(
                     pipeline_status("editing_image", "Editing your image. This may take a minute…"),
                     done_text="Edited image",

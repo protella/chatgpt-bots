@@ -21,6 +21,7 @@ LOADER = config.circle_loader_emoji
 def _client(**overrides):
     client = SimpleNamespace(
         send_thinking_indicator=AsyncMock(return_value="msg1"),
+        send_message_get_ts=AsyncMock(return_value={"success": True, "ts": "posted1"}),
         update_message=AsyncMock(return_value=True),
         set_assistant_status=AsyncMock(return_value=True),
         clear_assistant_status=AsyncMock(return_value=True),
@@ -95,6 +96,85 @@ async def test_status_only_surface_degrades_to_set_status():
 
     await c.complete()
     client.clear_assistant_status.assert_awaited_once_with("C1", "T1")
+
+
+# ---------------- prefer_message: force a visible message on status-only surfaces ----------------
+
+@pytest.mark.asyncio
+async def test_prefer_message_posts_real_message_when_status_only():
+    # send_thinking_indicator returns None (status-only surface), but prefer_message
+    # forces a real thread message via send_message_get_ts instead of degrading.
+    client = _client(send_thinking_indicator=AsyncMock(return_value=None))
+    c = ProgressChecklist(client, "C1", "T1", min_edit_interval=0, prefer_message=True)
+    await c.step("Generating image…", done_text="Generated image")
+
+    assert c.surface == "message"
+    assert c.message_id == "posted1"
+    assert c.mirrors_status is True
+    # The message was created (not degraded to composer-status-only).
+    client.send_message_get_ts.assert_awaited_once()
+    # The created message carries the invisible history-filter marker.
+    created_text = client.send_message_get_ts.await_args.args[2]
+    assert CHECKLIST_STATUS_MARKER in created_text
+    assert "Generating image…" in created_text
+
+
+@pytest.mark.asyncio
+async def test_prefer_message_mirrors_active_step_to_status_and_clears():
+    client = _client(send_thinking_indicator=AsyncMock(return_value=None))
+    c = ProgressChecklist(client, "C1", "T1", min_edit_interval=0, prefer_message=True)
+
+    await c.step("Generating image…", done_text="Generated image")
+    # Dual display: active step mirrored into the composer status too.
+    client.set_assistant_status.assert_awaited_with("C1", "T1", status="Generating image…")
+
+    await c.step("Uploading…")
+    client.set_assistant_status.assert_awaited_with("C1", "T1", status="Uploading…")
+
+    await c.complete()
+    # The checklist owns clearing the mirrored status on terminal.
+    client.clear_assistant_status.assert_awaited_once_with("C1", "T1")
+
+
+@pytest.mark.asyncio
+async def test_prefer_message_delete_after_still_deletes():
+    client = _client(send_thinking_indicator=AsyncMock(return_value=None))
+    c = ProgressChecklist(client, "C1", "T1", min_edit_interval=0, prefer_message=True)
+    await c.step("Generating image…", done_text="Generated image")
+    await c.complete(delete_after=0.01)
+    client.delete_message.assert_not_awaited()  # not yet
+    await asyncio.sleep(0.05)
+    client.delete_message.assert_awaited_once_with("C1", "posted1")
+
+
+@pytest.mark.asyncio
+async def test_prefer_message_off_reverts_to_status_degradation():
+    # Even with send_message_get_ts available, prefer_message=False (config off) keeps
+    # today's degradation: no message posted, composer status carries the active step.
+    client = _client(send_thinking_indicator=AsyncMock(return_value=None))
+    c = ProgressChecklist(client, "C1", "T1", min_edit_interval=0, prefer_message=False)
+    await c.step("Generating image…", done_text="Generated image")
+
+    assert c.surface == "assistant_status"
+    assert c.message_id is None
+    assert c.mirrors_status is False
+    client.send_message_get_ts.assert_not_awaited()
+    client.update_message.assert_not_awaited()
+    client.set_assistant_status.assert_awaited_once_with("C1", "T1", status="Generating image…")
+
+
+@pytest.mark.asyncio
+async def test_prefer_message_with_real_thinking_ts_does_not_mirror():
+    # send_thinking_indicator returns a real ts (setStatus failed → no status surface):
+    # normal message surface, no mirror even though prefer_message is on.
+    client = _client()  # send_thinking_indicator → "msg1"
+    c = ProgressChecklist(client, "C1", "T1", min_edit_interval=0, prefer_message=True)
+    await c.step("Generating image…")
+    assert c.surface == "message"
+    assert c.message_id == "msg1"
+    assert c.mirrors_status is False
+    client.send_message_get_ts.assert_not_awaited()
+    client.set_assistant_status.assert_not_awaited()
 
 
 # ---------------- fail keeps the message visible ----------------
@@ -245,16 +325,20 @@ class _ImgHost:
     log_debug = log_warning = log_error = log_info
 
 
-def _img_client():
-    return SimpleNamespace(
+def _img_client(**overrides):
+    client = SimpleNamespace(
         supports_streaming=lambda: True,
         get_streaming_config=lambda: {},
         send_thinking_indicator=AsyncMock(return_value="gen1"),
+        send_message_get_ts=AsyncMock(return_value={"success": True, "ts": "posted1"}),
         update_message=AsyncMock(return_value=True),
         delete_message=AsyncMock(return_value=True),
         set_assistant_status=AsyncMock(return_value=True),
         clear_assistant_status=AsyncMock(return_value=True),
     )
+    for key, value in overrides.items():
+        setattr(client, key, value)
+    return client
 
 
 def _img_openai():
@@ -312,3 +396,55 @@ async def test_rotator_started_when_checklist_disabled(mock_env, monkeypatch):
         "a cat", _thread_state(), client, "C1", "think1", _message())
 
     host._start_progress_updater_async.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_image_gen_prefer_message_posts_visible_message_on_status_only(mock_env, monkeypatch):
+    # Status-only surface (send_thinking_indicator → None), prefer_message config on:
+    # the image pipeline must still post a real visible checklist message.
+    monkeypatch.setattr(config, "enable_progress_checklist", True)
+    monkeypatch.setattr(config, "progress_checklist_prefer_message", True)
+    monkeypatch.setattr(
+        config, "get_thread_config_async",
+        AsyncMock(return_value={
+            "enable_streaming": True, "image_model": "gpt-image-1",
+            "image_size": "1024x1024", "image_quality": "auto",
+            "image_background": "auto"}))
+    client = _img_client(send_thinking_indicator=AsyncMock(return_value=None))
+    host = _ImgHost(client, _img_openai())
+
+    resp = await host._handle_image_generation(
+        "a cat", _thread_state(), client, "C1", None, _message())
+
+    # A real message was posted (not degraded to status-only) and its ts recorded.
+    client.send_message_get_ts.assert_awaited()
+    checklist = resp.metadata.get("checklist")
+    assert checklist is not None
+    assert checklist.surface == "message"
+    assert checklist.mirrors_status is True
+    assert resp.metadata.get("status_message_id") == "posted1"
+
+
+@pytest.mark.asyncio
+async def test_image_gen_prefer_message_off_degrades_to_status(mock_env, monkeypatch):
+    # prefer_message config off → today's degradation: no visible message, status only.
+    monkeypatch.setattr(config, "enable_progress_checklist", True)
+    monkeypatch.setattr(config, "progress_checklist_prefer_message", False)
+    monkeypatch.setattr(
+        config, "get_thread_config_async",
+        AsyncMock(return_value={
+            "enable_streaming": True, "image_model": "gpt-image-1",
+            "image_size": "1024x1024", "image_quality": "auto",
+            "image_background": "auto"}))
+    client = _img_client(send_thinking_indicator=AsyncMock(return_value=None))
+    host = _ImgHost(client, _img_openai())
+
+    resp = await host._handle_image_generation(
+        "a cat", _thread_state(), client, "C1", None, _message())
+
+    checklist = resp.metadata.get("checklist")
+    assert checklist is not None
+    assert checklist.surface == "assistant_status"
+    assert checklist.message_id is None
+    # No status_message_id stored (message_id is None on the degraded surface).
+    assert resp.metadata.get("status_message_id") is None

@@ -37,12 +37,20 @@ class ProgressChecklist:
 
     def __init__(self, client, channel_id: str, thread_id: Optional[str],
                  message_id: Optional[str] = None,
-                 min_edit_interval: float = 0.8):
+                 min_edit_interval: float = 0.8,
+                 prefer_message: bool = False):
         self._client = client
         self._channel_id = channel_id
         self._thread_id = thread_id
         self._message_id = message_id
         self._min_interval = min_edit_interval
+        # When True, a status-only surface still gets a real visible checklist message
+        # (posted lazily via send_message_get_ts) instead of degrading to the composer
+        # status, and the active step is mirrored into that status too (dual display).
+        self._prefer_message = prefer_message
+        # Set only when the force-message path fires: the message is the primary surface
+        # AND the composer status is mirrored, so terminal/abort must clear the status.
+        self._mirror_status = False
 
         # A caller-supplied message id fixes the surface up front; otherwise it is
         # resolved on the first flush via send_thinking_indicator.
@@ -66,6 +74,11 @@ class ProgressChecklist:
     @property
     def surface(self) -> str:
         return self._surface or "none"
+
+    @property
+    def mirrors_status(self) -> bool:
+        """True when the force-message surface is also mirroring the composer status."""
+        return self._mirror_status
 
     async def step(self, active_text: str, done_text: Optional[str] = None) -> None:
         """Complete the current active step and start a new one."""
@@ -126,6 +139,15 @@ class ProgressChecklist:
         if msg_id:
             self._message_id = msg_id
             self._surface = "message"
+        elif (self._prefer_message and self._channel_id and self._thread_id
+              and hasattr(self._client, "send_message_get_ts")):
+            # Force a visible checklist message even though the assistant-status surface
+            # is available (send_thinking_indicator returned None because setStatus
+            # succeeded). The message is posted lazily on the first flush so its first
+            # write already carries the rendered steps; the active step is ALSO mirrored
+            # into the composer status (dual display).
+            self._surface = "message"
+            self._mirror_status = hasattr(self._client, "set_assistant_status")
         elif (hasattr(self._client, "set_assistant_status")
               and self._channel_id and self._thread_id):
             self._surface = "assistant_status"
@@ -169,25 +191,73 @@ class ProgressChecklist:
     async def _edit(self) -> None:
         """Render the current (non-terminal) state to the active surface."""
         if self._surface == "message":
-            if self._message_id and hasattr(self._client, "update_message"):
+            just_created = await self._ensure_message_posted()
+            if not just_created and self._message_id and hasattr(self._client, "update_message"):
                 ok = await self._client.update_message(
                     self._channel_id, self._message_id, self._message_body())
                 if ok is False:
                     logger.debug("checklist edit failed; keeping state for next flush")
+            await self._mirror_active_status()
         elif self._surface == "assistant_status":
             if self._active and hasattr(self._client, "set_assistant_status"):
                 await self._client.set_assistant_status(
                     self._channel_id, self._thread_id, status=self._active)
         self._last_edit_time = self._now()
 
+    async def _ensure_message_posted(self) -> bool:
+        """Lazily post the force-message checklist message with the current rendering.
+
+        Returns True only when it creates the message on this call (so the caller can
+        skip a redundant immediate update — the create already carried the body). A
+        no-op returning False once a message id exists or off the force-message path.
+        A create failure is swallowed and retried on the next flush.
+        """
+        if self._message_id is not None or not self._prefer_message:
+            return False
+        if not hasattr(self._client, "send_message_get_ts"):
+            return False
+        try:
+            res = await self._client.send_message_get_ts(
+                self._channel_id, self._thread_id, self._message_body())
+            if res and res.get("success") and res.get("ts"):
+                self._message_id = res["ts"]
+                return True
+        except Exception:  # noqa: BLE001 — a UI failure must never break the pipeline
+            logger.debug("checklist message create failed", exc_info=True)
+        return False
+
+    async def _mirror_active_status(self) -> None:
+        """Best-effort dual display: reflect the active step in the composer status too.
+        Only fires on the force-message surface; failures never raise."""
+        if not self._mirror_status or not self._active:
+            return
+        if hasattr(self._client, "set_assistant_status"):
+            try:
+                await self._client.set_assistant_status(
+                    self._channel_id, self._thread_id, status=self._active)
+            except Exception:  # noqa: BLE001 — mirror is best-effort
+                logger.debug("checklist status mirror failed", exc_info=True)
+
+    async def _clear_mirror_status(self) -> None:
+        """Clear the mirrored composer status (checklist owns this clear)."""
+        if hasattr(self._client, "clear_assistant_status"):
+            try:
+                await self._client.clear_assistant_status(self._channel_id, self._thread_id)
+            except Exception:  # noqa: BLE001 — best-effort
+                logger.debug("checklist status mirror clear failed", exc_info=True)
+
     async def _terminal_flush(self) -> None:
         elapsed = self._now() - self._last_edit_time
         if elapsed < self._min_interval:
             await asyncio.sleep(self._min_interval - elapsed)
         if self._surface == "message":
-            if self._message_id and hasattr(self._client, "update_message"):
+            just_created = await self._ensure_message_posted()
+            if not just_created and self._message_id and hasattr(self._client, "update_message"):
                 await self._client.update_message(
                     self._channel_id, self._message_id, self._message_body())
+            if self._mirror_status:
+                # Dual-display: the checklist owns clearing the mirrored composer status.
+                await self._clear_mirror_status()
         elif self._surface == "assistant_status":
             # The checklist owns the composer status clear on this surface.
             if hasattr(self._client, "clear_assistant_status"):

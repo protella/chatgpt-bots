@@ -130,7 +130,8 @@ class ImageGenerationMixin:
                 # The checklist owns the generating-status message; the legacy rotator
                 # would overwrite its accumulated steps, so it is NOT started here (F4).
                 checklist = ProgressChecklist(client, channel_id, thread_state.thread_ts,
-                                              message_id=generating_id)
+                                              message_id=generating_id,
+                                              prefer_message=config.progress_checklist_prefer_message)
                 await checklist.step(
                     pipeline_status("generating_image", "Generating image. This may take a minute…"),
                     done_text="Generated image",
@@ -238,7 +239,8 @@ class ImageGenerationMixin:
             # Non-streaming fallback or skip enhancement
             if config.enable_progress_checklist:
                 checklist = ProgressChecklist(client, channel_id, thread_state.thread_ts,
-                                              message_id=thinking_id)
+                                              message_id=thinking_id,
+                                              prefer_message=config.progress_checklist_prefer_message)
                 if not skip_enhancement:
                     await checklist.step(
                         pipeline_status("enhancing_prompt", "Enhancing your prompt…"),
@@ -481,8 +483,13 @@ class ImageGenerationMixin:
             if checklist.surface == "assistant_status":
                 if hasattr(client, "clear_assistant_status"):
                     await client.clear_assistant_status(channel_id, thread_id)
-            elif checklist.message_id and hasattr(client, "delete_message"):
-                await client.delete_message(channel_id, checklist.message_id)
+            else:
+                # A force-message checklist also mirrors the composer status — clear it
+                # too so no status bubble lingers after the message is deleted.
+                if checklist.mirrors_status and hasattr(client, "clear_assistant_status"):
+                    await client.clear_assistant_status(channel_id, thread_id)
+                if checklist.message_id and hasattr(client, "delete_message"):
+                    await client.delete_message(channel_id, checklist.message_id)
         except Exception as e:  # noqa: BLE001
             self.log_warning(f"Failed to clear checklist surface: {e}")
 
