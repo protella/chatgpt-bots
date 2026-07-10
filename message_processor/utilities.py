@@ -1182,7 +1182,7 @@ class MessageUtilitiesMixin:
         thread_id — the composer status changes instead of a message edit.
         """
         if thinking_id and hasattr(client, 'update_message'):
-            status_emoji = emoji or config.thinking_emoji
+            status_emoji = emoji or config.circle_loader_emoji
             # Schedule the async call as a task to avoid blocking
             self._schedule_async_call(client.update_message(
                 channel_id,
@@ -1242,7 +1242,7 @@ class MessageUtilitiesMixin:
 
                     try:
                         # Use streaming update method with appropriate emoji
-                        status_emoji = emoji or config.thinking_emoji
+                        status_emoji = emoji or config.circle_loader_emoji
                         progress_msg_with_emoji = f"{status_emoji} {progress_msg}"
                         result = await client.update_message_streaming(channel_id, thinking_id, progress_msg_with_emoji)
                         if result["success"]:
@@ -1296,7 +1296,7 @@ class MessageUtilitiesMixin:
                         # Pick a random message from unused pool
                         progress_msg = random.choice(unused_messages)
                         unused_messages.remove(progress_msg)
-                        status_emoji = emoji or config.thinking_emoji
+                        status_emoji = emoji or config.circle_loader_emoji
                         progress_msg_with_emoji = f"{status_emoji} {progress_msg}"
                         result = await client.update_message_streaming(channel_id, thinking_id, progress_msg_with_emoji)
                         if not result["success"]:
@@ -1347,7 +1347,7 @@ class MessageUtilitiesMixin:
                 # Update message
                 progress_msg = messages[message_index]
                 try:
-                    self._update_status(client, channel_id, thinking_id, progress_msg, emoji=config.thinking_emoji)
+                    self._update_status(client, channel_id, thinking_id, progress_msg, emoji=config.circle_loader_emoji)
                 except Exception as e:
                     self.log_error(f"Failed to update progress: {e}")
                     break
@@ -1402,7 +1402,7 @@ class MessageUtilitiesMixin:
                             unused_messages.remove(progress_msg)
                             self._update_status(client, channel_id, thinking_id,
                                              progress_msg,
-                                             emoji=config.thinking_emoji)
+                                             emoji=config.circle_loader_emoji)
                         except Exception:
                             break
 

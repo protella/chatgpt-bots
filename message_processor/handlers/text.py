@@ -1075,7 +1075,7 @@ class TextHandlerMixin:
         # Start progress updater before making API call
         try:
             progress_task = await self._start_progress_updater_async(
-                client, message.channel_id, message_id, "request", emoji=config.thinking_emoji
+                client, message.channel_id, message_id, "request", emoji=config.circle_loader_emoji
             )
             self.log_debug("Started progress updater task")
         except Exception as e:

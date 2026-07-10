@@ -1207,7 +1207,7 @@ class ThreadManagementMixin:
                     message.channel_id,
                     thinking_id,
                     pipeline_status("optimizing_history", f"Optimizing conversation history ({current_tokens:,}/{max_tokens:,} tokens)…"),
-                    emoji=config.thinking_emoji
+                    emoji=config.circle_loader_emoji
                 )
 
             # Phase S: one chunky compaction to target; the dropped span rolls into the
