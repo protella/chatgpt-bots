@@ -113,10 +113,13 @@ class ImageEditMixin:
     ) -> Response:
         """Handle image modification request by finding and editing the target image"""
         # Don't update status yet - we might fall back to generation
-        
+
         # Initialize response metadata early to track status messages
         response_metadata = {}
-        
+        # Owned by whichever branch sets it up; threaded to main.py so F4's status
+        # message is completed in place rather than overwritten (delivery-seam handoff).
+        checklist = None
+
         # Try to find target image URL from conversation
         target_url = await self._find_target_image(text, thread_state, client)
         
@@ -216,7 +219,7 @@ class ImageEditMixin:
                                 if pid is None:
                                     if not prompt_ref["creating"]:
                                         prompt_ref["creating"] = True
-                                        self._schedule_async_call(self._lazy_create_prompt_ref(
+                                        prompt_ref["task"] = self._schedule_async_call(self._lazy_create_prompt_ref(
                                             client, channel_id, thread_state.thread_ts, display_text, prompt_ref))
                                     return
                                 result = self._update_message_streaming_sync(client, channel_id, pid, display_text)
@@ -366,7 +369,10 @@ class ImageEditMixin:
                             "url": None  # Will be updated after upload
                         }
                     )
-                    
+
+                    response_metadata["image_type"] = "edited"
+                    if checklist is not None:
+                        response_metadata["checklist"] = checklist
                     return Response(
                         type="image",
                         content=edited_image,
@@ -561,6 +567,7 @@ class ImageEditMixin:
         
         # Check if streaming is supported for enhancement
         response_metadata = {}
+        checklist = None  # threaded to main.py so F4's status message is completed in place
         streaming_enabled = thread_config.get('enable_streaming', config.enable_streaming)
         if hasattr(client, 'supports_streaming') and client.supports_streaming() and streaming_enabled:
             # Stream the enhancement to user with proper rate limiting
@@ -598,7 +605,7 @@ class ImageEditMixin:
                     if pid is None:
                         if not prompt_ref["creating"]:
                             prompt_ref["creating"] = True
-                            self._schedule_async_call(self._lazy_create_prompt_ref(
+                            prompt_ref["task"] = self._schedule_async_call(self._lazy_create_prompt_ref(
                                 client, channel_id, thread_state.thread_ts, display_text, prompt_ref))
                         return
                     result = self._update_message_streaming_sync(client, channel_id, pid, display_text)
@@ -716,6 +723,17 @@ class ImageEditMixin:
                 )
         else:
             # Non-streaming fallback
+            if config.enable_progress_checklist and thinking_id:
+                # F4 on the non-streaming edit path too — own the thinking message so the
+                # edit step shows and gets completed by the delivery seam.
+                checklist = ProgressChecklist(client, channel_id, thread_state.thread_ts,
+                                              message_id=thinking_id)
+                await checklist.step(
+                    pipeline_status("editing_image", "Editing your image. This may take a minute…"),
+                    done_text="Edited image",
+                )
+                if checklist.message_id:
+                    response_metadata["status_message_id"] = checklist.message_id
             # Use the edit_image API with separated inputs
             try:
                 image_data = await self.openai_client.edit_image(
@@ -779,7 +797,10 @@ class ImageEditMixin:
                 "url": None  # Will be updated after upload
             }
         )
-        
+
+        response_metadata["image_type"] = "edited"
+        if checklist is not None:
+            response_metadata["checklist"] = checklist
         return Response(
             type="image",
             content=image_data,

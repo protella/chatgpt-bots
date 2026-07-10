@@ -915,7 +915,8 @@ class ThreadManagementMixin:
             # Full-history rebuild (and a brand-new thread, whose only history IS the
             # current message): the earliest fetched message is the root. Summary-tail
             # rebuild: the root is before the fetched window — fetch it explicitly, once.
-            if thread_state.root_author is None:
+            # Guarded by the feature flag so a disabled envelope makes no extra API call.
+            if config.enable_wake_envelope and thread_state.root_author is None:
                 try:
                     if summary_boundary is None and history:
                         root_hist = history[0]

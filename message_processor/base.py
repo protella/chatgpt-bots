@@ -131,7 +131,8 @@ class MessageProcessor(ThreadManagementMixin,
             # F3: if the root author is still unknown and THIS message is the thread root
             # (a new top-level message whose warm state skipped the rebuild), the sender is
             # the root author.
-            if getattr(thread_state, "root_author", None) is None and message.metadata:
+            if (config.enable_wake_envelope
+                    and getattr(thread_state, "root_author", None) is None and message.metadata):
                 if message.metadata.get("ts") == thread_state.thread_ts:
                     thread_state.root_author = (message.user_id, message.metadata.get("sender_type"))
 
@@ -628,10 +629,14 @@ class MessageProcessor(ThreadManagementMixin,
             # Generate response based on intent
             if _gen_in_flight:
                 self.log_info(f"Image intent '{intent}' rejected — a generation is already in flight on {thread_key}")
-                response = Response(
-                    type="text",
-                    content="Still working on the previous image — ask me again once it lands.",
-                )
+                rejection_msg = "Still working on the previous image — ask me again once it lands."
+                # Record the exchange in warm state so a conversational turn BEFORE the
+                # generation lands can see it (the background refresh only repairs it later).
+                message_ts = message.metadata.get("ts") if message.metadata else None
+                formatted_request = self._format_user_content_with_username(message.text or "", message)
+                self._add_message_with_token_management(thread_state, "user", formatted_request, db=self.db, thread_key=thread_key, message_ts=message_ts)
+                self._add_message_with_token_management(thread_state, "assistant", rejection_msg, db=self.db, thread_key=thread_key)
+                response = Response(type="text", content=rejection_msg)
             elif intent == "new_image":
                 response = await self._handle_image_generation(message.text, thread_state, client, message.channel_id, thinking_id, message, allow_background=True)
             elif intent == "edit_image":

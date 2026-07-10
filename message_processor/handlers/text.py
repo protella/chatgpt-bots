@@ -397,6 +397,18 @@ class TextHandlerMixin:
                           "posted": False}
             )
 
+        # Bare empty response with no terminal tool and no reaction (contract violation /
+        # glitch): decide the empty outcome HERE, before any assistant-state append or
+        # post-response memory cleanup — never persist an empty assistant turn. main.py
+        # logs the WARNING and burns no quota.
+        if not (response_text or "").strip():
+            self.log_warning("Empty non-streaming response without a terminal action — posting nothing")
+            return Response(
+                type="text",
+                content="",
+                metadata={"model": thread_config.get("model"), "posted": False}
+            )
+
         # Attribution lists only EXTERNAL sources (web_search + MCP servers). Local
         # context tools (history fetches, reactions, memory ops) are plumbing, not
         # sources — never shown.
@@ -1253,7 +1265,10 @@ class TextHandlerMixin:
                     type="text",
                     content="",
                     metadata={"streamed": True, "reaction_only": True,
-                              "model": thread_config.get("model")}
+                              "model": thread_config.get("model"),
+                              # No visible content went out — must not burn the quota
+                              # (streamed=True would otherwise read as posted).
+                              "posted": False}
                 )
 
             # Build list of tools used (unified attribution). EXTERNAL sources only

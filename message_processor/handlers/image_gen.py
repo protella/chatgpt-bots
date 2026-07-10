@@ -86,7 +86,7 @@ class ImageGenerationMixin:
                         # editing until its ts lands (a chunk or two may be dropped).
                         if not prompt_ref["creating"]:
                             prompt_ref["creating"] = True
-                            self._schedule_async_call(self._lazy_create_prompt_ref(
+                            prompt_ref["task"] = self._schedule_async_call(self._lazy_create_prompt_ref(
                                 client, channel_id, thread_state.thread_ts, display_text, prompt_ref))
                         return
                     result = self._update_message_streaming_sync(client, channel_id, pid, display_text)
@@ -157,6 +157,10 @@ class ImageGenerationMixin:
 
             # F1: detach the slow generation into a background job (lock releases).
             if config.enable_background_image_gen and allow_background:
+                # Stop the legacy rotator before detaching — otherwise (checklist off) it
+                # keeps editing the generating-status message forever after we return.
+                if progress_task and not progress_task.done():
+                    progress_task.cancel()
                 return await self._start_background_generation(
                     thread_state=thread_state, message=message, client=client,
                     channel_id=channel_id, prompt=prompt, final_prompt=enhanced_prompt,
@@ -329,7 +333,13 @@ class ImageGenerationMixin:
         # Note: response_metadata already initialized and populated above
         if hasattr(client, 'supports_streaming') and client.supports_streaming() and streaming_enabled:
             response_metadata["streamed"] = True
-            
+
+        # Hand the live checklist to the delivery seam (main.py) so F4's status message
+        # is completed in place instead of overwritten. image_type drives the DB row.
+        response_metadata["image_type"] = "generated"
+        if checklist is not None:
+            response_metadata["checklist"] = checklist
+
         return Response(
             type="image",
             content=image_data,
@@ -358,7 +368,8 @@ class ImageGenerationMixin:
                 client=client, channel_id=channel_id, thread_id=thread_state.thread_ts,
                 thread_key=thread_key, prompt=final_prompt, enhance=enhance,
                 conversation_history=conversation_history, thread_config=thread_config,
-                checklist=checklist, generation_id=generation_id, message=message))
+                checklist=checklist, generating_id=generating_id,
+                generation_id=generation_id, message=message))
         except Exception as e:
             # Scheduling failed — the job will never run. Clear the registry (the latch
             # isn't started until process_message's return guard, so nothing to release)
@@ -376,7 +387,7 @@ class ImageGenerationMixin:
 
     async def _finish_image_generation_background(self, *, client, channel_id, thread_id,
             thread_key, prompt, enhance, conversation_history, thread_config, checklist,
-            generation_id, message) -> None:
+            generating_id, generation_id, message) -> None:
         """Background half of new-image generation (F1): the slow generate_image call plus
         delivery, run after the thread lock has already released."""
         from message_processor.image_delivery import publish_image
@@ -404,6 +415,11 @@ class ImageGenerationMixin:
                 # (recoverable via the post-refresh Slack rebuild).
                 await client.handle_error(channel_id, thread_id,
                     "⚠️ I generated the image but couldn't post it. Please try again.")
+        except asyncio.CancelledError:
+            # Shutdown/cancel: clear the progress surface (message-surface checklists too,
+            # which the finally's status-only clear wouldn't reach), then let finally run.
+            await self._abort_checklist(checklist, client, channel_id, thread_id)
+            raise
         except Exception as e:  # noqa: BLE001
             error_str = str(e)
             if ("moderation_blocked" in error_str or "safety system" in error_str
@@ -430,12 +446,20 @@ class ImageGenerationMixin:
                 except Exception:
                     pass
         finally:
-            # Best-effort: clear a status-only progress surface on every path.
-            if status_only and hasattr(client, "clear_assistant_status"):
-                try:
+            # Clear the progress surface on every path. With a checklist: only status-only
+            # surfaces here (complete/fail already handled message surfaces). Without a
+            # checklist (config-off background): delete the plain generating-status message,
+            # or clear the composer status if the surface was status-only (generating_id None).
+            try:
+                if checklist is not None:
+                    if status_only and hasattr(client, "clear_assistant_status"):
+                        await client.clear_assistant_status(channel_id, thread_id)
+                elif generating_id and hasattr(client, "delete_message"):
+                    await client.delete_message(channel_id, generating_id)
+                elif not generating_id and hasattr(client, "clear_assistant_status"):
                     await client.clear_assistant_status(channel_id, thread_id)
-                except Exception:
-                    pass
+            except Exception:
+                pass
             # ID-conditional clear: a watchdog-cleared zombie must never clear a newer
             # job or release its latch. finish_generation returns True only when THIS job
             # is still the registered one.
@@ -488,6 +512,14 @@ class ImageGenerationMixin:
     async def _resolve_prompt_message(self, client, channel_id, thread_ts, prompt_ref, text) -> Optional[str]:
         """Final enhanced-prompt write: edit the existing message, or create one if none
         exists yet (status-only surface, or the lazy create lost the race)."""
+        # If a lazy first-post is still in flight, wait for it — otherwise we'd post a
+        # SECOND message and the pending task would then clobber prompt_ref["id"].
+        pending = prompt_ref.get("task")
+        if pending is not None:
+            try:
+                await pending
+            except Exception:
+                pass
         pid = prompt_ref.get("id")
         if pid:
             result = self._update_message_streaming_sync(client, channel_id, pid, text)
