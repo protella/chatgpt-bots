@@ -142,10 +142,14 @@ class ImageGenerationMixin:
 
                 error_str = str(e)
                 if "moderation_blocked" in error_str or "safety system" in error_str or "content policy" in error_str.lower():
-                    # Clean up status message
+                    # Clean up status message — best-effort; the friendly
+                    # moderation reply below must still go out if this fails.
                     if "status_message_id" in response_metadata:
                         if hasattr(client, 'delete_message'):
-                            client.delete_message(channel_id, response_metadata["status_message_id"])
+                            try:
+                                await client.delete_message(channel_id, response_metadata["status_message_id"])
+                            except Exception as delete_error:
+                                self.log_warning(f"Failed to delete status message: {delete_error}")
                     
                     # Provide friendly message
                     moderation_msg = (

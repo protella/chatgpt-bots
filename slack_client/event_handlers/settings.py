@@ -136,6 +136,15 @@ class SlackSettingsHandlersMixin:
                 self.log_info(f"Channel settings modal opened for {channel_id} by {user_id} (footer button)")
             except Exception as e:
                 self.log_error(f"Error opening channel settings modal from footer: {e}")
+                # The user clicked a button — silence reads as a dead button.
+                try:
+                    await client.chat_postEphemeral(
+                        channel=channel_id,
+                        user=user_id,
+                        text="⚠️ Couldn't open settings — please try again."
+                    )
+                except Exception:
+                    pass
 
         @self.app.view("channel_settings_modal")
         async def handle_channel_settings_submission(ack, body, view, client):

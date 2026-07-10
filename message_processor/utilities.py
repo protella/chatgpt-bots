@@ -380,9 +380,25 @@ class MessageUtilitiesMixin:
                         
                         image_count += 1
                         self.log_debug(f"Processed image {image_count}/{max_images}: {file_name}")
-                
+                    else:
+                        # Silently answering as if the file were never attached
+                        # reads as the bot being obtuse — surface the failure.
+                        self.log_warning(f"Failed to download image attachment: {file_name}")
+                        unsupported_files.append({
+                            "name": file_name,
+                            "type": "image",
+                            "mimetype": attachment.get("mimetype", "unknown"),
+                            "error": "download_failed"
+                        })
+
                 except Exception as e:
                     self.log_error(f"Error processing attachment: {e}")
+                    unsupported_files.append({
+                        "name": file_name,
+                        "type": "image",
+                        "mimetype": attachment.get("mimetype", "unknown"),
+                        "error": "download_failed"
+                    })
             elif self.document_handler and self.document_handler.is_document_file(file_name, attachment.get("mimetype")):
                 # Process document file
                 mimetype = attachment.get("mimetype", "application/octet-stream")
@@ -519,7 +535,17 @@ class MessageUtilitiesMixin:
                                 "type": "file",
                                 "mimetype": mimetype
                             })
-                
+                    else:
+                        # Download failed — tell the user instead of answering
+                        # as if the document were never attached.
+                        self.log_warning(f"Failed to download document attachment: {file_name}")
+                        unsupported_files.append({
+                            "name": file_name,
+                            "type": "file",
+                            "mimetype": mimetype,
+                            "error": "download_failed"
+                        })
+
                 except Exception as e:
                     self.log_error(f"Error processing document attachment: {e}")
                     # Add to unsupported if processing failed
@@ -689,6 +715,13 @@ class MessageUtilitiesMixin:
                             self.log_warning(f"Unknown file type or image limit reached for Slack URL: {url}")
                     else:
                         self.log_warning(f"Failed to download Slack file from URL: {url}")
+                        filename_match = re.search(r'/([^/?]+)(\?|$)', url)
+                        unsupported_files.append({
+                            "name": filename_match.group(1) if filename_match else url,
+                            "type": "file",
+                            "mimetype": "unknown",
+                            "error": "download_failed"
+                        })
             
             # Now check for external image URLs (excluding already-processed Slack URLs)
             # Create a modified text with Slack URLs removed to avoid double-processing
@@ -730,6 +763,13 @@ class MessageUtilitiesMixin:
             
             if failed_urls:
                 self.log_warning(f"Failed to download images from URLs: {', '.join(failed_urls)}")
+                for failed_url in failed_urls:
+                    unsupported_files.append({
+                        "name": failed_url,
+                        "type": "image",
+                        "mimetype": "unknown",
+                        "error": "download_failed"
+                    })
         
         return image_inputs, document_inputs, unsupported_files
 
