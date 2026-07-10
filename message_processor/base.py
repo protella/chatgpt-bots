@@ -270,7 +270,7 @@ class MessageProcessor(ThreadManagementMixin,
                     message.channel_id,
                     thinking_id,
                     pipeline_status("optimizing_history", f"Optimizing conversation history ({projected_tokens:,}/{max_tokens:,} tokens)…"),
-                    emoji=config.thinking_emoji, thread_id=message.thread_id)
+                    emoji=config.circle_loader_emoji, thread_id=message.thread_id)
 
                 total_trimmed = 0
 
