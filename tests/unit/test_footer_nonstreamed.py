@@ -185,3 +185,24 @@ async def test_main_degrades_to_fallback_when_no_blocks_built():
     assert resp.metadata.get("footer_attached") is not True
     # Falls back to the separate trailing footer post.
     client.maybe_post_response_footer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_main_suppresses_separate_footer_when_send_failed():
+    # If the reply didn't actually post (send returned None → posted False), the separate
+    # footer must be suppressed — a footer under a message that never landed is orphaned.
+    bot = _make_bot()
+    client = _client()
+
+    async def _send_fail(channel_id, thread_id, text, blocks=None, meta_out=None):
+        return None  # send failed
+    client.send_message = AsyncMock(side_effect=_send_fail)
+    resp = Response(type="text", content="hello", metadata={"streamed": False, "model": "m"})
+    bot.processor.process_message = AsyncMock(return_value=resp)
+    message = Message(text="q", user_id="U1", channel_id="D123", thread_id="T1",
+                      metadata={"ts": "200.0"})
+
+    await bot.handle_message(message, client)
+
+    assert resp.metadata.get("posted") is False
+    client.maybe_post_response_footer.assert_not_awaited()

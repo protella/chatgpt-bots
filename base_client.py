@@ -75,20 +75,25 @@ class BaseClient(ABC, LoggerMixin):
     
     @abstractmethod
     def send_message(self, channel_id: str, thread_id: str, text: str,
-                     blocks: Optional[list] = None) -> Optional[str]:
+                     blocks: Optional[list] = None,
+                     meta_out: Optional[dict] = None) -> Optional[str]:
         """Send a text message. Returns the posted message ts (truthy on success) or None
         on failure.
 
         `blocks`: optional platform chrome (e.g. a settings-footer actions row) to attach
         to the message itself; implementations that don't support blocks may ignore the
         kwarg (it always defaults to None, so callers passing blocks=None never break a
-        non-Slack impl)."""
+        non-Slack impl).
+        `meta_out`: optional caller-provided dict a platform MAY populate with delivery
+        facts (e.g. meta_out["footer_attached"]); implementations that don't report any
+        may ignore it. Both kwargs default to None so non-Slack impls stay compatible."""
         pass
 
     @abstractmethod
     async def send_message_async(self, channel_id: str, thread_id: str, text: str,
-                                 blocks: Optional[list] = None) -> Optional[str]:
-        """Send a text message (async version). See send_message for the blocks contract."""
+                                 blocks: Optional[list] = None,
+                                 meta_out: Optional[dict] = None) -> Optional[str]:
+        """Send a text message (async version). See send_message for the blocks/meta_out contract."""
         pass
 
     @abstractmethod
