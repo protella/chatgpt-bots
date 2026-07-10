@@ -262,6 +262,7 @@ class VisionHandlerMixin:
                     native_coord = NativeStreamCoordinator(
                         client, channel_id, message.thread_id,
                         char_limit=message_char_limit, logger=self.log_debug,
+                        user_id=message.user_id,
                     )
 
                 # Start progress updater task (will be cancelled when streaming starts)

@@ -55,10 +55,13 @@ class NativeStreamCoordinator:
     """
 
     def __init__(self, client, channel_id: str, thread_ts: Optional[str],
-                 char_limit: int, logger=None):
+                 char_limit: int, logger=None, user_id: Optional[str] = None):
         self._client = client
         self.channel = channel_id
         self.thread_ts = thread_ts
+        # Triggering user's id — chat.startStream needs it as recipient_user_id for
+        # channel streaming; forwarded to begin_native_stream on start() and roll.
+        self.user_id = user_id
         self.char_limit = max(200, char_limit)
         self._log = logger or (lambda msg: None)
         self.session = None
@@ -89,7 +92,7 @@ class NativeStreamCoordinator:
 
     async def start(self) -> bool:
         try:
-            self.session = self._client.begin_native_stream(self.channel, self.thread_ts)
+            self.session = self._client.begin_native_stream(self.channel, self.thread_ts, user_id=self.user_id)
             ok = await self.session.start()
         except Exception as e:  # noqa: BLE001 - best-effort sink, never fatal
             self._log(f"native coordinator start error: {e}")
@@ -138,7 +141,7 @@ class NativeStreamCoordinator:
         self.part += 1
         self.base = part_prefix_markdown(self.part) + (f"```{lang}\n" if in_block else "")
         try:
-            self.session = self._client.begin_native_stream(self.channel, self.thread_ts)
+            self.session = self._client.begin_native_stream(self.channel, self.thread_ts, user_id=self.user_id)
             ok = await self.session.start(self.base + overflow)
         except Exception as e:  # noqa: BLE001
             self._log(f"native coordinator roll-start error: {e}")

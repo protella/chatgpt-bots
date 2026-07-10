@@ -40,7 +40,7 @@ class _FakeSlackSDK:
         self.stopped = set()
 
     async def chat_startStream(self, channel, thread_ts=None, markdown_text=None,
-                               recipient_team_id=None):
+                               recipient_team_id=None, recipient_user_id=None):
         if self._fail_start:
             raise RuntimeError("startStream down")
         self._n += 1
@@ -68,8 +68,9 @@ class _FakeClient:
     def __init__(self, sdk):
         self.sdk = sdk
 
-    def begin_native_stream(self, channel_id, thread_id):
-        return NativeStreamSession(self.sdk, channel_id, thread_id, team_id="TEAM1")
+    def begin_native_stream(self, channel_id, thread_id, user_id=None):
+        return NativeStreamSession(self.sdk, channel_id, thread_id,
+                                   team_id="TEAM1", user_id=user_id or "U1")
 
 
 def _slack_stores(markdown: str) -> str:

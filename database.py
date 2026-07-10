@@ -2158,13 +2158,14 @@ class DatabaseManager(LoggerMixin):
 
     @staticmethod
     def _merge_tool_provenance(existing: List[Dict], new: List[Dict]) -> List[Dict]:
-        """Union two provenance lists by tool_name (existing first, then new tools).
+        """Merge two provenance lists (existing first, then new), ORDER-preserving.
 
-        Preserves existing entries and upgrades an empty gist to a later non-empty one; a
-        re-persist for the same reply thus only ever ACCUMULATES tools, never drops them.
-        Capped at 8 entries (MAX_PROVENANCE_ENTRIES)."""
+        A tool that genuinely ran more than once in a turn (same name, different gists) is
+        kept as multiple entries. Only EXACT duplicates (same name AND gist) are deduped, and
+        an empty-gist placeholder is UPGRADED in place by a later non-empty gist for the same
+        tool (the same execution, refined). A re-persist thus accumulates without dropping or
+        double-counting. Capped at 8 entries (MAX_PROVENANCE_ENTRIES)."""
         merged: List[Dict] = []
-        by_name: Dict[str, Dict] = {}
         for entry in list(existing or []) + list(new or []):
             if not isinstance(entry, dict):
                 continue
@@ -2172,14 +2173,17 @@ class DatabaseManager(LoggerMixin):
             if not name:
                 continue
             gist = entry.get("gist") or ""
-            if name in by_name:
-                cur = by_name[name]
-                if not (cur.get("gist") or "").strip() and gist.strip():
-                    cur["gist"] = gist  # upgrade empty -> non-empty
-            else:
-                e = {"tool_name": name, "gist": gist}
-                by_name[name] = e
-                merged.append(e)
+            if any(m["tool_name"] == name and m["gist"] == gist for m in merged):
+                continue  # exact duplicate — dedupe
+            if gist.strip():
+                placeholder = next(
+                    (m for m in merged if m["tool_name"] == name and not m["gist"].strip()), None)
+                if placeholder is not None:
+                    placeholder["gist"] = gist  # upgrade empty placeholder in place
+                    continue
+            elif any(m["tool_name"] == name and m["gist"].strip() for m in merged):
+                continue  # empty gist already covered by a non-empty entry for this tool
+            merged.append({"tool_name": name, "gist": gist})
         return merged[:8]
 
     async def save_tool_usage_async(self, channel_id: str, message_ts: str,
@@ -2194,6 +2198,11 @@ class DatabaseManager(LoggerMixin):
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute("PRAGMA journal_mode=WAL")
+                # BEGIN IMMEDIATE takes the write lock up front so the read-modify-write
+                # (SELECT existing → merge → UPSERT) is atomic against a concurrent
+                # persist for the same reply — otherwise two passes could each read the
+                # old row and the second would clobber the first's merged tools.
+                await db.execute("BEGIN IMMEDIATE")
                 existing: List[Dict] = []
                 async with db.execute(
                     "SELECT tools_json FROM message_tool_usage WHERE channel_id = ? AND message_ts = ?",

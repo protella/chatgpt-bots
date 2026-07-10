@@ -77,6 +77,19 @@ def test_record_event_recovery_log_never_raises():
     assert m._episode is None
 
 
+def test_check_logging_never_raises():
+    # A failing logger during a death/drought check must not crash the monitor cycle
+    # (all monitor logging is routed through the non-raising wrapper).
+    boom = MagicMock(side_effect=RuntimeError("log sink down"))
+    # Both events and ping-pong frozen → the ERROR path, which we make raise.
+    client = SimpleNamespace(last_ping_pong_time=time.time() - 9999)
+    m = SocketLivenessMonitor(client, timeout=600, log_info=MagicMock(),
+                              log_warning=MagicMock(), log_error=boom)
+    _stale(m, 9999)
+    m._check()                 # must not raise
+    assert m._episode == "error"  # episode still transitioned despite the failing logger
+
+
 # --------------------------------------------------------------- check logic
 
 def test_healthy_when_events_fresh():
