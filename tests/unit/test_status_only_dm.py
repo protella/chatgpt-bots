@@ -302,20 +302,20 @@ class TestStatusPlainText:
         assert _status_plain_text("") == "working on it…"
 
     @pytest.mark.asyncio
-    async def test_explicit_phase_status_is_bubble_only(self, monkeypatch):
-        # The composer bottom-bar line is retired: the status field goes out EMPTY
-        # (the API requires it) and the phase text rides as the single loading
-        # message, replacing any stored bubble rotation.
+    async def test_explicit_phase_status_sends_same_text_both_fields(self, monkeypatch):
+        # Slack renders nothing without a non-empty status ("" is the clear signal,
+        # verified live 2026-07-10), so a phase update sends ONE sanitized text in
+        # BOTH fields — identical surfaces, no mismatched dual indicator.
         from config import config
         monkeypatch.setattr(config, "enable_assistant_status", True)
         host = _MsgClient(SimpleNamespace(assistant_threads_setStatus=AsyncMock()))
         await host.set_assistant_status("D1", "1.0", status=":hourglass_flowing_sand: pulling it together…")
         kwargs = host.app.client.assistant_threads_setStatus.await_args.kwargs
-        assert kwargs["status"] == ""
+        assert kwargs["status"] == "⏳ pulling it together…"
         assert kwargs["loading_messages"] == ["⏳ pulling it together…"]
 
     @pytest.mark.asyncio
-    async def test_initial_indicator_samples_pool_sanitized(self, monkeypatch):
+    async def test_initial_indicator_picks_one_pool_message_both_fields(self, monkeypatch):
         from config import config
         monkeypatch.setattr(config, "enable_assistant_status", True)
         monkeypatch.setattr(config, "status_loading_messages_inline", True)
@@ -323,5 +323,18 @@ class TestStatusPlainText:
         host = _MsgClient(SimpleNamespace(assistant_threads_setStatus=AsyncMock()))
         await host.set_assistant_status("D1", "1.0")
         kwargs = host.app.client.assistant_threads_setStatus.await_args.kwargs
-        assert sorted(kwargs["loading_messages"]) == ["two…", "🔍 one…"]
+        assert kwargs["status"] in ("🔍 one…", "two…")
+        assert kwargs["loading_messages"] == [kwargs["status"]]
+
+    @pytest.mark.asyncio
+    async def test_clear_sends_bare_empty_status(self, monkeypatch):
+        # The API rejects loading_messages=[] and treats status="" as the clear —
+        # a clear must go out bare (needed explicitly after native-streamed replies,
+        # which never trip Slack's auto-clear).
+        from config import config
+        monkeypatch.setattr(config, "enable_assistant_status", True)
+        host = _MsgClient(SimpleNamespace(assistant_threads_setStatus=AsyncMock()))
+        assert await host.clear_assistant_status("D1", "1.0") is True
+        kwargs = host.app.client.assistant_threads_setStatus.await_args.kwargs
         assert kwargs["status"] == ""
+        assert "loading_messages" not in kwargs

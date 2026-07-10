@@ -674,24 +674,33 @@ class SlackMessagingMixin:
             return False
         if not hasattr(self.app.client, "assistant_threads_setStatus"):
             return False
-        # Slack renders the status in TWO places: the in-thread transient bubble
-        # (rotates loading_messages) and a composer bottom-bar line (the status
-        # string). The composer line is retired (user request 2026-07-10): the
-        # bubble is the sole indicator, matching Claude's surface. The API
-        # requires the status field, so it goes out EMPTY and loading_messages
-        # carries the visible text — a phase update as the single message
-        # (replacing any stored rotation; the bubble retains old frames when a
-        # call omits loading_messages), the initial no-args call as a random
-        # sample from the configured pool.
-        if loading_messages is not None:
-            msgs = loading_messages
+        # Slack API contract (verified live 2026-07-10): a NON-EMPTY `status`
+        # string is what renders — status:"" is the CLEAR signal and hides the
+        # indicator entirely, loading_messages never render without a status,
+        # and an empty loading_messages array is rejected ("must provide at
+        # least 1 items"). So every visible update sends ONE text in BOTH
+        # fields, keeping the in-thread transient and the composer line
+        # identical (mismatched texts read as two indicators; user screenshots
+        # 2026-07-09/10). Variety comes from the pools: the initial call picks
+        # a random loading message, phase updates pick a random stage variant.
+        # An explicit status="" (clear_assistant_status) goes out bare.
+        if status == "":
+            msgs = []  # clear: bare empty status, never loading_messages
+            status_text = ""
         elif status is not None:
-            msgs = [status]
+            msgs = loading_messages if loading_messages is not None else [status]
+            status_text = status
+        elif loading_messages:
+            msgs = loading_messages
+            status_text = loading_messages[0]
         else:
             pool = config.get_loading_messages() or [config.status_loading_fallback]
-            msgs = random.sample(pool, min(5, len(pool)))
+            pick = random.choice(pool)
+            msgs = [pick]
+            status_text = pick
         try:
-            kwargs = {"channel_id": channel_id, "thread_ts": thread_id, "status": ""}
+            kwargs = {"channel_id": channel_id, "thread_ts": thread_id,
+                      "status": _status_plain_text(status_text) if status_text else ""}
             texts = [t for t in (_status_plain_text(m) for m in msgs) if t]
             if texts:
                 kwargs["loading_messages"] = texts
@@ -707,8 +716,10 @@ class SlackMessagingMixin:
             return False
 
     async def clear_assistant_status(self, channel_id: str, thread_id: str) -> bool:
-        """Clear the assistant status (empty string). Best-effort; setStatus also auto-clears on reply."""
-        return await self.set_assistant_status(channel_id, thread_id, status="", loading_messages=[])
+        """Clear the assistant status: bare status="" with NO loading_messages (the API
+        rejects an empty array and treats "" as the clear signal). Needed explicitly for
+        native-streamed replies — Slack's auto-clear keys on chat.postMessage only."""
+        return await self.set_assistant_status(channel_id, thread_id, status="")
 
     async def react(self, channel_id: str, message_ts: str, emoji: str) -> bool:
         """Add an emoji reaction to a message (Phase 4). ``emoji`` may include or omit colons.
