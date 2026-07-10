@@ -128,3 +128,25 @@ def test_prompt_carries_addressed_to_someone_else_rule():
     from prompts import PARTICIPATION_SYSTEM_PROMPT
     assert "addressed to SOMEONE ELSE" in PARTICIPATION_SYSTEM_PROMPT
     assert "hey claude" in PARTICIPATION_SYSTEM_PROMPT
+
+
+def test_prompt_carries_second_person_continuity_rule():
+    # Regression guard for the "how does your background workspace work?" bug
+    # (2026-07-10): an unnamed "you"-follow-up mid-exchange with another
+    # participant continues THAT exchange — it is not an invitation to jump in.
+    from prompts import PARTICIPATION_SYSTEM_PROMPT
+    assert '"You" belongs to whoever the sender has been talking to' in PARTICIPATION_SYSTEM_PROMPT
+    assert "helpful third voice" in PARTICIPATION_SYSTEM_PROMPT
+
+
+def test_participation_uses_dedicated_reasoning_effort():
+    # Referent resolution fails at effort=none (verified live 2026-07-10), so the
+    # participation call has its own knob, defaulting to "low" — without dragging
+    # the rest of the utility calls (intent classification) up with it.
+    import config as config_module
+    assert config_module.config.participation_reasoning_effort  # field exists, non-empty
+    import inspect
+    from openai_client.api import responses
+    src = inspect.getsource(responses.classify_participation)
+    assert "participation_reasoning_effort" in src
+    assert "utility_reasoning_effort" not in src
