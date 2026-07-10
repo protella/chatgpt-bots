@@ -484,13 +484,13 @@ class TextHandlerMixin:
                                                   user_timezone, user_tz_label),
         }]
 
-        # Post an initial message to get the message ID for streaming updates
-        # For streaming with potential tools, start with "Working on it"
-        # (will be overridden if tools are used)
+        # Post an initial message to get the message ID for streaming updates.
+        # Seed with a random pick from the loading pool (same variance as the
+        # native status) — overridden once tools/streaming take over.
         if exclude_mcp_server:
             initial_message = f"{config.circle_loader_emoji} Retrying without '{exclude_mcp_display}'..."
         else:
-            initial_message = f"{config.thinking_emoji} Working on it..."
+            initial_message = f"{config.circle_loader_emoji} {config.random_loading_message()}"
         if thinking_id:
             # Update existing thinking message
             message_id = thinking_id
