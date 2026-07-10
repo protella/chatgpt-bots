@@ -278,6 +278,10 @@ class SlackMessageEventsMixin:
                 message.metadata["channel_directives"] = cs["directives"]
             if cs.get("reply_in_channel"):
                 message.metadata["reply_in_channel"] = True
+        elif config.reply_in_channel_default:
+            # No saved channel settings: the global default decides whether top-level
+            # replies are allowed (the engine still judges placement per message).
+            message.metadata["reply_in_channel"] = True
 
         self.log_debug(
             f"Channel message dispatch: channel={channel_id}, ts={ts}, level={level}, "
