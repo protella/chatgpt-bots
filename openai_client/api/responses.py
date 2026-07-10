@@ -960,6 +960,8 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
         )
     if signals.get("is_thread_reply"):
         lines.append("- This is a reply inside a thread the assistant can see.")
+    if signals.get("channel_topic"):
+        lines.append(f"- Channel topic: {signals['channel_topic']}")
     if signals.get("name_hit"):
         lines.append(
             "- The message contains the assistant's name. Decide from context whether the "
