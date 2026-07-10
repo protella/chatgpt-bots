@@ -259,10 +259,12 @@ class ChatBotV2:
             response = await self.processor.process_message(message, client, thinking_id)
             
             # Delete thinking indicator (but not if streaming was used - it's already the
-            # response, and not for background image gen — the job owns that message/status).
+            # response, not for background image gen — the job owns that message/status —
+            # and not when a ProgressChecklist owns the thinking message, F4).
             if (thinking_id and response
                     and not response.metadata.get("streamed")
-                    and response.type != "background"):
+                    and response.type != "background"
+                    and response.metadata.get("checklist") is None):
                 await client.delete_message(message.channel_id, thinking_id)
             elif thinking_id and not response:
                 await client.delete_message(message.channel_id, thinking_id)
@@ -282,11 +284,15 @@ class ChatBotV2:
                     elif not response.metadata.get("streamed"):
                         # Format and send text (top-level when placement chose channel)
                         formatted_text = client.format_text(response.content)
-                        await client.send_message(
+                        sent_ok = await client.send_message(
                             message.channel_id,
                             post_thread_id,
                             formatted_text
                         )
+                        # Honest accounting: the ACTUAL send result decides `posted` (a
+                        # failed send must not burn the hourly unprompted quota).
+                        if isinstance(response.metadata, dict):
+                            response.metadata["posted"] = bool(sent_ok)
                     # Phase 7: Configure footer under the response (channels only, any
                     # member can open settings). Native-streamed responses attach the
                     # chrome to the message itself on stopStream (footer_attached
@@ -310,36 +316,36 @@ class ChatBotV2:
                     upload_manager = getattr(self.processor, "thread_manager", None)
                     if upload_manager and hasattr(upload_manager, "mark_upload_started"):
                         upload_manager.mark_upload_started(upload_thread_key)
-                    # Show uploading status
+
+                    from message_processor.image_delivery import publish_image
+                    unprompted = bool(message.metadata and message.metadata.get("participation_check") is True)
+                    # F4: if the handler threaded a live ProgressChecklist, it owns the
+                    # status surface — publish_image does the "Uploading…" step + completes
+                    # it in place (keeping the accumulated steps + history marker). Only the
+                    # config-off (no-checklist) path gets the manual "Uploading…" message.
+                    checklist = response.metadata.get("checklist")
                     upload_status_id = None
-                    # Use the client's name (e.g., "SlackBot") or extract platform name
-                    platform_name = client.name.replace("Bot", "") if hasattr(client, 'name') else "system"
-                    upload_status = f"{config.circle_loader_emoji} Uploading image to {platform_name}..."
-                    
-                    if response.metadata.get("streamed"):
-                        # For streamed cases, we have a separate status message - update that, NOT the prompt!
-                        status_msg_id = response.metadata.get("status_message_id")
-                        if status_msg_id and hasattr(client, 'update_message'):
-                            await client.update_message(message.channel_id, status_msg_id, upload_status)
-                            upload_status_id = status_msg_id
+                    if checklist is None:
+                        platform_name = client.name.replace("Bot", "") if hasattr(client, 'name') else "system"
+                        upload_status = f"{config.circle_loader_emoji} Uploading image to {platform_name}..."
+                        if response.metadata.get("streamed"):
+                            status_msg_id = response.metadata.get("status_message_id")
+                            if status_msg_id and hasattr(client, 'update_message'):
+                                await client.update_message(message.channel_id, status_msg_id, upload_status)
+                                upload_status_id = status_msg_id
+                            else:
+                                upload_status_id = await client.send_thinking_indicator(message.channel_id, message.thread_id)
+                                if upload_status_id and hasattr(client, 'update_message'):
+                                    await client.update_message(message.channel_id, upload_status_id, upload_status)
                         else:
-                            # Fallback: create new status message if not provided
                             upload_status_id = await client.send_thinking_indicator(message.channel_id, message.thread_id)
                             if upload_status_id and hasattr(client, 'update_message'):
                                 await client.update_message(message.channel_id, upload_status_id, upload_status)
-                    else:
-                        # Non-streaming case - create new status message
-                        upload_status_id = await client.send_thinking_indicator(message.channel_id, message.thread_id)
-                        if upload_status_id and hasattr(client, 'update_message'):
-                            await client.update_message(message.channel_id, upload_status_id, upload_status)
-                    
+
                     try:
-                        # F1: the shared delivery seam owns upload, falsey-URL = failure,
-                        # persistence, ledger, and unprompted accounting. generation_id
-                        # is None here (legacy sync path — the breadcrumb still exists, so
-                        # persistence stays breadcrumb-driven via update_last_image_url).
-                        from message_processor.image_delivery import publish_image
-                        unprompted = bool(message.metadata and message.metadata.get("participation_check") is True)
+                        # Delivery seam owns upload, falsey-URL = failure, breadcrumb-
+                        # independent DB persistence + warm state, ledger, checklist
+                        # completion, and unprompted accounting. generation_id is None (sync).
                         file_url = await publish_image(
                             processor=self.processor,
                             client=client,
@@ -347,13 +353,14 @@ class ChatBotV2:
                             thread_id=message.thread_id,
                             thread_key=upload_thread_key,
                             image_data=response.content,
-                            checklist=None,
+                            checklist=checklist,
                             generation_id=None,
                             prompt=(response.metadata.get("prompt") or ""),
                             db=getattr(self.processor, "db", None),
                             thread_manager=self.processor.thread_manager,
                             unprompted=unprompted,
                             message_ts=(message.metadata or {}).get("ts"),
+                            image_type=response.metadata.get("image_type", "generated"),
                         )
                         if file_url is None:
                             await client.handle_error(
@@ -365,11 +372,10 @@ class ChatBotV2:
                         if upload_manager and hasattr(upload_manager, "mark_upload_finished"):
                             upload_manager.mark_upload_finished(upload_thread_key)
 
-                    # Wait 4 seconds then handle cleanup
+                    # Manual status cleanup (the checklist path deletes its own message via
+                    # complete(delete_after=4)).
                     if upload_status_id:
                         await asyncio.sleep(4)
-
-                        # Delete the status message - the enhanced prompt message remains untouched
                         await client.delete_message(message.channel_id, upload_status_id)
                 elif response.type == "background":
                     # F1: new-image generation detached to a background job. Like 'queued',
