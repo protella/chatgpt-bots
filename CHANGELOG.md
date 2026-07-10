@@ -238,6 +238,29 @@ DMs behave as before.
 - Fixed an orphaned "Generating image…" indicator when image generation was blocked
   by moderation
 
+### 🎨 Fixed - Image settings now reach the API on every path
+
+- **Your quality setting applies to edits too**: image *edits* previously ignored the
+  quality picker (only generations honored it); both paths now send it
+- **Output format honored on generation**: `DEFAULT_IMAGE_FORMAT` (png/jpeg/webp) and
+  compression were accepted but silently dropped on generation; they're now wired
+  through just like on edits
+- Verified against the live API: the shared size list (square/portrait/landscape/auto)
+  is valid on both gpt-image-2 and gpt-image-1, so one setting covers both models
+
+### 🧹 Changed - .env reorganized & stale settings retired
+
+- **`.env.example` reordered by audience**: required credentials up top, branding/UX
+  next, models & features in the middle, and "don't touch unless you know what you're
+  doing" tuning at the bottom — same variables, no value changes
+- **Dead entries removed**: `DALLE_MODEL`, `DEBUG_MODE`, `MAX_CONCURRENT_THREADS`,
+  `MESSAGE_TIMEOUT` (nothing read them); missing live keys added
+  (`TOKEN_COMPACTION_TARGET`, `UTILITY_MAX_TOKENS`, `DEFAULT_IMAGE_FORMAT`)
+- **Settings modal remnants cleaned up**: leftover GPT-4/5.1/5.2-era form ids and the
+  obsolete "web search disables Minimal reasoning" coupling are gone (verified live:
+  web search works at reasoning `none` on 5.6); every comment now matches what the
+  API actually accepts
+
 ### 🧹 Removed - Discord scaffolding & legacy code
 
 - **Discord support removed**: the V2 Discord bot was never built (the launcher was a
