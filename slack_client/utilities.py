@@ -92,6 +92,9 @@ class SlackUtilitiesMixin:
             if resp.get("ok"):
                 self.bot_user_id = resp.get("user_id")
                 self.bot_id = resp.get("bot_id")
+                # team_id is required by chat.startStream (recipient_team_id) for
+                # channel streaming; stash it here from the same auth.test call.
+                self.self_team_id = resp.get("team_id")
                 self.log_info(f"Resolved bot self-identity: user_id={self.bot_user_id}, bot_id={self.bot_id}")
             else:
                 self.log_warning(f"auth_test returned not ok: {resp.get('error')}")

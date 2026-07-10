@@ -489,6 +489,58 @@ class TestReactTool:
         assert all(r["ok"] is False for r in results)
 
     @pytest.mark.asyncio
+    async def test_pending_reservation_never_evicted(self, monkeypatch):
+        # F3 (BLOCKER): LRU eviction must NEVER remove an entry that still holds a
+        # pending reservation — evicting it and recreating the key later lets the
+        # evicted owner's finally delete the replacement. Pinned entries are skipped;
+        # a committed entry is evicted instead.
+        from collections import OrderedDict
+        monkeypatch.setattr(config, "enable_reactions", True)
+        monkeypatch.setattr(config, "enable_react_tool", True)
+        monkeypatch.setattr(config, "reaction_emojis", ["thumbsup"])
+        monkeypatch.setattr(config, "reaction_max_per_message", 4)
+        s = _react_self()
+        s.react = AsyncMock(return_value=True)
+
+        guard = s._reaction_guard = OrderedDict()
+        # Oldest entry holds a PENDING reservation (a not-yet-resolved future).
+        pending_fut = asyncio.get_event_loop().create_future()
+        guard[("C1", "pinned")] = {"eyes": pending_fut}
+        # Fill to the eviction threshold with committed entries.
+        for i in range(2000):
+            guard[("C1", f"c{i}")] = {"thumbsup": True}
+
+        # A fresh reservation pushes the guard over 2000 and triggers eviction.
+        await s._reserve_and_react("C1", "fresh", "thumbsup")
+
+        assert ("C1", "pinned") in guard          # pinned (pending) survived
+        assert len(guard) <= 2000                 # committed entries evicted instead
+        pending_fut.set_result(False)             # cleanup
+
+    @pytest.mark.asyncio
+    async def test_rollback_is_identity_conditional(self, monkeypatch):
+        # F3: a failed reservation's finally must NOT delete a REPLACEMENT entry that a
+        # concurrent recreate installed under the same key (different dict identity).
+        from collections import OrderedDict
+        monkeypatch.setattr(config, "enable_reactions", True)
+        monkeypatch.setattr(config, "enable_react_tool", True)
+        monkeypatch.setattr(config, "reaction_emojis", ["thumbsup"])
+        monkeypatch.setattr(config, "reaction_max_per_message", 4)
+        s = _react_self()
+        guard = s._reaction_guard = OrderedDict()
+
+        async def _fail_and_swap(*a, **k):
+            # Mid-flight, a concurrent recreate installs a DIFFERENT dict for the key.
+            guard[("C1", "k")] = {"tada": True}
+            return False
+        s.react = AsyncMock(side_effect=_fail_and_swap)
+
+        out = await s._reserve_and_react("C1", "k", "thumbsup")
+        assert out["ok"] is False
+        # The owner's finally left the replacement entry intact.
+        assert guard.get(("C1", "k")) == {"tada": True}
+
+    @pytest.mark.asyncio
     async def test_gating(self, monkeypatch):
         monkeypatch.setattr(config, "enable_reactions", True)
         monkeypatch.setattr(config, "enable_react_tool", False)

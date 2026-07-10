@@ -55,6 +55,9 @@ class SlackBot(SlackMessageEventsMixin,
         self.bot_user_id = None
         self.bot_id = None
         self.app_id = None
+        # Workspace team_id (from auth_test); chat.startStream now requires it as
+        # recipient_team_id for channel streaming (see NativeStreamSession.start).
+        self.self_team_id = None
 
         # Initialize database manager
         self.db = DatabaseManager(platform="slack")

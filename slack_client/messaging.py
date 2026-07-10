@@ -101,11 +101,16 @@ class NativeStreamSession:
     inert so the caller can recover.
     """
 
-    def __init__(self, client, channel_id: str, thread_id: str, logger=None):
+    def __init__(self, client, channel_id: str, thread_id: str, logger=None,
+                 team_id: Optional[str] = None):
         self._client = client
         self._channel = channel_id
         self._thread = thread_id
         self._log = logger
+        # Workspace team_id — chat.startStream requires recipient_team_id for channel
+        # streaming (Slack: "missing_recipient_team_id"). appendStream/stopStream key off
+        # the returned ts and need no team_id.
+        self._team_id = team_id
         self.ts: Optional[str] = None
         self.active: bool = False
         self._sent: str = ""
@@ -119,11 +124,21 @@ class NativeStreamSession:
                 self._log("native streaming requires a thread — top-level reply falls back to legacy")
             self.active = False
             return False
+        if not self._team_id:
+            # chat.startStream now REQUIRES recipient_team_id for channel streaming
+            # (Slack: "missing_recipient_team_id"). Without a resolved workspace
+            # team_id the call is guaranteed to fail — skip it and let the caller
+            # fall back to legacy streaming (never crash).
+            if self._log:
+                self._log("native streaming requires a workspace team_id — falling back to legacy")
+            self.active = False
+            return False
         try:
             resp = await self._client.chat_startStream(
                 channel=self._channel,
                 thread_ts=self._thread,
                 markdown_text=initial_text or None,
+                recipient_team_id=self._team_id,
             )
             self.ts = resp.get("ts")
             self._sent = initial_text or ""
@@ -725,8 +740,13 @@ class SlackMessagingMixin:
         )
 
     def begin_native_stream(self, channel_id: str, thread_id: str) -> "NativeStreamSession":
-        """Create a (not-yet-started) NativeStreamSession bound to this channel/thread."""
-        return NativeStreamSession(self.app.client, channel_id, thread_id, logger=self.log_debug)
+        """Create a (not-yet-started) NativeStreamSession bound to this channel/thread.
+
+        Passes the workspace team_id (resolved once via auth.test in _ensure_self_identity)
+        as chat.startStream now requires it as recipient_team_id for channel streaming."""
+        return NativeStreamSession(
+            self.app.client, channel_id, thread_id, logger=self.log_debug,
+            team_id=getattr(self, "self_team_id", None))
 
     async def set_assistant_status(self, channel_id: str, thread_id: str,
                                    status: Optional[str] = None,
@@ -880,8 +900,20 @@ class SlackMessagingMixin:
         if slots is None:
             slots = guard[key] = {}
         guard.move_to_end(key)  # LRU recency refresh
-        while len(guard) > 2000:  # whole-message eviction, oldest first
-            guard.popitem(last=False)
+        # Whole-message LRU eviction, oldest first — but NEVER evict an entry that still
+        # holds a pending reservation (a slot value that isn't the committed sentinel
+        # True). Evicting a pinned entry then recreating the key later would let the
+        # evicted owner's `finally` delete the replacement dict (identity race). Pinned
+        # entries are skipped here; they're removed by their own finally on resolution.
+        if len(guard) > 2000:
+            for k in list(guard.keys()):
+                if len(guard) <= 2000:
+                    break
+                entry = guard.get(k)
+                if entry is slots:
+                    continue  # never evict the entry we're about to use
+                if entry is None or all(v is True for v in entry.values()):
+                    del guard[k]
 
         existing = slots.get(emoji)
         if existing is not None:
@@ -925,7 +957,10 @@ class SlackMessagingMixin:
                     del slots[emoji]
                 if not fut.done():
                     fut.set_result(False)
-                if not slots:
+                # Identity-conditional cleanup: only drop the key when it STILL maps to
+                # our own slots object (a concurrent recreate after eviction installs a
+                # different dict, which we must not delete).
+                if not slots and guard.get(key) is slots:
                     guard.pop(key, None)
 
     def get_no_reply_tool_schema(self) -> dict:

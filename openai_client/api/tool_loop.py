@@ -159,12 +159,22 @@ async def _handle_no_reply_terminal(
 
     F6 fix (b): react siblings still count against MAX_TOOL_CALLS_PER_TURN — the terminal
     branch runs before the loop's own cap check, so apply the remaining global budget to
-    the react calls here."""
+    the react calls here.
+
+    F4 fix: the terminal no_response_needed call itself consumes ONE slot of the remaining
+    budget, so react siblings are capped at remaining_budget - 1 (floor 0) — the round can
+    never exceed the cap by that one terminal call. Duplicate no_response_needed calls are
+    suppressed: only the FIRST (``terminal_call``) is honored (first wins)."""
     react_calls = [c for c in calls if c.get("name") == _REACT_TOOL]
-    budget = len(react_calls) if remaining_budget is None else max(0, int(remaining_budget))
-    allowed_react_ids = {id(c) for c in react_calls[:budget]}
+    if remaining_budget is None:
+        react_budget = len(react_calls)
+    else:
+        react_budget = max(0, int(remaining_budget) - 1)  # reserve one slot for the terminal
+    allowed_react_ids = {id(c) for c in react_calls[:react_budget]}
+    # Only the first terminal call runs (identity match); duplicate no_response_needed
+    # calls are dropped into `skipped` below and never dispatched.
     exec_calls = [c for c in calls
-                  if c.get("name") == _NO_REPLY_TOOL or id(c) in allowed_react_ids]
+                  if c is terminal_call or id(c) in allowed_react_ids]
     exec_ids = {id(c) for c in exec_calls}
     skipped = [c.get("name") for c in calls if id(c) not in exec_ids]
     if skipped:

@@ -381,6 +381,20 @@ DMs behave as before.
 
 ### 🩹 Fixed - Reliability hardening for the new channel/image features
 
+- **Streaming into Slack's native message surface works again.** Slack now requires a
+  workspace id to open a streamed reply, which every attempt was missing — so native
+  streaming failed on every turn and quietly fell back to the classic edit loop. The
+  bot now supplies it; when it can't, it still falls back cleanly instead of erroring.
+- The bot now reliably remembers its **own** streamed replies and which tools it used on
+  them, so a moment later it can refer back to what it just said and did instead of
+  denying it. (Previously these were filed under a placeholder that no longer existed,
+  so they silently vanished.)
+- In busy channels, a delayed duplicate of an old message can no longer resurface as if
+  it were new, and the bot's channel-awareness memory no longer grows without bound.
+- When the bot decides to stay silent and just add reactions, it can no longer slip one
+  extra reaction past its own per-turn limit or double-fire the silence.
+- Emoji reactions placed at the same moment on the same message no longer occasionally
+  step on each other under heavy concurrency.
 - Live progress checklists now also appear when the bot **edits** an image (not just when
   it generates one), and when background image generation is turned off.
 - A generated image now reliably lands in the bot's memory even if the thread was busy at

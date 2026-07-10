@@ -23,6 +23,20 @@ from message_processor.tool_provenance import (
 )
 
 
+def _delivered_stream_ts(native_coord, native_finalized: bool,
+                         current_message_id: Optional[str]) -> Optional[str]:
+    """The ACTUAL delivered message ts for a streamed reply — the key F5/F7 must use.
+
+    NOT the original placeholder `message_id` (None on native status-only streams, a
+    DELETED placeholder on native fallback). Native path (finalize confirmed): the native
+    stream's current ts. Legacy/fallback path: the final `current_message_id` from the
+    update loop (which already tracks the native ts whenever the stream ran). Returns None
+    when nothing was delivered — callers must then skip the pulse/provenance record."""
+    if native_coord is not None and native_finalized:
+        return native_coord.current_ts
+    return current_message_id
+
+
 class TextHandlerMixin:
     def _get_tool_registry(self, client: BaseClient, thread_config: dict):
         """The client's local-tool registry, or None when the loop can't/shouldn't run."""
@@ -1407,7 +1421,12 @@ class TextHandlerMixin:
                 # appended to response_text above).
                 self.log_info("No streaming message exists — posting final response directly")
                 try:
-                    await client.send_message(message.channel_id, message.thread_id, response_text)
+                    # Capture the delivered ts so F5/F7 below key on the real message
+                    # (send_message already records the own-reply pulse for this ts;
+                    # record_own_reply is idempotent by (channel, ts) so a repeat is a no-op).
+                    posted_ts = await client.send_message(message.channel_id, message.thread_id, response_text)
+                    if posted_ts:
+                        current_message_id = posted_ts
                 except Exception as e:
                     self.log_error(f"Error posting final response directly: {e}")
             elif current_part > 1:
@@ -1523,16 +1542,22 @@ class TextHandlerMixin:
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
             self._add_message_with_token_management(thread_state, "assistant", stored_content, db=self.db, thread_key=thread_key)
 
-            # F7: persist keyed on the reply's real ts (same ts the pulse records; the
-            # native stream's own message). Skipped silently when no message exists.
+            # F5/F7: key both the provenance persist and the own-reply pulse on the ACTUAL
+            # delivered message ts — NOT the original `message_id` (None on native
+            # status-only streams, a deleted placeholder on native fallback). Persist/record
+            # ONLY on confirmed delivery — a None ts means nothing was delivered, skip.
+            delivered_ts = _delivered_stream_ts(native_coord, native_finalized, current_message_id)
+
+            # F7: persist keyed on the reply's real ts (same ts the pulse records).
+            # Skipped silently when no message was delivered.
             self._persist_tool_provenance(
-                thread_state.channel_id, message_id, thread_key, tool_provenance)
+                thread_state.channel_id, delivered_ts, thread_key, tool_provenance)
 
             # F5 fix (a): record the bot's own streamed final reply into the pulse — native
             # stream edits never echo back as a clean event, so this is their only capture.
-            if hasattr(client, "_record_own_reply_pulse"):
+            if delivered_ts and hasattr(client, "_record_own_reply_pulse"):
                 client._record_own_reply_pulse(
-                    thread_state.channel_id, thread_state.thread_ts, message_id, response_text)
+                    thread_state.channel_id, thread_state.thread_ts, delivered_ts, response_text)
             
             # Schedule async cleanup after response
             cleanup_coro = self._async_post_response_cleanup(thread_state, thread_key)

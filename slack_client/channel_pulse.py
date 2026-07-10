@@ -81,7 +81,9 @@ class ChannelPulse:
         # Both maps are LRU (whole-thread / whole-channel eviction, oldest first).
         self._thread_tails: "OrderedDict[str, OrderedDict[str, deque]]" = OrderedDict()
         # channel -> OrderedDict(ts -> True): idempotency window for record() dedup.
-        self._seen_ts: "Dict[str, OrderedDict[str, bool]]" = {}
+        # OUTER map is a whole-channel LRU (bounded like _thread_tails) so it can't grow
+        # without limit; the inner window is bounded per-channel by _SEEN_TS_MAX.
+        self._seen_ts: "OrderedDict[str, OrderedDict[str, bool]]" = OrderedDict()
 
     # ------------------------------------------------------------------ feed
 
@@ -89,17 +91,44 @@ class ChannelPulse:
     def _is_dm(channel_id: Optional[str]) -> bool:
         return bool(channel_id) and channel_id.startswith("D")
 
+    def _ts_in_live_rings(self, channel_id: str, ts: str) -> bool:
+        """True if `ts` is still held in the channel buffer or the per-thread tail ring.
+
+        A ts can age out of the _seen_ts dedup window while still living in our rings; a
+        delayed retry must not resurrect it, so treat anything still in a live ring as
+        already recorded (round-2 fix — idempotence beyond the _seen_ts window)."""
+        buf = self._buffers.get(channel_id)
+        if buf and any(e.get("ts") == ts for e in buf):
+            return True
+        chan_tails = self._thread_tails.get(channel_id)
+        if chan_tails:
+            for dq in chan_tails.values():
+                if any(e.get("ts") == ts for e in dq):
+                    return True
+        return False
+
     def _already_recorded(self, channel_id: str, ts: str) -> bool:
         """True (and marks seen) if (channel, ts) was already recorded recently.
         Makes record() idempotent for dual delivery (app_mention + message) and retries."""
-        seen = self._seen_ts.setdefault(channel_id, OrderedDict())
+        seen = self._seen_ts.get(channel_id)
+        if seen is None:
+            seen = self._seen_ts[channel_id] = OrderedDict()
+        self._seen_ts.move_to_end(channel_id)  # whole-channel LRU recency refresh
         if ts in seen:
             seen.move_to_end(ts)
             return True
+        # Resurrection guard: even if `ts` aged out of the dedup window, a message still
+        # present in our live rings was already recorded — don't re-append it.
+        already = self._ts_in_live_rings(channel_id, ts)
         seen[ts] = True
+        seen.move_to_end(ts)
         while len(seen) > _SEEN_TS_MAX:
             seen.popitem(last=False)
-        return False
+        # Bound the OUTER channel map (whole-channel LRU, oldest first) so it can't leak.
+        channels_max = int(getattr(config, "pulse_thread_tail_channels_max", 30))
+        while len(self._seen_ts) > max(1, channels_max):
+            self._seen_ts.popitem(last=False)
+        return already
 
     def record(self, channel_id: str, *, ts: str, thread_ts: Optional[str],
                user_id: Optional[str], display_name: Optional[str],
