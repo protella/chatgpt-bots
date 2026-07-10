@@ -306,6 +306,21 @@ class BotConfig:
     # request. Empty/vague questions get VISION_DEFAULT_QUESTION either way.
     enable_vision_enhancement: bool = field(default_factory=lambda: os.getenv("ENABLE_VISION_ENHANCEMENT", "false").lower() == "true")
 
+    # --- Document architecture (Phase D2) ---
+    # Native file input: PDFs within the API limits ride the attach turn as an input_file
+    # content part (base64 per-request — never the OpenAI Files API), so the model sees
+    # text + rendered pages (tables/charts/scans readable). Oversized PDFs and all other
+    # types use local extraction. Later turns always use summary + read_document.
+    enable_native_file_input: bool = field(default_factory=lambda: os.getenv("ENABLE_NATIVE_FILE_INPUT", "true").lower() == "true")
+    native_file_max_pages: int = field(default_factory=lambda: int(os.getenv("NATIVE_FILE_MAX_PAGES", "100")))
+    native_file_max_mb: int = field(default_factory=lambda: int(os.getenv("NATIVE_FILE_MAX_MB", "32")))
+    # read_document tool: on-demand document access (download from Slack CDN -> extract in
+    # memory -> return the requested slice). The DB holds summary + metadata + ref only.
+    enable_read_document_tool: bool = field(default_factory=lambda: os.getenv("ENABLE_READ_DOCUMENT_TOOL", "true").lower() == "true")
+    # Process-lifetime LRU of extracted document text (never persisted) so iterating on one
+    # document doesn't re-download/re-extract per question.
+    doc_extraction_cache_size: int = field(default_factory=lambda: int(os.getenv("DOC_EXTRACTION_CACHE_SIZE", "20")))
+
     # --- On-demand Slack history-fetch tools (Phase 8) ---
     # Read-only + privacy-scoped (public or bot-member channels only), so default ON. Wired to
     # the model through the local function-call loop (ENABLE_TOOL_LOOP).

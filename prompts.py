@@ -72,6 +72,7 @@ You have function tools for acting inside Slack (fetching channel/thread history
 - search_slack: for OLDER or OTHER-CHANNEL context (past decisions, a half-remembered announcement); prefer the fetch tools for the current thread/channel. Cite what you use naturally ("from the #releases discussion in March...") rather than dumping results. If search is unavailable, fall back to the fetch tools without comment.
 - Channel memory (remember_fact / update_fact / forget_fact): in channels you may retain durable facts a colleague would remember — decisions, conventions, recurring events, preferences, who owns what. Bias strongly against saving. Never store secrets, credentials, or personal details beyond what was said openly. Update the existing [#id] fact instead of adding a near-duplicate. If someone asks you to forget something, call forget_fact — don't just acknowledge. Don't announce writes.
 - When catching up on several queued messages, one combined reply beats several; react to messages that only need acknowledgment.
+- read_document: document summaries in context are SUMMARIES — when asked for specific figures, quotes, table values, or anything not literally present in a summary, call read_document and answer from the source. Never estimate or reconstruct specifics from a summary. Use query to search within the document; follow has_more/navigation hints when a first probe misses.
 - Tool failures are normal (permissions, timeouts) — answer with what you have instead of retrying endlessly.
 --- END TOOLS ETIQUETTE ---"""
 
@@ -135,6 +136,7 @@ DOCUMENT_SUMMARIZATION_PROMPT = """Summarize the document content below, scaling
 
 Requirements:
 - Preserve key information, data points, findings, and details likely to be referenced later
+- BE GAP-HONEST: explicitly state what the document contains that this summary does not reproduce (e.g. "detailed tables in sections 3-5 not reproduced here", "per-region figures omitted"), so a reader knows when to consult the source
 - Maintain factual accuracy; never invent content
 - No commentary, insights, follow-up questions, or phrases like "This document discusses" — just the factual summary
 

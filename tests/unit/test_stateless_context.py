@@ -246,7 +246,9 @@ def test_mirror_drop_migration(tmp_path, monkeypatch):
     from database import DatabaseManager
 
     db = DatabaseManager(platform="slack")
-    # Simulate a legacy database: messages table + documents.summary column
+    # Simulate a genuinely legacy database: messages table + old documents shape
+    # (content column; its dead summary column is dropped by Phase S and the
+    # LOAD-BEARING summary column is (re)created by the D2 migration).
     db.conn.execute("""
         CREATE TABLE messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id TEXT, role TEXT,
@@ -254,7 +256,7 @@ def test_mirror_drop_migration(tmp_path, monkeypatch):
             message_ts TEXT, metadata_json TEXT)
     """)
     db.conn.execute("INSERT INTO messages (thread_id, role, content) VALUES ('C1:1','user','hi')")
-    db.conn.execute("ALTER TABLE documents ADD COLUMN summary TEXT")
+    db.conn.execute("ALTER TABLE documents ADD COLUMN content TEXT")
     db.conn.close()
 
     # Restart: migration runs
@@ -264,7 +266,8 @@ def test_mirror_drop_migration(tmp_path, monkeypatch):
     assert "messages" not in tables
     assert "thread_summaries" in tables
     doc_cols = [c[1] for c in db2.conn.execute("PRAGMA table_info(documents)")]
-    assert "summary" not in doc_cols
+    assert "content" not in doc_cols  # D2: no document content at rest
+    assert "summary" in doc_cols      # D2's load-bearing summary column
     backups = os.listdir(str(tmp_path / "backups"))
     assert any("pre-v3-mirror-drop" in b for b in backups)
 

@@ -156,6 +156,12 @@ class ThreadManagementMixin:
         # But full/unsummarized documents are NOT preserved (they can be trimmed/summarized)
         if "[SUMMARIZED" in content:
             return True
+
+        # Phase D2 summary blocks are already-compressed (summary + ref, no full
+        # content) — preserved; read_document covers depth, so re-summarizing
+        # them would only destroy the pointer.
+        if "=== DOCUMENT SUMMARY:" in content:
+            return True
         
         # Check for injected analysis markers
         if "[Image Analysis:" in content or "[Vision Context:" in content:
@@ -1034,53 +1040,82 @@ class ThreadManagementMixin:
                                         self.log_warning(f"Failed to save image metadata during rebuild: {e}")
                             
                             elif is_document:
-                                # Handle document attachments during rebuild
+                                # Handle document attachments during rebuild (Phase D2):
+                                # the stored summary row is the fast path — no download,
+                                # no re-extraction. Only legacy threads without a row
+                                # fall back to download + extract (summary-only inject).
                                 self.log_info(f"Found document attachment during rebuild: {filename} ({mimetype})")
-                                
-                                # Store document metadata (but don't mark as preserved type)
-                                # Documents should be trimmable/summarizable
+
                                 message_metadata["filename"] = filename
                                 message_metadata["mimetype"] = mimetype
-                                
-                                # Try to download and process the document
+
                                 try:
-                                    # Download the document using the client
-                                    document_data = await client.download_file(att_url, attachment.get("id"))
-                                    
-                                    if document_data and self.document_handler:
-                                        # Extract document content
-                                        extracted_content = await self.document_handler.safe_extract_content_async(
-                                            document_data, mimetype, filename
+                                    thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+                                    doc_row = None
+                                    try:
+                                        doc_row = await self.db.get_document_by_filename_async(thread_key, filename)
+                                    except Exception as row_err:
+                                        self.log_debug(f"Doc row lookup failed for {filename}: {row_err}")
+
+                                    if doc_row and doc_row.get("summary"):
+                                        # Stored summary + ref — zero API calls
+                                        content = self._build_message_with_documents(
+                                            content,
+                                            [{
+                                                "filename": filename,
+                                                "mimetype": mimetype,
+                                                "summary": doc_row.get("summary"),
+                                                "total_pages": doc_row.get("total_pages"),
+                                                "size_bytes": doc_row.get("size_bytes"),
+                                                "file_id": doc_row.get("file_id"),
+                                            }]
                                         )
-                                        
-                                        if extracted_content and extracted_content.get("content"):
-                                            # Add document content to the message
-                                            doc_content = self._build_message_with_documents(
-                                                content,  # Original message content
-                                                [{
-                                                    "filename": filename,
-                                                    "mimetype": mimetype,
-                                                    "content": extracted_content["content"],
-                                                    "metadata": extracted_content
-                                                }]
-                                            )
-                                            content = doc_content
-                                            self.log_info(f"Successfully extracted document content during rebuild: {filename}")
-                                            
-                                            # Store in document ledger
-                                            thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-                                            document_ledger = self.thread_manager.get_or_create_document_ledger(thread_state.thread_ts)
-                                            document_ledger.add_document(
-                                                content=extracted_content["content"],
-                                                filename=filename,
-                                                mime_type=mimetype,
-                                                metadata=extracted_content
-                                            )
-                                        else:
-                                            self.log_warning(f"Failed to extract content from document during rebuild: {filename}")
+                                        self.log_info(f"Injected stored summary during rebuild: {filename}")
                                     else:
-                                        self.log_warning(f"Failed to download document during rebuild: {filename}")
-                                        
+                                        # Legacy thread (no row): derive once, store
+                                        # summary + ref, inject the summary block
+                                        document_data = await client.download_file(att_url, attachment.get("id"))
+                                        if document_data and self.document_handler:
+                                            extracted_content = await self.document_handler.safe_extract_content_async(
+                                                document_data, mimetype, filename,
+                                                ocr_images=False  # summary-only injection; no page images needed
+                                            )
+                                            if extracted_content and extracted_content.get("content"):
+                                                doc_summary = await self._summarize_document_for_attach(
+                                                    extracted_content, filename, mimetype)
+                                                content = self._build_message_with_documents(
+                                                    content,
+                                                    [{
+                                                        "filename": filename,
+                                                        "mimetype": mimetype,
+                                                        "summary": doc_summary,
+                                                        "total_pages": extracted_content.get("total_pages"),
+                                                        "size_bytes": len(document_data),
+                                                        "file_id": attachment.get("id"),
+                                                    }]
+                                                )
+                                                document_ledger = self.thread_manager.get_or_create_document_ledger(thread_state.thread_ts)
+                                                document_ledger.add_document(
+                                                    content=extracted_content["content"],  # transient
+                                                    filename=filename,
+                                                    mime_type=mimetype,
+                                                    summary=doc_summary,
+                                                    total_pages=extracted_content.get("total_pages"),
+                                                    page_structure=extracted_content.get("page_structure"),
+                                                    metadata=None,
+                                                    db=self.db,
+                                                    thread_id=thread_key,
+                                                    message_ts=message_metadata.get("ts"),
+                                                    file_id=attachment.get("id"),
+                                                    url_private=att_url,
+                                                    size_bytes=len(document_data),
+                                                )
+                                                self.log_info(f"Derived + stored summary during rebuild: {filename}")
+                                            else:
+                                                self.log_warning(f"Failed to extract content from document during rebuild: {filename}")
+                                        else:
+                                            self.log_warning(f"Failed to download document during rebuild: {filename}")
+
                                 except Exception as e:
                                     self.log_error(f"Error processing document during rebuild: {e}")
                                     # Continue without the document content

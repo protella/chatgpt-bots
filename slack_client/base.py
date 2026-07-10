@@ -24,6 +24,7 @@ from .search_tool import SlackSearchToolMixin
 from .channel_pulse import ChannelPulse
 from tool_registry import ToolRegistry
 from message_processor.memory_tools import register_memory_tools
+from message_processor.document_tools import register_document_tools
 
 
 class SlackBot(SlackMessageEventsMixin,
@@ -87,6 +88,8 @@ class SlackBot(SlackMessageEventsMixin,
             registry.register(self.get_search_tool_schema(), self.execute_search_tool)
         if config.enable_channel_memory:
             register_memory_tools(registry)  # channel-only; executors refuse DMs
+        if config.enable_read_document_tool:
+            register_document_tools(registry)  # summary+ref rows; content re-derived in memory
         return registry
 
     # Async versions required by BaseClient

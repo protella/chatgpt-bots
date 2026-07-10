@@ -468,11 +468,13 @@ class TestProcessorGlue:
             "type": "function", "name": "react_to_message", "parameters": {}}
         s.get_search_tool_schema.return_value = {
             "type": "function", "name": "search_slack", "parameters": {}}
+        monkeypatch.setattr(config, "enable_read_document_tool", True)
         registry = SlackBot._build_tool_registry(s)
         names = {t["name"] for t in registry.schemas()}
         assert names == {"fetch_channel_history", "fetch_thread_messages",
                          "react_to_message", "search_slack",
-                         "remember_fact", "update_fact", "forget_fact"}
+                         "remember_fact", "update_fact", "forget_fact",
+                         "read_document"}
 
     def test_registry_builder_search_gated_off(self, monkeypatch):
         from slack_client.base import SlackBot

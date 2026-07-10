@@ -32,6 +32,27 @@ All notable changes to this project will be documented in this file.
 - **More literal image edits**: the edit-prompt instructions no longer mandate re-describing the whole scene (a source of unwanted "re-imagining" drift); edits state exactly what changes and preserve everything else. Generation prompts now preserve your explicit specifications verbatim.
 - **Lower cost per message**: the intent classifier prompt was trimmed ~60% (it runs on every responded message), and in multi-user threads the system prompt no longer changes per speaker — restoring prompt-cache hits that were silently lost on every speaker change.
 
+### 📄 Feature - Smarter, Lighter Document Handling
+
+#### Added
+- **Documents no longer flood the conversation**: uploading a document now injects a concise summary (spreadsheets show their sheets/columns/sample rows); the bot pulls exact figures, quotes, and sections from the original file on demand when you ask for specifics
+- **PDFs are read natively by the model** (`ENABLE_NATIVE_FILE_INPUT`, on by default): tables, charts, and scanned pages are actually visible to it now — no more mangled text extraction for PDFs within API limits
+- **Privacy**: document content is never stored — the bot keeps only a summary and a reference to the file in Slack. Deleting a file from Slack removes its content from the bot's reach entirely
+
+#### Changed
+- One-time automatic migration on first startup (a tagged backup lands in `data/backups/` first); existing document references keep working
+
+#### Upgrade Instructions
+Add to your `.env` (all default on/sane if omitted):
+```
+ENABLE_NATIVE_FILE_INPUT=true
+NATIVE_FILE_MAX_PAGES=100
+NATIVE_FILE_MAX_MB=32
+ENABLE_READ_DOCUMENT_TOOL=true
+DOC_EXTRACTION_CACHE_SIZE=20
+```
+Watch startup logs for `DB: Doc-content-drop migration complete`.
+
 ### 🧹 Removed - Discord scaffolding, legacy code & tiktoken
 
 - **Discord support removed**: the V2 Discord bot was never built (the launcher was a "Coming Soon" stub). All Discord scaffolding is gone — stub launcher, config vars, prompts, markdown branch, and the `discord` dependency. The bot is Slack-only.

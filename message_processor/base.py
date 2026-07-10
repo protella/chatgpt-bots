@@ -231,12 +231,23 @@ class MessageProcessor(ThreadManagementMixin,
             username = message.metadata.get("username", "User") if message.metadata else "User"
             base_text_with_username = f"{username}: {message.text}" if message.text else f"{username}:"
             
-            # If we have documents, enhance the text with document content
+            # If we have documents, enhance the text with their labeled SUMMARIES
+            # (full content never enters context — read_document covers depth)
             enhanced_text = base_text_with_username
+            file_inputs = []
             if document_inputs:
                 enhanced_text = self._build_message_with_documents(base_text_with_username, document_inputs)
-            
-            user_content = self._build_user_content(enhanced_text, image_inputs)
+                # Native-eligible PDFs additionally ride this turn as input_file
+                # parts so the model sees text + rendered pages (Phase D2).
+                for doc in document_inputs:
+                    if doc.get("native") and doc.get("file_data_b64"):
+                        file_inputs.append({
+                            "type": "input_file",
+                            "filename": doc.get("filename", "document.pdf"),
+                            "file_data": f"data:application/pdf;base64,{doc['file_data_b64']}",
+                        })
+
+            user_content = self._build_user_content(enhanced_text, image_inputs, file_inputs)
             
             # Check if adding this message would exceed limits and trim if needed
             # We temporarily add the message to check, then remove it

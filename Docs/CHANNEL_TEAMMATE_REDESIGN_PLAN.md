@@ -491,6 +491,32 @@ capture during processing, single-batch drain w/ multiple senders, drain loop on
 burst, linger, DM + thread + channel parity, no busy message posted, ordering, needs_refresh
 interplay. Live: send 3 messages fast in a DM — one combined reply, none dropped.
 
+**D2. Document architecture (user decisions 2026-07-09: no content at rest; native PDF +
+read_document both ON)** ✅
+*Implemented. The DB never stores document content — rows are summary + metadata + Slack CDN
+ref (file_id/url_private/size_bytes), enforcing CLAUDE.md pitfall 6a. One-time startup
+migration (tagged backup `pre-v3-doc-content-drop` → synthesize labeled-excerpt summaries for
+legacy rows → DROP COLUMN content → VACUUM, idempotent). Attach flow: extract in memory →
+gap-honest utility-model summary (spreadsheets get a deterministic schema-first block instead:
+sheets/columns/row counts/sample rows, no model call) → inject ONLY the labeled summary block
+(`=== DOCUMENT SUMMARY: name ===`, preserved from compaction; deterministic for cache hygiene)
+→ row written → extraction LRU warmed. Native input_file (default ON): PDFs ≤100 pages/≤32MB
+ride the attach turn as base64 `input_file` parts (verified shape in openai 2.45:
+type/filename/file_data — per-request, never the OpenAI Files API) so the model sees text +
+rendered pages; the scanned-PDF pdf2image OCR path is SKIPPED on this route (and its poppler
+temp files with it — no-disk bonus) via an `ocr_images` toggle through
+`safe_extract_content(_async)`; flag-off/oversized PDFs keep the isolated legacy OCR helper.
+`read_document` tool (default ON): resolve row → download from Slack CDN into memory →
+BytesIO extraction → query (context windows) or offset slices with has_more/next_offset;
+process-lifetime bounded LRU (20 entries, never persisted); deleted Slack file →
+`file_deleted` (privacy feature: deletion removes content from the bot's reach). Cold rebuilds
+inject the STORED summary (zero API calls); legacy threads derive + store once.
+Anti-confabulation guidance in LOCAL_TOOLS_GUIDANCE (never estimate specifics from a summary).
+Mixed image+document vision turns still use transient full text in-turn (never persisted) —
+deliberate deviation for analysis quality. Files: database.py, thread_manager.py,
+message_processor/{utilities,base,thread_management,document_tools}.py, document_handler.py,
+slack_client/base.py, prompts.py, config.py. Tests: tests/unit/test_doc_architecture.py (29).*
+
 **P. Prompt modernization** ✅ (2026-07-09, from the prompt-audit report) — legacy GPT-4-era
 prompts trimmed/rewritten for frontier models: SLACK_SYSTEM_PROMPT rewritten (teammate
 identity, channel-brevity + reaction-as-response etiquette, Phase-Q multi-sender batch rule,

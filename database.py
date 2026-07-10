@@ -138,14 +138,20 @@ class DatabaseManager(LoggerMixin):
             ON images(url)
         """)
         
-        # Documents table
+        # Documents table — summary + metadata + Slack ref ONLY (user hard rule,
+        # CLAUDE.md pitfall 6a): full content is never at rest. The file lives on
+        # Slack's CDN (file_id/url_private) and is re-derived in memory on demand
+        # via the read_document tool.
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS documents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 thread_id TEXT NOT NULL,
                 filename TEXT NOT NULL,
                 mime_type TEXT NOT NULL,
-                content TEXT NOT NULL,
+                summary TEXT,
+                file_id TEXT,
+                url_private TEXT,
+                size_bytes INTEGER,
                 page_structure TEXT,
                 total_pages INTEGER,
                 metadata_json TEXT,
@@ -564,12 +570,15 @@ class DatabaseManager(LoggerMixin):
                 cursor = self.conn.execute("SELECT COUNT(*) FROM messages")
                 row_count = cursor.fetchone()[0]
                 self.conn.execute("DROP TABLE IF EXISTS messages")
-                # Drop the never-read documents.summary column (dead since day one).
+                # Drop the never-read LEGACY documents.summary column (dead since
+                # day one). Only on the legacy table shape (content column present)
+                # — the D2 schema has a NEW, load-bearing summary column that the
+                # D2 migration below (re)creates and populates.
                 # ALTER ... DROP COLUMN needs SQLite 3.35+; degrade gracefully below it.
                 try:
                     cursor = self.conn.execute("PRAGMA table_info(documents)")
                     doc_columns = [col[1] for col in cursor.fetchall()]
-                    if 'summary' in doc_columns:
+                    if 'summary' in doc_columns and 'content' in doc_columns:
                         self.conn.execute("ALTER TABLE documents DROP COLUMN summary")
                 except Exception as col_err:
                     self.log_warning(f"DB: Could not drop documents.summary column: {col_err}")
@@ -580,6 +589,45 @@ class DatabaseManager(LoggerMixin):
                     f"row(s), reclaimed {max(0, size_before - size_after):,} bytes "
                     f"(backup tagged pre-v3-mirror-drop in {self.db_dir}/backups)"
                 )
+
+            # Doc-architecture (D2) one-time cleanup: drop documents.content.
+            # Same hard rule as the mirror drop — no file/document content at rest;
+            # rows keep summary + metadata + the Slack CDN ref. Guarded on the
+            # content column existing so it runs exactly once per database.
+            cursor = self.conn.execute("PRAGMA table_info(documents)")
+            doc_columns = [col[1] for col in cursor.fetchall()]
+            if 'content' in doc_columns:
+                self.backup_database(tag="pre-v3-doc-content-drop")
+                size_before = os.path.getsize(self.db_path)
+                # Ensure the new columns exist before synthesizing summaries
+                for col_name, col_type in (("summary", "TEXT"), ("file_id", "TEXT"),
+                                           ("url_private", "TEXT"), ("size_bytes", "INTEGER")):
+                    if col_name not in doc_columns:
+                        self.conn.execute(f"ALTER TABLE documents ADD COLUMN {col_name} {col_type}")
+                # Mechanical summary synthesis for legacy rows: labeled excerpt of
+                # the stored content (cheap, safe; rows are ≤30 days old).
+                cursor = self.conn.execute("""
+                    UPDATE documents
+                    SET summary = '[excerpt of original — full document available via read_document]' || char(10)
+                                  || substr(content, 1, 1500)
+                    WHERE (summary IS NULL OR summary = '') AND content IS NOT NULL
+                """)
+                synthesized = cursor.rowcount
+                try:
+                    self.conn.execute("ALTER TABLE documents DROP COLUMN content")
+                    self.conn.execute("VACUUM")
+                    size_after = os.path.getsize(self.db_path)
+                    self.log_info(
+                        f"DB: Doc-content-drop migration complete — synthesized {synthesized} "
+                        f"summary(ies), reclaimed {max(0, size_before - size_after):,} bytes "
+                        f"(backup tagged pre-v3-doc-content-drop in {self.db_dir}/backups)"
+                    )
+                except Exception as col_err:
+                    # SQLite < 3.35 can't DROP COLUMN; content stays but is never
+                    # read or written again. Log loudly — this violates the
+                    # no-content-at-rest rule until SQLite is upgraded.
+                    self.log_warning(f"DB: Could not drop documents.content column: {col_err}")
+                self.conn.commit()
 
             # Check if mcp_tools table exists
             cursor = self.conn.execute("""
@@ -1141,34 +1189,39 @@ class DatabaseManager(LoggerMixin):
     # Document operations
     
     def save_document(self, thread_id: str, filename: str, mime_type: str,
-                     content: str, page_structure: Optional[Dict] = None,
-                     total_pages: Optional[int] = None, summary: Optional[str] = None,
+                     summary: Optional[str] = None, file_id: Optional[str] = None,
+                     url_private: Optional[str] = None, size_bytes: Optional[int] = None,
+                     page_structure: Optional[Dict] = None,
+                     total_pages: Optional[int] = None,
                      metadata: Optional[Dict] = None, message_ts: Optional[str] = None):
         """
-        Save document content and metadata.
-        
+        Save document summary + metadata + Slack CDN ref. Full content is NEVER
+        persisted (CLAUDE.md pitfall 6a) — it is re-derived in memory on demand.
+
         Args:
             thread_id: Thread identifier
             filename: Original filename
             mime_type: Document MIME type
-            content: Full document text content
+            summary: Attach-time summary (the only content-bearing field)
+            file_id: Slack file id (read_document lookup key)
+            url_private: Slack CDN URL for authenticated re-download
+            size_bytes: Original file size
             page_structure: Optional page/sheet structure info as dict
             total_pages: Total page/sheet count
-            summary: Accepted for backward compatibility; no longer persisted
-                     (the documents.summary column was dropped — never read)
             metadata: Additional metadata (size, author, etc.)
             message_ts: Message timestamp to link document to specific message
         """
         self.log_debug(f"DB: Saving document - thread={thread_id}, filename={filename}, "
-                      f"content_len={len(content) if content else 0}, pages={total_pages}")
+                      f"summary_len={len(summary) if summary else 0}, pages={total_pages}")
 
         try:
             self.conn.execute("""
                 INSERT INTO documents
-                (thread_id, filename, mime_type, content, page_structure, total_pages,
-                 metadata_json, message_ts)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (thread_id, filename, mime_type, content,
+                (thread_id, filename, mime_type, summary, file_id, url_private,
+                 size_bytes, page_structure, total_pages, metadata_json, message_ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (thread_id, filename, mime_type, summary, file_id, url_private,
+                  size_bytes,
                   json.dumps(page_structure) if page_structure else None,
                   total_pages,
                   json.dumps(metadata) if metadata else None, message_ts))
@@ -2246,6 +2299,28 @@ class DatabaseManager(LoggerMixin):
                         del doc["metadata_json"]
                     documents.append(doc)
                 return documents
+
+    async def get_document_by_filename_async(self, thread_id: str, filename: str) -> Optional[Dict]:
+        """Async version of get_document_by_filename (newest matching row)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(
+                """SELECT * FROM documents
+                   WHERE thread_id = ? AND filename = ?
+                   ORDER BY created_at DESC LIMIT 1""",
+                (thread_id, filename),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return None
+                doc = dict(row)
+                if doc.get("page_structure"):
+                    doc["page_structure"] = json.loads(doc["page_structure"])
+                if doc.get("metadata_json"):
+                    doc["metadata"] = json.loads(doc["metadata_json"])
+                    del doc["metadata_json"]
+                return doc
 
     async def get_or_create_thread_async(self, thread_id: str, channel_id: str,
                                          user_id: Optional[str] = None) -> Dict:

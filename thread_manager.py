@@ -134,71 +134,77 @@ class DocumentLedger:
     thread_ts: str
     documents: List[Dict[str, Any]] = field(default_factory=list)
     
-    def add_document(self, content: str, filename: str, mime_type: str, 
-                    page_structure: Optional[Dict[str, Any]] = None, 
-                    total_pages: Optional[int] = None, 
+    def add_document(self, content: str, filename: str, mime_type: str,
+                    page_structure: Optional[Dict[str, Any]] = None,
+                    total_pages: Optional[int] = None,
                     summary: Optional[str] = None,
-                    metadata: Optional[Dict[str, Any]] = None, 
+                    metadata: Optional[Dict[str, Any]] = None,
                     timestamp: float = None,
-                    db = None, thread_id: Optional[str] = None, 
-                    message_ts: Optional[str] = None):
-        """Add a document to the ledger
-        
+                    db = None, thread_id: Optional[str] = None,
+                    message_ts: Optional[str] = None,
+                    file_id: Optional[str] = None,
+                    url_private: Optional[str] = None,
+                    size_bytes: Optional[int] = None):
+        """Add a document to the ledger.
+
+        Content is NEVER persisted (CLAUDE.md pitfall 6a): the DB row and the
+        in-memory entry hold summary + metadata + the Slack CDN ref only. The
+        ``content`` parameter is accepted for interface stability but only used
+        to derive a fallback summary when none was provided.
+
         Args:
-            content: Full document text content
+            content: Full document text (transient; not stored)
             filename: Original filename
             mime_type: Document MIME type
             page_structure: Optional page/sheet structure info as dict
             total_pages: Total page/sheet count
-            summary: Optional AI-generated summary
+            summary: Attach-time summary (the only content-bearing field)
             metadata: Additional metadata (size, author, etc.)
             timestamp: When the document was added
             db: Optional database manager for persistence
             thread_id: Optional thread ID for database storage
             message_ts: Message timestamp to link document to specific message
+            file_id: Slack file id (read_document lookup key)
+            url_private: Slack CDN URL for authenticated re-download
+            size_bytes: Original file size
         """
         if timestamp is None:
             timestamp = time.time()
-            
-        # Store in memory (metadata only when DB available)
-        if db:
-            # Don't store full content in memory when DB is available
-            self.documents.append({
-                "filename": filename,
-                "mime_type": mime_type,
-                "content": None,  # No full content in memory when using DB
-                "page_structure": page_structure,
-                "total_pages": total_pages,
-                "summary": summary,
-                "timestamp": timestamp,
-                "metadata": metadata
-            })
-            
-            # Store full content in database
-            if thread_id:
-                db.save_document(
-                    thread_id=thread_id,
-                    filename=filename,
-                    mime_type=mime_type,
-                    content=content,  # Full content to DB
-                    page_structure=page_structure,
-                    total_pages=total_pages,
-                    summary=summary,
-                    metadata=metadata,
-                    message_ts=message_ts
-                )
-        else:
-            # Legacy behavior when no DB - store limited content in memory
-            self.documents.append({
-                "filename": filename,
-                "mime_type": mime_type,
-                "content": content[:1000] if content else None,  # Truncated without DB
-                "page_structure": page_structure,
-                "total_pages": total_pages,
-                "summary": summary[:200] if summary else None,  # Truncated without DB
-                "timestamp": timestamp,
-                "metadata": metadata
-            })
+
+        if not summary and content:
+            # Fallback so a row is never contentless if summarization failed upstream
+            summary = ("[excerpt of original — full document available via read_document]\n"
+                       + content[:1500])
+
+        entry = {
+            "filename": filename,
+            "mime_type": mime_type,
+            "content": None,  # never held; re-derived on demand via read_document
+            "page_structure": page_structure,
+            "total_pages": total_pages,
+            "summary": summary,
+            "timestamp": timestamp,
+            "metadata": metadata,
+            "file_id": file_id,
+            "url_private": url_private,
+            "size_bytes": size_bytes,
+        }
+        self.documents.append(entry)
+
+        if db and thread_id:
+            db.save_document(
+                thread_id=thread_id,
+                filename=filename,
+                mime_type=mime_type,
+                summary=summary,
+                file_id=file_id,
+                url_private=url_private,
+                size_bytes=size_bytes,
+                page_structure=page_structure,
+                total_pages=total_pages,
+                metadata=metadata,
+                message_ts=message_ts
+            )
     
     def get_recent_documents(self, count: int = 5) -> List[Dict[str, Any]]:
         """Get the most recent documents"""
@@ -698,7 +704,10 @@ class AsyncThreadStateManager(LoggerMixin):
                 timestamp=doc.get('timestamp'),
                 db=self.db,
                 thread_id=thread_key,
-                message_ts=doc.get('message_ts')
+                message_ts=doc.get('message_ts'),
+                file_id=doc.get('file_id'),
+                url_private=doc.get('url_private') or doc.get('url'),
+                size_bytes=doc.get('size_bytes'),
             )
 
         self.log_info(f"Updated documents for thread {thread_ts}: {len(documents)} documents")
