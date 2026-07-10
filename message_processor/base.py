@@ -143,11 +143,13 @@ class MessageProcessor(ThreadManagementMixin,
             
             # Note: 80% context warning moved to after response generation
             
-            # Get thread config to determine model (with user preferences)
+            # Get thread config to determine model (user prefs + shared channel
+            # settings; DMs simply have no channel_settings row → no-op there)
             thread_config = await config.get_thread_config_async(
                 overrides=thread_state.config_overrides,
                 user_id=message.user_id,
-                db=self.db
+                db=self.db,
+                channel_id=message.channel_id
             )
             
             # Update thread state with current model for token limit calculations
