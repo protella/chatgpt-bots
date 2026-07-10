@@ -42,9 +42,14 @@ async def _run_tool_round(
     input_items: List[Dict[str, Any]],
     local_tool_calls: List[Dict[str, Any]],
     tool_callback: Optional[Callable[[str, str], Any]] = None,
+    result_overrides: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Dispatch one round's calls, then replay the round's items (reasoning items in
-    place, each function_call followed by its function_call_output) onto the input."""
+    place, each function_call followed by its function_call_output) onto the input.
+
+    ``result_overrides`` (call_id -> result) short-circuits specific calls: they are NOT
+    dispatched and their given result is fed back instead — used to reject an invalid
+    no_response_needed (F2) while still running its siblings."""
 
     async def _notify(tool_id: str, status: str) -> None:
         if not tool_callback:
@@ -56,13 +61,18 @@ async def _run_tool_round(
         except Exception as e:  # noqa: BLE001 — status UI must never break the loop
             self.log_warning(f"Tool callback error for {tool_id}: {e}")
 
+    overrides = result_overrides or {}
     calls = _function_calls(sink)
     for call in calls:
         await _notify(f"local:{call.get('name')}", "started")
 
-    results = await registry.dispatch_all(tool_context, calls)
+    dispatch_calls = [c for c in calls if c.get("call_id") not in overrides]
+    dispatched = await registry.dispatch_all(tool_context, dispatch_calls)
+    dispatched_by_id = {id(c): r for c, r in zip(dispatch_calls, dispatched)}
     result_by_id = {}
-    for call, result in zip(calls, results):
+    for call in calls:
+        cid = call.get("call_id")
+        result = overrides[cid] if cid in overrides else dispatched_by_id.get(id(call))
         ok = _call_ok(result)
         local_tool_calls.append({"name": call.get("name"), "ok": ok})
         self.log_info(f"Local tool '{call.get('name')}' -> {'ok' if ok else 'error'}")
@@ -99,6 +109,15 @@ def _merge_used(tools_used_all: List[str], round_used: List[str]) -> None:
 
 _NO_REPLY_TOOL = "no_response_needed"
 _REACT_TOOL = "react_to_message"
+
+# F2: fed back when no_response_needed is called AFTER visible reply text already
+# streamed to Slack — the call is invalid; the model must finish the reply instead.
+_INVALID_NO_REPLY_RESULT = {
+    "ok": False,
+    "error": "invalid_no_response_needed",
+    "message": ("Invalid: you already began a visible reply — complete the reply instead "
+                "of calling no_response_needed."),
+}
 
 
 def _no_reply_call(calls: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -243,6 +262,11 @@ async def create_streaming_response_with_tool_loop(
     rounds = 0
     total_calls = 0
     tool_choice: Optional[str] = None
+    # F2: track whether any visible reply text has streamed to Slack this turn. The round's
+    # returned text is exactly what was forwarded to the stream callback (pre-tool-call
+    # preamble is committed; post-call text is suppressed), so this is the committed-text
+    # signal that decides whether a no_response_needed call is valid.
+    visible_committed = False
 
     while True:
         sink: List[Dict[str, Any]] = []
@@ -256,6 +280,8 @@ async def create_streaming_response_with_tool_loop(
             tool_choice=tool_choice,
             **params,
         )
+        if (text or "").strip():
+            visible_committed = True
 
         calls = _function_calls(sink)
         if not calls or tool_choice == "none":
@@ -267,10 +293,30 @@ async def create_streaming_response_with_tool_loop(
 
         terminal_call = _no_reply_call(calls)
         if terminal_call is not None:
-            return await _handle_no_reply_terminal(
-                self, registry, tool_context, calls, terminal_call,
-                tools_used_all, local_tool_calls,
-                remaining_budget=config.max_tool_calls_per_turn - total_calls)
+            if not visible_committed:
+                # Nothing visible has posted yet — honor the terminal (silent turn).
+                return await _handle_no_reply_terminal(
+                    self, registry, tool_context, calls, terminal_call,
+                    tools_used_all, local_tool_calls,
+                    remaining_budget=config.max_tool_calls_per_turn - total_calls)
+            # A visible reply already began: no_response_needed is INVALID. Reject it
+            # (feed an error back), run any siblings, and CONTINUE so the model completes
+            # the reply into the same streamed message. WARNING = contract friction.
+            self.log_warning(
+                f"{_NO_REPLY_TOOL} called after visible text already streamed — rejecting; "
+                "model must complete the reply")
+            rounds += 1
+            total_calls += len(calls)
+            await _run_tool_round(
+                self, registry, tool_context, sink, input_items, local_tool_calls, tool_callback,
+                result_overrides={terminal_call.get("call_id"): _INVALID_NO_REPLY_RESULT})
+            _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")])
+            if rounds >= config.max_tool_rounds or total_calls >= config.max_tool_calls_per_turn:
+                self.log_warning(
+                    f"Tool loop cap hit ({rounds} rounds / {total_calls} calls) — forcing final answer"
+                )
+                tool_choice = "none"
+            continue
 
         rounds += 1
         total_calls += len(calls)

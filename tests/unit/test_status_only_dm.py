@@ -255,6 +255,29 @@ async def test_gate_none_ts_without_native_does_not_stream(monkeypatch):
     assert not src_gate_streams
 
 
+@pytest.mark.asyncio
+async def test_unprompted_turn_streams_after_f2_revision(monkeypatch):
+    """F2 revision: an UNPROMPTED (participation-gated) turn now streams like any other —
+    the old defer-to-non-streaming fork is gone."""
+    from base_client import Message
+    monkeypatch.setattr(config, "enable_no_reply_tool", True)
+    host = _text_handler_host()
+    client = MagicMock()
+    client.supports_streaming = MagicMock(return_value=True)
+    client.supports_native_streaming = MagicMock(return_value=True)
+    msg = Message(text="hi", user_id="U1", channel_id="C1", thread_id="T1",
+                  metadata={"participation_check": True})
+    thread_state = MagicMock()
+
+    async def fake_config(**kw):
+        return {"enable_streaming": True}
+    with patch.object(config, "get_thread_config_async", side_effect=fake_config):
+        result = await host._handle_text_response(
+            "hello", thread_state, client, msg, thinking_id="P1")
+    assert result == "STREAMED"
+    host._handle_streaming_text_response.assert_awaited_once()
+
+
 # ---------------- vision gate parity ----------------
 
 def test_vision_gates_stay_in_sync():
