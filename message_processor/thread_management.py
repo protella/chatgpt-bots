@@ -724,6 +724,19 @@ class ThreadManagementMixin:
             current_tokens = self._tracked_context_tokens(thread_state) or \
                 self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
 
+            # Cost visibility: >272K input bills at 2x input / 1.5x output on 5.5/5.6.
+            # Log once per thread when it crosses the tier (log only — never block).
+            if config.is_long_context(current_tokens) and \
+                    not getattr(thread_state, "_long_context_logged", False):
+                try:
+                    thread_state._long_context_logged = True
+                except Exception:
+                    pass
+                self.log_info(
+                    f"Thread crossed the long-context billing tier: {current_tokens:,} input tokens "
+                    f"> {config.LONG_CONTEXT_BILLING_THRESHOLD:,} (2x input / 1.5x output pricing applies)"
+                )
+
             if current_tokens > cleanup_threshold:
                 self.log_info(f"Thread at {current_tokens}/{max_tokens} tokens ({current_tokens/max_tokens:.1%}), triggering compaction")
 
