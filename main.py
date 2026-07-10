@@ -74,6 +74,11 @@ class ChatBotV2:
             level = message.metadata.get("participation_level") or "judicious"
             pulse = getattr(client, "channel_pulse", None)
 
+            # F5 fix (b): register this message's ts as the channel's newest BEFORE the
+            # memory/topic awaits below — an older event delayed by that I/O must not
+            # overwrite a newer event's debounce marker and win the race.
+            engine.note_arrival(channel_id, ts)
+
             # Hard rail BEFORE any model call. Mentions never route through this gate,
             # so the throttle can't silence an addressed message.
             if engine.over_throttle(pulse, channel_id, level):
@@ -117,6 +122,7 @@ class ChatBotV2:
                 snoozed=message.metadata.get("participation_snoozed") is True,
                 sender_is_bot=message.metadata.get("participation_sender_bot") is True,
                 channel_topic=channel_topic,
+                pulse=pulse, thread_root_ts=message.thread_id,
             )
             if verdict is None:  # superseded by a newer message during debounce
                 main_logger.debug("Participation gate: superseded during debounce — silent")

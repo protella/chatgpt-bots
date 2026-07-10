@@ -146,6 +146,35 @@ async def test_tool_loop_no_reply_ends_and_suppresses_siblings(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_terminal_round_reacts_respect_global_cap(monkeypatch):
+    # F6 fix (b): react siblings in a no_reply terminal round still count against
+    # MAX_TOOL_CALLS_PER_TURN — the terminal branch runs before the loop's cap check.
+    from openai_client.api import tool_loop
+    monkeypatch.setattr(tool_loop.config, "max_tool_calls_per_turn", 2)
+    scripts = [[
+        _fc("no_response_needed", "1", '{"reason": "silent"}'),
+        _fc("react_to_message", "2", '{"emoji": "eyes"}'),
+        _fc("react_to_message", "3", '{"emoji": "tada"}'),
+        _fc("react_to_message", "4", '{"emoji": "thumbsup"}'),
+    ]]
+
+    async def fake_create(self, messages, tools, return_metadata, function_call_sink,
+                          tool_choice=None, **kw):
+        function_call_sink.extend(scripts.pop(0))
+        return {"text": "", "tools_used": []}
+
+    monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake_create)
+    dispatched = []
+    result = await tool_loop.create_text_response_with_tool_loop(
+        _LoopSelf(), messages=[], tools=[], registry=_FakeRegistry(dispatched),
+        tool_context=None)
+    assert result["terminal_action"] == "no_reply"
+    # no_response_needed + exactly 2 reacts (budget), the 3rd react dropped.
+    assert dispatched.count("react_to_message") == 2
+    assert "no_response_needed" in dispatched
+
+
+@pytest.mark.asyncio
 async def test_tool_loop_no_reply_reason_sanitized(monkeypatch):
     from openai_client.api import tool_loop
     dirty = "line one\nline two\t" + "x" * 400

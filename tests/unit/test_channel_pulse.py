@@ -155,6 +155,9 @@ def _mixin_host(pulse):
             self.user_cache = {"U7": {"real_name": "Peter"}}
             self.bot_user_id = "UBOT"
 
+        def is_own_message(self, e):
+            return e.get("user") == "UBOT"
+
         def classify_sender(self, e):
             return "self" if e.get("user") == "UBOT" else "human"
 
@@ -164,7 +167,10 @@ def _mixin_host(pulse):
 
 
 @pytest.mark.asyncio
-async def test_feed_records_even_own_messages_before_gates():
+async def test_feed_skips_own_records_others():
+    # F5 fix (a): the event feed skips OUR OWN posts (echoed placeholders/footers/edits
+    # are chrome) — the bot's own final reply is recorded cleanly at the messaging layer.
+    # Other senders (incl. bot_message subtype) are recorded.
     p = ChannelPulse(size=5)
     host = _mixin_host(p)
     await host._feed_channel_pulse({"channel": "C1", "ts": "1.0", "user": "UBOT",
@@ -172,7 +178,11 @@ async def test_feed_records_even_own_messages_before_gates():
     await host._feed_channel_pulse({"channel": "C1", "ts": "2.0", "user": "U7",
                                     "text": "human post"})
     env = p.render_envelope("C1")
-    assert "my own post" in env and "Peter" in env
+    assert "human post" in env and "Peter" in env
+    assert "my own post" not in env
+    # ...but the bot's own reply DOES enter the ring via the messaging-layer recorder.
+    p.record_own_reply("C1", thread_ts=None, ts="3.0", text="my own post")
+    assert "my own post" in p.render_envelope("C1")
 
 
 @pytest.mark.asyncio

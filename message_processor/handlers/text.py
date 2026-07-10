@@ -1459,6 +1459,12 @@ class TextHandlerMixin:
             # Add assistant response to thread state
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
             self._add_message_with_token_management(thread_state, "assistant", response_text, db=self.db, thread_key=thread_key)
+
+            # F5 fix (a): record the bot's own streamed final reply into the pulse — native
+            # stream edits never echo back as a clean event, so this is their only capture.
+            if hasattr(client, "_record_own_reply_pulse"):
+                client._record_own_reply_pulse(
+                    thread_state.channel_id, thread_state.thread_ts, message_id, response_text)
             
             # Schedule async cleanup after response
             cleanup_coro = self._async_post_response_cleanup(thread_state, thread_key)
