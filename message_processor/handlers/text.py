@@ -1225,10 +1225,22 @@ class TextHandlerMixin:
             # the attribution note and stop it. On any failure fall through to the
             # legacy final-correction edit against the native message's ts.
             native_finalized = False
+            footer_blocks = None
             if native_coord is not None and native_coord.started and not native_coord.failed:
                 suffix = tools_note if (tools_used or exclude_mcp_server) else ""
+                # Settings chrome ("⚙️ <model>") rides the LAST part of the response
+                # itself (stopStream accepts blocks) instead of a separate trailing
+                # message — every surface: channels open channel settings, DMs open
+                # user settings (routing lives in the client helper). Same placement
+                # rule as main.py's separate footer: never on top-level
+                # place-in-channel replies (coordinator thread_ts None); the helper
+                # returns None when the footer feature is disabled.
+                if (native_coord.thread_ts is not None
+                        and hasattr(client, "attachable_footer_blocks")):
+                    footer_blocks = client.attachable_footer_blocks(
+                        message.channel_id, thread_config.get("model"))
                 native_finalized = await native_coord.finalize(
-                    buffer.get_complete_text(), suffix=suffix)
+                    buffer.get_complete_text(), suffix=suffix, blocks=footer_blocks)
                 current_message_id = native_coord.current_ts or current_message_id
                 if native_finalized:
                     current_part = native_coord.part
@@ -1368,6 +1380,9 @@ class TextHandlerMixin:
                 metadata={"streamed": True, "message_id": message_id,
                           "native_stream": bool(native_coord is not None and native_coord.started
                                                 and not native_coord.failed),
+                          # Chrome rode the final stopStream — tells main.py's separate
+                          # footer post to stand down (falls back when finalize failed).
+                          "footer_attached": bool(native_finalized and footer_blocks),
                           "model": thread_config.get("model")}
             )
             

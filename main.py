@@ -275,8 +275,11 @@ class ChatBotV2:
                             post_thread_id,
                             formatted_text
                         )
-                    # Phase 7: append a Configure footer under the response (channels only, any
-                    # member can open settings). Separate trailing message → safe for streamed too.
+                    # Phase 7: Configure footer under the response (channels only, any
+                    # member can open settings). Native-streamed responses attach the
+                    # chrome to the message itself on stopStream (footer_attached
+                    # metadata makes this call a no-op); everything else falls back to
+                    # this separate trailing message.
                     # Best-effort: a cosmetic footer must never break message handling.
                     # Skipped for top-level placement — it would land as ANOTHER top-level
                     # message and read as spam.
