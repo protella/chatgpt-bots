@@ -7,6 +7,7 @@ from openai import APIError, APIStatusError
 
 from base_client import BaseClient, Message, Response
 from config import config, pipeline_status
+from prompts import NO_REPLY_CONTRACT_SUFFIX
 from message_markers import (
     CONTINUATION_HEAD,
     continuation_trailer,
@@ -26,6 +27,31 @@ class TextHandlerMixin:
         if registry is None or not registry.has_tools(thread_config):
             return None
         return registry
+
+    def _materialize_request_tools(self, client: BaseClient, thread_config: dict,
+                                   message: Message, tools_disabled: bool):
+        """F2: resolve this attempt's tool exposure ONCE, up front. Returns
+        (registry_or_None, request_config, no_reply_tool_available).
+
+        request_config is a COPY of the shared thread_config with `_unprompted_turn` set on
+        participation-gated turns — the shared dict is never mutated. no_reply_tool_available
+        is derived from the resolved schema set (so it's False whenever the tool isn't
+        actually exposed — timeout retries that drop the registry, config off, prompted
+        turns), and that single flag drives both the tools array and the suffix paragraph."""
+        unprompted = bool((message.metadata or {}).get("participation_check") is True)
+        request_config = dict(thread_config)
+        if unprompted:
+            request_config["_unprompted_turn"] = True
+        if tools_disabled:
+            return None, request_config, False
+        registry = self._get_tool_registry(client, request_config)
+        no_reply_available = False
+        if registry is not None and unprompted and config.enable_no_reply_tool:
+            no_reply_available = any(
+                s.get("name") == "no_response_needed"
+                for s in registry.schemas(request_config)
+            )
+        return registry, request_config, no_reply_available
 
     def _build_tool_context(self, message: Message, client: BaseClient) -> ToolContext:
         """Per-request context handed to local tool executors."""
@@ -77,8 +103,17 @@ class TextHandlerMixin:
                           and client.supports_native_streaming())
         can_stream = (hasattr(client, 'supports_streaming') and client.supports_streaming() and
                      streaming_enabled and (thinking_id is not None or native_capable))
+        # F2 buffered output (defer_visible_output): on an UNPROMPTED turn where the
+        # no_response_needed contract is active, visible text must never post before the
+        # terminal verdict is known. We realize that by NOT streaming at all — the
+        # non-streaming path accumulates the full reply and posts it once at the end (or
+        # nothing on a no_reply outcome), which strictly guarantees no partial post and
+        # sidesteps every streaming escape hatch. Prompted/config-off turns are unchanged.
+        unprompted_turn = bool((message.metadata or {}).get("participation_check") is True)
+        defer_visible_output = unprompted_turn and config.enable_no_reply_tool
         # Stream on first attempt OR on MCP-failure retry (streaming itself didn't fail)
-        should_stream = can_stream and (retry_count == 0 or failed_mcp_server is not None)
+        should_stream = (can_stream and (retry_count == 0 or failed_mcp_server is not None)
+                         and not defer_visible_output)
         if should_stream:
             return await self._handle_streaming_text_response(
                 user_content, thread_state, client, message, thinking_id, attachment_urls,
@@ -152,14 +187,26 @@ class TextHandlerMixin:
         model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
         system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_directives=getattr(thread_state, 'channel_directives', None), channel_info=await self._build_channel_info(client, message.channel_id))
 
+        # Determine timeout based on retry attempt (needed to resolve tool exposure below)
+        retry_timeout = 60.0 if retry_count > 0 else None
+        # F2: resolve this attempt's tool exposure ONCE. The timeout-retry path runs the
+        # loop-less API, so it disables the registry — and (Codex finding 19) that same
+        # flag must drop the suffix paragraph, which falls out of no_reply_available below.
+        registry, request_config, no_reply_available = self._materialize_request_tools(
+            client, thread_config, message, tools_disabled=bool(retry_timeout))
+
         # Prompt-cache hygiene: volatile context (minute-precision time + channel-activity
-        # envelope) rides at the SUFFIX (last message), never in the system prompt, so the
-        # cached prefix survives across turns.
+        # envelope + F1 in-flight note) rides at the SUFFIX (last message), never in the
+        # system prompt, so the cached prefix survives across turns. F2's contract paragraph
+        # rides the same slot, appended only when the no_response_needed tool is exposed.
+        suffix = self._build_suffix_context(client, message.channel_id,
+                                            thread_state.thread_ts,
+                                            user_timezone, user_tz_label)
+        if no_reply_available:
+            suffix = f"{suffix}\n\n{NO_REPLY_CONTRACT_SUFFIX}"
         messages_for_api = messages_for_api + [{
             "role": "developer",
-            "content": self._build_suffix_context(client, message.channel_id,
-                                                  thread_state.thread_ts,
-                                                  user_timezone, user_tz_label),
+            "content": suffix,
         }]
 
         # Update status before generating
@@ -172,19 +219,15 @@ class TextHandlerMixin:
         else:
             self._update_status(client, message.channel_id, thinking_id, pipeline_status("generating_response", "Generating response…"), thread_id=message.thread_id)
         
-        # Determine timeout based on retry attempt
-        retry_timeout = 60.0 if retry_count > 0 else None
-
         # Determine which model to use (web search model if web search enabled)
         web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
         model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
 
-        # Build tools array (includes web_search and/or MCP tools based on config)
-        # Exclude any MCP server that failed in a previous attempt.
-        # Local tools ride along via the registry — but not on the timeout-retry path,
-        # which calls the plain (loop-less) API and couldn't execute them.
-        registry = None if retry_timeout else self._get_tool_registry(client, thread_config)
-        tools = self._build_tools_array(thread_config, model,
+        # Build tools array (includes web_search and/or MCP tools based on config).
+        # `registry` and `request_config` were resolved once above (F2) — request_config
+        # carries the per-turn _unprompted_turn flag so no_response_needed is exposed only
+        # where it should be; the timeout-retry path already nulled the registry there.
+        tools = self._build_tools_array(request_config, model,
                                         exclude_mcp_server=failed_mcp_server, registry=registry)
 
         # Start progress updater for fallback/retry scenarios (streaming already has one)
@@ -202,6 +245,8 @@ class TextHandlerMixin:
         # Generate response with or without tools
         tools_actually_used = []  # Track which tools were actually invoked
         local_tool_calls = []     # [{"name","ok"}] record of local tool executions
+        terminal_action = None    # F2: "no_reply" when the model called no_response_needed
+        no_reply_reason = None
         usage_info = {}           # response.usage lands here (usage-driven budgeting)
         mcp_discovered = {}       # mcp_list_tools payloads land here (discovery cache)
         try:
@@ -227,6 +272,8 @@ class TextHandlerMixin:
                 response_text = result["text"]
                 tools_actually_used = result["tools_used"]
                 local_tool_calls = result["local_tool_calls"]
+                terminal_action = result.get("terminal_action")
+                no_reply_reason = result.get("reason")
             elif tools:
                 # Generate response with tools
                 if retry_timeout:
@@ -323,6 +370,20 @@ class TextHandlerMixin:
         for _label, _tools_payload in mcp_discovered.items():
             self.mcp_manager.cache_discovered_tools_payload(_label, _tools_payload)
 
+        # F2: explicit no-reply outcome. Nothing posts, no footer, no empty assistant turn
+        # (we return before the append), and no post-response memory extraction (scheduled
+        # only on the normal path below). main.py logs it and burns no quota. Placeholder
+        # deletion / status clear is main.py's empty-path + finally.
+        if terminal_action == "no_reply":
+            self.log_info(f"no_response_needed — ending turn silently: {no_reply_reason!r}")
+            return Response(
+                type="text",
+                content="",
+                metadata={"model": thread_config.get("model"),
+                          "terminal_action": "no_reply",
+                          "reason": no_reply_reason, "posted": False},
+            )
+
         # Build unified tools attribution at the end of response
         # Reaction-only turn: the model reacted via the react tool and deliberately
         # returned no text — post nothing (main.py skips empty sends; footer skips too).
@@ -331,7 +392,8 @@ class TextHandlerMixin:
             return Response(
                 type="text",
                 content="",
-                metadata={"model": thread_config.get("model"), "reaction_only": True}
+                metadata={"model": thread_config.get("model"), "reaction_only": True,
+                          "posted": False}
             )
 
         # Attribution lists only EXTERNAL sources (web_search + MCP servers). Local

@@ -95,6 +95,63 @@ def _merge_used(tools_used_all: List[str], round_used: List[str]) -> None:
             tools_used_all.append(name)
 
 
+# --- F2: no_response_needed terminal action ---
+
+_NO_REPLY_TOOL = "no_response_needed"
+_REACT_TOOL = "react_to_message"
+
+
+def _no_reply_call(calls: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    return next((c for c in calls if c.get("name") == _NO_REPLY_TOOL), None)
+
+
+def _sanitize_reason(call: Dict[str, Any]) -> str:
+    """Extract + sanitize the no_response_needed reason (control-stripped, length-capped)."""
+    import json
+    args = call.get("arguments")
+    if isinstance(args, str):
+        try:
+            args = json.loads(args or "{}")
+        except json.JSONDecodeError:
+            args = {}
+    reason = (args or {}).get("reason", "") if isinstance(args, dict) else ""
+    reason = "".join(ch if ch.isprintable() else " " for ch in str(reason)).strip()
+    return reason[:300]
+
+
+async def _handle_no_reply_terminal(
+    self,
+    registry: ToolRegistry,
+    tool_context: ToolContext,
+    calls: List[Dict[str, Any]],
+    terminal_call: Dict[str, Any],
+    tools_used_all: List[str],
+    local_tool_calls: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Terminal round: no_response_needed ends the turn. Only sibling react_to_message
+    calls execute (filtered BEFORE dispatch — dispatch_all runs a round concurrently);
+    other side-effect calls are suppressed with a logged skip. Returns a no_reply outcome
+    with the (sanitized) reason; nothing is posted."""
+    exec_calls = [c for c in calls if c.get("name") in (_NO_REPLY_TOOL, _REACT_TOOL)]
+    skipped = [c.get("name") for c in calls if c not in exec_calls]
+    if skipped:
+        self.log_info(f"{_NO_REPLY_TOOL} terminal — suppressing sibling calls: {skipped}")
+    results = await registry.dispatch_all(tool_context, exec_calls)
+    for call, result in zip(exec_calls, results):
+        if call.get("name") == _REACT_TOOL:
+            local_tool_calls.append({"name": call.get("name"), "ok": _call_ok(result)})
+    _merge_used(tools_used_all, [c.get("name") for c in exec_calls if c.get("name")])
+    reason = _sanitize_reason(terminal_call)
+    self.log_info(f"{_NO_REPLY_TOOL}: ending turn without posting — reason: {reason!r}")
+    return {
+        "text": "",
+        "tools_used": tools_used_all,
+        "local_tool_calls": local_tool_calls,
+        "terminal_action": "no_reply",
+        "reason": reason,
+    }
+
+
 async def create_text_response_with_tool_loop(
     self,
     messages: List[Dict[str, Any]],
@@ -135,6 +192,12 @@ async def create_text_response_with_tool_loop(
                 "tools_used": tools_used_all,
                 "local_tool_calls": local_tool_calls,
             }
+
+        terminal_call = _no_reply_call(calls)
+        if terminal_call is not None:
+            return await _handle_no_reply_terminal(
+                self, registry, tool_context, calls, terminal_call,
+                tools_used_all, local_tool_calls)
 
         rounds += 1
         total_calls += len(calls)
@@ -190,6 +253,12 @@ async def create_streaming_response_with_tool_loop(
                 "tools_used": tools_used_all,
                 "local_tool_calls": local_tool_calls,
             }
+
+        terminal_call = _no_reply_call(calls)
+        if terminal_call is not None:
+            return await _handle_no_reply_terminal(
+                self, registry, tool_context, calls, terminal_call,
+                tools_used_all, local_tool_calls)
 
         rounds += 1
         total_calls += len(calls)

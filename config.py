@@ -454,6 +454,11 @@ class BotConfig:
     tool_result_max_chars: int = field(default_factory=lambda: int(os.getenv("TOOL_RESULT_MAX_CHARS", "20000")))
     # Model-invoked emoji reactions (redesign Phase D) — allowlist still REACTION_EMOJIS.
     enable_react_tool: bool = field(default_factory=lambda: os.getenv("ENABLE_REACT_TOOL", "true").lower() == "true")
+    # --- Explicit no-reply terminal tool (F2) ---
+    # Exposes a `no_response_needed` tool on UNPROMPTED (participation-gated) turns so the
+    # model can end without posting instead of emitting filler. Off → tool hidden, suffix
+    # paragraph absent, behavior as today (the honest-accounting fix is unconditional).
+    enable_no_reply_tool: bool = field(default_factory=lambda: os.getenv("ENABLE_NO_REPLY_TOOL", "true").lower() == "true")
 
     # --- Slack search tool (redesign Phase B) — assistant.search.context ---
     # Requires an action_token from the triggering event, so the bot can only search in

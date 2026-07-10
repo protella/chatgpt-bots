@@ -816,6 +816,33 @@ class SlackMessagingMixin:
             return {"ok": True, "emoji": emoji, "ts": ts}
         return {"ok": False, "error": "reaction_failed", "message": f"Could not add :{emoji}:."}
 
+    def get_no_reply_tool_schema(self) -> dict:
+        """Function-tool schema for the F2 terminal no-reply action (unprompted turns only)."""
+        return {
+            "type": "function",
+            "name": "no_response_needed",
+            "description": (
+                "End this turn without posting anything. Call this when, after seeing the "
+                "full conversation, you have nothing useful to add — the message wasn't "
+                "really for you, someone else already answered, or silence is the socially "
+                "right move. You may add an emoji reaction (react_to_message) in the same "
+                "round; call this instead of replying, never after writing a reply."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string",
+                               "description": "One short sentence: why silence is right."},
+                },
+                "required": ["reason"],
+            },
+        }
+
+    async def execute_no_reply_tool(self, ctx, args: dict) -> dict:
+        """Executor for no_response_needed. Terminal signal only — the tool loop stops the
+        turn and the handler surfaces the outcome; nothing is posted here."""
+        return {"ok": True}
+
     async def update_message_streaming(self, channel_id: str, message_id: str, text: str) -> Dict:
         """Updates a message with rate limit awareness"""
         try:
