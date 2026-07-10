@@ -113,6 +113,51 @@ class SlackSettingsHandlersMixin:
                 except Exception:
                     pass
         
+        # --- Phase H+: USER settings modal, opened from the DM strip's "⚙️ <model>" button ---
+        @self.app.action("open_user_settings")
+        async def handle_open_user_settings(ack, body, client):
+            """DM feedback strip's '⚙️ <model>' button → open the global user settings
+            modal (same flow as the slash command).
+
+            trigger_ids expire in ~3s, so ack and views_open immediately.
+            """
+            await ack()
+            trigger_id = body.get('trigger_id')
+            user_id = (body.get('user') or {}).get('id')
+            channel_id = ((body.get('container') or {}).get('channel_id')
+                          or (body.get('channel') or {}).get('id'))
+            if not trigger_id or not user_id:
+                return
+            try:
+                current_settings = await self.db.get_user_preferences_async(user_id)
+                is_new_user = current_settings is None
+                if is_new_user:
+                    user_data = await self.db.get_or_create_user_async(user_id)
+                    email = user_data.get('email') if user_data else None
+                    current_settings = await self.db.create_default_user_preferences_async(user_id, email)
+                modal = await self.settings_modal.build_settings_modal(
+                    user_id=user_id,
+                    trigger_id=trigger_id,
+                    current_settings=current_settings,
+                    is_new_user=is_new_user,
+                    thread_id=None,   # strip button always edits global settings
+                    in_thread=False,
+                )
+                await client.views_open(trigger_id=trigger_id, view=modal)
+                self.log_info(f"User settings modal opened for {user_id} (DM strip button)")
+            except Exception as e:
+                self.log_error(f"Error opening user settings modal from DM strip: {e}")
+                # The user clicked a button — silence reads as a dead button.
+                try:
+                    if channel_id:
+                        await client.chat_postEphemeral(
+                            channel=channel_id,
+                            user=user_id,
+                            text="⚠️ Couldn't open settings — please try again."
+                        )
+                except Exception:
+                    pass
+
         # --- Phase 7: per-channel settings modal, opened from the response footer button ---
         # ANY channel member may open Configure and save — no admin gating, no membership lookups.
         @self.app.action("open_channel_settings")
