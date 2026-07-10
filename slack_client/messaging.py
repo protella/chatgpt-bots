@@ -660,12 +660,15 @@ class SlackMessagingMixin:
         if not hasattr(self.app.client, "assistant_threads_setStatus"):
             return False
         # Slack renders the status TWICE on the agent surface: an in-thread transient
-        # bubble (prefers loading_messages rotation) and the composer bottom-bar line
-        # (the status string). Sending both with different texts looks like two
-        # separate indicators (user screenshot 2026-07-09). Rule: an explicit phase
-        # status is sent ALONE; the rotating set rides only the initial no-args call.
+        # bubble (rotates loading_messages) and the composer bottom-bar line (the
+        # status string). The bubble also RETAINS previously-sent rotation frames
+        # when a later call omits loading_messages, so the two surfaces drift apart
+        # (user screenshots 2026-07-09/10). Rule: an explicit phase status sends
+        # itself as the single loading message too — replacing any stored rotation —
+        # so both surfaces always show the same current text; the branded rotating
+        # set rides only the initial no-args call.
         if status is not None:
-            msgs = loading_messages  # explicit phase → no default rotation alongside
+            msgs = loading_messages if loading_messages is not None else [status]
             status_text = status
         else:
             msgs = loading_messages if loading_messages is not None else (config.status_loading_messages or None)
