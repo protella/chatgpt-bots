@@ -215,12 +215,19 @@ class ChatBotV2:
             )
             # Batched catch-up turn (drained queue): make the status say so.
             batch_size = message.metadata.get("queued_batch_size", 0)
-            if thinking_id and isinstance(batch_size, int) and batch_size > 1 and hasattr(client, "update_message"):
+            if isinstance(batch_size, int) and batch_size > 1:
+                catch_up = f"Catching up on {batch_size} messages..."
                 try:
-                    await client.update_message(
-                        message.channel_id, thinking_id,
-                        f"{config.thinking_emoji} Catching up on {batch_size} messages..."
-                    )
+                    if thinking_id and hasattr(client, "update_message"):
+                        await client.update_message(
+                            message.channel_id, thinking_id,
+                            f"{config.thinking_emoji} {catch_up}"
+                        )
+                    elif thinking_id is None and hasattr(client, "set_assistant_status"):
+                        # Status-only DM indicator: the composer status carries it.
+                        await client.set_assistant_status(
+                            message.channel_id, post_thread_id, status=catch_up
+                        )
                 except Exception as e:
                     main_logger.debug(f"Catch-up status update failed: {e}")
 

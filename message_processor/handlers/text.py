@@ -69,8 +69,13 @@ class TextHandlerMixin:
         # Check if streaming is enabled and supported (respecting user prefs)
         # Allow streaming on retry if the failure was just MCP-related (not a streaming failure)
         streaming_enabled = thread_config.get('enable_streaming', config.enable_streaming)
+        # thinking_id None = status-only DM indicator (setStatus, no placeholder).
+        # Streaming still works there when the native path can create its own
+        # message (chat.startStream); the legacy edit loop seeds one lazily.
+        native_capable = (hasattr(client, 'supports_native_streaming')
+                          and client.supports_native_streaming())
         can_stream = (hasattr(client, 'supports_streaming') and client.supports_streaming() and
-                     streaming_enabled and thinking_id is not None)
+                     streaming_enabled and (thinking_id is not None or native_capable))
         # Stream on first attempt OR on MCP-failure retry (streaming itself didn't fail)
         should_stream = can_stream and (retry_count == 0 or failed_mcp_server is not None)
         if should_stream:
@@ -159,11 +164,11 @@ class TextHandlerMixin:
         failed_mcp_display = ", ".join(sorted(self._as_mcp_exclusion_set(failed_mcp_server)))
         if failed_mcp_server:
             self._update_status(client, message.channel_id, thinking_id,
-                               f"Retrying without '{failed_mcp_display}'...", emoji=config.circle_loader_emoji)
+                               f"Retrying without '{failed_mcp_display}'...", emoji=config.circle_loader_emoji, thread_id=message.thread_id)
         elif retry_count > 0:
-            self._update_status(client, message.channel_id, thinking_id, "Retrying response...", emoji=config.circle_loader_emoji)
+            self._update_status(client, message.channel_id, thinking_id, "Retrying response...", emoji=config.circle_loader_emoji, thread_id=message.thread_id)
         else:
-            self._update_status(client, message.channel_id, thinking_id, "Generating response...")
+            self._update_status(client, message.channel_id, thinking_id, "Generating response...", thread_id=message.thread_id)
         
         # Determine timeout based on retry attempt
         retry_timeout = 60.0 if retry_count > 0 else None
@@ -480,11 +485,29 @@ class TextHandlerMixin:
             # Update existing thinking message
             message_id = thinking_id
             await client.update_message(message.channel_id, message_id, initial_message)
+        elif hasattr(client, 'supports_native_streaming') and client.supports_native_streaming():
+            # Status-only DM indicator: no placeholder exists (setStatus is the
+            # visible cue). The native stream creates the reply message on the
+            # first chunk; if that fails, the legacy loop seeds one lazily.
+            message_id = None
         else:
             # We need a way to post a message and get its ID - this would depend on client implementation
             self.log_warning("No thinking_id provided for streaming - falling back to non-streaming")
             return await self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls, retry_count=0)
         
+        async def stream_status_update(status_msg: str) -> dict:
+            """Tool/phase status during streaming: edit the placeholder when one
+            exists; on status-only DMs (no placeholder) route to the native
+            composer status instead of editing a message."""
+            if message_id:
+                return await stream_status_update(status_msg)
+            if hasattr(client, "set_assistant_status"):
+                try:
+                    await client.set_assistant_status(message.channel_id, message.thread_id, status=status_msg)
+                except Exception as e:
+                    self.log_debug(f"Status-only tool status failed: {e}")
+            return {"success": True}
+
         # Track tool states for status updates
         tool_states = {
             "web_search": False,
@@ -534,7 +557,7 @@ class TextHandlerMixin:
                     status_msg = f"{config.web_search_emoji} Searching the web (query {search_counts['web_search']})..."
                     try:
                         # Use update_message_streaming for consistency with streaming flow
-                        result = await client.update_message_streaming(message.channel_id, message_id, status_msg)
+                        result = await stream_status_update(status_msg)
                         if result["success"]:
                             self.log_info(f"Web search #{search_counts['web_search']} started - updated status")
                         else:
@@ -548,7 +571,7 @@ class TextHandlerMixin:
                     # Show search count consistently for all searches
                     status_msg = f"{config.web_search_emoji} Searching files (query {search_counts['file_search']})..."
                     try:
-                        result = await client.update_message_streaming(message.channel_id, message_id, status_msg)
+                        result = await stream_status_update(status_msg)
                         if result["success"]:
                             self.log_info(f"File search #{search_counts['file_search']} started - updated status")
                         else:
@@ -559,7 +582,7 @@ class TextHandlerMixin:
                     tool_states["image_generation"] = True
                     status_msg = f"{config.circle_loader_emoji} Generating image. This may take a minute..."
                     try:
-                        result = await client.update_message_streaming(message.channel_id, message_id, status_msg)
+                        result = await stream_status_update(status_msg)
                         if result["success"]:
                             self.log_info("Image generation started - updated status")
                         else:
@@ -577,7 +600,7 @@ class TextHandlerMixin:
                     if label:  # instant tools (e.g. reactions) don't need a status line
                         status_msg = f"{config.circle_loader_emoji} {label}..."
                         try:
-                            result = await client.update_message_streaming(message.channel_id, message_id, status_msg)
+                            result = await stream_status_update(status_msg)
                             if not result["success"]:
                                 self.log_warning(f"Failed to update local tool status: {result.get('error', 'Unknown error')}")
                         except Exception as e:
@@ -610,7 +633,7 @@ class TextHandlerMixin:
                     call_suffix = f" (call {search_counts['mcp']})" if search_counts['mcp'] > 1 else ""
                     status_msg = f"{config.web_search_emoji} Using MCP tools{server_suffix}{call_suffix}..."
                     try:
-                        result = await client.update_message_streaming(message.channel_id, message_id, status_msg)
+                        result = await stream_status_update(status_msg)
                         if result["success"]:
                             self.log_info(f"MCP call #{search_counts['mcp']}{server_suffix} started - updated status")
                         else:
@@ -694,11 +717,13 @@ class TextHandlerMixin:
                     if await native_coord.start():
                         current_message_id = native_coord.current_ts or current_message_id
                         # Placeholder is skipped in native mode — startStream created
-                        # the reply message. Best-effort removal of the old indicator.
-                        try:
-                            await client.delete_message(message.channel_id, message_id)
-                        except Exception as e:
-                            self.log_debug(f"Could not remove placeholder for native stream: {e}")
+                        # the reply message. Best-effort removal of the old indicator
+                        # (status-only DMs never had one).
+                        if message_id:
+                            try:
+                                await client.delete_message(message.channel_id, message_id)
+                            except Exception as e:
+                                self.log_debug(f"Could not remove placeholder for native stream: {e}")
                     else:
                         self.log_info("Native streaming unavailable — using legacy streaming updates")
                 if not native_coord.failed:
@@ -727,6 +752,22 @@ class TextHandlerMixin:
                             self.log_warning("Native stream went inert — continuing with legacy updates")
                     return
                 # start failed: fall through to the legacy path (chunk not yet buffered)
+
+            # Status-only DM (no placeholder) reaching the legacy path: edits need
+            # a real message — seed it now, once. Retried on the next chunk if the
+            # seed post fails; the post-stream final correction is the backstop.
+            if current_message_id is None:
+                if text_chunk is None and not buffer.has_pending_update():
+                    return
+                seed = await client.send_message_get_ts(
+                    message.channel_id, message.thread_id, initial_message)
+                if seed and seed.get("success") and seed.get("ts"):
+                    current_message_id = seed["ts"]
+                else:
+                    self.log_warning("Could not seed legacy streaming message (status-only DM) — chunk buffered")
+                    if text_chunk:
+                        buffer.add_chunk(text_chunk)
+                    return
 
             # Check if this is the completion signal (None)
             if text_chunk is None:
@@ -846,7 +887,7 @@ class TextHandlerMixin:
                             continuation_text = f"{part_prefix(current_part)}{continuation_display} {config.loading_ellipse_emoji}"
 
                             # Send new message and get its ID
-                            new_msg_result = await client.send_message_get_ts(message.channel_id, thinking_id, continuation_text)
+                            new_msg_result = await client.send_message_get_ts(message.channel_id, thinking_id or message.thread_id, continuation_text)
                             if new_msg_result and new_msg_result.get("success") and "ts" in new_msg_result:
                                 current_message_id = new_msg_result["ts"]
                                 # Reset buffer with the properly fenced overflow content
@@ -1125,10 +1166,11 @@ class TextHandlerMixin:
                 self.log_info("Reaction-only streamed response (react tool) — removing placeholder")
                 if native_coord is not None and native_coord.started:
                     await native_coord.abandon()  # stop the (empty) stream before deleting it
-                try:
-                    await client.delete_message(message.channel_id, current_message_id)
-                except Exception as e:
-                    self.log_warning(f"Could not delete placeholder for reaction-only response: {e}")
+                if current_message_id:  # status-only DMs may have no message at all
+                    try:
+                        await client.delete_message(message.channel_id, current_message_id)
+                    except Exception as e:
+                        self.log_warning(f"Could not delete placeholder for reaction-only response: {e}")
                 return Response(
                     type="text",
                     content="",
@@ -1196,6 +1238,16 @@ class TextHandlerMixin:
             # We need to update the current message (which might be part 2, 3, etc)
             if native_finalized:
                 pass  # native stopStream delivered the final text (+ attribution)
+            elif current_message_id is None:
+                # Status-only DM where neither the native stream nor the lazy legacy
+                # seed ever produced a message (e.g. zero chunks before completion).
+                # Post the response fresh so nothing is lost (attribution is already
+                # appended to response_text above).
+                self.log_info("No streaming message exists — posting final response directly")
+                try:
+                    await client.send_message(message.channel_id, message.thread_id, response_text)
+                except Exception as e:
+                    self.log_error(f"Error posting final response directly: {e}")
             elif current_part > 1:
                 # We're on an overflow message - just remove the loading indicator
                 self.log_debug(f"Removing loading indicator from part {current_part}")
@@ -1276,7 +1328,7 @@ class TextHandlerMixin:
                             if truncated_text.count('```') % 2 == 1:
                                 truncated_text += '\n```'
                             truncated_text += continuation_msg
-                            final_result = await client.update_message_streaming(message.channel_id, message_id, truncated_text)
+                            final_result = await client.update_message_streaming(message.channel_id, current_message_id, truncated_text)
 
                             # Send the rest as new messages
                             overflow_text = response_text[cut:].lstrip()
@@ -1360,8 +1412,11 @@ class TextHandlerMixin:
                 progress_task.cancel()
                 self.log_debug("Cancelled progress updater due to error")
 
-            # Try to remove the loading indicator if we had a message_id
-            if message_id and hasattr(client, 'update_message_streaming'):
+            # Try to remove the loading indicator if we have a visible message —
+            # the lazy legacy seed (status-only DMs) lives in current_message_id,
+            # never in message_id.
+            cleanup_ts = current_message_id or message_id
+            if cleanup_ts and hasattr(client, 'update_message_streaming'):
                 try:
                     # Send whatever text we have without the loading indicator, or a formatted error message
                     if buffer.has_content():
@@ -1371,7 +1426,7 @@ class TextHandlerMixin:
                             error_text = f"{config.error_emoji} *MCP Connection Failed*\n\nCouldn't connect to MCP server '{failed_mcp_server}'. Retrying with other tools..."
                         else:
                             error_text = f"{config.error_emoji} *OpenAI Stream Interrupted*\n\nOpenAI's streaming response was interrupted. I'll try again without streaming..."
-                    await client.update_message_streaming(message.channel_id, message_id, error_text)
+                    await client.update_message_streaming(message.channel_id, cleanup_ts, error_text)
                 except Exception as cleanup_error:
                     self.log_debug(f"Could not remove loading indicator: {cleanup_error}")
 
