@@ -15,16 +15,26 @@ import re
 from typing import List, Tuple
 
 # Canonical marker set ("Continued..." style — user preference).
-CONTINUATION_TRAILER = "*Continued in next message...*"
-CONTINUATION_HEAD = "*...continued*"
+_TRAILER_BODY = "Continued in next message..."
+_HEAD_BODY = "...continued"
+CONTINUATION_TRAILER = f"*{_TRAILER_BODY}*"
+CONTINUATION_HEAD = f"*{_HEAD_BODY}*"
 
-# Legacy shapes still present in old Slack history; recognized on read, never written.
+# Legacy/alternate shapes still present in Slack history; recognized on read, never
+# written by the mrkdwn writers. The markdown-flavored variants cover the native
+# streaming path (chat.startStream markdown_text): Slack converts markdown **bold**
+# to stored mrkdwn *bold* (canonical), but the raw/italic forms are recognized too
+# in case a message is stored unconverted.
 _LEGACY_TRAILERS = (
     "*...continued in next message...*",  # messaging-layer backup truncation
+    f"**{_TRAILER_BODY}**",               # markdown bold, stored verbatim
+    f"_{_TRAILER_BODY}_",                 # markdown italic converted to mrkdwn
 )
 _TRAILER_VARIANTS = (CONTINUATION_TRAILER,) + _LEGACY_TRAILERS
-# "*Part 2 (continued)*" (streaming) and "*Part 1/3*" (old non-streaming) prefixes.
-_PART_PREFIX_RE = re.compile(r"^\s*\*Part \d+(?: \(continued\)|\s*/\s*\d+)\*\s*\n+")
+_HEAD_VARIANTS = (CONTINUATION_HEAD, f"**{_HEAD_BODY}**", f"_{_HEAD_BODY}_")
+# "*Part 2 (continued)*" (streaming) and "*Part 1/3*" (old non-streaming) prefixes;
+# [*_]{1,2} accepts the markdown-written (native streaming) sibling shapes.
+_PART_PREFIX_RE = re.compile(r"^\s*[*_]{1,2}Part \d+(?: \(continued\)|\s*/\s*\d+)[*_]{1,2}\s*\n+")
 
 
 def part_prefix(part: int) -> str:
@@ -35,6 +45,20 @@ def part_prefix(part: int) -> str:
 def continuation_trailer() -> str:
     """Trailer appended to a message that continues in the next one."""
     return f"\n\n{CONTINUATION_TRAILER}"
+
+
+def part_prefix_markdown(part: int) -> str:
+    """part_prefix for markdown-input sinks (chat.startStream markdown_text).
+
+    Slack converts markdown **bold** to mrkdwn *bold* on store, so this lands in
+    history as exactly ``part_prefix(part)`` — the shape the rebuild merger strips.
+    """
+    return f"**Part {part} (continued)**\n\n"
+
+
+def continuation_trailer_markdown() -> str:
+    """continuation_trailer for markdown-input sinks; stores as the canonical shape."""
+    return f"\n\n**{_TRAILER_BODY}**"
 
 
 def ends_with_continuation(text: str) -> bool:
@@ -49,7 +73,8 @@ def starts_as_continuation(text: str) -> bool:
         return False
     if _PART_PREFIX_RE.match(text):
         return True
-    return text.lstrip().startswith(CONTINUATION_HEAD)
+    stripped = text.lstrip()
+    return any(stripped.startswith(h) for h in _HEAD_VARIANTS)
 
 
 def strip_continuation_markers(text: str) -> str:
@@ -58,8 +83,10 @@ def strip_continuation_markers(text: str) -> str:
         return text
     t = _PART_PREFIX_RE.sub("", text)
     lstripped = t.lstrip()
-    if lstripped.startswith(CONTINUATION_HEAD):
-        t = lstripped[len(CONTINUATION_HEAD):].lstrip("\n ")
+    for head in _HEAD_VARIANTS:
+        if lstripped.startswith(head):
+            t = lstripped[len(head):].lstrip("\n ")
+            break
     stripped = t.rstrip()
     changed = True
     while changed:

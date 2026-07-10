@@ -13,7 +13,7 @@ from message_markers import (
     entity_safe_cut,
     part_prefix,
 )
-from streaming import FenceHandler, RateLimitManager, StreamingBuffer
+from streaming import FenceHandler, NativeStreamCoordinator, RateLimitManager, StreamingBuffer
 from tool_registry import ToolContext
 
 
@@ -509,6 +509,12 @@ class TextHandlerMixin:
             """Handle tool events for status updates"""
             nonlocal progress_task
 
+            # Native mode: once the stream owns the visible message the placeholder is
+            # gone — status edits would hit a deleted ts. Log tool activity instead.
+            if native_coord is not None and native_coord.started and not native_coord.failed:
+                self.log_debug(f"Tool event during native stream (status suppressed): {tool_type} {status}")
+                return
+
             if status == "started":
                 # Cancel progress updater when tools start (web search takes over status)
                 if progress_task and not progress_task.done():
@@ -631,6 +637,28 @@ class TextHandlerMixin:
         message_char_limit = 3700 - safety_margin  # Approximately 3060 chars - ensures overflow before messaging truncation
         streaming_aborted = False  # Track if we had to abort streaming due to failures
 
+        # Native Slack streaming sink (Phase G): created here, STARTED lazily on the
+        # first content chunk — chat.startStream creates the reply message itself, so
+        # the "Thinking..." placeholder is deleted at that moment instead of edited.
+        # Any start/append failure flips the coordinator inert and the legacy
+        # update_message_streaming edit loop below takes over seamlessly.
+        native_coord = None
+        if (hasattr(client, "supports_native_streaming") and client.supports_native_streaming()
+                and hasattr(client, "begin_native_stream")):
+            # Same placement rule as main.py's indicator: reply_in_channel channels
+            # get a top-level message (thread_ts None); everything else threads.
+            meta = message.metadata or {}
+            is_top_level_trigger = meta.get("ts") == message.thread_id
+            place_in_channel = (
+                bool(meta.get("reply_in_channel")) and is_top_level_trigger
+                and bool(message.channel_id) and not message.channel_id.startswith("D")
+            )
+            native_coord = NativeStreamCoordinator(
+                client, message.channel_id,
+                None if place_in_channel else message.thread_id,
+                char_limit=message_char_limit, logger=self.log_debug,
+            )
+
         # Start progress updater task (will be cancelled when streaming starts)
         progress_task = None
         first_chunk_received = False
@@ -657,7 +685,49 @@ class TextHandlerMixin:
                     except asyncio.CancelledError:
                         pass
                     self.log_debug("Cancelled progress updater - streaming started")
-            
+
+            # ---- Native sink (Phase G): append-only streaming replaces the edit loop ----
+            if native_coord is not None and not native_coord.failed:
+                if text_chunk is None:
+                    return  # tail + attribution are appended by finalize() after the API call
+                if not native_coord.started:
+                    if await native_coord.start():
+                        current_message_id = native_coord.current_ts or current_message_id
+                        # Placeholder is skipped in native mode — startStream created
+                        # the reply message. Best-effort removal of the old indicator.
+                        try:
+                            await client.delete_message(message.channel_id, message_id)
+                        except Exception as e:
+                            self.log_debug(f"Could not remove placeholder for native stream: {e}")
+                    else:
+                        self.log_info("Native streaming unavailable — using legacy streaming updates")
+                if not native_coord.failed:
+                    buffer.add_chunk(text_chunk)
+                    if buffer.should_update() and rate_limiter.can_make_request():
+                        rate_limiter.record_request_attempt()
+                        ok, overflow = await native_coord.update(buffer.get_complete_text())
+                        if overflow is not None:
+                            # Part rolled: markers were appended by the coordinator
+                            # (message_markers shapes); buffer restarts from the overflow.
+                            buffer.reset()
+                            buffer.add_chunk(overflow)
+                            buffer.mark_updated()
+                            current_part = native_coord.part
+                        if ok:
+                            rate_limiter.record_success()
+                            if overflow is None:
+                                buffer.mark_updated()
+                            buffer.update_interval_setting(rate_limiter.get_current_interval())
+                            current_message_id = native_coord.current_ts or current_message_id
+                        else:
+                            # Went inert mid-stream: legacy edits continue on the
+                            # native message so nothing visible is lost.
+                            rate_limiter.record_failure(is_rate_limit=False)
+                            current_message_id = native_coord.current_ts or current_message_id
+                            self.log_warning("Native stream went inert — continuing with legacy updates")
+                    return
+                # start failed: fall through to the legacy path (chunk not yet buffered)
+
             # Check if this is the completion signal (None)
             if text_chunk is None:
                 # Stream is complete - flush any remaining buffered text WITHOUT loading indicator
@@ -1053,6 +1123,8 @@ class TextHandlerMixin:
             # returned no text — delete the placeholder and post nothing.
             if self._is_reaction_only(response_text, local_tool_calls):
                 self.log_info("Reaction-only streamed response (react tool) — removing placeholder")
+                if native_coord is not None and native_coord.started:
+                    await native_coord.abandon()  # stop the (empty) stream before deleting it
                 try:
                     await client.delete_message(message.channel_id, current_message_id)
                 except Exception as e:
@@ -1105,10 +1177,26 @@ class TextHandlerMixin:
                     metadata={"streaming_aborted": True}
                 )
 
+            # Native mode: the stream is still open — append the remaining tail plus
+            # the attribution note and stop it. On any failure fall through to the
+            # legacy final-correction edit against the native message's ts.
+            native_finalized = False
+            if native_coord is not None and native_coord.started and not native_coord.failed:
+                suffix = tools_note if (tools_used or exclude_mcp_server) else ""
+                native_finalized = await native_coord.finalize(
+                    buffer.get_complete_text(), suffix=suffix)
+                current_message_id = native_coord.current_ts or current_message_id
+                if native_finalized:
+                    current_part = native_coord.part
+                else:
+                    self.log_warning("Native finalize failed — applying legacy final correction")
+
             # Safety check: ensure all text was sent AND remove loading indicator
             # Note: current_message_id might be different from message_id if we overflowed
             # We need to update the current message (which might be part 2, 3, etc)
-            if current_part > 1:
+            if native_finalized:
+                pass  # native stopStream delivered the final text (+ attribution)
+            elif current_part > 1:
                 # We're on an overflow message - just remove the loading indicator
                 self.log_debug(f"Removing loading indicator from part {current_part}")
                 try:
@@ -1223,7 +1311,10 @@ class TextHandlerMixin:
             return Response(
                 type="text",
                 content=response_text,
-                metadata={"streamed": True, "message_id": message_id, "model": thread_config.get("model")}
+                metadata={"streamed": True, "message_id": message_id,
+                          "native_stream": bool(native_coord is not None and native_coord.started
+                                                and not native_coord.failed),
+                          "model": thread_config.get("model")}
             )
             
         except Exception as e:

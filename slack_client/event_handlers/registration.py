@@ -27,6 +27,19 @@ class SlackRegistrationMixin:
                 if config.enable_channel_listening:
                     await self._handle_channel_message(event, client)
 
+        # --- agent_view lifecycle (June 2026 surface, Phase G) ---
+        @self.app.event("app_home_opened")
+        async def handle_app_home_opened(event, client):
+            # Messages tab opened: greet once per channel (tab filter + dedup inside).
+            await self._handle_app_home_opened(event, client)
+
+        @self.app.event("app_context_changed")
+        async def handle_app_context_changed(event):
+            await self._handle_app_context_changed(event)
+
+        # --- LEGACY agent surface (deprecated by agent_view) ---
+        # Keep during the transition (whichever fires, the greeting dedup makes it
+        # fire once); remove one release after the manifest fully flips to agent_view.
         @self.app.event("assistant_thread_started")
         async def handle_assistant_thread_started(event, client):
             # Agent split-view opened: greet + set suggested prompts (best-effort, flag-gated).
