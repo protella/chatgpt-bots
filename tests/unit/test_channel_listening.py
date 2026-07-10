@@ -205,7 +205,7 @@ async def test_participation_level_off_row_silences_channel(monkeypatch):
 @pytest.mark.asyncio
 async def test_thread_reply_one_on_one_responds(tag_only):
     bot = _make_bot()
-    bot._thread_participation = AsyncMock(return_value=(True, 1))
+    bot._thread_participation = AsyncMock(return_value=(True, 1, 0))
     await bot._handle_channel_message(_evt(text="and what about friday?", thread_ts="50.0", ts="60.0"), bot.app.client)
     bot.message_handler.assert_called_once()
 
@@ -213,8 +213,55 @@ async def test_thread_reply_one_on_one_responds(tag_only):
 @pytest.mark.asyncio
 async def test_thread_reply_multiparty_unaddressed_ignored(tag_only):
     bot = _make_bot()
-    bot._thread_participation = AsyncMock(return_value=(True, 3))
+    bot._thread_participation = AsyncMock(return_value=(True, 3, 0))
     await bot._handle_channel_message(_evt(text="sounds good to me", thread_ts="50.0", ts="60.0"), bot.app.client)
+    bot.message_handler.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_thread_with_other_agent_is_not_a_continuation(tag_only):
+    # A second bot/agent in the thread means untagged replies may be for IT —
+    # no deterministic continuation (this is the Claude-in-the-test-channel bug:
+    # one human + two agents looked "1:1" when only humans were counted).
+    bot = _make_bot()
+    bot._thread_participation = AsyncMock(return_value=(True, 1, 1))
+    await bot._handle_channel_message(_evt(text="sounds good", thread_ts="50.0", ts="60.0"), bot.app.client)
+    bot.message_handler.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bot_sender_never_direct_continuation(tag_only):
+    # Another bot replying in our 1:1 thread must not get a judgment-free response.
+    bot = _make_bot()
+    bot._thread_participation = AsyncMock(return_value=(True, 1, 0))
+    evt = _evt(user="UCLAUDE", bot_id="BCLAUDE", text="I agree with the plan.",
+               thread_ts="50.0", ts="60.0")
+    await bot._handle_channel_message(evt, bot.app.client)
+    bot.message_handler.assert_not_called()
+    bot._thread_participation.assert_not_called()  # not even consulted for bot senders
+
+
+@pytest.mark.asyncio
+async def test_bot_sender_name_hit_routes_to_engine_with_signal(tag_only):
+    # Bot-to-bot is allowed — but only via the engine's judgment, with the
+    # sender-is-bot signal attached.
+    bot = _make_bot()
+    evt = _evt(user="UCLAUDE", bot_id="BCLAUDE", text="ChatGPT, what does the data say?")
+    await bot._handle_channel_message(evt, bot.app.client)
+    bot.message_handler.assert_called_once()
+    msg = bot.message_handler.call_args[0][0]
+    assert msg.metadata.get("participation_check") is True
+    assert msg.metadata.get("participation_sender_bot") is True
+
+
+@pytest.mark.asyncio
+async def test_bot_sender_name_hit_engine_disabled_stays_silent(tag_only, monkeypatch):
+    # With the engine off there is no judgment available, so a bot naming us
+    # must not trigger the legacy deterministic wake (loop seed).
+    monkeypatch.setattr(config, "enable_participation_engine", False, raising=False)
+    bot = _make_bot()
+    evt = _evt(user="UCLAUDE", bot_id="BCLAUDE", text="ChatGPT, ping")
+    await bot._handle_channel_message(evt, bot.app.client)
     bot.message_handler.assert_not_called()
 
 
@@ -242,17 +289,20 @@ async def test_thread_participation_counts_humans_and_bot(tag_only):
         {"user": "UHUMAN1"},
         {"user": "UHUMAN2"},
         {"user": "UHUMAN1"},  # dup human
+        {"user": "UCLAUDE", "bot_id": "BCLAUDE"},  # another agent
+        {"user": "UCLAUDE", "bot_id": "BCLAUDE"},  # dup agent
     ]})
-    bot_present, humans = await bot._thread_participation("C1", "50.0")
+    bot_present, humans, other_bots = await bot._thread_participation("C1", "50.0")
     assert bot_present is True
     assert humans == 2
+    assert other_bots == 1
 
 
 @pytest.mark.asyncio
 async def test_thread_participation_handles_api_error(tag_only):
     bot = _make_bot()
     bot.app.client.conversations_replies = AsyncMock(side_effect=RuntimeError("boom"))
-    assert await bot._thread_participation("C1", "50.0") == (False, 0)
+    assert await bot._thread_participation("C1", "50.0") == (False, 0, 0)
 
 
 def test_default_config_is_safe(monkeypatch):

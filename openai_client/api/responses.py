@@ -950,6 +950,14 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
         )
     if signals.get("sender_name"):
         lines.append(f"- Sender: {signals['sender_name']}")
+    if signals.get("sender_is_bot"):
+        lines.append(
+            "- The sender is another bot/agent, not a human. Responding to a bot is fine "
+            "when it genuinely addresses the assistant or the assistant adds real value — "
+            "use judgment. But never reply reflexively: two agents answering each other "
+            "creates loops, so ignore bot chatter aimed at humans or other bots, and don't "
+            "respond just to acknowledge or agree."
+        )
     if signals.get("is_thread_reply"):
         lines.append("- This is a reply inside a thread the assistant can see.")
     if signals.get("name_hit"):

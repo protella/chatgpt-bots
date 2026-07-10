@@ -102,6 +102,19 @@ async def test_signals_render_into_prompt_deterministically():
 
 
 @pytest.mark.asyncio
+async def test_sender_is_bot_signal_renders_judgment_line():
+    llm = _FakeLLM(text='{"action": "ignore"}')
+    await classify_participation(llm, "msg", signals={"sender_is_bot": True})
+    prompt = llm.captured_input[1]["content"]
+    assert "another bot/agent" in prompt
+    assert "use judgment" in prompt  # allowed, not banned
+    # And absent the signal, the line stays out.
+    llm2 = _FakeLLM(text='{"action": "ignore"}')
+    await classify_participation(llm2, "msg", signals={})
+    assert "another bot/agent" not in llm2.captured_input[1]["content"]
+
+
+@pytest.mark.asyncio
 async def test_deprecated_classify_wake_still_importable():
     # Kept one release for rollback; no runtime call sites.
     from openai_client.api.responses import classify_wake
