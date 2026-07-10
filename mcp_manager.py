@@ -4,10 +4,15 @@ Handles loading, caching, and formatting of MCP server configurations
 """
 import json
 import os
-from typing import Dict, List, Optional, Any
+import re
+from typing import Dict, List, Optional, Any, Tuple
 from urllib.parse import urlparse
 from logger import LoggerMixin
 from config import config
+
+# ${VAR_NAME} placeholders in mcp_config.json values are expanded from the
+# environment at load time so secrets can live in .env instead of the config file.
+_ENV_PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 class MCPManager(LoggerMixin):
@@ -82,6 +87,31 @@ class MCPManager(LoggerMixin):
                     self.log_warning(f"Skipping invalid server config for '{label}': not an object/dict")
                     continue
 
+                # Per-server enable switch ("enabled": false skips the server)
+                if server_config.get("enabled", True) is False:
+                    self.log_info(f"MCP server '{label}' is disabled in config - skipping")
+                    continue
+
+                # Expand ${VAR} placeholders from the environment. A server with
+                # unresolved placeholders is skipped entirely - sending a literal
+                # "${...}" as an auth header would just fail confusingly downstream.
+                server_config, unresolved = self._interpolate_env(server_config)
+                if unresolved:
+                    self.log_warning(
+                        f"MCP server '{label}' skipped: unresolved environment "
+                        f"variable(s) in config: {', '.join(sorted(unresolved))}"
+                    )
+                    continue
+
+                # Approval UI is not implemented; anything but "never" is forced.
+                requested_approval = server_config.get("require_approval", "never")
+                if requested_approval != "never":
+                    self.log_warning(
+                        f"MCP server '{label}' requests require_approval="
+                        f"'{requested_approval}' but no approval UI is implemented; "
+                        f"forcing 'never'. Use allowed_tools to restrict exposure."
+                    )
+
                 # Warn if server_url is missing (may fail at runtime)
                 if "server_url" not in server_config:
                     self.log_warning(f"Server '{label}' missing 'server_url' - may fail when OpenAI attempts to connect")
@@ -120,6 +150,86 @@ class MCPManager(LoggerMixin):
         except Exception as e:
             self.log_error(f"Error loading MCP config: {e}", exc_info=True)
             return False
+
+    def _interpolate_env(self, value: Any) -> Tuple[Any, set]:
+        """
+        Recursively expand ${VAR_NAME} placeholders in config values from the
+        environment. Returns (expanded_value, set_of_unresolved_var_names).
+        """
+        unresolved = set()
+
+        def expand(v):
+            if isinstance(v, str):
+                def repl(m):
+                    var = m.group(1)
+                    val = os.environ.get(var)
+                    if val is None:
+                        unresolved.add(var)
+                        return m.group(0)
+                    return val
+                return _ENV_PLACEHOLDER.sub(repl, v)
+            if isinstance(v, dict):
+                return {k: expand(item) for k, item in v.items()}
+            if isinstance(v, list):
+                return [expand(item) for item in v]
+            return v
+
+        return expand(value), unresolved
+
+    async def health_probe(self):
+        """
+        Best-effort startup reachability check for each enabled server.
+
+        Purely informational: logs one line per server (never disables a server
+        on failure - transient network at boot shouldn't kill it). Also logs any
+        cached tool discovery so admins can see server -> tools at a glance.
+        """
+        if not self.has_mcp_servers():
+            return
+
+        import aiohttp
+
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for label, server_config in self.servers.items():
+                url = server_config.get("server_url")
+                if not url:
+                    self.log_warning(f"MCP health: '{label}' has no server_url - skipped")
+                    continue
+                headers = server_config.get("headers") or {}
+                try:
+                    # GET (not HEAD): some MCP endpoints reject HEAD outright.
+                    # Any HTTP response at all proves reachability; the status is
+                    # informational (MCP endpoints often 4xx a bare GET).
+                    async with session.get(url, headers=headers) as resp:
+                        self.log_info(f"MCP health: '{label}' reachable (HTTP {resp.status})")
+                except Exception as e:
+                    self.log_warning(f"MCP health: '{label}' unreachable: {type(e).__name__}: {e}")
+
+                cached = self.get_cached_tools(label)
+                if cached:
+                    names = ", ".join(sorted(t.get("tool_name", "?") for t in cached))
+                    self.log_info(f"MCP health: '{label}' cached tools: {names}")
+
+    def cache_discovered_tools_payload(self, server_label: str, tools: List[Dict[str, Any]]):
+        """
+        Cache a full tools payload as discovered from a response.mcp_list_tools
+        output item. Each entry: {"name": ..., "description": ..., "input_schema": ...}.
+        """
+        if not server_label or not tools:
+            return
+        for tool in tools:
+            name = tool.get("name")
+            if not name:
+                continue
+            schema = tool.get("input_schema")
+            if schema is not None and not isinstance(schema, str):
+                try:
+                    schema = json.dumps(schema, sort_keys=True)
+                except (TypeError, ValueError):
+                    schema = None
+            self.cache_discovered_tool(server_label, name, tool.get("description"), schema)
+        self.log_info(f"MCP discovery: cached {len(tools)} tool(s) for '{server_label}'")
 
     def _load_cache_from_db(self):
         """Load cached tool definitions from database."""
