@@ -157,6 +157,34 @@ async def test_db_get_is_silent_on_missing_table(temp_db):
     assert await temp_db.get_thread_tool_usage_async("C1:100.0") == {}  # no raise
 
 
+# ---------------------------------------------- delivered-ts selection (F5/F7)
+
+def test_delivered_ts_native_path_uses_native_current_ts():
+    from message_processor.handlers.text import _delivered_stream_ts
+    from types import SimpleNamespace
+    native = SimpleNamespace(current_ts="999.9")
+    # Native finalize confirmed → the native stream's own message ts, NOT the (stale)
+    # legacy current_message_id.
+    assert _delivered_stream_ts(native, True, "111.1") == "999.9"
+
+
+def test_delivered_ts_legacy_path_uses_current_message_id():
+    from message_processor.handlers.text import _delivered_stream_ts
+    from types import SimpleNamespace
+    # Native ran but did NOT finalize (fell back to legacy edits) → the final
+    # current_message_id from the update loop.
+    native = SimpleNamespace(current_ts="999.9")
+    assert _delivered_stream_ts(native, False, "222.2") == "222.2"
+    # No native coordinator at all (pure legacy streaming).
+    assert _delivered_stream_ts(None, False, "333.3") == "333.3"
+
+
+def test_delivered_ts_none_when_nothing_delivered():
+    from message_processor.handlers.text import _delivered_stream_ts
+    # Status-only stream where no message was ever delivered → None (caller skips).
+    assert _delivered_stream_ts(None, False, None) is None
+
+
 # ------------------------------------------------------------------ persistence seam
 
 @pytest.mark.asyncio

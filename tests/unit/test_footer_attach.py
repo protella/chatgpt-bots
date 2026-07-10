@@ -79,7 +79,7 @@ class _CoordClient:
 
     def begin_native_stream(self, channel_id, thread_id):
         from slack_client.messaging import NativeStreamSession
-        return NativeStreamSession(self._client, channel_id, thread_id)
+        return NativeStreamSession(self._client, channel_id, thread_id, team_id="TEAM1")
 
 
 @pytest.mark.asyncio
