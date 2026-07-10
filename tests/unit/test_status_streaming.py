@@ -39,7 +39,7 @@ async def test_native_stream_start_update_finish_sends_deltas():
         chat_appendStream=AsyncMock(),
         chat_stopStream=AsyncMock(),
     )
-    sess = NativeStreamSession(client, "C1", "T1")
+    sess = NativeStreamSession(client, "C1", "T1", team_id="TEAM1")
 
     assert await sess.start("") is True
     assert sess.active and sess.ts == "100.1"
@@ -52,6 +52,50 @@ async def test_native_stream_start_update_finish_sends_deltas():
 
     await sess.finish("Hello world")  # nothing new -> stop without extra text
     client.chat_stopStream.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_native_stream_start_passes_recipient_team_id():
+    # chat.startStream now REQUIRES recipient_team_id for channel streaming
+    # (Slack: "missing_recipient_team_id"). The resolved workspace team_id must ride
+    # the call.
+    client = SimpleNamespace(
+        chat_startStream=AsyncMock(return_value={"ts": "100.1"}),
+        chat_appendStream=AsyncMock(),
+        chat_stopStream=AsyncMock(),
+    )
+    sess = NativeStreamSession(client, "C1", "T1", team_id="TEAM1")
+    assert await sess.start("hi") is True
+    _, kwargs = client.chat_startStream.call_args
+    assert kwargs["recipient_team_id"] == "TEAM1"
+    assert kwargs["channel"] == "C1" and kwargs["thread_ts"] == "T1"
+
+
+@pytest.mark.asyncio
+async def test_native_stream_without_team_id_falls_back():
+    # No resolved team_id → the call would fail with missing_recipient_team_id, so it's
+    # skipped entirely and the session stays inert (caller falls back to legacy).
+    client = SimpleNamespace(chat_startStream=AsyncMock())
+    sess = NativeStreamSession(client, "C1", "T1")  # team_id defaults to None
+    assert await sess.start("hi") is False
+    assert sess.active is False
+    client.chat_startStream.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_begin_native_stream_threads_team_id_from_identity():
+    # begin_native_stream must forward the bot's resolved self_team_id onto the session.
+    client = SimpleNamespace(
+        chat_startStream=AsyncMock(return_value={"ts": "1"}),
+        chat_appendStream=AsyncMock(),
+        chat_stopStream=AsyncMock(),
+    )
+    host = _MsgClient(client)
+    host.self_team_id = "TEAMX"
+    sess = host.begin_native_stream("C1", "T1")
+    assert await sess.start("") is True
+    _, kwargs = client.chat_startStream.call_args
+    assert kwargs["recipient_team_id"] == "TEAMX"
 
 
 @pytest.mark.asyncio
@@ -68,7 +112,7 @@ async def test_native_stream_top_level_skips_start():
 @pytest.mark.asyncio
 async def test_native_stream_start_failure_is_inert():
     client = SimpleNamespace(chat_startStream=AsyncMock(side_effect=RuntimeError("boom")))
-    sess = NativeStreamSession(client, "C1", "T1")
+    sess = NativeStreamSession(client, "C1", "T1", team_id="TEAM1")
     assert await sess.start("x") is False
     assert sess.active is False
     # update on an inert session is a no-op returning False (caller falls back)
@@ -81,7 +125,7 @@ async def test_native_stream_append_failure_flips_inactive():
         chat_startStream=AsyncMock(return_value={"ts": "1"}),
         chat_appendStream=AsyncMock(side_effect=_api_error("rate_limited")),
     )
-    sess = NativeStreamSession(client, "C1", "T1")
+    sess = NativeStreamSession(client, "C1", "T1", team_id="TEAM1")
     await sess.start("")
     assert await sess.update("text") is False
     assert sess.active is False

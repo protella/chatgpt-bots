@@ -148,8 +148,10 @@ async def test_tool_loop_no_reply_ends_and_suppresses_siblings(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_terminal_round_reacts_respect_global_cap(monkeypatch):
-    # F6 fix (b): react siblings in a no_reply terminal round still count against
-    # MAX_TOOL_CALLS_PER_TURN — the terminal branch runs before the loop's cap check.
+    # F6 fix (b) + F4 fix: react siblings in a no_reply terminal round still count
+    # against MAX_TOOL_CALLS_PER_TURN, AND the terminal no_response_needed call itself
+    # consumes one slot — so reacts are capped at remaining_budget - 1. With a cap of 2
+    # that means terminal(1) + exactly 1 react = 2 total; the round never exceeds the cap.
     from openai_client.api import tool_loop
     monkeypatch.setattr(tool_loop.config, "max_tool_calls_per_turn", 2)
     scripts = [[
@@ -170,9 +172,36 @@ async def test_terminal_round_reacts_respect_global_cap(monkeypatch):
         _LoopSelf(), messages=[], tools=[], registry=_FakeRegistry(dispatched),
         tool_context=None)
     assert result["terminal_action"] == "no_reply"
-    # no_response_needed + exactly 2 reacts (budget), the 3rd react dropped.
-    assert dispatched.count("react_to_message") == 2
-    assert "no_response_needed" in dispatched
+    # no_response_needed reserves one slot; only 1 react fits under the cap of 2.
+    assert dispatched.count("react_to_message") == 1
+    assert dispatched.count("no_response_needed") == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_round_suppresses_duplicate_no_reply(monkeypatch):
+    # F4 fix: when the model emits multiple no_response_needed calls in one terminal
+    # round, only the FIRST is dispatched (first wins); the duplicates are suppressed.
+    from openai_client.api import tool_loop
+    scripts = [[
+        _fc("no_response_needed", "1", '{"reason": "first"}'),
+        _fc("no_response_needed", "2", '{"reason": "second"}'),
+        _fc("react_to_message", "3", '{"emoji": "eyes"}'),
+    ]]
+
+    async def fake_create(self, messages, tools, return_metadata, function_call_sink,
+                          tool_choice=None, **kw):
+        function_call_sink.extend(scripts.pop(0))
+        return {"text": "", "tools_used": []}
+
+    monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake_create)
+    dispatched = []
+    result = await tool_loop.create_text_response_with_tool_loop(
+        _LoopSelf(), messages=[], tools=[], registry=_FakeRegistry(dispatched),
+        tool_context=None)
+    assert result["terminal_action"] == "no_reply"
+    assert result["reason"] == "first"  # first wins
+    assert dispatched.count("no_response_needed") == 1  # duplicate suppressed
+    assert dispatched.count("react_to_message") == 1
 
 
 @pytest.mark.asyncio

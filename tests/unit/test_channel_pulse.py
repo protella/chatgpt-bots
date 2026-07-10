@@ -143,6 +143,43 @@ def test_participation_stat_math():
     assert p.unprompted_count_last_hour("C2", now=now) == 0
 
 
+# ------------------------------------------------- idempotence / dedup (F5)
+
+def test_record_idempotent_by_ts():
+    # Dual delivery (app_mention + message) / retries: same ts recorded once.
+    p = ChannelPulse(size=10)
+    p.record("C1", **_entry("1.0", text="hi"))
+    p.record("C1", **_entry("1.0", text="hi"))
+    assert len(p._buffers["C1"]) == 1
+
+
+def test_seen_ts_outer_map_bounded(monkeypatch):
+    # The OUTER channel map must be a bounded whole-channel LRU (no unbounded growth).
+    monkeypatch.setattr(config, "pulse_thread_tail_channels_max", 3)
+    p = ChannelPulse(size=5)
+    for i in range(10):
+        p.record(f"C{i}", **_entry("1.0", text="hi"))
+    assert len(p._seen_ts) <= 3
+    assert "C9" in p._seen_ts          # newest channels retained
+    assert "C0" not in p._seen_ts      # oldest evicted
+
+
+def test_seen_ts_resurrection_guard_uses_live_ring():
+    # A ts that aged out of the dedup window but is STILL in the live ring must be
+    # treated as already-recorded — a delayed retry can't resurrect it (F5).
+    p = ChannelPulse(size=30)
+    p.record("C1", **_entry("100.1", text="original"))
+    assert len(p._buffers["C1"]) == 1
+    # Simulate the ts falling out of the bounded _seen_ts window while it lives on in
+    # the buffer (and the thread-tail ring).
+    p._seen_ts["C1"].clear()
+    p.record("C1", **_entry("100.1", text="original"))   # delayed retry
+    assert len(p._buffers["C1"]) == 1                     # NOT re-appended
+    # A genuinely new ts (not in any ring) still records normally.
+    p.record("C1", **_entry("200.2", text="new"))
+    assert len(p._buffers["C1"]) == 2
+
+
 # ------------------------------------------------------------------ wiring
 
 def _mixin_host(pulse):
