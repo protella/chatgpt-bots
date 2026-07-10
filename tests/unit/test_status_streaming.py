@@ -145,6 +145,24 @@ def test_loading_messages_config_present():
     assert isinstance(config.status_loading_fallback, str) and config.status_loading_fallback
 
 
+def test_random_loading_message_draws_from_pool():
+    pool = set(config.get_loading_messages())
+    assert config.random_loading_message() in pool
+
+
+@pytest.mark.asyncio
+async def test_thinking_indicator_fallback_uses_loading_pool(monkeypatch):
+    # The legacy placeholder (posted only where setStatus fails) draws from the
+    # same variance pool as the native status — no baked-in "Thinking..." text.
+    monkeypatch.setattr(config, "enable_assistant_status", False)
+    client = SimpleNamespace(chat_postMessage=AsyncMock(return_value={"ts": "1.0"}))
+    host = _MsgClient(client)
+    assert await host.send_thinking_indicator("C1", "T1") == "1.0"
+    text = client.chat_postMessage.call_args.kwargs["text"]
+    assert text.startswith(config.circle_loader_emoji)
+    assert text.split(" ", 1)[1] in set(config.get_loading_messages())
+
+
 # ---------------- outbound self-prefix strip ----------------
 
 @pytest.mark.parametrize("text,expected", [
