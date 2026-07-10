@@ -206,10 +206,11 @@ async def test_coordinator_finalize_failure_reports_false():
 # ---------------- agent_view event handlers ----------------
 
 class _AssistantHost(SlackAssistantEventsMixin):
-    def __init__(self):
+    def __init__(self, history_messages=None):
         self.app = SimpleNamespace(client=SimpleNamespace(
             chat_postMessage=AsyncMock(),
             assistant_threads_setSuggestedPrompts=AsyncMock(),
+            conversations_history=AsyncMock(return_value={"messages": history_messages or []}),
         ))
         self.debug_lines = []
 
@@ -232,6 +233,31 @@ async def test_app_home_opened_messages_tab_greets_once(monkeypatch):
     # second visit: deduped
     await host._handle_app_home_opened({"tab": "messages", "channel": "D1", "user": "U1"}, None)
     assert host.app.client.chat_postMessage.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_greeting_skipped_when_conversation_has_history(monkeypatch):
+    # A returning user's DM has history — never re-greet (restarts forget the
+    # in-memory dedup; the conversation itself is the source of truth).
+    from config import config
+    monkeypatch.setattr(config, "enable_assistant_surface", True)
+    monkeypatch.setattr(config, "assistant_greeting", "Hi there!")
+    host = _AssistantHost(history_messages=[{"ts": "1.0", "text": "old msg"}])
+    await host._handle_app_home_opened({"tab": "messages", "channel": "D1", "user": "U1"}, None)
+    host.app.client.chat_postMessage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_greeting_skipped_when_history_check_fails(monkeypatch):
+    # Fail-open: if the history probe errors, skip the greeting (a spurious
+    # greeting is worse than a missing one).
+    from config import config
+    monkeypatch.setattr(config, "enable_assistant_surface", True)
+    monkeypatch.setattr(config, "assistant_greeting", "Hi there!")
+    host = _AssistantHost()
+    host.app.client.conversations_history = AsyncMock(side_effect=Exception("boom"))
+    await host._handle_app_home_opened({"tab": "messages", "channel": "D1", "user": "U1"}, None)
+    host.app.client.chat_postMessage.assert_not_awaited()
 
 
 @pytest.mark.asyncio

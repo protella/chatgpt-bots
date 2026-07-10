@@ -33,6 +33,8 @@ def _make_bot():
     bot.app.client.chat_postMessage = AsyncMock(return_value={"ok": True})
     bot.app.client.assistant_threads_setSuggestedPrompts = AsyncMock(return_value={"ok": True})
     bot.app.client.assistant_threads_setTitle = AsyncMock(return_value={"ok": True})
+    # Empty conversation by default so greeting tests exercise the greet path.
+    bot.app.client.conversations_history = AsyncMock(return_value={"messages": []})
     return bot
 
 
