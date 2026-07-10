@@ -122,7 +122,11 @@ DMs behave as before.
   tools; facts are recalled in future conversations in that channel
 - **On-demand context tools**: the bot can fetch older thread/channel history and
   search the workspace (`assistant.search.context`) when a conversation references
-  something it can't see — instead of guessing. Search is permission-gated in code
+  something it can't see — instead of guessing. It can also link directly to an
+  earlier message (drop a clickable permalink for "where did we discuss X?"), read
+  a message's current emoji reactions, list a channel's pins (needs the new
+  `pins:read` scope from the updated manifest), and look up channel info and user
+  profiles — all fetched live, nothing stored. Search is permission-gated in code
   (public/private channels only by default) and only possible while handling a real
   triggering message.
 - **Emoji reactions** as a response type, both engine-chosen and model-invoked
