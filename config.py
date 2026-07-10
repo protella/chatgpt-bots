@@ -169,19 +169,23 @@ class BotConfig:
     api_timeout_read: float = field(default_factory=lambda: float(os.getenv("API_TIMEOUT_READ", "180")))  # Overall timeout for API requests
     api_timeout_streaming_chunk: float = field(default_factory=lambda: float(os.getenv("API_TIMEOUT_STREAMING_CHUNK", "30")))  # Max time between streaming chunks
     
-    # Model token limits
-    # GPT-5.5: 1.05M total context window (shared between input, output, and reasoning)
-    # GPT-5 Mini (utility): 400k total context window
-    # Reserved for output/reasoning/overhead is ~130k (static across models)
-    # Buffer percentages are calculated so effective input = total - 130k reserved
+    # Model token limits (verified 2026-07-09 against developers.openai.com/api/docs/models/*)
+    # GPT-5.6 family (sol/terra/luna) AND GPT-5.5: 1,050,000 total context window,
+    #   128,000 max output tokens (window is shared between input, output, and reasoning)
+    # gpt-5-mini (legacy/fallback only): 400,000 total / 128,000 max output
     # (env var names kept as GPT54_*/GPT5_* so existing .env files keep working)
-    gpt54_max_tokens: int = field(default_factory=lambda: int(os.getenv("GPT54_MAX_TOKENS", "1050000")))  # GPT-5.5 context window
-    gpt5_max_tokens: int = field(default_factory=lambda: int(os.getenv("GPT5_MAX_TOKENS", "400000")))  # gpt-5-mini (utility) context window
+    gpt54_max_tokens: int = field(default_factory=lambda: int(os.getenv("GPT54_MAX_TOKENS", "1050000")))  # 5.6-family + 5.5 context window
+    gpt5_max_tokens: int = field(default_factory=lambda: int(os.getenv("GPT5_MAX_TOKENS", "400000")))  # fallback window for unknown/legacy models
 
     # Token management configuration
-    # Buffer to leave room for output/reasoning tokens and overhead
-    # GPT-5.5: 0.876 = ~920k usable of 1.05M (130k reserved)
-    # GPT-5 Mini: 0.675 = ~270k usable of 400k (130k reserved)
+    # Reserve formula (documented here, enforced by tests/unit/test_context_windows.py):
+    #   usable input = window * buffer_pct; reserve = window - usable input.
+    #   The reserve must cover: the configured output cap (DEFAULT_MAX_TOKENS /
+    #   VISION_MAX_TOKENS, 32,768 each — reasoning tokens bill inside that output
+    #   budget), chars/4 estimator error on large threads (~5-8%), and per-request
+    #   overhead (system prompt growth, tool schemas/results, doc summary expansion).
+    # 1.05M window: 0.876 → ~919.8k usable, ~130.2k reserved (32.8k output + ~97k headroom)
+    # 400k fallback: 0.875 → 350k usable, 50k reserved (32.8k output + ~17k headroom)
     gpt54_token_buffer_percentage: float = field(default_factory=lambda: float(os.getenv("GPT54_TOKEN_BUFFER_PERCENTAGE", "0.876")))
     token_buffer_percentage: float = field(default_factory=lambda: float(os.getenv("TOKEN_BUFFER_PERCENTAGE", "0.875")))
     token_cleanup_threshold: float = field(default_factory=lambda: float(os.getenv("TOKEN_CLEANUP_THRESHOLD", "0.8")))
@@ -379,12 +383,23 @@ class BotConfig:
     # per exchange when on. Default OFF now that the model writes memory via tools.
     enable_memory_extraction_fallback: bool = field(default_factory=lambda: os.getenv("ENABLE_MEMORY_EXTRACTION_FALLBACK", "false").lower() == "true")
 
+    # Long-context billing threshold (verified 2026-07-09): on 5.6-family and 5.5,
+    # prompts with >272K input tokens bill at 2x input / 1.5x output for the request.
+    LONG_CONTEXT_BILLING_THRESHOLD: int = 272_000
+
+    def is_long_context(self, tokens: int) -> bool:
+        """True when an input of `tokens` crosses OpenAI's long-context billing tier
+        (>272K input → 2x input / 1.5x output on 5.5 and the 5.6 family)."""
+        return tokens > self.LONG_CONTEXT_BILLING_THRESHOLD
+
     def get_model_token_limit(self, model: str) -> int:
         """Get the effective input token limit for a specific model
 
         This returns the maximum number of input tokens we should send.
-        For GPT-5.6 family / GPT-5.5: 1.05M total - 130k reserved = ~920k usable
-        Anything else (unknown/legacy): the conservative 400k window.
+        GPT-5.6 family (sol/terra/luna) and GPT-5.5 all share the verified
+        1.05M window: 1.05M total - ~130k reserved = ~920k usable.
+        Anything else (unknown/legacy, e.g. gpt-5-mini): the conservative
+        400k window with a 50k reserve.
 
         Args:
             model: Model name (e.g., 'gpt-5.6-sol', 'gpt-5.5')
