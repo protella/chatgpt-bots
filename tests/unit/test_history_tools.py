@@ -184,6 +184,45 @@ async def test_dispatch_thread_with_json_string_args(bot):
 
 
 @pytest.mark.asyncio
+async def test_dispatch_defaults_channel_from_ctx(bot):
+    # Regression (2026-07-10): requiring channel_id made the model fabricate IDs
+    # (channel_not_found). Omitted channel_id falls back to the current channel.
+    from types import SimpleNamespace
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_history.return_value = {"messages": []}
+    ctx = SimpleNamespace(channel_id="C_CUR", thread_ts="9.0")
+    res = await bot.dispatch_history_tool_call("fetch_channel_history", {}, ctx)
+    assert res["ok"] is True
+    assert bot.app.client.conversations_history.call_args.kwargs["channel"] == "C_CUR"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_defaults_thread_from_ctx(bot):
+    from types import SimpleNamespace
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_replies.return_value = {"messages": []}
+    ctx = SimpleNamespace(channel_id="C_CUR", thread_ts="9.0")
+    res = await bot.dispatch_history_tool_call("fetch_thread_messages", {}, ctx)
+    assert res["ok"] is True
+    kw = bot.app.client.conversations_replies.call_args.kwargs
+    assert kw["channel"] == "C_CUR" and kw["ts"] == "9.0"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_thread_without_ts_anywhere_is_bad_arguments(bot):
+    from types import SimpleNamespace
+    ctx = SimpleNamespace(channel_id="C_CUR", thread_ts=None)
+    res = await bot.dispatch_history_tool_call("fetch_thread_messages", {}, ctx)
+    assert res["ok"] is False and res["error"] == "bad_arguments"
+
+
+def test_schemas_do_not_require_channel_id(bot):
+    # channel_id must stay optional in every schema — required IDs get hallucinated.
+    for schema in bot.get_history_tools_for_openai():
+        assert "channel_id" not in schema["parameters"].get("required", []), schema["name"]
+
+
+@pytest.mark.asyncio
 async def test_dispatch_unknown_tool(bot):
     res = await bot.dispatch_history_tool_call("nope", {})
     assert res["ok"] is False and res["error"] == "unknown_tool"

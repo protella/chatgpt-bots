@@ -202,6 +202,10 @@ class ChatBotV2:
                 f"{'channel' if place_in_channel else 'thread'}"
             )
         post_thread_id = None if place_in_channel else message.thread_id
+        # Handlers key presentation chrome off this (e.g. the Used Tools attribution
+        # line is suppressed on top-level channel replies).
+        if isinstance(message.metadata, dict):
+            message.metadata["place_in_channel"] = place_in_channel
 
         # Phase Q: if this conversation is mid-processing, the message is about to be
         # queued (not answered now) — skip the thinking indicator so nothing flashes.

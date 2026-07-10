@@ -334,11 +334,18 @@ class TextHandlerMixin:
                 metadata={"model": thread_config.get("model"), "reaction_only": True}
             )
 
-        # A reaction is visible on the message itself — don't list it in Used Tools
-        tools_actually_used = [t for t in tools_actually_used if t != "react_to_message"]
+        # Attribution lists only EXTERNAL sources (web_search + MCP servers). Local
+        # context tools (history fetches, reactions, memory ops) are plumbing, not
+        # sources — never shown.
+        local_names = {c.get("name") for c in local_tool_calls if c.get("name")}
+        tools_actually_used = [t for t in tools_actually_used if t not in local_names]
+
+        # Top-level channel replies stay chrome-free; attribution rides only in
+        # threads and DMs.
+        show_attribution = not bool((message.metadata or {}).get("place_in_channel"))
 
         # Use the actual tools that were invoked (from response metadata)
-        if tools_actually_used or failed_mcp_server:
+        if (tools_actually_used or failed_mcp_server) and show_attribution:
             # Add unified tools note at the END
             if tools_actually_used:
                 # Show successful tools
@@ -530,7 +537,7 @@ class TextHandlerMixin:
 
         # Track which MCP servers were used
         mcp_servers_used = set()
-        local_tools_used = []  # non-reaction local tools (history fetch, …) for attribution
+        loop_external_used = []  # web_search/MCP names surfaced by the tool loop (local tools are plumbing, never listed)
 
         # Define tool event callback
         async def tool_callback(tool_type: str, status: str):
@@ -1114,10 +1121,12 @@ class TextHandlerMixin:
                 )
                 response_text = loop_result["text"]
                 local_tool_calls = loop_result["local_tool_calls"]
-                # Local tools that aren't reactions join the attribution list
+                # Only EXTERNAL names (web_search/MCP) join the attribution list —
+                # local tool executions are recorded in local_tool_calls, not shown
+                local_names = {c.get("name") for c in local_tool_calls if c.get("name")}
                 for name in loop_result["tools_used"]:
-                    if name != "react_to_message" and name not in mcp_servers_used:
-                        local_tools_used.append(name)
+                    if name not in local_names and name not in mcp_servers_used:
+                        loop_external_used.append(name)
             elif tools:
                 # Generate response with tools (web_search and/or MCP)
                 response_text = await self.openai_client.create_streaming_response_with_tools(
@@ -1183,7 +1192,8 @@ class TextHandlerMixin:
                               "model": thread_config.get("model")}
                 )
 
-            # Build list of tools used (unified attribution)
+            # Build list of tools used (unified attribution). EXTERNAL sources only
+            # (web_search + MCP) — local context tools are plumbing, never listed.
             tools_used = []
             if search_counts["web_search"] > 0:
                 tools_used.append("web_search")
@@ -1194,13 +1204,17 @@ class TextHandlerMixin:
             elif search_counts["mcp"] > 0:
                 # Fallback to generic "MCP" if server names weren't tracked
                 tools_used.append("MCP")
-            for name in local_tools_used:
+            for name in loop_external_used:
                 if name not in tools_used:
                     tools_used.append(name)
 
+            # Top-level channel replies stay chrome-free; attribution rides only in
+            # threads and DMs.
+            show_attribution = not bool((message.metadata or {}).get("place_in_channel"))
+
             # Add unified tools note at the END if any tools were used
             # This works for both paginated and non-paginated responses
-            if tools_used or exclude_mcp_server:
+            if (tools_used or exclude_mcp_server) and show_attribution:
                 if tools_used:
                     # Show successful tools
                     if exclude_mcp_server:
@@ -1273,7 +1287,7 @@ class TextHandlerMixin:
                     final_part_text = buffer.get_complete_text()
                     if final_part_text:
                         # Add tools attribution to the final overflow message if tools were used
-                        if tools_used or exclude_mcp_server:
+                        if (tools_used or exclude_mcp_server) and show_attribution:
                             if tools_used:
                                 if exclude_mcp_server:
                                     tools_note = f"\n\n_Used Tools: {', '.join(tools_used)} (failed: {exclude_mcp_display})_"
