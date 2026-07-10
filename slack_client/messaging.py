@@ -109,6 +109,14 @@ class NativeStreamSession:
         self._sent: str = ""
 
     async def start(self, initial_text: str = "") -> bool:
+        if not self._thread:
+            # chat.startStream REQUIRES thread_ts (Slack: "missing required field"),
+            # so top-level channel replies can never stream natively. Skip the
+            # guaranteed-to-fail call; the caller falls back to legacy streaming.
+            if self._log:
+                self._log("native streaming requires a thread — top-level reply falls back to legacy")
+            self.active = False
+            return False
         try:
             resp = await self._client.chat_startStream(
                 channel=self._channel,

@@ -80,7 +80,7 @@ class SlackBot(SlackMessageEventsMixin,
             name = schema["name"]
             registry.register(
                 schema,
-                lambda ctx, args, _name=name: self.dispatch_history_tool_call(_name, args),
+                lambda ctx, args, _name=name: self.dispatch_history_tool_call(_name, args, ctx),
             )
         if config.enable_reactions and config.enable_react_tool and config.reaction_emojis:
             registry.register(self.get_react_tool_schema(), self.execute_react_tool)

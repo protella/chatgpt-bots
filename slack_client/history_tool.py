@@ -40,10 +40,10 @@ class SlackHistoryToolMixin:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "channel_id": {"type": "string", "description": "Slack channel ID, e.g. C0123ABC."},
+                        "channel_id": {"type": "string", "description": "Slack channel ID. Omit to use the CURRENT channel. Only pass an ID you have actually seen in context or from another tool — never guess one."},
                         "limit": {"type": "integer", "description": f"Max messages to return (1-{cap})."},
                     },
-                    "required": ["channel_id"],
+                    "required": [],
                 },
             },
             {
@@ -58,11 +58,11 @@ class SlackHistoryToolMixin:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "channel_id": {"type": "string", "description": "Slack channel ID."},
-                        "thread_ts": {"type": "string", "description": "Thread root timestamp (ts)."},
+                        "channel_id": {"type": "string", "description": "Slack channel ID. Omit to use the CURRENT channel; never guess an ID."},
+                        "thread_ts": {"type": "string", "description": "Thread root timestamp (ts). Omit to use the CURRENT thread."},
                         "limit": {"type": "integer", "description": f"Max messages to return (1-{cap})."},
                     },
-                    "required": ["channel_id", "thread_ts"],
+                    "required": [],
                 },
             },
             {
@@ -78,10 +78,10 @@ class SlackHistoryToolMixin:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "channel_id": {"type": "string", "description": "Slack channel ID the message lives in."},
+                        "channel_id": {"type": "string", "description": "Slack channel ID the message lives in. Omit for the CURRENT channel; never guess an ID."},
                         "message_ts": {"type": "string", "description": "The message's timestamp (ts), e.g. 1720500000.123456."},
                     },
-                    "required": ["channel_id", "message_ts"],
+                    "required": ["message_ts"],
                 },
             },
             {
@@ -94,9 +94,9 @@ class SlackHistoryToolMixin:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "channel_id": {"type": "string", "description": "Slack channel ID."},
+                        "channel_id": {"type": "string", "description": "Slack channel ID. Omit to use the CURRENT channel; never guess an ID."},
                     },
-                    "required": ["channel_id"],
+                    "required": [],
                 },
             },
             {
@@ -110,9 +110,9 @@ class SlackHistoryToolMixin:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "channel_id": {"type": "string", "description": "Slack channel ID."},
+                        "channel_id": {"type": "string", "description": "Slack channel ID. Omit to use the CURRENT channel; never guess an ID."},
                     },
-                    "required": ["channel_id"],
+                    "required": [],
                 },
             },
             {
@@ -327,8 +327,12 @@ class SlackHistoryToolMixin:
             self.log_warning(f"history_tool: user profile failed for {user_id}: {err}")
             return {"ok": False, "error": err, "message": f"Could not fetch that user's profile: {err}"}
 
-    async def dispatch_history_tool_call(self, name: str, arguments: Any) -> Dict[str, Any]:
-        """Route a model function-call (name + args) to its executor."""
+    async def dispatch_history_tool_call(self, name: str, arguments: Any, ctx: Any = None) -> Dict[str, Any]:
+        """Route a model function-call (name + args) to its executor.
+
+        ``channel_id``/``thread_ts`` default to the CURRENT conversation (from the
+        ToolContext) when omitted — the model doesn't know Slack IDs it hasn't seen,
+        and requiring them made it fabricate plausible ones (channel_not_found)."""
         if isinstance(arguments, str):
             try:
                 args = json.loads(arguments or "{}")
@@ -337,16 +341,22 @@ class SlackHistoryToolMixin:
         else:
             args = arguments or {}
 
+        channel_id = args.get("channel_id") or getattr(ctx, "channel_id", None)
+
         if name == "fetch_channel_history":
-            return await self.fetch_history_tool(args.get("channel_id"), args.get("limit"))
+            return await self.fetch_history_tool(channel_id, args.get("limit"))
         if name == "fetch_thread_messages":
-            return await self.fetch_history_tool(args.get("channel_id"), args.get("limit"), args.get("thread_ts"))
+            thread_ts = args.get("thread_ts") or getattr(ctx, "thread_ts", None)
+            if not thread_ts:
+                return {"ok": False, "error": "bad_arguments",
+                        "message": "No thread here — pass thread_ts or use fetch_channel_history."}
+            return await self.fetch_history_tool(channel_id, args.get("limit"), thread_ts)
         if name == "get_message_permalink":
-            return await self.get_message_permalink_tool(args.get("channel_id"), args.get("message_ts"))
+            return await self.get_message_permalink_tool(channel_id, args.get("message_ts"))
         if name == "fetch_channel_info":
-            return await self.fetch_channel_info_tool(args.get("channel_id"))
+            return await self.fetch_channel_info_tool(channel_id)
         if name == "fetch_pinned_messages":
-            return await self.fetch_pinned_messages_tool(args.get("channel_id"))
+            return await self.fetch_pinned_messages_tool(channel_id)
         if name == "fetch_user_profile":
             return await self.fetch_user_profile_tool(args.get("user_id"))
         return {"ok": False, "error": "unknown_tool", "message": f"Unknown history tool: {name}"}
