@@ -18,6 +18,7 @@ from slack_client.event_handlers.feedback import (
     USER_SETTINGS_ACTION_ID,
     build_feedback_blocks,
     feedback_enabled,
+    should_offer_feedback,
 )
 from slack_client.utilities import strip_citations
 
@@ -371,13 +372,20 @@ class SlackMessagingMixin:
             return None
 
     async def send_thinking_indicator(self, channel_id: str, thread_id: str) -> Optional[str]:
-        """Send thinking indicator to Slack.
+        """Show a progress indicator; returns the placeholder message ts, or None.
 
-        Also fires a best-effort assistant.threads.setStatus (Phase 3.2) so the assistant-thread
-        surface shows a rotating branded status. That call is additive and no-ops gracefully in
-        plain channels, where the posted message below is the visible progress cue.
+        Two-surface contract:
+        - DMs (assistant/agent surface): assistant.threads.setStatus is the SOLE
+          indicator — native composer status, no message, no "(edited)" churn,
+          auto-clears when the app replies. Returns None; downstream consumers
+          treat a None ts as "status-only" (streaming seeds its own message
+          lazily, phase updates route to setStatus, deletes no-op).
+        - Channels (setStatus no-ops there) and any DM where setStatus fails:
+          post the classic "Thinking..." placeholder and return its ts.
         """
-        await self.set_assistant_status(channel_id, thread_id)
+        status_set = await self.set_assistant_status(channel_id, thread_id)
+        if status_set and channel_id and channel_id.startswith("D"):
+            return None
         try:
             result = await self.app.client.chat_postMessage(
                 channel=channel_id,
@@ -879,10 +887,17 @@ class SlackMessagingMixin:
                 # assistant/DM surface.
                 if not feedback_enabled():
                     return
+                # The whole strip (feedback thumbs + "⚙️ <model>" settings button)
+                # posts ONCE, under the first reply of a thread — later replies get
+                # no trailing chrome at all (user feedback 2026-07-09: per-message
+                # buttons are bulky; a hyperlink can't open a modal — no trigger_id).
+                thread_ts = getattr(message, "thread_id", None)
+                if not should_offer_feedback(channel_id, thread_ts):
+                    return
                 model = (getattr(response, "metadata", None) or {}).get("model")
                 await self.app.client.chat_postMessage(
                     channel=channel_id,
-                    thread_ts=getattr(message, "thread_id", None),
+                    thread_ts=thread_ts,
                     text="Rate this response",  # fallback text for notifications
                     blocks=build_feedback_blocks(model),
                 )

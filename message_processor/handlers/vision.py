@@ -184,7 +184,7 @@ class VisionHandlerMixin:
             }]
 
             # Update status to show we're preparing the analysis
-            self._update_status(client, channel_id, thinking_id, "Preparing analysis...", emoji=config.analyze_emoji)
+            self._update_status(client, channel_id, thinking_id, "Preparing analysis...", emoji=config.analyze_emoji, thread_id=thread_state.thread_ts)
             
             # Extract filenames from attachments for context
             filenames = []
@@ -207,12 +207,18 @@ class VisionHandlerMixin:
                 status_msg = "Analyzing your image..."
             else:
                 status_msg = f"Analyzing {len(images_to_analyze)} images..."
-            self._update_status(client, channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
+            self._update_status(client, channel_id, thinking_id, status_msg, emoji=config.analyze_emoji, thread_id=thread_state.thread_ts)
             
-            # Check if streaming is supported and enabled (respecting user prefs)
+            # Check if streaming is supported and enabled (respecting user prefs).
+            # thinking_id None = status-only DM indicator: streaming still allowed
+            # when the native path can create its own message; the legacy loop
+            # seeds one lazily. MUST stay in sync with the "streamed" metadata
+            # gate at the end of this method.
             streaming_enabled = thread_config.get('enable_streaming', config.enable_streaming)
-            if (hasattr(client, 'supports_streaming') and client.supports_streaming() and 
-                streaming_enabled and thinking_id is not None):
+            native_capable = (hasattr(client, 'supports_native_streaming')
+                              and client.supports_native_streaming())
+            if (hasattr(client, 'supports_streaming') and client.supports_streaming() and
+                streaming_enabled and (thinking_id is not None or native_capable)):
                 # Stream the vision analysis response
                 from streaming.buffer import StreamingBuffer
                 from streaming import RateLimitManager
@@ -302,10 +308,11 @@ class VisionHandlerMixin:
                             if not native_coord.started:
                                 if await native_coord.start():
                                     current_message_id = native_coord.current_ts or current_message_id
-                                    try:
-                                        await client.delete_message(channel_id, thinking_id)
-                                    except Exception as e:
-                                        self.log_debug(f"Could not remove placeholder for native vision stream: {e}")
+                                    if thinking_id:  # status-only DMs have no placeholder
+                                        try:
+                                            await client.delete_message(channel_id, thinking_id)
+                                        except Exception as e:
+                                            self.log_debug(f"Could not remove placeholder for native vision stream: {e}")
                                 else:
                                     self.log_info("Native streaming unavailable — using legacy vision updates")
                             if not native_coord.failed:
@@ -329,6 +336,22 @@ class VisionHandlerMixin:
                                         self.log_warning("Native vision stream went inert — continuing with legacy updates")
                                 return
                             # start failed: fall through to legacy (chunk not yet buffered)
+
+                    # Status-only DM (no placeholder) on the legacy path: seed the
+                    # message the edit loop needs, once. Retried next chunk on failure.
+                    if current_message_id is None:
+                        if chunk is None and not buffer.has_pending_update():
+                            return
+                        seed = await client.send_message_get_ts(
+                            channel_id, thread_state.thread_ts,
+                            f"{config.analyze_emoji} Analyzing images...")
+                        if seed and seed.get("success") and seed.get("ts"):
+                            current_message_id = seed["ts"]
+                        else:
+                            self.log_warning("Could not seed legacy vision streaming message — chunk buffered")
+                            if chunk:
+                                buffer.add_chunk(chunk)
+                            return
 
                     # Handle completion signal (None chunk)
                     if chunk is None:
@@ -427,7 +450,7 @@ class VisionHandlerMixin:
                                     continuation_text = f"{part_prefix(current_part)}{continuation_display} {config.loading_ellipse_emoji}"
 
                                     # Send new message and get its ID
-                                    new_msg_result = await client.send_message_get_ts(channel_id, thinking_id, continuation_text)
+                                    new_msg_result = await client.send_message_get_ts(channel_id, thinking_id or thread_state.thread_ts, continuation_text)
                                     if new_msg_result and new_msg_result.get("success") and "ts" in new_msg_result:
                                         current_message_id = new_msg_result["ts"]
                                         buffer.reset()
@@ -641,11 +664,14 @@ class VisionHandlerMixin:
             self.log_error(f"Failed to save messages to database: {e}", exc_info=True)
             # Continue anyway - messages are in memory at least
         
-        # Check if we streamed the response
+        # Check if we streamed the response — MUST mirror the streaming gate above,
+        # or status-only DM responses would be posted twice by main.py.
         response_metadata = {}
         streaming_enabled = thread_config.get('enable_streaming', config.enable_streaming)
-        if (hasattr(client, 'supports_streaming') and client.supports_streaming() and 
-            streaming_enabled and thinking_id is not None):
+        native_capable = (hasattr(client, 'supports_native_streaming')
+                          and client.supports_native_streaming())
+        if (hasattr(client, 'supports_streaming') and client.supports_streaming() and
+            streaming_enabled and (thinking_id is not None or native_capable)):
             response_metadata["streamed"] = True
         
         return Response(
@@ -672,7 +698,7 @@ class VisionHandlerMixin:
         """
         try:
             # Step 1: Analyze images with vision model using IMAGE_ANALYSIS_PROMPT
-            self._update_status(client, channel_id, thinking_id, "Analyzing images...", emoji=config.analyze_emoji)
+            self._update_status(client, channel_id, thinking_id, "Analyzing images...", emoji=config.analyze_emoji, thread_id=thread_state.thread_ts)
             
             # Extract base64 data from image inputs
             images_to_analyze = []
@@ -696,7 +722,7 @@ class VisionHandlerMixin:
             self.log_info(f"Image analysis completed: {len(image_analysis)} chars")
             
             # Step 2: Build comprehensive context with image analysis and documents
-            self._update_status(client, channel_id, thinking_id, "Combining analysis with documents...", emoji=config.analyze_emoji)
+            self._update_status(client, channel_id, thinking_id, "Combining analysis with documents...", emoji=config.analyze_emoji, thread_id=thread_state.thread_ts)
             
             # Build enhanced message with all context
             context_parts = []
@@ -744,7 +770,7 @@ class VisionHandlerMixin:
             combined_context = "\n".join(str_context_parts)
             
             # Step 3: Send to text model for final analysis
-            self._update_status(client, channel_id, thinking_id, "Generating comprehensive response...", emoji=config.thinking_emoji)
+            self._update_status(client, channel_id, thinking_id, "Generating comprehensive response...", emoji=config.thinking_emoji, thread_id=thread_state.thread_ts)
             
             # Use text response handler with the combined context
             return await self._handle_text_response(combined_context, thread_state, client, message, thinking_id, retry_count=0)

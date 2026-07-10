@@ -102,9 +102,10 @@ class ImageGenerationMixin:
             generating_id = await client.send_thinking_indicator(channel_id, thread_state.thread_ts)
             self._update_status(client, channel_id, generating_id, 
                               "Generating image. This may take a minute...", 
-                              emoji=config.circle_loader_emoji)
+                              emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
             # Track the status message ID
-            response_metadata["status_message_id"] = generating_id
+            if generating_id:  # status-only DMs return no ts — never store a None id
+                response_metadata["status_message_id"] = generating_id
             
             # Start progress updater for image generation
             progress_task = None
@@ -186,10 +187,10 @@ class ImageGenerationMixin:
         else:
             # Non-streaming fallback or skip enhancement
             if not skip_enhancement:
-                self._update_status(client, channel_id, thinking_id, "Enhancing your prompt...")
+                self._update_status(client, channel_id, thinking_id, "Enhancing your prompt...", thread_id=thread_state.thread_ts)
             
             # Generate image with or without enhancement
-            self._update_status(client, channel_id, thinking_id, "Creating your image. This may take a minute...", emoji=config.circle_loader_emoji)
+            self._update_status(client, channel_id, thinking_id, "Creating your image. This may take a minute...", emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
             
             try:
                 image_data = await self.openai_client.generate_image(
@@ -266,8 +267,8 @@ class ImageGenerationMixin:
             metadata=response_metadata
         )
 
-    def _update_thinking_for_image(self, client: BaseClient, channel_id: str, thinking_id: str):
-        """Update the thinking indicator to show image generation message"""
-        self._update_status(client, channel_id, thinking_id, 
+    def _update_thinking_for_image(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], thread_id: Optional[str] = None):
+        """Update the progress indicator to show image generation message"""
+        self._update_status(client, channel_id, thinking_id,
                           "Generating image. This may take a minute, please wait...",
-                          emoji=config.circle_loader_emoji)
+                          emoji=config.circle_loader_emoji, thread_id=thread_id)
