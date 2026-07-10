@@ -299,6 +299,13 @@ class BotConfig:
     search_channel_types: list = field(default_factory=lambda: _env_list(
         "SEARCH_CHANNEL_TYPES", ["public_channel", "private_channel"]))
 
+    # --- Vision question enhancement hop (legacy) ---
+    # When true, a utility-model call rewrites the user's question about an image (with full
+    # conversation history) before the vision call. Frontier vision models don't need the
+    # question pre-chewed — default OFF saves one utility call + 1-2s latency per vision
+    # request. Empty/vague questions get VISION_DEFAULT_QUESTION either way.
+    enable_vision_enhancement: bool = field(default_factory=lambda: os.getenv("ENABLE_VISION_ENHANCEMENT", "false").lower() == "true")
+
     # --- On-demand Slack history-fetch tools (Phase 8) ---
     # Read-only + privacy-scoped (public or bot-member channels only), so default ON. Wired to
     # the model through the local function-call loop (ENABLE_TOOL_LOOP).
