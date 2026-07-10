@@ -101,33 +101,49 @@ class TestImageURLHandlerMethods:
         
         assert len(urls) == 0
     
-    def test_validate_image_url_valid(self):
-        """Test validating a valid image URL"""
+    @pytest.mark.asyncio
+    async def test_validate_image_url_valid(self):
+        """Test validating a valid image URL (aiohttp session mocked)"""
         from image_url_handler import ImageURLHandler
-        
+
         handler = ImageURLHandler()
-        
-        # Mock the request to avoid actual network call
-        with patch('image_url_handler.requests.head') as mock_head:
-            mock_head.return_value.status_code = 200
-            mock_head.return_value.headers = {'content-type': 'image/jpeg'}
-            
-            is_valid, mimetype, error = handler.validate_image_url("https://example.com/image.jpg")
-            
-            assert is_valid is True
-            assert mimetype == "image/jpeg"  # Returns mimetype, not URL
-            assert error is None
-    
-    def test_validate_image_url_invalid(self):
+
+        class FakeResponse:
+            status = 200
+            headers = {'content-type': 'image/jpeg'}
+
+        class FakeHeadCM:
+            async def __aenter__(self):
+                return FakeResponse()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        fake_session = Mock()
+        fake_session.head = Mock(return_value=FakeHeadCM())
+
+        with patch.object(handler, '_get_session', return_value=fake_session):
+            is_valid, mimetype, error = await handler.validate_image_url(
+                "https://example.com/image.jpg"
+            )
+
+        assert is_valid is True
+        assert mimetype == "image/jpeg"  # Returns mimetype, not URL
+        assert error is None
+
+    @pytest.mark.asyncio
+    async def test_validate_image_url_invalid(self):
         """Test validating an invalid URL"""
         from image_url_handler import ImageURLHandler
-        
+
         handler = ImageURLHandler()
-        
-        is_valid, url, error = handler.validate_image_url("not_a_url")
-        
+
+        is_valid, url, error = await handler.validate_image_url("not_a_url")
+
         assert is_valid is False
         assert error is not None
+
+        await handler.cleanup()
 
 
 class TestThreadManagerMoreMethods:

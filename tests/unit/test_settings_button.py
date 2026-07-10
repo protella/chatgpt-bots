@@ -105,8 +105,10 @@ def test_settings_button_not_deleted_after_click(slack_client):
     # Verify modal was opened
     mock_client.views_open.assert_called_once()
 
-def test_settings_button_posted_for_new_thread(slack_client):
+@pytest.mark.asyncio
+async def test_settings_button_posted_for_new_thread(slack_client):
     """Test that settings button is posted at the start of new threads"""
+    from unittest.mock import AsyncMock
     # Setup
     message = Message(
         text="Hello bot",
@@ -116,16 +118,17 @@ def test_settings_button_posted_for_new_thread(slack_client):
         attachments=[],
         metadata={'ts': '1234567890.123456'}  # thread_id == ts means new thread
     )
-    
+
     mock_client = Mock()
-    mock_client.conversations_history.return_value = {'messages': []}
-    
+    mock_client.conversations_replies = AsyncMock(return_value={'messages': []})
+    mock_client.chat_postMessage = AsyncMock()
+
     # Test with user who has completed settings
     user_prefs = {'settings_completed': True}
-    
+
     # Call the method
-    slack_client._post_settings_button_if_new_thread(message, mock_client, user_prefs)
-    
+    await slack_client._post_settings_button_if_new_thread(message, mock_client, user_prefs)
+
     # Verify message was posted
     mock_client.chat_postMessage.assert_called_once()
     call_args = mock_client.chat_postMessage.call_args
@@ -134,8 +137,10 @@ def test_settings_button_posted_for_new_thread(slack_client):
     assert "Quick Settings Access" in str(call_args)
     assert "actions" in str(call_args)  # Compact format uses actions block
 
-def test_welcome_message_for_new_users(slack_client):
+@pytest.mark.asyncio
+async def test_welcome_message_for_new_users(slack_client):
     """Test that new users get full welcome message"""
+    from unittest.mock import AsyncMock
     # Setup
     message = Message(
         text="Hello bot",
@@ -145,16 +150,17 @@ def test_welcome_message_for_new_users(slack_client):
         attachments=[],
         metadata={'ts': '1234567890.123456'}
     )
-    
+
     mock_client = Mock()
-    mock_client.conversations_history.return_value = {'messages': []}
-    
+    mock_client.conversations_replies = AsyncMock(return_value={'messages': []})
+    mock_client.chat_postMessage = AsyncMock()
+
     # Test with new user (settings not completed)
     user_prefs = {'settings_completed': False}
-    
+
     # Call the method
-    slack_client._post_settings_button_if_new_thread(message, mock_client, user_prefs)
-    
+    await slack_client._post_settings_button_if_new_thread(message, mock_client, user_prefs)
+
     # Verify message was posted
     mock_client.chat_postMessage.assert_called_once()
     call_args = mock_client.chat_postMessage.call_args
