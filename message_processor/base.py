@@ -259,15 +259,14 @@ class MessageProcessor(ThreadManagementMixin,
             if projected_tokens > max_tokens:
                 self.log_info(f"Thread would exceed limit with new message ({projected_tokens}/{max_tokens} tokens), applying smart trim")
 
-                # Update status to show we're optimizing
-                if thinking_id:
-                    self._update_status(
-                        client,
-                        message.channel_id,
-                        thinking_id,
-                        f"Optimizing conversation history ({projected_tokens:,}/{max_tokens:,} tokens)...",
-                        emoji=config.thinking_emoji
-                    )
+                # Update status to show we're optimizing (routes to the composer
+                # status on status-only DMs where no indicator message exists)
+                self._update_status(
+                    client,
+                    message.channel_id,
+                    thinking_id,
+                    f"Optimizing conversation history ({projected_tokens:,}/{max_tokens:,} tokens)...",
+                    emoji=config.thinking_emoji, thread_id=message.thread_id)
 
                 total_trimmed = 0
 
@@ -390,11 +389,11 @@ class MessageProcessor(ThreadManagementMixin,
 
                 # Check if intent classification failed
                 if intent == 'error':
-                    # Update thinking message
-                    if thinking_id:
-                        self._update_status(client, message.channel_id, thinking_id,
-                                          "Service temporarily unavailable.",
-                                          emoji=config.error_emoji)
+                    # Update the progress indicator (message edit, or composer
+                    # status on status-only DMs)
+                    self._update_status(client, message.channel_id, thinking_id,
+                                      "Service temporarily unavailable.",
+                                      emoji=config.error_emoji, thread_id=message.thread_id)
 
                     elapsed = time.time() - request_start_time
                     self.log_info("")
@@ -427,7 +426,7 @@ class MessageProcessor(ThreadManagementMixin,
                 else:
                     # Has text with images - classify if it's edit or vision
                     self._update_status(client, message.channel_id, thinking_id, 
-                                      "Understanding your request...")
+                                      "Understanding your request...", thread_id=message.thread_id)
                     # For intent classification, include the current message in trimming
                     # Temporarily add the current message
                     temp_intent_msg = {"role": "user", "content": enhanced_text}
@@ -501,7 +500,7 @@ class MessageProcessor(ThreadManagementMixin,
             else:
                 # No images uploaded - standard classification
                 self._update_status(client, message.channel_id, thinking_id, 
-                                  "Understanding your request...")
+                                  "Understanding your request...", thread_id=message.thread_id)
                 # For intent classification, include the current message in trimming
                 # Temporarily add the current message
                 temp_intent_msg = {"role": "user", "content": enhanced_text if enhanced_text else ""}
@@ -598,11 +597,12 @@ class MessageProcessor(ThreadManagementMixin,
                     self.log_debug("No recent images found, treating ambiguous as new generation")
             
             # Update thinking indicator if generating/editing image (only for non-streaming)
-            if intent in ["new_image", "edit_image"] and thinking_id:
+            if intent in ["new_image", "edit_image"]:
                 # Only show the image thinking message if we're not streaming
+                # (on status-only DMs this routes to the composer status)
                 # Note: We check global streaming here since we don't have thread_config yet
                 if not (hasattr(client, 'supports_streaming') and client.supports_streaming() and config.enable_streaming):
-                    self._update_thinking_for_image(client, message.channel_id, thinking_id)
+                    self._update_thinking_for_image(client, message.channel_id, thinking_id, thread_id=message.thread_id)
             
             # Generate response based on intent
             if intent == "new_image":
@@ -646,7 +646,7 @@ class MessageProcessor(ThreadManagementMixin,
                         if doc_count > 3:
                             doc_names += f" and {doc_count - 3} more"
                         status_msg = f"Analyzing {doc_count} document{'s' if doc_count > 1 else ''}: {doc_names}..."
-                        self._update_status(client, message.channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
+                        self._update_status(client, message.channel_id, thinking_id, status_msg, emoji=config.analyze_emoji, thread_id=message.thread_id)
                         
                         # Documents are already in enhanced_text, just process as text with vision intent
                         response = await self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0)
@@ -654,7 +654,7 @@ class MessageProcessor(ThreadManagementMixin,
                         # Both images and documents - use two-call approach
                         total_files = len(image_inputs) + len(document_inputs)
                         status_msg = f"Analyzing {len(image_inputs)} image{'s' if len(image_inputs) > 1 else ''} and {len(document_inputs)} document{'s' if len(document_inputs) > 1 else ''}..."
-                        self._update_status(client, message.channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
+                        self._update_status(client, message.channel_id, thinking_id, status_msg, emoji=config.analyze_emoji, thread_id=message.thread_id)
                         
                         # Use new two-call approach for mixed content
                         response = await self._handle_mixed_content_analysis(
@@ -788,7 +788,7 @@ class MessageProcessor(ThreadManagementMixin,
                 if thinking_id and hasattr(client, 'update_message'):
                     retry_msg = "OpenAI is slow to respond. Retrying with shorter timeout..."
                     try:
-                        self._update_status(client, message.channel_id, thinking_id, retry_msg, emoji="⏳")
+                        self._update_status(client, message.channel_id, thinking_id, retry_msg, emoji="⏳", thread_id=message.thread_id)
                         self.log_debug("Updated thinking message to show retry attempt")
                     except Exception as update_error:
                         self.log_error(f"Failed to update thinking message for retry: {update_error}")
@@ -886,7 +886,7 @@ class MessageProcessor(ThreadManagementMixin,
             if thinking_id and hasattr(client, 'update_message'):
                 timeout_msg = "OpenAI is not responding. Try again shortly."
                 try:
-                    self._update_status(client, message.channel_id, thinking_id, timeout_msg, emoji=config.error_emoji)
+                    self._update_status(client, message.channel_id, thinking_id, timeout_msg, emoji=config.error_emoji, thread_id=message.thread_id)
                     self.log_debug("Updated thinking message to show timeout")
                 except Exception as update_error:
                     self.log_error(f"Failed to update thinking message: {update_error}")

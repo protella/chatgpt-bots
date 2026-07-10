@@ -412,7 +412,7 @@ class MessageUtilitiesMixin:
                     if thinking_id:
                         self._update_status(client, message.channel_id, thinking_id, 
                                           f"Processing {file_name}...", 
-                                          emoji=config.analyze_emoji)
+                                          emoji=config.analyze_emoji, thread_id=message.thread_id)
                     
                     # Download the document
                     document_data = await client.download_file(
@@ -425,7 +425,7 @@ class MessageUtilitiesMixin:
                         if thinking_id:
                             self._update_status(client, message.channel_id, thinking_id, 
                                               f"Extracting content from {file_name}...", 
-                                              emoji=config.analyze_emoji)
+                                              emoji=config.analyze_emoji, thread_id=message.thread_id)
                         
                         # Extract document content using DocumentHandler. Pre-extraction
                         # native screen (flag + PDF + size): when a PDF may ride the
@@ -469,7 +469,7 @@ class MessageUtilitiesMixin:
                             if thinking_id:
                                 self._update_status(client, message.channel_id, thinking_id,
                                                   f"Summarizing {file_name}...",
-                                                  emoji=config.analyze_emoji)
+                                                  emoji=config.analyze_emoji, thread_id=message.thread_id)
                             doc_summary = await self._summarize_document_for_attach(
                                 extracted_content, file_name, mimetype)
 
@@ -528,7 +528,7 @@ class MessageUtilitiesMixin:
                             if thinking_id:
                                 error_msg = extracted_content.get("error", "Unable to extract content")
                                 self._update_status(client, message.channel_id, thinking_id, 
-                                                  f"⚠️ {file_name}: {error_msg}")
+                                                  f"⚠️ {file_name}: {error_msg}", thread_id=message.thread_id)
                             # Add to unsupported if extraction failed
                             unsupported_files.append({
                                 "name": file_name,
@@ -624,7 +624,7 @@ class MessageUtilitiesMixin:
                                 if thinking_id:
                                     self._update_status(client, message.channel_id, thinking_id,
                                                       f"Extracting content from {file_name}...",
-                                                      emoji=config.analyze_emoji)
+                                                      emoji=config.analyze_emoji, thread_id=message.thread_id)
                                 
                                 # Extract content
                                 extracted_content = await self.document_handler.safe_extract_content_async(
@@ -1148,8 +1148,14 @@ class MessageUtilitiesMixin:
             self.log_error(f"Error scheduling async message send: {e}")
             return None
 
-    def _update_status(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], message: str, emoji: Optional[str] = None):
-        """Update the thinking indicator with a status message"""
+    def _update_status(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], message: str, emoji: Optional[str] = None, thread_id: Optional[str] = None):
+        """Update the progress indicator with a status message.
+
+        With a message indicator (thinking_id set): edit that message.
+        Status-only DMs (thinking_id None on the assistant surface): route the
+        phase text to assistant.threads.setStatus when the caller supplies
+        thread_id — the composer status changes instead of a message edit.
+        """
         if thinking_id and hasattr(client, 'update_message'):
             status_emoji = emoji or config.thinking_emoji
             # Schedule the async call as a task to avoid blocking
@@ -1160,7 +1166,14 @@ class MessageUtilitiesMixin:
             ))
             self.log_debug(f"Status updated: {message}")
         elif not thinking_id:
-            self.log_debug("No thinking_id provided for status update")
+            if (thread_id and channel_id and channel_id.startswith("D")
+                    and hasattr(client, "set_assistant_status")):
+                self._schedule_async_call(client.set_assistant_status(
+                    channel_id, thread_id, status=message
+                ))
+                self.log_debug(f"Status routed to assistant status: {message}")
+            else:
+                self.log_debug("No thinking_id provided for status update")
         else:
             self.log_debug("Client doesn't support message updates")
 

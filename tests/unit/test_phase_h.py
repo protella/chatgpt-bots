@@ -315,6 +315,13 @@ def _resp(content="an answer", type_="text", model=None):
 
 @pytest.mark.asyncio
 class TestFeedbackStripPosting:
+    @pytest.fixture(autouse=True)
+    def _fresh_offers(self):
+        # Feedback buttons show once per thread per process — reset between tests.
+        feedback._reset_feedback_offers()
+        yield
+        feedback._reset_feedback_offers()
+
     async def test_dm_gets_feedback_strip(self):
         host = _MsgHost()
         await host.maybe_post_response_footer(_msg("D123"), _resp())
@@ -322,6 +329,28 @@ class TestFeedbackStripPosting:
         assert kwargs["channel"] == "D123"
         assert kwargs["blocks"][0]["type"] == "context_actions"
         assert kwargs["blocks"][0]["elements"][0]["action_id"] == feedback.FEEDBACK_ACTION_ID
+
+    async def test_strip_posts_once_per_thread(self):
+        # The ENTIRE strip (thumbs + settings button) posts under the FIRST reply
+        # of a thread only; later replies get no trailing chrome (reactions stay
+        # the always-available feedback signal). A different thread starts fresh.
+        host = _MsgHost()
+        await host.maybe_post_response_footer(_msg("D123"), _resp(model="gpt-5.6-sol"))
+        assert host.app.client.chat_postMessage.await_count == 1
+        first = host.app.client.chat_postMessage.await_args.kwargs["blocks"]
+        assert any(b["type"] == "context_actions" for b in first)
+        assert any(
+            el.get("action_id") == feedback.USER_SETTINGS_ACTION_ID
+            for b in first for el in (b.get("elements") or [])
+        )
+
+        # Same thread again: nothing posted.
+        await host.maybe_post_response_footer(_msg("D123"), _resp(model="gpt-5.6-sol"))
+        assert host.app.client.chat_postMessage.await_count == 1
+
+        # New thread: strip offered again.
+        await host.maybe_post_response_footer(_msg("D123", thread_id="2.0"), _resp(model="gpt-5.6-sol"))
+        assert host.app.client.chat_postMessage.await_count == 2
 
     async def test_dm_strip_carries_responding_model_button(self):
         host = _MsgHost()

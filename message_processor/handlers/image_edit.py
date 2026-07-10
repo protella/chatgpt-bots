@@ -121,11 +121,11 @@ class ImageEditMixin:
         
         if target_url:
             # Found an image to edit - update status
-            self._update_status(client, channel_id, thinking_id, "Finding the image to edit...", emoji=config.web_search_emoji)
+            self._update_status(client, channel_id, thinking_id, "Finding the image to edit...", emoji=config.web_search_emoji, thread_id=thread_state.thread_ts)
             
             # Download the image from Slack
             self.log_info(f"Found target image URL: {target_url}")
-            self._update_status(client, channel_id, thinking_id, "Downloading the image...")
+            self._update_status(client, channel_id, thinking_id, "Downloading the image...", thread_id=thread_state.thread_ts)
             
             try:
                 # Download the image
@@ -138,7 +138,7 @@ class ImageEditMixin:
                     
                     # Analyze the image first
                     self.log_debug("Analyzing image for context")
-                    self._update_status(client, channel_id, thinking_id, "Analyzing the image...", emoji=config.analyze_emoji)
+                    self._update_status(client, channel_id, thinking_id, "Analyzing the image...", emoji=config.analyze_emoji, thread_id=thread_state.thread_ts)
 
                     # Start progress updater for analysis
                     progress_task = None
@@ -245,9 +245,10 @@ class ImageEditMixin:
                         editing_id = await client.send_thinking_indicator(channel_id, thread_state.thread_ts)
                         self._update_status(client, channel_id, editing_id,
                                           "Editing your image. This may take a minute...",
-                                          emoji=config.circle_loader_emoji)
+                                          emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
                         # Track the status message ID
-                        response_metadata["status_message_id"] = editing_id
+                        if editing_id:  # status-only DMs return no ts — never store a None id
+                            response_metadata["status_message_id"] = editing_id
 
                         # Mark as streamed for main.py
                         response_metadata["streamed"] = True
@@ -293,8 +294,8 @@ class ImageEditMixin:
                             raise
                     else:
                         # Non-streaming fallback
-                        self._update_status(client, channel_id, thinking_id, "Enhancing your edit request...")
-                        self._update_status(client, channel_id, thinking_id, "Editing your image. This may take a minute...", emoji=config.circle_loader_emoji)
+                        self._update_status(client, channel_id, thinking_id, "Enhancing your edit request...", thread_id=thread_state.thread_ts)
+                        self._update_status(client, channel_id, thinking_id, "Editing your image. This may take a minute...", emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
                         
                         edited_image = await self.openai_client.edit_image(
                             input_images=[base64_data],
@@ -377,7 +378,7 @@ class ImageEditMixin:
                     # Update the thinking message to show we're generating instead
                     self._update_status(client, channel_id, thinking_id, 
                                       "Edit failed, generating new image instead...", 
-                                      emoji=config.error_emoji)
+                                      emoji=config.error_emoji, thread_id=thread_state.thread_ts)
         
         # Fallback to generation if edit failed or no URL found
         self.log_info("No image URL found or edit failed, falling back to generation based on description")
@@ -405,7 +406,7 @@ class ImageEditMixin:
         message: Message = None
     ) -> Response:
         """Handle image editing with uploaded images"""
-        self._update_status(client, channel_id, thinking_id, "Processing uploaded images...")
+        self._update_status(client, channel_id, thinking_id, "Processing uploaded images...", thread_id=thread_state.thread_ts)
         
         # Extract base64 data and mime types from image inputs
         input_images = []
@@ -444,7 +445,7 @@ class ImageEditMixin:
             status_msg = "Analyzing your uploaded image..."
         else:
             status_msg = f"Analyzing {len(input_images)} uploaded images..."
-        self._update_status(client, channel_id, thinking_id, status_msg, emoji=config.analyze_emoji)
+        self._update_status(client, channel_id, thinking_id, status_msg, emoji=config.analyze_emoji, thread_id=thread_state.thread_ts)
         
         # Log the analysis prompt
         self.log_debug("\n" + "="*100)
@@ -482,7 +483,7 @@ class ImageEditMixin:
             # Don't show the analysis - just update status to show we're editing
             # The analysis is only used internally for better edit quality
             if thinking_id:
-                self._update_status(client, channel_id, thinking_id, "Editing your image. This may take a minute...", emoji=config.circle_loader_emoji)
+                self._update_status(client, channel_id, thinking_id, "Editing your image. This may take a minute...", emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
 
             # Store the description and user request separately for clean enhancement
             image_analysis = image_description
@@ -588,9 +589,10 @@ class ImageEditMixin:
             editing_id = await client.send_thinking_indicator(channel_id, thread_state.thread_ts)
             self._update_status(client, channel_id, editing_id,
                               "Generating edited image. This may take a minute...",
-                              emoji=config.circle_loader_emoji)
+                              emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
             # Track the status message ID
-            response_metadata["status_message_id"] = editing_id
+            if editing_id:  # status-only DMs return no ts — never store a None id
+                response_metadata["status_message_id"] = editing_id
 
             # Mark as streamed for main.py
             response_metadata["streamed"] = True

@@ -48,37 +48,65 @@ def feedback_enabled() -> bool:
     return os.getenv("ENABLE_FEEDBACK_BUTTONS", "true").lower() == "true"
 
 
-def build_feedback_blocks(model_label: str | None = None) -> list:
-    """The DM/assistant response strip: native feedback buttons plus a compact
-    "⚙️ <model>" button that opens the user settings modal (Claude-style subtext
-    row: model visibility + Configure in one click).
+# Threads that already got a thumbs pair this process — feedback buttons show on the
+# FIRST response of a conversation thread only (user feedback 2026-07-09: "we don't
+# need the feedback after every response"). Reactions stay the always-available
+# signal; a restart forgetting this set costs at most one extra thumbs row per thread.
+from collections import OrderedDict
+
+_FEEDBACK_OFFERED: "OrderedDict[str, None]" = OrderedDict()
+_FEEDBACK_OFFERED_MAX = 500
+
+
+def should_offer_feedback(channel_id: str, thread_ts: str | None) -> bool:
+    """True exactly once per (channel, thread) per process lifetime."""
+    key = f"{channel_id}:{thread_ts or ''}"
+    if key in _FEEDBACK_OFFERED:
+        return False
+    _FEEDBACK_OFFERED[key] = None
+    while len(_FEEDBACK_OFFERED) > _FEEDBACK_OFFERED_MAX:
+        _FEEDBACK_OFFERED.popitem(last=False)
+    return True
+
+
+def _reset_feedback_offers() -> None:
+    """Test hook: forget which threads were offered feedback."""
+    _FEEDBACK_OFFERED.clear()
+
+
+def build_feedback_blocks(model_label: str | None = None, *, offer_feedback: bool = True) -> list:
+    """The DM/assistant response strip: a compact "⚙️ <model>" button that opens the
+    user settings modal (Claude-style subtext row), plus — on the FIRST response of a
+    thread only (offer_feedback) — the native feedback buttons.
 
     Why a regular actions button and not an icon_button inside context_actions:
     Slack's icon_button enum currently accepts ONLY "trash" (verified live
     2026-07-09 against chat.postMessage; docs agree) — no gear/settings icon
     exists yet. Revisit when more icons ship.
     """
-    blocks = [
-        {
-            "type": "context_actions",
-            "elements": [
-                {
-                    "type": "feedback_buttons",
-                    "action_id": FEEDBACK_ACTION_ID,
-                    "positive_button": {
-                        "text": {"type": "plain_text", "text": "Good response"},
-                        "accessibility_label": "Mark this response as good",
-                        "value": "good",
-                    },
-                    "negative_button": {
-                        "text": {"type": "plain_text", "text": "Bad response"},
-                        "accessibility_label": "Mark this response as bad",
-                        "value": "bad",
-                    },
-                }
-            ],
-        }
-    ]
+    blocks = []
+    if offer_feedback:
+        blocks.append(
+            {
+                "type": "context_actions",
+                "elements": [
+                    {
+                        "type": "feedback_buttons",
+                        "action_id": FEEDBACK_ACTION_ID,
+                        "positive_button": {
+                            "text": {"type": "plain_text", "text": "Good response"},
+                            "accessibility_label": "Mark this response as good",
+                            "value": "good",
+                        },
+                        "negative_button": {
+                            "text": {"type": "plain_text", "text": "Bad response"},
+                            "accessibility_label": "Mark this response as bad",
+                            "value": "bad",
+                        },
+                    }
+                ],
+            }
+        )
     label = (model_label or getattr(config, "gpt_model", "") or "").strip()
     if label:
         blocks.append(
