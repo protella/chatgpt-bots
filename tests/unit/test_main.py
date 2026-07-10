@@ -1,5 +1,6 @@
 """Unit tests for main.py - Main application entry point"""
 
+import asyncio
 import pytest
 import sys
 import signal
@@ -296,10 +297,14 @@ class TestChatBotV2MessageHandling:
         # Should delete thinking indicator on error
         client.delete_message.assert_called_once_with("C123", "thinking_123")
 
-        # Should send error message
-        client.handle_error.assert_called_once_with(
-            "C123", "thread_123", "Processing error"
-        )
+        # Should send a fixed friendly notice — the raw exception text must
+        # never reach Slack (it stays in the logs)
+        client.handle_error.assert_called_once()
+        args = client.handle_error.call_args[0]
+        assert args[0] == "C123"
+        assert args[1] == "thread_123"
+        assert "Processing error" not in args[2]
+        assert "Something Went Wrong" in args[2]
 
 
 class TestChatBotV2CleanupThread:
@@ -380,6 +385,10 @@ class TestChatBotV2Lifecycle:
         mock_config.validate.return_value = None
         mock_client = Mock(db=Mock())
         mock_slackbot_class.return_value = mock_client
+
+        # No MCP servers — otherwise run() would try to create the health-probe
+        # task from a MagicMock coroutine
+        mock_processor_class.return_value.mcp_manager.has_mcp_servers.return_value = False
 
         # Make client.start() raise an exception to trigger the finally block
         mock_client.start.side_effect = KeyboardInterrupt("Test interrupt")
@@ -714,9 +723,13 @@ class TestChatBotV2Critical:
         # Should not crash, but handle error
         await bot.handle_message(message, client)
 
-        # Should clean up and report error
+        # Should clean up and report a sanitized error (raw text stays in logs)
         client.delete_message.assert_called_with("C123", "thinking_123")
-        client.handle_error.assert_called_with("C123", "thread_123", "Critical error")
+        client.handle_error.assert_called_once()
+        args = client.handle_error.call_args[0]
+        assert args[0] == "C123"
+        assert args[1] == "thread_123"
+        assert "Critical error" not in args[2]
 
 
 @pytest.mark.integration
@@ -922,6 +935,7 @@ class TestChatBotV2CleanupTaskCoverage:
         bot.processor = Mock()
         bot.processor.thread_manager = Mock()
         bot.processor.thread_manager.cleanup_old_threads = AsyncMock()
+        bot.processor.db.cleanup_old_modal_sessions_async = AsyncMock()
         bot.processor.get_stats = Mock(return_value={"threads": 10, "cleaned": 2})
         bot.running = True
         return bot
@@ -959,6 +973,7 @@ class TestChatBotV2CleanupTaskCoverage:
 
         # Start cleanup task which creates the worker
         await bot.start_cleanup_task()
+        await bot.cleanup_task  # let the background worker run to completion
 
         # Verify error was logged and fallback was used
         mock_logger.error.assert_called_with("Invalid cron expression 'invalid_cron': Invalid cron expression")
@@ -1007,6 +1022,7 @@ class TestChatBotV2CleanupTaskCoverage:
 
         # Start cleanup task
         await bot.start_cleanup_task()
+        await bot.cleanup_task  # let the background worker run to completion
 
         # Verify minutes logging was used (< 3600 seconds)
         mock_logger.info.assert_any_call("Next cleanup scheduled for 2023-01-01 12:30:00 (30.0 minutes from now)")
@@ -1056,6 +1072,7 @@ class TestChatBotV2CleanupTaskCoverage:
 
         # Start cleanup task
         await bot.start_cleanup_task()
+        await bot.cleanup_task  # let the background worker run to completion
 
         # Verify cleanup was executed
         bot.processor.thread_manager.cleanup_old_threads.assert_called_with(max_age=48 * 3600)
@@ -1093,6 +1110,7 @@ class TestChatBotV2CleanupTaskCoverage:
 
         # Start cleanup task
         await bot.start_cleanup_task()
+        await bot.cleanup_task  # let the background worker run to completion
 
         # Verify cancellation was handled
         mock_logger.info.assert_any_call("Cleanup task cancelled")
@@ -1140,6 +1158,7 @@ class TestChatBotV2CleanupTaskCoverage:
 
         # Start cleanup task
         await bot.start_cleanup_task()
+        await bot.cleanup_task  # let the background worker run to completion
 
         # Verify error was logged and retry delay was used
         mock_logger.error.assert_called_with("Error in cleanup task: Cleanup error")
@@ -1153,12 +1172,14 @@ class TestChatBotV2AsyncCancellation:
         bot = ChatBotV2(platform="slack")
         bot.client = Mock()
         bot.processor = Mock()
+        # No MCP servers — keeps run() from spawning a health-probe task
+        # off a MagicMock coroutine
+        bot.processor.mcp_manager.has_mcp_servers.return_value = False
         return bot
 
-    @patch('main.asyncio.CancelledError')
     @patch('main.main_logger')
     @pytest.mark.asyncio
-    async def test_run_client_cancelled_error(self, mock_logger, mock_cancelled_error, bot):
+    async def test_run_client_cancelled_error(self, mock_logger, bot):
         """Test run method handles client CancelledError during shutdown"""
         bot.client.start = AsyncMock(side_effect=asyncio.CancelledError("Client cancelled"))
         bot.running = True
@@ -1173,7 +1194,7 @@ class TestChatBotV2AsyncCancellation:
 
     @patch('main.asyncio.all_tasks')
     @patch('main.asyncio.current_task')
-    @patch('main.asyncio.gather')
+    @patch('main.asyncio.gather', new_callable=AsyncMock)
     @patch('main.main_logger')
     @pytest.mark.asyncio
     async def test_shutdown_cancels_remaining_tasks(self, mock_logger, mock_gather, mock_current_task, mock_all_tasks, bot):

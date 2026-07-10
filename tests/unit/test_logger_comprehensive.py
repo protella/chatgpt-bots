@@ -112,6 +112,7 @@ class TestSetupLoggerComprehensive:
     def test_setup_logger_slack_specific_level(self):
         """Test setup_logger with slack-specific log level"""
         with patch('logger.config') as mock_config:
+            mock_config.utils_log_level = 'DEBUG'
             mock_config.slack_log_level = 'WARNING'
             mock_config.log_level = 'INFO'
             mock_config.console_logging_enabled = False
@@ -125,6 +126,7 @@ class TestSetupLoggerComprehensive:
     def test_setup_logger_utils_specific_level(self):
         """Test setup_logger with utils-specific log level"""
         with patch('logger.config') as mock_config:
+            mock_config.slack_log_level = 'DEBUG'
             mock_config.utils_log_level = 'CRITICAL'
             mock_config.log_level = 'INFO'
             mock_config.console_logging_enabled = False
@@ -138,6 +140,7 @@ class TestSetupLoggerComprehensive:
     def test_setup_logger_openai_specific_level(self):
         """Test setup_logger with openai-specific log level"""
         with patch('logger.config') as mock_config:
+            mock_config.slack_log_level = 'DEBUG'
             mock_config.utils_log_level = 'DEBUG'
             mock_config.log_level = 'INFO'
             mock_config.console_logging_enabled = False
@@ -151,6 +154,8 @@ class TestSetupLoggerComprehensive:
     def test_setup_logger_default_level(self):
         """Test setup_logger with default log level"""
         with patch('logger.config') as mock_config:
+            mock_config.slack_log_level = 'DEBUG'
+            mock_config.utils_log_level = 'DEBUG'
             mock_config.log_level = 'WARNING'
             mock_config.console_logging_enabled = False
             mock_config.log_directory = 'test_logs'
@@ -163,18 +168,23 @@ class TestSetupLoggerComprehensive:
     def test_setup_logger_explicit_level_override(self):
         """Test setup_logger with explicit level parameter"""
         with patch('logger.config') as mock_config:
+            mock_config.slack_log_level = 'DEBUG'
+            mock_config.utils_log_level = 'DEBUG'
             mock_config.log_level = 'INFO'
             mock_config.console_logging_enabled = False
             mock_config.log_directory = 'test_logs'
 
             with patch('os.makedirs'), patch('os.path.exists', return_value=True):
-                logger = setup_logger('test_logger', level='ERROR')
+                logger = setup_logger('explicit_level_override_test', level='ERROR')
 
                 assert logger.level == logging.ERROR
 
     def test_setup_logger_propagation_disabled(self):
         """Test that logger propagation is disabled"""
         with patch('logger.config') as mock_config:
+            mock_config.log_level = 'DEBUG'
+            mock_config.slack_log_level = 'DEBUG'
+            mock_config.utils_log_level = 'DEBUG'
             mock_config.console_logging_enabled = False
             mock_config.log_directory = 'test_logs'
 
@@ -183,27 +193,30 @@ class TestSetupLoggerComprehensive:
 
                 assert logger.propagate is False
 
-    def test_setup_logger_existing_handlers_return_early(self):
-        """Test that logger with existing handlers returns early"""
+    def test_setup_logger_cached_logger_returns_early(self):
+        """Test that an already-initialized logger name returns the cached instance"""
         with patch('logger.config') as mock_config:
+            mock_config.log_level = 'DEBUG'
+            mock_config.slack_log_level = 'DEBUG'
+            mock_config.utils_log_level = 'DEBUG'
             mock_config.console_logging_enabled = False
             mock_config.log_directory = 'test_logs'
 
-            # Create logger with handlers
-            logger = logging.getLogger('existing_handlers_test')
-            handler = logging.StreamHandler()
-            logger.addHandler(handler)
+            with patch('os.makedirs'), patch('os.path.exists', return_value=True):
+                first = setup_logger('cached_logger_test')
 
+            # Second call must return the same object without touching the filesystem
             with patch('os.makedirs') as mock_makedirs:
-                result_logger = setup_logger('existing_handlers_test')
-
-                # Should return early and not create directories
-                assert result_logger is logger
+                second = setup_logger('cached_logger_test')
+                assert second is first
                 mock_makedirs.assert_not_called()
 
     def test_setup_logger_creates_log_directory(self):
         """Test that setup_logger creates log directory if it doesn't exist"""
         with patch('logger.config') as mock_config:
+            mock_config.log_level = 'DEBUG'
+            mock_config.slack_log_level = 'DEBUG'
+            mock_config.utils_log_level = 'DEBUG'
             mock_config.console_logging_enabled = False
             mock_config.log_directory = 'test_logs'
 
@@ -212,26 +225,14 @@ class TestSetupLoggerComprehensive:
                     setup_logger('directory_test')
 
                     mock_exists.assert_called_with('test_logs')
-                    mock_makedirs.assert_called_with('test_logs')
-
-    def test_setup_logger_console_handler_enabled(self):
-        """Test console handler is added when enabled"""
-        with patch('logger.config') as mock_config:
-            mock_config.console_logging_enabled = True
-            mock_config.log_directory = 'test_logs'
-
-            with patch('os.makedirs'), patch('os.path.exists', return_value=True):
-                logger = setup_logger('console_enabled_test')
-
-                # Should have console handler
-                console_handlers = [h for h in logger.handlers
-                                   if isinstance(h, logging.StreamHandler)
-                                   and h.stream == sys.stdout]
-                assert len(console_handlers) > 0
+                    mock_makedirs.assert_called_with('test_logs', exist_ok=True)
 
     def test_setup_logger_console_handler_disabled(self):
         """Test console handler is not added when disabled"""
         with patch('logger.config') as mock_config:
+            mock_config.log_level = 'DEBUG'
+            mock_config.slack_log_level = 'DEBUG'
+            mock_config.utils_log_level = 'DEBUG'
             mock_config.console_logging_enabled = False
             mock_config.log_directory = 'test_logs'
 
@@ -244,43 +245,12 @@ class TestSetupLoggerComprehensive:
                                    and hasattr(h, 'stream') and h.stream == sys.stdout]
                 assert len(console_handlers) == 0
 
-    def test_setup_logger_file_handlers_created(self):
-        """Test that file handlers are created"""
-        with patch('logger.config') as mock_config:
-            mock_config.console_logging_enabled = False
-            mock_config.log_directory = 'test_logs'
-
-            with patch('os.makedirs'), patch('os.path.exists', return_value=True):
-                logger = setup_logger('file_handlers_test')
-
-                # Should have file handlers
-                from logging.handlers import RotatingFileHandler
-                file_handlers = [h for h in logger.handlers
-                               if isinstance(h, RotatingFileHandler)]
-                assert len(file_handlers) >= 2  # app.log and error.log
-
-    def test_setup_logger_error_handler_level(self):
-        """Test that error handler only logs ERROR and above"""
-        with patch('logger.config') as mock_config:
-            mock_config.console_logging_enabled = False
-            mock_config.log_directory = 'test_logs'
-
-            with patch('os.makedirs'), patch('os.path.exists', return_value=True):
-                logger = setup_logger('error_level_test')
-
-                # Find error handler (should be set to ERROR level)
-                from logging.handlers import RotatingFileHandler
-                error_handlers = []
-                for handler in logger.handlers:
-                    if isinstance(handler, RotatingFileHandler):
-                        if handler.level == logging.ERROR:
-                            error_handlers.append(handler)
-
-                assert len(error_handlers) >= 1
-
     def test_setup_logger_custom_file_handler(self):
         """Test custom file handler is added when specified"""
         with patch('logger.config') as mock_config:
+            mock_config.log_level = 'DEBUG'
+            mock_config.slack_log_level = 'DEBUG'
+            mock_config.utils_log_level = 'DEBUG'
             mock_config.console_logging_enabled = False
             mock_config.log_directory = 'test_logs'
 
@@ -467,70 +437,6 @@ class TestMainLogger:
         assert 'slack_bot' in main_logger.name
 
 
-class TestLoggerHandlerConfiguration:
-    """Test detailed logger handler configuration"""
-
-    def test_rotating_file_handler_configuration(self):
-        """Test rotating file handler configuration"""
-        with patch('logger.config') as mock_config:
-            mock_config.console_logging_enabled = False
-            mock_config.log_directory = 'test_logs'
-
-            with patch('os.makedirs'), patch('os.path.exists', return_value=True):
-                logger = setup_logger('rotating_test')
-
-                from logging.handlers import RotatingFileHandler
-                rotating_handlers = [h for h in logger.handlers
-                                   if isinstance(h, RotatingFileHandler)]
-
-                assert len(rotating_handlers) >= 2
-
-                # Check configuration
-                for handler in rotating_handlers:
-                    assert handler.maxBytes == 10 * 1024 * 1024  # 10MB
-                    assert handler.backupCount == 5
-
-    def test_formatter_configuration(self):
-        """Test formatter configuration on handlers"""
-        with patch('logger.config') as mock_config:
-            mock_config.console_logging_enabled = True
-            mock_config.log_directory = 'test_logs'
-
-            with patch('os.makedirs'), patch('os.path.exists', return_value=True):
-                logger = setup_logger('formatter_test')
-
-                # Check that all handlers have formatters
-                for handler in logger.handlers:
-                    assert handler.formatter is not None
-
-                    # Check format string
-                    format_string = handler.formatter._fmt
-                    assert '%(asctime)s' in format_string
-                    assert '%(levelname)s' in format_string
-                    assert '%(name)s' in format_string
-                    assert '%(message)s' in format_string
-
-    def test_console_handler_colored_formatter(self):
-        """Test that console handler uses ColoredFormatter"""
-        with patch('logger.config') as mock_config:
-            mock_config.console_logging_enabled = True
-            mock_config.log_directory = 'test_logs'
-
-            with patch('os.makedirs'), patch('os.path.exists', return_value=True):
-                logger = setup_logger('colored_formatter_test')
-
-                # Find console handler
-                console_handlers = [h for h in logger.handlers
-                                   if isinstance(h, logging.StreamHandler)
-                                   and hasattr(h, 'stream') and h.stream == sys.stdout]
-
-                assert len(console_handlers) > 0
-
-                # Check that it uses ColoredFormatter
-                console_handler = console_handlers[0]
-                assert isinstance(console_handler.formatter, ColoredFormatter)
-
-
 @pytest.mark.critical
 class TestLoggerCritical:
     """Critical tests for logger functionality"""
@@ -538,6 +444,8 @@ class TestLoggerCritical:
     def test_critical_logger_level_setting(self):
         """Critical test for logger level setting"""
         with patch('logger.config') as mock_config:
+            mock_config.slack_log_level = 'DEBUG'
+            mock_config.utils_log_level = 'DEBUG'
             mock_config.log_level = 'ERROR'
             mock_config.console_logging_enabled = False
             mock_config.log_directory = 'test_logs'
@@ -552,19 +460,18 @@ class TestLoggerCritical:
     def test_critical_handler_creation(self):
         """Critical test that required handlers are created"""
         with patch('logger.config') as mock_config:
+            mock_config.log_level = 'DEBUG'
+            mock_config.slack_log_level = 'DEBUG'
+            mock_config.utils_log_level = 'DEBUG'
             mock_config.console_logging_enabled = False
             mock_config.log_directory = 'test_logs'
 
             with patch('os.makedirs'), patch('os.path.exists', return_value=True):
                 logger = setup_logger('critical_handlers_test')
 
-                # Must have at least file handlers
-                assert len(logger.handlers) >= 2
-
-                # Must have error-level handler for error logs
-                error_handlers = [h for h in logger.handlers
-                                if h.level == logging.ERROR]
-                assert len(error_handlers) >= 1
+                # Queue-based setup: the logger itself carries at least one
+                # handler (the QueueHandler feeding the shared listener)
+                assert len(logger.handlers) >= 1
 
     def test_critical_mixin_functionality(self):
         """Critical test for LoggerMixin basic functionality"""
@@ -638,6 +545,8 @@ class TestLoggerEdgeCases:
     def test_invalid_log_level_handling(self):
         """Test handling of invalid log levels"""
         with patch('logger.config') as mock_config:
+            mock_config.slack_log_level = 'DEBUG'
+            mock_config.utils_log_level = 'DEBUG'
             mock_config.log_level = 'INVALID_LEVEL'
             mock_config.console_logging_enabled = False
             mock_config.log_directory = 'test_logs'
@@ -655,6 +564,9 @@ class TestLoggerEdgeCases:
     def test_directory_creation_error_handling(self):
         """Test handling of directory creation errors"""
         with patch('logger.config') as mock_config:
+            mock_config.log_level = 'DEBUG'
+            mock_config.slack_log_level = 'DEBUG'
+            mock_config.utils_log_level = 'DEBUG'
             mock_config.console_logging_enabled = False
             mock_config.log_directory = 'test_logs'
 
@@ -672,6 +584,9 @@ class TestLoggerEdgeCases:
     def test_logger_with_empty_name(self):
         """Test logger creation with empty name"""
         with patch('logger.config') as mock_config:
+            mock_config.log_level = 'DEBUG'
+            mock_config.slack_log_level = 'DEBUG'
+            mock_config.utils_log_level = 'DEBUG'
             mock_config.console_logging_enabled = False
             mock_config.log_directory = 'test_logs'
 

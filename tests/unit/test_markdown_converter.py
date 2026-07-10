@@ -182,7 +182,9 @@ def hello():
         assert "• List item" in result
         assert "<https://google.com|Link to Google>" in result
         assert "> This is a blockquote" in result
-        assert "```python" in result
+        # Slack fences drop the language tag; content is preserved
+        assert "```" in result
+        assert 'def hello():' in result
         assert "`code`" in result
 
     def test_whitespace_cleanup(self):
@@ -289,7 +291,9 @@ class TestCodeBlockExtraction:
 
         result = self.converter._restore_code_blocks_slack(text, storage)
 
-        assert "```python" in result
+        # Slack restoration strips the language tag from fences
+        assert "```" in result
+        assert "```python" not in result
         assert "print('hello')" in result
         assert "`variable`" in result
         assert "###CODE_BLOCK_0###" not in result
@@ -372,6 +376,10 @@ class TestMarkdownConverterCritical:
 @pytest.mark.smoke
 class TestMarkdownConverterSmoke:
     """Smoke tests for markdown converter"""
+
+    def setup_method(self):
+        """Setup test fixtures"""
+        self.converter = MarkdownConverter("slack")
 
     def test_smoke_basic_functionality(self):
         """Smoke test for basic converter functionality"""
