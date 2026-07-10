@@ -111,12 +111,16 @@ class TestFooterPosting:
         s.app.client.chat_postMessage.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_skips_dm(self, monkeypatch):
+    async def test_dm_gets_feedback_strip_not_footer(self, monkeypatch):
+        # Phase H: DMs post the native feedback strip instead of the Configure footer.
         monkeypatch.setattr(config, "enable_response_footer", True)
         s = self._fake_self()
         msg = Message(text="hi", user_id="U1", channel_id="D1", thread_id="T1")
         await SlackMessagingMixin.maybe_post_response_footer(s, msg, Response(type="text", content="x"))
-        s.app.client.chat_postMessage.assert_not_awaited()
+        s.app.client.chat_postMessage.assert_awaited_once()
+        blocks = str(s.app.client.chat_postMessage.await_args.kwargs.get("blocks", ""))
+        assert "response_feedback" in blocks
+        assert "open_channel_settings" not in blocks
 
     @pytest.mark.asyncio
     async def test_skips_when_flag_off(self, monkeypatch):

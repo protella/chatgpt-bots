@@ -13,9 +13,28 @@ from message_markers import (
     continuation_trailer,
     fence_safe_chunks,
 )
+from slack_client.event_handlers.feedback import (
+    FEEDBACK_ACTION_ID,
+    build_feedback_blocks,
+    feedback_enabled,
+)
 from slack_client.utilities import strip_citations
 
 import re as _re
+
+# Block action_ids that mark a message as one of our UI helpers (channel footer's
+# Configure button, Phase H feedback strip). Such messages are chrome, not
+# conversation — the history rebuild must never feed them back into context.
+_UI_HELPER_ACTION_IDS = frozenset({"open_channel_settings", FEEDBACK_ACTION_ID})
+
+
+def _is_ui_helper_message(msg: dict) -> bool:
+    """True when any block element carries one of our UI-helper action_ids."""
+    return any(
+        el.get("action_id") in _UI_HELPER_ACTION_IDS
+        for b in (msg.get("blocks") or []) if b.get("type") in ("actions", "context_actions")
+        for el in (b.get("elements") or [])
+    )
 
 # Own-message placeholder/status filters for history rebuild (R3): only messages
 # shaped like ":emoji: Status text" AND carrying a known transient marker are
@@ -481,13 +500,10 @@ class SlackMessagingMixin:
                         # Settings button messages
                         if text == "Settings available":
                             continue
-                    # Skip response-footer messages (model context line + Configure button) —
-                    # detected by their action block, so a real reply can't false-positive.
-                    if any(
-                        el.get("action_id") == "open_channel_settings"
-                        for b in (msg.get("blocks") or []) if b.get("type") == "actions"
-                        for el in (b.get("elements") or [])
-                    ):
+                    # Skip our UI-helper messages (channel footer's Configure button,
+                    # Phase H feedback strip) — detected by their block action_ids,
+                    # so a real reply can't false-positive.
+                    if _is_ui_helper_message(msg):
                         continue
 
                     # sender_type computed above (drives both the self-only filters and metadata)
@@ -833,23 +849,41 @@ class SlackMessagingMixin:
         ]
 
     async def maybe_post_response_footer(self, message, response) -> None:
-        """Phase 7: post a small footer (model + Configure button) under a channel text response.
+        """Trailing chrome under a final text response — surface-dependent:
 
-        Posted as a SEPARATE trailing message, so it never touches the text/split/streaming path
-        and is inherently attached only after the final part. Fires once, only for text responses,
-        only in channels (not DMs), only when ENABLE_RESPONSE_FOOTER is on. Never raises.
+        - Channels: the Phase 7 footer (model + Configure button), when
+          ENABLE_RESPONSE_FOOTER is on.
+        - DMs/assistant threads: the Phase H native feedback buttons strip, when
+          ENABLE_FEEDBACK_BUTTONS is on (channels deliberately get no feedback strip —
+          pixels matter there; reactions cover feedback in channels).
+
+        Posted as a SEPARATE trailing message, so it never touches the text/split/streaming
+        path and is inherently attached only after the final part (streamed included).
+        Fires once, only for text responses. Never raises.
         """
         try:
-            if not getattr(config, "enable_response_footer", True):
-                return
             if not response or getattr(response, "type", None) != "text":
                 return
-            # Reaction-only turns post no message — nothing to hang a footer under
+            # Reaction-only turns post no message — nothing to hang chrome under
             if not (getattr(response, "content", None) or "").strip():
                 return
             channel_id = getattr(message, "channel_id", None)
-            if not channel_id or channel_id.startswith("D"):
-                return  # per-channel settings don't apply in DMs
+            if not channel_id:
+                return
+            if channel_id.startswith("D"):
+                # Phase H: feedback buttons on the assistant/DM surface.
+                if not feedback_enabled():
+                    return
+                await self.app.client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=getattr(message, "thread_id", None),
+                    text="Rate this response",  # fallback text for notifications
+                    blocks=build_feedback_blocks(),
+                )
+                return
+            # Channels: per-channel settings footer.
+            if not getattr(config, "enable_response_footer", True):
+                return
             model = (getattr(response, "metadata", None) or {}).get("model")
             blocks = self._build_response_footer_blocks(model)
             await self.app.client.chat_postMessage(
