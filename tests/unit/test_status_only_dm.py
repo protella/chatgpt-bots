@@ -302,9 +302,11 @@ class TestStatusPlainText:
         assert _status_plain_text("") == "working on it…"
 
     @pytest.mark.asyncio
-    async def test_explicit_phase_status_sends_alone_and_sanitized(self, monkeypatch):
-        # Slack renders status + loading_messages as TWO separate indicators; an
-        # explicit phase status therefore goes out WITHOUT the default rotation.
+    async def test_explicit_phase_status_replaces_rotation_with_itself(self, monkeypatch):
+        # Slack renders status (composer bar) and loading_messages (in-thread bubble)
+        # as two surfaces, and the bubble RETAINS old rotation frames when a call
+        # omits loading_messages. A phase status therefore sends itself as the single
+        # loading message so both surfaces show the same current text.
         from config import config
         monkeypatch.setattr(config, "enable_assistant_status", True)
         monkeypatch.setattr(config, "status_loading_messages", [":mag: one…", ":datassential: two…"])
@@ -312,7 +314,7 @@ class TestStatusPlainText:
         await host.set_assistant_status("D1", "1.0", status=":hourglass_flowing_sand: pulling it together…")
         kwargs = host.app.client.assistant_threads_setStatus.await_args.kwargs
         assert kwargs["status"] == "⏳ pulling it together…"
-        assert "loading_messages" not in kwargs
+        assert kwargs["loading_messages"] == ["⏳ pulling it together…"]
 
     @pytest.mark.asyncio
     async def test_initial_indicator_sends_rotation_sanitized(self, monkeypatch):
