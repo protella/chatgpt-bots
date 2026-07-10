@@ -394,17 +394,19 @@ class SlackMessagingMixin:
     async def send_thinking_indicator(self, channel_id: str, thread_id: str) -> Optional[str]:
         """Show a progress indicator; returns the placeholder message ts, or None.
 
-        Two-surface contract:
-        - DMs (assistant/agent surface): assistant.threads.setStatus is the SOLE
-          indicator — native composer status, no message, no "(edited)" churn,
-          auto-clears when the app replies. Returns None; downstream consumers
-          treat a None ts as "status-only" (streaming seeds its own message
-          lazily, phase updates route to setStatus, deletes no-op).
-        - Channels (setStatus no-ops there) and any DM where setStatus fails:
-          post the classic "Thinking..." placeholder and return its ts.
+        Contract: assistant.threads.setStatus is the SOLE indicator wherever Slack
+        accepts it — the June-2026 agent surface renders the composer status in DMs
+        AND channel threads (verified live 2026-07-09: a channel thread showed both
+        the status line and our redundant placeholder). Native status means no
+        message, no "(edited)" churn, auto-clears on reply. Returns None; downstream
+        consumers treat a None ts as "status-only" (streaming seeds its own message
+        lazily, phase updates route to setStatus, deletes no-op).
+
+        Only where setStatus FAILS (non-agent contexts, older surfaces) do we post
+        the classic "Thinking..." placeholder and return its ts.
         """
         status_set = await self.set_assistant_status(channel_id, thread_id)
-        if status_set and channel_id and channel_id.startswith("D"):
+        if status_set:
             return None
         try:
             result = await self.app.client.chat_postMessage(

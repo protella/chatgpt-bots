@@ -1166,8 +1166,10 @@ class MessageUtilitiesMixin:
             ))
             self.log_debug(f"Status updated: {message}")
         elif not thinking_id:
-            if (thread_id and channel_id and channel_id.startswith("D")
-                    and hasattr(client, "set_assistant_status")):
+            # No placeholder ts means the turn is status-only: setStatus succeeded
+            # at indicator time (DMs AND channel threads on the agent surface), so
+            # phase updates route there too.
+            if thread_id and channel_id and hasattr(client, "set_assistant_status"):
                 self._schedule_async_call(client.set_assistant_status(
                     channel_id, thread_id, status=message
                 ))
