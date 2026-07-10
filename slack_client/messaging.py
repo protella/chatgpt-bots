@@ -8,7 +8,7 @@ from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_sdk.errors import SlackApiError
 
 from base_client import HistoryFetchError, Message, Response
-from config import config, pipeline_status_markers
+from config import SUPPORTED_CHAT_MODELS, config, pipeline_status_markers
 from message_markers import (
     CONTINUATION_HEAD,
     continuation_trailer,
@@ -26,21 +26,34 @@ from slack_client.utilities import strip_citations
 import re as _re
 
 # Block action_ids that mark a message as one of our UI helpers (channel footer's
-# Configure button, Phase H feedback strip + its user-settings button). Such messages
-# are chrome, not conversation — the history rebuild must never feed them back into
-# context.
+# Configure button, Phase H feedback strip + its user-settings button). PURE-chrome
+# messages are not conversation — the history rebuild must never feed them back into
+# context. But a real response can now CARRY the Configure chrome (native streaming
+# attaches it on stopStream), so helper action_ids alone no longer condemn a message:
+# only the known chrome fallback texts do. Those fallbacks are exactly what the
+# separate helper posts set as `text`: the model label (footer), "Rate this response"
+# (feedback strip), and the legacy "Settings available".
 _UI_HELPER_ACTION_IDS = frozenset({
     "open_channel_settings", FEEDBACK_ACTION_ID, USER_SETTINGS_ACTION_ID,
 })
+_UI_HELPER_FALLBACK_TEXTS = frozenset(
+    {"Rate this response", "Settings available"} | set(SUPPORTED_CHAT_MODELS)
+)
 
 
 def _is_ui_helper_message(msg: dict) -> bool:
-    """True when any block element carries one of our UI-helper action_ids."""
-    return any(
+    """True when a message is PURE UI chrome: a helper action_id in its blocks AND no
+    text beyond the helper's own notification fallback. A content-bearing response
+    with the Configure chrome attached keeps its real text and is preserved."""
+    has_helper = any(
         el.get("action_id") in _UI_HELPER_ACTION_IDS
         for b in (msg.get("blocks") or []) if b.get("type") in ("actions", "context_actions")
         for el in (b.get("elements") or [])
     )
+    if not has_helper:
+        return False
+    text = (msg.get("text") or "").strip()
+    return not text or text in _UI_HELPER_FALLBACK_TEXTS
 
 # Own-message placeholder/status filters for history rebuild (R3): only messages
 # shaped like ":emoji: Status text" AND carrying a known transient marker are
@@ -899,6 +912,37 @@ class SlackMessagingMixin:
             ]},
         ]
 
+    def attachable_footer_blocks(self, channel_id: Optional[str], model: Optional[str] = None):
+        """Settings chrome to ATTACH to the final part of a native-streamed response
+        (chat.stopStream accepts blocks), so the "⚙️ <model>" row rides the response
+        message itself instead of a separate trailing post — on EVERY surface
+        (user request 2026-07-10; matches Claude's per-message footer row).
+
+        Surface routing: channels/channel threads get the per-channel settings button
+        (open_channel_settings); DMs/assistant threads get the personal settings
+        button (open_user_settings) since there are no channel settings there. This
+        is independent of the feedback strip (ENABLE_FEEDBACK_BUTTONS), which stays
+        off by the operator's choice.
+
+        Returns None when ENABLE_RESPONSE_FOOTER is off. Fallback for paths that
+        can't attach: channels may still post the separate footer message
+        (maybe_post_response_footer); DMs simply get no gear — /chatgpt-settings
+        always works."""
+        if not channel_id:
+            return None
+        if not getattr(config, "enable_response_footer", True):
+            return None
+        if channel_id.startswith("D"):
+            model_label = model or config.gpt_model
+            return [
+                {"type": "actions", "elements": [
+                    {"type": "button",
+                     "text": {"type": "plain_text", "text": f"⚙️ {model_label}"},
+                     "action_id": USER_SETTINGS_ACTION_ID}
+                ]},
+            ]
+        return self._build_response_footer_blocks(model)
+
     async def maybe_post_response_footer(self, message, response) -> None:
         """Trailing chrome under a final text response — surface-dependent:
 
@@ -917,6 +961,10 @@ class SlackMessagingMixin:
                 return
             # Reaction-only turns post no message — nothing to hang chrome under
             if not (getattr(response, "content", None) or "").strip():
+                return
+            # The chrome already rode the response message itself (native streaming
+            # attaches it on stopStream) — don't double up with a separate post.
+            if (getattr(response, "metadata", None) or {}).get("footer_attached"):
                 return
             channel_id = getattr(message, "channel_id", None)
             if not channel_id:

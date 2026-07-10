@@ -150,11 +150,15 @@ class NativeStreamCoordinator:
         self.failed = True
         return False, overflow
 
-    async def finalize(self, final_raw: str, suffix: str = "") -> bool:
+    async def finalize(self, final_raw: str, suffix: str = "", blocks=None) -> bool:
         """Append any remaining tail (+ suffix, e.g. tools attribution) and stop.
 
+        ``blocks`` (e.g. the channel Configure chrome) ride the LAST part's stopStream
+        only — intermediate rolled parts close without them, so a multi-part response
+        carries the chrome exactly once, at the very end.
+
         Returns False if anything failed — the caller should fall back to the legacy
-        final-correction edit on ``current_ts``."""
+        final-correction edit on ``current_ts`` (and post any chrome separately)."""
         if self.session is None or self.finished:
             return False
         try:
@@ -166,7 +170,7 @@ class NativeStreamCoordinator:
                 text = overflow
             if not self.active:
                 return False
-            ok = await self.session.finish(final_text=self.base + text + suffix)
+            ok = await self.session.finish(final_text=self.base + text + suffix, blocks=blocks)
             if ok:
                 self.finished = True
             else:
