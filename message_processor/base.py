@@ -175,28 +175,12 @@ class MessageProcessor(ThreadManagementMixin,
             # Process any attachments (images, documents, and other files)
             image_inputs, document_inputs, unsupported_files = await self._process_attachments(message, client, thinking_id)
             
-            # Check for unsupported files and notify user
+            # Files that were accepted but couldn't be fetched/processed create an
+            # obligation: use them or tell the user they failed — never answer as
+            # if they were never attached.
             if unsupported_files:
-                file_types = set()
-                file_names = []
-                for file in unsupported_files:
-                    file_types.add(file['mimetype'])
-                    file_names.append(file['name'])
-                
-                types_str = ", ".join(sorted(file_types))
-                files_str = ", ".join(f"*{name}*" for name in file_names)
-                
-                unsupported_msg = "⚠️ *Unsupported File Type*\n\n"
-                unsupported_msg += f"I noticed you uploaded: {files_str}\n\n"
-                unsupported_msg += f"*File type(s):* `{types_str}`\n\n"
-                unsupported_msg += "───────────────\n"
-                unsupported_msg += "*Currently supported:*\n"
-                unsupported_msg += "• Images (JPEG, PNG, GIF, WebP)\n"
-                # Generated from the handler's own table so this list can't lie
-                from document_handler import DOCUMENT_EXTENSIONS
-                doc_types = ", ".join(sorted(ext.lstrip('.').upper() for ext in DOCUMENT_EXTENSIONS))
-                unsupported_msg += f"• Documents ({doc_types})\n\n"
-                unsupported_msg += "_Support for additional file types may be added in the future._"
+                files_str = ", ".join(f"*{f['name']}*" for f in unsupported_files)
+                unsupported_msg = self._build_failed_files_notice(unsupported_files)
                 
                 # If there's also text, images, or documents, continue processing those
                 if (message.text and message.text.strip()) or image_inputs or document_inputs:
@@ -204,7 +188,7 @@ class MessageProcessor(ThreadManagementMixin,
                     # Add the unsupported files warning to conversation
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                     message_ts = message.metadata.get("ts") if message.metadata else None
-                    formatted_content = self._format_user_content_with_username(f"[Uploaded unsupported file(s): {files_str}]", message)
+                    formatted_content = self._format_user_content_with_username(f"[File(s) not processed: {files_str}]", message)
                     self._add_message_with_token_management(thread_state, "user", formatted_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
                     self._add_message_with_token_management(thread_state, "assistant", unsupported_msg, db=self.db, thread_key=thread_key)
                     # Continue processing if we have text or images
@@ -212,7 +196,7 @@ class MessageProcessor(ThreadManagementMixin,
                     # Only unsupported files were uploaded, nothing else to process
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                     message_ts = message.metadata.get("ts") if message.metadata else None
-                    formatted_content = self._format_user_content_with_username(f"[Uploaded unsupported file(s): {files_str}]", message)
+                    formatted_content = self._format_user_content_with_username(f"[File(s) not processed: {files_str}]", message)
                     self._add_message_with_token_management(thread_state, "user", formatted_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
                     self._add_message_with_token_management(thread_state, "assistant", unsupported_msg, db=self.db, thread_key=thread_key)
                     elapsed = time.time() - request_start_time
@@ -1034,6 +1018,7 @@ class MessageProcessor(ThreadManagementMixin,
                 await self._dispatch_pending_batch(message, client, thread_key)
             except Exception as drain_error:
                 self.log_error(f"Pending-queue drain failed for {thread_key}: {drain_error}", exc_info=True)
+                await self._notify_drain_failure(message, client, thread_key)
             # Always release the thread lock, even on timeout
             try:
                 await self.thread_manager.release_thread_lock(
@@ -1043,6 +1028,56 @@ class MessageProcessor(ThreadManagementMixin,
             except Exception as lock_error:
                 # Even if release fails, log it but don't crash
                 self.log_error(f"Error releasing thread lock for {thread_key}: {lock_error}", exc_info=True)
+
+    async def _notify_drain_failure(self, message: Message, client: BaseClient, thread_key: str):
+        """Queued messages were silently accepted — their senders must not get
+        silence when the catch-up turn dies. Flag a transcript refetch so context
+        recovers, and tell the thread to re-send (both best-effort)."""
+        try:
+            self.thread_manager.mark_needs_refresh(thread_key)
+        except Exception:
+            pass
+        try:
+            await client.send_message_async(
+                message.channel_id, message.thread_id,
+                "⚠️ I hit an error catching up on the last few messages — please re-send."
+            )
+        except Exception as notify_error:
+            self.log_error(f"Failed to post drain-failure notice for {thread_key}: {notify_error}")
+
+    @staticmethod
+    def _build_failed_files_notice(unsupported_files: list) -> str:
+        """User notice for files that were accepted but not processed.
+
+        Download failures get their own actionable line (re-upload); genuinely
+        unsupported types keep the supported-formats explainer.
+        """
+        download_failures = [f for f in unsupported_files if f.get('error') == 'download_failed']
+        truly_unsupported = [f for f in unsupported_files if f.get('error') != 'download_failed']
+
+        sections = []
+        if download_failures:
+            failed_str = ", ".join(f"*{f['name']}*" for f in download_failures)
+            sections.append(
+                "⚠️ *Couldn't Download File*\n\n"
+                f"I couldn't download {failed_str} — try re-uploading."
+            )
+        if truly_unsupported:
+            types_str = ", ".join(sorted({f['mimetype'] for f in truly_unsupported}))
+            unsup_str = ", ".join(f"*{f['name']}*" for f in truly_unsupported)
+            section = "⚠️ *Unsupported File Type*\n\n"
+            section += f"I noticed you uploaded: {unsup_str}\n\n"
+            section += f"*File type(s):* `{types_str}`\n\n"
+            section += "───────────────\n"
+            section += "*Currently supported:*\n"
+            section += "• Images (JPEG, PNG, GIF, WebP)\n"
+            # Generated from the handler's own table so this list can't lie
+            from document_handler import DOCUMENT_EXTENSIONS
+            doc_types = ", ".join(sorted(ext.lstrip('.').upper() for ext in DOCUMENT_EXTENSIONS))
+            section += f"• Documents ({doc_types})\n\n"
+            section += "_Support for additional file types may be added in the future._"
+            sections.append(section)
+        return "\n\n".join(sections)
 
     async def _dispatch_pending_batch(self, finished_message: Message, client: BaseClient, thread_key: str):
         """Phase Q: after a turn finishes (lock still held), drain the conversation's
