@@ -104,13 +104,27 @@ async def test_tag_only_unaddressed_ignored(tag_only):
 
 
 @pytest.mark.asyncio
-async def test_tag_only_name_addressed_responds(tag_only):
+async def test_tag_only_name_hit_routes_to_engine(tag_only):
+    # Revised contract: a name-in-text hit is a SIGNAL, not a verdict — the engine
+    # decides addressed vs merely-discussed vs same-named public product.
     bot = _make_bot()
     await bot._handle_channel_message(_evt(text="ChatGPT, what's the weather?"), bot.app.client)
     bot.message_handler.assert_called_once()
     msg = bot.message_handler.call_args[0][0]
     assert msg.metadata.get("channel_listen") is True
-    assert msg.metadata.get("participation_check") is not True  # addressed → no engine needed
+    assert msg.metadata.get("participation_check") is True
+    assert msg.metadata.get("participation_name_hit") is True
+
+
+@pytest.mark.asyncio
+async def test_tag_only_name_hit_engine_disabled_falls_back_deterministic(tag_only, monkeypatch):
+    # With the engine off, the legacy deterministic name wake keeps working.
+    monkeypatch.setattr(config, "enable_participation_engine", False, raising=False)
+    bot = _make_bot()
+    await bot._handle_channel_message(_evt(text="ChatGPT, what's the weather?"), bot.app.client)
+    bot.message_handler.assert_called_once()
+    msg = bot.message_handler.call_args[0][0]
+    assert msg.metadata.get("participation_check") is not True
 
 
 @pytest.mark.asyncio
@@ -164,9 +178,14 @@ async def test_snoozed_channel_skips_unprompted_but_not_addressed(monkeypatch):
     # unprompted while snoozed → silent, no dispatch
     await bot._handle_channel_message(_evt(text="anyone know the q3 numbers?"), bot.app.client)
     bot.message_handler.assert_not_called()
-    # name-addressed while snoozed → still answered (told to be quiet ≠ deaf)
+    # name-bearing while snoozed → still reaches the engine (told to be quiet ≠ deaf),
+    # carrying both signals so the model can require a genuine summons.
     await bot._handle_channel_message(_evt(ts="102.1", text="ChatGPT you there?"), bot.app.client)
     bot.message_handler.assert_called_once()
+    msg = bot.message_handler.call_args[0][0]
+    assert msg.metadata.get("participation_check") is True
+    assert msg.metadata.get("participation_name_hit") is True
+    assert msg.metadata.get("participation_snoozed") is True
 
 
 @pytest.mark.asyncio
@@ -236,10 +255,16 @@ async def test_thread_participation_handles_api_error(tag_only):
     assert await bot._thread_participation("C1", "50.0") == (False, 0)
 
 
-def test_default_config_is_safe():
-    # OUT OF THE BOX: the bot must not auto-listen, and the default channel mode is tag_only.
-    assert config.enable_channel_listening is False
-    assert config.channel_response_mode == "tag_only"
+def test_default_config_is_safe(monkeypatch):
+    # OUT OF THE BOX: the bot must not auto-listen, and the default channel mode is
+    # tag_only. Build a fresh config with the env keys absent — the module singleton
+    # may reflect a real .env (e.g. the dev box enables listening for live testing).
+    monkeypatch.delenv("ENABLE_CHANNEL_LISTENING", raising=False)
+    monkeypatch.delenv("CHANNEL_RESPONSE_MODE", raising=False)
+    from config import BotConfig
+    fresh = BotConfig()
+    assert fresh.enable_channel_listening is False
+    assert fresh.channel_response_mode == "tag_only"
 
 
 def test_bot_with_real_user_id_lands_in_roster():

@@ -206,29 +206,40 @@ class SlackMessageEventsMixin:
             if text_mentions_user(text, bot_user_id):
                 return
 
-        # Addressed = bot's name appears.
-        addressed = self._text_mentions_bot_name(text)
+        # A name-in-text hit is a SIGNAL, not a verdict: "chatgpt, help" (addressed),
+        # "chatgpt was wrong earlier" (discussed), and "I asked ChatGPT on my phone"
+        # (OpenAI's product) all match the regex — only the engine can tell them apart.
+        # True @mentions stay deterministic via the app_mention event (deduped above).
+        name_hit = self._text_mentions_bot_name(text)
 
-        # Thread replies: an untagged reply is for us if it's a 1:1 thread, or our name appears.
+        # Thread replies: an untagged reply in a 1:1 thread with the bot continues
+        # that conversation deterministically (cheap, and practically always right).
         ts = event.get("ts")
         thread_ts = event.get("thread_ts")
+        direct_continuation = False
         if thread_ts and thread_ts != ts:
             bot_present, human_count = await self._thread_participation(channel_id, thread_ts)
-            if bot_present and (human_count <= 1 or addressed):
-                addressed = True
+            if bot_present and human_count <= 1:
+                direct_continuation = True
 
-        # Decide (Phase F): addressed → respond directly, never via the engine;
-        # judicious/active → ParticipationEngine judges (in handle_message);
-        # mentions_only (or engine disabled) → ignore, zero model cost.
+        # Decide (Phase F, revised): 1:1 thread continuation → respond directly;
+        # judicious/active → engine judges every message; mentions_only → engine
+        # judges ONLY name-bearing messages (zero model cost otherwise); engine
+        # disabled → legacy deterministic name wake.
+        engine_on = getattr(config, "enable_participation_engine", True)
         participation_check = False
-        if addressed:
+        snoozed = is_snoozed(cs)
+        if direct_continuation:
             pass  # respond directly
-        elif level in ("judicious", "active") and getattr(config, "enable_participation_engine", True):
-            # Snooze prefilter: a backoff verdict silences UNPROMPTED engagement only —
-            # told to be quiet ≠ deaf, so the addressed path above never checks this.
-            if is_snoozed(cs):
+        elif engine_on and (level in ("judicious", "active") or name_hit):
+            # Snooze prefilter: silences UNPROMPTED engagement only. Name-bearing
+            # messages still reach the engine with a snoozed signal — told to be
+            # quiet ≠ deaf, but the engine decides if this is a genuine summons.
+            if snoozed and not name_hit:
                 return
             participation_check = True
+        elif not engine_on and name_hit:
+            pass  # legacy deterministic name wake (engine disabled)
         else:
             return
 
@@ -246,6 +257,10 @@ class SlackMessageEventsMixin:
         message.metadata["participation_level"] = level
         if participation_check:
             message.metadata["participation_check"] = True
+            if name_hit:
+                message.metadata["participation_name_hit"] = True
+            if snoozed:
+                message.metadata["participation_snoozed"] = True
         # Phase 7: carry per-channel ground rules + placement into the response pipeline.
         if cs:
             if cs.get("directives"):
@@ -255,7 +270,8 @@ class SlackMessageEventsMixin:
 
         self.log_debug(
             f"Channel message dispatch: channel={channel_id}, ts={ts}, level={level}, "
-            f"addressed={addressed}, participation_check={participation_check}"
+            f"name_hit={name_hit}, direct_continuation={direct_continuation}, "
+            f"participation_check={participation_check}"
         )
         if self.message_handler:
             await self.message_handler(message, self)

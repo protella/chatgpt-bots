@@ -104,6 +104,8 @@ class ChatBotV2:
                 directives=message.metadata.get("channel_directives"),
                 memory_facts=memory_facts, channel_activity=channel_activity,
                 unprompted_last_hour=unprompted,
+                name_hit=message.metadata.get("participation_name_hit") is True,
+                snoozed=message.metadata.get("participation_snoozed") is True,
             )
             if verdict is None:  # superseded by a newer message during debounce
                 main_logger.debug("Participation gate: superseded during debounce — silent")
