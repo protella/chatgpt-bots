@@ -114,6 +114,7 @@ class TestFooterPosting:
     async def test_dm_gets_feedback_strip_not_footer(self, monkeypatch):
         # Phase H: DMs post the native feedback strip instead of the Configure footer.
         monkeypatch.setattr(config, "enable_response_footer", True)
+        monkeypatch.setattr(config, "enable_feedback_buttons", True)  # pinned: dev .env disables it
         s = self._fake_self()
         msg = Message(text="hi", user_id="U1", channel_id="D1", thread_id="T1")
         await SlackMessagingMixin.maybe_post_response_footer(s, msg, Response(type="text", content="x"))
