@@ -143,72 +143,26 @@ class SlackFormattingMixin:
         text = self._encode_mentions(text)
         return self.markdown_converter.convert(text)
 
+    # Error copy authored by the message processor: optional emoji (unicode or
+    # :name:) followed by a **Bold Title** on the first line. Raw exception
+    # strings never look like this.
+    _AUTHORED_ERROR_RE = re.compile(r"^(?::[\w+-]+:|[^\w*`\n])*\*{1,2}[^\n*]+\*{1,2}")
+
+    # The only error text a raw/technical failure may show the user. The actual
+    # exception belongs in the logs (callers log it before reaching here).
+    GENERIC_ERROR_MESSAGE = (
+        "⚠️ **Something Went Wrong**\n\n"
+        "Please try again in a moment. If it keeps happening, let an admin know."
+    )
+
     def format_error_message(self, error: str) -> str:
-        """Format error messages for Slack with emojis and code blocks"""
-        import re
+        """Single gate for user-facing error text.
 
-        # Check for specific error types first
-        if "taking too long" in error.lower() or "timeout" in error.lower():
-            error_code = "TIMEOUT"
-            error_type = "timeout_error"
-            error_message = error
-        elif "rate limit" in error.lower():
-            error_code = "RATE_LIMIT"
-            error_type = "rate_limit_error"
-            error_message = error
-        else:
-            # Extract error code if present
-            error_code_match = re.search(r'Error code: (\d+)', error)
-            error_code = error_code_match.group(1) if error_code_match else "Unknown"
-
-        # Try to extract the actual error message (if not already set)
-        if "error_message" not in locals():
-            if "{'error':" in error:
-                # Parse OpenAI API error format
-                try:
-                    import json
-                    error_dict_str = error[error.find("{'error':"):].replace("'", '"')
-                    error_dict = json.loads(error_dict_str)
-                    error_message = error_dict.get('error', {}).get('message', error)
-                    if "error_type" not in locals():
-                        error_type = error_dict.get('error', {}).get('type', 'unknown_error')
-                except Exception:
-                    # Fallback to simpler extraction
-                    if "'message':" in error:
-                        msg_start = error.find("'message': '") + len("'message': '")
-                        msg_end = error.find("',", msg_start)
-                        if msg_end > msg_start:
-                            error_message = error[msg_start:msg_end]
-                        else:
-                            error_message = error
-                    else:
-                        error_message = error
-                    if "error_type" not in locals():
-                        error_type = "api_error"
-            else:
-                error_message = error
-                if "error_type" not in locals():
-                    error_type = "general_error"
-        
-        # Format the error message for Slack
-        formatted = ":warning: *Oops! Something went wrong*\n\n"
-        formatted += f"*Error Code:* `{error_code}`\n"
-        formatted += f"*Type:* `{error_type}`\n\n"
-        formatted += f"*Details:*\n```{error_message}```\n\n"
-        formatted += ":bulb: *What you can do:*\n"
-        
-        # Add helpful suggestions based on error type
-        if "rate_limit" in error_type.lower():
-            formatted += "• Wait a moment and try again\n"
-            formatted += "• The API rate limit has been reached"
-        elif "invalid_request" in error_type.lower():
-            formatted += "• Try rephrasing your request\n"
-            formatted += "• The request format may be invalid"
-        elif "context_length" in error_message.lower():
-            formatted += "• Start a new thread\n"
-            formatted += "• The conversation has become too long"
-        else:
-            formatted += "• Try again in a moment\n"
-            formatted += "• If the problem persists, contact support"
-        
-        return formatted
+        Error copy authored upstream (emoji + **Bold Title** + one actionable
+        sentence) passes through untouched. Anything else is technical detail —
+        the user gets one fixed, friendly line instead of a code dump; the raw
+        text lives only in the logs.
+        """
+        if error and self._AUTHORED_ERROR_RE.match(error):
+            return error
+        return self.GENERIC_ERROR_MESSAGE

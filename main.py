@@ -345,17 +345,25 @@ class ChatBotV2:
         
         except Exception as e:
             main_logger.error(f"Error handling message: {e}", exc_info=True)
-            
-            # Delete thinking indicator on error
-            if thinking_id:
-                await client.delete_message(message.channel_id, thinking_id)
 
-            # Send error message
-            await client.handle_error(
-                message.channel_id,
-                message.thread_id,
-                str(e)
-            )
+            # Delete thinking indicator on error — best-effort; a failed delete
+            # must never swallow the user-facing notice below.
+            if thinking_id:
+                try:
+                    await client.delete_message(message.channel_id, thinking_id)
+                except Exception as delete_error:
+                    main_logger.error(f"Failed to delete thinking indicator: {delete_error}")
+
+            # Fixed, friendly notice — the raw exception stays in the logs only.
+            try:
+                await client.handle_error(
+                    message.channel_id,
+                    message.thread_id,
+                    "⚠️ **Something Went Wrong**\n\n"
+                    "I hit a snag finishing that response. Please try again in a moment."
+                )
+            except Exception as notify_error:
+                main_logger.error(f"Failed to send error notice: {notify_error}")
     
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals - double Ctrl-C for force exit"""
