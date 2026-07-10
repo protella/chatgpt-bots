@@ -177,6 +177,12 @@ class BotConfig:
     utility_reasoning_effort: str = field(default_factory=lambda: os.getenv("UTILITY_REASONING_EFFORT", "none"))
     utility_verbosity: str = field(default_factory=lambda: os.getenv("UTILITY_VERBOSITY", "low"))
     utility_max_tokens: int = field(default_factory=lambda: int(os.getenv("UTILITY_MAX_TOKENS", "20")))
+    # Participation judgment gets its own effort: referent resolution ("is 'you' me
+    # or the other agent?") reliably fails at `none`, and this call sits behind the
+    # debounce window — not on the response critical path — so `low` costs nothing
+    # the user can feel. Verified live 2026-07-10: none = 0/3, low = 3/3 on the
+    # mid-exchange follow-up case.
+    participation_reasoning_effort: str = field(default_factory=lambda: os.getenv("PARTICIPATION_REASONING_EFFORT", "low"))
 
     # Analysis function parameters (for vision analysis, complex tasks)
     analysis_reasoning_effort: str = field(default_factory=lambda: os.getenv("ANALYSIS_REASONING_EFFORT", "medium"))

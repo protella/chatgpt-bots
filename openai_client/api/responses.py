@@ -1009,7 +1009,9 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
     }
     # Utility model is a GPT-5-series reasoning model (gpt-5-mini)
     request_params["temperature"] = 1.0
-    request_params["reasoning"] = {"effort": clamp_effort(config.utility_model, config.utility_reasoning_effort)}
+    # Participation uses its own (higher) effort: resolving who "you" refers to in a
+    # multi-party thread needs actual reasoning — `none` misattributes it to self.
+    request_params["reasoning"] = {"effort": clamp_effort(config.utility_model, config.participation_reasoning_effort)}
     request_params["text"] = {"verbosity": config.utility_verbosity}
 
     try:
