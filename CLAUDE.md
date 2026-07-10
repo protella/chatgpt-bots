@@ -79,8 +79,8 @@ make clean   # Remove test artifacts and cache
 - Full message history passed in `input` parameter, not using `previous_response_id` chaining
 - System prompts included in messages as "developer" role
 - Model-specific parameter handling:
-  - `gpt-5.5` (only user-facing model): hybrid — supports `temperature`/`top_p` when `reasoning_effort=none`, otherwise forces `temperature=1.0`; uses `reasoning_effort`/`verbosity`; `prompt_cache_retention: 24h`
-  - `gpt-5-mini` (utility model only): reasoning shape — fixed `temperature=1.0`, no `top_p`, uses `reasoning_effort` and `verbosity`
+  - `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` (default: sol; luna doubles as utility model): hybrid — `temperature`/`top_p` allowed when `reasoning_effort=none`, otherwise `temperature=1.0`; effort ladder `none/low/medium/high/xhigh/max` (`minimal` 400s — `clamp_effort()` in config.py guards every call site); implicit prompt caching (send `prompt_cache_key` only, never `prompt_cache_retention`)
+  - `gpt-5.5` (still selectable): same hybrid shape but effort tops out at `xhigh` (no `max`); keeps explicit `prompt_cache_retention: 24h`
 
 ### Threading & State Management
 - `ThreadStateManager` maintains conversation state per thread in memory
@@ -117,16 +117,16 @@ make clean   # Remove test artifacts and cache
 ## Critical Implementation Notes
 
 ### Model-Specific Parameters
-Supported models: **gpt-5.5** (conversations) and **gpt-5-mini** (utility functions only). All GPT-4-series, gpt-5, gpt-5-nano, gpt-5-chat-*, and gpt-5.1–5.4 support has been removed.
+Supported models: **gpt-5.6-sol** (default), **gpt-5.6-terra**, **gpt-5.6-luna**, and **gpt-5.5** — all user-selectable. `gpt-5.6-luna` is also the utility model (`UTILITY_MODEL`); dedicated gpt-5-mini support has been removed, along with all GPT-4-series, gpt-5, gpt-5-nano, gpt-5-chat-*, and gpt-5.1–5.4 support.
 
-**gpt-5.5** (hybrid):
-- Supports temperature/top_p only when reasoning_effort=none; otherwise temperature forced to 1.0
-- Uses reasoning_effort and verbosity parameters
+**GPT-5.6 family** (hybrid; 1.05M context, Feb 2026 cutoff):
+- temperature/top_p only when reasoning_effort=none; otherwise temperature forced to 1.0
+- Effort ladder: none/low/medium/high/xhigh/max (`max` verified working on all three tiers; `minimal` is a 400 — always route stored efforts through `clamp_effort(model, effort)`)
+- Implicit prompt caching: no `prompt_cache_retention` (deprecated on 5.6); `prompt_cache_key` still sent for shard routing
 
-**gpt-5-mini** (reasoning shape, utility model only):
-- Temperature MUST be 1.0
-- No top_p support
-- Uses reasoning_effort and verbosity parameters
+**gpt-5.5** (hybrid, legacy-selectable):
+- Same temperature/top_p-at-none shape; effort tops out at xhigh (no max)
+- Keeps explicit `prompt_cache_retention: 24h`
 
 ### Image Processing Flow
 1. Intent classification determines image vs text response

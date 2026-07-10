@@ -26,17 +26,51 @@ def _env_list(var_name: str, default: list, sep: str = ",") -> list:
 
 
 # Model knowledge cutoff dates
-# Supported models: gpt-5.5 (primary), gpt-5-mini (utility functions only)
+# Supported models: gpt-5.6-sol (default), gpt-5.6-terra, gpt-5.6-luna, gpt-5.5
+# (gpt-5.6-luna doubles as the utility model)
 MODEL_KNOWLEDGE_CUTOFFS = {
+    # GPT-5.6 family (Feb 2026 cutoff, 1.05M context window, released July 9, 2026)
+    "gpt-5.6-sol": "February 16, 2026",
+    "gpt-5.6-terra": "February 16, 2026",
+    "gpt-5.6-luna": "February 16, 2026",
+
     # GPT-5.5 (August 2025 cutoff, 1.05M context window, released April 23, 2026)
     "gpt-5.5": "August 31, 2025",
-
-    # GPT-5 Mini (utility model only — not user-selectable)
-    "gpt-5-mini": "September 30, 2024",
 
     # Default fallback
     "default": "January 1, 2024"
 }
+
+# The full user-selectable model set (order = modal display order)
+SUPPORTED_CHAT_MODELS = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
+
+# Reasoning-effort ladders per model family (verified live 2026-07-09:
+# `max` returns 200 on ALL three 5.6 tiers; `minimal` 400s on all of them)
+GPT56_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"]
+GPT55_EFFORTS = ["none", "low", "medium", "high", "xhigh"]
+
+
+def clamp_effort(model: str, effort: Optional[str]) -> str:
+    """Coerce a stored/legacy reasoning effort into one the model accepts.
+
+    Guarantees bad stored settings can never reach the API:
+    - 5.6 family: `minimal` is unsupported (400) -> `none`; full ladder incl. `max`.
+    - gpt-5.5 / gpt-5-mini and anything else: `max` doesn't exist -> `xhigh`;
+      `minimal` stays valid on gpt-5-mini and maps to `low` on gpt-5.5 (its modal
+      never offered minimal).
+    Unknown values fall back to `medium`.
+    """
+    effort = (effort or "medium").lower()
+    if model.startswith("gpt-5.6"):
+        if effort == "minimal":
+            return "none"
+        return effort if effort in GPT56_EFFORTS else "medium"
+    if effort == "max":
+        return "xhigh"
+    if effort == "minimal" and model.startswith("gpt-5.5"):
+        return "low"
+    valid = GPT55_EFFORTS + ["minimal"]
+    return effort if effort in valid else "medium"
 
 
 @dataclass
@@ -51,8 +85,8 @@ class BotConfig:
     openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_KEY", ""))
     
     # Model configuration
-    gpt_model: str = field(default_factory=lambda: os.getenv("GPT_MODEL", "gpt-5.5"))
-    utility_model: str = field(default_factory=lambda: os.getenv("UTILITY_MODEL", "gpt-5-mini"))
+    gpt_model: str = field(default_factory=lambda: os.getenv("GPT_MODEL", "gpt-5.6-sol"))
+    utility_model: str = field(default_factory=lambda: os.getenv("UTILITY_MODEL", "gpt-5.6-luna"))
     image_model: str = field(default_factory=lambda: os.getenv("GPT_IMAGE_MODEL", "gpt-image-2"))
     
     # Default parameters for text generation
@@ -65,7 +99,8 @@ class BotConfig:
     default_verbosity: str = field(default_factory=lambda: os.getenv("DEFAULT_VERBOSITY", "medium"))
     
     # Utility function parameters (for quick checks, image intent, etc.)
-    utility_reasoning_effort: str = field(default_factory=lambda: os.getenv("UTILITY_REASONING_EFFORT", "minimal"))
+    # `none` = zero reasoning tokens — right default for classifiers (5.6 dropped `minimal`)
+    utility_reasoning_effort: str = field(default_factory=lambda: os.getenv("UTILITY_REASONING_EFFORT", "none"))
     utility_verbosity: str = field(default_factory=lambda: os.getenv("UTILITY_VERBOSITY", "low"))
     utility_max_tokens: int = field(default_factory=lambda: int(os.getenv("UTILITY_MAX_TOKENS", "20")))
 
@@ -231,6 +266,8 @@ class BotConfig:
     # "ChatGPT, can you…" wakes it. Keep in sync with the bot's display name(s).
     # Env: BOT_NAME_ALIASES (comma-separated) — SET THIS per environment (e.g. "ChatGPT-Dev" in dev).
     bot_name_aliases: list = field(default_factory=lambda: _env_list("BOT_NAME_ALIASES", ["ChatGPT"]))
+    # 👍/👎 feedback buttons under DM/assistant responses (Phase H; channels use reactions)
+    enable_feedback_buttons: bool = field(default_factory=lambda: os.getenv("ENABLE_FEEDBACK_BUTTONS", "true").lower() == "true")
     # --- ChannelPulse ambient awareness (redesign Phase E) ---
     # Per-channel in-memory ring of recent messages (fed by every channel event, even ignored
     # ones). Powers the wake-classifier context signal and the response envelope. Inert while
@@ -346,18 +383,18 @@ class BotConfig:
         """Get the effective input token limit for a specific model
 
         This returns the maximum number of input tokens we should send.
-        For GPT-5.5: 1.05M total - 130k reserved = ~920k usable
-        For GPT-5 Mini (utility): 400k total - 130k reserved = ~270k usable
+        For GPT-5.6 family / GPT-5.5: 1.05M total - 130k reserved = ~920k usable
+        Anything else (unknown/legacy): the conservative 400k window.
 
         Args:
-            model: Model name (e.g., 'gpt-5.5', 'gpt-5-mini')
+            model: Model name (e.g., 'gpt-5.6-sol', 'gpt-5.5')
 
         Returns:
             Buffered token limit for safe operation
         """
-        if model.startswith('gpt-5.5'):
+        if model.startswith('gpt-5.6') or model.startswith('gpt-5.5'):
             return int(self.gpt54_max_tokens * self.gpt54_token_buffer_percentage)
-        # gpt-5-mini (utility) and any unknown model: use the conservative 400k window
+        # Unknown/legacy models: use the conservative 400k window
         return int(self.gpt5_max_tokens * self.token_buffer_percentage)
     
     def validate(self) -> bool:
