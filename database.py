@@ -198,8 +198,8 @@ class DatabaseManager(LoggerMixin):
                 slack_email TEXT,
 
                 -- Model settings
-                model TEXT DEFAULT 'gpt-5.5',
-                reasoning_effort TEXT DEFAULT 'low',
+                model TEXT DEFAULT 'gpt-5.6-sol',
+                reasoning_effort TEXT DEFAULT 'medium',
                 verbosity TEXT DEFAULT 'low',
                 temperature REAL DEFAULT 0.8,
                 top_p REAL DEFAULT 1.0,
@@ -306,6 +306,29 @@ class DatabaseManager(LoggerMixin):
             "CREATE INDEX IF NOT EXISTS idx_channel_memory_lookup ON channel_memory (scope, channel_id)"
         )
 
+        # Response feedback (Phase H): thumbs signal from native feedback buttons and
+        # from +1/-1 reactions on the bot's own messages. One row per
+        # (message, user, source); a changed thumb updates the row in place.
+        # The participation engine may read per-channel ratios later.
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS response_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL,
+                thread_ts TEXT,
+                message_ts TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                signal INTEGER NOT NULL CHECK (signal IN (-1, 1)),
+                source TEXT NOT NULL CHECK (source IN ('button', 'reaction')),
+                created_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (message_ts, user_id, source)
+            )
+        """)
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_response_feedback_channel "
+            "ON response_feedback (channel_id, created_ts)"
+        )
+
         self.conn.commit()
 
         # Run migrations for existing databases
@@ -391,8 +414,8 @@ class DatabaseManager(LoggerMixin):
                         slack_email TEXT,
                         
                         -- Model settings
-                        model TEXT DEFAULT 'gpt-5.5',
-                        reasoning_effort TEXT DEFAULT 'low',
+                        model TEXT DEFAULT 'gpt-5.6-sol',
+                        reasoning_effort TEXT DEFAULT 'medium',
                         verbosity TEXT DEFAULT 'low',
                         temperature REAL DEFAULT 0.8,
                         top_p REAL DEFAULT 1.0,
@@ -509,32 +532,7 @@ class DatabaseManager(LoggerMixin):
                     f"DB: One-time migration — swapped {swapped} user(s) to gpt-5.5"
                 )
 
-            # Model lineup cleanup: gpt-5.5 is the ONLY supported chat model now.
-            # Normalize any stale selection — user preferences AND per-thread overrides —
-            # on every startup. Idempotent and cheap; no sentinel needed because nothing
-            # can legitimately set a different model anymore (the picker offers only 5.5),
-            # and this guarantees the API layer never receives a dropped model name.
-            cursor = self.conn.execute("""
-                UPDATE user_preferences
-                SET model = 'gpt-5.5'
-                WHERE model IS NOT NULL AND model != 'gpt-5.5'
-            """)
-            if cursor.rowcount:
-                self.log_info(
-                    f"DB: Normalized {cursor.rowcount} user(s) from dropped models to gpt-5.5"
-                )
-            cursor = self.conn.execute("""
-                UPDATE threads
-                SET config_json = json_set(config_json, '$.model', 'gpt-5.5')
-                WHERE config_json IS NOT NULL
-                  AND json_extract(config_json, '$.model') IS NOT NULL
-                  AND json_extract(config_json, '$.model') != 'gpt-5.5'
-            """)
-            if cursor.rowcount:
-                self.log_info(
-                    f"DB: Normalized {cursor.rowcount} thread override(s) to gpt-5.5"
-                )
-            self.conn.commit()
+            self._migrate_gpt56()
 
             # One-time backfill: mark long-standing users as settings_completed.
             # Earlier versions of the bot only flipped settings_completed=True when
@@ -656,7 +654,104 @@ class DatabaseManager(LoggerMixin):
                 self.log_info("DB: Successfully created mcp_tools table")
         except Exception as e:
             self.log_error(f"DB: Migration error: {e}", exc_info=True)
-    
+
+    def _migrate_gpt56(self):
+        """GPT-5.6 model-lineup migration (2026-07-09).
+
+        Two parts, both safe to run on every startup:
+        1. ONE-TIME (sentinel `gpt56_migrated` column, same pattern as the
+           gpt55/gpt-image-2 swaps): move EVERYONE's default model to
+           gpt-5.6-sol with medium reasoning. Users can re-customize globally
+           and per channel/thread afterward — this only resets the default.
+        2. EVERY-STARTUP normalizer: only gpt-5.6-sol/terra/luna and gpt-5.5
+           are selectable; any other stored model (user prefs or per-thread
+           overrides) coerces to gpt-5.6-sol, and stored reasoning efforts a
+           model rejects are clamped (`minimal` is a 400 on 5.6 -> none;
+           `max` doesn't exist on 5.5 -> xhigh). Guarantees the API layer
+           never receives a dropped model name or an unsupported effort.
+        """
+        cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if 'gpt56_migrated' not in columns:
+            self.conn.execute("""
+                ALTER TABLE user_preferences
+                ADD COLUMN gpt56_migrated INTEGER DEFAULT 0
+            """)
+            cursor = self.conn.execute("""
+                UPDATE user_preferences
+                SET model = 'gpt-5.6-sol', reasoning_effort = 'medium', gpt56_migrated = 1
+                WHERE gpt56_migrated = 0
+            """)
+            swapped = cursor.rowcount
+            self.conn.commit()
+            self.log_info(
+                f"DB: One-time GPT-5.6 migration — swapped {swapped} user(s) to "
+                f"gpt-5.6-sol with medium reasoning"
+            )
+
+        supported = "('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5')"
+        cursor = self.conn.execute(f"""
+            UPDATE user_preferences
+            SET model = 'gpt-5.6-sol'
+            WHERE model IS NOT NULL AND model NOT IN {supported}
+        """)
+        if cursor.rowcount:
+            self.log_info(
+                f"DB: Normalized {cursor.rowcount} user(s) from dropped models to gpt-5.6-sol"
+            )
+        cursor = self.conn.execute("""
+            UPDATE user_preferences
+            SET reasoning_effort = 'none'
+            WHERE model LIKE 'gpt-5.6%' AND reasoning_effort = 'minimal'
+        """)
+        if cursor.rowcount:
+            self.log_info(
+                f"DB: Clamped reasoning minimal->none for {cursor.rowcount} user(s) on 5.6 models"
+            )
+        cursor = self.conn.execute("""
+            UPDATE user_preferences
+            SET reasoning_effort = 'xhigh'
+            WHERE model = 'gpt-5.5' AND reasoning_effort = 'max'
+        """)
+        if cursor.rowcount:
+            self.log_info(
+                f"DB: Clamped reasoning max->xhigh for {cursor.rowcount} user(s) on gpt-5.5"
+            )
+        cursor = self.conn.execute(f"""
+            UPDATE threads
+            SET config_json = json_set(config_json, '$.model', 'gpt-5.6-sol')
+            WHERE config_json IS NOT NULL
+              AND json_extract(config_json, '$.model') IS NOT NULL
+              AND json_extract(config_json, '$.model') NOT IN {supported}
+        """)
+        if cursor.rowcount:
+            self.log_info(
+                f"DB: Normalized {cursor.rowcount} thread override(s) to gpt-5.6-sol"
+            )
+        cursor = self.conn.execute("""
+            UPDATE threads
+            SET config_json = json_set(config_json, '$.reasoning_effort', 'none')
+            WHERE config_json IS NOT NULL
+              AND json_extract(config_json, '$.model') LIKE 'gpt-5.6%'
+              AND json_extract(config_json, '$.reasoning_effort') = 'minimal'
+        """)
+        if cursor.rowcount:
+            self.log_info(
+                f"DB: Clamped {cursor.rowcount} thread override(s) minimal->none on 5.6 models"
+            )
+        cursor = self.conn.execute("""
+            UPDATE threads
+            SET config_json = json_set(config_json, '$.reasoning_effort', 'xhigh')
+            WHERE config_json IS NOT NULL
+              AND json_extract(config_json, '$.model') = 'gpt-5.5'
+              AND json_extract(config_json, '$.reasoning_effort') = 'max'
+        """)
+        if cursor.rowcount:
+            self.log_info(
+                f"DB: Clamped {cursor.rowcount} thread override(s) max->xhigh on gpt-5.5"
+            )
+        self.conn.commit()
+
     # Thread operations
     def get_or_create_thread(self, thread_id: str, channel_id: str, user_id: Optional[str] = None) -> Dict:
         """
@@ -835,6 +930,50 @@ class DatabaseManager(LoggerMixin):
         """Delete a memory row (manual forget / cap eviction)."""
         self.conn.execute("DELETE FROM channel_memory WHERE id = ?", (memory_id,))
         self.conn.commit()
+
+    # --- Response feedback (Phase H) ---
+    def record_response_feedback(self, channel_id: str, thread_ts: Optional[str],
+                                 message_ts: str, user_id: str, signal: int,
+                                 source: str) -> None:
+        """Upsert one feedback signal. A user changing their thumb (same message,
+        same source) updates the existing row rather than adding a second vote."""
+        self.conn.execute("""
+            INSERT INTO response_feedback (channel_id, thread_ts, message_ts, user_id, signal, source)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(message_ts, user_id, source) DO UPDATE SET
+                signal=excluded.signal,
+                updated_ts=CURRENT_TIMESTAMP
+        """, (channel_id, thread_ts, message_ts, user_id, signal, source))
+        self.conn.commit()
+        logger.debug(f"Recorded response feedback {signal:+d} ({source}) on {channel_id}:{message_ts}")
+
+    def delete_response_feedback(self, message_ts: str, user_id: str, source: str) -> None:
+        """Remove a feedback row (future reaction_removed handling)."""
+        self.conn.execute(
+            "DELETE FROM response_feedback WHERE message_ts = ? AND user_id = ? AND source = ?",
+            (message_ts, user_id, source)
+        )
+        self.conn.commit()
+
+    def get_channel_feedback_ratio(self, channel_id: str, days: int = 30):
+        """(positive, negative, ratio) for a channel's recent feedback.
+
+        ratio is positive/(positive+negative), or None when there's no feedback —
+        callers must treat None as "no signal", not as zero. Read-only plumbing for
+        the participation engine; not wired into decisions yet."""
+        cursor = self.conn.execute(
+            "SELECT "
+            "  SUM(CASE WHEN signal > 0 THEN 1 ELSE 0 END) AS positive, "
+            "  SUM(CASE WHEN signal < 0 THEN 1 ELSE 0 END) AS negative "
+            "FROM response_feedback "
+            "WHERE channel_id = ? AND created_ts >= datetime('now', ?)",
+            (channel_id, f"-{int(days)} days")
+        )
+        row = cursor.fetchone()
+        positive = row["positive"] or 0
+        negative = row["negative"] or 0
+        total = positive + negative
+        return positive, negative, (positive / total if total else None)
 
     def update_thread_activity(self, thread_id: str):
         """
@@ -2077,6 +2216,51 @@ class DatabaseManager(LoggerMixin):
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("DELETE FROM channel_memory WHERE id = ?", (memory_id,))
             await db.commit()
+
+    # --- Response feedback (Phase H) ---
+    async def record_response_feedback_async(self, channel_id: str, thread_ts: Optional[str],
+                                             message_ts: str, user_id: str, signal: int,
+                                             source: str) -> None:
+        """Async version of record_response_feedback (upsert per message/user/source)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("""
+                INSERT INTO response_feedback (channel_id, thread_ts, message_ts, user_id, signal, source)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(message_ts, user_id, source) DO UPDATE SET
+                    signal=excluded.signal,
+                    updated_ts=CURRENT_TIMESTAMP
+            """, (channel_id, thread_ts, message_ts, user_id, signal, source))
+            await db.commit()
+
+    async def delete_response_feedback_async(self, message_ts: str, user_id: str, source: str) -> None:
+        """Async version of delete_response_feedback."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute(
+                "DELETE FROM response_feedback WHERE message_ts = ? AND user_id = ? AND source = ?",
+                (message_ts, user_id, source)
+            )
+            await db.commit()
+
+    async def get_channel_feedback_ratio_async(self, channel_id: str, days: int = 30):
+        """Async version of get_channel_feedback_ratio."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(
+                "SELECT "
+                "  SUM(CASE WHEN signal > 0 THEN 1 ELSE 0 END) AS positive, "
+                "  SUM(CASE WHEN signal < 0 THEN 1 ELSE 0 END) AS negative "
+                "FROM response_feedback "
+                "WHERE channel_id = ? AND created_ts >= datetime('now', ?)",
+                (channel_id, f"-{int(days)} days")
+            ) as cursor:
+                row = await cursor.fetchone()
+        positive = row["positive"] or 0
+        negative = row["negative"] or 0
+        total = positive + negative
+        return positive, negative, (positive / total if total else None)
 
     async def get_or_create_user_async(self, user_id: str, username: Optional[str] = None) -> Dict:
         """

@@ -49,11 +49,12 @@ class SettingsModal(LoggerMixin):
                 current_settings = await self.db.create_default_user_preferences_async(user_id, email)
         
         # Determine which model is selected. Coerce any stale/dropped model value
-        # (e.g. an old thread override) to gpt-5.5 so the picker's initial_option
+        # (e.g. an old thread override) to gpt-5.6-sol so the picker's initial_option
         # is always a valid option.
+        from config import SUPPORTED_CHAT_MODELS
         selected_model = current_settings.get('model', config.gpt_model)
-        if selected_model != 'gpt-5.5':
-            selected_model = 'gpt-5.5'
+        if selected_model not in SUPPORTED_CHAT_MODELS:
+            selected_model = 'gpt-5.6-sol'
         
         # Determine default scope if not provided
         if scope is None:
@@ -346,6 +347,9 @@ class SettingsModal(LoggerMixin):
                     "value": selected_model
                 },
                 "options": [
+                    {"text": {"type": "plain_text", "text": "GPT-5.6 Sol (Flagship)"}, "value": "gpt-5.6-sol"},
+                    {"text": {"type": "plain_text", "text": "GPT-5.6 Terra (Balanced)"}, "value": "gpt-5.6-terra"},
+                    {"text": {"type": "plain_text", "text": "GPT-5.6 Luna (Fast)"}, "value": "gpt-5.6-luna"},
                     {"text": {"type": "plain_text", "text": "GPT-5.5"}, "value": "gpt-5.5"}
                 ]
             }
@@ -353,16 +357,19 @@ class SettingsModal(LoggerMixin):
 
         blocks.append({"type": "divider"})
 
-        # Model-specific settings — gpt-5.5 is the only selectable model
-        blocks.extend(self._add_gpt55_settings(settings))
+        # Model-specific settings (reasoning ladder differs: 5.6 family adds `max`)
+        blocks.extend(self._add_gpt55_settings(settings, selected_model))
         
         # Add common settings (features and image settings)
         blocks.extend(self._add_common_settings(settings))
         
         return blocks
     
-    def _add_gpt55_settings(self, settings: Dict) -> List[Dict]:
-        """Add GPT-5.4 specific settings blocks (xhigh reasoning, temp/top_p when reasoning=none)"""
+    def _add_gpt55_settings(self, settings: Dict, selected_model: str = 'gpt-5.6-sol') -> List[Dict]:
+        """Add model-specific settings blocks (reasoning ladder, temp/top_p when reasoning=none).
+
+        The 5.6 family offers the full ladder incl. `max` (verified live on all three
+        tiers); gpt-5.5 tops out at `xhigh`."""
         blocks = []
 
         # Check if web search is enabled
@@ -372,28 +379,28 @@ class SettingsModal(LoggerMixin):
             web_search_enabled = True
         self.log_debug(f"Settings passed to _add_gpt55_settings: enable_web_search={settings.get('enable_web_search')}, evaluated as {web_search_enabled}")
 
-        # Reasoning Level - GPT-5.4 supports none/low/medium/high/xhigh
-        from config import config
-        current_reasoning = settings.get('reasoning_effort', 'none')  # Default to 'none' for GPT-5.4
-        self.log_debug(f"Building reasoning options for GPT-5.4, current: {current_reasoning}")
+        from config import config, clamp_effort, GPT56_EFFORTS, GPT55_EFFORTS
+        current_reasoning = settings.get('reasoning_effort', 'none')
+        self.log_debug(f"Building reasoning options for {selected_model}, current: {current_reasoning}")
 
-        # Build options list
+        # Build options list per model family
+        effort_values = GPT56_EFFORTS if selected_model.startswith('gpt-5.6') else GPT55_EFFORTS
         reasoning_options = [
-            {"text": {"type": "plain_text", "text": self._get_reasoning_display('none')}, "value": "none"},
-            {"text": {"type": "plain_text", "text": self._get_reasoning_display('low')}, "value": "low"},
-            {"text": {"type": "plain_text", "text": self._get_reasoning_display('medium')}, "value": "medium"},
-            {"text": {"type": "plain_text", "text": self._get_reasoning_display('high')}, "value": "high"},
-            {"text": {"type": "plain_text", "text": self._get_reasoning_display('xhigh')}, "value": "xhigh"}
+            {"text": {"type": "plain_text", "text": self._get_reasoning_display(v)}, "value": v}
+            for v in effort_values
         ]
 
         available_values = [opt['value'] for opt in reasoning_options]
-        self.log_debug(f"Reasoning options available for GPT-5.4: {available_values}, initial: {current_reasoning}")
+        self.log_debug(f"Reasoning options available for {selected_model}: {available_values}, initial: {current_reasoning}")
 
-        # Final validation - ensure current_reasoning is in available options
+        # Clamp stale stored values per model rules (e.g. legacy `minimal`, or `max`
+        # carried over after switching 5.6 -> 5.5) instead of blindly resetting
         if current_reasoning not in available_values:
             old_reasoning = current_reasoning
-            current_reasoning = 'none'
-            self.log_warning(f"Current reasoning '{old_reasoning}' not in available options, using 'none'")
+            current_reasoning = clamp_effort(selected_model, current_reasoning)
+            if current_reasoning not in available_values:
+                current_reasoning = 'none'
+            self.log_warning(f"Current reasoning '{old_reasoning}' not in available options, clamped to '{current_reasoning}'")
 
         # Build the reasoning block
         reasoning_block = {
@@ -825,8 +832,8 @@ class SettingsModal(LoggerMixin):
                 selected_values = [opt['value'] for opt in selected_options]
                 web_search_enabled = 'web_search' in selected_values
 
-            # Use a safe default based on web search state (gpt-5.5 only)
-            model = extracted.get('model', 'gpt-5.5')
+            # Use a safe default based on web search state
+            model = extracted.get('model', config.gpt_model)
             default_reasoning = 'low' if web_search_enabled else 'none'
             extracted['reasoning_effort'] = default_reasoning
             self.log_debug(f"No reasoning selection found - using default: {default_reasoning} for model {model} (web_search: {web_search_enabled})")
@@ -918,15 +925,25 @@ class SettingsModal(LoggerMixin):
         """Validate and adjust settings for compatibility"""
         validated = settings.copy()
 
+        model = validated.get('model', config.gpt_model)
+
+        # Clamp legacy/incompatible efforts per model (5.6 rejects `minimal`; 5.5 has no `max`)
+        from config import clamp_effort
+        if validated.get('reasoning_effort'):
+            clamped = clamp_effort(model, validated['reasoning_effort'])
+            if clamped != validated['reasoning_effort']:
+                self.log_info(f"Clamped reasoning_effort {validated['reasoning_effort']} -> {clamped} for {model}")
+                validated['reasoning_effort'] = clamped
+
         # If web search enabled but reasoning too low (minimal), auto-upgrade
         if validated.get('enable_web_search') and validated.get('reasoning_effort') == 'minimal':
             validated['reasoning_effort'] = 'low'
             self.log_info("Auto-upgraded reasoning_effort from minimal to low for web search compatibility")
-        
+
         # Check if both temperature and top_p are changed for models that support them
-        # (gpt-5.5 supports temp/top_p only with reasoning=none)
-        model = validated.get('model', 'gpt-5.5')
-        supports_temp = model.startswith('gpt-5.5') and validated.get('reasoning_effort') == 'none'
+        # (gpt-5.5 and the 5.6 family support temp/top_p only with reasoning=none)
+        supports_temp = ((model.startswith('gpt-5.5') or model.startswith('gpt-5.6'))
+                         and validated.get('reasoning_effort') == 'none')
 
         if supports_temp:
             default_temp = config.default_temperature
@@ -950,8 +967,10 @@ class SettingsModal(LoggerMixin):
     def _get_model_display_name(self, model: str) -> str:
         """Get user-friendly model name"""
         display_names = {
+            'gpt-5.6-sol': 'GPT-5.6 Sol (Flagship)',
+            'gpt-5.6-terra': 'GPT-5.6 Terra (Balanced)',
+            'gpt-5.6-luna': 'GPT-5.6 Luna (Fast)',
             'gpt-5.5': 'GPT-5.5',
-            'gpt-5-mini': 'GPT-5 Mini',  # utility model (not user-selectable)
         }
         return display_names.get(model, model)
     
@@ -963,7 +982,8 @@ class SettingsModal(LoggerMixin):
             'low': '🚀 Low (Fast)',
             'medium': '⚖️ Medium (Balanced)',
             'high': '🧠 High (Thorough)',
-            'xhigh': '💎 Extra High (Maximum Quality)'
+            'xhigh': '💎 Extra High (Maximum Quality)',
+            'max': '🚀💎 Max (Deepest Reasoning, Slowest)'
         }
         return displays.get(level, '⚖️ Medium (Balanced)')
     

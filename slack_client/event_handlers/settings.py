@@ -720,11 +720,24 @@ class SlackSettingsHandlersMixin:
                         # Web search is on and wasn't minimal - keep the stored value
                         merged_settings['reasoning_effort'] = reasoning_from_stored
                 else:
-                    # No stored value either - use a safe default (gpt-5.5 only)
-                    model = merged_settings.get('model', 'gpt-5.5')
+                    # No stored value either - use a safe default
+                    model = merged_settings.get('model', config.gpt_model)
                     merged_settings['reasoning_effort'] = 'low' if web_search_enabled else 'none'
                     self.log_debug(f"No reasoning in form or stored, defaulting to {merged_settings['reasoning_effort']} for model {model}")
-            
+
+            # Final guard: the 5.6 family never accepts `minimal` (and 5.5 has no
+            # `max`) — clamp whatever the merge/restore produced so a stale stored
+            # value can never be re-stored or reach the API. With web search on,
+            # `minimal` upgrades to `low` (handled above) before this maps it to `none`.
+            from config import clamp_effort
+            _model = merged_settings.get('model', config.gpt_model)
+            _effort = merged_settings.get('reasoning_effort')
+            if _effort:
+                _clamped = clamp_effort(_model, _effort)
+                if _clamped != _effort:
+                    merged_settings['reasoning_effort'] = _clamped
+                    self.log_debug(f"Clamped reasoning {_effort} -> {_clamped} for {_model}")
+
             # Debug logging
             self.log_debug(f"Features change - Web search: {merged_settings.get('enable_web_search')}, Reasoning: {merged_settings.get('reasoning_effort')}")
 

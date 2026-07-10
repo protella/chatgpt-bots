@@ -5,7 +5,7 @@ import json
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from config import config
+from config import config, clamp_effort
 from prompts import (INTENT_CLASSIFIER_PROMPT, MEMORY_EXTRACTION_SYSTEM_PROMPT,
                      PARTICIPATION_SYSTEM_PROMPT, WAKE_CLASSIFIER_SYSTEM_PROMPT)
 
@@ -115,23 +115,28 @@ async def create_text_response(
     
     # Model-specific parameters — all supported models are GPT-5-series reasoning
     # models (gpt-5.5 primary, gpt-5-mini utility)
-    reasoning_effort = reasoning_effort or config.default_reasoning_effort
+    # Clamp guards against stored/legacy efforts the model rejects (e.g. `minimal`
+    # on 5.6, `max` on 5.5)
+    reasoning_effort = clamp_effort(model, reasoning_effort or config.default_reasoning_effort)
     request_params["reasoning"] = {"effort": reasoning_effort}
     verbosity = verbosity or config.default_verbosity
     request_params["text"] = {"verbosity": verbosity}
 
-    # gpt-5.5 allows temperature/top_p when reasoning=none
-    if model.startswith("gpt-5.5") and reasoning_effort == "none":
+    # gpt-5.5 and the 5.6 family allow temperature/top_p when reasoning=none
+    # (5.6 verified live 2026-07-09: effort=none + temperature/top_p -> 200)
+    if (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")) and reasoning_effort == "none":
         request_params["top_p"] = top_p
     else:
         request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
 
-    # Prompt caching (gpt-5.5): 24h retention + a per-thread cache key so repeat
-    # calls for the same thread route to the same cache shard (prefix-cache hygiene)
+    # Prompt caching: gpt-5.5 keeps the explicit 24h retention param; the 5.6 family
+    # uses implicit caching (verified live 2026-07-09: second identical call returned
+    # cached_tokens>0 with NO cache params; prompt_cache_retention is deprecated on 5.6).
+    # The per-thread cache key still helps route repeat calls to the same cache shard.
     if model.startswith("gpt-5.5"):
         request_params["prompt_cache_retention"] = "24h"
-        if prompt_cache_key:
-            request_params["prompt_cache_key"] = prompt_cache_key
+    if prompt_cache_key and (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")):
+        request_params["prompt_cache_key"] = prompt_cache_key
 
     self.log_debug(f"Creating text response with model {model}, temp {temperature}")
 
@@ -234,23 +239,28 @@ async def create_text_response_with_tools(
     
     # Model-specific parameters — all supported models are GPT-5-series reasoning
     # models (gpt-5.5 primary, gpt-5-mini utility)
-    reasoning_effort = reasoning_effort or config.default_reasoning_effort
+    # Clamp guards against stored/legacy efforts the model rejects (e.g. `minimal`
+    # on 5.6, `max` on 5.5)
+    reasoning_effort = clamp_effort(model, reasoning_effort or config.default_reasoning_effort)
     request_params["reasoning"] = {"effort": reasoning_effort}
     verbosity = verbosity or config.default_verbosity
     request_params["text"] = {"verbosity": verbosity}
 
-    # gpt-5.5 allows temperature/top_p when reasoning=none
-    if model.startswith("gpt-5.5") and reasoning_effort == "none":
+    # gpt-5.5 and the 5.6 family allow temperature/top_p when reasoning=none
+    # (5.6 verified live 2026-07-09: effort=none + temperature/top_p -> 200)
+    if (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")) and reasoning_effort == "none":
         request_params["top_p"] = top_p
     else:
         request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
 
-    # Prompt caching (gpt-5.5): 24h retention + a per-thread cache key so repeat
-    # calls for the same thread route to the same cache shard (prefix-cache hygiene)
+    # Prompt caching: gpt-5.5 keeps the explicit 24h retention param; the 5.6 family
+    # uses implicit caching (verified live 2026-07-09: second identical call returned
+    # cached_tokens>0 with NO cache params; prompt_cache_retention is deprecated on 5.6).
+    # The per-thread cache key still helps route repeat calls to the same cache shard.
     if model.startswith("gpt-5.5"):
         request_params["prompt_cache_retention"] = "24h"
-        if prompt_cache_key:
-            request_params["prompt_cache_key"] = prompt_cache_key
+    if prompt_cache_key and (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")):
+        request_params["prompt_cache_key"] = prompt_cache_key
 
     self.log_debug(f"Creating text response with tools using model {model}, tools: {tools}")
 
@@ -393,23 +403,28 @@ async def create_streaming_response(
     
     # Model-specific parameters — all supported models are GPT-5-series reasoning
     # models (gpt-5.5 primary, gpt-5-mini utility)
-    reasoning_effort = reasoning_effort or config.default_reasoning_effort
+    # Clamp guards against stored/legacy efforts the model rejects (e.g. `minimal`
+    # on 5.6, `max` on 5.5)
+    reasoning_effort = clamp_effort(model, reasoning_effort or config.default_reasoning_effort)
     request_params["reasoning"] = {"effort": reasoning_effort}
     verbosity = verbosity or config.default_verbosity
     request_params["text"] = {"verbosity": verbosity}
 
-    # gpt-5.5 allows temperature/top_p when reasoning=none
-    if model.startswith("gpt-5.5") and reasoning_effort == "none":
+    # gpt-5.5 and the 5.6 family allow temperature/top_p when reasoning=none
+    # (5.6 verified live 2026-07-09: effort=none + temperature/top_p -> 200)
+    if (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")) and reasoning_effort == "none":
         request_params["top_p"] = top_p
     else:
         request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
 
-    # Prompt caching (gpt-5.5): 24h retention + a per-thread cache key so repeat
-    # calls for the same thread route to the same cache shard (prefix-cache hygiene)
+    # Prompt caching: gpt-5.5 keeps the explicit 24h retention param; the 5.6 family
+    # uses implicit caching (verified live 2026-07-09: second identical call returned
+    # cached_tokens>0 with NO cache params; prompt_cache_retention is deprecated on 5.6).
+    # The per-thread cache key still helps route repeat calls to the same cache shard.
     if model.startswith("gpt-5.5"):
         request_params["prompt_cache_retention"] = "24h"
-        if prompt_cache_key:
-            request_params["prompt_cache_key"] = prompt_cache_key
+    if prompt_cache_key and (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")):
+        request_params["prompt_cache_key"] = prompt_cache_key
 
     self.log_debug(f"Creating streaming response with model {model}, temp {temperature}")
 
@@ -633,23 +648,28 @@ async def create_streaming_response_with_tools(
     
     # Model-specific parameters — all supported models are GPT-5-series reasoning
     # models (gpt-5.5 primary, gpt-5-mini utility)
-    reasoning_effort = reasoning_effort or config.default_reasoning_effort
+    # Clamp guards against stored/legacy efforts the model rejects (e.g. `minimal`
+    # on 5.6, `max` on 5.5)
+    reasoning_effort = clamp_effort(model, reasoning_effort or config.default_reasoning_effort)
     request_params["reasoning"] = {"effort": reasoning_effort}
     verbosity = verbosity or config.default_verbosity
     request_params["text"] = {"verbosity": verbosity}
 
-    # gpt-5.5 allows temperature/top_p when reasoning=none
-    if model.startswith("gpt-5.5") and reasoning_effort == "none":
+    # gpt-5.5 and the 5.6 family allow temperature/top_p when reasoning=none
+    # (5.6 verified live 2026-07-09: effort=none + temperature/top_p -> 200)
+    if (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")) and reasoning_effort == "none":
         request_params["top_p"] = top_p
     else:
         request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
 
-    # Prompt caching (gpt-5.5): 24h retention + a per-thread cache key so repeat
-    # calls for the same thread route to the same cache shard (prefix-cache hygiene)
+    # Prompt caching: gpt-5.5 keeps the explicit 24h retention param; the 5.6 family
+    # uses implicit caching (verified live 2026-07-09: second identical call returned
+    # cached_tokens>0 with NO cache params; prompt_cache_retention is deprecated on 5.6).
+    # The per-thread cache key still helps route repeat calls to the same cache shard.
     if model.startswith("gpt-5.5"):
         request_params["prompt_cache_retention"] = "24h"
-        if prompt_cache_key:
-            request_params["prompt_cache_key"] = prompt_cache_key
+    if prompt_cache_key and (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")):
+        request_params["prompt_cache_key"] = prompt_cache_key
 
     self.log_debug(f"Creating streaming response with tools using model {model}")
 
@@ -878,7 +898,7 @@ async def classify_wake(self, text: str, signals: Optional[Dict[str, Any]] = Non
     }
     # Utility model is a GPT-5-series reasoning model (gpt-5-mini)
     request_params["temperature"] = 1.0
-    request_params["reasoning"] = {"effort": config.utility_reasoning_effort}
+    request_params["reasoning"] = {"effort": clamp_effort(config.utility_model, config.utility_reasoning_effort)}
     request_params["text"] = {"verbosity": config.utility_verbosity}
 
     try:
@@ -956,7 +976,7 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
     }
     # Utility model is a GPT-5-series reasoning model (gpt-5-mini)
     request_params["temperature"] = 1.0
-    request_params["reasoning"] = {"effort": config.utility_reasoning_effort}
+    request_params["reasoning"] = {"effort": clamp_effort(config.utility_model, config.utility_reasoning_effort)}
     request_params["text"] = {"verbosity": config.utility_verbosity}
 
     try:
@@ -1007,7 +1027,7 @@ async def extract_memory(self, exchange_text: str, existing_memory: Optional[Lis
     }
     # Utility model is a GPT-5-series reasoning model (gpt-5-mini)
     request_params["temperature"] = 1.0
-    request_params["reasoning"] = {"effort": config.utility_reasoning_effort}
+    request_params["reasoning"] = {"effort": clamp_effort(config.utility_model, config.utility_reasoning_effort)}
     request_params["text"] = {"verbosity": config.utility_verbosity}
 
     try:
@@ -1128,7 +1148,7 @@ async def classify_intent(
         
         # Utility model is a GPT-5-series reasoning model (gpt-5-mini)
         request_params["temperature"] = 1.0  # Fixed for reasoning models
-        request_params["reasoning"] = {"effort": config.utility_reasoning_effort}  # Use utility config
+        request_params["reasoning"] = {"effort": clamp_effort(config.utility_model, config.utility_reasoning_effort)}  # Use utility config
         request_params["text"] = {"verbosity": config.utility_verbosity}  # Use utility config
         
         self.log_debug(f"About to call responses.create for intent classification at {time.strftime('%H:%M:%S')}")
@@ -1310,13 +1330,16 @@ async def _create_text_response_with_timeout(
 
     # Model-specific parameters — all supported models are GPT-5-series reasoning
     # models (gpt-5.5 primary, gpt-5-mini utility)
-    reasoning_effort = reasoning_effort or config.default_reasoning_effort
+    # Clamp guards against stored/legacy efforts the model rejects (e.g. `minimal`
+    # on 5.6, `max` on 5.5)
+    reasoning_effort = clamp_effort(model, reasoning_effort or config.default_reasoning_effort)
     request_params["reasoning"] = {"effort": reasoning_effort}
     verbosity = verbosity or config.default_verbosity
     request_params["text"] = {"verbosity": verbosity}
 
-    # gpt-5.5 allows temperature/top_p when reasoning=none
-    if model.startswith("gpt-5.5") and reasoning_effort == "none":
+    # gpt-5.5 and the 5.6 family allow temperature/top_p when reasoning=none
+    # (5.6 verified live 2026-07-09: effort=none + temperature/top_p -> 200)
+    if (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")) and reasoning_effort == "none":
         request_params["top_p"] = top_p
     else:
         request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
@@ -1421,13 +1444,16 @@ async def _create_text_response_with_tools_with_timeout(
 
     # Model-specific parameters — all supported models are GPT-5-series reasoning
     # models (gpt-5.5 primary, gpt-5-mini utility)
-    reasoning_effort = reasoning_effort or config.default_reasoning_effort
+    # Clamp guards against stored/legacy efforts the model rejects (e.g. `minimal`
+    # on 5.6, `max` on 5.5)
+    reasoning_effort = clamp_effort(model, reasoning_effort or config.default_reasoning_effort)
     request_params["reasoning"] = {"effort": reasoning_effort}
     verbosity = verbosity or config.default_verbosity
     request_params["text"] = {"verbosity": verbosity}
 
-    # gpt-5.5 allows temperature/top_p when reasoning=none
-    if model.startswith("gpt-5.5") and reasoning_effort == "none":
+    # gpt-5.5 and the 5.6 family allow temperature/top_p when reasoning=none
+    # (5.6 verified live 2026-07-09: effort=none + temperature/top_p -> 200)
+    if (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")) and reasoning_effort == "none":
         request_params["top_p"] = top_p
     else:
         request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
