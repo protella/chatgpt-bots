@@ -465,6 +465,13 @@ class ChatBotV2:
             # Start cleanup task
             await self.start_cleanup_task()
 
+            # MCP startup health probe (informational; runs in the background so
+            # a slow server can't delay boot). Strong ref so it can't be GC'd.
+            if getattr(self.processor, "mcp_manager", None) and self.processor.mcp_manager.has_mcp_servers():
+                self._mcp_probe_task = asyncio.create_task(self.processor.mcp_manager.health_probe())
+                self._mcp_probe_task.add_done_callback(
+                    lambda t: t.exception() and main_logger.warning(f"MCP health probe error: {t.exception()}"))
+
             # Start the client (blocks)
             main_logger.info(f"Starting {self.platform} bot...")
             if self.client:

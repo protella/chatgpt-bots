@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 🔌 Improvement - MCP Hardening
+
+#### Added
+- **Secrets out of `mcp_config.json`**: header values support `${VAR_NAME}` placeholders expanded from `.env` at load; a server with unresolved variables is skipped with a warning
+- **Per-server `"enabled": false`** to turn off one server without deleting its config
+- **Startup health probe**: one log line per MCP server (reachable/unreachable) plus its discovered tools
+- Tool discovery from conversations now populates the informational MCP tools cache
+
+#### Fixed
+- MCP failover survives multiple failing servers: exclusions accumulate across retries (previously two broken servers could retry forever), and failures are detected from structured error codes first with message-text matching as fallback
+- A config requesting `require_approval` other than "never" now logs a clear warning instead of being silently ignored
+
+#### Upgrade Instructions
+If your `mcp_config.json` contains literal API keys, move them to `.env` and reference them as `"X-API-Key": "${YOUR_VAR}"`.
+
 ### 🤝 Feature - Claude-style Channel Participation (flagged off by default)
 
 #### Added

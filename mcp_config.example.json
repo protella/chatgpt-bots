@@ -9,19 +9,20 @@
 
     "my-api-with-bearer-auth": {
       "server_url": "https://api.example.com/mcp",
-      "server_description": "Your API description here",
+      "server_description": "Your API description here. Secrets belong in .env - ${VAR_NAME} placeholders are expanded from the environment at load time.",
       "require_approval": "never",
       "headers": {
-        "Authorization": "Bearer YOUR_API_KEY_HERE"
+        "Authorization": "Bearer ${MY_API_TOKEN}"
       }
     },
 
     "my-api-with-custom-header": {
       "server_url": "https://api.example.com/mcp",
-      "server_description": "API using custom header auth",
+      "server_description": "API using custom header auth. Set \"enabled\": false to skip a server without deleting its config.",
       "require_approval": "never",
+      "enabled": true,
       "headers": {
-        "X-API-Key": "YOUR_API_KEY_HERE"
+        "X-API-Key": "${MY_OTHER_API_KEY}"
       }
     },
 

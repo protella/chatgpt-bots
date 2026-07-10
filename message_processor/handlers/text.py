@@ -156,9 +156,10 @@ class TextHandlerMixin:
         }]
 
         # Update status before generating
+        failed_mcp_display = ", ".join(sorted(self._as_mcp_exclusion_set(failed_mcp_server)))
         if failed_mcp_server:
             self._update_status(client, message.channel_id, thinking_id,
-                               f"Retrying without '{failed_mcp_server}'...", emoji=config.circle_loader_emoji)
+                               f"Retrying without '{failed_mcp_display}'...", emoji=config.circle_loader_emoji)
         elif retry_count > 0:
             self._update_status(client, message.channel_id, thinking_id, "Retrying response...", emoji=config.circle_loader_emoji)
         else:
@@ -195,6 +196,7 @@ class TextHandlerMixin:
         tools_actually_used = []  # Track which tools were actually invoked
         local_tool_calls = []     # [{"name","ok"}] record of local tool executions
         usage_info = {}           # response.usage lands here (usage-driven budgeting)
+        mcp_discovered = {}       # mcp_list_tools payloads land here (discovery cache)
         try:
             if tools and registry is not None:
                 # Local tools present — run the function-call loop (composes with
@@ -212,7 +214,8 @@ class TextHandlerMixin:
                     verbosity=thread_config.get("verbosity"),
                     store=False,
                     prompt_cache_key=thread_key,
-                    usage_sink=usage_info
+                    usage_sink=usage_info,
+                    mcp_tools_sink=mcp_discovered
                 )
                 response_text = result["text"]
                 tools_actually_used = result["tools_used"]
@@ -249,7 +252,8 @@ class TextHandlerMixin:
                         store=False,  # Match the existing behavior
                         return_metadata=True,
                         prompt_cache_key=thread_key,
-                        usage_sink=usage_info
+                        usage_sink=usage_info,
+                        mcp_tools_sink=mcp_discovered
                     )
                     response_text = result["text"]
                     tools_actually_used = result["tools_used"]
@@ -308,6 +312,10 @@ class TextHandlerMixin:
         thread_state.record_usage(usage_info.get("input_tokens", 0),
                                   usage_info.get("output_tokens", 0))
 
+        # Feed any mcp_list_tools discovery payloads into the informational cache
+        for _label, _tools_payload in mcp_discovered.items():
+            self.mcp_manager.cache_discovered_tools_payload(_label, _tools_payload)
+
         # Build unified tools attribution at the end of response
         # Reaction-only turn: the model reacted via the react tool and deliberately
         # returned no text — post nothing (main.py skips empty sends; footer skips too).
@@ -328,12 +336,12 @@ class TextHandlerMixin:
             if tools_actually_used:
                 # Show successful tools
                 if failed_mcp_server:
-                    tools_note = f"\n\n_Used Tools: {', '.join(tools_actually_used)} (failed: {failed_mcp_server})_"
+                    tools_note = f"\n\n_Used Tools: {', '.join(tools_actually_used)} (failed: {failed_mcp_display})_"
                 else:
                     tools_note = f"\n\n_Used Tools: {', '.join(tools_actually_used)}_"
             else:
                 # Only failed MCP, no successful tools
-                tools_note = f"\n\n_MCP server '{failed_mcp_server}' could not be reached. Response generated without external tools._"
+                tools_note = f"\n\n_MCP server '{failed_mcp_display}' could not be reached. Response generated without external tools._"
 
             response_text = response_text + tools_note
             self.log_info(f"Added tools attribution: {', '.join(tools_actually_used) if tools_actually_used else 'none'}{' with failure note' if failed_mcp_server else ''}")
@@ -355,8 +363,12 @@ class TextHandlerMixin:
     async def _handle_streaming_text_response(self, user_content: Any, thread_state, client: BaseClient,
                                       message: Message, thinking_id: Optional[str] = None,
                                       attachment_urls: Optional[List[str]] = None,
-                                      exclude_mcp_server: Optional[str] = None) -> Response:
-        """Handle text-only response generation with streaming support"""
+                                      exclude_mcp_server=None) -> Response:
+        """Handle text-only response generation with streaming support.
+
+        exclude_mcp_server accepts a single label or a set of labels (exclusions
+        accumulate across MCP-failure retries)."""
+        exclude_mcp_display = ", ".join(sorted(self._as_mcp_exclusion_set(exclude_mcp_server)))
         # Check if client supports streaming
         if not hasattr(client, 'supports_streaming') or not client.supports_streaming():
             self.log_debug("Client doesn't support streaming, falling back to non-streaming")
@@ -461,7 +473,7 @@ class TextHandlerMixin:
         # For streaming with potential tools, start with "Working on it"
         # (will be overridden if tools are used)
         if exclude_mcp_server:
-            initial_message = f"{config.circle_loader_emoji} Retrying without '{exclude_mcp_server}'..."
+            initial_message = f"{config.circle_loader_emoji} Retrying without '{exclude_mcp_display}'..."
         else:
             initial_message = f"{config.thinking_emoji} Working on it..."
         if thinking_id:
@@ -962,6 +974,7 @@ class TextHandlerMixin:
 
             local_tool_calls = []  # [{"name","ok"}] record of local tool executions
             usage_info = {}        # response.usage lands here (usage-driven budgeting)
+            mcp_discovered = {}    # mcp_list_tools payloads land here (discovery cache)
             if tools and registry is not None:
                 # Local tools present — streaming function-call loop (intermediate tool
                 # rounds don't stream text; the final round streams normally)
@@ -980,7 +993,8 @@ class TextHandlerMixin:
                     verbosity=thread_config.get("verbosity"),
                     store=False,
                     prompt_cache_key=thread_key,
-                    usage_sink=usage_info
+                    usage_sink=usage_info,
+                    mcp_tools_sink=mcp_discovered
                 )
                 response_text = loop_result["text"]
                 local_tool_calls = loop_result["local_tool_calls"]
@@ -1003,7 +1017,8 @@ class TextHandlerMixin:
                     verbosity=thread_config.get("verbosity"),
                     store=False,  # Match the existing behavior
                     prompt_cache_key=thread_key,
-                    usage_sink=usage_info
+                    usage_sink=usage_info,
+                    mcp_tools_sink=mcp_discovered
                 )
             else:
                 # Generate response without tools
@@ -1024,6 +1039,10 @@ class TextHandlerMixin:
             # Record the API's authoritative context size on the thread
             thread_state.record_usage(usage_info.get("input_tokens", 0),
                                       usage_info.get("output_tokens", 0))
+
+            # Feed any mcp_list_tools discovery payloads into the informational cache
+            for _label, _tools_payload in mcp_discovered.items():
+                self.mcp_manager.cache_discovered_tools_payload(_label, _tools_payload)
 
             # Ensure progress updater is cancelled if still running
             if progress_task and not progress_task.done():
@@ -1066,12 +1085,12 @@ class TextHandlerMixin:
                 if tools_used:
                     # Show successful tools
                     if exclude_mcp_server:
-                        tools_note = f"\n\n_Used Tools: {', '.join(tools_used)} (failed: {exclude_mcp_server})_"
+                        tools_note = f"\n\n_Used Tools: {', '.join(tools_used)} (failed: {exclude_mcp_display})_"
                     else:
                         tools_note = f"\n\n_Used Tools: {', '.join(tools_used)}_"
                 else:
                     # Only failed MCP, no successful tools
-                    tools_note = f"\n\n_MCP server '{exclude_mcp_server}' could not be reached. Response generated without external tools._"
+                    tools_note = f"\n\n_MCP server '{exclude_mcp_display}' could not be reached. Response generated without external tools._"
                 response_text = response_text + tools_note
                 self.log_info(f"Added tools attribution: {', '.join(tools_used) if tools_used else 'none'}{' with failure note' if exclude_mcp_server else ''}")
 
@@ -1100,11 +1119,11 @@ class TextHandlerMixin:
                         if tools_used or exclude_mcp_server:
                             if tools_used:
                                 if exclude_mcp_server:
-                                    tools_note = f"\n\n_Used Tools: {', '.join(tools_used)} (failed: {exclude_mcp_server})_"
+                                    tools_note = f"\n\n_Used Tools: {', '.join(tools_used)} (failed: {exclude_mcp_display})_"
                                 else:
                                     tools_note = f"\n\n_Used Tools: {', '.join(tools_used)}_"
                             else:
-                                tools_note = f"\n\n_MCP server '{exclude_mcp_server}' could not be reached. Response generated without external tools._"
+                                tools_note = f"\n\n_MCP server '{exclude_mcp_display}' could not be reached. Response generated without external tools._"
                             final_part_text = final_part_text + tools_note
                             self.log_debug(f"Added tools attribution to overflow part {current_part}")
 
@@ -1218,24 +1237,32 @@ class TextHandlerMixin:
                 except Exception as compact_err:
                     self.log_error(f"Compaction after context error failed: {compact_err}")
 
-            # Check if this is an MCP connection error first (before logging)
-            # Streaming throws APIError, non-streaming throws APIStatusError with code 424
-            failed_mcp_server = None
-            error_msg = str(e)
+            # Check if this is an MCP connection error first (before logging).
+            # Structured fields (status_code 424, error body) are checked before
+            # the message-text regex; exclusions ACCUMULATE across retries so two
+            # broken servers can't ping-pong forever (bounded by server count).
+            already_excluded = self._as_mcp_exclusion_set(exclude_mcp_server)
+            failed_mcp_server = self._extract_failed_mcp_server(e)
 
-            # Check for MCP server failure in error message
-            # Catch any error from MCP servers (400, 401, 403, 404, 424, 500, timeouts, etc.)
-            if "MCP server" in error_msg:
-                # Extract MCP server name from error message pattern
-                # Example: "Error retrieving tool list from MCP server: 'context7'"
-                match = re.search(r"MCP server: '([^']+)'", error_msg)
-                if match:
-                    failed_mcp_server = match.group(1)
+            if failed_mcp_server:
+                total_servers = len(self.mcp_manager.get_server_labels())
+                if failed_mcp_server in already_excluded or len(already_excluded) >= total_servers:
+                    # Same server failing while excluded (or nothing left to
+                    # exclude) means this isn't a recoverable MCP failover —
+                    # fall through to the generic non-streaming retry.
+                    self.log_error(
+                        f"MCP failover exhausted (failed: '{failed_mcp_server}', "
+                        f"already excluded: {sorted(already_excluded)}) - treating as generic error")
+                    failed_mcp_server = None
+                else:
                     # Log MCP failures at INFO level - they're handled gracefully
                     self.log_info(f"MCP server '{failed_mcp_server}' unavailable - retrying request without it")
             else:
                 # Unexpected errors - log as ERROR
                 self.log_error(f"Error in streaming response generation: {e}")
+
+            # The retry excludes everything that has failed so far
+            failed_mcp_servers = (already_excluded | {failed_mcp_server}) if failed_mcp_server else None
 
             # Ensure progress updater is cancelled on error
             if progress_task and not progress_task.done():
@@ -1270,14 +1297,54 @@ class TextHandlerMixin:
                 self.log_debug("Removed duplicate user message before fallback")
 
             # Pass retry_count=1 to prevent re-entering streaming after timeout
-            # Also pass failed_mcp_server so fallback can exclude it from tools
+            # Also pass the accumulated exclusion set so the retry drops ALL
+            # servers that have failed so far, not just the latest one
             return await self._handle_text_response(
                 user_content, thread_state, client, message, thinking_id,
-                attachment_urls, retry_count=1, failed_mcp_server=failed_mcp_server
+                attachment_urls, retry_count=1, failed_mcp_server=failed_mcp_servers
             )
 
+    @staticmethod
+    def _as_mcp_exclusion_set(value) -> set:
+        """Normalize an MCP exclusion (None | str | iterable of str) to a set."""
+        if not value:
+            return set()
+        if isinstance(value, str):
+            return {value}
+        return set(value)
+
+    def _extract_failed_mcp_server(self, e: Exception) -> Optional[str]:
+        """
+        Identify a failed MCP server from an OpenAI error.
+
+        Checks structured fields first (APIStatusError status_code 424 =
+        failed-dependency, the documented MCP failure status; error body
+        message), then falls back to the message-text regex so a format
+        change in OpenAI's error text degrades gracefully rather than
+        silently breaking MCP failover.
+        """
+        candidates = []
+        body = getattr(e, "body", None)
+        if isinstance(body, dict):
+            err = body.get("error", body)
+            if isinstance(err, dict) and err.get("message"):
+                candidates.append(str(err["message"]))
+        candidates.append(str(e))
+
+        is_mcp_status = getattr(e, "status_code", None) == 424
+        for text in candidates:
+            if is_mcp_status or "MCP server" in text:
+                match = re.search(r"MCP server:? '([^']+)'", text)
+                if match:
+                    return match.group(1)
+        if is_mcp_status:
+            # Definitely an MCP failure but the server label wasn't recoverable —
+            # caller can't exclude anything specific, so treat as generic.
+            self.log_warning("MCP failure (HTTP 424) without a recoverable server label")
+        return None
+
     def _build_tools_array(self, thread_config: dict, model: str,
-                           exclude_mcp_server: Optional[str] = None,
+                           exclude_mcp_server=None,
                            registry=None) -> Optional[List[dict]]:
         """
         Build tools array for OpenAI API based on user preferences and model.
@@ -1317,11 +1384,12 @@ class TextHandlerMixin:
         if mcp_enabled and model.startswith('gpt-5') and self.mcp_manager.has_mcp_servers():
             mcp_tools = self.mcp_manager.get_tools_for_openai()
 
-            # Filter out excluded MCP server if specified
-            if exclude_mcp_server:
+            # Filter out excluded MCP server(s) if specified (str or set)
+            excluded = self._as_mcp_exclusion_set(exclude_mcp_server)
+            if excluded:
                 mcp_tools = [tool for tool in mcp_tools
-                           if tool.get("server_label") != exclude_mcp_server]
-                self.log_info(f"Excluded failed MCP server '{exclude_mcp_server}' from tools array")
+                           if tool.get("server_label") not in excluded]
+                self.log_info(f"Excluded failed MCP server(s) {sorted(excluded)} from tools array")
 
             tools.extend(mcp_tools)
             self.log_debug(f"Added {len(mcp_tools)} MCP server(s) to tools array")

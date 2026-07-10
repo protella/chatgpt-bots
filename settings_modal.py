@@ -551,15 +551,9 @@ class SettingsModal(LoggerMixin):
             "text": {"type": "mrkdwn", "text": "*Features*"}
         })
 
-        # Check if model supports MCP (GPT-5 only)
-        current_model = settings.get('model', config.gpt_model)
-        is_gpt5 = current_model.startswith('gpt-5')
-
-        # Adjust enable_mcp if model doesn't support it
+        # All supported models (gpt-5.5) support MCP; the old GPT-4-era
+        # hide-MCP branch is gone with the pre-5.5 lineup.
         current_enable_mcp = settings.get('enable_mcp', True)
-        if not is_gpt5 and current_enable_mcp:
-            current_enable_mcp = False
-            self.log_debug(f"Adjusted enable_mcp from True to False for display (model {current_model} doesn't support MCP)")
 
         # Build checkbox options for features
         feature_options = []
@@ -581,23 +575,17 @@ class SettingsModal(LoggerMixin):
         if settings.get('enable_streaming', True):
             initial_options.append(feature_options[-1])
 
-        # MCP Servers (only show if GPT-5 model)
-        if is_gpt5:
-            feature_options.append({
-                "text": {"type": "mrkdwn", "text": "🔌 *MCP Servers*\nAccess specialized data sources"},
-                "value": "mcp"
-            })
-            if current_enable_mcp:
-                initial_options.append(feature_options[-1])
+        # MCP Servers
+        feature_options.append({
+            "text": {"type": "mrkdwn", "text": "🔌 *MCP Servers*\nAccess specialized data sources"},
+            "value": "mcp"
+        })
+        if current_enable_mcp:
+            initial_options.append(feature_options[-1])
 
-        # Build the features block
-        # Use different block_id/action_id based on model to force Slack to re-render
-        if is_gpt5:
-            block_id = "features_block_gpt5"
-            action_id = "features_with_mcp"
-        else:
-            block_id = "features_block_gpt4"
-            action_id = "features_no_mcp"
+        # Build the features block (ids kept stable for the registered action handler)
+        block_id = "features_block_gpt5"
+        action_id = "features_with_mcp"
 
         features_block = {
             "type": "section",
@@ -616,18 +604,8 @@ class SettingsModal(LoggerMixin):
 
         blocks.append(features_block)
 
-        # Add note about MCP being unavailable if not GPT-5
-        if not is_gpt5:
-            blocks.append({
-                "type": "context",
-                "elements": [{
-                    "type": "mrkdwn",
-                    "text": "_Note: MCP Servers feature will be available if you select a GPT-5 model_"
-                }]
-            })
-        
         blocks.append({"type": "divider"})
-        
+
         # Image Generation Settings
         blocks.append({
             "type": "section",
