@@ -15,6 +15,7 @@ from message_markers import (
 )
 from slack_client.event_handlers.feedback import (
     FEEDBACK_ACTION_ID,
+    USER_SETTINGS_ACTION_ID,
     build_feedback_blocks,
     feedback_enabled,
 )
@@ -23,9 +24,12 @@ from slack_client.utilities import strip_citations
 import re as _re
 
 # Block action_ids that mark a message as one of our UI helpers (channel footer's
-# Configure button, Phase H feedback strip). Such messages are chrome, not
-# conversation — the history rebuild must never feed them back into context.
-_UI_HELPER_ACTION_IDS = frozenset({"open_channel_settings", FEEDBACK_ACTION_ID})
+# Configure button, Phase H feedback strip + its user-settings button). Such messages
+# are chrome, not conversation — the history rebuild must never feed them back into
+# context.
+_UI_HELPER_ACTION_IDS = frozenset({
+    "open_channel_settings", FEEDBACK_ACTION_ID, USER_SETTINGS_ACTION_ID,
+})
 
 
 def _is_ui_helper_message(msg: dict) -> bool:
@@ -871,14 +875,16 @@ class SlackMessagingMixin:
             if not channel_id:
                 return
             if channel_id.startswith("D"):
-                # Phase H: feedback buttons on the assistant/DM surface.
+                # Phase H: feedback buttons + "⚙️ <model>" (user settings) on the
+                # assistant/DM surface.
                 if not feedback_enabled():
                     return
+                model = (getattr(response, "metadata", None) or {}).get("model")
                 await self.app.client.chat_postMessage(
                     channel=channel_id,
                     thread_ts=getattr(message, "thread_id", None),
                     text="Rate this response",  # fallback text for notifications
-                    blocks=build_feedback_blocks(),
+                    blocks=build_feedback_blocks(model),
                 )
                 return
             # Channels: per-channel settings footer.

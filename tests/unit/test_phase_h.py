@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from config import config
 from database import DatabaseManager
 from slack_client.event_handlers import feedback
 from slack_client.messaging import SlackMessagingMixin, _is_ui_helper_message
@@ -248,8 +249,8 @@ class TestFeedbackAction:
 
 class TestFeedbackBlocks:
     def test_shape_is_native_context_actions(self):
-        blocks = feedback.build_feedback_blocks()
-        assert len(blocks) == 1
+        blocks = feedback.build_feedback_blocks("gpt-5.6-sol")
+        assert len(blocks) == 2
         block = blocks[0]
         assert block["type"] == "context_actions"
         el = block["elements"][0]
@@ -258,8 +259,26 @@ class TestFeedbackBlocks:
         assert el["positive_button"]["value"] == "good"
         assert el["negative_button"]["value"] == "bad"
 
+    def test_model_button_present_with_user_settings_action(self):
+        blocks = feedback.build_feedback_blocks("gpt-5.6-sol")
+        btn = blocks[1]["elements"][0]
+        assert blocks[1]["type"] == "actions"
+        assert btn["type"] == "button"
+        assert btn["action_id"] == feedback.USER_SETTINGS_ACTION_ID
+        assert btn["text"]["text"] == "⚙️ gpt-5.6-sol"
+
+    def test_model_button_falls_back_to_config_model(self):
+        blocks = feedback.build_feedback_blocks(None)
+        assert blocks[1]["elements"][0]["text"]["text"] == f"⚙️ {config.gpt_model}"
+
     def test_rebuild_skips_feedback_strip(self):
-        msg = {"blocks": feedback.build_feedback_blocks(), "text": "Rate this response"}
+        msg = {"blocks": feedback.build_feedback_blocks("gpt-5.6-sol"), "text": "Rate this response"}
+        assert _is_ui_helper_message(msg) is True
+
+    def test_rebuild_skips_user_settings_button_alone(self):
+        # Robustness: even a strip variant carrying ONLY the model button is chrome.
+        msg = {"blocks": [{"type": "actions", "elements": [
+            {"type": "button", "action_id": "open_user_settings"}]}]}
         assert _is_ui_helper_message(msg) is True
 
     def test_rebuild_skips_channel_footer(self):
@@ -303,6 +322,14 @@ class TestFeedbackStripPosting:
         assert kwargs["channel"] == "D123"
         assert kwargs["blocks"][0]["type"] == "context_actions"
         assert kwargs["blocks"][0]["elements"][0]["action_id"] == feedback.FEEDBACK_ACTION_ID
+
+    async def test_dm_strip_carries_responding_model_button(self):
+        host = _MsgHost()
+        await host.maybe_post_response_footer(_msg("D123"), _resp(model="gpt-5.6-terra"))
+        blocks = host.app.client.chat_postMessage.await_args.kwargs["blocks"]
+        btn = blocks[1]["elements"][0]
+        assert btn["action_id"] == feedback.USER_SETTINGS_ACTION_ID
+        assert btn["text"]["text"] == "⚙️ gpt-5.6-terra"
 
     async def test_dm_flag_off_posts_nothing(self, monkeypatch):
         monkeypatch.setenv("ENABLE_FEEDBACK_BUTTONS", "false")
@@ -351,3 +378,94 @@ class TestFeedbackFlag:
         monkeypatch.setenv("ENABLE_FEEDBACK_BUTTONS", "false")
         monkeypatch.setattr(feedback, "config", SimpleNamespace(enable_feedback_buttons=None))
         assert feedback.feedback_enabled() is False
+
+
+# --------------------------------------------------------------------------- open_user_settings handler
+
+class _FakeApp:
+    """Captures handlers registered via @app.action/@app.command/@app.view/@app.shortcut."""
+    def __init__(self):
+        self.actions = {}
+
+    def action(self, action_id):
+        def deco(fn):
+            self.actions[action_id] = fn
+            return fn
+        return deco
+
+    def command(self, *_a, **_k):
+        return lambda fn: fn
+
+    def view(self, *_a, **_k):
+        return lambda fn: fn
+
+    def shortcut(self, *_a, **_k):
+        return lambda fn: fn
+
+    def event(self, *_a, **_k):
+        return lambda fn: fn
+
+
+def _settings_host():
+    from slack_client.event_handlers.settings import SlackSettingsHandlersMixin
+
+    host = SlackSettingsHandlersMixin.__new__(SlackSettingsHandlersMixin)
+    host.app = _FakeApp()
+    host.db = SimpleNamespace(
+        get_user_preferences_async=AsyncMock(return_value={"model": "gpt-5.6-sol"}),
+        get_or_create_user_async=AsyncMock(return_value={"email": "u@example.com"}),
+        create_default_user_preferences_async=AsyncMock(return_value={"model": "gpt-5.6-sol"}),
+        get_channel_settings_async=AsyncMock(return_value=None),
+    )
+    host.settings_modal = SimpleNamespace(
+        build_settings_modal=AsyncMock(return_value={"type": "modal"}),
+        build_channel_settings_modal=lambda *a, **k: {"type": "modal"},
+    )
+    host.log_info = lambda *a, **k: None
+    host.log_error = lambda *a, **k: None
+    host.log_debug = lambda *a, **k: None
+    host._register_settings_handlers()
+    return host
+
+
+def _action_body(action_id="open_user_settings"):
+    return {
+        "trigger_id": "trig-1",
+        "user": {"id": "U1"},
+        "container": {"channel_id": "D123"},
+        "actions": [{"action_id": action_id}],
+    }
+
+
+@pytest.mark.asyncio
+class TestOpenUserSettingsHandler:
+    async def test_opens_user_settings_modal(self):
+        host = _settings_host()
+        handler = host.app.actions["open_user_settings"]
+        client = SimpleNamespace(views_open=AsyncMock(return_value={"ok": True}),
+                                 chat_postEphemeral=AsyncMock())
+        await handler(ack=AsyncMock(), body=_action_body(), client=client)
+        client.views_open.assert_awaited_once()
+        kwargs = host.settings_modal.build_settings_modal.await_args.kwargs
+        assert kwargs["user_id"] == "U1"
+        assert kwargs["thread_id"] is None and kwargs["in_thread"] is False
+        client.chat_postEphemeral.assert_not_awaited()
+
+    async def test_failure_sends_ephemeral(self):
+        host = _settings_host()
+        handler = host.app.actions["open_user_settings"]
+        client = SimpleNamespace(views_open=AsyncMock(side_effect=RuntimeError("boom")),
+                                 chat_postEphemeral=AsyncMock())
+        await handler(ack=AsyncMock(), body=_action_body(), client=client)
+        eph = client.chat_postEphemeral.await_args.kwargs
+        assert eph["channel"] == "D123" and eph["user"] == "U1"
+        assert "Couldn't open settings" in eph["text"]
+
+    async def test_missing_trigger_id_noops(self):
+        host = _settings_host()
+        handler = host.app.actions["open_user_settings"]
+        client = SimpleNamespace(views_open=AsyncMock(), chat_postEphemeral=AsyncMock())
+        body = _action_body(); body.pop("trigger_id")
+        await handler(ack=AsyncMock(), body=body, client=client)
+        client.views_open.assert_not_awaited()
+        client.chat_postEphemeral.assert_not_awaited()

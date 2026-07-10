@@ -232,9 +232,12 @@ class BotConfig:
     # assistant threads from the first message. Additive/best-effort; messages themselves
     # still flow through the normal DM path.
     enable_assistant_surface: bool = field(default_factory=lambda: os.getenv("ENABLE_ASSISTANT_SURFACE", "true").lower() == "true")
+    # Keep this copy honest: on the agent_view surface, suggested prompts only render
+    # when the manifest's agent_view.suggested_prompts is filled (app_home_opened has
+    # no thread_ts, so they can't be set dynamically there).
     assistant_greeting: str = field(default_factory=lambda: os.getenv(
         "ASSISTANT_GREETING",
-        "👋 Hi! Ask me anything — or pick one of the suggestions below to get started."))
+        "👋 Hi! Ask me anything to get started."))
     # Starter prompts shown in the split view (comma-separated env).
     assistant_suggested_prompts: list = field(default_factory=lambda: _env_list("ASSISTANT_SUGGESTED_PROMPTS", [
         "What's trending in food & beverage right now?",

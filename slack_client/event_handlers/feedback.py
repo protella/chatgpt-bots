@@ -23,6 +23,11 @@ from config import config
 # to skip feedback-strip messages (like the footer's open_channel_settings).
 FEEDBACK_ACTION_ID = "response_feedback"
 
+# action_id for the DM strip's "⚙️ <model>" button → opens the USER settings modal
+# (the channel footer's open_channel_settings opens the per-channel modal instead).
+# Also in the rebuild filter's skip set.
+USER_SETTINGS_ACTION_ID = "open_user_settings"
+
 # Button values → signal. Slack echoes the clicked button's value in the action payload.
 _BUTTON_VALUES = {"good": 1, "bad": -1}
 
@@ -43,9 +48,17 @@ def feedback_enabled() -> bool:
     return os.getenv("ENABLE_FEEDBACK_BUTTONS", "true").lower() == "true"
 
 
-def build_feedback_blocks() -> list:
-    """The native feedback strip: one context_actions block with feedback_buttons."""
-    return [
+def build_feedback_blocks(model_label: str | None = None) -> list:
+    """The DM/assistant response strip: native feedback buttons plus a compact
+    "⚙️ <model>" button that opens the user settings modal (Claude-style subtext
+    row: model visibility + Configure in one click).
+
+    Why a regular actions button and not an icon_button inside context_actions:
+    Slack's icon_button enum currently accepts ONLY "trash" (verified live
+    2026-07-09 against chat.postMessage; docs agree) — no gear/settings icon
+    exists yet. Revisit when more icons ship.
+    """
+    blocks = [
         {
             "type": "context_actions",
             "elements": [
@@ -66,6 +79,21 @@ def build_feedback_blocks() -> list:
             ],
         }
     ]
+    label = (model_label or getattr(config, "gpt_model", "") or "").strip()
+    if label:
+        blocks.append(
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": f"⚙️ {label}"},
+                        "action_id": USER_SETTINGS_ACTION_ID,
+                    }
+                ],
+            }
+        )
+    return blocks
 
 
 def reaction_signal(reaction_name: str) -> int | None:

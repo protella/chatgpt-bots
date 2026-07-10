@@ -26,7 +26,15 @@ features:
     always_online: true
   agent_view:
     agent_description: ChatGPT — chat, image generation & editing, vision, and document analysis. Participates in channels it's invited to.
-    suggested_prompts: []
+    # Rendered in the agent split view. The ASSISTANT_SUGGESTED_PROMPTS env list only
+    # feeds the legacy assistant-thread surface — fill these for the current one.
+    suggested_prompts:
+      - title: What can you do?
+        message: What can you help me with?
+      - title: Summarize a document
+        message: Summarize this document for me
+      - title: Generate an image
+        message: "Generate an image of …"
   shortcuts:
     - name: Thread Settings
       type: message
