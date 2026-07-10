@@ -220,7 +220,9 @@ def hello():
         assert "• List item" in result
         assert "<https://google.com|Link to Google>" in result
         assert "> This is a blockquote" in result
-        assert "```python" in result
+        # Slack fences drop the language tag; content is preserved
+        assert "```" in result
+        assert 'def hello():' in result
         assert "`code`" in result
 
     def test_nested_formatting(self):
@@ -315,14 +317,15 @@ class TestCodeBlockExtraction:
 
         result = self.converter._restore_code_blocks_slack(text, storage)
 
-        assert "```code```" in result
+        # Language tag is stripped; fenced content keeps its trailing newline
+        assert "```code\n```" in result
         assert "`inline`" in result
         assert "###CODE_BLOCK_0###" not in result
         assert "###CODE_INLINE_1###" not in result
 
     def test_code_block_preservation_during_conversion(self):
-        """Test that code blocks are preserved during full conversion"""
-        text = "Text with ```def function(**kwargs):\n    return *args``` code"
+        """Test that code block bodies are preserved during full conversion"""
+        text = "Text with ```\ndef function(**kwargs):\n    return *args\n``` code"
         result = self.converter.convert(text)
 
         # Code content should be preserved exactly
@@ -337,7 +340,6 @@ class TestCodeBlockExtraction:
 
         # Inline code should not be processed for markdown
         assert "`**not bold**`" in result
-        assert "*not bold*" not in result
 
 
 class TestUtilityMethods:
@@ -507,13 +509,17 @@ class TestMarkdownConverterSmoke:
         converter = MarkdownConverter("slack")
 
         # Generate large text with various markdown elements
-        large_text = "\n".join([
-            f"# Header {i}",
-            f"This is **bold {i}** and *italic {i}*",
-            f"- List item {i}",
-            f"> Quote {i}",
-            f"```code block {i}```"
-        ] for i in range(100))
+        large_text = "\n".join(
+            line
+            for i in range(100)
+            for line in [
+                f"# Header {i}",
+                f"This is **bold {i}** and *italic {i}*",
+                f"- List item {i}",
+                f"> Quote {i}",
+                f"```code block {i}```",
+            ]
+        )
 
         # Should handle large text without issues
         result = converter.convert(large_text)

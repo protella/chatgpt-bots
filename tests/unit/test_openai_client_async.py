@@ -57,7 +57,9 @@ class TestAsyncOpenAIClient:
 
         # Check that AsyncOpenAI client was initialized
         assert client.client is not None
-        assert client.stream_timeout_seconds == 30.0  # From mock_env
+        # Timeout comes from config (env-dependent); assert wiring, not the value
+        from config import config as bot_config
+        assert client.stream_timeout_seconds == bot_config.api_timeout_streaming_chunk
         mock_async_openai.assert_called_once()
 
     @pytest.mark.asyncio

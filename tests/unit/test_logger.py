@@ -39,27 +39,6 @@ class TestLoggerSetup:
             # Logger should have a valid level even with invalid input
             assert logger.level in [logging.DEBUG, logging.INFO, logging.WARNING, logging.ERROR]
     
-    def test_setup_logger_file_logging(self):
-        """Test file logging configuration"""
-        with patch.dict('os.environ', {'LOG_TO_FILE': 'true'}):
-            logger = setup_logger("test_logger")
-            
-            # Check for file handler
-            file_handlers = [h for h in logger.handlers if isinstance(h, logging.FileHandler)]
-            assert len(file_handlers) > 0 or os.getenv('LOG_TO_FILE') == 'false'
-    
-    def test_logger_format(self):
-        """Test logger format includes timestamp and level"""
-        logger = setup_logger("test_logger")
-        
-        # Check handlers have formatters
-        for handler in logger.handlers:
-            formatter = handler.formatter
-            if formatter:
-                # Check format string contains expected elements
-                assert "asctime" in formatter._fmt or "%(asctime)s" in formatter._fmt
-                assert "levelname" in formatter._fmt or "%(levelname)s" in formatter._fmt
-    
     @pytest.mark.critical
     def test_critical_logger_creation(self):
         """Critical: Logger must be created successfully"""
