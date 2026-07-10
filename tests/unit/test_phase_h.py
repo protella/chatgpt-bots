@@ -316,8 +316,11 @@ def _resp(content="an answer", type_="text", model=None):
 @pytest.mark.asyncio
 class TestFeedbackStripPosting:
     @pytest.fixture(autouse=True)
-    def _fresh_offers(self):
-        # Feedback buttons show once per thread per process — reset between tests.
+    def _fresh_offers(self, monkeypatch):
+        # Pin the feature ON regardless of the local .env (the dev .env disables it),
+        # and reset the once-per-thread offer cache between tests.
+        from config import config
+        monkeypatch.setattr(config, "enable_feedback_buttons", True)
         feedback._reset_feedback_offers()
         yield
         feedback._reset_feedback_offers()
