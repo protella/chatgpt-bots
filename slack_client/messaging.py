@@ -45,6 +45,26 @@ def _is_ui_helper_message(msg: dict) -> bool:
 # shaped like ":emoji: Status text" AND carrying a known transient marker are
 # skipped — a human message merely containing the word "Thinking" is kept.
 _SELF_STATUS_RE = _re.compile(r"^:[a-z0-9_+\-]+:\s")
+
+# assistant.threads.setStatus renders PLAIN TEXT — :shortcodes: appear literally
+# (user screenshot 2026-07-09). Posted messages render them fine, so status strings
+# are sanitized only at the setStatus boundary: known shortcodes become Unicode,
+# unknown ones (incl. workspace custom emoji, which have no Unicode form) are
+# stripped. One configured string thus renders correctly on both surfaces.
+_SHORTCODE_TO_UNICODE = {
+    "hourglass_flowing_sand": "⏳", "hourglass": "⌛", "mag": "🔍",
+    "bar_chart": "📊", "brain": "🧠", "bulb": "💡", "gear": "⚙️",
+    "robot_face": "🤖", "sparkles": "✨", "thinking_face": "🤔",
+    "memo": "📝", "art": "🎨", "camera": "📷", "globe_with_meridians": "🌐",
+}
+_SHORTCODE_RE = _re.compile(r":([a-z0-9_+\-]+):")
+
+
+def _status_plain_text(text: str) -> str:
+    """Render a status string for the plain-text setStatus surface."""
+    def sub(m):
+        return _SHORTCODE_TO_UNICODE.get(m.group(1), "")
+    return _SHORTCODE_RE.sub(sub, text or "").strip() or "working on it…"
 _SELF_STATUS_MARKERS = (
     "Thinking...",
     "Rebuilding thread history",
@@ -640,9 +660,10 @@ class SlackMessagingMixin:
         msgs = loading_messages if loading_messages is not None else (config.status_loading_messages or None)
         status_text = status if status is not None else config.status_loading_fallback
         try:
-            kwargs = {"channel_id": channel_id, "thread_ts": thread_id, "status": status_text}
+            kwargs = {"channel_id": channel_id, "thread_ts": thread_id,
+                      "status": _status_plain_text(status_text)}
             if msgs:
-                kwargs["loading_messages"] = msgs
+                kwargs["loading_messages"] = [_status_plain_text(m) for m in msgs]
             await self.app.client.assistant_threads_setStatus(**kwargs)
             return True
         except SlackApiError as e:

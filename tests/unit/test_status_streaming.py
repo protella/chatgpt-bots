@@ -86,7 +86,12 @@ async def test_set_assistant_status_success(monkeypatch):
     assert await host.set_assistant_status("C1", "T1") is True
     _, kwargs = client.assistant_threads_setStatus.call_args
     assert kwargs["channel_id"] == "C1" and kwargs["thread_ts"] == "T1"
-    assert kwargs["loading_messages"] == config.status_loading_messages
+    # Loading messages are sanitized for the plain-text status surface
+    # (shortcodes → Unicode); count and wording survive.
+    from slack_client.messaging import _status_plain_text
+    assert kwargs["loading_messages"] == [
+        _status_plain_text(m) for m in config.status_loading_messages
+    ]
 
 
 @pytest.mark.asyncio
