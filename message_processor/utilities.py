@@ -70,16 +70,148 @@ class MessageUtilitiesMixin:
             # Normal text content
             return f"{username}: {content}"
 
-    def _build_user_content(self, text: str, image_inputs: List[Dict]) -> Any:
-        """Build user message content"""
-        if image_inputs:
-            # Multi-part content with text and images
+    def _build_user_content(self, text: str, image_inputs: List[Dict],
+                            file_inputs: Optional[List[Dict]] = None) -> Any:
+        """Build user message content.
+
+        file_inputs are native input_file content parts (Phase D2): per-request
+        base64 PDFs the model reads directly (text + rendered pages). They ride
+        only the attach turn — thread state keeps the summary breadcrumb.
+        """
+        if image_inputs or file_inputs:
             content = [{"type": "input_text", "text": text}]
-            content.extend(image_inputs)
+            content.extend(image_inputs or [])
+            content.extend(file_inputs or [])
             return content
         else:
             # Simple text content
             return text
+
+    def _native_file_eligible(self, mimetype: str, size_bytes: int,
+                              total_pages: Optional[int]) -> bool:
+        """Decide native input_file vs local extraction for the attach turn.
+
+        Native (model sees text + rendered pages) requires ALL of:
+        - ENABLE_NATIVE_FILE_INPUT on
+        - PDF (the API renders pages only for PDFs; other types go local)
+        - within the API request ceilings (<= NATIVE_FILE_MAX_MB, and
+          <= NATIVE_FILE_MAX_PAGES when the page count is known)
+        Everything else — non-PDF types, oversized PDFs, unknown-page scans
+        over the limit, flag off — uses the local extraction path, which is a
+        permanent first-class citizen (it also serves read_document).
+        """
+        if not config.enable_native_file_input:
+            return False
+        if mimetype != "application/pdf":
+            return False
+        if size_bytes > config.native_file_max_mb * 1024 * 1024:
+            return False
+        if total_pages is not None and total_pages > config.native_file_max_pages:
+            return False
+        return True
+
+    def _build_spreadsheet_schema_block(self, extracted: Dict, filename: str) -> str:
+        """Schema-first spreadsheet summary: sheets, columns, row counts, sample rows.
+
+        Deterministic (no model call) — full data is reachable via read_document.
+        """
+        lines = []
+        page_structure = extracted.get("page_structure") or {}
+        sheets = page_structure.get("sheets") if isinstance(page_structure, dict) else None
+        content = extracted.get("content") or ""
+        if sheets:
+            lines.append(f"Sheets ({len(sheets)}): {', '.join(list(sheets.keys())[:10])}")
+            for name, info in list(sheets.items())[:10]:
+                if isinstance(info, dict):
+                    rows = info.get("rows") or info.get("row_count")
+                    cols = info.get("columns") or info.get("column_names")
+                    desc = []
+                    if rows is not None:
+                        desc.append(f"{rows} rows")
+                    if isinstance(cols, list):
+                        desc.append("columns: " + ", ".join(str(c) for c in cols[:15]))
+                    if desc:
+                        lines.append(f"- {name}: {'; '.join(desc)}")
+        # Sample: first ~5 non-empty content lines (extraction renders markdown tables)
+        sample = [ln for ln in content.splitlines() if ln.strip()][:7]
+        if sample:
+            lines.append("Sample (first rows):")
+            lines.extend(sample)
+        lines.append("(Schema and sample only — query full data via read_document.)")
+        return "\n".join(lines)
+
+    async def _summarize_document_for_attach(self, extracted: Dict, filename: str,
+                                             mimetype: str) -> str:
+        """Attach-time summary — the ONLY content-bearing field that persists.
+
+        Spreadsheets get a deterministic schema-first block (no model call);
+        other documents get a gap-honest utility-model summary. Any failure
+        falls back to a labeled excerpt so the row is never contentless.
+        """
+        content = extracted.get("content") or ""
+        page_structure = extracted.get("page_structure") or {}
+        is_spreadsheet = isinstance(page_structure, dict) and "sheets" in page_structure
+        if is_spreadsheet:
+            try:
+                return self._build_spreadsheet_schema_block(extracted, filename)
+            except Exception as e:
+                self.log_warning(f"Schema block failed for {filename}: {e}")
+        try:
+            from prompts import DOCUMENT_SUMMARIZATION_PROMPT
+            # Bound the summarizer's input (utility window guard, chars/4 heuristic)
+            summary = await self.openai_client.create_text_response(
+                messages=[
+                    {"role": "developer", "content": DOCUMENT_SUMMARIZATION_PROMPT},
+                    {"role": "user", "content": content[:1_000_000]},
+                ],
+                model=config.utility_model,
+                temperature=0.3,
+                max_tokens=800,
+                system_prompt=None,
+            )
+            if summary and summary.strip():
+                return summary.strip()
+        except Exception as e:
+            self.log_warning(f"Attach-time summarization failed for {filename}: {e}")
+        return ("[excerpt of original — full document available via read_document]\n"
+                + content[:1500])
+
+    def _apply_scanned_pdf_ocr(self, extracted_content: Dict, mimetype: str,
+                               file_name: str, image_inputs: List[Dict],
+                               image_count: int, max_images: int) -> int:
+        """Legacy scanned-PDF OCR via page images (ISOLATED — local path only).
+
+        Runs only when a scanned PDF does NOT ride the native input_file route
+        (flag off, or PDF over the native size/page limits). Native page
+        rendering covers scans without this. Slated for retirement once native
+        input is validated in prod. Returns the updated image_count.
+        """
+        if not (extracted_content.get("is_image_based") and mimetype == "application/pdf"):
+            return image_count
+        self.log_info(f"PDF {file_name} appears to be image-based (scanned document)")
+        if extracted_content.get("page_images"):
+            self.log_info(f"PDF has {len(extracted_content['page_images'])} page images for OCR")
+            for page_img in extracted_content['page_images']:
+                if image_count >= max_images:
+                    self.log_warning(f"Reached image limit, only processing first {image_count} PDF pages")
+                    break
+                image_inputs.append({
+                    "type": "input_image",
+                    "image_url": f"data:{page_img['mimetype']};base64,{page_img['base64_data']}",
+                    "source": "pdf_page",
+                    "page_number": page_img['page'],
+                    "filename": file_name
+                })
+                image_count += 1
+            extracted_content["content"] = (
+                f"[PDF {file_name}: {extracted_content.get('total_pages', 'unknown')} pages total. "
+                f"This appears to be a scanned document. "
+                f"Using vision/OCR on {len(extracted_content['page_images'])} page(s) for text extraction.]"
+            )
+            extracted_content["ocr_processed"] = True
+        else:
+            extracted_content["warning"] = "This PDF appears to be a scanned document with minimal extractable text"
+        return image_count
 
     def _build_message_with_documents(self, text: str, document_inputs: List[Dict]) -> str:
         """Format documents with page/sheet structure for OpenAI context
@@ -93,61 +225,45 @@ class MessageUtilitiesMixin:
         """
         if not document_inputs:
             return text
-            
+
         # Ensure text is a string
         if not isinstance(text, str):
             self.log_warning(f"text parameter is not a string: {type(text)}")
             text = str(text) if text else ""
-            
+
         # Start with the original message
         message_parts = [text] if text and text.strip() else []
-        
-        # Add document boundaries and content
+
+        # Phase D2: inject the labeled SUMMARY, never the full content — the
+        # model reaches full fidelity via read_document (and, for eligible PDFs,
+        # the native input_file part riding this same turn). Deterministic
+        # rendering: summaries are stable once written (cache hygiene).
         for doc in document_inputs:
             filename = doc.get("filename", "unknown_document")
             mimetype = doc.get("mimetype", "unknown")
-            content = doc.get("content")
-            # Ensure content is never None
-            if content is None:
-                content = "[Document content not available]"
-            elif not content:
-                content = "[Empty document]"
-            page_structure = doc.get("page_structure")
+            summary = doc.get("summary")
+            if not summary:
+                # Never render full content; fall back to a labeled excerpt
+                content = doc.get("content") or ""
+                summary = ("[excerpt of original — full document available via read_document]\n"
+                           + content[:1500]) if content else "[Document content not available]"
             total_pages = doc.get("total_pages")
-            
-            # Build document header
-            doc_header = f"\n\n=== DOCUMENT: {filename} ==="
+            size_bytes = doc.get("size_bytes")
+            file_id = doc.get("file_id")
+
+            header = f"\n\n=== DOCUMENT SUMMARY: {filename} ==="
+            details = [mimetype]
             if total_pages:
-                doc_header += f" ({total_pages} pages)"
-            doc_header += f"\nMIME Type: {mimetype}\n"
-            
-            # Add page/sheet structure info if available
-            if page_structure:
-                if isinstance(page_structure, dict):
-                    if "sheets" in page_structure:
-                        # Excel/CSV with multiple sheets
-                        sheet_names = list(page_structure["sheets"].keys())
-                        doc_header += f"Sheets: {', '.join(sheet_names[:5])}"  # Limit displayed sheet names
-                        if len(sheet_names) > 5:
-                            doc_header += f" (and {len(sheet_names) - 5} more)"
-                        doc_header += "\n"
-                    elif "pages" in page_structure:
-                        # PDF with page info
-                        doc_header += f"Pages: {len(page_structure['pages'])}\n"
-            
-            doc_header += "=== CONTENT START ===\n"
-            
-            # Add the document content (ensure all parts are strings)
-            if not isinstance(doc_header, str):
-                self.log_warning(f"doc_header is not a string: {type(doc_header)}")
-                doc_header = str(doc_header)
-            if not isinstance(content, str):
-                self.log_warning(f"content is not a string: {type(content)}")
-                content = str(content)
-                
-            message_parts.append(doc_header)
-            message_parts.append(content)
-            message_parts.append(f"\n=== DOCUMENT END: {filename} ===")
+                details.append(f"{total_pages} pages")
+            if size_bytes:
+                details.append(f"{size_bytes:,} bytes")
+            if file_id:
+                details.append(f"file_id: {file_id}")
+            header += f"\n({'; '.join(details)} — full content available via read_document)\n"
+
+            message_parts.append(header)
+            message_parts.append(str(summary))
+            message_parts.append(f"=== END DOCUMENT SUMMARY: {filename} ===")
         
         # Ensure all parts are strings before joining
         str_parts = []
@@ -295,52 +411,69 @@ class MessageUtilitiesMixin:
                                               f"Extracting content from {file_name}...", 
                                               emoji=config.analyze_emoji)
                         
-                        # Extract document content using DocumentHandler
+                        # Extract document content using DocumentHandler. Pre-extraction
+                        # native screen (flag + PDF + size): when a PDF may ride the
+                        # native input_file route, skip OCR page-image conversion —
+                        # the model gets rendered pages from the API itself. (If the
+                        # page count then disqualifies it, the rare oversized scan
+                        # falls back to local extraction without page images.)
+                        maybe_native = (
+                            config.enable_native_file_input
+                            and mimetype == "application/pdf"
+                            and len(document_data) <= config.native_file_max_mb * 1024 * 1024
+                        )
                         extracted_content = await self.document_handler.safe_extract_content_async(
-                            document_data, mimetype, file_name
+                            document_data, mimetype, file_name,
+                            ocr_images=not maybe_native
                         )
                         
                         if extracted_content and extracted_content.get("content"):
-                            # Check if this is an image-based PDF that needs OCR
-                            if extracted_content.get("is_image_based") and mimetype == "application/pdf":
-                                self.log_info(f"PDF {file_name} appears to be image-based (scanned document)")
-                                
-                                # Check if we have page images for OCR
-                                if extracted_content.get("page_images"):
-                                    self.log_info(f"PDF has {len(extracted_content['page_images'])} page images for OCR")
-                                    # Add page images to image_inputs for vision processing
-                                    for page_img in extracted_content['page_images']:
-                                        if image_count >= max_images:
-                                            self.log_warning(f"Reached image limit, only processing first {image_count} PDF pages")
-                                            break
-                                        
-                                        image_inputs.append({
-                                            "type": "input_image",
-                                            "image_url": f"data:{page_img['mimetype']};base64,{page_img['base64_data']}",
-                                            "source": "pdf_page",
-                                            "page_number": page_img['page'],
-                                            "filename": file_name
-                                        })
-                                        image_count += 1
-                                    
-                                    # Update the document content to indicate OCR will be used
-                                    extracted_content["content"] = (
-                                        f"[PDF {file_name}: {extracted_content.get('total_pages', 'unknown')} pages total. "
-                                        f"This appears to be a scanned document. "
-                                        f"Using vision/OCR on {len(extracted_content['page_images'])} page(s) for text extraction.]"
-                                    )
-                                    extracted_content["ocr_processed"] = True
-                                else:
-                                    # No page images available
-                                    extracted_content["warning"] = "This PDF appears to be a scanned document with minimal extractable text"
-                            
+                            # Native-vs-local decision (one place, documented in
+                            # _native_file_eligible). Local extraction already ran —
+                            # it always does: it feeds the summary, page count,
+                            # spreadsheet schema, and warms the read_document cache.
+                            native = self._native_file_eligible(
+                                mimetype, len(document_data),
+                                extracted_content.get("total_pages"))
+
+                            if native:
+                                # Model reads the actual PDF this turn (text +
+                                # rendered pages) — the legacy OCR path is not
+                                # needed for scans on this route.
+                                file_data_b64 = base64.b64encode(document_data).decode("ascii")
+                            else:
+                                file_data_b64 = None
+                                # Legacy scanned-PDF OCR (flag-off / oversized PDFs
+                                # only) — isolated here; slated for retirement.
+                                image_count = self._apply_scanned_pdf_ocr(
+                                    extracted_content, mimetype, file_name,
+                                    image_inputs, image_count, max_images)
+
+                            # Attach-time summary: the only content that persists.
+                            if thinking_id:
+                                self._update_status(client, message.channel_id, thinking_id,
+                                                  f"Summarizing {file_name}...",
+                                                  emoji=config.analyze_emoji)
+                            doc_summary = await self._summarize_document_for_attach(
+                                extracted_content, file_name, mimetype)
+
+                            # Warm the read_document extraction LRU (in-memory only)
+                            if file_id:
+                                from message_processor.document_tools import _extraction_cache
+                                _extraction_cache.put(file_id, extracted_content["content"])
+
                             document_inputs.append({
                                 "filename": file_name,
                                 "mimetype": mimetype,
+                                # content is TRANSIENT (this turn's analysis only);
+                                # it is never persisted or re-injected.
                                 "content": extracted_content["content"],
+                                "summary": doc_summary,
+                                "native": native,
+                                "file_data_b64": file_data_b64,
+                                "size_bytes": len(document_data),
                                 "page_structure": extracted_content.get("page_structure"),
                                 "total_pages": extracted_content.get("total_pages"),
-                                "summary": extracted_content.get("summary"),
                                 "metadata": extracted_content.get("metadata", {}),
                                 "url": attachment.get("url"),
                                 "file_id": file_id,
@@ -350,27 +483,29 @@ class MessageUtilitiesMixin:
                                 "ocr_processed": extracted_content.get("ocr_processed", False),
                                 "warning": extracted_content.get("warning")
                             })
-                            
-                            # Store document in thread's DocumentLedger
+
+                            # Store summary + metadata + Slack ref (never content)
                             thread_key = f"{message.channel_id}:{message.thread_id}"
                             document_ledger = self.thread_manager.get_or_create_document_ledger(message.thread_id)
                             document_ledger.add_document(
-                                content=extracted_content["content"],
+                                content=extracted_content["content"],  # transient; used only as summary fallback
                                 filename=file_name,
                                 mime_type=mimetype,
                                 page_structure=extracted_content.get("page_structure"),
                                 total_pages=extracted_content.get("total_pages"),
-                                summary=extracted_content.get("summary"),
+                                summary=doc_summary,
                                 metadata=extracted_content.get("metadata", {}),
                                 db=self.db,
                                 thread_id=thread_key,
-                                message_ts=message.metadata.get("ts") if message.metadata else None
+                                message_ts=message.metadata.get("ts") if message.metadata else None,
+                                file_id=file_id,
+                                url_private=attachment.get("url"),
+                                size_bytes=len(document_data),
                             )
-                            
-                            if extracted_content.get("is_image_based"):
-                                self.log_info(f"Processed image-based PDF: {file_name} ({extracted_content.get('total_pages', 'unknown')} pages)")
-                            else:
-                                self.log_info(f"Processed document: {file_name} ({extracted_content.get('total_pages', 'unknown')} pages)")
+
+                            route = "native input_file" if native else "local extraction"
+                            self.log_info(f"Processed document: {file_name} "
+                                          f"({extracted_content.get('total_pages', 'unknown')} pages, {route})")
                         else:
                             self.log_warning(f"Failed to extract content from document: {file_name}")
                             # Update status to show extraction failed

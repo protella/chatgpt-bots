@@ -101,7 +101,8 @@ class DocumentHandler(LoggerMixin):
         self.max_document_size = max_document_size
     # Async entry point (single implementation; per-parser async wrappers were
     # phantoms referencing methods that never existed and have been removed)
-    async def safe_extract_content_async(self, file_data: bytes, mime_type: str, filename: str) -> Dict[str, Any]:
+    async def safe_extract_content_async(self, file_data: bytes, mime_type: str, filename: str,
+                                          ocr_images: bool = True) -> Dict[str, Any]:
         """Async entry point for document extraction.
 
         Deliberately a thin executor wrapper around the SYNC safe_extract_content:
@@ -114,7 +115,9 @@ class DocumentHandler(LoggerMixin):
         try:
             return await asyncio.wait_for(
                 loop.run_in_executor(
-                    _EXTRACTION_EXECUTOR, self.safe_extract_content, file_data, mime_type, filename
+                    _EXTRACTION_EXECUTOR,
+                    lambda: self.safe_extract_content(file_data, mime_type, filename,
+                                                      ocr_images=ocr_images),
                 ),
                 timeout=EXTRACTION_TIMEOUT_SECONDS,
             )
@@ -142,7 +145,8 @@ class DocumentHandler(LoggerMixin):
         # Check file extension
         filename_lower = filename.lower()
         return any(filename_lower.endswith(ext) for ext in DOCUMENT_EXTENSIONS)
-    def safe_extract_content(self, file_data: bytes, mime_type: str, filename: str) -> Dict[str, Any]:
+    def safe_extract_content(self, file_data: bytes, mime_type: str, filename: str,
+                             ocr_images: bool = True) -> Dict[str, Any]:
         """
         Safely extract document content with comprehensive error recovery
         Args:
@@ -188,9 +192,13 @@ class DocumentHandler(LoggerMixin):
                     'error': 'Decompressed size exceeds safety limit',
                     'format': 'error',
                 }
-            # Get the parser method
-            parser_method = getattr(self, handler_name)
-            result = parser_method(file_data, filename)
+            # Get the parser method (PDF takes the OCR-images toggle; the native
+            # input_file route sets ocr_images=False so scans skip pdf2image entirely)
+            if handler_name == 'parse_pdf_structured':
+                result = self.parse_pdf_structured(file_data, filename, ocr_images=ocr_images)
+            else:
+                parser_method = getattr(self, handler_name)
+                result = parser_method(file_data, filename)
             # Sanitize the content
             if 'content' in result:
                 result['content'] = self.sanitize_content(result['content'])
@@ -253,7 +261,8 @@ class DocumentHandler(LoggerMixin):
         # No size limit - let the model's token limit handle it
         # Previously limited to 1MB
         return sanitized
-    def parse_pdf_structured(self, file_data: bytes, filename: str) -> Dict[str, Any]:
+    def parse_pdf_structured(self, file_data: bytes, filename: str,
+                             ocr_images: bool = True) -> Dict[str, Any]:
         """
         Extract PDF content preserving tables and page structure
         Args:
@@ -272,6 +281,15 @@ class DocumentHandler(LoggerMixin):
         if result and self._is_image_based_pdf(result):
             result['is_image_based'] = True
             result['requires_ocr'] = True
+            if not ocr_images:
+                # Caller will present the PDF natively (rendered pages) — skip the
+                # pdf2image conversion (and its poppler temp files) entirely.
+                result['content'] = (
+                    f"[Note: This PDF appears to be a scanned document; text extraction found "
+                    f"minimal content. The document is being provided to the model as rendered pages.]\n\n"
+                    f"{result.get('content', '[No text extracted from PDF]')}"
+                )
+                return result
             # Convert PDF pages to images for vision processing
             self.log_info(f"Converting image-based PDF {filename} to images for OCR")
             page_images = self.convert_pdf_to_images(file_data, max_pages=10)
