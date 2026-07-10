@@ -61,6 +61,8 @@ async def _run_tool_round(
         except Exception as e:  # noqa: BLE001 — status UI must never break the loop
             self.log_warning(f"Tool callback error for {tool_id}: {e}")
 
+    from message_processor.tool_provenance import gist_from_arguments
+
     overrides = result_overrides or {}
     calls = _function_calls(sink)
     for call in calls:
@@ -74,7 +76,9 @@ async def _run_tool_round(
         cid = call.get("call_id")
         result = overrides[cid] if cid in overrides else dispatched_by_id.get(id(call))
         ok = _call_ok(result)
-        local_tool_calls.append({"name": call.get("name"), "ok": ok})
+        # F7: capture a short arg-derived gist alongside name/ok (provenance; no results).
+        local_tool_calls.append({"name": call.get("name"), "ok": ok,
+                                 "gist": gist_from_arguments(call.get("arguments"))})
         self.log_info(f"Local tool '{call.get('name')}' -> {'ok' if ok else 'error'}")
         result_by_id[id(call)] = result
         await _notify(f"local:{call.get('name')}", "completed")
@@ -165,10 +169,13 @@ async def _handle_no_reply_terminal(
     skipped = [c.get("name") for c in calls if id(c) not in exec_ids]
     if skipped:
         self.log_info(f"{_NO_REPLY_TOOL} terminal — suppressing sibling calls: {skipped}")
+    from message_processor.tool_provenance import gist_from_arguments
+
     results = await registry.dispatch_all(tool_context, exec_calls)
     for call, result in zip(exec_calls, results):
         if call.get("name") == _REACT_TOOL:
-            local_tool_calls.append({"name": call.get("name"), "ok": _call_ok(result)})
+            local_tool_calls.append({"name": call.get("name"), "ok": _call_ok(result),
+                                     "gist": gist_from_arguments(call.get("arguments"))})
     _merge_used(tools_used_all, [c.get("name") for c in exec_calls if c.get("name")])
     reason = _sanitize_reason(terminal_call)
     self.log_info(f"{_NO_REPLY_TOOL}: ending turn without posting — reason: {reason!r}")
