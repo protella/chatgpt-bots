@@ -127,7 +127,14 @@ class MessageProcessor(ThreadManagementMixin,
                 client,
                 thinking_id
             )
-            
+
+            # F3: if the root author is still unknown and THIS message is the thread root
+            # (a new top-level message whose warm state skipped the rebuild), the sender is
+            # the root author.
+            if getattr(thread_state, "root_author", None) is None and message.metadata:
+                if message.metadata.get("ts") == thread_state.thread_ts:
+                    thread_state.root_author = (message.user_id, message.metadata.get("sender_type"))
+
             # Check if this thread had a previous timeout
             if hasattr(thread_state, 'had_timeout') and thread_state.had_timeout:
                 # Send timeout notification to user

@@ -318,6 +318,16 @@ DMs behave as before.
   bot's hourly self-started-reply budget — reactions and deliberate silence no longer burn
   that budget.
 
+### 🧭 Feature - The bot knows why it woke up
+
+- The model now receives a compact, internal "wake context" note alongside each channel
+  message telling it why it's responding — an @-mention, its name coming up in passing, a
+  direct-message, a 1:1 thread reply, an ambient judgment call (with the reason), or a
+  batched catch-up — plus whether the sender started the thread or joined it, and whether
+  they're a person or another bot. This sharpens the bot's read of who's talking to whom
+  and when a reply is actually wanted. The note is internal context only (never posted,
+  never stored). Toggle with `ENABLE_WAKE_ENVELOPE` (default on).
+
 ## [2.5.1] - 2026-05-11
 
 ### 🚀 Feature - GPT-5.5 Support
