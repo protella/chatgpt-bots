@@ -423,7 +423,7 @@ class SettingsModal(LoggerMixin):
                 "text": {"type": "plain_text", "text": self._get_reasoning_display(current_reasoning)},
                 "value": current_reasoning
             }
-            self.log_debug(f"Set initial_option for GPT-5.4 reasoning: {current_reasoning}")
+            self.log_debug(f"Set initial_option for reasoning: {current_reasoning}")
         else:
             if available_values:
                 default_value = 'none'
@@ -467,7 +467,7 @@ class SettingsModal(LoggerMixin):
             }
         })
 
-        # Temperature and Top P - only visible when reasoning=none for GPT-5.4
+        # Temperature and Top P - only visible when reasoning=none
         if current_reasoning == 'none':
             blocks.append({
                 "type": "context",
@@ -568,7 +568,7 @@ class SettingsModal(LoggerMixin):
 
         # Web search
         feature_options.append({
-            "text": {"type": "mrkdwn", "text": "🌐 *Web Search*\nAllow searching the web for current information\n_(Disables the \"Minimal\" reasoning option above when enabled)_"},
+            "text": {"type": "mrkdwn", "text": "🌐 *Web Search*\nAllow searching the web for current information"},
             "value": "web_search"
         })
         if settings.get('enable_web_search', True):
@@ -771,72 +771,22 @@ class SettingsModal(LoggerMixin):
             if selected:
                 extracted['model'] = selected['value']
         
-        # GPT-5/5.1/5.2 settings
-        # Check all possible block_ids (different ones based on model and web search state)
-        reasoning_block = (values.get('reasoning_block_no_web', {}) or
-                          values.get('reasoning_block_web', {}) or
-                          values.get('reasoning_block_gpt51', {}) or
-                          values.get('reasoning_block_gpt52', {}) or
-                          values.get('reasoning_block_gpt54', {}))
-
-        # Check all possible action_ids
+        # Reasoning effort (block/action ids kept stable across model families)
+        reasoning_block = values.get('reasoning_block_gpt54', {})
         reasoning_found = False
-        if 'reasoning_level' in reasoning_block:
-            selected = reasoning_block['reasoning_level'].get('selected_option')
-            if selected:
-                extracted['reasoning_effort'] = selected['value']
-                reasoning_found = True
-            else:
-                # No selection - might happen during modal updates
-                self.log_debug("No reasoning_level selected_option found")
-        elif 'reasoning_level_no_minimal' in reasoning_block:
-            selected = reasoning_block['reasoning_level_no_minimal'].get('selected_option')
-            if selected:
-                extracted['reasoning_effort'] = selected['value']
-                reasoning_found = True
-            else:
-                self.log_debug("No reasoning_level_no_minimal selected_option found")
-        elif 'reasoning_level_gpt51' in reasoning_block:
-            selected = reasoning_block['reasoning_level_gpt51'].get('selected_option')
-            if selected:
-                extracted['reasoning_effort'] = selected['value']
-                reasoning_found = True
-            else:
-                self.log_debug("No reasoning_level_gpt51 selected_option found")
-        elif 'reasoning_level_gpt52' in reasoning_block:
-            selected = reasoning_block['reasoning_level_gpt52'].get('selected_option')
-            if selected:
-                extracted['reasoning_effort'] = selected['value']
-                reasoning_found = True
-            else:
-                self.log_debug("No reasoning_level_gpt52 selected_option found")
-        elif 'reasoning_level_gpt54' in reasoning_block:
+        if 'reasoning_level_gpt54' in reasoning_block:
             selected = reasoning_block['reasoning_level_gpt54'].get('selected_option')
             if selected:
                 extracted['reasoning_effort'] = selected['value']
                 reasoning_found = True
             else:
+                # No selection - might happen during modal updates
                 self.log_debug("No reasoning_level_gpt54 selected_option found")
 
         # Fallback if no reasoning selection due to Slack modal update bug
         if not reasoning_found:
-            # Check if web search is enabled from the form
-            features_block = values.get('features_block_gpt4', {}) or values.get('features_block_gpt5', {})
-            web_search_enabled = False
-            if 'features_no_mcp' in features_block:
-                selected_options = features_block['features_no_mcp'].get('selected_options', [])
-                selected_values = [opt['value'] for opt in selected_options]
-                web_search_enabled = 'web_search' in selected_values
-            elif 'features_with_mcp' in features_block:
-                selected_options = features_block['features_with_mcp'].get('selected_options', [])
-                selected_values = [opt['value'] for opt in selected_options]
-                web_search_enabled = 'web_search' in selected_values
-
-            # Use a safe default based on web search state
-            model = extracted.get('model', config.gpt_model)
-            default_reasoning = 'low' if web_search_enabled else 'none'
-            extracted['reasoning_effort'] = default_reasoning
-            self.log_debug(f"No reasoning selection found - using default: {default_reasoning} for model {model} (web_search: {web_search_enabled})")
+            extracted['reasoning_effort'] = 'none'
+            self.log_debug("No reasoning selection found - using default: none")
         
         verbosity_block = values.get('verbosity_block', {})
         if 'verbosity' in verbosity_block:
@@ -844,7 +794,7 @@ class SettingsModal(LoggerMixin):
             if selected:
                 extracted['verbosity'] = selected['value']
         
-        # GPT-4 settings
+        # Temperature / Top P (only present in the form when reasoning=none)
         temp_block = values.get('temperature_block', {})
         if 'temperature' in temp_block:
             extracted['temperature'] = float(temp_block['temperature'].get('value', 0.8))
@@ -854,17 +804,8 @@ class SettingsModal(LoggerMixin):
             extracted['top_p'] = float(top_p_block['top_p'].get('value', 1.0))
         
         # Features
-        # Check both possible block_ids (we use different ones based on model)
-        features_block = values.get('features_block_gpt4', {}) or values.get('features_block_gpt5', {})
-
-        # Check both possible action_ids
-        if 'features_no_mcp' in features_block:
-            selected_options = features_block['features_no_mcp'].get('selected_options', [])
-            selected_values = [opt['value'] for opt in selected_options]
-            extracted['enable_web_search'] = 'web_search' in selected_values
-            extracted['enable_streaming'] = 'streaming' in selected_values
-            # Don't set enable_mcp when it's not visible - preserve stored value
-        elif 'features_with_mcp' in features_block:
+        features_block = values.get('features_block_gpt5', {})
+        if 'features_with_mcp' in features_block:
             selected_options = features_block['features_with_mcp'].get('selected_options', [])
             selected_values = [opt['value'] for opt in selected_options]
             extracted['enable_web_search'] = 'web_search' in selected_values
@@ -935,11 +876,6 @@ class SettingsModal(LoggerMixin):
                 self.log_info(f"Clamped reasoning_effort {validated['reasoning_effort']} -> {clamped} for {model}")
                 validated['reasoning_effort'] = clamped
 
-        # If web search enabled but reasoning too low (minimal), auto-upgrade
-        if validated.get('enable_web_search') and validated.get('reasoning_effort') == 'minimal':
-            validated['reasoning_effort'] = 'low'
-            self.log_info("Auto-upgraded reasoning_effort from minimal to low for web search compatibility")
-
         # Check if both temperature and top_p are changed for models that support them
         # (gpt-5.5 and the 5.6 family support temp/top_p only with reasoning=none)
         supports_temp = ((model.startswith('gpt-5.5') or model.startswith('gpt-5.6'))
@@ -978,7 +914,6 @@ class SettingsModal(LoggerMixin):
         """Get display name for reasoning level"""
         displays = {
             'none': '🌟 None (Adaptive)',
-            'minimal': '⚡ Minimal (Fastest, Chat-like)',
             'low': '🚀 Low (Fast)',
             'medium': '⚖️ Medium (Balanced)',
             'high': '🧠 High (Thorough)',

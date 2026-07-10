@@ -33,12 +33,13 @@ async def generate_image(
         client: OpenAI client instance
         prompt: Text description of the image to generate
         model: Image model ID. Defaults to config.image_model.
-        size: Image dimensions (1024x1024, 1024x1536, 1536x1024, auto)
-        quality: Rendering quality (low, medium, high) - affects cost and detail
+        size: Image dimensions (1024x1024, 1024x1536, 1536x1024, auto); gpt-image-2
+            also accepts arbitrary WxH (multiples of 16, aspect <=3:1, up to 3840x2160)
+        quality: Rendering quality (auto, low, medium, high) - affects cost and detail
         background: Background type (auto, transparent, opaque). gpt-image-2 does NOT
             support transparent — coerced to auto with a warning.
         format: Output format (png, jpeg, webp)
-        compression: Compression level for jpeg/webp (0-100)
+        compression: Compression level for jpeg/webp (0-100); PNG must be 100
         enhance_prompt: Whether to enhance the prompt with AI
         conversation_history: Previous messages for context
 
@@ -52,6 +53,8 @@ async def generate_image(
     size = size or config.default_image_size
     quality = quality or config.default_image_quality
     background = background or config.default_image_background
+    format = format or config.default_image_format
+    compression = compression if compression is not None else config.default_image_compression
 
     # gpt-image-2 does not support transparent backgrounds — coerce to auto
     if _is_v2(effective_model) and background == "transparent":
@@ -76,7 +79,14 @@ async def generate_image(
             "size": size,
             "quality": quality,
             "background": background,
+            "output_format": format,
         }
+
+        # Only add compression for JPEG/WebP (PNG must be 100)
+        if format in ["jpeg", "webp"]:
+            params["output_compression"] = compression
+        elif format == "png" and compression != 100:
+            self.log_debug(f"PNG format requires compression=100, ignoring {compression}")
 
         # Use the images.generate API for image generation
         response = await self._safe_api_call(
@@ -114,7 +124,7 @@ async def generate_image(
 
         return ImageData(
             base64_data=image_data,
-            format="png",  # API always returns PNG for now
+            format=format,
             prompt=enhanced_prompt,  # Store the enhanced prompt that was actually used
         )
 
@@ -179,7 +189,7 @@ async def _enhance_image_edit_prompt(
             "store": False,
         }
 
-        # Utility model is a GPT-5-series reasoning model (gpt-5-mini)
+        # Utility model is a reasoning model (gpt-5.6-luna by default) — temperature fixed at 1.0
         request_params["temperature"] = 1.0
         request_params["reasoning"] = {"effort": config.utility_reasoning_effort}
         request_params["text"] = {"verbosity": config.utility_verbosity}
@@ -371,6 +381,7 @@ async def edit_image(
     input_mimetypes: Optional[List[str]] = None,
     image_description: Optional[str] = None,
     input_fidelity: str = "low",
+    quality: Optional[str] = None,
     background: Optional[str] = None,
     mask: Optional[str] = None,
     output_format: str = "png",
@@ -393,7 +404,8 @@ async def edit_image(
     # Resolve model + apply v2 param guards
     effective_model = model or config.image_model
 
-    # Default background
+    # Default quality/background
+    quality = quality or config.default_image_quality
     background = background or config.default_image_background
 
     # gpt-image-2 does not support transparent backgrounds
@@ -449,6 +461,7 @@ async def edit_image(
             "model": effective_model,
             "image": image_files if len(image_files) > 1 else image_files[0],
             "prompt": enhanced_prompt,
+            "quality": quality,
             "background": background,
             "output_format": output_format,
             "n": 1,

@@ -698,10 +698,8 @@ class SlackSettingsHandlersMixin:
             except SlackApiError as e:
                 self.log_error(f"Error updating modal for model change: {e}")
         
-        # Register handlers for features checkbox (needs modal rebuild for web search and MCP)
-        @self.app.action("features")  # Legacy - kept for compatibility
-        @self.app.action("features_with_mcp")  # Current features checkbox (MCP included)
-        @self.app.action("features_no_mcp")  # Legacy id from the dropped pre-5.5 lineup - kept for open modals
+        # Register handler for features checkbox (needs modal rebuild for web search and MCP)
+        @self.app.action("features_with_mcp")
         async def handle_features_change(ack, body, client):
             """Handle feature checkbox changes, especially web search and model-specific features"""
             await ack()
@@ -960,17 +958,13 @@ class SlackSettingsHandlersMixin:
                     view=updated_modal
                 )
                 if response.get('ok'):
-                    self.log_debug(f"Modal updated for GPT-5.4 reasoning change: {selected_reasoning}")
+                    self.log_debug(f"Modal updated for reasoning change: {selected_reasoning}")
                 else:
                     self.log_error(f"Failed to update modal: {response.get('error')}")
             except SlackApiError as e:
                 self.log_error(f"Error updating modal for reasoning change: {e}")
 
         # Register action handlers for other interactive components (just acknowledge)
-        @self.app.action("reasoning_level")
-        @self.app.action("reasoning_level_no_minimal")  # Alternative action_id when minimal is hidden
-        @self.app.action("reasoning_level_gpt51")  # GPT-5.1 reasoning options
-        @self.app.action("reasoning_level_gpt52")  # GPT-5.2 reasoning options (includes xhigh)
         @self.app.action("verbosity")
         @self.app.action("input_fidelity")
         @self.app.action("vision_detail")

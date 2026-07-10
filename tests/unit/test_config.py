@@ -44,7 +44,6 @@ class TestBotConfig:
         config = BotConfig()
         assert config.enable_web_search is True
         assert config.enable_streaming is True
-        assert config.debug_mode is False
     
     def test_validate_success(self, mock_env):
         """Test successful validation with all required fields"""
@@ -338,8 +337,7 @@ class TestBotConfig:
             },
             "features": {
                 "web_search": config.enable_web_search,
-                "streaming": config.enable_streaming,
-                "debug": config.debug_mode
+                "streaming": config.enable_streaming
             }
         }
 
