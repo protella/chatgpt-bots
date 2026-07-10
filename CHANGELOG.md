@@ -86,6 +86,11 @@ into `data/backups/` first (your rollback path). Watch for these log lines:
   instead of `gpt-5-mini`
 - Prompt caching on 5.6 models is automatic (no cache-retention parameter needed);
   GPT-5.5 keeps its 24-hour retention behavior
+- **Context budgets audited against verified model specs**: all 5.6 models and
+  GPT-5.5 use their full 1,050,000-token window (~920k usable after the reserve
+  for output, tool results, and estimator error), and the bot now logs once per
+  thread when a conversation crosses the 272k long-context billing tier (requests
+  beyond it bill at 2× input / 1.5× output — informational only, nothing blocks)
 
 #### Removed
 - **All pre-5.5 model support**: GPT-4 series, `gpt-5`, `gpt-5-nano`, `gpt-5-chat-*`,
