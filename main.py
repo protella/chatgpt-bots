@@ -236,7 +236,7 @@ class ChatBotV2:
                     if thinking_id and hasattr(client, "update_message"):
                         await client.update_message(
                             message.channel_id, thinking_id,
-                            f"{config.thinking_emoji} {catch_up}"
+                            f"{config.circle_loader_emoji} {catch_up}"
                         )
                     elif thinking_id is None and hasattr(client, "set_assistant_status"):
                         # Status-only DM indicator: the composer status carries it.
