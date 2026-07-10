@@ -131,11 +131,16 @@ class ChatBotV2:
 
             if verdict.action == "react":
                 react_ts = message.metadata.get("ts") or message.thread_id
-                if hasattr(client, "react"):
-                    try:
+                # F6: route the gate's own reaction through the reservation guard so a
+                # later main-model turn on this message honestly sees the slot consumed
+                # (and won't double-add the same emoji). Falls back to the raw react.
+                try:
+                    if hasattr(client, "_reserve_and_react"):
+                        await client._reserve_and_react(channel_id, react_ts, verdict.emoji)
+                    elif hasattr(client, "react"):
                         await client.react(channel_id, react_ts, verdict.emoji)
-                    except Exception as e:
-                        main_logger.debug(f"Participation react failed: {e}")
+                except Exception as e:
+                    main_logger.debug(f"Participation react failed: {e}")
                 return None
             if verdict.action == "backoff":
                 await self._apply_backoff(message, client)

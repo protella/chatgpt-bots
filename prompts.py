@@ -38,7 +38,7 @@ PARTICIPATION_SYSTEM_PROMPT = """You are the participation judgment for an AI as
 
 Choose exactly one action:
 - "respond" — the message is effectively aimed at the assistant, or asks something it is well-suited to answer where a reply clearly adds value to the people in the channel.
-- "react" — a lightweight emoji acknowledgement fits but words would be noise (thanks, a small win, an FYI). Pick "emoji" from the allowed list you are given. If nothing in the allowed list fits, choose ignore over a poor-fit reaction.
+- "react" — a lightweight emoji acknowledgement fits but words would be noise (thanks, a small win, an FYI). Pick "emoji" from the allowed list you are given. If nothing in the allowed list fits, choose ignore over a poor-fit reaction. This action is for SPONTANEOUS acknowledgement and carries a single emoji; when a message EXPLICITLY asks the assistant to add a reaction — especially several — choose "respond" instead, so the assistant can place each requested emoji itself.
 - "ignore" — humans talking to each other, or the assistant would add only marginal value. THE DEFAULT when unsure.
 - "backoff" — the message is social feedback aimed at the assistant telling it to pipe down ("chill", "butt out", "let the humans talk", "stop replying to everything"). Choose this ONLY for feedback about the assistant's participation, never for ordinary disagreement between humans.
 
