@@ -302,7 +302,9 @@ class TestStatusPlainText:
         assert _status_plain_text("") == "working on it…"
 
     @pytest.mark.asyncio
-    async def test_set_assistant_status_sends_sanitized_text(self, monkeypatch):
+    async def test_explicit_phase_status_sends_alone_and_sanitized(self, monkeypatch):
+        # Slack renders status + loading_messages as TWO separate indicators; an
+        # explicit phase status therefore goes out WITHOUT the default rotation.
         from config import config
         monkeypatch.setattr(config, "enable_assistant_status", True)
         monkeypatch.setattr(config, "status_loading_messages", [":mag: one…", ":datassential: two…"])
@@ -310,4 +312,15 @@ class TestStatusPlainText:
         await host.set_assistant_status("D1", "1.0", status=":hourglass_flowing_sand: pulling it together…")
         kwargs = host.app.client.assistant_threads_setStatus.await_args.kwargs
         assert kwargs["status"] == "⏳ pulling it together…"
+        assert "loading_messages" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_initial_indicator_sends_rotation_sanitized(self, monkeypatch):
+        from config import config
+        monkeypatch.setattr(config, "enable_assistant_status", True)
+        monkeypatch.setattr(config, "status_loading_messages", [":mag: one…", ":datassential: two…"])
+        host = _MsgClient(SimpleNamespace(assistant_threads_setStatus=AsyncMock()))
+        await host.set_assistant_status("D1", "1.0")
+        kwargs = host.app.client.assistant_threads_setStatus.await_args.kwargs
         assert kwargs["loading_messages"] == ["🔍 one…", "two…"]
+        assert ":hourglass" not in kwargs["status"]
