@@ -287,9 +287,11 @@ DMs behave as before.
 
 - Image generation and editing now show an accumulating checklist that ticks off each
   step in place ("✓ Enhanced prompt → ✓ Generated image → Uploading…") instead of a
-  single status line that overwrites itself. On surfaces where only the composer status
-  is available, it falls back to that automatically. Toggle with `ENABLE_PROGRESS_CHECKLIST`
-  (default on).
+  single status line that overwrites itself. It posts as a real, visible message in the
+  thread so the steps are always there to watch, and — where Slack also shows the little
+  "working…" status under the composer — the current step is mirrored there too. Toggle
+  the whole checklist with `ENABLE_PROGRESS_CHECKLIST` (default on); set
+  `PROGRESS_CHECKLIST_PREFER_MESSAGE=false` to go back to the status-line-only behavior.
 
 ### 🖼️ Feature - Image generation no longer freezes the conversation
 

@@ -531,3 +531,24 @@ async def test_checklist_message_carries_marker():
     await c.step("Generating image…", done_text="Generated image")
     sent = client.update_message.await_args.args[2]
     assert CHECKLIST_STATUS_MARKER in sent
+
+
+@pytest.mark.asyncio
+async def test_abort_checklist_clears_mirrored_status_and_deletes_message():
+    # A force-message checklist deletes its message AND clears the mirrored composer
+    # status on abort (moderation/cancel), so no status bubble lingers.
+    client = _delivery_client(
+        send_thinking_indicator=AsyncMock(return_value=None),
+        send_message_get_ts=AsyncMock(return_value={"success": True, "ts": "posted1"}),
+        set_assistant_status=AsyncMock(return_value=True),
+    )
+    from message_processor.handlers.image_gen import ImageGenerationMixin
+    host = SimpleNamespace(log_warning=lambda *a, **k: None)
+    host._abort_checklist = ImageGenerationMixin._abort_checklist.__get__(host)
+    c = ProgressChecklist(client, "C1", "T1", min_edit_interval=0, prefer_message=True)
+    await c.step("Generating image…", done_text="Generated image")
+    assert c.surface == "message" and c.mirrors_status is True
+
+    await host._abort_checklist(c, client, "C1", "T1")
+    client.delete_message.assert_awaited_once_with("C1", "posted1")
+    client.clear_assistant_status.assert_awaited_once_with("C1", "T1")
