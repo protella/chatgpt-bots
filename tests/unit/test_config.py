@@ -143,6 +143,7 @@ class TestBotConfig:
         """Test emoji settings"""
         config = BotConfig()
         # Just verify these properties exist and have values
+        assert config.thinking_emoji
         assert config.circle_loader_emoji
         assert config.web_search_emoji
         assert config.loading_ellipse_emoji

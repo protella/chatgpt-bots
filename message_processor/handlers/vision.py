@@ -785,7 +785,7 @@ class VisionHandlerMixin:
             combined_context = "\n".join(str_context_parts)
             
             # Step 3: Send to text model for final analysis
-            self._update_status(client, channel_id, thinking_id, pipeline_status("generating_response", "Generating comprehensive response…"), emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
+            self._update_status(client, channel_id, thinking_id, pipeline_status("generating_response", "Generating comprehensive response…"), emoji=config.thinking_emoji, thread_id=thread_state.thread_ts)
             
             # Use text response handler with the combined context
             return await self._handle_text_response(combined_context, thread_state, client, message, thinking_id, retry_count=0)

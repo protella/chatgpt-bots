@@ -208,6 +208,10 @@ class BotConfig:
     ))
     
     # UI Configuration
+    # Prefix on status/progress placeholder messages. Default is a Slack BUILT-IN
+    # emoji so fresh installs work without custom emoji; point it at a custom
+    # loader (e.g. :circle-loader:) if your workspace has one.
+    thinking_emoji: str = field(default_factory=lambda: os.getenv("THINKING_EMOJI", ":hourglass_flowing_sand:"))
     web_search_emoji: str = field(default_factory=lambda: os.getenv("WEB_SEARCH_EMOJI", ":web_search:"))
     loading_ellipse_emoji: str = field(default_factory=lambda: os.getenv("LOADING_ELLIPSE_EMOJI", ":loading-ellipse:"))
     circle_loader_emoji: str = field(default_factory=lambda: os.getenv("CIRCLE_LOADER_EMOJI", ":circle-loader:"))

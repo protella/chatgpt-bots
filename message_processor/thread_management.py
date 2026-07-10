@@ -894,7 +894,7 @@ class ThreadManagementMixin:
                         message.channel_id, 
                         thinking_id,
                         pipeline_status("rebuilding_history", "Rebuilding thread history from Slack…"),
-                        emoji=config.circle_loader_emoji
+                        emoji=config.thinking_emoji
                     )
                 self.log_info(f"Rebuilding thread state for {message.thread_id} with {len(history)} messages")
             
@@ -1207,7 +1207,7 @@ class ThreadManagementMixin:
                     message.channel_id,
                     thinking_id,
                     pipeline_status("optimizing_history", f"Optimizing conversation history ({current_tokens:,}/{max_tokens:,} tokens)…"),
-                    emoji=config.circle_loader_emoji
+                    emoji=config.thinking_emoji
                 )
 
             # Phase S: one chunky compaction to target; the dropped span rolls into the
