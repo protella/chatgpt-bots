@@ -185,15 +185,19 @@ class ChatBotV2:
                 return
             placement_verdict = verdict.placement
 
-        # Phase F placement (plan §4a): a genuine top-level reply happens only when the
-        # channel's reply_in_channel setting is ON (the setting wins over the engine's
-        # placement verdict, which is logged but not authoritative) AND the trigger was
-        # itself top-level. Everything else threads. Images always thread (enforced in
-        # the image branch, which keys off message.thread_id regardless).
+        # Phase F placement (plan §4a, revised 2026-07-10): the channel's
+        # reply_in_channel setting is an ALLOWANCE, not a mandate — when it's ON and
+        # the trigger was top-level, the engine's per-message placement verdict
+        # decides ("channel" = quick top-level answer, "thread" = worth a thread).
+        # Mentions/name-wakes carry no verdict (no engine call) and reply top-level:
+        # the user summoned the bot at channel level. Setting OFF = everything
+        # threads. Images always thread (enforced in the image branch, which keys
+        # off message.thread_id regardless).
         is_top_level_trigger = message.metadata.get("ts") == message.thread_id
         place_in_channel = (
             bool(message.metadata.get("reply_in_channel")) and is_top_level_trigger
             and bool(message.channel_id) and not message.channel_id.startswith("D")
+            and placement_verdict != "thread"
         )
         if placement_verdict:
             main_logger.debug(

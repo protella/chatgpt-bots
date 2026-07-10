@@ -118,11 +118,13 @@ class SettingsModal(LoggerMixin):
         """
         from message_processor.participation import MODE_TO_LEVEL, VALID_LEVELS, is_snoozed
 
-        from config import SUPPORTED_CHAT_MODELS, GPT56_EFFORTS
+        from config import SUPPORTED_CHAT_MODELS, GPT56_EFFORTS, GPT55_EFFORTS
 
         cs = current_settings or {}
         directives_value = cs.get("directives") or ""
-        reply_in_channel = bool(cs.get("reply_in_channel", False))
+        # No saved row → the global default decides (checkbox pre-checked when the
+        # default allows top-level replies)
+        reply_in_channel = bool(cs.get("reply_in_channel", config.reply_in_channel_default))
 
         def _select(action_id, label_map, current, inherit_label):
             """Static select with an 'inherit' first option; initial = current or inherit."""
@@ -140,9 +142,14 @@ class SettingsModal(LoggerMixin):
             cs.get("model"),
             f"Use each person's own setting (default: {config.gpt_model})",
         )
+        # Effort ladder follows the selected channel model (gpt-5.5 has no `max`).
+        # 'Inherit' shows the full 5.6 ladder — the effective model varies per asker
+        # and compose-time clamping adjusts anything a model doesn't support.
+        selected_channel_model = cs.get("model") or ""
+        effort_ladder = GPT55_EFFORTS if selected_channel_model.startswith("gpt-5.5") else GPT56_EFFORTS
         effort_element = _select(
             "channel_reasoning_effort",
-            [(e, e) for e in GPT56_EFFORTS],
+            [(e, e) for e in effort_ladder],
             cs.get("reasoning_effort"),
             "Use each person's own setting",
         )
@@ -191,7 +198,9 @@ class SettingsModal(LoggerMixin):
         blocks = [
             {"type": "section", "text": {"type": "mrkdwn",
              "text": f"*Channel settings* for <#{channel_id}>\nHow I participate in this channel. "
-                     f"Global defaults come from the bot's configuration; these override them here."}},
+                     f"Global defaults come from the bot's configuration; these override them here."},
+             "accessory": {"type": "button", "action_id": "open_user_settings_push",
+                           "text": {"type": "plain_text", "text": "👤 My personal settings"}}},
             {"type": "input", "block_id": "participation_block",
              "element": {"type": "static_select", "action_id": "participation_level",
                          "options": mode_options, "initial_option": initial_mode_option},
@@ -209,13 +218,13 @@ class SettingsModal(LoggerMixin):
              "element": reply_element,
              "label": {"type": "plain_text", "text": "Reply placement"},
              "hint": {"type": "plain_text",
-                      "text": "When checked, answers to top-level messages post at channel level instead of in a thread."}},
+                      "text": "When checked, I MAY answer a top-level message at channel level — I judge per message whether a quick channel reply or a thread fits better. Unchecked, everything gets a thread."}},
             {"type": "divider"},
             {"type": "section", "text": {"type": "mrkdwn",
              "text": "*Shared response settings* — apply to everyone in this channel. "
                      "Anything left on \"each person's own setting\" falls back to the "
                      "asker's personal preferences."}},
-            {"type": "input", "block_id": "channel_model_block",
+            {"type": "input", "block_id": "channel_model_block", "dispatch_action": True,
              "element": model_element,
              "label": {"type": "plain_text", "text": "Model"}},
             {"type": "input", "block_id": "channel_effort_block",
@@ -226,10 +235,6 @@ class SettingsModal(LoggerMixin):
             {"type": "input", "block_id": "channel_verbosity_block",
              "element": verbosity_element,
              "label": {"type": "plain_text", "text": "Verbosity"}},
-            {"type": "divider"},
-            {"type": "actions", "block_id": "personal_settings_link_block",
-             "elements": [{"type": "button", "action_id": "open_user_settings_push",
-                           "text": {"type": "plain_text", "text": "👤 My personal settings"}}]},
         ]
 
         # Phase F: while snoozed ("butt out"), offer an early resume.

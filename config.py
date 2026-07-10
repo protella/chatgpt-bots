@@ -371,6 +371,10 @@ class BotConfig:
     #   "auto_respond" - a lightweight classifier decides respond/react/ignore per message.
     #   "off"          - never respond in channels.
     channel_response_mode: str = field(default_factory=lambda: os.getenv("CHANNEL_RESPONSE_MODE", "tag_only").strip().lower())
+    # Default for channels with no explicit setting: may the bot answer a top-level
+    # message at channel level? (The engine still judges per message; a channel's
+    # saved setting overrides this.)
+    reply_in_channel_default: bool = field(default_factory=lambda: os.getenv("REPLY_IN_CHANNEL_DEFAULT", "true").lower() == "true")
     # Names the bot answers to without an @mention (case-insensitive whole-word match), so
     # "ChatGPT, can you…" wakes it. Keep in sync with the bot's display name(s).
     # Env: BOT_NAME_ALIASES (comma-separated) — SET THIS per environment (e.g. "ChatGPT-Dev" in dev).
