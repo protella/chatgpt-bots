@@ -284,6 +284,9 @@ class DatabaseManager(LoggerMixin):
                 reply_in_channel BOOLEAN DEFAULT 0,
                 participation_level TEXT,
                 snoozed_until TEXT,
+                model TEXT,
+                reasoning_effort TEXT,
+                verbosity TEXT,
                 updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_by TEXT
             )
@@ -348,6 +351,12 @@ class DatabaseManager(LoggerMixin):
                 self.log_info("DB: Adding snoozed_until column to channel_settings")
                 self.conn.execute("ALTER TABLE channel_settings ADD COLUMN snoozed_until TEXT")
                 self.conn.commit()
+            # Shared per-channel model/effort/verbosity overrides (NULL = inherit)
+            for col in ("model", "reasoning_effort", "verbosity"):
+                if cs_columns and col not in cs_columns:
+                    self.log_info(f"DB: Adding {col} column to channel_settings")
+                    self.conn.execute(f"ALTER TABLE channel_settings ADD COLUMN {col} TEXT")
+                    self.conn.commit()
 
             # Check if message_ts column exists in images table
             cursor = self.conn.execute("PRAGMA table_info(images)")
@@ -845,7 +854,7 @@ class DatabaseManager(LoggerMixin):
         """Get per-channel settings (Phase 7). Returns a dict or None if the channel has no row."""
         cursor = self.conn.execute(
             "SELECT response_mode, directives, reply_in_channel, participation_level, "
-            "snoozed_until, updated_ts, updated_by "
+            "snoozed_until, model, reasoning_effort, verbosity, updated_ts, updated_by "
             "FROM channel_settings WHERE channel_id = ?",
             (channel_id,)
         )
@@ -858,6 +867,9 @@ class DatabaseManager(LoggerMixin):
             "reply_in_channel": bool(row["reply_in_channel"]),
             "participation_level": row["participation_level"],
             "snoozed_until": row["snoozed_until"],
+            "model": row["model"],
+            "reasoning_effort": row["reasoning_effort"],
+            "verbosity": row["verbosity"],
             "updated_ts": row["updated_ts"],
             "updated_by": row["updated_by"],
         }
@@ -865,6 +877,7 @@ class DatabaseManager(LoggerMixin):
     def set_channel_settings(self, channel_id: str, response_mode=_UNSET,
                              directives=_UNSET, reply_in_channel=_UNSET,
                              participation_level=_UNSET, snoozed_until=_UNSET,
+                             model=_UNSET, reasoning_effort=_UNSET, verbosity=_UNSET,
                              updated_by: Optional[str] = None):
         """Upsert per-channel settings (Phase 7; Phase F adds participation_level/snoozed_until).
 
@@ -879,19 +892,27 @@ class DatabaseManager(LoggerMixin):
         new_ric = existing.get("reply_in_channel", False) if reply_in_channel is _UNSET else reply_in_channel
         new_level = existing.get("participation_level") if participation_level is _UNSET else participation_level
         new_snooze = existing.get("snoozed_until") if snoozed_until is _UNSET else snoozed_until
+        new_model = existing.get("model") if model is _UNSET else model
+        new_effort = existing.get("reasoning_effort") if reasoning_effort is _UNSET else reasoning_effort
+        new_verb = existing.get("verbosity") if verbosity is _UNSET else verbosity
         self.conn.execute("""
             INSERT INTO channel_settings (channel_id, response_mode, directives, reply_in_channel,
-                                          participation_level, snoozed_until, updated_ts, updated_by)
-            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                                          participation_level, snoozed_until, model, reasoning_effort,
+                                          verbosity, updated_ts, updated_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
             ON CONFLICT(channel_id) DO UPDATE SET
                 response_mode=excluded.response_mode,
                 directives=excluded.directives,
                 reply_in_channel=excluded.reply_in_channel,
                 participation_level=excluded.participation_level,
                 snoozed_until=excluded.snoozed_until,
+                model=excluded.model,
+                reasoning_effort=excluded.reasoning_effort,
+                verbosity=excluded.verbosity,
                 updated_ts=CURRENT_TIMESTAMP,
                 updated_by=excluded.updated_by
-        """, (channel_id, new_mode, new_dir, 1 if new_ric else 0, new_level, new_snooze, updated_by))
+        """, (channel_id, new_mode, new_dir, 1 if new_ric else 0, new_level, new_snooze,
+              new_model, new_effort, new_verb, updated_by))
         self.conn.commit()
         logger.debug(f"Saved channel_settings for {channel_id}: mode={new_mode}, level={new_level}")
 
@@ -2122,7 +2143,7 @@ class DatabaseManager(LoggerMixin):
             await db.execute("PRAGMA journal_mode=WAL")
             async with db.execute(
                 "SELECT response_mode, directives, reply_in_channel, participation_level, "
-                "snoozed_until, updated_ts, updated_by "
+                "snoozed_until, model, reasoning_effort, verbosity, updated_ts, updated_by "
                 "FROM channel_settings WHERE channel_id = ?",
                 (channel_id,)
             ) as cursor:
@@ -2135,6 +2156,9 @@ class DatabaseManager(LoggerMixin):
                     "reply_in_channel": bool(row["reply_in_channel"]),
                     "participation_level": row["participation_level"],
                     "snoozed_until": row["snoozed_until"],
+                    "model": row["model"],
+                    "reasoning_effort": row["reasoning_effort"],
+                    "verbosity": row["verbosity"],
                     "updated_ts": row["updated_ts"],
                     "updated_by": row["updated_by"],
                 }
@@ -2142,6 +2166,7 @@ class DatabaseManager(LoggerMixin):
     async def set_channel_settings_async(self, channel_id: str, response_mode=_UNSET,
                                          directives=_UNSET, reply_in_channel=_UNSET,
                                          participation_level=_UNSET, snoozed_until=_UNSET,
+                                         model=_UNSET, reasoning_effort=_UNSET, verbosity=_UNSET,
                                          updated_by: Optional[str] = None):
         """Async version of set_channel_settings (Phase F adds participation_level/snoozed_until).
 
@@ -2155,21 +2180,29 @@ class DatabaseManager(LoggerMixin):
         new_ric = existing.get("reply_in_channel", False) if reply_in_channel is _UNSET else reply_in_channel
         new_level = existing.get("participation_level") if participation_level is _UNSET else participation_level
         new_snooze = existing.get("snoozed_until") if snoozed_until is _UNSET else snoozed_until
+        new_model = existing.get("model") if model is _UNSET else model
+        new_effort = existing.get("reasoning_effort") if reasoning_effort is _UNSET else reasoning_effort
+        new_verb = existing.get("verbosity") if verbosity is _UNSET else verbosity
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("""
                 INSERT INTO channel_settings (channel_id, response_mode, directives, reply_in_channel,
-                                              participation_level, snoozed_until, updated_ts, updated_by)
-                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                                              participation_level, snoozed_until, model, reasoning_effort,
+                                              verbosity, updated_ts, updated_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
                 ON CONFLICT(channel_id) DO UPDATE SET
                     response_mode=excluded.response_mode,
                     directives=excluded.directives,
                     reply_in_channel=excluded.reply_in_channel,
                     participation_level=excluded.participation_level,
                     snoozed_until=excluded.snoozed_until,
+                    model=excluded.model,
+                    reasoning_effort=excluded.reasoning_effort,
+                    verbosity=excluded.verbosity,
                     updated_ts=CURRENT_TIMESTAMP,
                     updated_by=excluded.updated_by
-            """, (channel_id, new_mode, new_dir, 1 if new_ric else 0, new_level, new_snooze, updated_by))
+            """, (channel_id, new_mode, new_dir, 1 if new_ric else 0, new_level, new_snooze,
+                  new_model, new_effort, new_verb, updated_by))
             await db.commit()
             logger.debug(f"Saved channel_settings for {channel_id} (async): mode={new_mode}, level={new_level}")
 

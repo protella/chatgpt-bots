@@ -118,9 +118,40 @@ class SettingsModal(LoggerMixin):
         """
         from message_processor.participation import MODE_TO_LEVEL, VALID_LEVELS, is_snoozed
 
+        from config import SUPPORTED_CHAT_MODELS, GPT56_EFFORTS
+
         cs = current_settings or {}
         directives_value = cs.get("directives") or ""
         reply_in_channel = bool(cs.get("reply_in_channel", False))
+
+        def _select(action_id, label_map, current, inherit_label):
+            """Static select with an 'inherit' first option; initial = current or inherit."""
+            options = [{"text": {"type": "plain_text", "text": inherit_label}, "value": "inherit"}]
+            options += [{"text": {"type": "plain_text", "text": text}, "value": value}
+                        for value, text in label_map]
+            selected = current if current in {v for v, _ in label_map} else "inherit"
+            initial = next(o for o in options if o["value"] == selected)
+            return {"type": "static_select", "action_id": action_id,
+                    "options": options, "initial_option": initial}
+
+        model_element = _select(
+            "channel_model",
+            [(m, m) for m in SUPPORTED_CHAT_MODELS],
+            cs.get("model"),
+            f"Use each person's own setting (default: {config.gpt_model})",
+        )
+        effort_element = _select(
+            "channel_reasoning_effort",
+            [(e, e) for e in GPT56_EFFORTS],
+            cs.get("reasoning_effort"),
+            "Use each person's own setting",
+        )
+        verbosity_element = _select(
+            "channel_verbosity",
+            [(v, v) for v in ("low", "medium", "high")],
+            cs.get("verbosity"),
+            "Use each person's own setting",
+        )
 
         # Phase F: one Participation select replaces the old response-mode select.
         # Legacy rows with only response_mode map cleanly (off≡off, tag_only≡mentions_only,
@@ -179,6 +210,26 @@ class SettingsModal(LoggerMixin):
              "label": {"type": "plain_text", "text": "Reply placement"},
              "hint": {"type": "plain_text",
                       "text": "When checked, answers to top-level messages post at channel level instead of in a thread."}},
+            {"type": "divider"},
+            {"type": "section", "text": {"type": "mrkdwn",
+             "text": "*Shared response settings* — apply to everyone in this channel. "
+                     "Anything left on \"each person's own setting\" falls back to the "
+                     "asker's personal preferences."}},
+            {"type": "input", "block_id": "channel_model_block",
+             "element": model_element,
+             "label": {"type": "plain_text", "text": "Model"}},
+            {"type": "input", "block_id": "channel_effort_block",
+             "element": effort_element,
+             "label": {"type": "plain_text", "text": "Reasoning effort"},
+             "hint": {"type": "plain_text",
+                      "text": "Efforts a model doesn't support are adjusted automatically (e.g. max → xhigh on gpt-5.5)."}},
+            {"type": "input", "block_id": "channel_verbosity_block",
+             "element": verbosity_element,
+             "label": {"type": "plain_text", "text": "Verbosity"}},
+            {"type": "divider"},
+            {"type": "actions", "block_id": "personal_settings_link_block",
+             "elements": [{"type": "button", "action_id": "open_user_settings_push",
+                           "text": {"type": "plain_text", "text": "👤 My personal settings"}}]},
         ]
 
         # Phase F: while snoozed ("butt out"), offer an early resume.

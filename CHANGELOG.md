@@ -113,6 +113,12 @@ DMs behave as before.
 - **Per-channel participation levels** — off / mentions-only / judicious / active —
   set by anyone via the **⚙️ Configure** button under bot responses (plus channel
   directives and reply placement, as before)
+- **Shared channel response settings**: the same ⚙️ modal now also sets the channel's
+  model, reasoning effort, and verbosity — shared by everyone in that channel and
+  editable by any member. Hierarchy: personal settings < channel settings < per-thread
+  overrides; anything left on "each person's own setting" keeps using the asker's
+  personal preferences. A "My personal settings" button inside the modal opens your
+  own settings without a second button in chat.
 - **"Quiet down" works like you'd hope**: telling the bot to pipe down gets a 🤐 and
   snoozes unprompted participation for 4 hours (mentions still answered). Standing
   feedback ("stay out of here unless tagged", "keep answers short in this channel")

@@ -191,6 +191,35 @@ class SlackSettingsHandlersMixin:
                 except Exception:
                     pass
 
+        # One-gear design: the channel modal carries a "My personal settings" button
+        # that stacks the personal modal on top (views_push) — no second button in chat.
+        @self.app.action("open_user_settings_push")
+        async def handle_open_user_settings_push(ack, body, client):
+            await ack()
+            trigger_id = body.get('trigger_id')
+            user_id = (body.get('user') or {}).get('id')
+            if not trigger_id or not user_id:
+                return
+            try:
+                current_settings = await self.db.get_user_preferences_async(user_id)
+                is_new_user = current_settings is None
+                if is_new_user:
+                    user_data = await self.db.get_or_create_user_async(user_id)
+                    email = user_data.get('email') if user_data else None
+                    current_settings = await self.db.create_default_user_preferences_async(user_id, email)
+                modal = await self.settings_modal.build_settings_modal(
+                    user_id=user_id,
+                    trigger_id=trigger_id,
+                    current_settings=current_settings,
+                    is_new_user=is_new_user,
+                    thread_id=None,
+                    in_thread=False,
+                )
+                await client.views_push(trigger_id=trigger_id, view=modal)
+                self.log_info(f"User settings modal pushed for {user_id} (from channel modal)")
+            except Exception as e:
+                self.log_error(f"Error pushing user settings modal: {e}")
+
         @self.app.view("channel_settings_modal")
         async def handle_channel_settings_submission(ack, body, view, client):
             """Persist per-channel settings. 'inherit' clears the override (NULL → global default)."""
@@ -221,6 +250,17 @@ class SlackSettingsHandlersMixin:
             snooze_selected = state.get('snooze_block', {}).get('clear_snooze', {}).get('selected_options') or []
             extra = {"snoozed_until": None} if len(snooze_selected) > 0 else {}
 
+            # Shared response settings (model/effort/verbosity): 'inherit' clears to NULL
+            # so the asker's personal preferences apply again.
+            def _sel(block, action):
+                opt = state.get(block, {}).get(action, {}).get('selected_option') or {}
+                val = opt.get('value', 'inherit')
+                return None if val == 'inherit' else val
+
+            channel_model = _sel('channel_model_block', 'channel_model')
+            channel_effort = _sel('channel_effort_block', 'channel_reasoning_effort')
+            channel_verbosity = _sel('channel_verbosity_block', 'channel_verbosity')
+
             try:
                 await self.db.set_channel_settings_async(
                     channel_id,
@@ -228,6 +268,9 @@ class SlackSettingsHandlersMixin:
                     directives=directives,                # None → clears
                     reply_in_channel=reply_in_channel,
                     participation_level=participation_level,  # None → clears override
+                    model=channel_model,                  # None → each person's own setting
+                    reasoning_effort=channel_effort,
+                    verbosity=channel_verbosity,
                     updated_by=user_id,
                     **extra,
                 )
