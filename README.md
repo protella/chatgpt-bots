@@ -265,11 +265,11 @@ Edit `mcp_config.json` with your MCP servers:
     "my_database": {
       "server_url": "https://api.example.com/mcp",
       "server_description": "Company database access",
-      "authorization": {
-        "type": "bearer",
-        "token": "YOUR_API_KEY"
+      "headers": {
+        "Authorization": "Bearer ${MY_DATABASE_TOKEN}"
       },
       "require_approval": "never",
+      "enabled": true,
       "allowed_tools": ["query_customers", "get_orders"]
     }
   }
@@ -281,13 +281,16 @@ Edit `mcp_config.json` with your MCP servers:
 
 4. **Optional Fields**:
    - `server_description`: Helps the AI understand when to use this server
-   - `authorization`: Authentication credentials (bearer token, API key, etc.)
-   - `require_approval`: **IGNORED** - Always set to "never" internally. No approval UI is implemented yet, so other values would cause the bot to hang. This field is preserved in config for future feature development.
+   - `headers`: Authentication headers sent to the server. **Keep secrets in `.env`** — `${VAR_NAME}` placeholders are expanded from the environment at load time, and a server with unresolved placeholders is skipped with a warning
+   - `enabled`: Set `false` to skip a server without deleting its config
+   - `require_approval`: **IGNORED** - Always set to "never" internally. No approval UI is implemented yet, so other values would cause the bot to hang (a warning is logged if you request one). This field is preserved in config for future feature development.
    - `allowed_tools`: Whitelist specific tools (omit to allow all)
+
+> **Security stance**: with approval forced to "never", the model can call any tool an MCP server exposes without user confirmation. Prefer read-only servers, and use `allowed_tools` allowlists to bound what each server can do.
 
 5. **Restart the Bot**
 
-The bot will automatically load and connect to your configured MCP servers on startup.
+The bot loads your configured MCP servers on startup, runs a background reachability probe (one log line per server), and logs each server's discovered tools as conversations exercise them.
 
 #### User Configuration
 

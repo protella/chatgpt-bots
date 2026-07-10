@@ -646,8 +646,8 @@ class SlackSettingsHandlersMixin:
         
         # Register handlers for features checkbox (needs modal rebuild for web search and MCP)
         @self.app.action("features")  # Legacy - kept for compatibility
-        @self.app.action("features_with_mcp")  # GPT-5 models
-        @self.app.action("features_no_mcp")  # GPT-4 models
+        @self.app.action("features_with_mcp")  # Current features checkbox (MCP included)
+        @self.app.action("features_no_mcp")  # Legacy id from the dropped pre-5.5 lineup - kept for open modals
         async def handle_features_change(ack, body, client):
             """Handle feature checkbox changes, especially web search and model-specific features"""
             await ack()

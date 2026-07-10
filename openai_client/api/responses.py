@@ -21,6 +21,37 @@ def _capture_usage(usage_sink, response):
     usage_sink["output_tokens"] = getattr(usage, "output_tokens", 0) or 0
 
 
+def _collect_mcp_list_tools(mcp_tools_sink, item):
+    """
+    Harvest an mcp_list_tools output item into the caller's sink:
+    {server_label: [{"name","description","input_schema"}, ...]}.
+    Informational only (feeds the discovery cache) — never raises.
+    """
+    try:
+        server_label = getattr(item, "server_label", None)
+        tools = getattr(item, "tools", None) or []
+        if not server_label or not tools:
+            return
+        normalized = []
+        for t in tools:
+            if isinstance(t, dict):
+                name = t.get("name")
+                description = t.get("description")
+                schema = t.get("input_schema")
+            else:
+                name = getattr(t, "name", None)
+                description = getattr(t, "description", None)
+                schema = getattr(t, "input_schema", None)
+            if name:
+                normalized.append({"name": name, "description": description,
+                                   "input_schema": schema})
+        if normalized:
+            mcp_tools_sink[server_label] = normalized
+    except Exception:
+        # Discovery caching must never interfere with response processing
+        pass
+
+
 async def create_text_response(
     self,
     messages: List[Dict[str, Any]],
@@ -150,7 +181,8 @@ async def create_text_response_with_tools(
     function_call_sink: Optional[List[Dict[str, Any]]] = None,
     tool_choice: Optional[str] = None,
     prompt_cache_key: Optional[str] = None,
-    usage_sink: Optional[Dict[str, Any]] = None
+    usage_sink: Optional[Dict[str, Any]] = None,
+    mcp_tools_sink: Optional[Dict[str, Any]] = None
 ) -> str:
     """
     Create text response with tools (e.g., web search)
@@ -269,6 +301,10 @@ async def create_text_response_with_tools(
                         "type": "reasoning",
                         "item": item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else None,
                     })
+
+                elif item_type == "mcp_list_tools" and mcp_tools_sink is not None:
+                    # Tool discovery payload — informational cache (server -> tools)
+                    _collect_mcp_list_tools(mcp_tools_sink, item)
 
                 # Extract text content
                 if hasattr(item, "content") and item.content:
@@ -537,7 +573,8 @@ async def create_streaming_response_with_tools(
     function_call_sink: Optional[List[Dict[str, Any]]] = None,
     tool_choice: Optional[str] = None,
     prompt_cache_key: Optional[str] = None,
-    usage_sink: Optional[Dict[str, Any]] = None
+    usage_sink: Optional[Dict[str, Any]] = None,
+    mcp_tools_sink: Optional[Dict[str, Any]] = None
 ) -> str:
     """
     Create streaming text response with tools (e.g., web search)
@@ -713,6 +750,9 @@ async def create_streaming_response_with_tools(
                                 "type": "reasoning",
                                 "item": item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else None,
                             })
+                        elif item_type == 'mcp_list_tools' and mcp_tools_sink is not None:
+                            # Tool discovery payload — informational cache (server -> tools)
+                            _collect_mcp_list_tools(mcp_tools_sink, item)
                     continue
                 elif event_type in ["response.done", "response.completed"]:
                     _capture_usage(usage_sink, getattr(event, "response", None))
