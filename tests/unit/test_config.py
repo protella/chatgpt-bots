@@ -73,6 +73,17 @@ class TestBotConfig:
         assert config.api_timeout_image == 300.0
         assert config.api_timeout_image > config.api_timeout_read
 
+    def test_no_reply_tool_default_enabled(self, mock_env):
+        """ENABLE_NO_REPLY_TOOL defaults to True"""
+        config = BotConfig()
+        assert config.enable_no_reply_tool is True
+
+    @patch.dict(os.environ, {"ENABLE_NO_REPLY_TOOL": "false"})
+    def test_no_reply_tool_disabled(self, mock_env):
+        """ENABLE_NO_REPLY_TOOL=false hides the tool"""
+        config = BotConfig()
+        assert config.enable_no_reply_tool is False
+
     def test_validate_success(self, mock_env):
         """Test successful validation with all required fields"""
         config = BotConfig()

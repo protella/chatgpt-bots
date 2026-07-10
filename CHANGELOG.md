@@ -304,6 +304,20 @@ DMs behave as before.
   tied to a status message that newer Slack surfaces don't create) — it now posts as its
   own message so you can always see the prompt the image was built from.
 
+### 🤐 Feature - The bot can now choose to stay quiet
+
+- When the bot joins a channel conversation on its own (not @-mentioned or DMed), it can
+  now decide that silence is the right move — the message wasn't for it, someone already
+  answered, or a reaction says enough — instead of always producing a reply. These
+  self-started turns also no longer stream partial text; they post once, complete, or not
+  at all, so you never see a half-sentence that then vanishes. **Behavior change:**
+  self-started (unprompted) channel replies no longer stream incrementally — they appear
+  in one piece when finished. Directly addressed messages (mentions, DMs, 1:1 threads) are
+  unchanged and still stream as before. Toggle with `ENABLE_NO_REPLY_TOOL` (default on).
+- Fixed: a channel turn that ended in only an emoji reaction could still count against the
+  bot's hourly self-started-reply budget — reactions and deliberate silence no longer burn
+  that budget.
+
 ## [2.5.1] - 2026-05-11
 
 ### 🚀 Feature - GPT-5.5 Support

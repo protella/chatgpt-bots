@@ -87,6 +87,16 @@ You have function tools for acting inside Slack (fetching channel/thread history
 --- END TOOLS ETIQUETTE ---"""
 
 
+# F2: volatile developer-suffix paragraph, added only on UNPROMPTED turns where the
+# no_response_needed tool is exposed. Never in the system prompt (cache hygiene) and never
+# on prompted/config-off turns (LOCAL_TOOLS_GUIDANCE deliberately doesn't advertise it).
+NO_REPLY_CONTRACT_SUFFIX = (
+    "[You joined this conversation uninvited. End your turn with exactly one of: a normal "
+    "reply, a reaction (react_to_message with empty text), or a no_response_needed call. "
+    "If you have nothing genuinely useful to add, prefer no_response_needed over filler.]"
+)
+
+
 INTENT_CLASSIFIER_PROMPT = """Classify the user's LATEST message in a chat conversation into exactly one intent:
 
 - new — wants an image generated (create, draw, visualize, "show me" something visual). Requests about logos, icons, or what something looks like are "new", even when phrased as questions.
