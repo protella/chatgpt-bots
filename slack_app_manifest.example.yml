@@ -66,6 +66,7 @@ oauth_config:
       - im:write
       - mpim:history
       - mpim:read
+      - pins:read
       - reactions:read
       - reactions:write
       - search:read.public

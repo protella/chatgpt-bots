@@ -17,6 +17,9 @@ class _Harness(SlackHistoryToolMixin):
         self.app.client.conversations_info = AsyncMock()
         self.app.client.conversations_history = AsyncMock()
         self.app.client.conversations_replies = AsyncMock()
+        self.app.client.chat_getPermalink = AsyncMock()
+        self.app.client.pins_list = AsyncMock()
+        self.app.client.users_info = AsyncMock()
 
     def log_debug(self, *a, **k):
         pass
@@ -48,9 +51,11 @@ def _enable(monkeypatch):
 def test_tools_exposed_when_enabled(bot):
     tools = bot.get_history_tools_for_openai()
     names = {t["name"] for t in tools}
-    assert names == {"fetch_channel_history", "fetch_thread_messages"}
+    assert names == {
+        "fetch_channel_history", "fetch_thread_messages", "get_message_permalink",
+        "fetch_channel_info", "fetch_pinned_messages", "fetch_user_profile",
+    }
     assert all(t["type"] == "function" for t in tools)
-    assert all("channel_id" in t["parameters"]["properties"] for t in tools)
 
 
 def test_no_tools_when_disabled(bot, monkeypatch):
@@ -188,3 +193,137 @@ async def test_dispatch_unknown_tool(bot):
 async def test_dispatch_bad_json(bot):
     res = await bot.dispatch_history_tool_call("fetch_channel_history", "{not json")
     assert res["ok"] is False and res["error"] == "bad_arguments"
+
+
+# --- reactions in history payloads ---
+
+@pytest.mark.asyncio
+async def test_history_includes_current_reactions(bot):
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_history.return_value = {"messages": [
+        {"user": "U1", "ts": "1.1", "text": "hi",
+         "reactions": [{"name": "thumbsup", "count": 2, "users": ["U2", "U3"]}]},
+        {"user": "U2", "ts": "1.2", "text": "plain"},
+    ]}
+    res = await bot.fetch_history_tool("C_PUBLIC")
+    assert res["messages"][0]["reactions"] == [{"emoji": "thumbsup", "count": 2, "users": ["U2", "U3"]}]
+    assert "reactions" not in res["messages"][1]  # absent when a message has none
+
+
+# --- message permalinks ---
+
+@pytest.mark.asyncio
+async def test_permalink_returned_for_accessible_channel(bot):
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.chat_getPermalink.return_value = {
+        "permalink": "https://acme.slack.com/archives/C1/p1720500000123456"
+    }
+    res = await bot.get_message_permalink_tool("C1", "1720500000.123456")
+    assert res["ok"] is True
+    assert res["permalink"].startswith("https://")
+    kwargs = bot.app.client.chat_getPermalink.await_args.kwargs
+    assert kwargs == {"channel": "C1", "message_ts": "1720500000.123456"}
+
+
+@pytest.mark.asyncio
+async def test_permalink_refused_for_private_non_member(bot):
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": True, "is_member": False}}
+    res = await bot.get_message_permalink_tool("C_PRIV", "1.0")
+    assert res["ok"] is False and res["error"] == "not_accessible"
+    assert "permalink" not in res
+    bot.app.client.chat_getPermalink.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_permalink_api_error_graceful(bot):
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.chat_getPermalink.side_effect = SlackApiError("x", {"error": "message_not_found"})
+    res = await bot.get_message_permalink_tool("C1", "9.9")
+    assert res["ok"] is False and res["error"] == "message_not_found"
+
+
+# --- channel info ---
+
+@pytest.mark.asyncio
+async def test_channel_info_returns_facts(bot):
+    bot.app.client.conversations_info.return_value = {"channel": {
+        "is_private": False, "name": "menu-insights",
+        "topic": {"value": "menus"}, "purpose": {"value": "menu data"}, "num_members": 42,
+    }}
+    res = await bot.fetch_channel_info_tool("C1")
+    assert res == {"ok": True, "channel": "C1", "name": "menu-insights", "topic": "menus",
+                   "purpose": "menu data", "num_members": 42, "is_private": False}
+
+
+# --- pinned messages ---
+
+@pytest.mark.asyncio
+async def test_pins_listed_messages_only(bot):
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.pins_list.return_value = {"items": [
+        {"message": {"user": "U1", "ts": "1.1", "text": "release checklist",
+                     "permalink": "https://acme.slack.com/archives/C1/p11"}},
+        {"file": {"id": "F1"}},  # pinned file: skipped
+    ]}
+    res = await bot.fetch_pinned_messages_tool("C1")
+    assert res["ok"] is True and res["count"] == 1
+    assert res["pins"][0]["text"] == "release checklist"
+
+
+@pytest.mark.asyncio
+async def test_pins_missing_scope_names_the_fix(bot):
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.pins_list.side_effect = SlackApiError("x", {"error": "missing_scope"})
+    res = await bot.fetch_pinned_messages_tool("C1")
+    assert res["ok"] is False and res["error"] == "missing_scope"
+    assert "pins:read" in res["message"]
+
+
+@pytest.mark.asyncio
+async def test_pins_refused_for_private_non_member(bot):
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": True, "is_member": False}}
+    res = await bot.fetch_pinned_messages_tool("C_PRIV")
+    assert res["ok"] is False and res["error"] == "not_accessible"
+    bot.app.client.pins_list.assert_not_called()
+
+
+# --- user profiles ---
+
+@pytest.mark.asyncio
+async def test_user_profile_returns_card_facts_no_email(bot):
+    bot.app.client.users_info.return_value = {"user": {
+        "tz": "America/New_York", "tz_label": "Eastern Daylight Time", "is_bot": False,
+        "profile": {"real_name": "Erin Evans", "display_name": "peter",
+                    "title": "Slackbot Wrangler", "email": "should-not-leak@x.com"},
+    }}
+    res = await bot.fetch_user_profile_tool("U1")
+    assert res["ok"] is True
+    assert res["real_name"] == "Erin Evans"
+    assert res["timezone"] == "America/New_York"
+    assert "email" not in res  # profile-card facts only
+
+
+@pytest.mark.asyncio
+async def test_user_profile_error_graceful(bot):
+    bot.app.client.users_info.side_effect = SlackApiError("x", {"error": "user_not_found"})
+    res = await bot.fetch_user_profile_tool("UNOPE")
+    assert res["ok"] is False and res["error"] == "user_not_found"
+
+
+# --- dispatch routing for the new tools ---
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name,args,client_attr", [
+    ("get_message_permalink", {"channel_id": "C1", "message_ts": "1.0"}, "chat_getPermalink"),
+    ("fetch_channel_info", {"channel_id": "C1"}, "conversations_info"),
+    ("fetch_pinned_messages", {"channel_id": "C1"}, "pins_list"),
+    ("fetch_user_profile", {"user_id": "U1"}, "users_info"),
+])
+async def test_dispatch_routes_new_tools(bot, name, args, client_attr):
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.chat_getPermalink.return_value = {"permalink": "https://x"}
+    bot.app.client.pins_list.return_value = {"items": []}
+    bot.app.client.users_info.return_value = {"user": {"profile": {}}}
+    res = await bot.dispatch_history_tool_call(name, args)
+    assert res["ok"] is True
+    getattr(bot.app.client, client_attr).assert_called()

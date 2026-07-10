@@ -16,10 +16,10 @@ class SlackHistoryToolMixin:
     layer (never via prompt): content is only returned for public channels or channels the
     bot is a member of; a private channel the bot is not in is refused with no content.
 
-    NOTE: the executor + schemas are complete and tested, but not yet wired to the model —
-    the Responses API only runs server-side tools (web_search/MCP) and there is no local
-    function-call loop. `get_history_tools_for_openai()` / `dispatch_history_tool_call()`
-    are ready for that loop when it's built (see plan Phase 8 follow-up).
+    Wired to the model through the local function-call loop (registered in
+    SlackBot._build_tool_registry). Beyond history slices, this mixin also hosts the
+    other on-demand workspace-context tools: message permalinks, channel info, pinned
+    messages, and user profiles — same privacy gate, same graceful-refusal contract.
     """
 
     def get_history_tools_for_openai(self) -> List[Dict[str, Any]]:
@@ -63,6 +63,72 @@ class SlackHistoryToolMixin:
                         "limit": {"type": "integer", "description": f"Max messages to return (1-{cap})."},
                     },
                     "required": ["channel_id", "thread_ts"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "get_message_permalink",
+                "description": (
+                    "Get a permanent Slack link to a specific message (by channel and message ts). "
+                    "Use when the user asks WHERE something was said or wants a pointer to an "
+                    "earlier message — find the message first (history/search tools give you its "
+                    "ts), then include the returned URL in your reply; Slack renders it as a "
+                    "clickable message preview."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "channel_id": {"type": "string", "description": "Slack channel ID the message lives in."},
+                        "message_ts": {"type": "string", "description": "The message's timestamp (ts), e.g. 1720500000.123456."},
+                    },
+                    "required": ["channel_id", "message_ts"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "fetch_channel_info",
+                "description": (
+                    "Get a channel's name, topic, purpose, member count, and privacy flag. Use for "
+                    "questions about what a channel is for or its basic facts."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "channel_id": {"type": "string", "description": "Slack channel ID."},
+                    },
+                    "required": ["channel_id"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "fetch_pinned_messages",
+                "description": (
+                    "List a channel's pinned messages (text, author, ts, permalink). Pins usually "
+                    "hold a channel's important references — check them when asked about a "
+                    "channel's key links, rules, or standing info."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "channel_id": {"type": "string", "description": "Slack channel ID."},
+                    },
+                    "required": ["channel_id"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "fetch_user_profile",
+                "description": (
+                    "Look up a Slack user's profile: real name, display name, title, timezone, and "
+                    "whether they're a bot. Use to answer who someone is or their local time; user "
+                    "IDs appear in messages as <@U…> mentions and in reaction data."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "user_id": {"type": "string", "description": "Slack user ID, e.g. U0123ABC."},
+                    },
+                    "required": ["user_id"],
                 },
             },
         ]
@@ -170,8 +236,99 @@ class SlackHistoryToolMixin:
             self.log_error(f"history_tool: unexpected error for {channel_id}: {e}", exc_info=True)
             return {"ok": False, "error": "exception", "message": "Could not fetch history."}
 
+    async def get_message_permalink_tool(self, channel_id: str, message_ts: str) -> Dict[str, Any]:
+        """Permanent link to one message. Same privacy gate as history: no link into
+        a private channel the bot is not a member of."""
+        allowed, reason = await self._channel_is_accessible(channel_id)
+        if not allowed:
+            return {"ok": False, "error": "not_accessible", "reason": reason,
+                    "message": f"Channel {channel_id} is not accessible — no link can be returned."}
+        try:
+            resp = await self.app.client.chat_getPermalink(channel=channel_id, message_ts=message_ts)
+            return {"ok": True, "channel": channel_id, "message_ts": message_ts,
+                    "permalink": resp.get("permalink")}
+        except SlackApiError as e:
+            err = e.response.get("error", "unknown") if getattr(e, "response", None) else str(e)
+            self.log_warning(f"history_tool: permalink failed for {channel_id}/{message_ts}: {err}")
+            return {"ok": False, "error": err, "message": f"Could not get a permalink: {err}"}
+
+    async def fetch_channel_info_tool(self, channel_id: str) -> Dict[str, Any]:
+        """Channel facts (name/topic/purpose/member count). Privacy-gated like history."""
+        allowed, reason = await self._channel_is_accessible(channel_id)
+        if not allowed:
+            return {"ok": False, "error": "not_accessible", "reason": reason,
+                    "message": f"Channel {channel_id} is not accessible — no info can be returned."}
+        try:
+            resp = await self.app.client.conversations_info(channel=channel_id, include_num_members=True)
+            ch = resp.get("channel") or {}
+            return {
+                "ok": True,
+                "channel": channel_id,
+                "name": ch.get("name"),
+                "topic": (ch.get("topic") or {}).get("value"),
+                "purpose": (ch.get("purpose") or {}).get("value"),
+                "num_members": ch.get("num_members"),
+                "is_private": bool(ch.get("is_private")),
+            }
+        except SlackApiError as e:
+            err = e.response.get("error", "unknown") if getattr(e, "response", None) else str(e)
+            self.log_warning(f"history_tool: channel info failed for {channel_id}: {err}")
+            return {"ok": False, "error": err, "message": f"Could not fetch channel info: {err}"}
+
+    async def fetch_pinned_messages_tool(self, channel_id: str) -> Dict[str, Any]:
+        """Pinned items for a channel. Privacy-gated; degrades with a clear message if
+        the app is missing the pins:read scope (added to the manifest 2026-07-10)."""
+        allowed, reason = await self._channel_is_accessible(channel_id)
+        if not allowed:
+            return {"ok": False, "error": "not_accessible", "reason": reason,
+                    "message": f"Channel {channel_id} is not accessible — no pins can be returned."}
+        try:
+            resp = await self.app.client.pins_list(channel=channel_id)
+            pins = []
+            for item in resp.get("items") or []:
+                msg = item.get("message") or {}
+                if not msg:
+                    continue  # pinned files et al. — messages only
+                pins.append({
+                    "user": msg.get("user") or msg.get("username") or ("bot" if msg.get("bot_id") else "unknown"),
+                    "ts": msg.get("ts"),
+                    "text": msg.get("text", ""),
+                    "permalink": msg.get("permalink"),
+                })
+            return {"ok": True, "channel": channel_id, "count": len(pins), "pins": pins}
+        except SlackApiError as e:
+            err = e.response.get("error", "unknown") if getattr(e, "response", None) else str(e)
+            if err == "missing_scope":
+                return {"ok": False, "error": err,
+                        "message": "The Slack app lacks the pins:read scope — an admin must update "
+                                   "the app manifest and reinstall before pins can be read."}
+            self.log_warning(f"history_tool: pins failed for {channel_id}: {err}")
+            return {"ok": False, "error": err, "message": f"Could not fetch pins: {err}"}
+
+    async def fetch_user_profile_tool(self, user_id: str) -> Dict[str, Any]:
+        """Workspace-visible profile facts for one user (no email — keep it to what any
+        member sees on the profile card)."""
+        try:
+            resp = await self.app.client.users_info(user=user_id)
+            u = resp.get("user") or {}
+            profile = u.get("profile") or {}
+            return {
+                "ok": True,
+                "user_id": user_id,
+                "real_name": profile.get("real_name") or u.get("real_name"),
+                "display_name": profile.get("display_name") or None,
+                "title": profile.get("title") or None,
+                "timezone": u.get("tz"),
+                "timezone_label": u.get("tz_label"),
+                "is_bot": bool(u.get("is_bot")),
+            }
+        except SlackApiError as e:
+            err = e.response.get("error", "unknown") if getattr(e, "response", None) else str(e)
+            self.log_warning(f"history_tool: user profile failed for {user_id}: {err}")
+            return {"ok": False, "error": err, "message": f"Could not fetch that user's profile: {err}"}
+
     async def dispatch_history_tool_call(self, name: str, arguments: Any) -> Dict[str, Any]:
-        """Route a model function-call (name + args) to the executor. For the future function-call loop."""
+        """Route a model function-call (name + args) to its executor."""
         if isinstance(arguments, str):
             try:
                 args = json.loads(arguments or "{}")
@@ -184,4 +341,12 @@ class SlackHistoryToolMixin:
             return await self.fetch_history_tool(args.get("channel_id"), args.get("limit"))
         if name == "fetch_thread_messages":
             return await self.fetch_history_tool(args.get("channel_id"), args.get("limit"), args.get("thread_ts"))
+        if name == "get_message_permalink":
+            return await self.get_message_permalink_tool(args.get("channel_id"), args.get("message_ts"))
+        if name == "fetch_channel_info":
+            return await self.fetch_channel_info_tool(args.get("channel_id"))
+        if name == "fetch_pinned_messages":
+            return await self.fetch_pinned_messages_tool(args.get("channel_id"))
+        if name == "fetch_user_profile":
+            return await self.fetch_user_profile_tool(args.get("user_id"))
         return {"ok": False, "error": "unknown_tool", "message": f"Unknown history tool: {name}"}
