@@ -21,15 +21,19 @@ async def publish_image(
     thread_manager,
     unprompted: bool,
     message_ts: Optional[str] = None,
+    image_type: str = "generated",
 ) -> Optional[str]:
-    """Single owner of image delivery for both the background job and the config-off
-    sync path: checklist "Uploading…" transition, upload, falsey-URL = failure,
-    persistence, asset-ledger update, checklist completion, and unprompted participation
-    accounting. Returns the file URL, or None on failure.
+    """Single owner of image delivery for both the background job and the sync path:
+    checklist "Uploading…" transition, upload, falsey-URL = failure, persistence,
+    asset-ledger update, checklist completion, and unprompted participation accounting.
+    Returns the file URL, or None on failure.
 
-    Persistence splits on generation_id: the background path (id set) has no in-memory
-    breadcrumb, so it writes the DB row directly; the legacy sync path (id None) keeps
-    today's breadcrumb-driven update_last_image_url (which also writes the DB row).
+    Upload and persistence are separated: once send_image returns a URL the image IS
+    posted, so a later persistence failure is logged but never un-posts it (the user is
+    not told it failed, accounting still counts it). Persistence writes the DB row
+    DIRECTLY on both paths (merge-preserving upsert) so it never depends on finding a
+    mutable in-memory breadcrumb that a mid-flight refresh may have wiped; the sync path
+    additionally refreshes the warm breadcrumb (URL + analysis) via update_last_image_url.
 
     The upload latch is NOT released here — its lifecycle is owned by the caller
     (generation-ID-conditional in the background job's finally; main.py's finally on the
@@ -41,6 +45,7 @@ async def publish_image(
         except Exception as e:  # noqa: BLE001 — a status hiccup must not abort delivery
             processor.log_debug(f"checklist upload step failed: {e}")
 
+    # 1) Upload. A returned URL means the image is POSTED — nothing below may flip it back.
     file_url: Optional[str] = None
     try:
         file_url = await client.send_image(
@@ -50,26 +55,8 @@ async def publish_image(
             f"generated_image.{image_data.format}",
             "",
         )
-        if file_url:
-            if generation_id is None:
-                # Legacy sync path — breadcrumb exists; warm state + DB via the helper.
-                await processor.update_last_image_url(channel_id, thread_id, file_url)
-            else:
-                # Background path — no breadcrumb; write the DB row directly (must not
-                # depend on finding a mutable in-memory breadcrumb) and update the ledger
-                # in memory only (a persisting ledger upsert would fight this write).
-                if db:
-                    await db.save_image_metadata_async(
-                        thread_id=thread_key,
-                        url=file_url,
-                        image_type="generated",
-                        prompt=prompt,
-                        analysis="",
-                        metadata={"generation_id": generation_id, "timestamp": time.time()},
-                    )
-                _update_ledger(thread_manager, thread_id, prompt, file_url)
     except Exception as e:  # noqa: BLE001
-        processor.log_error(f"Image upload/persist failed for {thread_key}: {e}", exc_info=True)
+        processor.log_error(f"Image upload failed for {thread_key}: {e}", exc_info=True)
         file_url = None
 
     if not file_url:
@@ -79,6 +66,40 @@ async def publish_image(
             except Exception:
                 pass
         return None
+
+    # 2) Persist — the image is already posted; failures here are logged, never un-post it.
+    prompt_text = prompt or getattr(image_data, "prompt", "") or ""
+    try:
+        if db:
+            meta = {"timestamp": time.time()}
+            if generation_id:
+                meta["generation_id"] = generation_id
+            # Direct, breadcrumb-INDEPENDENT write (a Phase-Q refresh between lock release
+            # and upload can wipe the sync path's breadcrumb before we get here). The
+            # upsert is merge-preserving, so a later breadcrumb/rebuild write can enrich
+            # analysis without clobbering prompt/type/generation_id.
+            await db.save_image_metadata_async(
+                thread_id=thread_key,
+                url=file_url,
+                image_type=image_type,
+                prompt=prompt_text,
+                analysis="",
+                metadata=meta,
+            )
+    except Exception as e:  # noqa: BLE001
+        processor.log_error(
+            f"Image DB persist failed for {thread_key} (image WAS posted at {file_url}): {e}",
+            exc_info=True)
+    # Warm in-memory state: sync path refreshes the breadcrumb URL (+ analysis enrichment)
+    # for immediate "edit it" targeting; background path has no breadcrumb, so it just
+    # records a metadata-only ledger entry.
+    try:
+        if generation_id is None:
+            await processor.update_last_image_url(channel_id, thread_id, file_url)
+        else:
+            _update_ledger(thread_manager, thread_id, prompt_text, file_url)
+    except Exception as e:  # noqa: BLE001
+        processor.log_debug(f"warm-state image update failed: {e}")
 
     # Participation accounting: only a real posted image on an unprompted channel turn.
     if unprompted and channel_id and not channel_id.startswith("D"):

@@ -150,7 +150,7 @@ async def test_publish_image_falsey_url_is_failure():
 
 
 @pytest.mark.asyncio
-async def test_publish_image_sync_path_uses_breadcrumb_helper():
+async def test_publish_image_sync_path_persists_directly_and_via_breadcrumb():
     client = _delivery_client()
     db = SimpleNamespace(save_image_metadata_async=AsyncMock())
     proc = _processor()
@@ -159,12 +159,35 @@ async def test_publish_image_sync_path_uses_breadcrumb_helper():
         processor=proc, client=client, channel_id="C1", thread_id="T1",
         thread_key="C1:T1", image_data=_image_data(), checklist=None,
         generation_id=None, prompt="", db=db,
-        thread_manager=AsyncThreadStateManager(db=None), unprompted=False)
+        thread_manager=AsyncThreadStateManager(db=None), unprompted=False,
+        image_type="edited")
 
     assert url == "https://files.slack.com/img1"
-    # Legacy sync path persists via the breadcrumb helper, not a direct DB write.
+    # Sync path persists DIRECTLY (breadcrumb-independent; falls back to image_data.prompt)
+    # AND refreshes the warm breadcrumb — a mid-flight refresh can't lose the DB row.
+    db.save_image_metadata_async.assert_awaited_once()
+    kwargs = db.save_image_metadata_async.await_args.kwargs
+    assert kwargs["prompt"] == "an enhanced prompt" and kwargs["image_type"] == "edited"
+    assert "generation_id" not in kwargs["metadata"]  # no id on the sync path
     proc.update_last_image_url.assert_awaited_once()
-    db.save_image_metadata_async.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_publish_image_persist_failure_still_reports_posted():
+    # A DB failure after a successful upload must NOT un-post the image or fail the checklist.
+    client = _delivery_client()
+    db = SimpleNamespace(save_image_metadata_async=AsyncMock(side_effect=RuntimeError("db down")))
+    checklist = ProgressChecklist(client, "C1", "T1", message_id="m1", min_edit_interval=0)
+
+    url = await publish_image(
+        processor=_processor(), client=client, channel_id="C1", thread_id="T1",
+        thread_key="C1:T1", image_data=_image_data(), checklist=checklist,
+        generation_id="gen1", prompt="p", db=db,
+        thread_manager=AsyncThreadStateManager(db=None), unprompted=False)
+
+    assert url == "https://files.slack.com/img1"  # still posted
+    assert checklist._failed_note is None  # checklist NOT failed
+    assert checklist._terminal is True     # it completed
 
 
 # --------------------------------------------------------------------------- handoff
@@ -457,6 +480,25 @@ async def test_lazy_create_prompt_ref_populates_id():
     await host._lazy_create_prompt_ref(client, "C1", "T1", "first chunk", ref)
     assert ref["id"] == "new2"
     assert ref["creating"] is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_waits_for_pending_lazy_create_no_duplicate():
+    # A lazy first-post still in flight: the final resolve must WAIT for it and reuse that
+    # message, never post a second one (which would leave two prompt messages in history).
+    host = _PromptHost()
+    client = _prompt_client(ts="lazy1")
+    ref = {"id": None, "creating": True}
+
+    async def _lazy():
+        await asyncio.sleep(0)
+        ref["id"] = "lazy1"
+        ref["creating"] = False
+
+    ref["task"] = asyncio.create_task(_lazy())
+    pid = await host._resolve_prompt_message(client, "C1", "T1", ref, "the final prompt")
+    assert pid == "lazy1"
+    client.send_message_get_ts.assert_not_awaited()  # no SECOND create
 
 
 @pytest.mark.asyncio

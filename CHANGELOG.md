@@ -328,6 +328,20 @@ DMs behave as before.
   and when a reply is actually wanted. The note is internal context only (never posted,
   never stored). Toggle with `ENABLE_WAKE_ENVELOPE` (default on).
 
+### 🩹 Fixed - Reliability hardening for the new channel/image features
+
+- Live progress checklists now also appear when the bot **edits** an image (not just when
+  it generates one), and when background image generation is turned off.
+- A generated image now reliably lands in the bot's memory even if the thread was busy at
+  the moment it finished uploading — so a follow-up "edit that" always finds it.
+- If saving an image's details briefly fails after it was already posted, the bot no
+  longer tells you the post failed — the image you can see is treated as posted.
+- A reply that failed to send, ended in only an emoji reaction, or was deliberate silence
+  no longer counts against the bot's hourly self-started-reply budget.
+- Assorted internal cleanups: no lingering "Generating…" status when a background image is
+  in flight, no duplicate "Enhanced Prompt" messages on some surfaces, and the bot
+  remembers an "I'm still working on the last image" reply in-context right away.
+
 ## [2.5.1] - 2026-05-11
 
 ### 🚀 Feature - GPT-5.5 Support
