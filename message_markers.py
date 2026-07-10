@@ -1,0 +1,153 @@
+"""
+Shared continuation-marker and message-splitting helpers.
+
+Single source of truth for the "Continued..." markers used when a long reply is
+split across multiple Slack messages, plus the helpers that keep splits safe
+(code fences closed/reopened, Slack <entities> never cut mid-token) and the
+rebuild-side strippers that merge split parts back into ONE assistant turn.
+
+Writers (slack_client/messaging.py, message_processor/handlers/text.py) and the
+rebuild reader (message_processor/thread_management.py) must both import from
+here so the marker shapes can never drift apart. Phase G's native streaming
+path must build on these same helpers.
+"""
+import re
+from typing import List, Tuple
+
+# Canonical marker set ("Continued..." style — user preference).
+CONTINUATION_TRAILER = "*Continued in next message...*"
+CONTINUATION_HEAD = "*...continued*"
+
+# Legacy shapes still present in old Slack history; recognized on read, never written.
+_LEGACY_TRAILERS = (
+    "*...continued in next message...*",  # messaging-layer backup truncation
+)
+_TRAILER_VARIANTS = (CONTINUATION_TRAILER,) + _LEGACY_TRAILERS
+# "*Part 2 (continued)*" (streaming) and "*Part 1/3*" (old non-streaming) prefixes.
+_PART_PREFIX_RE = re.compile(r"^\s*\*Part \d+(?: \(continued\)|\s*/\s*\d+)\*\s*\n+")
+
+
+def part_prefix(part: int) -> str:
+    """Prefix for the Nth (N>1) message of a split reply."""
+    return f"*Part {part} (continued)*\n\n"
+
+
+def continuation_trailer() -> str:
+    """Trailer appended to a message that continues in the next one."""
+    return f"\n\n{CONTINUATION_TRAILER}"
+
+
+def ends_with_continuation(text: str) -> bool:
+    if not text:
+        return False
+    stripped = text.rstrip()
+    return any(stripped.endswith(t) for t in _TRAILER_VARIANTS)
+
+
+def starts_as_continuation(text: str) -> bool:
+    if not text:
+        return False
+    if _PART_PREFIX_RE.match(text):
+        return True
+    return text.lstrip().startswith(CONTINUATION_HEAD)
+
+
+def strip_continuation_markers(text: str) -> str:
+    """Remove part prefixes and continuation trailers/heads from a message body."""
+    if not text:
+        return text
+    t = _PART_PREFIX_RE.sub("", text)
+    lstripped = t.lstrip()
+    if lstripped.startswith(CONTINUATION_HEAD):
+        t = lstripped[len(CONTINUATION_HEAD):].lstrip("\n ")
+    stripped = t.rstrip()
+    changed = True
+    while changed:
+        changed = False
+        for trailer in _TRAILER_VARIANTS:
+            if stripped.endswith(trailer):
+                stripped = stripped[: -len(trailer)].rstrip()
+                changed = True
+    return stripped
+
+
+def entity_safe_cut(text: str, limit: int) -> int:
+    """Largest cut index <= limit that doesn't split a Slack <entity> (mention/URL).
+
+    Falls back to `limit` when the text before it is one giant unclosed entity
+    (pathological; better a broken entity than an infinite loop).
+    """
+    if len(text) <= limit:
+        return len(text)
+    lt = text.rfind("<", 0, limit)
+    if lt > 0 and text.rfind(">", lt, limit) == -1:
+        return lt
+    return limit
+
+
+def _fence_state(text: str) -> Tuple[bool, str]:
+    """Walk ``` fences in text (assumed to start outside a block); return (open?, lang)."""
+    in_block = False
+    lang = ""
+    for line in text.split("\n"):
+        s = line.strip()
+        if s.startswith("```"):
+            if in_block:
+                in_block, lang = False, ""
+            else:
+                in_block, lang = True, s[3:].strip()
+    return in_block, lang
+
+
+def fence_safe_chunks(text: str, chunk_size: int) -> List[str]:
+    """Split text into <=chunk_size pieces at paragraph/sentence boundaries,
+    hard-wrapping oversized fragments entity-safely, then close/reopen code
+    fences across the seams so no chunk ever renders a shattered block.
+    Markers are NOT added here — callers own presentation."""
+    if chunk_size <= 10:
+        chunk_size = 10
+
+    # Pass 1: raw chunks on paragraph, then sentence boundaries; hard-wrap leftovers.
+    raw_chunks: List[str] = []
+    current = ""
+
+    def flush():
+        nonlocal current
+        if current.strip():
+            raw_chunks.append(current.strip())
+        current = ""
+
+    def append_fragment(fragment: str):
+        nonlocal current
+        while len(fragment) > chunk_size:
+            flush()
+            cut = entity_safe_cut(fragment, chunk_size)
+            if cut <= 0:
+                cut = chunk_size
+            raw_chunks.append(fragment[:cut].strip())
+            fragment = fragment[cut:]
+        if len(current) + len(fragment) + 2 <= chunk_size:
+            current += fragment + "\n\n"
+        else:
+            flush()
+            current = fragment + "\n\n"
+
+    for para in text.split("\n\n"):
+        if len(para) > chunk_size:
+            # Sentence-level attempt before hard wrapping.
+            for sentence in para.replace(". ", ".\n").split("\n"):
+                append_fragment(sentence)
+        else:
+            append_fragment(para)
+    flush()
+
+    # Pass 2: fence continuity across seams.
+    result: List[str] = []
+    open_block, open_lang = False, ""
+    for chunk in raw_chunks:
+        body = (f"```{open_lang}\n" if open_block else "") + chunk
+        open_block, open_lang = _fence_state(body)
+        if open_block:
+            body += "\n```"
+        result.append(body)
+    return result

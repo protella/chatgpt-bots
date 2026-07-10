@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 from typing import Optional
-from base_client import BaseClient, Message, Response
+from base_client import BaseClient, HistoryFetchError, Message, Response
 from thread_manager import AsyncThreadStateManager
 from openai_client import OpenAIClient
 from config import config
@@ -192,7 +192,10 @@ class MessageProcessor(ThreadManagementMixin,
                 unsupported_msg += "───────────────\n"
                 unsupported_msg += "*Currently supported:*\n"
                 unsupported_msg += "• Images (JPEG, PNG, GIF, WebP)\n"
-                unsupported_msg += "• Documents (PDF, DOCX, XLSX, CSV, TXT, etc.)\n\n"
+                # Generated from the handler's own table so this list can't lie
+                from document_handler import DOCUMENT_EXTENSIONS
+                doc_types = ", ".join(sorted(ext.lstrip('.').upper() for ext in DOCUMENT_EXTENSIONS))
+                unsupported_msg += f"• Documents ({doc_types})\n\n"
                 unsupported_msg += "_Support for additional file types may be added in the future._"
                 
                 # If there's also text, images, or documents, continue processing those
@@ -906,6 +909,35 @@ class MessageProcessor(ThreadManagementMixin,
             return Response(
                 type="error",
                 content=error_message
+            )
+        except HistoryFetchError as e:
+            # Slack wouldn't give us the thread transcript (rate-limited or hard API
+            # error after retries). Since Phase S the platform IS the context — fail
+            # the turn loudly rather than answering with amnesia (R1).
+            self.log_error(f"History fetch failed for {thread_key}: {e}")
+            elapsed = time.time() - request_start_time
+            self.log_info("")
+            self.log_info("=" * 100)
+            self.log_info(f"REQUEST END | Thread: {thread_key} | Status: HISTORY_FETCH_FAILED | Time: {elapsed:.2f}s")
+            self.log_info("=" * 100)
+            self.log_info("")
+
+            if thinking_id and hasattr(client, 'update_message'):
+                try:
+                    await client.update_message(
+                        message.channel_id, thinking_id,
+                        f"{config.error_emoji} Couldn't load this conversation's history from Slack."
+                    )
+                except Exception:
+                    pass
+
+            return Response(
+                type="error",
+                content=(
+                    f"{config.error_emoji} **Couldn't Load Conversation History**\n\n"
+                    "Slack didn't return this conversation's history (it may be busy or "
+                    "rate-limiting). Your message wasn't processed — please try again in a moment."
+                )
             )
         except Exception as e:
             # Log full error details for non-timeout exceptions

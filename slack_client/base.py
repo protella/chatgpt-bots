@@ -110,9 +110,10 @@ class SlackBot(SlackMessageEventsMixin,
         """Update a message (async version)"""
         return await self.update_message(channel_id, message_id, text)
 
-    async def get_thread_history_async(self, channel_id: str, thread_id: str, limit: int = None) -> List[Message]:
+    async def get_thread_history_async(self, channel_id: str, thread_id: str, limit: int = None,
+                                       oldest: str = None) -> List[Message]:
         """Get message history for a thread (async version)"""
-        return await self.get_thread_history(channel_id, thread_id, limit)
+        return await self.get_thread_history(channel_id, thread_id, limit, oldest=oldest)
 
     async def download_file_async(self, file_url: str, file_id: str = None) -> Optional[bytes]:
         """Download a file/image from the platform (async version)"""
