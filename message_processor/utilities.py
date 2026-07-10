@@ -776,14 +776,23 @@ class MessageUtilitiesMixin:
             current_time = datetime.datetime.now(pytz.UTC)
             timezone_display = "UTC"
         
-        # Add user's name and email if available
+        # Add user's name and email if available.
+        # Prompt-cache hygiene: in MULTI-USER threads (roster lists >=2 humans) this line
+        # changes with every different sender, busting the prefix cache on each speaker
+        # change. The roster + the "Username:" prefix on each message already identify who
+        # is speaking there, so we omit it. DMs / single-user threads keep it — the sender
+        # never changes within those, so the prefix stays stable.
         user_context = ""
-        if user_real_name and user_email:
-            user_context = f"\n\nYou're speaking with {user_real_name} (email: {user_email})"
-        elif user_real_name:
-            user_context = f"\n\nYou're speaking with {user_real_name}"
-        elif user_email:
-            user_context = f"\n\nYou're speaking with user (email: {user_email})"
+        # Roster entries render as "- Name → <@UID>"; the instruction header also contains
+        # a literal "<@USER_ID>", so count entry arrows, not raw mentions.
+        multi_user_thread = (participant_roster or "").count("→ <@") >= 2
+        if not multi_user_thread:
+            if user_real_name and user_email:
+                user_context = f"\n\nYou're speaking with {user_real_name} (email: {user_email})"
+            elif user_real_name:
+                user_context = f"\n\nYou're speaking with {user_real_name}"
+            elif user_email:
+                user_context = f"\n\nYou're speaking with user (email: {user_email})"
 
         # Add model and knowledge cutoff info
         model_context = ""

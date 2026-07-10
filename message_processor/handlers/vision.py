@@ -7,10 +7,38 @@ import time
 
 from base_client import BaseClient, Message, Response
 from config import config
-from prompts import IMAGE_ANALYSIS_PROMPT
+from prompts import IMAGE_ANALYSIS_PROMPT, VISION_DEFAULT_QUESTION
+
+# Common no-real-question phrasings that should get the standard default question
+# instead of being passed through (or burned on the enhancement hop).
+_VAGUE_VISION_ASKS = frozenset({
+    "describe", "describe this", "describe this image", "describe it",
+    "what is this", "what's this", "whats this", "what is it", "what do you see",
+    "analyze this", "analyze this image", "look at this", "check this out",
+})
 
 
 class VisionHandlerMixin:
+    async def _build_vision_question(self, user_question, enhanced_messages):
+        """Build the question sent to the vision model.
+
+        Empty/vague asks get the standard default question; otherwise the user's question
+        passes through directly. The legacy utility-model enhancement hop (which re-sent
+        full conversation history to the utility model and added 1-2s latency per vision
+        request) only runs when ENABLE_VISION_ENHANCEMENT is explicitly on."""
+        stripped_q = (user_question or "").strip()
+        if not stripped_q or stripped_q.lower().rstrip("?!. ") in _VAGUE_VISION_ASKS:
+            self.log_debug("Vision question empty/vague — using VISION_DEFAULT_QUESTION")
+            return VISION_DEFAULT_QUESTION
+        if config.enable_vision_enhancement:
+            enhanced = await self.openai_client._enhance_vision_prompt(
+                user_question,
+                conversation_history=enhanced_messages  # Pass the full conversation context
+            )
+            self.log_debug(f"Enhanced vision prompt: {enhanced[:100]}...")
+            return enhanced
+        return user_question
+
     async def _inject_image_analyses(self, messages: List[Dict], thread_state) -> List[Dict]:
         """Inject stored image analyses into conversation for context.
 
@@ -165,14 +193,7 @@ class VisionHandlerMixin:
                     if i < len(attachments):
                         filenames.append(attachments[i].get("name", f"image{i+1}"))
             
-            # Enhance the vision prompt with conversation context
-            enhanced_question = user_question
-            if user_question:  # Only enhance if there's actually a question
-                enhanced_question = await self.openai_client._enhance_vision_prompt(
-                    user_question,
-                    conversation_history=enhanced_messages  # Pass the full conversation context
-                )
-                self.log_debug(f"Enhanced vision prompt: {enhanced_question[:100]}...")
+            enhanced_question = await self._build_vision_question(user_question, enhanced_messages)
             
             # Add filename context to the enhanced question for the API
             if filenames:

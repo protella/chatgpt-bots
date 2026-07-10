@@ -488,6 +488,22 @@ capture during processing, single-batch drain w/ multiple senders, drain loop on
 burst, linger, DM + thread + channel parity, no busy message posted, ordering, needs_refresh
 interplay. Live: send 3 messages fast in a DM — one combined reply, none dropped.
 
+**P. Prompt modernization** ✅ (2026-07-09, from the prompt-audit report) — legacy GPT-4-era
+prompts trimmed/rewritten for frontier models: SLACK_SYSTEM_PROMPT rewritten (teammate
+identity, channel-brevity + reaction-as-response etiquette, Phase-Q multi-sender batch rule,
+markdown-not-mrkdwn formatting guidance — kills the always-memo contradiction);
+IMAGE_INTENT_SYSTEM_PROMPT → INTENT_CLASSIFIER_PROMPT (~650→~260 tokens, back-compat alias
+kept, three learned disambiguation rules preserved); IMAGE_EDIT rewritten literal-first
+(10-80 words, never add unasked elements, photo-edit-only convention kept); IMAGE_GEN trimmed
++ preserve-explicit-specs-verbatim; IMAGE_ANALYSIS capped at 120 words (stored hidden-context
+cost); DOCUMENT_SUMMARIZATION length now scales to source; vision enhancement hop retired
+behind ENABLE_VISION_ENHANCEMENT (default OFF — saves a full-history utility call + 1-2s per
+vision request; empty/vague asks get VISION_DEFAULT_QUESTION); multi-user threads no longer
+carry the per-sender "You're speaking with ..." line in the cached prefix (roster + Username
+prefixes cover identity; DMs/single-user threads keep it); classify_participation got the
+512-token output floor. WAKE_CLASSIFIER + classify_wake still deprecated-not-deleted (one
+release). Tests: tests/unit/test_prompt_modernization.py + test_prompts.py rewritten.
+
 **H. (Optional) feedback_buttons + reaction_added ingestion** — thumbs signal → DB; engine may
 read per-channel feedback ratio later.
 

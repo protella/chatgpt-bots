@@ -6,7 +6,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from config import config
-from prompts import (IMAGE_INTENT_SYSTEM_PROMPT, MEMORY_EXTRACTION_SYSTEM_PROMPT,
+from prompts import (INTENT_CLASSIFIER_PROMPT, MEMORY_EXTRACTION_SYSTEM_PROMPT,
                      PARTICIPATION_SYSTEM_PROMPT, WAKE_CLASSIFIER_SYSTEM_PROMPT)
 
 
@@ -909,7 +909,9 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
     request_params = {
         "model": config.utility_model,
         "input": conversation_messages,
-        "max_output_tokens": config.utility_max_tokens,
+        # JSON verdict + reasoning-model preamble needs more room than a one-word
+        # classification; same floor the memory extractor uses.
+        "max_output_tokens": max(512, config.utility_max_tokens),
         "store": False,
     }
     # Utility model is a GPT-5-series reasoning model (gpt-5-mini)
@@ -1024,7 +1026,7 @@ async def classify_intent(
     # Add system prompt as developer message
     conversation_messages.append({
         "role": "developer",
-        "content": IMAGE_INTENT_SYSTEM_PROMPT
+        "content": INTENT_CLASSIFIER_PROMPT
     })
     
     # Track if we've seen recent images

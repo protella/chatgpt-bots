@@ -25,6 +25,13 @@ All notable changes to this project will be documented in this file.
 - All new behavior is env-flagged with sane defaults, documented in `.env.example`
 - Dependencies upgraded via `make lock-upgrade` (openai 2.44, slack-sdk 3.42, etc.)
 
+### ✨ Improvement - Prompts modernized for current models
+
+- **Snappier, channel-appropriate replies**: the bot now behaves like a teammate — brief and conversational at channel top level, fuller detail in threads, and it offers to expand in a thread instead of posting walls of text. The old always-use-section-headers formatting rule (which made every reply memo-shaped) is gone.
+- **Faster vision responses**: the extra "question enhancement" model call before every image analysis is now off by default (`ENABLE_VISION_ENHANCEMENT=false`) — it re-sent the full conversation history to a second model and added 1–2s latency. Current models answer the question directly.
+- **More literal image edits**: the edit-prompt instructions no longer mandate re-describing the whole scene (a source of unwanted "re-imagining" drift); edits state exactly what changes and preserve everything else. Generation prompts now preserve your explicit specifications verbatim.
+- **Lower cost per message**: the intent classifier prompt was trimmed ~60% (it runs on every responded message), and in multi-user threads the system prompt no longer changes per speaker — restoring prompt-cache hits that were silently lost on every speaker change.
+
 ### 🧹 Removed - Discord scaffolding, legacy code & tiktoken
 
 - **Discord support removed**: the V2 Discord bot was never built (the launcher was a "Coming Soon" stub). All Discord scaffolding is gone — stub launcher, config vars, prompts, markdown branch, and the `discord` dependency. The bot is Slack-only.
