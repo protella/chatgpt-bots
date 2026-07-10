@@ -28,7 +28,7 @@ class Message:
 @dataclass
 class Response:
     """Universal response format"""
-    type: str  # 'text', 'image', 'file', 'reaction', 'error'
+    type: str  # 'text', 'image', 'file', 'reaction', 'error', 'queued'
     content: Any
     metadata: Dict[str, Any] = None
 

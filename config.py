@@ -264,6 +264,17 @@ class BotConfig:
     # Emoji used to acknowledge a backoff request without more words.
     snooze_ack_emoji: str = field(default_factory=lambda: os.getenv("SNOOZE_ACK_EMOJI", "zipper_mouth_face").strip().strip(":"))
 
+    # Phase Q — conversational queueing (busy rejection retired). Messages arriving while a
+    # conversation is mid-processing queue and are answered in one batched catch-up turn.
+    # How long the finishing turn lingers (still holding the conversation lock) so stragglers
+    # join the same batch instead of triggering another turn seconds later.
+    queue_drain_linger_seconds: float = field(default_factory=lambda: float(os.getenv("QUEUE_DRAIN_LINGER_SECONDS", "1.0")))
+    # Max queued messages composed into ONE catch-up turn; the remainder drains next turn.
+    queue_max_batch: int = field(default_factory=lambda: int(os.getenv("QUEUE_MAX_BATCH", "10")))
+    # Hard bound on a conversation's pending queue; beyond this, messages are dropped with a
+    # log (Slack still has them — the thread is flagged for a transcript refetch).
+    queue_max_pending: int = field(default_factory=lambda: int(os.getenv("QUEUE_MAX_PENDING", "25")))
+
     # --- Local function-call loop (redesign Phase A) ---
     # Master switch for model-invoked local tools (history fetch, reactions, later search/memory).
     # The loop composes with server-side tools (web_search/MCP) in the same request.

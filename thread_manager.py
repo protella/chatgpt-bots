@@ -4,6 +4,7 @@ Manages conversation state, locks, and memory for each Slack thread
 """
 import time
 import asyncio
+from collections import deque
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from logger import LoggerMixin
@@ -340,6 +341,15 @@ class AsyncThreadLockManager(LoggerMixin):
         except asyncio.TimeoutError:
             return True
 
+    def locked_sync(self, thread_key: str) -> bool:
+        """Non-acquiring peek: is this conversation's lock currently held?
+        Dict access on the single event loop — safe without the global lock.
+        Advisory only (the answer can change right after); callers must not
+        use it for correctness, only to skip cosmetic work (e.g. a thinking
+        indicator that would be deleted immediately for a queued message)."""
+        lock = self._locks.get(thread_key)
+        return bool(lock and lock.locked())
+
     async def cleanup_old_locks(self, _max_age: int = 3600):
         """Remove locks that haven't been used recently"""
         # This is a placeholder for potential cleanup logic
@@ -379,12 +389,60 @@ class AsyncThreadStateManager(LoggerMixin):
         # releases, so a fast follow-up "edit it" could resolve its target before the
         # new image exists. Editors await the latch before resolving targets.
         self._upload_events: Dict[str, asyncio.Event] = {}
-        # Threads whose warm in-memory state is missing at least one Slack message:
-        # a message busy-rejected by the thread lock never entered the state, so the
-        # next request on that thread must refetch from Slack (the transcript) before
-        # processing. Set on busy rejection; consumed by the rebuild path.
+        # Threads whose warm in-memory state is missing at least one Slack message
+        # (e.g. a message dropped from an overfull pending queue, or a crash mid-queue).
+        # The next request on that thread refetches from Slack (the transcript) before
+        # processing. Consumed by the rebuild path.
         self._needs_refresh: set = set()
+        # Phase Q — conversational queueing: messages arriving while a conversation's
+        # lock is held append here instead of being busy-rejected. The finishing turn
+        # drains the queue into ONE batched catch-up turn. Enqueue and pop are plain
+        # synchronous operations, so on the single event loop each is atomic — the
+        # invariant is that nothing awaits between a lock-contention check and the
+        # corresponding enqueue, and the drain pops while STILL HOLDING the lock, so
+        # no message can slip between "queue looks empty" and "lock released".
+        self._pending_queues: Dict[str, deque] = {}
         self.log_info(f"AsyncThreadStateManager initialized {'with' if db else 'without'} database")
+
+    # --- Phase Q: pending-message queue (busy rejection retired) ---
+
+    def is_thread_processing(self, thread_ts: str, channel_id: str) -> bool:
+        """Advisory non-acquiring peek at the conversation lock (cosmetic uses only)."""
+        return self._lock_manager.locked_sync(f"{channel_id}:{thread_ts}")
+
+    def enqueue_pending(self, thread_key: str, message) -> bool:
+        """Queue a message that arrived while its conversation was mid-processing.
+        Returns False (and flags the thread for a transcript refetch) when the queue
+        is at QUEUE_MAX_PENDING — the message is dropped from warm state but Slack
+        still has it, so the refetch recovers it in context."""
+        queue = self._pending_queues.setdefault(thread_key, deque())
+        max_pending = int(getattr(config, "queue_max_pending", 25))
+        if len(queue) >= max_pending:
+            self.mark_needs_refresh(thread_key)
+            self.log_warning(
+                f"Pending queue full for {thread_key} ({max_pending}); dropping message "
+                f"from warm state (transcript refetch flagged)"
+            )
+            return False
+        queue.append(message)
+        self.log_debug(f"Queued message for busy conversation {thread_key} (pending={len(queue)})")
+        return True
+
+    def pending_count(self, thread_key: str) -> int:
+        return len(self._pending_queues.get(thread_key) or ())
+
+    def pop_pending_batch(self, thread_key: str, max_batch: int) -> list:
+        """Pop up to max_batch pending messages, FIFO. Synchronous == atomic on the
+        event loop. Anything left behind drains on the following turn."""
+        queue = self._pending_queues.get(thread_key)
+        if not queue:
+            return []
+        batch = []
+        while queue and len(batch) < max_batch:
+            batch.append(queue.popleft())
+        if not queue:
+            self._pending_queues.pop(thread_key, None)
+        return batch
 
     def mark_needs_refresh(self, thread_key: str):
         """Flag a thread whose warm state is now incomplete (e.g. a busy-rejected
