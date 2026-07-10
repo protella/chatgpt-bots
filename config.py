@@ -379,6 +379,9 @@ class BotConfig:
     reaction_emojis: list = field(default_factory=lambda: _env_list("REACTION_EMOJIS", [
         "thumbsup", "eyes", "white_check_mark", "raised_hands", "tada", "thinking_face", "+1",
     ]))
+    # F6: max distinct emoji the bot may place on a single message. Guards against
+    # over-reaction while still letting a user who asks for several get several.
+    reaction_max_per_message: int = field(default_factory=lambda: int(os.getenv("REACTION_MAX_PER_MESSAGE", "4")))
 
     # --- Outbound self-prefix hygiene (Phase 3.4) ---
     # Leading "Name:" prefixes to strip from the model's reply so it never answers as "ChatGPT: …"
@@ -416,6 +419,14 @@ class BotConfig:
     # Max "[Recent channel activity]" lines injected (at the SUFFIX — volatile, cache hygiene)
     # when responding in a channel. 0 disables the envelope without disabling the buffer.
     channel_pulse_envelope_max: int = field(default_factory=lambda: int(os.getenv("CHANNEL_PULSE_ENVELOPE_MAX", "15")))
+    # F5: per-thread tail ring for the participation classifier. The pulse keeps the last
+    # N messages of each active thread (their last 400 chars, sender-typed) so the wake
+    # judge can resolve who "you" addresses. 0 disables recording + the signal.
+    participation_thread_tail: int = field(default_factory=lambda: int(os.getenv("PARTICIPATION_THREAD_TAIL", "6")))
+    # Max distinct threads whose tails are retained per channel (whole-thread LRU eviction).
+    pulse_thread_tails_max: int = field(default_factory=lambda: int(os.getenv("PULSE_THREAD_TAILS_MAX", "50")))
+    # Global bound on how many channels retain thread-tail rings (outer-map LRU).
+    pulse_thread_tail_channels_max: int = field(default_factory=lambda: int(os.getenv("PULSE_THREAD_TAIL_CHANNELS_MAX", "30")))
 
     # --- Response footer (Phase 7 entry point): a small context line + "⚙️ Configure" button
     # appended under each channel response (any member can open the per-channel settings modal).

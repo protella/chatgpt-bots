@@ -330,6 +330,28 @@ DMs behave as before.
   and when a reply is actually wanted. The note is internal context only (never posted,
   never stored). Toggle with `ENABLE_WAKE_ENVELOPE` (default on).
 
+### 🧵 Fixed - The bot reads the room before deciding to jump in
+
+- When the bot is deciding whether an unaddressed channel message is meant for it, it now
+  sees the thread's recent back-and-forth — so an unnamed follow-up like "are you not able
+  to see that?" is correctly read as continuing whoever the sender was already talking to,
+  instead of the bot assuming "you" means itself and barging in. This closes a live case
+  where it answered a question aimed at another participant. The thread context is internal
+  only (never posted, never stored) and costs no extra API calls. Tune how much it sees with
+  `PARTICIPATION_THREAD_TAIL` (default 6 messages; 0 turns it off).
+- The bot's awareness of channel activity is now more reliable: it takes in other apps'
+  messages and its own posted replies (not just people's), so its sense of who-said-what to
+  whom is complete.
+
+### 🎉 Feature - The bot can add several reactions when you ask for them
+
+- Asking the bot for multiple emoji reactions on a message now works — previously it would
+  add only one, because it was hard-limited to a single reaction per message. It still
+  reacts sparingly by default (most messages get none), but when you explicitly ask for
+  several distinct emoji it adds them, up to a safety cap. Set the cap with
+  `REACTION_MAX_PER_MESSAGE` (default 4). Reacting with the same emoji twice remains a
+  harmless no-op.
+
 ### 🩹 Fixed - Reliability hardening for the new channel/image features
 
 - Live progress checklists now also appear when the bot **edits** an image (not just when
