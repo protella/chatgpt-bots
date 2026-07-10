@@ -14,6 +14,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Set test environment
 os.environ['TESTING'] = 'true'
 
+# Redirect ALL database/backup writes to a throwaway dir before config.py is
+# imported (its singleton reads DATABASE_DIR at import time). Without this,
+# any DatabaseManager built in a test writes tagged migration backups into the
+# real data/backups/ — and backup retention cleanup could then delete real
+# backups older than 7 days.
+import tempfile
+os.environ['DATABASE_DIR'] = tempfile.mkdtemp(prefix='pytest-bot-db-')
+
 @pytest.fixture
 def mock_env(monkeypatch):
     """Mock environment variables for testing"""
