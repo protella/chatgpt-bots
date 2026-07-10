@@ -61,6 +61,10 @@ class SlackAssistantEventsMixin:
         try:
             if config.assistant_greeting and thread["channel_id"] not in self._greeted_channels():
                 self._greeted_channels().add(thread["channel_id"])
+                # Same empty-conversation guard as the agent_view path: a restart
+                # forgets the in-memory dedup, and returning users have history.
+                if await self._conversation_has_history(thread["channel_id"]):
+                    return
                 await self.app.client.chat_postMessage(
                     channel=thread["channel_id"],
                     thread_ts=thread["thread_ts"],
@@ -117,12 +121,28 @@ class SlackAssistantEventsMixin:
         try:
             if config.assistant_greeting and channel_id not in self._greeted_channels():
                 self._greeted_channels().add(channel_id)
+                # Greet only a genuinely EMPTY conversation. The in-memory set
+                # resets on restart, and this event fires on every tab visit —
+                # without this check, returning users get re-greeted even though
+                # their history is right there.
+                if await self._conversation_has_history(channel_id):
+                    return
                 await self.app.client.chat_postMessage(
                     channel=channel_id,
                     text=config.assistant_greeting,
                 )
         except Exception as e:  # noqa: BLE001
             self.log_debug(f"Could not post agent-view greeting: {e}")
+
+    async def _conversation_has_history(self, channel_id: str) -> bool:
+        """True if the conversation already has any message. Fail-open to True
+        (skip the greeting) — a spurious greeting is worse than a missing one."""
+        try:
+            result = await self.app.client.conversations_history(channel=channel_id, limit=1)
+            return bool(result.get("messages"))
+        except Exception as e:  # noqa: BLE001
+            self.log_debug(f"Greeting history check failed (skipping greeting): {e}")
+            return True
 
     async def _handle_app_context_changed(self, event: Dict[str, Any]) -> None:
         """agent_view lifecycle: the user's active channel/context changed while the
