@@ -64,6 +64,13 @@ class SlackMessageEventsMixin:
                 user_tz_label = user_info.get('tz_label')
                 self.log_debug(f"User from DB for {user_id}: email={user_email}, real_name={user_real_name}")
 
+        # F3 sender classification (human | self | other_bot) for the wake envelope.
+        # Guarded: _event_to_message can run before bot identity is fully wired.
+        try:
+            event_sender_type = self.classify_sender(event)
+        except Exception:
+            event_sender_type = None
+
         # Create universal message
         message = Message(
             text=text,
@@ -83,7 +90,9 @@ class SlackMessageEventsMixin:
                 # Minted by Slack on message/app_mention events for AI apps; authorizes
                 # assistant.search.context for this interaction. Absent on older/replayed
                 # events — the search tool degrades gracefully (Phase B).
-                "action_token": event.get("action_token")
+                "action_token": event.get("action_token"),
+                # F3: human | self | other_bot — lets the wake envelope render "— bot".
+                "sender_type": event_sender_type,
             }
         )
         return message
@@ -264,6 +273,15 @@ class SlackMessageEventsMixin:
         message.thread_id = thread_ts or ts
         message.metadata["channel_listen"] = True
         message.metadata["participation_level"] = level
+        # F3 wake source: a name-in-text hit reads as name_mention (engine-gated or the
+        # legacy deterministic wake); a 1:1 thread reply as thread_continuation; anything
+        # else the engine woke on is ambient.
+        if direct_continuation:
+            message.metadata["wake_source"] = "thread_continuation"
+        elif name_hit:
+            message.metadata["wake_source"] = "name_mention"
+        else:
+            message.metadata["wake_source"] = "ambient"
         if participation_check:
             message.metadata["participation_check"] = True
             if name_hit:
@@ -291,14 +309,19 @@ class SlackMessageEventsMixin:
         if self.message_handler:
             await self.message_handler(message, self)
 
-    async def _handle_slack_message(self, event: Dict[str, Any], client):
-        """Handle a mention/DM event: build the message, run onboarding, dispatch (unchanged)."""
+    async def _handle_slack_message(self, event: Dict[str, Any], client, wake_source: str = None):
+        """Handle a mention/DM event: build the message, run onboarding, dispatch (unchanged).
+
+        wake_source (F3): "app_mention" or "dm" — this path is shared by both, so the
+        caller (registration) tags which one so the wake envelope can tell them apart."""
 
         # Skip message_changed events
         if event.get("subtype") == "message_changed":
             return
 
         message = await self._event_to_message(event, client)
+        if wake_source:
+            message.metadata["wake_source"] = wake_source
         user_id = event.get("user")
 
         # Phase E: an @mention in a channel is also a wake — seed the pulse ring so the

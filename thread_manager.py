@@ -32,6 +32,10 @@ class ThreadState:
     has_shown_80_percent_warning: bool = False  # Track if we've shown the 80% context warning
     current_model: str = field(default_factory=lambda: config.gpt_model)  # Track current model for token limits
     participants: Dict[str, str] = field(default_factory=dict)  # user_id -> display name, for the @mention roster
+    # F3 wake envelope: (user_id, sender_type) of the thread's ROOT message author, so the
+    # model can be told whether the current sender started the thread or joined it. Set on
+    # thread creation / rebuild; None until known.
+    root_author: Optional[tuple] = None
     # Usage-driven budgeting: authoritative context size from the API's response.usage
     # after each call, plus chars/4 estimates for messages added between calls.
     context_tokens: int = 0

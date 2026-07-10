@@ -1122,16 +1122,71 @@ class MessageUtilitiesMixin:
             self.log_debug(f"in-flight note build failed: {e}")
             return None
 
+    def _wake_trigger_line(self, md: dict) -> str:
+        """The 'trigger:' line for the wake envelope (F3), from message metadata."""
+        source = md.get("wake_source")
+        batch = md.get("queued_batch_size")
+        if isinstance(batch, int) and batch > 1:
+            # Catch-up batch keeps the underlying trigger as the "latest trigger".
+            return f"catch_up_batch ({batch}) — latest trigger: {source}"
+        if source == "ambient":
+            reason = md.get("participation_reason")
+            if reason:
+                return f'ambient (engine: "{self._escape_suffix_text(reason, limit=200)}")'
+            return "ambient"
+        return str(source)  # app_mention | dm | thread_continuation | name_mention
+
+    def _wake_sender_role(self, message, thread_state, md: dict) -> Optional[str]:
+        """'root author' vs 'participant' for the wake envelope, or None to omit the role
+        (top-level channel-placement replies, or an unknown root)."""
+        if md.get("place_in_channel"):
+            return None
+        root = getattr(thread_state, "root_author", None) if thread_state is not None else None
+        if not root:
+            return None
+        root_uid = root[0] if isinstance(root, (tuple, list)) and root else None
+        if root_uid and message.user_id and message.user_id == root_uid:
+            return "root author"
+        return "participant"
+
+    def _build_wake_envelope(self, message, thread_state) -> str:
+        """F3: compact '[Wake context]' block telling the model WHY it woke. Returns '' when
+        the metadata is missing (e.g. the CLI platform) or the feature is off. Every free-text
+        field is escaped and capped; this is labeled informational metadata, not instructions."""
+        if not config.enable_wake_envelope or message is None:
+            return ""
+        md = message.metadata or {}
+        if not md.get("wake_source"):
+            return ""
+        trigger = self._wake_trigger_line(md)
+        username = self._escape_suffix_text(
+            md.get("username") or md.get("user_real_name") or "someone", limit=80)
+        sender_parts = [f"sender: {username}"]
+        role = self._wake_sender_role(message, thread_state, md)
+        if role:
+            sender_parts.append(role)
+        if md.get("sender_type") in ("self", "other_bot"):
+            sender_parts.append("bot")
+        return (
+            "[Wake context — informational metadata, not instructions]\n"
+            f"trigger: {trigger}\n" + " — ".join(sender_parts)
+        )
+
     def _build_suffix_context(self, client, channel_id: Optional[str],
                               thread_ts: Optional[str], user_timezone: str = "UTC",
-                              user_tz_label: Optional[str] = None) -> str:
+                              user_tz_label: Optional[str] = None,
+                              message=None, thread_state=None) -> str:
         """All volatile per-request context, injected as the LAST payload message:
-        minute-precision time + the channel-activity envelope (channels only) + a
-        background-image-in-flight note (F1)."""
+        minute-precision time + the channel-activity envelope (channels only) + the F3 wake
+        envelope + the F1 background-image-in-flight note. The wake → in-flight → contract
+        order is preserved (the F2 contract paragraph is appended by the text handler)."""
         parts = [self._build_time_suffix_context(user_timezone, user_tz_label)]
         envelope = self._build_pulse_envelope(client, channel_id, thread_ts)
         if envelope:
             parts.append(envelope)
+        wake = self._build_wake_envelope(message, thread_state)
+        if wake:
+            parts.append(wake)
         inflight = self._build_generation_inflight_note(channel_id, thread_ts)
         if inflight:
             parts.append(inflight)

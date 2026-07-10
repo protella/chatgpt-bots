@@ -84,6 +84,17 @@ class TestBotConfig:
         config = BotConfig()
         assert config.enable_no_reply_tool is False
 
+    def test_wake_envelope_default_enabled(self, mock_env):
+        """ENABLE_WAKE_ENVELOPE defaults to True"""
+        config = BotConfig()
+        assert config.enable_wake_envelope is True
+
+    @patch.dict(os.environ, {"ENABLE_WAKE_ENVELOPE": "false"})
+    def test_wake_envelope_disabled(self, mock_env):
+        """ENABLE_WAKE_ENVELOPE=false disables the wake envelope"""
+        config = BotConfig()
+        assert config.enable_wake_envelope is False
+
     def test_validate_success(self, mock_env):
         """Test successful validation with all required fields"""
         config = BotConfig()
