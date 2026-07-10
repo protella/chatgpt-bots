@@ -937,10 +937,33 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
     identical inputs produce identical payloads."""
     signals = signals or {}
     lines = []
+    # Identity anchor so the model can recognize addressing by name — including
+    # typos and case variants ("chatgpt-dve, help") that the deterministic
+    # alias prefilter misses. Config aliases are constant, so this line is
+    # deterministic (cache-friendly).
+    aliases = list(getattr(config, "bot_name_aliases", None) or [])
+    if aliases:
+        lines.append(
+            f"- The assistant's name in this workspace: {aliases[0]}"
+            + (f" (also answers to: {', '.join(aliases[1:])})" if len(aliases) > 1 else "")
+            + ". Messages addressing it by name — even misspelled — are meant for it."
+        )
     if signals.get("sender_name"):
         lines.append(f"- Sender: {signals['sender_name']}")
     if signals.get("is_thread_reply"):
         lines.append("- This is a reply inside a thread the assistant can see.")
+    if signals.get("name_hit"):
+        lines.append(
+            "- The message contains the assistant's name. Decide from context whether the "
+            "assistant is being ADDRESSED (respond) or merely being talked about (do not "
+            "respond just because the name appears) — including the possibility that the "
+            "name refers to a public product or service rather than this workspace assistant."
+        )
+    if signals.get("snoozed"):
+        lines.append(
+            "- This channel recently told the assistant to quiet down (currently snoozed). "
+            "Respond ONLY if this message unmistakably summons the assistant; otherwise ignore."
+        )
     lines.append(f"- Strictness: {signals.get('strictness') or 'judicious'}")
     lines.append(
         f"- Assistant's unprompted replies in this channel in the last hour: "
