@@ -967,7 +967,10 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
             "- The message contains the assistant's name. Decide from context whether the "
             "assistant is being ADDRESSED (respond) or merely being talked about (do not "
             "respond just because the name appears) — including the possibility that the "
-            "name refers to a public product or service rather than this workspace assistant."
+            "name refers to a public product or service rather than this workspace assistant. "
+            "If the message opens with or names a DIFFERENT party as its addressee, that "
+            "party wins: the assistant's name is then just part of the topic (a possessive "
+            "or reference like \"the chatgpt bot's repo\"), not a summons."
         )
     if signals.get("snoozed"):
         lines.append(

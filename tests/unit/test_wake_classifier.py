@@ -130,6 +130,19 @@ def test_prompt_carries_addressed_to_someone_else_rule():
     assert "hey claude" in PARTICIPATION_SYSTEM_PROMPT
 
 
+def test_prompt_carries_addressee_precedence_over_name_hit():
+    # Regression guard (2026-07-10): "claude, do you still have the chatgpt bot's
+    # repo checked out?" — the alias prefilter flags "chatgpt" (a possessive topic
+    # ref) as a name hit, and the model must not let that outrank the opener
+    # naming another party. Both the rule and the name_hit signal carry it.
+    from prompts import PARTICIPATION_SYSTEM_PROMPT
+    assert "the chatgpt bot's repo" in PARTICIPATION_SYSTEM_PROMPT
+    import inspect
+    from openai_client.api import responses
+    src = inspect.getsource(responses.classify_participation)
+    assert "DIFFERENT party" in src
+
+
 def test_prompt_carries_second_person_continuity_rule():
     # Regression guard for the "how does your background workspace work?" bug
     # (2026-07-10): an unnamed "you"-follow-up mid-exchange with another
