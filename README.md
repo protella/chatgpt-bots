@@ -233,7 +233,7 @@ built-in texts.
 - **Document Processing**: Uploads become concise summaries in the conversation; the bot re-reads the original from Slack on demand when asked for specifics. Document content is never stored and never touches disk — delete a file in Slack and it's genuinely gone from the bot's reach.
 - **Web Search**: Current information retrieval
 - **Streaming Responses**: Real-time message updates as responses generate
-- **On-Demand Context**: The bot can fetch older history and search the workspace (permission-scoped) when a conversation references something it can't see
+- **On-Demand Context**: The bot can fetch older history, search the workspace (permission-scoped), link directly to earlier messages ("link me to where we decided X"), and look up channel info, pinned messages, emoji reactions, and user profiles — all fetched live when asked, never stored
 
 #### Channel Teammate (optional, off by default)
 Flip `ENABLE_CHANNEL_LISTENING=true` and the bot behaves like a thoughtful colleague
