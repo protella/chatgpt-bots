@@ -28,7 +28,8 @@ class ImageGenerationMixin:
         thread_config = await config.get_thread_config_async(
             overrides=thread_state.config_overrides,
             user_id=message.user_id,
-            db=self.db
+            db=self.db,
+            channel_id=message.channel_id
         )
         
         # Inject stored image analyses for style consistency

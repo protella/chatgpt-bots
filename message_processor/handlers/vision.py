@@ -154,7 +154,8 @@ class VisionHandlerMixin:
             thread_config = await config.get_thread_config_async(
                 overrides=thread_state.config_overrides,
                 user_id=message.user_id,
-                db=self.db
+                db=self.db,
+                channel_id=message.channel_id
             )
             web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
             system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"], web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_directives=getattr(thread_state, 'channel_directives', None))
