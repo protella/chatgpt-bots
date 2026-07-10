@@ -118,10 +118,12 @@ class SlackMessageEventsMixin:
         return False
 
     async def _thread_participation(self, channel_id: str, thread_ts: str):
-        """Best-effort (bot_present, distinct_human_count) for an existing thread.
+        """Best-effort (bot_present, distinct_human_count, other_bot_count) for a thread.
 
-        Lets an untagged reply count as 'for us' only in a 1:1 thread (bot + one human);
-        in a multi-party thread it's for us only if explicitly addressed. On error → (False, 0)."""
+        Lets an untagged reply count as 'for us' only in a genuinely 1:1 thread: the bot,
+        at most one human, and NO other bots/agents. Another agent in the thread (e.g. a
+        second assistant) means messages may be for it — only the engine can tell, so no
+        deterministic continuation there. On error → (False, 0, 0)."""
         try:
             result = await self.app.client.conversations_replies(
                 channel=channel_id, ts=thread_ts, limit=50
@@ -129,9 +131,10 @@ class SlackMessageEventsMixin:
             msgs = result.get("messages", [])
         except Exception as e:
             self.log_debug(f"_thread_participation failed: {e}")
-            return (False, 0)
+            return (False, 0, 0)
         bot_present = False
         humans = set()
+        other_bots = set()
         for m in msgs:
             if self.is_own_message(m):
                 bot_present = True
@@ -139,7 +142,9 @@ class SlackMessageEventsMixin:
                 uid = m.get("user")
                 if uid:
                     humans.add(uid)
-        return (bot_present, len(humans))
+            else:
+                other_bots.add(m.get("bot_id") or m.get("user") or "bot")
+        return (bot_present, len(humans), len(other_bots))
 
     async def _feed_channel_pulse(self, event: Dict[str, Any]) -> None:
         """Phase E: feed EVERY real channel message into the ambient ring buffer —
@@ -212,20 +217,24 @@ class SlackMessageEventsMixin:
         # True @mentions stay deterministic via the app_mention event (deduped above).
         name_hit = self._text_mentions_bot_name(text)
 
-        # Thread replies: an untagged reply in a 1:1 thread with the bot continues
-        # that conversation deterministically (cheap, and practically always right).
+        # Thread replies: an untagged HUMAN reply in a genuinely 1:1 thread with the
+        # bot (one human, no other bots/agents) continues that conversation
+        # deterministically (cheap, and practically always right). A message from
+        # another bot is never a continuation — it goes to the engine or nowhere.
         ts = event.get("ts")
         thread_ts = event.get("thread_ts")
+        sender_is_bot = self.classify_sender(event) != "human"
         direct_continuation = False
-        if thread_ts and thread_ts != ts:
-            bot_present, human_count = await self._thread_participation(channel_id, thread_ts)
-            if bot_present and human_count <= 1:
+        if not sender_is_bot and thread_ts and thread_ts != ts:
+            bot_present, human_count, other_bots = await self._thread_participation(channel_id, thread_ts)
+            if bot_present and human_count <= 1 and other_bots == 0:
                 direct_continuation = True
 
         # Decide (Phase F, revised): 1:1 thread continuation → respond directly;
         # judicious/active → engine judges every message; mentions_only → engine
         # judges ONLY name-bearing messages (zero model cost otherwise); engine
-        # disabled → legacy deterministic name wake.
+        # disabled → legacy deterministic name wake (humans only — a bot naming us
+        # must never trigger a judgment-free reply, that's a loop seed).
         engine_on = getattr(config, "enable_participation_engine", True)
         participation_check = False
         snoozed = is_snoozed(cs)
@@ -238,7 +247,7 @@ class SlackMessageEventsMixin:
             if snoozed and not name_hit:
                 return
             participation_check = True
-        elif not engine_on and name_hit:
+        elif not engine_on and name_hit and not sender_is_bot:
             pass  # legacy deterministic name wake (engine disabled)
         else:
             return
@@ -261,6 +270,8 @@ class SlackMessageEventsMixin:
                 message.metadata["participation_name_hit"] = True
             if snoozed:
                 message.metadata["participation_snoozed"] = True
+            if sender_is_bot:
+                message.metadata["participation_sender_bot"] = True
         # Phase 7: carry per-channel ground rules + placement into the response pipeline.
         if cs:
             if cs.get("directives"):

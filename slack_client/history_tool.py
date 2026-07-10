@@ -34,7 +34,8 @@ class SlackHistoryToolMixin:
                 "description": (
                     "Fetch a bounded slice of recent messages from a Slack channel the bot can "
                     "access (public channels, or private channels the bot is a member of). Use when "
-                    "you need more context than the current thread provides."
+                    "you need more context than the current thread provides. Each message includes "
+                    "its current emoji reactions (who reacted with what)."
                 ),
                 "parameters": {
                     "type": "object",
@@ -50,7 +51,9 @@ class SlackHistoryToolMixin:
                 "name": "fetch_thread_messages",
                 "description": (
                     "Fetch messages from a specific Slack thread in a channel the bot can access "
-                    "(public, or private the bot is a member of)."
+                    "(public, or private the bot is a member of). Each message includes its current "
+                    "emoji reactions (who reacted with what) — use this to check up-to-date "
+                    "reactions, including on the current thread's own messages."
                 ),
                 "parameters": {
                     "type": "object",
@@ -121,14 +124,26 @@ class SlackHistoryToolMixin:
                 resp = await self.app.client.conversations_history(channel=channel_id, limit=n)
             all_messages = resp.get("messages") or []
             raw = all_messages[:n]
-            messages = [
-                {
+            messages = []
+            for m in raw:
+                entry = {
                     "user": m.get("user") or m.get("username") or ("bot" if m.get("bot_id") else "unknown"),
                     "ts": m.get("ts"),
                     "text": m.get("text", ""),
                 }
-                for m in raw
-            ]
+                # Emoji reactions on the message (who reacted with what) — lets the
+                # model answer reaction questions with current data, since in-memory
+                # thread state only carries reactions present at capture time.
+                if m.get("reactions"):
+                    entry["reactions"] = [
+                        {
+                            "emoji": r.get("name"),
+                            "count": r.get("count") or len(r.get("users") or []),
+                            "users": r.get("users") or [],
+                        }
+                        for r in m["reactions"] if r.get("name")
+                    ]
+                messages.append(entry)
             # R5: tell the model whether it saw a window or everything — otherwise
             # "50 messages" is indistinguishable from "the newest 50 of 5,000".
             has_more = bool(

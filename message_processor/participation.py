@@ -126,7 +126,8 @@ class ParticipationEngine:
                        channel_activity: Optional[str] = None,
                        unprompted_last_hour: int = 0,
                        name_hit: bool = False,
-                       snoozed: bool = False) -> Optional[ParticipationVerdict]:
+                       snoozed: bool = False,
+                       sender_is_bot: bool = False) -> Optional[ParticipationVerdict]:
         """Debounced judgment. Returns None when superseded — a newer message in
         the same channel arrived during the debounce window, and ITS evaluation
         (whose envelope includes this message) covers the batch."""
@@ -148,6 +149,7 @@ class ParticipationEngine:
             "hourly_cap": self.hourly_cap(level),
             "name_hit": bool(name_hit),
             "snoozed": bool(snoozed),
+            "sender_is_bot": bool(sender_is_bot),
         }
         try:
             raw = await self.openai_client.classify_participation(text=text, signals=signals)
