@@ -590,40 +590,13 @@ class SlackMessageEventsMixin:
                     
                     # No need to warn user - we handle truncation transparently
                 else:
-                    # Existing user - message is already being processed, just provide settings access
-                    # Only store minimal context needed for settings modal
-                    button_value = json.dumps({
-                        "channel_id": message.channel_id,
-                        "thread_id": message.thread_id
-                    })
-                    
-                    # Compact settings button for existing users
-                    blocks = [
-                        {
-                            "type": "section",
-                            "text": {
-                                "type": "mrkdwn",
-                                "text": "⚙️ *Quick Settings Access*"
-                            }
-                        },
-                        {
-                            "type": "actions",
-                            "elements": [
-                                {
-                                    "type": "button",
-                                    "text": {
-                                        "type": "plain_text",
-                                        "text": "Settings"
-                                    },
-                                    "style": "primary",
-                                    "action_id": "open_welcome_settings",
-                                    "value": button_value
-                                }
-                            ]
-                        }
-                    ]
-                
-                # Post the settings button as the first message in the thread
+                    # Existing user: no chrome. The old "Quick Settings Access"
+                    # button per new DM thread is retired — settings are reachable
+                    # via the slash command, the channel ⚙️ footer, and the
+                    # Configure icon-button on DM responses.
+                    return
+
+                # Post the onboarding settings button as the first message in the thread
                 await client.chat_postMessage(
                     channel=message.channel_id,
                     thread_ts=message.thread_id,  # Always use thread_ts to post in the thread
