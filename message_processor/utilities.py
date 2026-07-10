@@ -12,7 +12,7 @@ import re
 import pytz
 
 from base_client import BaseClient, Message
-from config import config
+from config import config, pipeline_status
 from prompts import SLACK_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, LOCAL_TOOLS_GUIDANCE
 
 
@@ -411,7 +411,7 @@ class MessageUtilitiesMixin:
                     # Update status to show we're processing the document
                     if thinking_id:
                         self._update_status(client, message.channel_id, thinking_id, 
-                                          f"Processing {file_name}...", 
+                                          pipeline_status("processing_document", f"Processing {file_name}…", file_name=file_name), 
                                           emoji=config.analyze_emoji, thread_id=message.thread_id)
                     
                     # Download the document
@@ -424,7 +424,7 @@ class MessageUtilitiesMixin:
                         # Update status to show we're extracting content
                         if thinking_id:
                             self._update_status(client, message.channel_id, thinking_id, 
-                                              f"Extracting content from {file_name}...", 
+                                              pipeline_status("extracting_document", f"Extracting content from {file_name}…", file_name=file_name), 
                                               emoji=config.analyze_emoji, thread_id=message.thread_id)
                         
                         # Extract document content using DocumentHandler. Pre-extraction
@@ -468,7 +468,7 @@ class MessageUtilitiesMixin:
                             # Attach-time summary: the only content that persists.
                             if thinking_id:
                                 self._update_status(client, message.channel_id, thinking_id,
-                                                  f"Summarizing {file_name}...",
+                                                  pipeline_status("summarizing_document", f"Summarizing {file_name}…", file_name=file_name),
                                                   emoji=config.analyze_emoji, thread_id=message.thread_id)
                             doc_summary = await self._summarize_document_for_attach(
                                 extracted_content, file_name, mimetype)
@@ -623,7 +623,7 @@ class MessageUtilitiesMixin:
                                 # Update status
                                 if thinking_id:
                                     self._update_status(client, message.channel_id, thinking_id,
-                                                      f"Extracting content from {file_name}...",
+                                                      pipeline_status("extracting_document", f"Extracting content from {file_name}…", file_name=file_name),
                                                       emoji=config.analyze_emoji, thread_id=message.thread_id)
                                 
                                 # Extract content

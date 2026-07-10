@@ -6,7 +6,7 @@ from typing import Optional
 import time
 
 from base_client import BaseClient, Message, Response
-from config import config
+from config import config, pipeline_status
 from streaming import RateLimitManager, StreamingBuffer
 
 
@@ -101,7 +101,7 @@ class ImageGenerationMixin:
             # Create a NEW message for generating status - don't touch the enhanced prompt!
             generating_id = await client.send_thinking_indicator(channel_id, thread_state.thread_ts)
             self._update_status(client, channel_id, generating_id, 
-                              "Generating image. This may take a minute...", 
+                              pipeline_status("generating_image", "Generating image. This may take a minute…"), 
                               emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
             # Track the status message ID
             if generating_id:  # status-only DMs return no ts — never store a None id
@@ -187,10 +187,10 @@ class ImageGenerationMixin:
         else:
             # Non-streaming fallback or skip enhancement
             if not skip_enhancement:
-                self._update_status(client, channel_id, thinking_id, "Enhancing your prompt...", thread_id=thread_state.thread_ts)
+                self._update_status(client, channel_id, thinking_id, pipeline_status("enhancing_prompt", "Enhancing your prompt…"), thread_id=thread_state.thread_ts)
             
             # Generate image with or without enhancement
-            self._update_status(client, channel_id, thinking_id, "Creating your image. This may take a minute...", emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
+            self._update_status(client, channel_id, thinking_id, pipeline_status("generating_image", "Creating your image. This may take a minute…"), emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
             
             try:
                 image_data = await self.openai_client.generate_image(
@@ -270,5 +270,5 @@ class ImageGenerationMixin:
     def _update_thinking_for_image(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], thread_id: Optional[str] = None):
         """Update the progress indicator to show image generation message"""
         self._update_status(client, channel_id, thinking_id,
-                          "Generating image. This may take a minute, please wait...",
+                          pipeline_status("generating_image", "Generating image. This may take a minute…"),
                           emoji=config.circle_loader_emoji, thread_id=thread_id)
