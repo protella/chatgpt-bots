@@ -55,6 +55,17 @@ async def test_native_stream_start_update_finish_sends_deltas():
 
 
 @pytest.mark.asyncio
+async def test_native_stream_top_level_skips_start():
+    # chat.startStream requires thread_ts — a top-level (threadless) reply must not
+    # even attempt the call (it 400s with "missing required field: thread_ts").
+    client = SimpleNamespace(chat_startStream=AsyncMock())
+    sess = NativeStreamSession(client, "C1", None)
+    assert await sess.start("hi") is False
+    assert sess.active is False
+    client.chat_startStream.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_native_stream_start_failure_is_inert():
     client = SimpleNamespace(chat_startStream=AsyncMock(side_effect=RuntimeError("boom")))
     sess = NativeStreamSession(client, "C1", "T1")

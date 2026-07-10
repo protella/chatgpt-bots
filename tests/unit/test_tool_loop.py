@@ -497,6 +497,8 @@ class TestProcessorGlue:
         ]
         s.dispatch_history_tool_call = AsyncMock(return_value={"ok": True})
         registry = SlackBot._build_tool_registry(s)
-        await registry.dispatch(ToolContext(), "fetch_thread_messages", '{"channel_id": "C1"}')
+        ctx = ToolContext()
+        await registry.dispatch(ctx, "fetch_thread_messages", '{"channel_id": "C1"}')
+        # ctx rides along so omitted channel_id/thread_ts default to the current conversation
         s.dispatch_history_tool_call.assert_awaited_once_with(
-            "fetch_thread_messages", {"channel_id": "C1"})
+            "fetch_thread_messages", {"channel_id": "C1"}, ctx)
