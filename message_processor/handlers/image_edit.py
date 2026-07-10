@@ -8,6 +8,7 @@ import time
 
 from base_client import BaseClient, Message, Response
 from config import config, pipeline_status
+from message_processor.progress import ProgressChecklist
 from prompts import IMAGE_ANALYSIS_PROMPT
 
 
@@ -200,6 +201,10 @@ class ImageEditMixin:
                             cooldown_seconds=streaming_config.get("circuit_breaker_cooldown", 60)
                         )
                         
+                        # Enhanced-prompt display id (regression fix): thinking_id is None
+                        # on status-only surfaces, so lazily create a real message there.
+                        prompt_ref = {"id": thinking_id, "creating": False}
+
                         def enhancement_callback(chunk: str):
                             buffer.add_chunk(chunk)
                             # Only update if both buffer says it's time AND rate limiter allows it
@@ -207,8 +212,15 @@ class ImageEditMixin:
                                 rate_limiter.record_request_attempt()
                                 display_text = f"*Enhanced Prompt:* ✨ _{buffer.get_complete_text()}_ {config.loading_ellipse_emoji}"
 
-                                result = self._update_message_streaming_sync(client, channel_id, thinking_id, display_text)
-                                
+                                pid = prompt_ref["id"]
+                                if pid is None:
+                                    if not prompt_ref["creating"]:
+                                        prompt_ref["creating"] = True
+                                        self._schedule_async_call(self._lazy_create_prompt_ref(
+                                            client, channel_id, thread_state.thread_ts, display_text, prompt_ref))
+                                    return
+                                result = self._update_message_streaming_sync(client, channel_id, pid, display_text)
+
                                 if result["success"]:
                                     rate_limiter.record_success()
                                     buffer.mark_updated()
@@ -218,13 +230,13 @@ class ImageEditMixin:
                                         if result["retry_after"]:
                                             rate_limiter.set_retry_after(result["retry_after"])
                                         rate_limiter.record_failure(is_rate_limit=True)
-                                        
+
                                         # Check if circuit breaker opened
                                         if not rate_limiter.is_streaming_enabled():
                                             self.log_warning("Image edit enhancement rate limited - circuit breaker opened")
                                     else:
                                         rate_limiter.record_failure(is_rate_limit=False)
-                        
+
                         # First enhance the prompt with streaming
                         enhanced_edit_prompt = await self.openai_client._enhance_image_edit_prompt(
                             user_request=text,
@@ -232,38 +244,50 @@ class ImageEditMixin:
                             conversation_history=enhanced_messages,
                             stream_callback=enhancement_callback
                         )
-                        
+
                         # Show the final enhanced prompt (without loading indicator)
-                        if enhanced_edit_prompt and thinking_id:
+                        if enhanced_edit_prompt:
                             enhanced_text = f"*Enhanced Prompt:* ✨ _{enhanced_edit_prompt}_"
-                            result = self._update_message_streaming_sync(client, channel_id, thinking_id, enhanced_text)
-                            if not result["success"] and result.get("rate_limited"):
-                                self.log_debug("Couldn't remove loading indicator from enhanced prompt due to rate limit")
-                            # Mark that we should NOT touch this message again
-                            response_metadata["prompt_message_id"] = thinking_id
+                            pid = await self._resolve_prompt_message(
+                                client, channel_id, thread_state.thread_ts, prompt_ref, enhanced_text)
+                            if pid:
+                                # Mark that we should NOT touch this message again
+                                response_metadata["prompt_message_id"] = pid
                         
                         # Create a NEW message for editing status - don't touch the enhanced prompt!
                         editing_id = await client.send_thinking_indicator(channel_id, thread_state.thread_ts)
-                        self._update_status(client, channel_id, editing_id,
-                                          pipeline_status("editing_image", "Editing your image. This may take a minute…"),
-                                          emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
-                        # Track the status message ID
-                        if editing_id:  # status-only DMs return no ts — never store a None id
-                            response_metadata["status_message_id"] = editing_id
-
                         # Mark as streamed for main.py
                         response_metadata["streamed"] = True
 
-                        # Start progress updater for image editing
                         progress_task = None
-                        try:
-                            progress_task = await self._start_progress_updater_async(
-                                client, channel_id, editing_id, "image edit", emoji=config.circle_loader_emoji
+                        if config.enable_progress_checklist:
+                            # The checklist owns the editing-status message; the legacy
+                            # rotator would overwrite its steps, so it is NOT started (F4).
+                            checklist = ProgressChecklist(client, channel_id, thread_state.thread_ts,
+                                                          message_id=editing_id)
+                            await checklist.step(
+                                pipeline_status("editing_image", "Editing your image. This may take a minute…"),
+                                done_text="Edited image",
                             )
-                            self.log_debug("Started progress updater for image editing")
-                        except Exception as e:
-                            self.log_warning(f"Failed to start progress updater: {e}")
-                            progress_task = None
+                            if checklist.message_id:  # status-only surface exposes no ts — never store a None id
+                                response_metadata["status_message_id"] = checklist.message_id
+                        else:
+                            self._update_status(client, channel_id, editing_id,
+                                              pipeline_status("editing_image", "Editing your image. This may take a minute…"),
+                                              emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
+                            # Track the status message ID
+                            if editing_id:  # status-only DMs return no ts — never store a None id
+                                response_metadata["status_message_id"] = editing_id
+
+                            # Start progress updater for image editing
+                            try:
+                                progress_task = await self._start_progress_updater_async(
+                                    client, channel_id, editing_id, "image edit", emoji=config.circle_loader_emoji
+                                )
+                                self.log_debug("Started progress updater for image editing")
+                            except Exception as e:
+                                self.log_warning(f"Failed to start progress updater: {e}")
+                                progress_task = None
 
                         # Use the edit_image API with the pre-enhanced prompt
                         try:
@@ -296,8 +320,20 @@ class ImageEditMixin:
                             raise
                     else:
                         # Non-streaming fallback
-                        self._update_status(client, channel_id, thinking_id, pipeline_status("enhancing_prompt", "Enhancing your edit request…"), thread_id=thread_state.thread_ts)
-                        self._update_status(client, channel_id, thinking_id, pipeline_status("editing_image", "Editing your image. This may take a minute…"), emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
+                        if config.enable_progress_checklist:
+                            checklist = ProgressChecklist(client, channel_id, thread_state.thread_ts,
+                                                          message_id=thinking_id)
+                            await checklist.step(
+                                pipeline_status("enhancing_prompt", "Enhancing your edit request…"),
+                                done_text="Enhanced prompt",
+                            )
+                            await checklist.step(
+                                pipeline_status("editing_image", "Editing your image. This may take a minute…"),
+                                done_text="Edited image",
+                            )
+                        else:
+                            self._update_status(client, channel_id, thinking_id, pipeline_status("enhancing_prompt", "Enhancing your edit request…"), thread_id=thread_state.thread_ts)
+                            self._update_status(client, channel_id, thinking_id, pipeline_status("editing_image", "Editing your image. This may take a minute…"), emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
                         
                         edited_image = await self.openai_client.edit_image(
                             input_images=[base64_data],
@@ -547,6 +583,10 @@ class ImageEditMixin:
             )
             
             
+            # Enhanced-prompt display id (regression fix): thinking_id is None on
+            # status-only surfaces, so lazily create a real message there.
+            prompt_ref = {"id": thinking_id, "creating": False}
+
             def enhancement_callback(chunk: str):
                 buffer.add_chunk(chunk)
                 # Only update if both buffer says it's time AND rate limiter allows it
@@ -554,8 +594,15 @@ class ImageEditMixin:
                     rate_limiter.record_request_attempt()
                     display_text = f"*Enhanced Prompt:* ✨ _{buffer.get_complete_text()}_ {config.loading_ellipse_emoji}"
 
-                    result = self._update_message_streaming_sync(client, channel_id, thinking_id, display_text)
-                    
+                    pid = prompt_ref["id"]
+                    if pid is None:
+                        if not prompt_ref["creating"]:
+                            prompt_ref["creating"] = True
+                            self._schedule_async_call(self._lazy_create_prompt_ref(
+                                client, channel_id, thread_state.thread_ts, display_text, prompt_ref))
+                        return
+                    result = self._update_message_streaming_sync(client, channel_id, pid, display_text)
+
                     if result["success"]:
                         rate_limiter.record_success()
                         buffer.mark_updated()
@@ -565,13 +612,13 @@ class ImageEditMixin:
                             if result["retry_after"]:
                                 rate_limiter.set_retry_after(result["retry_after"])
                             rate_limiter.record_failure(is_rate_limit=True)
-                            
+
                             # Check if circuit breaker opened
                             if not rate_limiter.is_streaming_enabled():
                                 self.log_warning("Image edit enhancement rate limited - circuit breaker opened")
                         else:
                             rate_limiter.record_failure(is_rate_limit=False)
-            
+
             # First enhance the prompt with streaming
             enhanced_edit_prompt = await self.openai_client._enhance_image_edit_prompt(
                 user_request=user_edit_request,
@@ -579,38 +626,50 @@ class ImageEditMixin:
                 conversation_history=enhanced_messages,
                 stream_callback=enhancement_callback
             )
-            
+
             # Show the final enhanced prompt (without loading indicator)
-            if enhanced_edit_prompt and thinking_id:
+            if enhanced_edit_prompt:
                 enhanced_text = f"*Enhanced Prompt:* ✨ _{enhanced_edit_prompt}_"
-                result = self._update_message_streaming_sync(client, channel_id, thinking_id, enhanced_text)
-                if not result["success"] and result.get("rate_limited"):
-                    self.log_debug("Couldn't remove loading indicator from enhanced prompt due to rate limit")
-                # Mark that we should NOT touch this message again
-                response_metadata["prompt_message_id"] = thinking_id
+                pid = await self._resolve_prompt_message(
+                    client, channel_id, thread_state.thread_ts, prompt_ref, enhanced_text)
+                if pid:
+                    # Mark that we should NOT touch this message again
+                    response_metadata["prompt_message_id"] = pid
             
             # Create a NEW message for editing status - don't touch the enhanced prompt!
             editing_id = await client.send_thinking_indicator(channel_id, thread_state.thread_ts)
-            self._update_status(client, channel_id, editing_id,
-                              pipeline_status("editing_image", "Generating edited image. This may take a minute…"),
-                              emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
-            # Track the status message ID
-            if editing_id:  # status-only DMs return no ts — never store a None id
-                response_metadata["status_message_id"] = editing_id
-
             # Mark as streamed for main.py
             response_metadata["streamed"] = True
 
-            # Start progress updater for image editing
             progress_task = None
-            try:
-                progress_task = await self._start_progress_updater_async(
-                    client, channel_id, editing_id, "image edit", emoji=config.circle_loader_emoji
+            if config.enable_progress_checklist:
+                # The checklist owns the editing-status message; the legacy rotator
+                # would overwrite its steps, so it is NOT started here (F4).
+                checklist = ProgressChecklist(client, channel_id, thread_state.thread_ts,
+                                              message_id=editing_id)
+                await checklist.step(
+                    pipeline_status("editing_image", "Generating edited image. This may take a minute…"),
+                    done_text="Edited image",
                 )
-                self.log_debug("Started progress updater for image editing")
-            except Exception as e:
-                self.log_warning(f"Failed to start progress updater: {e}")
-                progress_task = None
+                if checklist.message_id:  # status-only surface exposes no ts — never store a None id
+                    response_metadata["status_message_id"] = checklist.message_id
+            else:
+                self._update_status(client, channel_id, editing_id,
+                                  pipeline_status("editing_image", "Generating edited image. This may take a minute…"),
+                                  emoji=config.circle_loader_emoji, thread_id=thread_state.thread_ts)
+                # Track the status message ID
+                if editing_id:  # status-only DMs return no ts — never store a None id
+                    response_metadata["status_message_id"] = editing_id
+
+                # Start progress updater for image editing
+                try:
+                    progress_task = await self._start_progress_updater_async(
+                        client, channel_id, editing_id, "image edit", emoji=config.circle_loader_emoji
+                    )
+                    self.log_debug("Started progress updater for image editing")
+                except Exception as e:
+                    self.log_warning(f"Failed to start progress updater: {e}")
+                    progress_task = None
 
             # Use the edit_image API with the pre-enhanced prompt
             try:
@@ -636,8 +695,8 @@ class ImageEditMixin:
 
                 # After edit is complete, update message to show just the enhanced prompt
                 # (remove the "Generating edited image..." status) - but respect rate limits
-                if enhanced_edit_prompt and thinking_id and rate_limiter.can_make_request():
-                    result = self._update_message_streaming_sync(client, channel_id, thinking_id, f"*Enhanced Prompt:* ✨ _{enhanced_edit_prompt}_")
+                if enhanced_edit_prompt and prompt_ref["id"] and rate_limiter.can_make_request():
+                    result = self._update_message_streaming_sync(client, channel_id, prompt_ref["id"], f"*Enhanced Prompt:* ✨ _{enhanced_edit_prompt}_")
                     if result["success"]:
                         rate_limiter.record_success()
                     else:

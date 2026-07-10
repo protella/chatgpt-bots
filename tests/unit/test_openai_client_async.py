@@ -33,6 +33,11 @@ class TestAsyncOpenAIClient:
             mock_instance.images.generate = AsyncMock()
             mock_instance.images.edit = AsyncMock()
 
+            # with_options(timeout=...) is a SYNC SDK method returning a client copy;
+            # image calls route through it for their per-request timeout (F1). Return the
+            # same instance so images.generate/edit stay the tracked mocks.
+            mock_instance.with_options = MagicMock(return_value=mock_instance)
+
             mock.return_value = mock_instance
             yield mock
 

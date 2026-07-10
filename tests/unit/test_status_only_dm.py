@@ -279,7 +279,11 @@ def test_image_handlers_guard_status_message_id():
         for i, line in enumerate(src.splitlines()):
             if 'response_metadata["status_message_id"]' in line and "=" in line.split("status_message_id")[1]:
                 window = "\n".join(src.splitlines()[max(0, i - 2):i])
-                assert "if generating_id" in window or "if editing_id" in window, (
+                assert (
+                    "if generating_id" in window
+                    or "if editing_id" in window
+                    or "if checklist.message_id" in window
+                ), (
                     f"{mod.__name__}: status_message_id stored without a None guard"
                 )
 
