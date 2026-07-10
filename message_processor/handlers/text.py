@@ -201,7 +201,8 @@ class TextHandlerMixin:
         # rides the same slot, appended only when the no_response_needed tool is exposed.
         suffix = self._build_suffix_context(client, message.channel_id,
                                             thread_state.thread_ts,
-                                            user_timezone, user_tz_label)
+                                            user_timezone, user_tz_label,
+                                            message=message, thread_state=thread_state)
         if no_reply_available:
             suffix = f"{suffix}\n\n{NO_REPLY_CONTRACT_SUFFIX}"
         messages_for_api = messages_for_api + [{
@@ -543,7 +544,8 @@ class TextHandlerMixin:
             "role": "developer",
             "content": self._build_suffix_context(client, message.channel_id,
                                                   thread_state.thread_ts,
-                                                  user_timezone, user_tz_label),
+                                                  user_timezone, user_tz_label,
+                                                  message=message, thread_state=thread_state),
         }]
 
         # Post an initial message to get the message ID for streaming updates.

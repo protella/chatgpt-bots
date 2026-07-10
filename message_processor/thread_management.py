@@ -802,6 +802,19 @@ class ThreadManagementMixin:
                     msg.text = stripped
         return merged
 
+    async def _fetch_thread_root(self, client, channel_id: str, thread_id: str):
+        """F3: fetch a thread's ROOT message only (summary-tail rebuild, where the root is
+        before the fetched window). A limit=1 replies page with no `oldest` returns the
+        root. Best-effort — returns None on any failure (the wake role just gets omitted)."""
+        if not channel_id or not thread_id or not hasattr(client, "get_thread_history"):
+            return None
+        try:
+            page = await client.get_thread_history(channel_id, thread_id, limit=1)
+            return page[0] if page else None
+        except Exception as e:
+            self.log_debug(f"root message fetch failed: {e}")
+            return None
+
     async def _get_or_rebuild_thread_state(
         self,
         message: Message,
@@ -898,10 +911,31 @@ class ThreadManagementMixin:
                     )
                 self.log_info(f"Rebuilding thread state for {message.thread_id} with {len(history)} messages")
             
+            # F3: capture the thread's ROOT author for the wake envelope.
+            # Full-history rebuild (and a brand-new thread, whose only history IS the
+            # current message): the earliest fetched message is the root. Summary-tail
+            # rebuild: the root is before the fetched window — fetch it explicitly, once.
+            if thread_state.root_author is None:
+                try:
+                    if summary_boundary is None and history:
+                        root_hist = history[0]
+                        rt = root_hist.metadata.get("sender_type") or (
+                            "self" if root_hist.metadata.get("is_bot") else "human")
+                        thread_state.root_author = (root_hist.user_id, rt)
+                    elif summary_boundary is not None:
+                        root_msg = await self._fetch_thread_root(client, message.channel_id,
+                                                                 message.thread_id)
+                        if root_msg is not None:
+                            rt = root_msg.metadata.get("sender_type") or (
+                                "self" if root_msg.metadata.get("is_bot") else "human")
+                            thread_state.root_author = (root_msg.user_id, rt)
+                except Exception as e:
+                    self.log_debug(f"root author capture failed: {e}")
+
             # Track pending image URLs for vision analysis association
             pending_image_urls = []
             pending_image_metadata = {}  # Store additional metadata per URL
-            
+
             # Convert to thread state messages
             for hist_msg in history:
                 # Skip the current message being processed

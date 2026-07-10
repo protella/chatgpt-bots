@@ -302,6 +302,11 @@ class BotConfig:
     # message instead of a single replaced status line + rotating "still working"
     # strings. Off → today's single-line _update_status/rotator behavior.
     enable_progress_checklist: bool = field(default_factory=lambda: os.getenv("ENABLE_PROGRESS_CHECKLIST", "true").lower() == "true")
+    # --- Wake envelope (F3) ---
+    # Compact "[Wake context]" block in the volatile developer suffix telling the model
+    # WHY it woke (trigger reason, sender role, bot-vs-human). Text-handler turns only;
+    # never in the system prompt or history. Off → suffix unchanged.
+    enable_wake_envelope: bool = field(default_factory=lambda: os.getenv("ENABLE_WAKE_ENVELOPE", "true").lower() == "true")
     # --- Background image generation (F1) ---
     # New-image generation runs in a background job so the thread lock releases and
     # conversation keeps flowing during the (multi-minute) generation. Off → today's

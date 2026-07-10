@@ -11,7 +11,7 @@ class SlackRegistrationMixin:
         @self.app.event("app_mention")
         async def handle_app_mention(event, say, client):
             self.log_debug(f"App mention event: channel={event.get('channel')}, ts={event.get('ts')}")
-            await self._handle_slack_message(event, client)
+            await self._handle_slack_message(event, client, wake_source="app_mention")
 
         @self.app.event("message")
         async def handle_message(event, say, client):
@@ -20,7 +20,7 @@ class SlackRegistrationMixin:
                 # DMs from anyone except ourselves (other bots allowed so bot<->bot works).
                 if not self.is_own_message(event):
                     self.log_debug(f"DM message event: channel={event.get('channel')}, ts={event.get('ts')}")
-                    await self._handle_slack_message(event, client)
+                    await self._handle_slack_message(event, client, wake_source="dm")
             elif channel_type in ("channel", "group", "mpim"):
                 # Phase 5 channel listening — gated by the master switch (DEFAULT OFF). When off,
                 # non-mention channel messages are ignored entirely (mentions still arrive via

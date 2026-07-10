@@ -184,6 +184,9 @@ class ChatBotV2:
             if verdict is None:
                 return
             placement_verdict = verdict.placement
+            # F3: the engine's reason rides the wake envelope for ambient wakes.
+            if isinstance(message.metadata, dict) and getattr(verdict, "reason", None):
+                message.metadata["participation_reason"] = verdict.reason
 
         # Phase F placement (plan §4a, revised 2026-07-10): the channel's
         # reply_in_channel setting is an ALLOWANCE, not a mandate — when it's ON and
