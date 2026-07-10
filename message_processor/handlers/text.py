@@ -490,7 +490,7 @@ class TextHandlerMixin:
         if exclude_mcp_server:
             initial_message = f"{config.circle_loader_emoji} Retrying without '{exclude_mcp_display}'..."
         else:
-            initial_message = f"{config.circle_loader_emoji} {config.random_loading_message()}"
+            initial_message = f"{config.thinking_emoji} {config.random_loading_message()}"
         if thinking_id:
             # Update existing thinking message
             message_id = thinking_id
@@ -1075,7 +1075,7 @@ class TextHandlerMixin:
         # Start progress updater before making API call
         try:
             progress_task = await self._start_progress_updater_async(
-                client, message.channel_id, message_id, "request", emoji=config.circle_loader_emoji
+                client, message.channel_id, message_id, "request", emoji=config.thinking_emoji
             )
             self.log_debug("Started progress updater task")
         except Exception as e:

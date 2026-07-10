@@ -434,7 +434,7 @@ class SlackMessagingMixin:
             result = await self.app.client.chat_postMessage(
                 channel=channel_id,
                 thread_ts=thread_id,
-                text=f"{config.circle_loader_emoji} {config.random_loading_message()}"
+                text=f"{config.thinking_emoji} {config.random_loading_message()}"
             )
             return result.get("ts")  # Return message timestamp for deletion
         except SlackApiError as e:
