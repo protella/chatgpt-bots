@@ -88,9 +88,12 @@ async def generate_image(
         elif format == "png" and compression != 100:
             self.log_debug(f"PNG format requires compression=100, ignoring {compression}")
 
-        # Use the images.generate API for image generation
+        # Use the images.generate API for image generation. Pass a per-request SDK
+        # timeout: the AsyncOpenAI client is constructed with api_timeout_read, so the
+        # outer wait_for alone couldn't extend an image call past that (the SDK would
+        # abort first). with_options overrides it for this call only.
         response = await self._safe_api_call(
-            self.client.images.generate,
+            self.client.with_options(timeout=config.api_timeout_image).images.generate,
             operation_type="image_generation",
             **params,
         )
@@ -484,9 +487,10 @@ async def edit_image(
             mask_bytes = base64.b64decode(mask)
             params["mask"] = BytesIO(mask_bytes)
 
-        # Use the images.edit API
+        # Use the images.edit API with a per-request SDK timeout (see generate_image
+        # above — the client's construction-time api_timeout_read would otherwise cap it).
         response = await self._safe_api_call(
-            self.client.images.edit,
+            self.client.with_options(timeout=config.api_timeout_image).images.edit,
             operation_type="image_edit",
             **params,
         )

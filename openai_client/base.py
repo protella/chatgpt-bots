@@ -66,9 +66,9 @@ class OpenAIClient(LoggerMixin):
 
         # Operation-specific timeouts based on real-world usage patterns
         operation_timeouts = {
-            # Image operations - full API timeout
-            "image_generation": config.api_timeout_read,  # Use configured timeout
-            "image_edit": config.api_timeout_read,        # Use configured timeout
+            # Image operations - dedicated (longer) image budget; vision stays on read
+            "image_generation": config.api_timeout_image,  # Dedicated image timeout
+            "image_edit": config.api_timeout_image,        # Dedicated image timeout
             "vision_analysis": config.api_timeout_read,   # Use configured timeout
 
             # All text operations - use streaming chunk timeout from config

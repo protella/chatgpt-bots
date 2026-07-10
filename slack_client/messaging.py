@@ -13,6 +13,7 @@ from message_markers import (
     CONTINUATION_HEAD,
     continuation_trailer,
     fence_safe_chunks,
+    is_checklist_status_text,
 )
 from slack_client.event_handlers.feedback import (
     FEEDBACK_ACTION_ID,
@@ -544,6 +545,11 @@ class SlackMessagingMixin:
                     # "Thinking about the Q3 plan" is real context, not a placeholder).
                     sender_type = self.classify_sender(msg)
                     if sender_type == "self":
+                        # F1 progress-checklist messages carry an invisible marker (their
+                        # "✓ …" shape doesn't match the ":emoji:" filter below). Drop them
+                        # so a mid-generation rebuild never replays them as an assistant turn.
+                        if is_checklist_status_text(text):
+                            continue
                         # Our transient placeholders/status lines: ":emoji: Thinking..."
                         # and status updates that share that shape. Precise-match only.
                         if _SELF_STATUS_RE.match(text) and (

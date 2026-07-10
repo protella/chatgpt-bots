@@ -1080,15 +1080,28 @@ class DatabaseManager(LoggerMixin):
                       f"prompt_len={len(prompt) if prompt else 0}")
         
         try:
+            # Merge-preserving upsert (F1): a later write over the same URL (the
+            # post-refresh Slack rebuild saves the uploaded file with an empty caption,
+            # and the ledger issues its own upsert) must NOT erase the non-empty
+            # prompt/analysis/type/generation_id an earlier write already recorded.
+            # Existing non-empty values win over incoming empties; message_ts fills in.
             self.conn.execute("""
-                INSERT OR REPLACE INTO images 
+                INSERT INTO images
                 (thread_id, url, image_type, prompt, analysis, original_analysis, metadata_json, message_ts)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(url) DO UPDATE SET
+                    thread_id = excluded.thread_id,
+                    image_type = COALESCE(NULLIF(images.image_type, ''), excluded.image_type),
+                    prompt = COALESCE(NULLIF(images.prompt, ''), excluded.prompt),
+                    analysis = COALESCE(NULLIF(images.analysis, ''), excluded.analysis),
+                    original_analysis = COALESCE(NULLIF(images.original_analysis, ''), excluded.original_analysis),
+                    metadata_json = COALESCE(NULLIF(images.metadata_json, ''), excluded.metadata_json),
+                    message_ts = COALESCE(excluded.message_ts, images.message_ts)
             """, (thread_id, url, image_type, prompt, analysis, original_analysis,
                   json.dumps(metadata) if metadata else None, message_ts))
-            
+
             self.log_info(f"DB: Successfully saved image metadata for {url[:50]}... in thread {thread_id}")
-            
+
         except sqlite3.IntegrityError as e:
             self.log_warning(f"DB: Image metadata already exists for {url[:50]}...: {e}")
         except Exception as e:
@@ -2075,10 +2088,21 @@ class DatabaseManager(LoggerMixin):
                 db.row_factory = aiosqlite.Row
                 await db.execute("PRAGMA journal_mode=WAL")
 
+                # Merge-preserving upsert (F1): see save_image_metadata. A later empty
+                # write (rebuild with empty caption, ledger upsert) must not erase the
+                # prompt/analysis/type/generation_id an earlier write recorded.
                 await db.execute("""
-                    INSERT OR REPLACE INTO images
+                    INSERT INTO images
                     (thread_id, url, image_type, prompt, analysis, original_analysis, metadata_json, message_ts)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(url) DO UPDATE SET
+                        thread_id = excluded.thread_id,
+                        image_type = COALESCE(NULLIF(images.image_type, ''), excluded.image_type),
+                        prompt = COALESCE(NULLIF(images.prompt, ''), excluded.prompt),
+                        analysis = COALESCE(NULLIF(images.analysis, ''), excluded.analysis),
+                        original_analysis = COALESCE(NULLIF(images.original_analysis, ''), excluded.original_analysis),
+                        metadata_json = COALESCE(NULLIF(images.metadata_json, ''), excluded.metadata_json),
+                        message_ts = COALESCE(excluded.message_ts, images.message_ts)
                 """, (thread_id, url, image_type, prompt, analysis, original_analysis,
                       json.dumps(metadata) if metadata else None, message_ts))
 
