@@ -102,8 +102,14 @@ class TextHandlerMixin:
                               attachment_urls: Optional[List[str]] = None,
                               retry_count: int = 0,
                               failed_mcp_server: Optional[str] = None,
-                              _context_retry: bool = False) -> Response:
-        """Handle text-only response generation"""
+                              _context_retry: bool = False,
+                              visible_already_committed: bool = False) -> Response:
+        """Handle text-only response generation.
+
+        ``visible_already_committed`` (F8): True when an earlier attempt this turn already
+        exposed visible text (e.g. a streaming attempt that failed mid-reply). It is passed
+        into the tool loop / streaming retry as ``prior_committed`` so a no_response_needed
+        on this attempt is rejected instead of orphaning that partial as fake silence."""
         # Get thread config (with user preferences)
         thread_config = await config.get_thread_config_async(
             overrides=thread_state.config_overrides,
@@ -132,7 +138,8 @@ class TextHandlerMixin:
         if should_stream:
             return await self._handle_streaming_text_response(
                 user_content, thread_state, client, message, thinking_id, attachment_urls,
-                exclude_mcp_server=failed_mcp_server
+                exclude_mcp_server=failed_mcp_server,
+                visible_already_committed=visible_already_committed,
             )
         
         # Fall back to non-streaming logic
@@ -274,6 +281,7 @@ class TextHandlerMixin:
                     tools=tools,
                     registry=registry,
                     tool_context=self._build_tool_context(message, client),
+                    prior_committed=visible_already_committed,
                     model=model,
                     temperature=thread_config["temperature"],
                     max_tokens=thread_config["max_tokens"],
@@ -365,7 +373,8 @@ class TextHandlerMixin:
                 return await self._handle_text_response(
                     user_content, thread_state, client, message, thinking_id,
                     attachment_urls, retry_count=retry_count,
-                    failed_mcp_server=failed_mcp_server, _context_retry=True
+                    failed_mcp_server=failed_mcp_server, _context_retry=True,
+                    visible_already_committed=visible_already_committed
                 )
             raise
         finally:
@@ -478,19 +487,45 @@ class TextHandlerMixin:
                       "tool_provenance": tool_provenance}
         )
 
+    async def _cleanup_silent_stream(self, client, channel_id: str, native_coord,
+                                     message_id: Optional[str], current_message_id: Optional[str],
+                                     context: str) -> None:
+        """Tear down a streamed turn that will post NOTHING (honored no_reply / reaction-only).
+
+        Abandons any live native stream (reporting a failed stop) and deletes EVERY distinct
+        message we created — the original placeholder AND the stream/seed message. They differ
+        when native started after a placeholder, or a legacy seed replaced a status-only None;
+        deleting only current_message_id would orphan the other. Best-effort: individual
+        failures are logged, never raised."""
+        if native_coord is not None and native_coord.started:
+            if not await native_coord.abandon():
+                self.log_warning(f"Native stream abandon failed during {context} cleanup")
+        for ts in {t for t in (message_id, current_message_id) if t}:
+            try:
+                if not await client.delete_message(channel_id, ts):
+                    self.log_debug(f"Could not delete message {ts} during {context} cleanup")
+            except Exception as e:
+                self.log_debug(f"Error deleting message {ts} during {context} cleanup: {e}")
+
     async def _handle_streaming_text_response(self, user_content: Any, thread_state, client: BaseClient,
                                       message: Message, thinking_id: Optional[str] = None,
                                       attachment_urls: Optional[List[str]] = None,
-                                      exclude_mcp_server=None) -> Response:
+                                      exclude_mcp_server=None,
+                                      visible_already_committed: bool = False) -> Response:
         """Handle text-only response generation with streaming support.
 
         exclude_mcp_server accepts a single label or a set of labels (exclusions
-        accumulate across MCP-failure retries)."""
+        accumulate across MCP-failure retries).
+
+        ``visible_already_committed`` (F8): True when an earlier attempt this turn already
+        exposed visible text; seeds the tool loop's committed-text signal so a
+        no_response_needed on this attempt is rejected instead of orphaning the partial."""
         exclude_mcp_display = ", ".join(sorted(self._as_mcp_exclusion_set(exclude_mcp_server)))
         # Check if client supports streaming
         if not hasattr(client, 'supports_streaming') or not client.supports_streaming():
             self.log_debug("Client doesn't support streaming, falling back to non-streaming")
-            return await self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls, retry_count=0)
+            return await self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls, retry_count=0,
+                                                    visible_already_committed=visible_already_committed)
         
         # Get streaming configuration from client
         streaming_config = client.get_streaming_config() if hasattr(client, 'get_streaming_config') else {}
@@ -619,7 +654,8 @@ class TextHandlerMixin:
         else:
             # We need a way to post a message and get its ID - this would depend on client implementation
             self.log_warning("No thinking_id provided for streaming - falling back to non-streaming")
-            return await self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls, retry_count=0)
+            return await self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls, retry_count=0,
+                                                    visible_already_committed=visible_already_committed)
         
         async def stream_status_update(status_msg: str) -> dict:
             """Tool/phase status during streaming: edit the placeholder when one
@@ -1227,6 +1263,7 @@ class TextHandlerMixin:
                     tool_context=self._build_tool_context(message, client),
                     stream_callback=stream_callback,
                     tool_callback=tool_callback,
+                    prior_committed=visible_already_committed,
                     model=model,
                     temperature=thread_config["temperature"],
                     max_tokens=thread_config["max_tokens"],
@@ -1301,13 +1338,8 @@ class TextHandlerMixin:
             # and post nothing.
             if terminal_action == "no_reply":
                 self.log_info(f"no_response_needed (streamed) — ending turn silently: {no_reply_reason!r}")
-                if native_coord is not None and native_coord.started:
-                    await native_coord.abandon()
-                if current_message_id:
-                    try:
-                        await client.delete_message(message.channel_id, current_message_id)
-                    except Exception as e:
-                        self.log_warning(f"Could not delete placeholder for no_reply: {e}")
+                await self._cleanup_silent_stream(
+                    client, message.channel_id, native_coord, message_id, current_message_id, "no_reply")
                 return Response(
                     type="text",
                     content="",
@@ -1320,13 +1352,8 @@ class TextHandlerMixin:
             # returned no text — delete the placeholder and post nothing.
             if self._is_reaction_only(response_text, local_tool_calls):
                 self.log_info("Reaction-only streamed response (react tool) — removing placeholder")
-                if native_coord is not None and native_coord.started:
-                    await native_coord.abandon()  # stop the (empty) stream before deleting it
-                if current_message_id:  # status-only DMs may have no message at all
-                    try:
-                        await client.delete_message(message.channel_id, current_message_id)
-                    except Exception as e:
-                        self.log_warning(f"Could not delete placeholder for reaction-only response: {e}")
+                await self._cleanup_silent_stream(
+                    client, message.channel_id, native_coord, message_id, current_message_id, "reaction-only")
                 return Response(
                     type="text",
                     content="",
@@ -1578,6 +1605,11 @@ class TextHandlerMixin:
                           # Chrome rode the final stopStream — tells main.py's separate
                           # footer post to stand down (falls back when finalize failed).
                           "footer_attached": bool(native_finalized and footer_blocks),
+                          # Honest accounting from ACTUAL delivery: a visible message ts plus
+                          # non-empty text means content went out. A failed stream that left
+                          # no delivered ts must not burn the unprompted quota (main.py's
+                          # streamed=True fallback would otherwise read as posted).
+                          "posted": bool(delivered_ts and (response_text or "").strip()),
                           "model": thread_config.get("model")}
             )
             
@@ -1656,10 +1688,15 @@ class TextHandlerMixin:
 
             # Pass retry_count=1 to prevent re-entering streaming after timeout
             # Also pass the accumulated exclusion set so the retry drops ALL
-            # servers that have failed so far, not just the latest one
+            # servers that have failed so far, not just the latest one.
+            # F8: if THIS attempt already exposed partial visible text (it was left in the
+            # message above), tell the retry so a no_response_needed on it is rejected
+            # rather than orphaning that partial as fake silence.
+            partial_exposed = visible_already_committed or buffer.has_content()
             return await self._handle_text_response(
                 user_content, thread_state, client, message, thinking_id,
-                attachment_urls, retry_count=1, failed_mcp_server=failed_mcp_servers
+                attachment_urls, retry_count=1, failed_mcp_server=failed_mcp_servers,
+                visible_already_committed=partial_exposed
             )
 
     @staticmethod

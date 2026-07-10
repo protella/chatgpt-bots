@@ -389,6 +389,17 @@ DMs behave as before.
   them, so a moment later it can refer back to what it just said and did instead of
   denying it. (Previously these were filed under a placeholder that no longer existed,
   so they silently vanished.)
+- **Replies with the settings footer show the full answer again.** On some non-streamed
+  replies the message could render as *only* the ⚙️ settings button, hiding the actual
+  answer — the reply text now always rides the message, with the button beneath it.
+- The bot no longer keeps snippets of what you asked (search terms, prompts, links) in
+  its internal "which tools did I use" memory — it records only the tool names and neutral
+  details like result counts, never the content of your request.
+- After a hiccup mid-reply, the bot finishes the reply instead of occasionally going quiet
+  and leaving a half-written message stranded.
+- Longer replies that get split into parts, or that briefly failed to send, now behave
+  correctly: split replies still get their settings footer, and a reply that didn't
+  actually send no longer counts against the bot's quiet-hours self-reply budget.
 - In busy channels, a delayed duplicate of an old message can no longer resurface as if
   it were new, and the bot's channel-awareness memory no longer grows without bound.
 - When the bot decides to stay silent and just add reactions, it can no longer slip one

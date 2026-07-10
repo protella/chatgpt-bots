@@ -370,18 +370,44 @@ class SlackMessagingMixin:
         except Exception as e:
             self.log_debug(f"own-reply pulse record failed: {e}")
 
+    # Slack section-block text hard limit is 3000 chars; keep a margin so the reply text
+    # fits one section when we attach the footer as blocks.
+    _SECTION_TEXT_LIMIT = 2900
+
+    def _compose_reply_with_footer(self, formatted_text: str, footer_blocks: list):
+        """Blocks that render the REPLY TEXT plus the footer actions row.
+
+        Attaching action blocks alone makes Slack render blocks INSTEAD of the top-level
+        `text`, hiding the answer (only the ⚙️ button shows). So the reply rides a leading
+        section block, then the footer actions. Returns None when the text is too long to
+        fit a single section — the caller then posts plain text and lets the separate
+        footer post happen instead."""
+        if not footer_blocks or len(formatted_text) > self._SECTION_TEXT_LIMIT:
+            return None
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": formatted_text}}] + list(footer_blocks)
+
     async def send_message(self, channel_id: str, thread_id: str, text: str,
-                           blocks: Optional[list] = None) -> Optional[str]:
+                           blocks: Optional[list] = None,
+                           meta_out: Optional[dict] = None) -> Optional[str]:
         """Send a text message to Slack, splitting if needed.
 
         Returns the posted message ts (the FIRST chunk's ts when split), or None on
         failure. Truthy-on-success, so legacy `if await send_message(...)` callers keep
         working while F7 can key tool-use provenance on the returned ts.
 
-        `blocks` (F8): when provided AND the message fits one part, they attach to the
-        chat.postMessage (the settings-footer chrome rides the message itself instead of a
-        separate trailing post). Split messages ignore blocks and fall back to the separate
-        footer post — attaching chrome mid-thread would misplace it."""
+        `blocks` (F8): the settings-footer ACTIONS row. When provided AND the reply fits a
+        single section block, the reply text + footer ride the message itself (composed via
+        _compose_reply_with_footer) instead of a separate trailing post. When the text is
+        too long for a section, or the message must split, the footer is NOT attached and
+        the plain text posts — the caller's separate footer post covers it.
+
+        `meta_out` (F8): optional dict the caller can read back — `meta_out["footer_attached"]`
+        reports whether the footer ACTUALLY rode the message, so the caller sets its
+        footer_attached flag from reality (a split/too-long reply must still get the
+        separate footer)."""
+        def _set_attached(v: bool) -> None:
+            if meta_out is not None:
+                meta_out["footer_attached"] = v
         try:
             # Strip MCP citations from text before sending to Slack
             text = strip_citations(text)
@@ -392,13 +418,17 @@ class SlackMessagingMixin:
             if len(formatted_text) <= self.MAX_MESSAGE_LENGTH:
                 # Single message
                 post_kwargs = dict(channel=channel_id, thread_ts=thread_id, text=formatted_text)
-                if blocks:
-                    post_kwargs["blocks"] = blocks
+                composed = self._compose_reply_with_footer(formatted_text, blocks) if blocks else None
+                if composed is not None:
+                    # text stays as the notification fallback; blocks carry the visible reply.
+                    post_kwargs["blocks"] = composed
+                _set_attached(composed is not None)
                 result = await self.app.client.chat_postMessage(**post_kwargs)
                 posted_ts = result.get("ts")
                 self._record_own_reply_pulse(channel_id, thread_id, posted_ts, text)
                 return posted_ts
             else:
+                _set_attached(False)  # split replies never attach the footer
                 # Split into multiple messages, "Continued..." style (shared markers so
                 # the rebuild-side stripper always recognizes them). One chunk failing
                 # must not abort the rest.

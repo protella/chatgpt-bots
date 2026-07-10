@@ -15,14 +15,28 @@ from typing import Any, Dict, List, Optional
 
 # The external `_Used Tools:_` attribution footer (handlers/text.py appends this to the
 # VISIBLE message). It is deliberately user-facing chrome and must never reach model
-# context. END-anchored, but tolerant of trailing `[used tools: …]` / `[reactions: …]`
-# annotations so a following annotation can never shield the footer from stripping (F7-4).
-_USED_TOOLS_FOOTER_RE = re.compile(r'\n\n_Used Tools:.+?_(?=\n\[|\s*$)')
+# context. END-anchored: the remainder after the footer must be ONLY optional
+# `[used tools: …]` / `[reactions: …]` annotation lines then end-of-string, so a
+# following annotation can never shield the footer from stripping (F7-4) while an
+# unrelated trailing bracket line no longer triggers a false match.
+_USED_TOOLS_FOOTER_RE = re.compile(
+    r'\n\n_Used Tools:.+?_(?=(?:\n\[(?:used tools|reactions):[^\n\]]*\])*\s*$)')
 
 # Budgets (spec F7): <=8 entries/turn, gist <=~80 chars, annotation <=~160 chars.
 MAX_PROVENANCE_ENTRIES = 8
 MAX_GIST_CHARS = 80
 MAX_ANNOTATION_CHARS = 160
+
+# Allowlist of STRUCTURAL arg keys whose scalar values describe the SHAPE of a call
+# (pagination / sizing / time-window) and are safe to persist verbatim. Every other
+# string value is user content — search queries, prompts, URLs, potential tokens — and
+# is NEVER persisted (rendered as `<str>`), per the derived-artifacts rule (CLAUDE.md).
+# Numbers and booleans are always safe regardless of key.
+_SAFE_GIST_KEYS = frozenset({
+    "limit", "count", "max", "max_results", "n", "top_k", "k", "size", "num", "num_results",
+    "days", "hours", "minutes", "page", "offset", "oldest", "latest", "before", "after",
+    "since", "until", "depth", "start", "end",
+})
 
 
 def strip_used_tools_footer(content: Any) -> Any:
@@ -52,13 +66,21 @@ def gist_from_arguments(arguments: Any) -> str:
         return ""
     parts: List[str] = []
     for key, value in arguments.items():
-        if isinstance(value, dict):
+        if isinstance(value, bool) or isinstance(value, (int, float)):
+            # Numbers/booleans never carry user content — safe to keep verbatim.
+            rendered = str(value)
+        elif isinstance(value, dict):
             rendered = f"{{{len(value)}}}"
         elif isinstance(value, list):
             rendered = f"[{len(value)}]"
+        elif str(key).lower() in _SAFE_GIST_KEYS:
+            # An allowlisted structural key (e.g. oldest="169…", a Slack ts) — the value
+            # describes call shape, not content, so it's safe to keep (still per-value capped).
+            rendered = str(value).replace("\n", " ").replace("\r", " ").strip()
         else:
-            rendered = str(value)
-        rendered = rendered.replace("\n", " ").replace("\r", " ").strip()
+            # Any other string value is opaque user content (query/prompt/URL/token) —
+            # record only that a value was present, NEVER the value itself.
+            rendered = "<str>"
         if len(rendered) > 30:
             rendered = rendered[:27] + "…"
         parts.append(f"{key}={rendered}")

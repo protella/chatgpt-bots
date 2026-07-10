@@ -35,13 +35,35 @@ class _Bot(SlackMessagingMixin, SlackFormattingMixin, SlackUtilitiesMixin):
 
 @pytest.mark.asyncio
 async def test_single_message_attaches_blocks_and_returns_ts():
+    # F8 fix: action-only blocks would render INSTEAD of the reply text (hiding the
+    # answer), so the reply rides a leading section block, then the footer actions.
     b = _Bot()
     b.app.client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": "111.0"})
     blocks = [{"type": "actions", "elements": []}]
-    ts = await b.send_message("C1", "T1", "short reply", blocks=blocks)
+    meta = {}
+    ts = await b.send_message("C1", "T1", "short reply", blocks=blocks, meta_out=meta)
     assert ts == "111.0"
     kwargs = b.app.client.chat_postMessage.await_args.kwargs
-    assert kwargs["blocks"] == blocks
+    assert kwargs["blocks"][0]["type"] == "section"
+    assert kwargs["blocks"][0]["text"]["text"] == "short reply"   # answer visible
+    assert kwargs["blocks"][1:] == blocks                          # footer follows
+    assert kwargs["text"] == "short reply"                         # notification fallback
+    assert meta["footer_attached"] is True
+
+
+@pytest.mark.asyncio
+async def test_too_long_for_section_does_not_attach_footer():
+    # A reply that doesn't fit one section block can't carry the footer as blocks — it
+    # posts as plain text and reports footer_attached False so the separate footer posts.
+    b = _Bot()
+    b.app.client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": "111.0"})
+    long_reply = "x" * 3200  # > section limit (2900), still <= MAX_MESSAGE_LENGTH (3900)
+    meta = {}
+    await b.send_message("C1", "T1", long_reply, blocks=[{"type": "actions"}], meta_out=meta)
+    kwargs = b.app.client.chat_postMessage.await_args.kwargs
+    assert "blocks" not in kwargs
+    assert kwargs["text"] == long_reply
+    assert meta["footer_attached"] is False
 
 
 @pytest.mark.asyncio
@@ -95,7 +117,14 @@ def _client():
     c = MagicMock()
     c.send_thinking_indicator = AsyncMock(return_value=None)
     c.delete_message = AsyncMock()
-    c.send_message = AsyncMock(return_value="posted.1")
+
+    # Mirror the real send seam: report footer_attached via meta_out when blocks ride the
+    # message (the composed section+actions path), so main.py sets its flag from reality.
+    async def _send(channel_id, thread_id, text, blocks=None, meta_out=None):
+        if meta_out is not None:
+            meta_out["footer_attached"] = bool(blocks)
+        return "posted.1"
+    c.send_message = AsyncMock(side_effect=_send)
     c.format_text = MagicMock(side_effect=lambda t: t)
     c.attachable_footer_blocks = MagicMock(return_value=[{"type": "actions"}])
     c.maybe_post_response_footer = AsyncMock()
