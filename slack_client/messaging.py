@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from typing import Dict, List, Optional
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_sdk.errors import SlackApiError
 
 from base_client import HistoryFetchError, Message, Response
-from config import config
+from config import config, pipeline_status_markers
 from message_markers import (
     CONTINUATION_HEAD,
     continuation_trailer,
@@ -524,8 +525,9 @@ class SlackMessagingMixin:
                     if sender_type == "self":
                         # Our transient placeholders/status lines: ":emoji: Thinking..."
                         # and status updates that share that shape. Precise-match only.
-                        if _SELF_STATUS_RE.match(text) and any(
-                            marker in text for marker in _SELF_STATUS_MARKERS
+                        if _SELF_STATUS_RE.match(text) and (
+                            any(marker in text for marker in _SELF_STATUS_MARKERS)
+                            or any(marker in text for marker in pipeline_status_markers())
                         ):
                             continue
                         # Legacy busy/processing notices
@@ -659,25 +661,27 @@ class SlackMessagingMixin:
             return False
         if not hasattr(self.app.client, "assistant_threads_setStatus"):
             return False
-        # Slack renders the status TWICE on the agent surface: an in-thread transient
-        # bubble (rotates loading_messages) and the composer bottom-bar line (the
-        # status string). The bubble also RETAINS previously-sent rotation frames
-        # when a later call omits loading_messages, so the two surfaces drift apart
-        # (user screenshots 2026-07-09/10). Rule: an explicit phase status sends
-        # itself as the single loading message too — replacing any stored rotation —
-        # so both surfaces always show the same current text; the branded rotating
-        # set rides only the initial no-args call.
-        if status is not None:
-            msgs = loading_messages if loading_messages is not None else [status]
-            status_text = status
+        # Slack renders the status in TWO places: the in-thread transient bubble
+        # (rotates loading_messages) and a composer bottom-bar line (the status
+        # string). The composer line is retired (user request 2026-07-10): the
+        # bubble is the sole indicator, matching Claude's surface. The API
+        # requires the status field, so it goes out EMPTY and loading_messages
+        # carries the visible text — a phase update as the single message
+        # (replacing any stored rotation; the bubble retains old frames when a
+        # call omits loading_messages), the initial no-args call as a random
+        # sample from the configured pool.
+        if loading_messages is not None:
+            msgs = loading_messages
+        elif status is not None:
+            msgs = [status]
         else:
-            msgs = loading_messages if loading_messages is not None else (config.status_loading_messages or None)
-            status_text = config.status_loading_fallback
+            pool = config.get_loading_messages() or [config.status_loading_fallback]
+            msgs = random.sample(pool, min(5, len(pool)))
         try:
-            kwargs = {"channel_id": channel_id, "thread_ts": thread_id,
-                      "status": _status_plain_text(status_text)}
-            if msgs:
-                kwargs["loading_messages"] = [_status_plain_text(m) for m in msgs]
+            kwargs = {"channel_id": channel_id, "thread_ts": thread_id, "status": ""}
+            texts = [t for t in (_status_plain_text(m) for m in msgs) if t]
+            if texts:
+                kwargs["loading_messages"] = texts
             await self.app.client.assistant_threads_setStatus(**kwargs)
             return True
         except SlackApiError as e:

@@ -9,7 +9,7 @@ from typing import Optional
 from base_client import BaseClient, HistoryFetchError, Message, Response
 from thread_manager import AsyncThreadStateManager
 from openai_client import OpenAIClient
-from config import config
+from config import config, pipeline_status
 from logger import LoggerMixin
 from .thread_management import ThreadManagementMixin
 from .handlers.text import TextHandlerMixin
@@ -265,7 +265,7 @@ class MessageProcessor(ThreadManagementMixin,
                     client,
                     message.channel_id,
                     thinking_id,
-                    f"Optimizing conversation history ({projected_tokens:,}/{max_tokens:,} tokens)...",
+                    pipeline_status("optimizing_history", f"Optimizing conversation history ({projected_tokens:,}/{max_tokens:,} tokens)…"),
                     emoji=config.thinking_emoji, thread_id=message.thread_id)
 
                 total_trimmed = 0
@@ -426,7 +426,7 @@ class MessageProcessor(ThreadManagementMixin,
                 else:
                     # Has text with images - classify if it's edit or vision
                     self._update_status(client, message.channel_id, thinking_id, 
-                                      "Understanding your request...", thread_id=message.thread_id)
+                                      pipeline_status("understanding_request", "Understanding your request…"), thread_id=message.thread_id)
                     # For intent classification, include the current message in trimming
                     # Temporarily add the current message
                     temp_intent_msg = {"role": "user", "content": enhanced_text}
@@ -500,7 +500,7 @@ class MessageProcessor(ThreadManagementMixin,
             else:
                 # No images uploaded - standard classification
                 self._update_status(client, message.channel_id, thinking_id, 
-                                  "Understanding your request...", thread_id=message.thread_id)
+                                  pipeline_status("understanding_request", "Understanding your request…"), thread_id=message.thread_id)
                 # For intent classification, include the current message in trimming
                 # Temporarily add the current message
                 temp_intent_msg = {"role": "user", "content": enhanced_text if enhanced_text else ""}

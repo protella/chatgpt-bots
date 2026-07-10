@@ -4,7 +4,7 @@ import asyncio
 from typing import Any, Dict, List, Optional
 
 from base_client import BaseClient, Message
-from config import config
+from config import config, pipeline_status
 from message_markers import (
     ends_with_continuation,
     starts_as_continuation,
@@ -893,7 +893,7 @@ class ThreadManagementMixin:
                         client, 
                         message.channel_id, 
                         thinking_id,
-                        "Rebuilding thread history from Slack...",
+                        pipeline_status("rebuilding_history", "Rebuilding thread history from Slack…"),
                         emoji=config.circle_loader_emoji
                     )
                 self.log_info(f"Rebuilding thread state for {message.thread_id} with {len(history)} messages")
@@ -1206,7 +1206,7 @@ class ThreadManagementMixin:
                     client,
                     message.channel_id,
                     thinking_id,
-                    f"Optimizing conversation history ({current_tokens:,}/{max_tokens:,} tokens)...",
+                    pipeline_status("optimizing_history", f"Optimizing conversation history ({current_tokens:,}/{max_tokens:,} tokens)…"),
                     emoji=config.thinking_emoji
                 )
 

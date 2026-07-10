@@ -6,7 +6,7 @@ from typing import Any, List, Optional, Set
 from openai import APIError, APIStatusError
 
 from base_client import BaseClient, Message, Response
-from config import config
+from config import config, pipeline_status
 from message_markers import (
     CONTINUATION_HEAD,
     continuation_trailer,
@@ -168,7 +168,7 @@ class TextHandlerMixin:
         elif retry_count > 0:
             self._update_status(client, message.channel_id, thinking_id, "Retrying response...", emoji=config.circle_loader_emoji, thread_id=message.thread_id)
         else:
-            self._update_status(client, message.channel_id, thinking_id, "Generating response...", thread_id=message.thread_id)
+            self._update_status(client, message.channel_id, thinking_id, pipeline_status("generating_response", "Generating response…"), thread_id=message.thread_id)
         
         # Determine timeout based on retry attempt
         retry_timeout = 60.0 if retry_count > 0 else None
