@@ -40,15 +40,17 @@ class TestDatabaseManagerComprehensive:
 
     def test_init_creates_directories(self):
         """Test that __init__ creates necessary directories"""
+        from config import config as bot_config
         with patch('os.makedirs') as mock_makedirs:
             with tempfile.TemporaryDirectory() as tmpdir:
                 db = DatabaseManager("test")
 
-                # Should create data and data/backups directories
+                # Should create the database dir and its backups subdir
+                # (conftest redirects DATABASE_DIR to a tmp dir for tests)
                 assert mock_makedirs.call_count >= 2
                 calls = [call[0][0] for call in mock_makedirs.call_args_list]
-                assert "data" in calls
-                assert "data/backups" in calls
+                assert bot_config.database_dir in calls
+                assert f"{bot_config.database_dir}/backups" in calls
 
     def test_init_wal_mode_enabled(self, temp_db):
         """Test that WAL mode is enabled on initialization"""

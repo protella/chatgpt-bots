@@ -148,10 +148,10 @@ class TestDatabaseBackupOperations:
     @pytest.fixture
     def db_with_backup(self, tmp_path):
         """Create a database manager with backup directory"""
-        # Create the expected backup directory
-        os.makedirs("data/backups", exist_ok=True)
-        
         db = DatabaseManager("test")
+        # Backup dir derives from config.database_dir (redirected to a tmp dir
+        # by conftest so tests never touch the real data/backups).
+        os.makedirs(f"{db.db_dir}/backups", exist_ok=True)
         db.db_path = str(tmp_path / "test.db")
         # Recreate connection with new path
         db.conn.close()
@@ -164,8 +164,8 @@ class TestDatabaseBackupOperations:
         db.save_thread_summary("thread1", "seed summary", "1.0")
         
         # Store backup dir for tests
-        db.backup_dir = "data/backups"
-        
+        db.backup_dir = f"{db.db_dir}/backups"
+
         return db
     
     def test_backup_database_success(self, db_with_backup):
@@ -201,11 +201,15 @@ class TestDatabaseBackupOperations:
         """Test backup when directory doesn't exist"""
         import glob
         import shutil
-        
-        # Remove the backup directory if it exists
-        if os.path.exists("data/backups"):
-            shutil.rmtree("data/backups")
-        
+
+        from config import config as bot_config
+        backup_dir = f"{bot_config.database_dir}/backups"
+
+        # Remove the backup directory if it exists; DatabaseManager.__init__
+        # is what recreates it
+        if os.path.exists(backup_dir):
+            shutil.rmtree(backup_dir)
+
         db = DatabaseManager("test")
         db.db_path = str(tmp_path / "test.db")
         # Recreate connection with new path
@@ -213,21 +217,21 @@ class TestDatabaseBackupOperations:
         db.conn = sqlite3.connect(db.db_path, check_same_thread=False, isolation_level=None)
         db.conn.row_factory = sqlite3.Row
         db.init_schema()
-        
+
         # Should create directory and backup
         db.backup_database()
-        
+
         # Check that directory was created
-        assert os.path.exists("data/backups")
-        
+        assert os.path.exists(backup_dir)
+
         # Check that backup was created
-        backup_files = glob.glob("data/backups/*.db")
+        backup_files = glob.glob(f"{backup_dir}/*.db")
         assert len(backup_files) > 0
     
     def test_cleanup_old_backups(self, db_with_backup):
         """Test cleanup of old backup files"""
         # Create multiple old backup files with correct naming format
-        backup_dir = "data/backups"  # Hardcoded in DatabaseManager
+        backup_dir = db_with_backup.backup_dir
         old_date = (datetime.now() - timedelta(days=10))
         old_filename_date = old_date.strftime("%Y%m%d_%H%M%S")
         
