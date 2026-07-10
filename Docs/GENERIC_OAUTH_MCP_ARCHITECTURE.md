@@ -1,8 +1,12 @@
 # Generic OAuth Architecture for MCP Servers
 
 ## Document Status
-**Status:** Design Proposal
-**Created:** 2025-01-01
+**Status:** Design Proposal (not implemented)
+**Created:** 2026-07-09
+**Note:** As of 2026-07-09 the shipped MCP config already supports static secrets via
+`headers` with `${ENV_VAR}` interpolation (secrets live in `.env`, e.g. `DATASSENTIAL_MCP_KEY`)
+plus a per-server `"enabled"` flag — that covers the `static_bearer` case below today.
+This proposal remains the design for true OAuth flows (user/service tokens, refresh, discovery).
 **Purpose:** Define a modular, provider-agnostic OAuth framework for MCP server authentication
 
 ---
@@ -261,7 +265,8 @@ For each MCP server:
 1. Read `auth.type` from config
 2. Based on type:
    - `none`: No authorization header
-   - `static_bearer`: Resolve token from env/config, add `authorization` field
+   - `static_bearer`: Resolve token from env/config, add auth header (shipped today as
+     `headers` + `${ENV_VAR}` interpolation in `mcp_config.json`)
    - `user_oauth2`: Look up user token in DB, inject if valid
    - `service_oauth2`: Use service token (from background refresher)
 3. If token missing/expired for `user_oauth2`, skip that tool (don't include in array)
