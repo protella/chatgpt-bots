@@ -283,6 +283,27 @@ DMs behave as before.
   `make test` now runs the entire suite instead of stopping at the first failure.
   Stale tests of removed behavior were deleted; tests of real behavior were repaired.
 
+### ✅ Feature - Live progress checklists on image tasks
+
+- Image generation and editing now show an accumulating checklist that ticks off each
+  step in place ("✓ Enhanced prompt → ✓ Generated image → Uploading…") instead of a
+  single status line that overwrites itself. On surfaces where only the composer status
+  is available, it falls back to that automatically. Toggle with `ENABLE_PROGRESS_CHECKLIST`
+  (default on).
+
+### 🖼️ Feature - Image generation no longer freezes the conversation
+
+- Creating a new image used to hold the thread while the model worked, so anything you
+  said in the meantime had to wait. Image generation now runs in the background: the
+  image posts automatically when it's ready and you can keep chatting the whole time.
+  If you ask for another image while one is still cooking, the bot tells you it's still
+  working rather than starting a second one. Image editing is unchanged this release.
+  Toggle with `ENABLE_BACKGROUND_IMAGE_GEN` (default on); image jobs get their own
+  longer time budget via `API_TIMEOUT_IMAGE` (default 300s).
+- Fixed: the "✨ Enhanced Prompt" preview had stopped appearing on most surfaces (it was
+  tied to a status message that newer Slack surfaces don't create) — it now posts as its
+  own message so you can always see the prompt the image was built from.
+
 ## [2.5.1] - 2026-05-11
 
 ### 🚀 Feature - GPT-5.5 Support

@@ -14,6 +14,20 @@ path must build on these same helpers.
 import re
 from typing import List, Tuple
 
+# Invisible tag (F1) appended to the bot's own progress-checklist messages so the
+# history rebuild can recognize and drop them — their "✓ …" rendering doesn't match the
+# ":emoji: text" self-status filter, and if a rebuild fires mid-generation (the checklist
+# is still visible) they must never replay as an assistant turn. Three INVISIBLE
+# SEPARATORs (U+2063): render nothing, survive chat.update, and can't collide with human
+# text. Recognized on read; users never see it.
+CHECKLIST_STATUS_MARKER = "⁣⁣⁣"
+
+
+def is_checklist_status_text(text: str) -> bool:
+    """True if `text` carries the checklist marker (an own progress-checklist message)."""
+    return bool(text) and CHECKLIST_STATUS_MARKER in text
+
+
 # Canonical marker set ("Continued..." style — user preference).
 _TRAILER_BODY = "Continued in next message..."
 _HEAD_BODY = "...continued"

@@ -600,17 +600,33 @@ class MessageProcessor(ThreadManagementMixin,
                     intent = "new_image"
                     self.log_debug("No recent images found, treating ambiguous as new generation")
             
+            # F1: one in-flight background generation per thread. A new image request
+            # (new/edit) while the previous generation is still running is intentionally
+            # rejected — it posts automatically when ready, and a second concurrent job
+            # would cross-talk on the shared status/latch. Conversational turns are
+            # unaffected (they flow normally, with the suffix in-flight note).
+            _gen_in_flight = (
+                intent in ("new_image", "edit_image")
+                and self.thread_manager.generation_in_flight(thread_key) is not None
+            )
+
             # Update thinking indicator if generating/editing image (only for non-streaming)
-            if intent in ["new_image", "edit_image"]:
+            if intent in ["new_image", "edit_image"] and not _gen_in_flight:
                 # Only show the image thinking message if we're not streaming
                 # (on status-only DMs this routes to the composer status)
                 # Note: We check global streaming here since we don't have thread_config yet
                 if not (hasattr(client, 'supports_streaming') and client.supports_streaming() and config.enable_streaming):
                     self._update_thinking_for_image(client, message.channel_id, thinking_id, thread_id=message.thread_id)
-            
+
             # Generate response based on intent
-            if intent == "new_image":
-                response = await self._handle_image_generation(message.text, thread_state, client, message.channel_id, thinking_id, message)
+            if _gen_in_flight:
+                self.log_info(f"Image intent '{intent}' rejected — a generation is already in flight on {thread_key}")
+                response = Response(
+                    type="text",
+                    content="Still working on the previous image — ask me again once it lands.",
+                )
+            elif intent == "new_image":
+                response = await self._handle_image_generation(message.text, thread_state, client, message.channel_id, thinking_id, message, allow_background=True)
             elif intent == "edit_image":
                 # Check if we have uploaded images or need to find recent ones
                 if image_inputs:
@@ -693,6 +709,16 @@ class MessageProcessor(ThreadManagementMixin,
             else:
                 response = await self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0)
             
+            # F1 latch relocation (TOCTOU fix): the image upload + DB row land AFTER this
+            # lock releases (main.py sync path, or the background job). Mark the upload
+            # latch NOW, while we still hold the lock, so a fast follow-up "edit it" that
+            # wins the lock next can't slip in before the latch is set (Codex finding 11).
+            if response is not None and response.type in ("image", "background"):
+                try:
+                    self.thread_manager.mark_upload_started(thread_key)
+                except Exception as latch_error:
+                    self.log_warning(f"Failed to mark upload started for {thread_key}: {latch_error}")
+
             # DEBUG: log conversation history after processing (with truncated content).
             # log_debug, not print — conversation content must not leak to stdout
             # unconditionally, and the json.dumps is only worth building at debug level.

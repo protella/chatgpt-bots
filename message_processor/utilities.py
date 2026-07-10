@@ -1090,15 +1090,51 @@ class MessageUtilitiesMixin:
             self.log_debug(f"pulse envelope build failed: {e}")
             return None
 
+    @staticmethod
+    def _escape_suffix_text(text: Optional[str], limit: int = 200) -> str:
+        """Sanitize free text for the informational suffix block: strip control chars /
+        newlines, neutralize brackets (so it can't close the [...] frame or read as
+        instructions), and length-cap."""
+        cleaned = "".join(ch if ch.isprintable() else " " for ch in (text or ""))
+        cleaned = cleaned.replace("[", "(").replace("]", ")").strip()
+        if len(cleaned) > limit:
+            cleaned = cleaned[:limit].rstrip() + "…"
+        return cleaned
+
+    def _build_generation_inflight_note(self, channel_id: Optional[str],
+                                        thread_ts: Optional[str]) -> Optional[str]:
+        """F1: volatile suffix line telling the model a background image generation is
+        still running in this thread, so a follow-up turn doesn't claim it's done or kick
+        off a second one. Returns None when nothing is in flight."""
+        try:
+            if not channel_id or thread_ts is None or not hasattr(self, "thread_manager"):
+                return None
+            entry = self.thread_manager.generation_in_flight(f"{channel_id}:{thread_ts}")
+            if not entry:
+                return None
+            summary = self._escape_suffix_text(entry.get("prompt_summary"))
+            return (
+                f'[An image for "{summary}" is currently being generated in this thread '
+                "and will be posted automatically when ready. Don't claim it is done and "
+                "don't start another image unless asked.]"
+            )
+        except Exception as e:
+            self.log_debug(f"in-flight note build failed: {e}")
+            return None
+
     def _build_suffix_context(self, client, channel_id: Optional[str],
                               thread_ts: Optional[str], user_timezone: str = "UTC",
                               user_tz_label: Optional[str] = None) -> str:
         """All volatile per-request context, injected as the LAST payload message:
-        minute-precision time + the channel-activity envelope (channels only)."""
+        minute-precision time + the channel-activity envelope (channels only) + a
+        background-image-in-flight note (F1)."""
         parts = [self._build_time_suffix_context(user_timezone, user_tz_label)]
         envelope = self._build_pulse_envelope(client, channel_id, thread_ts)
         if envelope:
             parts.append(envelope)
+        inflight = self._build_generation_inflight_note(channel_id, thread_ts)
+        if inflight:
+            parts.append(inflight)
         return "\n\n".join(parts)
 
     def _schedule_async_call(self, coro):

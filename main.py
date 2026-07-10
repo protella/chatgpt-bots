@@ -255,16 +255,24 @@ class ChatBotV2:
             # Process the message and get intent
             response = await self.processor.process_message(message, client, thinking_id)
             
-            # Delete thinking indicator (but not if streaming was used - it's already the response)
-            if thinking_id and not (response and response.metadata.get("streamed")):
+            # Delete thinking indicator (but not if streaming was used - it's already the
+            # response, and not for background image gen — the job owns that message/status).
+            if (thinking_id and response
+                    and not response.metadata.get("streamed")
+                    and response.type != "background"):
                 await client.delete_message(message.channel_id, thinking_id)
-            
+            elif thinking_id and not response:
+                await client.delete_message(message.channel_id, thinking_id)
+
             # Phase E/F: participation stats — count replies the bot volunteered
             # (wake-gate 'respond' verdicts) so the engine can self-throttle later.
+            # Image/background turns are NOT counted here — the delivery seam
+            # (publish_image) accounts on the real posted image (F1).
             if (response and message.channel_id and not message.channel_id.startswith("D")
                     and getattr(client, "channel_pulse", None) is not None):
-                posted = (response.metadata.get("streamed")
-                          or (response.type == "text" and (response.content or "").strip()))
+                posted = (response.type == "text"
+                          and (response.metadata.get("streamed")
+                               or (response.content or "").strip()))
                 if posted:
                     try:
                         client.channel_pulse.record_bot_reply(
@@ -338,26 +346,34 @@ class ChatBotV2:
                             await client.update_message(message.channel_id, upload_status_id, upload_status)
                     
                     try:
-                        # Send image
-                        image_data = response.content
-                        file_url = await client.send_image(
-                            message.channel_id,
-                            message.thread_id,
-                            image_data.to_bytes(),
-                            f"generated_image.{image_data.format}",
-                            ""  # No caption - prompt already displayed via streaming
+                        # F1: the shared delivery seam owns upload, falsey-URL = failure,
+                        # persistence, ledger, and unprompted accounting. generation_id
+                        # is None here (legacy sync path — the breadcrumb still exists, so
+                        # persistence stays breadcrumb-driven via update_last_image_url).
+                        from message_processor.image_delivery import publish_image
+                        unprompted = bool(message.metadata and message.metadata.get("participation_check") is True)
+                        file_url = await publish_image(
+                            processor=self.processor,
+                            client=client,
+                            channel_id=message.channel_id,
+                            thread_id=message.thread_id,
+                            thread_key=upload_thread_key,
+                            image_data=response.content,
+                            checklist=None,
+                            generation_id=None,
+                            prompt=(response.metadata.get("prompt") or ""),
+                            db=getattr(self.processor, "db", None),
+                            thread_manager=self.processor.thread_manager,
+                            unprompted=unprompted,
+                            message_ts=(message.metadata or {}).get("ts"),
                         )
-
-                        # Update thread state with the URL
-                        if file_url:
-                            await self.processor.update_last_image_url(
-                                message.channel_id,
-                                message.thread_id,
-                                file_url
-                            )
+                        if file_url is None:
+                            await client.handle_error(
+                                message.channel_id, message.thread_id,
+                                "⚠️ I created the image but couldn't post it. Please try again.")
                     finally:
                         # Always release the latch — a wedged latch would stall the next
-                        # edit for the full wait timeout.
+                        # edit for the full wait timeout (publish_image no longer releases it).
                         if upload_manager and hasattr(upload_manager, "mark_upload_finished"):
                             upload_manager.mark_upload_finished(upload_thread_key)
 
@@ -367,6 +383,12 @@ class ChatBotV2:
 
                         # Delete the status message - the enhanced prompt message remains untouched
                         await client.delete_message(message.channel_id, upload_status_id)
+                elif response.type == "background":
+                    # F1: new-image generation detached to a background job. Like 'queued',
+                    # nothing to post here — the job posts the image and owns its progress
+                    # surface. The thinking indicator was already left in place above.
+                    main_logger.debug(
+                        f"Image generation running in background for {message.channel_id}:{message.thread_id}")
                 elif response.type == "error":
                     # Send error message
                     await client.handle_error(
@@ -374,7 +396,7 @@ class ChatBotV2:
                         message.thread_id,
                         response.content
                     )
-        
+
         except Exception as e:
             main_logger.error(f"Error handling message: {e}", exc_info=True)
 
@@ -402,8 +424,12 @@ class ChatBotV2:
             # left the working bubble spinning forever (user report 2026-07-10).
             # Explicit best-effort clear. Skipped for queued turns — their status
             # belongs to the in-flight request that will answer them.
+            # Also skipped for background image gen (background_owns_status): the job owns
+            # the status-only progress surface and clears it on completion — clearing here
+            # would blank it the instant the turn returns (Codex finding 8).
             if (thinking_id is None
                     and not (response is not None and response.type == "queued")
+                    and not (response is not None and response.metadata.get("background_owns_status"))
                     and hasattr(client, "clear_assistant_status")):
                 try:
                     await client.clear_assistant_status(message.channel_id, post_thread_id)
@@ -556,6 +582,15 @@ class ChatBotV2:
                 await self.cleanup_task
             except asyncio.CancelledError:
                 pass
+
+        # F1: cancel/await in-flight background image generations BEFORE the Slack client
+        # stops — otherwise the client tears down mid-upload and the jobs fail noisily.
+        tm = getattr(self.processor, "thread_manager", None) if self.processor else None
+        if tm is not None and hasattr(tm, "cancel_generations"):
+            try:
+                await tm.cancel_generations(timeout=5.0)
+            except Exception as e:
+                main_logger.warning(f"Error cancelling background generations: {e}")
 
         # Stop the client (this should interrupt any stuck operations)
         if self.client:

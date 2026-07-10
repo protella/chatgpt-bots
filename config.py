@@ -245,6 +245,10 @@ class BotConfig:
     # API Timeout settings (in seconds)
     api_timeout_read: float = field(default_factory=lambda: float(os.getenv("API_TIMEOUT_READ", "180")))  # Overall timeout for API requests
     api_timeout_streaming_chunk: float = field(default_factory=lambda: float(os.getenv("API_TIMEOUT_STREAMING_CHUNK", "30")))  # Max time between streaming chunks
+    # Image generation/edit can legitimately run past the general read timeout. Applied
+    # BOTH as the outer asyncio.wait_for and as a per-request SDK timeout (the AsyncOpenAI
+    # client is built with api_timeout_read, so wait_for alone can't extend past it).
+    api_timeout_image: float = field(default_factory=lambda: float(os.getenv("API_TIMEOUT_IMAGE", "300")))
     
     # Model token limits (verified 2026-07-09 against developers.openai.com/api/docs/models/*)
     # GPT-5.6 family (sol/terra/luna) AND GPT-5.5: 1,050,000 total context window,
@@ -293,6 +297,17 @@ class BotConfig:
     # Transient "thinking/working" status on the assistant-thread surface. Additive + best-effort:
     # it no-ops gracefully in plain channels (where the visible progress comes from streaming text).
     enable_assistant_status: bool = field(default_factory=lambda: os.getenv("ENABLE_ASSISTANT_STATUS", "true").lower() == "true")
+    # --- Edit-in-place progress checklist (F4) ---
+    # Accumulating "✓ done / loader active" checklist on the image-pipeline status
+    # message instead of a single replaced status line + rotating "still working"
+    # strings. Off → today's single-line _update_status/rotator behavior.
+    enable_progress_checklist: bool = field(default_factory=lambda: os.getenv("ENABLE_PROGRESS_CHECKLIST", "true").lower() == "true")
+    # --- Background image generation (F1) ---
+    # New-image generation runs in a background job so the thread lock releases and
+    # conversation keeps flowing during the (multi-minute) generation. Off → today's
+    # inline behavior (generation holds the lock), minus the shared-delivery bug fixes
+    # which apply to both paths. Image EDIT stays synchronous either way this phase.
+    enable_background_image_gen: bool = field(default_factory=lambda: os.getenv("ENABLE_BACKGROUND_IMAGE_GEN", "true").lower() == "true")
     # Rotating loading messages shown in the assistant thread's transient bubble.
     # Sourced from a message file (one per line, # comments ok) — see
     # status_messages/loading_messages.generic.txt. Brand them by pointing

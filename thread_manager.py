@@ -395,6 +395,11 @@ class AsyncThreadStateManager(LoggerMixin):
         # releases, so a fast follow-up "edit it" could resolve its target before the
         # new image exists. Editors await the latch before resolving targets.
         self._upload_events: Dict[str, asyncio.Event] = {}
+        # F1 — background image generation registry: at most one in-flight generation
+        # per thread. Entry: {generation_id, task, started_at, prompt_summary}. Used by
+        # follow-up turns (suffix in-flight note + image-intent rejection) and shutdown
+        # (cancel/await the tasks). All access is synchronous == atomic on the loop.
+        self._active_generations: Dict[str, dict] = {}
         # Threads whose warm in-memory state is missing at least one Slack message
         # (e.g. a message dropped from an overfull pending queue, or a crash mid-queue).
         # The next request on that thread refetches from Slack (the transcript) before
@@ -485,6 +490,65 @@ class AsyncThreadStateManager(LoggerMixin):
             await asyncio.wait_for(event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             self.log_warning(f"Timed out waiting for in-flight upload on {thread_key}; proceeding")
+
+    # --- F1: background image-generation registry ---
+
+    def register_generation(self, thread_key: str, generation_id: str,
+                            prompt_summary: str, task: Optional[asyncio.Task] = None):
+        """Register an in-flight background image generation for this thread."""
+        self._active_generations[thread_key] = {
+            "generation_id": generation_id,
+            "task": task,
+            "started_at": time.monotonic(),
+            "prompt_summary": prompt_summary,
+        }
+
+    def attach_generation_task(self, thread_key: str, generation_id: str, task: asyncio.Task):
+        """Store the scheduled task handle (minted after the id, needed for shutdown).
+        ID-conditional so a stale job can't overwrite a newer registration."""
+        entry = self._active_generations.get(thread_key)
+        if entry is not None and entry["generation_id"] == generation_id:
+            entry["task"] = task
+
+    def finish_generation(self, thread_key: str, generation_id: str) -> bool:
+        """Clear the in-flight generation, but ONLY if the id still matches — a stale
+        job (already superseded by a newer one) must never clear the newer entry."""
+        entry = self._active_generations.get(thread_key)
+        if entry is not None and entry["generation_id"] == generation_id:
+            self._active_generations.pop(thread_key, None)
+            return True
+        return False
+
+    def generation_in_flight(self, thread_key: str) -> Optional[dict]:
+        """Advisory peek at the in-flight generation entry, or None. Force-clears (and
+        logs) an entry older than api_timeout_image + 30s — a watchdog against a job
+        that died without clearing itself."""
+        entry = self._active_generations.get(thread_key)
+        if entry is None:
+            return None
+        max_age = float(config.api_timeout_image) + 30.0
+        if time.monotonic() - entry["started_at"] > max_age:
+            self.log_warning(
+                f"Force-clearing stale generation {entry['generation_id']} on "
+                f"{thread_key} (age > {max_age:.0f}s)")
+            self._active_generations.pop(thread_key, None)
+            return None
+        return entry
+
+    async def cancel_generations(self, timeout: float = 5.0):
+        """Cancel and await all registered generation tasks (shutdown). Bounded so a
+        wedged job can't stall shutdown."""
+        tasks = [e["task"] for e in self._active_generations.values() if e.get("task")]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
+            except asyncio.TimeoutError:
+                self.log_warning("Timed out awaiting generation tasks during shutdown")
+        self._active_generations.clear()
 
     def _start_async_watchdog(self):
         """Start the background task that monitors for stuck locks"""
