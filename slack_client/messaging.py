@@ -598,6 +598,12 @@ class SlackMessagingMixin:
         Shows a transient 'thinking/working' status on the assistant-thread surface with a
         rotating branded loading_messages set; auto-clears when the app replies. Degrades to a
         silent no-op in plain channels / non-assistant contexts — must never raise.
+
+        GUARD (Phase G / agent_view): on the June-2026 surface setStatus AUTO-OPENS the
+        thread for the user. Never call this speculatively for a channel message the
+        participation engine might still ignore — the only caller is
+        send_thinking_indicator, which main.py invokes strictly AFTER the engine's
+        'respond' verdict. Keep it that way (regression-tested in test_phase_g.py).
         """
         if not config.enable_assistant_status:
             return False

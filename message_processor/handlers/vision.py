@@ -7,6 +7,7 @@ import time
 
 from base_client import BaseClient, Message, Response
 from config import config
+from message_markers import continuation_trailer, part_prefix
 from prompts import IMAGE_ANALYSIS_PROMPT, VISION_DEFAULT_QUESTION
 
 # Common no-real-question phrasings that should get the standard default question
@@ -217,6 +218,8 @@ class VisionHandlerMixin:
                 from streaming import RateLimitManager
                 from streaming.fence_handler import FenceHandler
 
+                from streaming.native_sink import NativeStreamCoordinator
+
                 streaming_config = client.get_streaming_config() if hasattr(client, 'get_streaming_config') else {}
                 buffer = StreamingBuffer(
                     update_interval=streaming_config.get("update_interval", 2.0),
@@ -235,12 +238,23 @@ class VisionHandlerMixin:
                 # Track current streaming message and overflow
                 current_message_id = thinking_id
                 current_part = 1
-                continuation_msg = "\n\n*Continued in next message...*"
+                continuation_msg = continuation_trailer()  # shared marker (message_markers)
                 # Reserve space for: continuation msg (~40), part prefix (~30), markdown expansion (~400)
                 # CRITICAL: Must trigger overflow BEFORE messaging layer's backup truncation at 3700 chars
                 safety_margin = len(continuation_msg) + 600
                 message_char_limit = 3700 - safety_margin  # ~3060 chars
                 streaming_aborted = False
+
+                # Native Slack streaming sink (Phase G) — started lazily on the first
+                # chunk; on start the "Analyzing..." placeholder is deleted because
+                # chat.startStream creates the reply message. Vision always threads.
+                native_coord = None
+                if (hasattr(client, "supports_native_streaming") and client.supports_native_streaming()
+                        and hasattr(client, "begin_native_stream")):
+                    native_coord = NativeStreamCoordinator(
+                        client, channel_id, message.thread_id,
+                        char_limit=message_char_limit, logger=self.log_debug,
+                    )
 
                 # Start progress updater task (will be cancelled when streaming starts)
                 progress_task = None
@@ -265,6 +279,57 @@ class VisionHandlerMixin:
                                 pass
                             self.log_debug("Cancelled progress updater - vision streaming started")
 
+                    # ---- Native sink (Phase G): append-only streaming replaces the edit loop ----
+                    if native_coord is not None and not native_coord.failed:
+                        if chunk is None:
+                            # Completion: append the tail and stop the stream; legacy
+                            # edit on the native ts if the stop itself fails.
+                            if native_coord.started:
+                                finalized = await native_coord.finalize(buffer.get_complete_text())
+                                current_message_id = native_coord.current_ts or current_message_id
+                                current_part = native_coord.part
+                                if not finalized and current_message_id:
+                                    final_text = buffer.get_complete_text()
+                                    if current_part > 1:
+                                        final_text = f"{part_prefix(current_part)}{final_text}"
+                                    try:
+                                        await client.update_message_streaming(channel_id, current_message_id, final_text)
+                                    except Exception as e:
+                                        self.log_error(f"Error updating final vision text: {e}")
+                                return
+                            # Native never started (no chunks arrived) — fall through.
+                        elif chunk:
+                            if not native_coord.started:
+                                if await native_coord.start():
+                                    current_message_id = native_coord.current_ts or current_message_id
+                                    try:
+                                        await client.delete_message(channel_id, thinking_id)
+                                    except Exception as e:
+                                        self.log_debug(f"Could not remove placeholder for native vision stream: {e}")
+                                else:
+                                    self.log_info("Native streaming unavailable — using legacy vision updates")
+                            if not native_coord.failed:
+                                buffer.add_chunk(chunk)
+                                if buffer.should_update() and rate_limiter.can_make_request():
+                                    rate_limiter.record_request_attempt()
+                                    ok, overflow = await native_coord.update(buffer.get_complete_text())
+                                    if overflow is not None:
+                                        buffer.reset()
+                                        buffer.add_chunk(overflow)
+                                        buffer.mark_updated()
+                                        current_part = native_coord.part
+                                    if ok:
+                                        rate_limiter.record_success()
+                                        if overflow is None:
+                                            buffer.mark_updated()
+                                        current_message_id = native_coord.current_ts or current_message_id
+                                    else:
+                                        rate_limiter.record_failure(is_rate_limit=False)
+                                        current_message_id = native_coord.current_ts or current_message_id
+                                        self.log_warning("Native vision stream went inert — continuing with legacy updates")
+                                return
+                            # start failed: fall through to legacy (chunk not yet buffered)
+
                     # Handle completion signal (None chunk)
                     if chunk is None:
                         # Final update without loading indicator
@@ -272,7 +337,7 @@ class VisionHandlerMixin:
                             final_text = buffer.get_complete_text()
                             # Preserve part number prefix for overflow messages
                             if current_part > 1:
-                                final_text = f"*Part {current_part} (continued)*\n\n{final_text}"
+                                final_text = f"{part_prefix(current_part)}{final_text}"
                             try:
                                 await client.update_message_streaming(channel_id, current_message_id, final_text)
                             except Exception as e:
@@ -359,7 +424,7 @@ class VisionHandlerMixin:
                                     fence_handler_cont.update_text(overflow_with_fence)
                                     continuation_display = fence_handler_cont.get_display_safe_text()
 
-                                    continuation_text = f"*Part {current_part} (continued)*\n\n{continuation_display} {config.loading_ellipse_emoji}"
+                                    continuation_text = f"{part_prefix(current_part)}{continuation_display} {config.loading_ellipse_emoji}"
 
                                     # Send new message and get its ID
                                     new_msg_result = await client.send_message_get_ts(channel_id, thinking_id, continuation_text)
@@ -382,7 +447,7 @@ class VisionHandlerMixin:
 
                             # Preserve part number prefix for overflow messages
                             if current_part > 1:
-                                display_text_with_indicator = f"*Part {current_part} (continued)*\n\n{display_text} {config.loading_ellipse_emoji}"
+                                display_text_with_indicator = f"{part_prefix(current_part)}{display_text} {config.loading_ellipse_emoji}"
                             else:
                                 display_text_with_indicator = f"{display_text} {config.loading_ellipse_emoji}"
 
