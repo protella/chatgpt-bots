@@ -120,3 +120,11 @@ async def test_deprecated_classify_wake_still_importable():
     from openai_client.api.responses import classify_wake
     llm = _FakeLLM(exc=RuntimeError("api down"))
     assert await classify_wake(llm, "anything") == "ignore"
+
+
+def test_prompt_carries_addressed_to_someone_else_rule():
+    # Regression guard for the "hey claude, ..." bug (2026-07-10): a message that
+    # names ANOTHER party is never for the assistant, however helpful it could be.
+    from prompts import PARTICIPATION_SYSTEM_PROMPT
+    assert "addressed to SOMEONE ELSE" in PARTICIPATION_SYSTEM_PROMPT
+    assert "hey claude" in PARTICIPATION_SYSTEM_PROMPT
