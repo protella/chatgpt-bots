@@ -1242,6 +1242,67 @@ verdicts ignore the field; intent output two-token parse + one-word fallback + g
 default; ack intent → reaction before handler runs; reservation guard consulted;
 config off → field ignored everywhere; emoji configurable.
 
+## F20. Human-style reactions on others' posts (user directive 2026-07-11)
+
+**Rationale (user):** the bot is welcome to react tastefully, with judgment, on other
+people's posts — a thumbs-up on something relevant to it or an earlier conversation it
+was in, joining a laugh (especially when warranted or when others have reacted
+similarly). Goal: more human, has opinions, not afraid to be part of the team. Today
+the react verdict exists but is prompted so conservatively (thanks/small-win/FYI
+acknowledgement only) it effectively never fires, and the allowed-emoji defaults
+contain no humor entries.
+
+**Design:**
+1. **Broaden the react verdict's judgment** (PARTICIPATION_SYSTEM_PROMPT): reacting is
+   how a teammate participates without words — join a laugh when something genuinely
+   lands; thumbs-up agreement, good news, or a resolution of something the assistant
+   was involved in; celebrate a win. Others having already reacted similarly LOWERS
+   the bar (joining the room's reaction is low-risk). Keep the taste rails: most
+   messages still get nothing; never react to heated, sensitive, or personal content;
+   when unsure, ignore.
+2. **Unrestricted standard-emoji judgment (user directive — no curated palette).** The
+   models know Slack's standard emoji shorthand; picking the right one IS the
+   judgment. Remove the allowlist as a default at all four enforcement points:
+   - `get_react_tool_schema` (messaging.py:895): drop the `enum`; description says any
+     standard Slack emoji shorthand name, no colons.
+   - `execute_react_tool` (messaging.py:921): syntactic validation only (lowercase
+     name charset `[a-z0-9_+'-]`, sane length); Slack's `invalid_name` error already
+     fails gracefully through the existing add-reaction error path.
+   - `classify_participation`'s "Allowed reaction emoji" line and
+     `validate_verdict`'s membership check (participation.py:208): replaced by "any
+     standard Slack emoji name (shorthand, no colons)" guidance + the same syntactic
+     check.
+   - The tool-enabled gate (slack_client/base.py:86) no longer requires a non-empty
+     list.
+   `REACTION_EMOJIS` becomes an OPTIONAL restriction: default now EMPTY = unrestricted
+   judgment; when set, it is honored everywhere as an allowlist (for workspaces that
+   want brand control). .env.example rewritten to say exactly that. `SNOOZE_ACK_EMOJI`
+   / `ACK_REACTION_EMOJI` (single-purpose) and `REACTION_MAX_PER_MESSAGE` (F6 cap)
+   unchanged.
+3. **Social-proof signal — pulse tracks others' reactions.** The already-subscribed
+   reaction_added (and reaction_removed, if subscribed) events update the in-memory
+   pulse ring entry for the target ts (zero-await, in-memory only; entries for the
+   bot's own messages keep flowing to feedback as today — this is additive for
+   OTHERS' messages). Envelope and thread-tail lines append a compact summary, e.g.
+   `[reactions: 3× joy, 1× fire]` (top 2 emoji by count). Both the classifier and the
+   main model then SEE what the room is reacting to.
+4. **Main-model etiquette softened to match** (LOCAL_TOOLS_GUIDANCE): from "most
+   messages deserve NO reaction" absolutism to the personable-teammate framing —
+   react the way a teammate does: when something lands, when you agree, when the room
+   is already reacting; still never spam, still one emoji per message unless asked.
+5. Interplay: F19's ack (receipt) and F20 (opinion) are distinct uses; the F6
+   reservation guard already prevents double-adds of the same emoji per message.
+
+**Tests:** react-verdict prompt guidance present (social-proof + taste rails
+substrings, any-standard-emoji wording); tool schema has NO enum by default and gains
+one when REACTION_EMOJIS is set; executor accepts a valid off-list name by default,
+rejects malformed names syntactically, and enforces the allowlist when configured;
+validate_verdict same matrix; tool-enabled gate works with the empty default; pulse
+ring entry accumulates reaction_added (and decrements on removed if handled), keyed by
+ts, in-memory only; envelope/tail line renders the compact summary (top-2, counts) and
+omits when none; bot's own-message reactions still reach the feedback sink; render
+stays deterministic given ring state.
+
 ## Rollout / verification
 
 1. `make test` green after each change set (F4 → F1 → F2 → F3); `make lint` clean.

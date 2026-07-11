@@ -57,6 +57,14 @@ class SlackRegistrationMixin:
             # no LLM call, no reply, never raises. Everything else is ignored
             # (acked so Bolt doesn't log every reaction as unhandled).
             await feedback_handlers.ingest_reaction(self, event)
+            # F20 social proof: mirror the reaction onto the pulse ring (in-memory, additive).
+            feedback_handlers.note_reaction_pulse(self, event, added=True)
+
+        @self.app.event("reaction_removed")
+        async def handle_reaction_removed(event):
+            # F20: keep the pulse ring's social-proof counts in sync when reactions are
+            # removed (only fires if the app is subscribed to reaction_removed).
+            feedback_handlers.note_reaction_pulse(self, event, added=False)
 
         # Phase H: native feedback buttons (context_actions block on DM/assistant
         # responses) arrive as ordinary block_actions.
