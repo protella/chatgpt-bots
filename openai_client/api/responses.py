@@ -1010,8 +1010,7 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
     lines.append(f"- Strictness: {signals.get('strictness') or 'judicious'}")
     lines.append(
         f"- Assistant's unprompted replies in this channel in the last hour: "
-        f"{int(signals.get('unprompted_last_hour') or 0)} (self-throttle cap: "
-        f"{int(signals.get('hourly_cap') or 0)})"
+        f"{int(signals.get('unprompted_last_hour') or 0)}"
     )
     allow = list(getattr(config, "reaction_emojis", None) or ["eyes"])
     lines.append(f"- Allowed reaction emoji: {', '.join(allow)}")
@@ -1041,7 +1040,7 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
         "input": conversation_messages,
         # JSON verdict + reasoning-model preamble needs more room than a one-word
         # classification; same floor the memory extractor uses.
-        "max_output_tokens": max(512, config.utility_max_tokens),
+        "max_output_tokens": max(1024, config.utility_max_tokens),
         "store": False,
     }
     # Utility model is a GPT-5-series reasoning model (gpt-5-mini)
@@ -1094,7 +1093,7 @@ async def extract_memory(self, exchange_text: str, existing_memory: Optional[Lis
     request_params = {
         "model": config.utility_model,
         "input": conversation_messages,
-        "max_output_tokens": max(512, config.utility_max_tokens),
+        "max_output_tokens": max(1024, config.utility_max_tokens),
         "store": False,
     }
     # Utility model is a GPT-5-series reasoning model (gpt-5-mini)
@@ -1148,7 +1147,7 @@ async def summarize_tool_result(self, text: str, max_chars: int) -> Optional[str
     request_params = {
         "model": config.utility_model,
         "input": conversation_messages,
-        "max_output_tokens": max(512, config.utility_max_tokens),
+        "max_output_tokens": max(1024, config.utility_max_tokens),
         "store": False,
     }
     # Utility model is a GPT-5-series reasoning model; temperature fixed to 1.0. Low effort

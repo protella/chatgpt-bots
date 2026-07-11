@@ -125,23 +125,6 @@ class ParticipationEngine:
         if current is None or _ts_key(ts) > _ts_key(current):
             self._latest[channel_id] = ts
 
-    # ---------------------------------------------------------------- rails
-
-    def hourly_cap(self, level: str) -> int:
-        base = int(getattr(config, "max_unprompted_replies_per_hour", 6))
-        return base * 2 if level == "active" else base
-
-    def over_throttle(self, pulse, channel_id: str, level: str) -> bool:
-        """Hard self-throttle: at/over the unprompted cap the engine is not even
-        called (addressed messages never pass through here, so mentions are
-        never throttled)."""
-        if pulse is None:
-            return False
-        try:
-            return pulse.unprompted_count_last_hour(channel_id) >= self.hourly_cap(level)
-        except Exception:
-            return False
-
     # ------------------------------------------------------------- evaluate
 
     async def evaluate(self, *, channel_id: str, ts: str, text: str,
@@ -187,7 +170,6 @@ class ParticipationEngine:
             "channel_activity": channel_activity,
             "thread_tail": thread_tail,
             "unprompted_last_hour": int(unprompted_last_hour),
-            "hourly_cap": self.hourly_cap(level),
             "name_hit": bool(name_hit),
             "sender_is_bot": bool(sender_is_bot),
             "channel_topic": channel_topic,
