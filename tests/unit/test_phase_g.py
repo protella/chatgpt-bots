@@ -148,7 +148,9 @@ async def test_coordinator_rolls_parts_with_shared_markers():
 
     first_ts, second_ts = coord.part_ts
     stored_first = _slack_stores(sdk.messages[first_ts])
-    assert ends_with_continuation(stored_first)
+    # No trailing "Continued in next message..." (user directive 2026-07-11): the next
+    # part's "Part N (continued)" header alone marks the seam for the rebuild merger.
+    assert not ends_with_continuation(stored_first)
     assert first_ts in sdk.stopped
 
     stored_second = _slack_stores(sdk.messages[second_ts])

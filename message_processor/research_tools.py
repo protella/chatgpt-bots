@@ -237,7 +237,11 @@ async def _deliver_findings(processor, client, channel_id: str, thread_root: str
     if (getattr(config, "enable_research_label", True)
             and not getattr(processor, _RESEARCH_LABEL_DISABLED_ATTR, False)):
         alias = (config.bot_name_aliases or ["bot"])[0]
-        label = f"{alias} [research: {_gist(task, 40)}]"
+        # Slack truncates chat.postMessage usernames at 50 chars SERVER-SIDE (verified
+        # live 2026-07-11 — a 61-char label lost its closing bracket in storage), so the
+        # gist budget is whatever keeps the full label, bracket included, within 50.
+        gist_budget = 50 - len(alias) - len(" [research: ") - 1
+        label = f"{alias} [research: {_gist(task, max(gist_budget, 8))}]"
     posted = None
     if label:
         try:

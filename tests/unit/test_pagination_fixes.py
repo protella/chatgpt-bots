@@ -307,7 +307,7 @@ async def test_send_message_split_uses_continued_markers_and_isolates_failures()
     b = _Bot()
     calls = []
 
-    async def post(channel, thread_ts, text):
+    async def post(channel, thread_ts, text, **kw):
         calls.append(text)
         if len(calls) == 2:
             raise _slack_error(error="msg_too_long", status=400)
@@ -318,8 +318,10 @@ async def test_send_message_split_uses_continued_markers_and_isolates_failures()
     ok = await b.send_message("C1", "1", long_text)
     # send_message now returns the first landed chunk's ts (truthy) instead of a bool.
     assert ok == "ts1"  # some chunks landed despite chunk-2 failure
-    assert len(calls) >= 3, "failure on chunk 2 must not abort later chunks"
-    assert calls[0].rstrip().endswith(CONTINUATION_TRAILER)
+    assert len(calls) >= 3, "a transient chunk-2 failure must retry, not abort the rest"
+    # No "Continued in next message..." trailer (user directive 2026-07-11): the
+    # "...continued" HEAD on the following chunk alone marks the seam.
+    assert not calls[0].rstrip().endswith(CONTINUATION_TRAILER)
     assert calls[1].startswith(CONTINUATION_HEAD)
     assert "Part 1/" not in calls[0]  # old style retired
 
