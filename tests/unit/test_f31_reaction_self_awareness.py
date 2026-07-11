@@ -76,9 +76,10 @@ def test_record_own_reaction_uses_bot_alias_name(monkeypatch):
     p = ChannelPulse(size=10)
     p.record("C1", **_human("100.0", text="hi", name="Dan"))
     p.record_own_reaction("C1", message_ts="100.0", emoji="wave")
-    # Rendered as a self entry under the first alias.
+    # Rendered as a self entry under the first alias, landing in the TARGET's thread
+    # (a root target IS its own thread root — Codex review fix, never a bogus top-level).
     env = p.render_envelope("C1")
-    assert "Sol (top-level): [reacted :wave:" in env
+    assert 'Sol (in thread "hi…"): [reacted :wave:' in env
 
 
 # --------------------------------------------- _reserve_and_react choke-point hook

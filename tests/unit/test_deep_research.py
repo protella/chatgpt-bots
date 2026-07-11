@@ -290,3 +290,70 @@ def test_config_defaults():
     # Effort routes through clamp_effort against a real model (never rejected).
     assert clamp_effort("gpt-5.6-sol", config.deep_research_reasoning_effort) in {
         "none", "low", "medium", "high", "xhigh", "max"}
+
+
+# --------------------------------------------- Codex review fixes (round 1)
+
+@pytest.mark.asyncio
+async def test_web_search_forced_into_job_tools(monkeypatch):
+    """An MCP-only tools array (global web search off) must still get web_search —
+    the tool IS web research; a truthy array must not silently strip it."""
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    monkeypatch.setattr(config, "enable_research_label", False)
+    openai = SimpleNamespace(create_text_response_with_tools=AsyncMock(
+        return_value={"text": "report", "tools_used": []}))
+    proc = _FakeProcessor(openai_client=openai, tm=AsyncThreadStateManager())
+    proc._build_tools_array = lambda cfg, model, registry=None: [
+        {"type": "mcp", "server_label": "x"}]  # truthy, no web_search
+    await rt._run_deep_research_job(
+        processor=proc, client=_FakeClient(), channel_id="C1", thread_root="100.0",
+        thread_key="C1:100.0", job_id="j1", task="t",
+        snapshot=[], system_prompt="DEV", model="gpt-5.6-sol")
+    tools = openai.create_text_response_with_tools.await_args.kwargs["tools"]
+    assert {"type": "web_search"} in tools
+    assert {"type": "mcp", "server_label": "x"} in tools
+
+
+@pytest.mark.asyncio
+async def test_failed_findings_post_posts_failure_note(monkeypatch):
+    """send_message swallowing a Slack error into None must NOT read as job success:
+    the job posts an honest failure note instead of logging 'completed'."""
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    monkeypatch.setattr(config, "enable_research_label", False)
+    openai = SimpleNamespace(create_text_response_with_tools=AsyncMock(
+        return_value={"text": "report", "tools_used": []}))
+    proc = _FakeProcessor(openai_client=openai, tm=AsyncThreadStateManager())
+
+    class _FailingThenNoteClient(_FakeClient):
+        async def send_message(self, channel_id, thread_id, text, blocks=None,
+                               meta_out=None, username=None):
+            if "hit a wall" not in text:
+                return None  # the findings post itself fails
+            return await super().send_message(channel_id, thread_id, text,
+                                              blocks=blocks, meta_out=meta_out,
+                                              username=username)
+
+    client = _FailingThenNoteClient()
+    await rt._run_deep_research_job(
+        processor=proc, client=client, channel_id="C1", thread_root="100.0",
+        thread_key="C1:100.0", job_id="j1", task="t",
+        snapshot=[], system_prompt="DEV", model="gpt-5.6-sol")
+    assert len(client.sent) == 1
+    assert "hit a wall" in client.sent[0][2]
+    assert "posting them to Slack failed" in client.sent[0][2]
+
+
+@pytest.mark.asyncio
+async def test_schedule_failure_closes_coroutine(monkeypatch):
+    """A never-scheduled job coroutine is close()d so it can't warn as unawaited."""
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    proc = _FakeProcessor(openai_client=SimpleNamespace(), tm=AsyncThreadStateManager())
+
+    def _boom(coro):
+        raise RuntimeError("loop is closed")
+    proc._schedule_async_call = _boom
+    res = await rt.execute_start_deep_research(
+        _ctx(proc, _FakeClient()), {"task": "t"})
+    assert res["ok"] is False and res["error"] == "schedule_failed"
+    # Registry cleared — nothing left in flight for the thread.
+    assert proc.thread_manager.research_in_flight_count("C1:100.0") == 0

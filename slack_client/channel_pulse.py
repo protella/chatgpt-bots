@@ -290,12 +290,17 @@ class ChannelPulse:
                 text = f'[reacted :{shorthand}: to {who}\'s message: "{excerpt}"]'
             else:
                 text = f"[reacted :{shorthand}: to {who}'s message]"
-            # Land the synthetic entry in the target's thread (a reply carries its thread
-            # root) so the thread tail sees it too; top-level targets stay top-level.
-            thread_ts = target.get("thread_ts")
+            # Land the synthetic entry under the target's thread ROOT — a reply carries its
+            # root in thread_ts, a root/top-level target IS the root (its ts). Falling back
+            # to message_ts keeps root-targeted reactions in the real thread tail instead of
+            # minting a bogus top-level entry + thread label (Codex review find).
+            thread_ts = target.get("thread_ts") or message_ts
         else:
             text = f"[reacted :{shorthand}: to an earlier message]"
-            thread_ts = None
+            # Target aged out of the ring: message_ts is the best root guess (exact for
+            # top-level/root targets; a stale reply target lands under its own ts, which
+            # only seeds an unused tail ring — harmless, LRU-bounded).
+            thread_ts = message_ts
         # Synthetic wall-clock ts sorts newest and dodges (channel, ts) dedup collisions.
         synth_ts = f"{time.time():.6f}"
         self.record(
