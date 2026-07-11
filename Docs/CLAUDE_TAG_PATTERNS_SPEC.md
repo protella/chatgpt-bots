@@ -1530,6 +1530,36 @@ the earlier text; 5-burst caps at newest 3; stale entries not carried; thread-re
 collapse unchanged; pending cleanup after collection; gate metadata attach + envelope
 rendering.
 
+## F28. Unresolved mentions must keep the addressee visible (live misfire 2026-07-11)
+
+**Gap (observed live):** a top-level "<@Claude's-id> I heard that you…" was answered BY
+THIS BOT, top-level, even explaining Claude's internals as itself; it then also took an
+unaddressed "you" follow-up in the resulting thread. Root cause: resolve_inbound_mentions
+silently DELETED unknown-id mentions (legacy strip from the mentions-only era), and
+Claude's bot-user id was never in the user cache — the classifier received "I heard that
+you…" with the addressee marker destroyed. A second, compounding weakness: with the
+mention preserved ("@Claude …"), the utility model STILL chose respond once, because the
+channel's recorded proactivity directive ("respond even without a direct mention") plus
+"ground rules override your instincts" outweighed the addressee rule.
+
+**Design:**
+1. _event_to_message warms the user cache for every <@id> in the raw text before
+   cleaning (users.info resolves bot users too) — first-ever mentions of co-resident
+   assistants render "@Name".
+2. resolve_inbound_mentions unknown-id fallback renders "@<id>" instead of '' — never a
+   silent strip; raw <@ID> bracket syntax still never reaches the model.
+3. PARTICIPATION_SYSTEM_PROMPT: explicit @-mention of another party = the STRONGEST
+   addressee marker, every "you" in such a message belongs to the addressee, and the
+   someone-else rule OUTRANKS channel ground rules / proactivity directives / memory
+   facts (those govern value+pacing on unaddressed messages only).
+4. history tool file-name cap 5 → 10 (Slack's own per-message max) — every attached
+   file on a message stays discoverable by name.
+
+**Tests:** unknown-id marker fallback; addressee-preserved question; extract_mention_ids
+matrix; mixin resilience without cache/identity. Live: "@Claude do you see…" → respond
+(pre-prompt-fix, reply withheld by the main model's own judgment) → after prompt fix,
+ignore ("The message explicitly addresses Claude, not ChatGPT").
+
 ## Rollout / verification
 
 1. `make test` green after each change set (F4 → F1 → F2 → F3); `make lint` clean.
