@@ -348,3 +348,41 @@ def test_supports_native_streaming_still_gates_on_flag(monkeypatch):
     assert host.supports_native_streaming() is False
     monkeypatch.setattr(config, "slack_native_streaming", True)
     assert host.supports_native_streaming() is True
+
+
+# ---------------- native-stream placement (verdict-aware stamp) ----------------
+
+def _placement_msg(metadata, channel_id="C123CHAN", thread_id="111.0"):
+    from base_client import Message
+    return Message(text="hi", user_id="U1", channel_id=channel_id,
+                   thread_id=thread_id, metadata=metadata)
+
+
+def test_native_placement_honors_main_stamp_over_channel_setting():
+    """A top-level trigger in a reply_in_channel channel whose participation verdict
+    said "thread": main.py stamps place_in_channel=False and threads the reply. The
+    coordinator must follow the stamp — recomputing from the channel setting built it
+    with thread=None, silently forcing legacy fallback on a threaded reply."""
+    from message_processor.handlers.text import native_stream_place_in_channel
+    msg = _placement_msg({"ts": "111.0", "reply_in_channel": True,
+                          "place_in_channel": False})
+    assert native_stream_place_in_channel(msg) is False
+
+
+def test_native_placement_stamp_true_targets_channel_top_level():
+    from message_processor.handlers.text import native_stream_place_in_channel
+    msg = _placement_msg({"ts": "111.0", "reply_in_channel": True,
+                          "place_in_channel": True})
+    assert native_stream_place_in_channel(msg) is True
+
+
+def test_native_placement_fallback_recompute_without_stamp():
+    """Paths that bypass main.py's stamp keep the original rule: reply_in_channel +
+    top-level trigger + real channel → top level; thread replies and DMs thread."""
+    from message_processor.handlers.text import native_stream_place_in_channel
+    top = _placement_msg({"ts": "111.0", "reply_in_channel": True})
+    assert native_stream_place_in_channel(top) is True
+    threaded = _placement_msg({"ts": "222.0", "reply_in_channel": True})  # ts != thread_id
+    assert native_stream_place_in_channel(threaded) is False
+    dm = _placement_msg({"ts": "111.0", "reply_in_channel": True}, channel_id="D123DM")
+    assert native_stream_place_in_channel(dm) is False
