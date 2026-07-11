@@ -1,6 +1,6 @@
 """Test settings button persistence implementation"""
 import pytest
-from unittest.mock import Mock, MagicMock, patch, call
+from unittest.mock import Mock, patch
 import json
 from slack_client import SlackBot
 from base_client import Message
@@ -55,7 +55,7 @@ def test_settings_button_not_deleted_after_click(slack_client):
         button_value = body['actions'][0].get('value', '{}')
         try:
             original_context = json.loads(button_value)
-        except:
+        except Exception:
             original_context = {}
         
         # Get or create user preferences
@@ -188,4 +188,4 @@ def test_settings_completed_flag_set_on_save(slack_client):
     
     # Verify the call was made with settings_completed
     slack_client.db.update_user_preferences.assert_called_once_with(user_id, preferences_with_flag)
-    assert result == True
+    assert result is True

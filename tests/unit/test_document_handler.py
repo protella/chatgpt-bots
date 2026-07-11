@@ -1,9 +1,7 @@
 """Unit tests for document_handler.py"""
 
 import pytest
-from unittest.mock import Mock, patch, MagicMock, mock_open
-import io
-from io import BytesIO
+from unittest.mock import Mock, patch
 
 # Import the document handler normally since pandas import was removed
 from document_handler import (
@@ -338,7 +336,6 @@ class TestDocumentHandlerWordProcessing:
     def handler_with_docx(self):
         """Handler with python-docx capabilities"""
         handler = DocumentHandler()
-        mock_docx = Mock()
         return handler
     
     @patch('document_handler.Document')

@@ -84,7 +84,6 @@ class TestSlackBotIntegration:
     @pytest.mark.smoke
     def test_smoke_import_chain(self):
         """Smoke test for import chain"""
-        import slackbot
         from main import ChatBotV2
 
         assert isinstance(ChatBotV2, type)

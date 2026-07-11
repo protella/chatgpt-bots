@@ -5,10 +5,8 @@ These tests use actual API calls to verify end-to-end functionality
 
 import pytest
 import time
-import os
 from unittest.mock import Mock, patch
 from openai_client import OpenAIClient, ImageData
-from config import BotConfig
 from message_processor.base import MessageProcessor
 from base_client import Message
 

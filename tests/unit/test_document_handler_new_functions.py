@@ -1,12 +1,9 @@
 """Tests for new document handler functionality added for PDF OCR and DOCX alternative parsing"""
 
 import pytest
-from unittest.mock import Mock, patch, MagicMock, call
-import io
+from unittest.mock import Mock, patch
 from io import BytesIO
-import base64
 import zipfile
-import xml.etree.ElementTree as ET
 
 from document_handler import DocumentHandler
 

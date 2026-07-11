@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from typing import Any, Callable, Dict, List, Optional
 
 import aiohttp
@@ -36,7 +35,9 @@ class OpenAIClient(LoggerMixin):
     async def close(self):
         """Close OpenAI client and cleanup resources"""
         await self._cleanup_session()
-        # Note: AsyncOpenAI client doesn't need explicit closing
+        if hasattr(self, 'client') and self.client:
+            await self.client.close()
+            self.log_debug("OpenAI client closed and resources cleaned up")
 
     def __init__(self):
         # Initialize async OpenAI client with timeout directly
@@ -227,26 +228,20 @@ class OpenAIClient(LoggerMixin):
             f"read={config.api_timeout_read}s, chunk={config.api_timeout_streaming_chunk}s)"
         )
 
-        api_name = getattr(api_method, "__name__", str(api_method))
-
-        call_start = time.time()
         try:
             # Use asyncio.wait_for for proper async timeout handling
             result = await asyncio.wait_for(
                 api_method(*args, **kwargs),
                 timeout=timeout
             )
-            call_duration = time.time() - call_start
             return result
         except asyncio.TimeoutError:
-            call_duration = time.time() - call_start
             self.log_error(f"API call ({operation_type}) timed out after {timeout}s")
             # Create TimeoutError with operation_type attribute for smart retry logic
             timeout_error = TimeoutError(f"OpenAI API call timed out after {timeout} seconds")
             timeout_error.operation_type = operation_type
             raise timeout_error
         except Exception as e:
-            call_duration = time.time() - call_start
             error_msg = str(e).lower()
             if "timeout" in error_msg or "timed out" in error_msg or "read timeout" in error_msg:
                 self.log_error(f"API call ({operation_type}) timed out after {timeout}s: {e}")
@@ -493,26 +488,20 @@ class OpenAIClient(LoggerMixin):
             f"read={config.api_timeout_read}s, chunk={config.api_timeout_streaming_chunk}s)"
         )
 
-        api_name = getattr(api_method, "__name__", str(api_method))
-
-        call_start = time.time()
         try:
             # Use asyncio.wait_for for proper async timeout handling
             result = await asyncio.wait_for(
                 api_method(*args, **kwargs),
                 timeout=timeout
             )
-            call_duration = time.time() - call_start
             return result
         except asyncio.TimeoutError:
-            call_duration = time.time() - call_start
             self.log_error(f"API call ({operation_type}) timed out after {timeout}s")
             # Create TimeoutError with operation_type attribute for smart retry logic
             timeout_error = TimeoutError(f"OpenAI API call timed out after {timeout} seconds")
             timeout_error.operation_type = operation_type
             raise timeout_error
         except Exception as e:
-            call_duration = time.time() - call_start
             error_msg = str(e).lower()
             if "timeout" in error_msg or "timed out" in error_msg or "read timeout" in error_msg:
                 self.log_error(f"API call ({operation_type}) timed out after {timeout}s: {e}")
@@ -710,12 +699,6 @@ class OpenAIClient(LoggerMixin):
             timeout_seconds=timeout_seconds,
             return_metadata=return_metadata,
         )
-
-    async def close(self):
-        """Close the OpenAI client and clean up resources."""
-        if hasattr(self, 'client') and self.client:
-            await self.client.close()
-            self.log_debug("OpenAI client closed and resources cleaned up")
 
 
 __all__ = ["OpenAIClient", "ImageData"]

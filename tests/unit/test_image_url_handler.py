@@ -1,10 +1,9 @@
 """Unit tests for image_url_handler.py (Async Version)"""
 
 import pytest
-from unittest.mock import Mock, patch, MagicMock, AsyncMock
+from unittest.mock import patch, MagicMock, AsyncMock
 import base64
-import aiohttp
-from image_url_handler import ImageURLHandler, SUPPORTED_IMAGE_MIMETYPES, IMAGE_EXTENSIONS
+from image_url_handler import ImageURLHandler
 
 
 class TestImageURLHandler:

@@ -5,14 +5,12 @@ and are answered by the finishing turn's drain hook as ONE batched catch-up turn
 Covers: queue primitives, the process_message contention path, the drain/dispatch
 hook, gate-order eligibility, needs_refresh interplay, and busy retirement gates.
 """
-import asyncio
 import pathlib
-from collections import deque
 from unittest.mock import Mock, AsyncMock, patch
 
 import pytest
 
-from base_client import Message, Response
+from base_client import Message
 from config import config
 from thread_manager import AsyncThreadStateManager
 from message_processor.base import MessageProcessor

@@ -10,7 +10,6 @@ R5: history tool reports has_more.
 W1-W3: overflow completion posts its remainder; non-streaming splits are
     fence-aware, per-chunk isolated, and never cut inside a <entity>.
 """
-import asyncio
 import inspect
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch

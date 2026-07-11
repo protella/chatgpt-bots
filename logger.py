@@ -10,7 +10,7 @@ from typing import Optional
 from logging.handlers import RotatingFileHandler, QueueHandler, QueueListener
 import queue
 import threading
-from typing import Dict, List
+from typing import Dict
 try:
     from concurrent_log_handler import ConcurrentRotatingFileHandler
     USE_CONCURRENT_HANDLER = True

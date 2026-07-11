@@ -2,12 +2,8 @@
 
 import asyncio
 import pytest
-import sys
 import signal
-import time
-from unittest.mock import Mock, patch, MagicMock, call, AsyncMock
-from threading import Thread
-import argparse
+from unittest.mock import Mock, patch, AsyncMock
 
 from main import ChatBotV2, main
 
@@ -770,7 +766,7 @@ class TestChatBotV2Integration:
         """Smoke test for import chain"""
         # Should be able to import without errors
         import main
-        from main import ChatBotV2, main as main_func
+        from main import main as main_func
 
         # Verify exports
         assert hasattr(main, 'ChatBotV2')

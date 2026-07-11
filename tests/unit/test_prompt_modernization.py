@@ -12,6 +12,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from config import config
+from openai_client.api.responses import classify_intent as _classify_intent
 from message_processor.utilities import MessageUtilitiesMixin
 from message_processor.handlers.vision import VisionHandlerMixin, _VAGUE_VISION_ASKS
 from prompts import (
@@ -150,7 +151,6 @@ class _Classifier:
     def log_error(self, *a, **k): pass
 
 
-from openai_client.api.responses import classify_intent as _classify_intent
 _Classifier.classify_intent = _classify_intent
 
 

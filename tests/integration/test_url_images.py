@@ -5,7 +5,6 @@ Test script for URL image detection and downloading functionality
 
 import sys
 import logging
-import asyncio
 from image_url_handler import ImageURLHandler
 
 # Setup logging
@@ -101,7 +100,7 @@ async def test_integration():
 
         downloaded_images, failed_urls = await handler.process_urls_from_text(test_text)
 
-        print(f"\nResults:")
+        print("\nResults:")
         print(f"  Successfully downloaded: {len(downloaded_images)} images")
         for img in downloaded_images:
             print(f"    - {img['url']} ({img['mimetype']}, {img['size']} bytes)")

@@ -4,10 +4,9 @@ Covers the ring buffer, once-only backfill, DM exclusion, deterministic envelope
 rendering with current-thread exclusion, suffix (not system prompt) placement,
 participation stats, feed-before-gates wiring, and flag gating.
 """
-import asyncio
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from slack_client.channel_pulse import ChannelPulse
 from config import config
@@ -122,7 +121,7 @@ def test_envelope_cap_and_zero():
     for i in range(8):
         p.record("C1", **_entry(f"{i}.0", text=f"m{i}"))
     capped = p.render_envelope("C1", max_lines=3)
-    assert len([l for l in capped.splitlines() if l.startswith("- ")]) == 3
+    assert len([ln for ln in capped.splitlines() if ln.startswith("- ")]) == 3
     assert "m7" in capped and "m0" not in capped  # newest kept
     assert p.render_envelope("C1", max_lines=0) == ""
 

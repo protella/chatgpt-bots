@@ -4,7 +4,6 @@ Covers inbound mention resolution, self-mention detection, the participant roste
 outbound mention-encoding safety net. Pure functions are tested directly; the SlackFormattingMixin
 methods are exercised via a tiny stub.
 """
-import pytest
 
 from slack_client.formatting.text import (
     resolve_inbound_mentions,

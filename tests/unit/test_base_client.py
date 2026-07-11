@@ -3,9 +3,8 @@ Unit tests for base_client.py module
 Tests the abstract base client for platform implementations
 """
 import pytest
-from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
-from unittest.mock import MagicMock, patch, Mock, AsyncMock
+from unittest.mock import patch, AsyncMock
 from base_client import BaseClient, Message, Response
 
 

@@ -3,9 +3,7 @@ Unit tests for async OpenAI client
 Tests async OpenAI API client wrapper for Responses API
 """
 import pytest
-import json
-from unittest.mock import MagicMock, patch, Mock, AsyncMock, PropertyMock
-from datetime import datetime
+from unittest.mock import MagicMock, patch, AsyncMock
 import base64
 import asyncio
 from openai_client import OpenAIClient, ImageData

@@ -4,12 +4,8 @@
 import pytest
 import sqlite3
 import os
-import shutil
-import time
 from datetime import datetime, timedelta
-from unittest.mock import Mock, patch, MagicMock
 import json
-import tempfile
 
 from database import DatabaseManager
 
@@ -31,7 +27,6 @@ class TestDatabaseErrorHandling:
         """Create a DatabaseManager instance with temp database"""
         db = DatabaseManager("test")
         # Override the path before connection is made
-        original_path = db.db_path
         db.db_path = temp_db_path
         # Recreate connection with new path
         db.conn.close()
@@ -109,7 +104,6 @@ class TestDatabaseErrorHandling:
         # DatabaseManager handles corrupt databases gracefully by recreating them
         # So we test that it doesn't crash and can still work
         db = DatabaseManager("test")
-        original_path = db.db_path
         db.db_path = temp_db_path
         # Close original connection and try to connect to corrupt db
         db.conn.close()

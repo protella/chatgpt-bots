@@ -167,7 +167,6 @@ class RateLimitManager(LoggerMixin):
         
         # Also update our interval to be at least the retry-after period
         if retry_after_seconds > self.current_interval:
-            old_interval = self.current_interval
             self.current_interval = min(retry_after_seconds, self.max_interval)
             self.log_warning(f"Interval adjusted to {self.current_interval:.1f}s based on retry-after")
     

@@ -9,9 +9,7 @@ import tempfile
 import time
 import threading
 import asyncio
-import queue
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from unittest.mock import patch, MagicMock, Mock, PropertyMock
+from unittest.mock import patch, MagicMock, Mock
 import shutil
 from pathlib import Path
 
@@ -19,10 +17,9 @@ from pathlib import Path
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from logger import (
-    setup_logger, ColoredFormatter, LoggerMixin,
-    log_session_start, log_session_end,
-    _logger_lock, _initialized_loggers, _queue_listener, _log_queue
+from logger import (  # noqa: E402
+    setup_logger, LoggerMixin,
+    log_session_end
 )
 
 
@@ -153,7 +150,7 @@ class TestQueueHandlerPattern:
         assert logger._queue_listener is None
 
         # Create logger
-        logger_obj = setup_logger('test_listener')
+        setup_logger('test_listener')
 
         # Queue listener should be started
         assert logger._queue_listener is not None
@@ -192,7 +189,7 @@ class TestQueueHandlerPattern:
         import logger
 
         # Create logger to start listener
-        logger_obj = setup_logger('test_cleanup')
+        setup_logger('test_cleanup')
         assert logger._queue_listener is not None
 
         # Call log_session_end which should stop the listener
@@ -243,7 +240,6 @@ class TestThreadSafeSingleton:
         mock_log_dir.__str__ = Mock(return_value=temp_log_dir)
         mock_log_dir.__fspath__ = Mock(return_value=temp_log_dir)
 
-        import logger
         loggers = []
         errors = []
 
@@ -475,7 +471,7 @@ class TestErrorHandling:
                 assert not os.path.exists(non_existent)
 
                 # Create logger
-                logger_obj = setup_logger('test_dir_creation')
+                setup_logger('test_dir_creation')
 
                 # Directory should be created
                 assert os.path.exists(non_existent)

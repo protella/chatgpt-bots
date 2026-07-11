@@ -2,10 +2,6 @@
 
 import pytest
 import time
-import threading
-from datetime import datetime, timedelta
-from unittest.mock import Mock, patch, MagicMock
-import json
 
 from thread_manager import ThreadState, AssetLedger
 
@@ -38,8 +34,6 @@ class TestThreadStateEdgeCases:
     
     def test_thread_state_with_large_images(self):
         """Test thread state with large image data"""
-        thread_state = ThreadState("test:thread", "channel")
-        
         # Add large images to asset ledger
         for i in range(10):
             large_data = "x" * (1024 * 1024)  # 1MB per image

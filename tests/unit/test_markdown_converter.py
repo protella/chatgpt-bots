@@ -730,7 +730,7 @@ class TestDiagnostics:
             "platform": converter.platform
         }
         
-        print(f"\nDiagnostic Conversion Info:")
+        print("\nDiagnostic Conversion Info:")
         print(f"  Original: {diagnostics['original']}")
         print(f"  Converted: {diagnostics['after_conversion']}")
         print(f"  Platform: {diagnostics['platform']}")
