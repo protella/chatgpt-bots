@@ -260,6 +260,48 @@ class ChannelPulse:
             channel_id, ts=ts, thread_ts=thread_ts, user_id=None,
             display_name=display_name, sender_type="self", text=text or "", is_bot=True)
 
+    def record_own_reaction(self, channel_id: str, *, message_ts: str, emoji: str) -> None:
+        """F31: record a reaction the BOT ITSELF just placed as a synthetic self-entry, so
+        both the channel envelope and the per-thread classifier tails show the bot's own
+        reactions ("did you react to that?" becomes answerable from context). Verdict-,
+        ack-, and tool-path reactions all commit through _reserve_and_react — the single
+        choke point that calls this on a successful add. DMs are excluded (record() already
+        excludes them). Idempotent by construction: a fresh wall-clock ts avoids collisions,
+        so a re-add that never actually commits never reaches here."""
+        if not channel_id or self._is_dm(channel_id) or not message_ts:
+            return
+        display_name = (config.bot_name_aliases or ["bot"])[0]
+        shorthand = self._norm_reaction(emoji)
+        # Look up the target message in the ring to build an attribution excerpt; if it's
+        # aged out of the buffer, omit attribution rather than guess.
+        target = None
+        buf = self._buffers.get(channel_id)
+        if buf:
+            for e in buf:
+                if e.get("ts") == message_ts:
+                    target = e
+                    break
+        if target is not None:
+            who = _sanitize_name(target.get("display_name"))
+            excerpt = " ".join((target.get("text") or "").split())
+            if len(excerpt) > 80:
+                excerpt = excerpt[:79].rstrip() + "…"
+            if excerpt:
+                text = f'[reacted :{shorthand}: to {who}\'s message: "{excerpt}"]'
+            else:
+                text = f"[reacted :{shorthand}: to {who}'s message]"
+            # Land the synthetic entry in the target's thread (a reply carries its thread
+            # root) so the thread tail sees it too; top-level targets stay top-level.
+            thread_ts = target.get("thread_ts")
+        else:
+            text = f"[reacted :{shorthand}: to an earlier message]"
+            thread_ts = None
+        # Synthetic wall-clock ts sorts newest and dodges (channel, ts) dedup collisions.
+        synth_ts = f"{time.time():.6f}"
+        self.record(
+            channel_id, ts=synth_ts, thread_ts=thread_ts, user_id=None,
+            display_name=display_name, sender_type="self", text=text, is_bot=True)
+
     async def ensure_backfill(self, channel_id: str, client, bot) -> None:
         """Seed the ring with ONE conversations.history call, once per channel
         per process. `bot` supplies classify_sender/get_username-style helpers."""
