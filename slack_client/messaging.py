@@ -389,6 +389,19 @@ class SlackMessagingMixin:
         except Exception as e:
             self.log_debug(f"own-reply pulse record failed: {e}")
 
+    def _record_own_reaction_pulse(self, channel_id: str, ts: Optional[str], emoji: str) -> None:
+        """F31: record a reaction the bot itself just placed into the channel pulse, so the
+        envelope and thread tails surface the bot's own reactions. All real Slack reaction
+        paths (verdict, ack, react_to_message tool) commit through _reserve_and_react, so
+        hooking that single choke point covers them once. Best-effort; never breaks reacting."""
+        pulse = getattr(self, "channel_pulse", None)
+        if pulse is None or not ts:
+            return
+        try:
+            pulse.record_own_reaction(channel_id, message_ts=ts, emoji=emoji)
+        except Exception as e:
+            self.log_debug(f"own-reaction pulse record failed: {e}")
+
     # Slack section-block text hard limit is 3000 chars; keep a margin so the reply text
     # fits one section when we attach the footer as blocks.
     _SECTION_TEXT_LIMIT = 2900
@@ -1027,6 +1040,9 @@ class SlackMessagingMixin:
                 committed = True
                 if not fut.done():
                     fut.set_result(True)
+                # F31: a genuine new commit — record it as the bot's own reaction so it's
+                # self-visible in the rings (idempotent duplicates below never reach here).
+                self._record_own_reaction_pulse(channel_id, ts, emoji)
                 return {"ok": True, "emoji": emoji, "ts": ts}
             if not fut.done():
                 fut.set_result(False)
