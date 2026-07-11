@@ -1604,3 +1604,81 @@ lookup_user by NAME ok (Pacific Daylight Time), threaded native-streamed reply, 
 3. Live dev-bot pass in #chatgpt-bot-test (C04QDHE8W8M, authorized): generate an image
    and chat mid-generation (F1+F4 visible); unprompted message the bot should skip (F2
    logs a no_reply reason); @-mention vs ambient wake visible in request logs (F3).
+
+---
+
+## F31 — Reaction self-awareness (2026-07-11)
+
+**Trigger (live incident, #tech-coding-with-ai):** the bot placed a 🎉 via a
+participation-verdict react, then — asked about "its reaction" — misattributed it to
+"the old bot" and had to be corrected by Claude's bot. Verdict-path reactions were
+recorded nowhere the model could see: F7 provenance only records tool-loop calls, the
+pulse only recorded messages.
+
+**Design:** hook the single choke point. All real reaction paths (verdict react, F19
+ack, react_to_message tool) commit through `_reserve_and_react` (the F6 reservation
+guard); on a genuine new commit it calls `ChannelPulse.record_own_reaction` —
+a synthetic self-entry (`[reacted :tada: to Kousha's message: "…80-char excerpt"]`,
+sender_type "self", fresh wall-clock ts) that rides the existing rings, so both the
+"[Recent channel activity]" envelope and the per-thread classifier tails surface the
+bot's own reactions. Attribution comes from the ring lookup by target ts; an aged-out
+target degrades honestly to "[reacted :x: to an earlier message]". The entry lands
+under the target's thread ROOT (a root target IS its own root — Codex review fix;
+never a bogus top-level entry/thread label). No config flag — correct bookkeeping,
+always on. Idempotent duplicates (F6 reservation already held) never record.
+
+## F30 — Background deep-dive research jobs (2026-07-11)
+
+**Trigger:** live comparison in #tech-coding-with-ai — Claude Tag took a validation
+question as a research task (todo checklist, per-message label, returned minutes later
+with a sourced report); our bot answered the same ask in 15s with one web_search.
+User: "spec them both and build."
+
+**Design (mirrors background image gen):**
+1. `start_deep_research` local tool (message_processor/research_tools.py, gated on
+   ENABLE_DEEP_RESEARCH): model judges when a sourced multi-source report beats an
+   inline answer, calls the tool, closes its turn with ONE short ack line (the tool
+   posts nothing — no duplicate chrome). LOCAL_TOOLS_GUIDANCE bullet teaches
+   inline-web_search vs deep-research.
+2. Context: the tool loop exposes the live input array + developer prompt + model on
+   ToolContext; the executor deep-copies at call time (full context rule — the job
+   runs correctly after the conversation moves on). Snapshot cannot see half-mutated
+   state (mutation happens post-dispatch; Codex-verified).
+3. The job: ONE non-streaming Responses call, store=False, thread's model, effort
+   DEEP_RESEARCH_REASONING_EFFORT=high (clamp_effort), verbosity medium, timeout
+   DEEP_RESEARCH_TIMEOUT=600s, tools = web_search + MCP servers, NO local tools.
+   web_search is FORCED into the tools even if globally off (Codex fix — the tool IS
+   web research). Developer instruction: cross-check sources, lead with the answer,
+   link sources, state uncertainty honestly.
+4. Delivery: findings post to the originating thread through send_message (markdown
+   conversion + record_own_reply inherited) with an italic trailer
+   "_deep research · Xm Ys · effort high_". Every failure posts an honest one-line
+   note: API error, timeout, empty result, and a findings post that itself fails
+   (send_message → None must not read as success; Codex fix). CancelledError
+   (shutdown) stays silent by design.
+5. Label: ENABLE_RESEARCH_LABEL attempts chat.postMessage username override
+   ("<alias> [research: gist≤40]"); needs chat:write.customize — on first failure the
+   process falls back to plain posts permanently. Never breaks delivery.
+6. Lifecycle: thread_manager research registry (register/attach/finish/count),
+   per-thread cap DEEP_RESEARCH_MAX_PER_THREAD=2 (friendly structured rejection, no
+   global cap — image gen's deliberate choice), cancel/await on shutdown; a
+   never-scheduled coroutine is close()d (Codex fix).
+
+**Ride-along (user bug report, same day):** participation "off" now gates explicit
+@mentions — the app_mention path never consulted the level, so "off" collapsed into
+mentions_only despite the modal promising "never respond in this channel". The mention
+handler drops the wake with an INFO log when the level is off (DMs unaffected); modal
+label now says "even when @mentioned". off vs mentions_only is now real: off = fully
+silent, mentions_only = speaks only when summoned.
+
+**Codex review (user-directed, read-only):** 2 high (silent delivery failure, split-post
+partial delivery), 2 medium fixed (web_search stripping, coroutine leak), F31 thread-tail
+landing fixed; cap race-freedom, snapshot integrity, signatures, shutdown verified sound.
+Split-post partial delivery (chunk errors swallowed in send_message) is PRE-EXISTING
+global behavior, flagged, not fixed this round.
+
+**Tests:** F31 attribution/excerpt/truncation/generic/thread-landing/DM; choke-point
+fires on commit only; verdict path end-to-end. F30 schema/gating/cap/snapshot-by-copy/
+happy trailer/error+timeout+failed-post notes/label fallback+memory/registry+shutdown/
+config defaults/forced web_search/coroutine close. Off-gate: drops app_mention,
+mentions_only answers, DMs ungated.
