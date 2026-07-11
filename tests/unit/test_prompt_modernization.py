@@ -17,6 +17,7 @@ from message_processor.utilities import MessageUtilitiesMixin
 from message_processor.handlers.vision import VisionHandlerMixin, _VAGUE_VISION_ASKS
 from prompts import (
     INTENT_CLASSIFIER_PROMPT,
+    PARTICIPATION_SYSTEM_PROMPT,
     SLACK_SYSTEM_PROMPT,
     VISION_DEFAULT_QUESTION,
 )
@@ -184,6 +185,28 @@ def test_teammate_batch_brevity_lines_present():
     assert "offer to expand in a thread" in SLACK_SYSTEM_PROMPT
     assert "several queued messages" in SLACK_SYSTEM_PROMPT
     assert "emoji reaction is your entire response" in SLACK_SYSTEM_PROMPT
+
+
+def test_f17_voice_banter_clause_present():
+    # F17: the Voice paragraph adopts a personable-teammate register — banter/teasing
+    # aimed at the bot gets answered in kind, with self-aware humor, but never forced
+    # and never at the expense of real help; playful register never licenses fabrication.
+    assert "teasing pointed straight at you" in SLACK_SYSTEM_PROMPT
+    assert "self-aware humor about being a bot" in SLACK_SYSTEM_PROMPT
+    assert "never force a joke" in SLACK_SYSTEM_PROMPT
+    assert "never do bits when someone actually needs help" in SLACK_SYSTEM_PROMPT
+    assert "never licenses making things up" in SLACK_SYSTEM_PROMPT
+    # channel-level brevity for banter lives in the Participation paragraph
+    assert "one good line beats three" in SLACK_SYSTEM_PROMPT
+
+
+def test_f17_classifier_banter_clause_present():
+    # F17: playful banter/teasing genuinely AT the assistant is a respond (a short quip)
+    # or react case — not "marginal value" to ignore — but addressee rules still dominate.
+    assert "Playful banter or teasing aimed genuinely AT the assistant is a respond case" \
+        in PARTICIPATION_SYSTEM_PROMPT
+    assert "not marginal-value noise to ignore" in PARTICIPATION_SYSTEM_PROMPT
+    assert "never overrides the addressee rules" in PARTICIPATION_SYSTEM_PROMPT
 
 
 def test_tool_provenance_ground_truth_instruction_present():
