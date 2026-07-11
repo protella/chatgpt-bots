@@ -1056,6 +1056,17 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
             f"[#{f.get('id')}] {f.get('content')}" for f in sorted(facts, key=lambda f: f.get("id") or 0)
         )
         lines.append(f"- Channel memory (may be stale): {rendered}")
+    # F27: same-author fast-follow/addendum. The sender posted these top-level message(s)
+    # in the seconds just before the latest one; judge the burst as ONE combined request so
+    # a respond verdict's reply is expected to cover all of it (don't dismiss just because
+    # the newest fragment alone looks trivial).
+    burst = [str(b) for b in (signals.get("burst_earlier") or []) if str(b).strip()]
+    if burst:
+        joined = " / ".join(f'"{b}"' for b in burst)
+        lines.append(
+            "- Moments before this message the SAME sender also posted (treat the whole "
+            f"burst as one combined request): {joined}"
+        )
     signal_note = "\n\nSignals:\n" + "\n".join(lines)
     # F5: the current thread's recent exchange is the AUTHORITATIVE evidence for
     # addressee resolution — render it above the peripheral channel envelope.

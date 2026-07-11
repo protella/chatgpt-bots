@@ -88,8 +88,10 @@ class ChatBotV2:
             # F5 fix (b): register this message's ts as its conversation's newest BEFORE
             # the memory/topic awaits below — an older event delayed by that I/O must not
             # overwrite a newer event's debounce marker and win the race. F21: the marker
-            # is conversation-scoped (message.thread_id is the thread root).
-            engine.note_arrival(channel_id, ts, message.thread_id)
+            # is conversation-scoped (message.thread_id is the thread root). F27: sender_id
+            # scopes the top-level stream per author so different people's unrelated
+            # top-level questions never collide.
+            engine.note_arrival(channel_id, ts, message.thread_id, message.user_id)
 
             # F17: no hourly-cap hard rail — pacing is the classifier's judgment. The
             # unprompted-reply count is still tallied and fed to the engine as a signal
@@ -127,6 +129,7 @@ class ChatBotV2:
             capabilities = render_capabilities_line(getattr(self.processor, "mcp_manager", None))
             verdict = await engine.evaluate(
                 channel_id=channel_id, ts=ts, text=message.text,
+                sender_id=message.user_id,
                 sender_name=message.metadata.get("user_real_name") or message.metadata.get("username"),
                 is_thread_reply=is_thread_reply, level=level,
                 directives=message.metadata.get("channel_directives"),
@@ -278,6 +281,10 @@ class ChatBotV2:
             # F3: the engine's reason rides the wake envelope for ambient wakes.
             if isinstance(message.metadata, dict) and getattr(verdict, "reason", None):
                 message.metadata["participation_reason"] = verdict.reason
+            # F27: earlier same-author burst messages ride the wake envelope too, so the
+            # reply is told to cover the whole burst, not just the triggering fragment.
+            if isinstance(message.metadata, dict) and getattr(verdict, "burst_earlier", None):
+                message.metadata["participation_burst_earlier"] = verdict.burst_earlier
 
         # Phase F placement (plan §4a, revised 2026-07-10): the channel's
         # reply_in_channel setting is an ALLOWANCE, not a mandate — when it's ON and
