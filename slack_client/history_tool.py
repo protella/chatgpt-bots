@@ -18,8 +18,9 @@ class SlackHistoryToolMixin:
 
     Wired to the model through the local function-call loop (registered in
     SlackBot._build_tool_registry). Beyond history slices, this mixin also hosts the
-    other on-demand workspace-context tools: message permalinks, channel info, pinned
-    messages, and user profiles — same privacy gate, same graceful-refusal contract.
+    other on-demand workspace-context tools: message permalinks, channel info, and pinned
+    messages — same privacy gate, same graceful-refusal contract. (User profiles moved
+    to lookup_user in people_tools.py — F29.)
     """
 
     def get_history_tools_for_openai(self) -> List[Dict[str, Any]]:
@@ -115,22 +116,9 @@ class SlackHistoryToolMixin:
                     "required": [],
                 },
             },
-            {
-                "type": "function",
-                "name": "fetch_user_profile",
-                "description": (
-                    "Look up a Slack user's profile: real name, display name, title, timezone, and "
-                    "whether they're a bot. Use to answer who someone is or their local time; user "
-                    "IDs appear in messages as <@U…> mentions and in reaction data."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "user_id": {"type": "string", "description": "Slack user ID, e.g. U0123ABC."},
-                    },
-                    "required": ["user_id"],
-                },
-            },
+            # fetch_user_profile retired (F29): lookup_user in people_tools.py subsumes it
+            # (id OR name resolution, fresh users.info, disambiguation) and keeps the same
+            # profile-card-only privacy stance (no email).
         ]
 
     async def _channel_is_accessible(self, channel_id: str) -> Tuple[bool, str]:
@@ -313,28 +301,6 @@ class SlackHistoryToolMixin:
             self.log_warning(f"history_tool: pins failed for {channel_id}: {err}")
             return {"ok": False, "error": err, "message": f"Could not fetch pins: {err}"}
 
-    async def fetch_user_profile_tool(self, user_id: str) -> Dict[str, Any]:
-        """Workspace-visible profile facts for one user (no email — keep it to what any
-        member sees on the profile card)."""
-        try:
-            resp = await self.app.client.users_info(user=user_id)
-            u = resp.get("user") or {}
-            profile = u.get("profile") or {}
-            return {
-                "ok": True,
-                "user_id": user_id,
-                "real_name": profile.get("real_name") or u.get("real_name"),
-                "display_name": profile.get("display_name") or None,
-                "title": profile.get("title") or None,
-                "timezone": u.get("tz"),
-                "timezone_label": u.get("tz_label"),
-                "is_bot": bool(u.get("is_bot")),
-            }
-        except SlackApiError as e:
-            err = e.response.get("error", "unknown") if getattr(e, "response", None) else str(e)
-            self.log_warning(f"history_tool: user profile failed for {user_id}: {err}")
-            return {"ok": False, "error": err, "message": f"Could not fetch that user's profile: {err}"}
-
     async def dispatch_history_tool_call(self, name: str, arguments: Any, ctx: Any = None) -> Dict[str, Any]:
         """Route a model function-call (name + args) to its executor.
 
@@ -365,6 +331,4 @@ class SlackHistoryToolMixin:
             return await self.fetch_channel_info_tool(channel_id)
         if name == "fetch_pinned_messages":
             return await self.fetch_pinned_messages_tool(channel_id)
-        if name == "fetch_user_profile":
-            return await self.fetch_user_profile_tool(args.get("user_id"))
         return {"ok": False, "error": "unknown_tool", "message": f"Unknown history tool: {name}"}

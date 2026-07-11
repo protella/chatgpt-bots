@@ -56,8 +56,8 @@ def get_lookup_user_schema() -> Dict[str, Any]:
         "type": "function",
         "name": "lookup_user",
         "description": (
-            "Look up a workspace member's profile — real name, title, status, timezone, "
-            "whether they're a bot, and email. Use it whenever someone asks who a person is, "
+            "Look up a workspace member's profile — real name, title, status, timezone, and "
+            "whether they're a bot. Use it whenever someone asks who a person is, "
             "or about their role, title, timezone, or status. You do NOT need a Slack id: ANY "
             "name you've seen is enough — a name in chat, in the 'Channel people' line, in a "
             "participant roster, or in channel memory. Pass what you have as `user` (a Slack id "
@@ -150,7 +150,8 @@ def _profile_result(user_id: str, u: Dict[str, Any]) -> Dict[str, Any]:
         "status_emoji": profile.get("status_emoji") or None,
         "timezone": u.get("tz_label") or u.get("tz") or None,
         "is_bot": bool(u.get("is_bot")),
-        "email": profile.get("email") or None,
+        # No email: profile-CARD facts only — the standing rail from the retired
+        # fetch_user_profile history tool ("should-not-leak" test) carries over.
     }
 
 

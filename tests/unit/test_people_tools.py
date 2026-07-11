@@ -106,7 +106,9 @@ async def test_lookup_by_bare_id():
     res = await execute_lookup_user(_ctx(client), {"user": "U07PETER"})
     assert res["ok"] and res["id"] == "U07PETER"
     assert res["real_name"] == "Erin Evans" and res["title"] == "Engineer"
-    assert res["timezone"] == "Eastern" and res["email"] == "peter@x.com"
+    assert res["timezone"] == "Eastern"
+    # Profile-CARD facts only: the retired fetch_user_profile's no-email rail carries over.
+    assert "email" not in res
     api.users_info.assert_awaited_once_with(user="U07PETER")
 
 

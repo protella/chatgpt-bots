@@ -51,9 +51,10 @@ def _enable(monkeypatch):
 def test_tools_exposed_when_enabled(bot):
     tools = bot.get_history_tools_for_openai()
     names = {t["name"] for t in tools}
+    # fetch_user_profile retired (F29) — lookup_user in people_tools subsumes it.
     assert names == {
         "fetch_channel_history", "fetch_thread_messages", "get_message_permalink",
-        "fetch_channel_info", "fetch_pinned_messages", "fetch_user_profile",
+        "fetch_channel_info", "fetch_pinned_messages",
     }
     assert all(t["type"] == "function" for t in tools)
 
@@ -347,24 +348,11 @@ async def test_pins_refused_for_private_non_member(bot):
 # --- user profiles ---
 
 @pytest.mark.asyncio
-async def test_user_profile_returns_card_facts_no_email(bot):
-    bot.app.client.users_info.return_value = {"user": {
-        "tz": "America/New_York", "tz_label": "Eastern Daylight Time", "is_bot": False,
-        "profile": {"real_name": "Erin Evans", "display_name": "peter",
-                    "title": "Slackbot Wrangler", "email": "should-not-leak@x.com"},
-    }}
-    res = await bot.fetch_user_profile_tool("U1")
-    assert res["ok"] is True
-    assert res["real_name"] == "Erin Evans"
-    assert res["timezone"] == "America/New_York"
-    assert "email" not in res  # profile-card facts only
-
-
-@pytest.mark.asyncio
-async def test_user_profile_error_graceful(bot):
-    bot.app.client.users_info.side_effect = SlackApiError("x", {"error": "user_not_found"})
-    res = await bot.fetch_user_profile_tool("UNOPE")
-    assert res["ok"] is False and res["error"] == "user_not_found"
+async def test_user_profile_tool_retired(bot):
+    """fetch_user_profile is gone (F29): lookup_user subsumes it. Dispatch must refuse
+    gracefully, and its no-email privacy stance lives on in test_people_tools."""
+    res = await bot.dispatch_history_tool_call("fetch_user_profile", {"user_id": "U1"})
+    assert res["ok"] is False and res["error"] == "unknown_tool"
 
 
 # --- dispatch routing for the new tools ---
@@ -374,7 +362,6 @@ async def test_user_profile_error_graceful(bot):
     ("get_message_permalink", {"channel_id": "C1", "message_ts": "1.0"}, "chat_getPermalink"),
     ("fetch_channel_info", {"channel_id": "C1"}, "conversations_info"),
     ("fetch_pinned_messages", {"channel_id": "C1"}, "pins_list"),
-    ("fetch_user_profile", {"user_id": "U1"}, "users_info"),
 ])
 async def test_dispatch_routes_new_tools(bot, name, args, client_attr):
     bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
