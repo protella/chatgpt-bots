@@ -274,10 +274,15 @@ class TestSpreadsheetSchema:
 # read_document tool
 # ---------------------------------------------------------------------------
 
-def _ctx(docs, download=b"%PDF", channel="C1", thread="111.0"):
+def _ctx(docs, download=b"%PDF", channel="C1", thread="111.0", channel_docs=None):
     from tool_registry import ToolContext
     db = MagicMock()
     db.get_thread_documents_async = AsyncMock(return_value=docs)
+    # F22: channel-wide fallback lookup. Defaults to the thread docs so tests that never
+    # trigger the fallback (thread resolve hits) behave unchanged; pass channel_docs to
+    # exercise the cross-thread path.
+    db.get_channel_documents_async = AsyncMock(
+        return_value=docs if channel_docs is None else channel_docs)
     client = MagicMock()
     client.download_file = AsyncMock(return_value=download)
     return ToolContext(channel_id=channel, thread_ts=thread, trigger_ts="1",
@@ -392,3 +397,88 @@ class TestReadDocumentTool:
         register_document_tools(reg)
         names = [s["name"] for s in reg.schemas()]
         assert "read_document" in names
+
+    # ---- F22: channel-wide document access ----
+
+    @pytest.mark.asyncio
+    async def test_channel_wide_hit_returns_content_and_origin(self):
+        dt = self._fresh_cache()
+        # Current thread has NO documents; the file lives in another thread of the channel.
+        ctx = _ctx([], channel_docs=[dict(DOC_ROW)])
+        with patch.object(dt._document_handler, "safe_extract_content_async",
+                          AsyncMock(return_value={"content": "Q3 revenue was 4.2M"})):
+            out = await dt.execute_read_document(ctx, {"file_id": "F42"})
+        assert out["ok"] is True
+        assert out["content"] == "Q3 revenue was 4.2M"
+        assert out["origin"] == "shared in another conversation in this channel"
+
+    @pytest.mark.asyncio
+    async def test_in_thread_wins_over_channel_same_name(self):
+        dt = self._fresh_cache()
+        # Same filename in both threads: the current thread's copy must win, with no
+        # channel-wide fallback and no origin note.
+        thread_doc = {**DOC_ROW, "file_id": "F_THREAD"}
+        channel_doc = {**DOC_ROW, "file_id": "F_CHANNEL"}
+        ctx = _ctx([thread_doc], channel_docs=[channel_doc, thread_doc])
+        with patch.object(dt._document_handler, "safe_extract_content_async",
+                          AsyncMock(return_value={"content": "x"})):
+            out = await dt.execute_read_document(ctx, {"filename": "q3.pdf"})
+        assert out["ok"] is True
+        assert "origin" not in out
+        ctx.db.get_channel_documents_async.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_miss_lists_channel_wide_known(self):
+        dt = self._fresh_cache()
+        channel_docs = [dict(DOC_ROW), {**DOC_ROW, "filename": "plan.docx", "file_id": "F99"}]
+        ctx = _ctx([], channel_docs=channel_docs)
+        out = await dt.execute_read_document(ctx, {"filename": "nope.docx"})
+        assert out["ok"] is False and out["error"] == "document_not_found"
+        assert out["known_documents"] == ["q3.pdf", "plan.docx"]
+
+    @pytest.mark.asyncio
+    async def test_no_cross_channel_leak(self):
+        dt = self._fresh_cache()
+        # From channel C2, the channel-wide lookup returns nothing (the C1 doc is scoped
+        # out by the DB prefix match) — the tool must not surface it.
+        ctx = _ctx([], channel="C2", channel_docs=[])
+        out = await dt.execute_read_document(ctx, {"file_id": "F42"})
+        assert out["ok"] is False and out["error"] == "document_not_found"
+        assert out["known_documents"] == []
+
+    @pytest.mark.asyncio
+    async def test_thread_scoped_path_byte_identical(self):
+        dt = self._fresh_cache()
+        text = "The Q3 revenue was 4.2M. " * 400
+        # In-thread doc: result must be exactly the pre-F22 shape (no origin key).
+        ctx = _ctx([dict(DOC_ROW)], channel_docs=[dict(DOC_ROW)])
+        with patch.object(dt._document_handler, "safe_extract_content_async",
+                          AsyncMock(return_value={"content": text})):
+            out = await dt.execute_read_document(ctx, {"file_id": "F42"})
+        assert "origin" not in out
+        assert out["content"] == text[:dt.SLICE_CHARS]
+        ctx.db.get_channel_documents_async.assert_not_awaited()
+
+    def test_schema_description_mentions_channel_scope(self):
+        from message_processor.document_tools import get_read_document_schema
+        desc = get_read_document_schema()["description"]
+        assert "current conversation checked first" in desc
+
+    @pytest.mark.asyncio
+    async def test_channel_wide_prefix_isolation_at_db(self, tmp_path):
+        # DB-level proof of the privacy boundary: a doc in C1 is invisible to C2.
+        import sqlite3
+        from database import DatabaseManager
+        db = DatabaseManager("test")
+        db.db_path = f"{tmp_path}/t.db"
+        db.conn = sqlite3.connect(db.db_path, check_same_thread=False, isolation_level=None)
+        db.conn.row_factory = sqlite3.Row
+        db.init_schema()
+        db.save_document("C1:111.0", "a.pdf", "application/pdf", file_id="FA")
+        db.save_document("C1:222.0", "b.pdf", "application/pdf", file_id="FB")
+        db.save_document("C2:333.0", "c.pdf", "application/pdf", file_id="FC")
+        db.conn.close()
+        c1 = await db.get_channel_documents_async("C1")
+        c2 = await db.get_channel_documents_async("C2")
+        assert sorted(d["filename"] for d in c1) == ["a.pdf", "b.pdf"]
+        assert [d["filename"] for d in c2] == ["c.pdf"]

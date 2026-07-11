@@ -1338,6 +1338,74 @@ top-level burst still collapses to the newest; marker stays monotonic per conver
 (stale older ts never clobbers a newer one); a top-level root message and its own
 first thread reply are distinct keys (reply keyed by root).
 
+## F22. Channel-wide document access (user directive 2026-07-11)
+
+**Gap (observed live):** a CSV dropped in thread A is unreadable from a turn in thread
+B — `execute_read_document` resolves documents strictly by the CURRENT thread key
+(`ctx.channel_id:ctx.thread_ts`), so the bot truthfully answered "the CSV contents
+aren't available to me from here" when asked to analyze another thread's file. Claude
+Tag stages files channel-wide. Message TEXT is already reachable cross-thread
+(fetch_thread_messages); only file contents are thread-locked. User: "Something we can
+add to context I think."
+
+**Design:**
+1. `database.py`: `get_channel_documents_async(channel_id)` — documents whose
+   `thread_id` starts with `channel_id || ':'` (prefix match; channel ids contain no
+   LIKE metacharacters), ordered by created_at. Same row shape as the thread lookup.
+2. `execute_read_document`: resolve against the CURRENT thread first (unchanged
+   precedence — same filename in both threads → this thread's wins); on miss, resolve
+   channel-wide (newest match). A channel-wide hit includes the origin in the payload
+   (e.g. `"origin": "shared in another conversation in this channel"`) so the model
+   attributes honestly. The document_not_found hint's known_documents list becomes
+   channel-wide.
+3. Tool schema description: "shared in this conversation" → "shared in this channel
+   (current conversation checked first)".
+4. Privacy boundary unchanged: SAME CHANNEL ONLY — never cross-channel; DMs keep DM
+   scope. Slack CDN download path, memory-only extraction, and cache are untouched.
+5. Honesty ride-along (SLACK_SYSTEM_PROMPT): never claim to have "opened"/"read" a
+   file unless read_document ran THIS turn — numbers recalled from context are
+   attributed to context ("from the earlier discussion"), observed live as an
+   overstatement the user had to press on.
+
+**Tests:** cross-thread hit returns content + origin note; in-thread match still wins
+over a channel-wide same-name match; miss lists channel-wide known documents; no
+cross-CHANNEL leak (doc in C1 invisible from C2); thread-scoped path byte-identical
+when the doc is in-thread; prompt substring.
+
+## F23. Cross-thread reply tool (user directive 2026-07-11)
+
+**Gap (observed live):** asked to "go back and answer that team msg" in another
+thread, the bot could not — replies are hard-bound to the triggering conversation; no
+tool posts elsewhere. Claude Tag acknowledged in the current thread and answered in
+the other one ("answers incoming in their threads").
+
+**Design:**
+1. New local tool `post_to_thread` (registered alongside the history/react tools):
+   params `thread_ts` (required — root ts of the target conversation; a top-level
+   message ts targets its thread), `text` (required). CURRENT CHANNEL ONLY — no
+   channel_id param; cross-channel posting is out of scope (write-boundary, unlike
+   read tools).
+2. Executor path: converts markdown exactly like a normal reply, posts via the
+   standard messaging layer into the target thread, calls
+   `channel_pulse.record_own_reply` so the rings stay truthful. No unprompted
+   accounting (it runs inside an addressed/judged turn). Never raises — refusals
+   return {"ok": False, ...}.
+3. Rails (cheap, semantic): target thread muted by the user (F15 muted_threads) →
+   refuse with "thread_muted_by_user" (the mute means "stop contributing there"; the
+   model relays that instead of violating it). Empty text / missing thread_ts →
+   refuse. Posting to the CURRENT thread → refuse with a hint to just reply normally
+   (prevents double-posting).
+4. Tool description teaches the Claude-Tag pattern: use when a reply belongs in a
+   DIFFERENT conversation (user asked you to answer a message elsewhere, or you're
+   closing a loop you were part of); acknowledge briefly in the current thread rather
+   than duplicating the content in both.
+5. LOCAL_TOOLS_GUIDANCE: one short bullet on the same judgment.
+
+**Tests:** schema registered + required params; executor posts markdown-converted
+text to the target thread; muted-thread refusal; current-thread refusal; empty-text
+refusal; record_own_reply called with the target thread; used-tools provenance line
+includes post_to_thread; never-raises contract on Slack API failure.
+
 ## Rollout / verification
 
 1. `make test` green after each change set (F4 → F1 → F2 → F3); `make lint` clean.
