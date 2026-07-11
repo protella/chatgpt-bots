@@ -189,13 +189,17 @@ async def _run_deep_research_job(*, processor, client, channel_id: str, thread_r
         )
         text = result.get("text") if isinstance(result, dict) else str(result or "")
         text = (text or "").strip()
+        tools_used = (result.get("tools_used") or []) if isinstance(result, dict) else []
         elapsed = time.monotonic() - started
         if not text:
             processor.log_warning(f"Deep research {job_id} produced no text")
             await _deliver_failure(client, channel_id, thread_root,
                                    "the research came back empty")
             return
-        trailer = f"\n\n_deep research · {_fmt_duration(elapsed)} · effort {effort}_"
+        # Visible tool attribution (same spirit as the F7 "Used Tools" footer on normal
+        # turns — the findings post is out-of-band, so it carries its own).
+        tool_bit = f" · tools: {', '.join(tools_used)}" if tools_used else ""
+        trailer = f"\n\n_deep research · {_fmt_duration(elapsed)} · effort {effort}{tool_bit}_"
         posted = await _deliver_findings(processor, client, channel_id, thread_root,
                                          text + trailer, task)
         if not posted:
