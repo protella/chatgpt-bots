@@ -128,6 +128,8 @@ def test_schema_shape():
     assert schema["type"] == "function"
     props = schema["parameters"]["properties"]
     assert "task" in props and props["task"]["type"] == "string"
+    # Optional short byline tag (F30.2 follow-up) — task stays the only required param.
+    assert "label" in props and props["label"]["type"] == "string"
     assert schema["parameters"]["required"] == ["task"]
 
 
@@ -759,6 +761,59 @@ async def test_job_wires_report_progress_milestones_to_card(monkeypatch):
     # Trailer attributes research sources only — card bookkeeping excluded.
     assert "tools: web_search" in client.sent[0][2]
     assert "report_progress" not in client.sent[0][2]
+
+
+# --------------------------------------------- short byline tag (label param)
+
+@pytest.mark.asyncio
+async def test_executor_passes_label_hint_to_job(monkeypatch):
+    """The model's short topic tag rides the detach into the job (whitespace-collapsed)."""
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    seen = {}
+
+    def _fake_job(**kwargs):
+        seen.update(kwargs)
+
+        async def _noop():
+            return None
+        return _noop()
+
+    monkeypatch.setattr(rt, "_run_deep_research_job", _fake_job)
+    proc = _FakeProcessor(openai_client=SimpleNamespace(), tm=AsyncThreadStateManager())
+    res = await rt.execute_start_deep_research(
+        _ctx(proc, _FakeClient()),
+        {"task": "long fully-restated task", "label": "  fast-casual\n2026 performance "})
+    assert res["ok"] is True
+    assert seen["label_hint"] == "fast-casual 2026 performance"
+    await proc.scheduled[0]  # run the captured no-op job
+
+
+@pytest.mark.asyncio
+async def test_short_label_hint_survives_untruncated_on_card_and_findings(monkeypatch):
+    """A short topic tag renders whole inside Slack's 50-char username cap — same byline on
+    the card and the findings; the long task no longer forces a truncated gist."""
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    monkeypatch.setattr(config, "enable_research_label", True)
+    monkeypatch.setattr(config, "bot_name_aliases", ["ChatGPT"])
+    stub = _StreamStub(text="findings body")
+    proc = _FakeProcessor(openai_client=SimpleNamespace(
+        create_streaming_response_with_tool_loop=stub))
+    proc.thread_manager = AsyncThreadStateManager()
+    client = _CardClient()
+    await rt._run_deep_research_job(
+        processor=proc, client=client, channel_id="C1", thread_root="100.0",
+        thread_key="C1:100.0", job_id="j1",
+        task="Produce a sourced, cross-checked report on the three major US fast-casual "
+             "chains' 2026 performance including traffic, comps, and expansion plans",
+        label_hint="fast-casual 2026 outlook",
+        snapshot=[], system_prompt="DEV", model="gpt-5.6-sol")
+    expected = "ChatGPT [research: fast-casual 2026 outlook]"
+    assert len(expected) <= 50
+    assert client.card_posts[0][4] == expected      # untruncated, bracket intact
+    assert client.sent[0][3] == expected            # findings byline identical
+    # No hint → falls back to the (gisted) task text, still bracket-safe.
+    label = rt._research_label(proc, "fast-casual 2026 outlook")
+    assert label == expected
 
 
 @pytest.mark.asyncio
