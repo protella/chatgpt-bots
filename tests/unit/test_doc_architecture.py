@@ -6,6 +6,7 @@ prompt, labeled injection, read_document (query/offset/LRU/file_deleted),
 native input_file gating, spreadsheet schema-first, and guidance presence.
 """
 import inspect
+import shutil
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -214,6 +215,141 @@ class TestNativeFileInput:
              patch.object(h, "convert_pdf_to_images", return_value=[]) as convert:
             h.parse_pdf_structured(b"%PDF-fake", "scan.pdf", ocr_images=True)
             convert.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# F26: OCR text for image-only / scanned PDFs (later-turn read path)
+# ---------------------------------------------------------------------------
+
+def _poppler_missing():
+    return shutil.which("pdftoppm") is None and shutil.which("pdfinfo") is None
+
+
+class TestScannedPdfOcr:
+    """OCR text is orthogonal to the vision page-image path: read_document wants text,
+    the local attach path wants both. All degradations fall back, never raise."""
+
+    def _image_based_handler(self, total_pages=2):
+        from document_handler import DocumentHandler
+        h = DocumentHandler()
+        base = {"content": "", "total_pages": total_pages, "pages": [], "format": "pdf"}
+        return h, base
+
+    def test_ocr_text_builds_page_structured_content(self, monkeypatch):
+        h, base = self._image_based_handler(total_pages=2)
+        monkeypatch.setattr(config, "enable_pdf_ocr", True)
+        monkeypatch.setattr(config, "ocr_max_pages", 20)
+        with patch.object(h, "_parse_pdf_with_pdfplumber", return_value=dict(base)), \
+             patch.object(h, "_is_image_based_pdf", return_value=True), \
+             patch("document_handler.convert_from_bytes",
+                   return_value=[MagicMock(), MagicMock()]), \
+             patch("pytesseract.image_to_string", side_effect=["HELLO WORLD", "SECOND PAGE"]):
+            out = h.parse_pdf_structured(b"%PDF-fake", "scan.pdf",
+                                         ocr_images=False, ocr_text=True)
+        assert out["ocr_text_used"] is True
+        assert "[Page 1]" in out["content"] and "HELLO WORLD" in out["content"]
+        assert "[Page 2]" in out["content"] and "SECOND PAGE" in out["content"]
+        assert [(p["page"], p.get("ocr")) for p in out["pages"]] == [(1, True), (2, True)]
+
+    def test_truncation_note_is_loud_when_pages_exceed_cap(self, monkeypatch):
+        # Document has 5 pages but only 2 get OCR'd (cap) — the note must say so.
+        h, base = self._image_based_handler(total_pages=5)
+        monkeypatch.setattr(config, "enable_pdf_ocr", True)
+        monkeypatch.setattr(config, "ocr_max_pages", 2)
+        with patch.object(h, "_parse_pdf_with_pdfplumber", return_value=dict(base)), \
+             patch.object(h, "_is_image_based_pdf", return_value=True), \
+             patch("document_handler.convert_from_bytes",
+                   return_value=[MagicMock(), MagicMock()]), \
+             patch("pytesseract.image_to_string", side_effect=["A", "B"]):
+            out = h.parse_pdf_structured(b"%PDF-fake", "big-scan.pdf",
+                                         ocr_images=False, ocr_text=True)
+        assert out["ocr_text_used"] is True
+        assert "first 2 of 5" in out["content"]
+
+    def test_tesseract_not_found_falls_back_no_raise(self, monkeypatch):
+        import pytesseract
+        h, base = self._image_based_handler(total_pages=1)
+        monkeypatch.setattr(config, "enable_pdf_ocr", True)
+        with patch.object(h, "_parse_pdf_with_pdfplumber", return_value=dict(base)), \
+             patch.object(h, "_is_image_based_pdf", return_value=True), \
+             patch("document_handler.convert_from_bytes", return_value=[MagicMock()]), \
+             patch("pytesseract.image_to_string",
+                   side_effect=pytesseract.TesseractNotFoundError()):
+            out = h.parse_pdf_structured(b"%PDF-fake", "scan.pdf",
+                                         ocr_images=False, ocr_text=True)
+        assert "ocr_text_used" not in out
+        assert "scanned document" in out["content"]
+
+    def test_enable_pdf_ocr_false_skips_ocr_entirely(self, monkeypatch):
+        h, base = self._image_based_handler(total_pages=2)
+        monkeypatch.setattr(config, "enable_pdf_ocr", False)
+        with patch.object(h, "_parse_pdf_with_pdfplumber", return_value=dict(base)), \
+             patch.object(h, "_is_image_based_pdf", return_value=True), \
+             patch.object(h, "ocr_pdf_pages") as ocr_spy:
+            out = h.parse_pdf_structured(b"%PDF-fake", "scan.pdf",
+                                         ocr_images=False, ocr_text=True)
+        ocr_spy.assert_not_called()
+        assert "ocr_text_used" not in out
+
+    def test_local_attach_path_emits_both_page_images_and_ocr_text(self, monkeypatch):
+        # ocr_images=True AND ocr_text=True (big-file local route): both must be present.
+        h, base = self._image_based_handler(total_pages=1)
+        monkeypatch.setattr(config, "enable_pdf_ocr", True)
+        with patch.object(h, "_parse_pdf_with_pdfplumber", return_value=dict(base)), \
+             patch.object(h, "_is_image_based_pdf", return_value=True), \
+             patch.object(h, "convert_pdf_to_images",
+                          return_value=[{"page": 1, "base64_data": "x", "mimetype": "image/png"}]), \
+             patch("document_handler.convert_from_bytes", return_value=[MagicMock()]), \
+             patch("pytesseract.image_to_string", return_value="INVOICE TOTAL 500"):
+            out = h.parse_pdf_structured(b"%PDF-fake", "scan.pdf",
+                                         ocr_images=True, ocr_text=True)
+        assert out.get("page_images")  # vision path preserved
+        assert out["ocr_text_used"] is True
+        assert "INVOICE TOTAL 500" in out["content"]
+
+    @pytest.mark.asyncio
+    async def test_read_document_returns_ocr_text_for_scan(self):
+        # read_document path: a scanned doc that yields nothing locally now comes back ok.
+        import message_processor.document_tools as dt
+        dt._extraction_cache = dt.ExtractionCache(5)
+        captured = {}
+
+        async def fake_extract(data, mime, name, ocr_images=True, ocr_text=False):
+            captured["ocr_images"] = ocr_images
+            captured["ocr_text"] = ocr_text
+            return {"content": "[Page 1]\nSCANNED CONTRACT VALUE 4.2M"}
+
+        with patch.object(dt._document_handler, "safe_extract_content_async",
+                          side_effect=fake_extract):
+            out = await dt.execute_read_document(_ctx([dict(DOC_ROW)]), {"file_id": "F42"})
+        assert out["ok"] is True
+        assert "SCANNED CONTRACT VALUE 4.2M" in out["content"]
+        # Tool wants text, not page images.
+        assert captured == {"ocr_images": False, "ocr_text": True}
+
+    @pytest.mark.skipif(_poppler_missing() or shutil.which("tesseract") is None,
+                        reason="requires poppler-utils and tesseract-ocr binaries")
+    def test_real_ocr_end_to_end(self):
+        # Build a genuine image-only PDF (no text layer) with PIL and OCR it for real.
+        from io import BytesIO
+        from PIL import Image, ImageDraw, ImageFont
+        from document_handler import DocumentHandler
+
+        img = Image.new("RGB", (1240, 1754), "white")
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 90)
+        except OSError:
+            font = ImageFont.load_default()
+        draw.text((150, 700), "PINEAPPLE", fill="black", font=font)
+        buf = BytesIO()
+        img.save(buf, format="PDF")  # single page, no text layer
+
+        out = DocumentHandler().parse_pdf_structured(
+            buf.getvalue(), "scan.pdf", ocr_images=False, ocr_text=True)
+        assert out.get("ocr_text_used") is True
+        assert "PINEAPPLE" in out["content"]
 
 
 # ---------------------------------------------------------------------------

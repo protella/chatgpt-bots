@@ -18,12 +18,15 @@ from pdf2image import convert_from_bytes
 from docx import Document
 from pptx import Presentation
 import pandas as pd
+from config import config
 from logger import LoggerMixin
 
 # Hard rule: file processing never touches disk — all extraction operates on
-# in-memory bytes/BytesIO only. (Known exception OUTSIDE this module: pdf2image's
-# poppler backend uses its own internal temp files for the scanned-PDF OCR path;
-# that path is slated for retirement with native PDF input.)
+# in-memory bytes/BytesIO only. (Known exceptions OUTSIDE this module, both in the
+# scanned-PDF path: pdf2image's poppler backend uses its own internal temp files to
+# render pages, and pytesseract likewise hands each rendered page to the tesseract
+# binary via its own internal temp files. We never write those ourselves; the bytes
+# we hold stay in memory.)
 
 # Per-file extraction timeout. Module constant for now; can move to env config
 # once config.py is available to this layer's changes.
@@ -102,14 +105,16 @@ class DocumentHandler(LoggerMixin):
     # Async entry point (single implementation; per-parser async wrappers were
     # phantoms referencing methods that never existed and have been removed)
     async def safe_extract_content_async(self, file_data: bytes, mime_type: str, filename: str,
-                                          ocr_images: bool = True) -> Dict[str, Any]:
+                                          ocr_images: bool = True,
+                                          ocr_text: bool = False) -> Dict[str, Any]:
         """Async entry point for document extraction.
 
         Deliberately a thin executor wrapper around the SYNC safe_extract_content:
         a previous hand-rolled async router drifted from the sync routing table
         (missing text types, a phantom CSV handler, no sanitization, no metadata,
         no fallback chain). One implementation, one behavior — the parity unit
-        test enforces the routing table itself.
+        test enforces the routing table itself. The executor offload matters doubly
+        for ocr_text=True: OCR is subprocess+CPU heavy and must not block the loop.
         """
         loop = asyncio.get_running_loop()
         try:
@@ -117,7 +122,8 @@ class DocumentHandler(LoggerMixin):
                 loop.run_in_executor(
                     _EXTRACTION_EXECUTOR,
                     lambda: self.safe_extract_content(file_data, mime_type, filename,
-                                                      ocr_images=ocr_images),
+                                                      ocr_images=ocr_images,
+                                                      ocr_text=ocr_text),
                 ),
                 timeout=EXTRACTION_TIMEOUT_SECONDS,
             )
@@ -146,7 +152,7 @@ class DocumentHandler(LoggerMixin):
         filename_lower = filename.lower()
         return any(filename_lower.endswith(ext) for ext in DOCUMENT_EXTENSIONS)
     def safe_extract_content(self, file_data: bytes, mime_type: str, filename: str,
-                             ocr_images: bool = True) -> Dict[str, Any]:
+                             ocr_images: bool = True, ocr_text: bool = False) -> Dict[str, Any]:
         """
         Safely extract document content with comprehensive error recovery
         Args:
@@ -195,7 +201,8 @@ class DocumentHandler(LoggerMixin):
             # Get the parser method (PDF takes the OCR-images toggle; the native
             # input_file route sets ocr_images=False so scans skip pdf2image entirely)
             if handler_name == 'parse_pdf_structured':
-                result = self.parse_pdf_structured(file_data, filename, ocr_images=ocr_images)
+                result = self.parse_pdf_structured(file_data, filename,
+                                                   ocr_images=ocr_images, ocr_text=ocr_text)
             else:
                 parser_method = getattr(self, handler_name)
                 result = parser_method(file_data, filename)
@@ -262,12 +269,19 @@ class DocumentHandler(LoggerMixin):
         # Previously limited to 1MB
         return sanitized
     def parse_pdf_structured(self, file_data: bytes, filename: str,
-                             ocr_images: bool = True) -> Dict[str, Any]:
+                             ocr_images: bool = True, ocr_text: bool = False) -> Dict[str, Any]:
         """
         Extract PDF content preserving tables and page structure
         Args:
             file_data: PDF file data as bytes
             filename: Original filename for error reporting
+            ocr_images: For image-based PDFs, render pages to base64 images for the
+                vision path (attach-turn big-file local route). Native input sets this
+                False so scans skip pdf2image entirely.
+            ocr_text: For image-based PDFs, OCR the rendered pages to plain TEXT and
+                fold it into result['content'] (gated on config.enable_pdf_ocr). This is
+                orthogonal to ocr_images: the read_document text tool wants text only,
+                the local attach path wants both text AND page images.
         Returns:
             Dict with pages, content, and structure info
         """
@@ -281,7 +295,23 @@ class DocumentHandler(LoggerMixin):
         if result and self._is_image_based_pdf(result):
             result['is_image_based'] = True
             result['requires_ocr'] = True
+            # OCR text is orthogonal to the vision page-image path and gated on config.
+            do_ocr = ocr_text and config.enable_pdf_ocr
+            ocr_pages = (
+                self.ocr_pdf_pages(file_data, max_pages=config.ocr_max_pages, dpi=config.ocr_dpi)
+                if do_ocr else []
+            )
             if not ocr_images:
+                # Text-only route (native attach turn / read_document tool): never render
+                # page images. If OCR produced text, use it; otherwise fall back to the
+                # honest scanned-document note.
+                if ocr_pages:
+                    ocr_content, ocr_page_entries = self._format_ocr_pages(
+                        ocr_pages, result.get('total_pages', 0))
+                    result['content'] = ocr_content
+                    result['pages'] = ocr_page_entries
+                    result['ocr_text_used'] = True
+                    return result
                 # Caller will present the PDF natively (rendered pages) — skip the
                 # pdf2image conversion (and its poppler temp files) entirely.
                 result['content'] = (
@@ -321,7 +351,75 @@ class DocumentHandler(LoggerMixin):
                     f"PDF to image conversion failed - OCR not available.]\n\n"
                     f"{result.get('content', '[No text extracted from PDF]')}"
                 )
+            # OCR text ALSO improves summaries for scans on the big-file local path — emit
+            # BOTH the page images (above) and the OCR text content when OCR succeeded.
+            if ocr_pages:
+                ocr_content, ocr_page_entries = self._format_ocr_pages(
+                    ocr_pages, result.get('total_pages', 0))
+                result['content'] = f"{result['content']}\n\n{ocr_content}"
+                result['pages'] = ocr_page_entries
+                result['ocr_text_used'] = True
         return result
+
+    def _format_ocr_pages(self, ocr_pages: List[str],
+                          total_pages: int) -> tuple:
+        """Build page-structured OCR content + per-page entries from OCR'd page texts.
+
+        Returns (content_str, pages_list). Truncation is LOUD: if the document has more
+        pages than were OCR'd (OCR page cap), a bracketed note is prepended saying how
+        many of how many pages were read.
+        """
+        blocks: List[str] = []
+        if total_pages and total_pages > len(ocr_pages):
+            blocks.append(
+                f"[OCR text extracted from the first {len(ocr_pages)} of {total_pages} page(s); "
+                f"the remaining {total_pages - len(ocr_pages)} page(s) exceed the OCR page limit "
+                f"and were not read.]"
+            )
+        pages: List[Dict[str, Any]] = []
+        for i, page_text in enumerate(ocr_pages, start=1):
+            text = (page_text or "").strip() or "[Page contained no OCR-readable text]"
+            blocks.append(f"[Page {i}]\n{text}")
+            pages.append({'page': i, 'content': text, 'ocr': True})
+        return '\n\n'.join(blocks), pages
+
+    def ocr_pdf_pages(self, file_data: bytes, max_pages: int = 20,
+                      dpi: int = 300) -> List[str]:
+        """OCR an image-only/scanned PDF to per-page plain text.
+
+        Returns one string per rendered page (index 0 == page 1), capped at max_pages.
+        Everything stays in memory except the poppler/tesseract temp files documented at
+        the module top. NEVER raises: a missing pytesseract package, a missing tesseract
+        binary, or any render/OCR error logs a warning and yields [] so the caller falls
+        back to the honest scanned-document note.
+        """
+        try:
+            import pytesseract
+        except ImportError as e:
+            self.log_warning(f"pytesseract not installed; skipping PDF OCR: {e}")
+            return []
+        try:
+            images = convert_from_bytes(file_data, dpi=dpi, fmt='png',
+                                        first_page=1, last_page=max_pages)
+        except Exception as e:
+            self.log_error(f"Failed to render PDF for OCR: {e}")
+            if "poppler" in str(e).lower():
+                self.log_error("poppler-utils may not be installed. Install with: "
+                               "apt-get install poppler-utils (Linux) or brew install poppler (Mac)")
+            return []
+        page_texts: List[str] = []
+        for i, image in enumerate(images[:max_pages], start=1):
+            try:
+                page_texts.append(pytesseract.image_to_string(image) or "")
+            except pytesseract.TesseractNotFoundError as e:
+                self.log_warning(f"tesseract binary not found; skipping PDF OCR: {e}")
+                return []
+            except Exception as e:
+                self.log_warning(f"OCR failed on page {i}: {e}")
+                page_texts.append("")
+        if page_texts:
+            self.log_info(f"OCR'd {len(page_texts)} PDF page(s) at {dpi} DPI")
+        return page_texts
     def _parse_pdf_with_pdfplumber(self, file_data: bytes, filename: str) -> Dict[str, Any]:
         """Parse PDF using pdfplumber for advanced structure extraction"""
         pages = []
