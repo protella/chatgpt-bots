@@ -290,7 +290,10 @@ async def test_rebuild_ordering_footer_stripped_then_used_then_reactions(temp_db
     state = await proc._get_or_rebuild_thread_state(_incoming(), _client(history))
     content = next(m for m in state.messages if m["role"] == "assistant")["content"]
     assert "_Used Tools:" not in content  # external chrome stripped, not in model context
-    assert content == "Answer.\n[used tools: web_search]\n[reactions: :eyes: x1 (<@U9>)]"
+    # F10 stamp is a pure PREFIX — it rides ahead of the pinned suffix order without
+    # disturbing footer-strip → [used tools:] → [reactions:] (ts 101.0, self turn → UTC).
+    assert content == ("[Thu 1970-01-01 12:01 AM UTC] Answer.\n"
+                       "[used tools: web_search]\n[reactions: :eyes: x1 (<@U9>)]")
 
 
 @pytest.mark.asyncio
