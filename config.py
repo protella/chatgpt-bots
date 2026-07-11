@@ -648,6 +648,12 @@ class BotConfig:
     # process falls back to plain posts for the rest of its life. Never breaks delivery.
     enable_research_label: bool = field(default_factory=lambda: os.getenv("ENABLE_RESEARCH_LABEL", "true").lower() == "true")
 
+    # Link previews (unfurl cards) on the bot's posted messages. Default OFF (user
+    # preference 2026-07-11, matching Claude Tag): links stay inline, and Slack's
+    # unfurler no longer stamps "(edited)" on link-bearing posts. Applies to the
+    # send_message path (normal replies, split chunks, research findings).
+    enable_link_previews: bool = field(default_factory=lambda: os.getenv("ENABLE_LINK_PREVIEWS", "false").lower() == "true")
+
     # --- On-demand Slack history-fetch tools (Phase 8) ---
     # Read-only + privacy-scoped (public or bot-member channels only), so default ON. Wired to
     # the model through the local function-call loop (ENABLE_TOOL_LOOP).
