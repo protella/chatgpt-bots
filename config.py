@@ -496,6 +496,15 @@ class BotConfig:
     # confabulating. Off → nothing captured, nothing persisted, no annotation.
     enable_tool_provenance: bool = field(default_factory=lambda: os.getenv("ENABLE_TOOL_PROVENANCE", "true").lower() == "true")
 
+    # --- Per-message timestamps (F10) ---
+    # Prefix every message in model-visible thread context with a deterministic local
+    # timestamp ("[Fri 2026-07-10 9:17 PM EDT]") rendered from the message's Slack ts in
+    # the sender's profile timezone (UTC fallback), so the model can reason about time
+    # gaps between messages. Applied on warm append + rebuild (self turns on rebuild only)
+    # and to the participation classifier's thread-tail / channel-activity lines. Off →
+    # content is byte-identical to pre-F10 (helper returns "" at every guarded call site).
+    enable_message_timestamps: bool = field(default_factory=lambda: os.getenv("ENABLE_MESSAGE_TIMESTAMPS", "true").lower() == "true")
+
     # --- Slack search tool (redesign Phase B) — assistant.search.context ---
     # Requires an action_token from the triggering event, so the bot can only search in
     # response to a user interaction. See slack_client/search_tool.py for the privacy model.

@@ -11,6 +11,7 @@ from thread_manager import AsyncThreadStateManager
 from openai_client import OpenAIClient
 from config import config, pipeline_status
 from logger import LoggerMixin
+from .message_timestamps import stamp_content
 from .thread_management import ThreadManagementMixin
 from .handlers.text import TextHandlerMixin
 from .handlers.vision import VisionHandlerMixin
@@ -226,7 +227,13 @@ class MessageProcessor(ThreadManagementMixin,
             # First, format the base text with username
             username = message.metadata.get("username", "User") if message.metadata else "User"
             base_text_with_username = f"{username}: {message.text}" if message.text else f"{username}:"
-            
+            # F10: stamp this turn (aligns this bypass site with _format_user_content_with_username);
+            # the stamp rides at the front, ahead of any document summaries appended below.
+            if config.enable_message_timestamps and message.metadata:
+                base_text_with_username = stamp_content(
+                    base_text_with_username, message.metadata.get("ts"),
+                    message.metadata.get("user_timezone") or "UTC")
+
             # If we have documents, enhance the text with their labeled SUMMARIES
             # (full content never enters context — read_document covers depth)
             enhanced_text = base_text_with_username
@@ -883,6 +890,11 @@ class MessageProcessor(ThreadManagementMixin,
                             # Build username-prefixed text without documents
                             username = message.metadata.get("username", "User") if message.metadata else "User"
                             text_with_username = f"{username}: {message.text}" if message.text else f"{username}:"
+                            # F10: stamp this bypass site too (parity with the shared helper)
+                            if config.enable_message_timestamps and message.metadata:
+                                text_with_username = stamp_content(
+                                    text_with_username, message.metadata.get("ts"),
+                                    message.metadata.get("user_timezone") or "UTC")
                             response = await self._handle_vision_analysis(
                                 text_with_username,  # Use username-prefixed text, not enhanced with full documents
                                 image_inputs if 'image_inputs' in locals() else [],

@@ -770,6 +770,55 @@ disambiguate.
 WARNING (once per episode) when only events stale; recovery logged; 0 disables; no
 reconnect/socket calls ever made by the monitor.
 
+## F10. Per-message timestamps in model context (user request 2026-07-10)
+
+**Gap (user-observed):** Claude Tag stamps every message in its context with a local
+timestamp, letting it reason across time gaps ("last night" vs "this morning", "you
+asked this an hour ago", and even inferring the user's timezone from the offset). Our
+rebuilt history is `username: text` — message `ts` lives only in metadata, so the model
+cannot perceive elapsed time between messages. Related live miss the same evening: the
+participation classifier ignored "anyone know what time it is in tokyo?" reasoning the
+assistant "has no current-time tool" — it doesn't know the main model receives a
+current-time injection.
+
+**Design:**
+1. **Stamp helper (pure function):** `render_message_timestamp(ts, tz) ->
+   "[Fri 2026-07-10 9:17 PM EDT]"` — weekday + date + 12-hour time + tz label,
+   minute precision, rendered from the message's immutable Slack `ts` in the SENDER's
+   profile timezone (IANA name), falling back to UTC when unknown (e.g. other bots).
+   Precedent: `username:` prefixes already bake mutable profile fields into rebuilt
+   content; sender tz is the same class of stable-but-mutable input and is already
+   cached (`get_user_timezone`, DB-backed). Determinism per the F7-5 standard: pure
+   function of (immutable ts, cached sender tz) — every rebuild renders identically.
+2. **Rebuild path:** in the rebuild loop (thread_management.py ~1016), prefix EVERY
+   turn's content with the stamp: non-self turns become `[stamp] username: text`, self
+   turns `[stamp] text`. The stamp is a PREFIX — no interaction with the pinned
+   end-anchored suffix order (footer-strip → `[used tools:]` → `[reactions:]`). The
+   compaction summary head stays timestamp-free (existing prompt-cache-hygiene rule);
+   messages at/behind `boundary_ts` are already skipped.
+3. **Warm path:** `_format_user_content_with_username` gains the stamp using the
+   triggering message's own `ts` + `user_timezone` metadata (warm inbound sender ==
+   triggering user, so both are already on the Message). All inbound content routes
+   (text/vision/image/document breadcrumbs) inherit via the shared helper; audit
+   call sites that bypass it (base.py:228,885) and align them.
+4. **Self turns warm:** NOT stamped at warm append (delivered-ts timing varies by
+   path); rebuild adds them — same rebuild-only precedent as the reactions
+   annotation. The current-time suffix already covers "just now" for live turns.
+5. **Classifier awareness (same theme):** (a) the F5 thread-tail lines and pulse
+   envelope lines reuse the same stamp helper so the participation classifier can
+   judge staleness; (b) PARTICIPATION_SYSTEM_PROMPT gains one line stating the
+   assistant always knows the current date/time (and receives web search/tools when
+   enabled), fixing the "no current-time tool" ignore.
+6. Config: `ENABLE_MESSAGE_TIMESTAMPS` (default true). Off = today's exact content
+   (helper returns ""), warm and rebuild both gated by the same flag.
+
+**Tests:** stamp is a pure function (fixed ts+tz → fixed string, repeated rebuilds
+identical); rebuild prefixes self and non-self turns; warm inbound stamped identically
+to its later rebuild (same ts+tz); UTC fallback for unknown-tz senders/other bots;
+prefix coexists with `[used tools:]`/`[reactions:]` suffix annotations and footer
+stripping; summary head never stamped; flag off = byte-identical to pre-F10 content;
+classifier tail lines stamped; participation prompt line present.
+
 ## Rollout / verification
 
 1. `make test` green after each change set (F4 → F1 → F2 → F3); `make lint` clean.
