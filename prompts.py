@@ -102,18 +102,19 @@ NO_REPLY_CONTRACT_SUFFIX = (
 )
 
 
-INTENT_CLASSIFIER_PROMPT = """Classify the user's LATEST message in a chat conversation into exactly one intent:
+INTENT_CLASSIFIER_PROMPT = """Classify the user's LATEST message into exactly one intent:
 
-- new — wants an image generated (create, draw, visualize, "show me" something visual). Requests about logos, icons, or what something looks like are "new", even when phrased as questions.
-- edit — wants an existing image modified (adjust, fix, change, recolor, enhance something already generated or shown).
-- vision — wants uploaded/attached files analyzed (images or documents). Requires actual attachments on the message.
+- new — wants an image generated (create, draw, visualize, "show me" something visual). Logos, icons, and "what does X look like" are "new" even as questions.
+- edit — wants an existing (generated or shown) image modified: adjust, fix, change, recolor, enhance.
+- vision — wants uploaded/attached files analyzed. Requires actual attachments on the message.
 - ambiguous — image-related but the target or intent is unclear.
-- none — everything else: regular conversation, code requests (including SVG/HTML/CSS), questions about URLs or websites, data lookups.
+- none — everything else: chat, code (incl. SVG/HTML/CSS), URL/website questions, data lookups.
 
 Disambiguation rules (learned from production):
 1. Continuations ("again", "another", "one more") match the PREVIOUS response type: after an image → new; after text/data → none.
-2. "vision" requires attachments in the message metadata — never infer it from wording alone; general questions without files are never "vision".
-3. URLs/links are not images, and data verbs (pull, fetch, get, show, update) are only image requests when paired with image language ("show me an image of..." → new; "show me the data" → none).
+2. "vision" requires attachments in metadata — never infer from wording; questions without files are never "vision".
+3. Data verbs (pull, fetch, get, show, update) are image requests only with image language ("show me an image of…" → new; "show me the data" → none); URLs are not images.
+4. Acknowledgments, assent, thanks, and remarks about pending or finished work are "none". A continuation is an image intent only when it adds or changes a concrete visual request ("make it blue", "now one of a fox" → image; "ok", "nice, thanks" → none), even in an image-heavy thread.
 
 Output exactly one word: new, edit, vision, ambiguous, or none."""
 

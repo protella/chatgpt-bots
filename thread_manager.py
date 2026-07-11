@@ -397,13 +397,18 @@ class AsyncThreadStateManager(LoggerMixin):
         self._watchdog_started = False
         # Upload-in-flight latches: image upload + DB row land AFTER the thread lock
         # releases, so a fast follow-up "edit it" could resolve its target before the
-        # new image exists. Editors await the latch before resolving targets.
+        # new image exists. Editors await the latch before resolving targets. F13:
+        # overlapping generations are tolerated — _upload_pending tracks the set of
+        # outstanding upload tokens per thread (generation_id, or "__sync__" for the
+        # inherently-serial sync path) and the event is SET only once the set drains.
         self._upload_events: Dict[str, asyncio.Event] = {}
-        # F1 — background image generation registry: at most one in-flight generation
-        # per thread. Entry: {generation_id, task, started_at, prompt_summary}. Used by
-        # follow-up turns (suffix in-flight note + image-intent rejection) and shutdown
-        # (cancel/await the tasks). All access is synchronous == atomic on the loop.
-        self._active_generations: Dict[str, dict] = {}
+        self._upload_pending: Dict[str, set] = {}
+        # F1/F13 — background image generation registry: MULTIPLE concurrent generations
+        # per thread (F13), keyed thread_key -> {generation_id -> entry}. Entry:
+        # {generation_id, task, started_at, prompt_summary}. Used by follow-up turns
+        # (suffix in-flight notes + image-intent routing/cap) and shutdown (cancel/await
+        # the tasks). All access is synchronous == atomic on the loop.
+        self._active_generations: Dict[str, Dict[str, dict]] = {}
         # Threads whose warm in-memory state is missing at least one Slack message
         # (e.g. a message dropped from an overfull pending queue, or a crash mid-queue).
         # The next request on that thread refetches from Slack (the transcript) before
@@ -471,22 +476,37 @@ class AsyncThreadStateManager(LoggerMixin):
             return True
         return False
 
-    def mark_upload_started(self, thread_key: str):
-        """Signal that an asset upload for this thread is in flight."""
+    def mark_upload_started(self, thread_key: str, generation_id: Optional[str] = None):
+        """Signal that an asset upload for this thread is in flight. F13: overlapping
+        generations each register their own token (generation_id, or "__sync__" for the
+        serial sync path which passes None); wait_for_uploads blocks until ALL land."""
+        token = generation_id or "__sync__"
+        self._upload_pending.setdefault(thread_key, set()).add(token)
         event = self._upload_events.get(thread_key)
         if event is None:
             event = asyncio.Event()
             self._upload_events[thread_key] = event
         event.clear()
 
-    def mark_upload_finished(self, thread_key: str):
-        """Signal that the in-flight asset upload (incl. its DB row) has landed."""
-        event = self._upload_events.get(thread_key)
-        if event is not None:
-            event.set()
+    def mark_upload_finished(self, thread_key: str, generation_id: Optional[str] = None):
+        """Signal that ONE in-flight asset upload (incl. its DB row) has landed.
+        Idempotent per token — discarding my own token can never release a sibling's
+        upload — and the thread's waiters unblock only once the last token drains."""
+        token = generation_id or "__sync__"
+        pending = self._upload_pending.get(thread_key)
+        if pending is not None:
+            pending.discard(token)
+            if not pending:
+                self._upload_pending.pop(thread_key, None)
+        if not self._upload_pending.get(thread_key):
+            event = self._upload_events.get(thread_key)
+            if event is not None:
+                event.set()
 
     async def wait_for_uploads(self, thread_key: str, timeout: float = 10.0):
-        """Wait (bounded) for any in-flight asset upload on this thread to land."""
+        """Wait (bounded) for ALL in-flight asset uploads on this thread to land."""
+        if not self._upload_pending.get(thread_key):
+            return
         event = self._upload_events.get(thread_key)
         if event is None or event.is_set():
             return
@@ -499,8 +519,9 @@ class AsyncThreadStateManager(LoggerMixin):
 
     def register_generation(self, thread_key: str, generation_id: str,
                             prompt_summary: str, task: Optional[asyncio.Task] = None):
-        """Register an in-flight background image generation for this thread."""
-        self._active_generations[thread_key] = {
+        """Register an in-flight background image generation for this thread. F13:
+        additive — a thread can hold several concurrent generations at once."""
+        self._active_generations.setdefault(thread_key, {})[generation_id] = {
             "generation_id": generation_id,
             "task": task,
             "started_at": time.monotonic(),
@@ -510,39 +531,47 @@ class AsyncThreadStateManager(LoggerMixin):
     def attach_generation_task(self, thread_key: str, generation_id: str, task: asyncio.Task):
         """Store the scheduled task handle (minted after the id, needed for shutdown).
         ID-conditional so a stale job can't overwrite a newer registration."""
-        entry = self._active_generations.get(thread_key)
-        if entry is not None and entry["generation_id"] == generation_id:
+        entry = self._active_generations.get(thread_key, {}).get(generation_id)
+        if entry is not None:
             entry["task"] = task
 
     def finish_generation(self, thread_key: str, generation_id: str) -> bool:
-        """Clear the in-flight generation, but ONLY if the id still matches — a stale
-        job (already superseded by a newer one) must never clear the newer entry."""
-        entry = self._active_generations.get(thread_key)
-        if entry is not None and entry["generation_id"] == generation_id:
-            self._active_generations.pop(thread_key, None)
+        """Clear ONE in-flight generation by id. A stale/superseded job clears only its
+        own entry (F13) and never touches a sibling; returns True iff an entry was
+        removed. The thread's bucket is dropped once its last generation finishes."""
+        bucket = self._active_generations.get(thread_key)
+        if bucket is not None and generation_id in bucket:
+            bucket.pop(generation_id, None)
+            if not bucket:
+                self._active_generations.pop(thread_key, None)
             return True
         return False
 
-    def generation_in_flight(self, thread_key: str) -> Optional[dict]:
-        """Advisory peek at the in-flight generation entry, or None. Force-clears (and
-        logs) an entry older than api_timeout_image + 30s — a watchdog against a job
-        that died without clearing itself."""
-        entry = self._active_generations.get(thread_key)
-        if entry is None:
-            return None
+    def generations_in_flight(self, thread_key: str) -> List[dict]:
+        """Advisory list of in-flight generation entries for this thread, oldest first.
+        Force-clears (and logs) any entry older than api_timeout_image + 30s — a
+        per-entry watchdog against a job that died without clearing itself (a stale
+        sibling never disturbs a healthy one)."""
+        bucket = self._active_generations.get(thread_key)
+        if not bucket:
+            return []
         max_age = float(config.api_timeout_image) + 30.0
-        if time.monotonic() - entry["started_at"] > max_age:
+        now = time.monotonic()
+        for gid in [g for g, e in bucket.items() if now - e["started_at"] > max_age]:
             self.log_warning(
-                f"Force-clearing stale generation {entry['generation_id']} on "
-                f"{thread_key} (age > {max_age:.0f}s)")
+                f"Force-clearing stale generation {gid} on {thread_key} "
+                f"(age > {max_age:.0f}s)")
+            bucket.pop(gid, None)
+        if not bucket:
             self._active_generations.pop(thread_key, None)
-            return None
-        return entry
+            return []
+        return sorted(bucket.values(), key=lambda e: e["started_at"])
 
     async def cancel_generations(self, timeout: float = 5.0):
         """Cancel and await all registered generation tasks (shutdown). Bounded so a
         wedged job can't stall shutdown."""
-        tasks = [e["task"] for e in self._active_generations.values() if e.get("task")]
+        tasks = [e["task"] for bucket in self._active_generations.values()
+                 for e in bucket.values() if e.get("task")]
         for task in tasks:
             if not task.done():
                 task.cancel()
