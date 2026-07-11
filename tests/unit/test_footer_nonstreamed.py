@@ -274,3 +274,19 @@ async def test_split_aborts_with_loud_note_when_chunk_fails_twice(monkeypatch):
     assert len(note) == 1 and "failed to post" in note[0]
     # No chunk posted AFTER the failure other than the note (abort, not skip-and-continue).
     assert texts.index(note[0]) == len(texts) - 1
+
+
+@pytest.mark.asyncio
+async def test_link_previews_follow_env_toggle(monkeypatch):
+    """ENABLE_LINK_PREVIEWS drives unfurl_links/unfurl_media on send_message posts
+    (default false: inline links, no preview cards)."""
+    from config import config as _cfg
+    b = _Bot()
+    b.app.client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": "1.0"})
+    await b.send_message("C1", "T1", "see <https://example.com|docs>")
+    kwargs = b.app.client.chat_postMessage.await_args.kwargs
+    assert kwargs["unfurl_links"] is False and kwargs["unfurl_media"] is False
+    monkeypatch.setattr(_cfg, "enable_link_previews", True)
+    await b.send_message("C1", "T1", "see <https://example.com|docs>")
+    kwargs = b.app.client.chat_postMessage.await_args.kwargs
+    assert kwargs["unfurl_links"] is True and kwargs["unfurl_media"] is True
