@@ -173,7 +173,7 @@ class SettingsModal(LoggerMixin):
              "value": "judicious"},
             {"text": {"type": "plain_text", "text": "Active — participate more freely (higher reply cap)"},
              "value": "active"},
-            {"text": {"type": "plain_text", "text": "Off — never respond in this channel"},
+            {"text": {"type": "plain_text", "text": "Off — never respond here, even when @mentioned"},
              "value": "off"},
         ]
         current_level = cs.get("participation_level")
