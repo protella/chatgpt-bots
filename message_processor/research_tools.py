@@ -130,12 +130,14 @@ async def execute_start_deep_research(ctx: ToolContext, args: Dict[str, Any]) ->
     job_id = uuid4().hex[:12]
     if tm is not None and hasattr(tm, "register_research"):
         tm.register_research(thread_key, job_id, _gist(task))
+    coro = _run_deep_research_job(
+        processor=processor, client=client, channel_id=channel_id,
+        thread_root=thread_root, thread_key=thread_key, job_id=job_id,
+        task=task, snapshot=snapshot, system_prompt=system_prompt, model=model)
     try:
-        task_handle = processor._schedule_async_call(_run_deep_research_job(
-            processor=processor, client=client, channel_id=channel_id,
-            thread_root=thread_root, thread_key=thread_key, job_id=job_id,
-            task=task, snapshot=snapshot, system_prompt=system_prompt, model=model))
+        task_handle = processor._schedule_async_call(coro)
     except Exception as e:  # scheduling failed — the job will never run; clear the registry
+        coro.close()  # dispose the never-scheduled coroutine (no unawaited-coroutine warning)
         if tm is not None and hasattr(tm, "finish_research"):
             tm.finish_research(thread_key, job_id)
         processor.log_error(f"Failed to schedule deep research for {thread_key}: {e}", exc_info=True)
@@ -166,12 +168,16 @@ async def _run_deep_research_job(*, processor, client, channel_id: str, thread_r
         job_input: List[Dict[str, Any]] = list(snapshot)
         job_input.append({"role": "developer",
                           "content": _RESEARCH_JOB_INSTRUCTION.format(task=task)})
-        # web_search + configured MCP servers, NO local tools (registry=None).
-        tools = processor._build_tools_array({}, model, registry=None)
+        # web_search + configured MCP servers, NO local tools (registry=None). web_search is
+        # FORCED into the job's tools regardless of the global toggle — this tool IS web
+        # research; a truthy MCP-only array must not silently strip it (Codex review find).
+        tools = processor._build_tools_array({}, model, registry=None) or []
+        if not any(t.get("type") == "web_search" for t in tools):
+            tools.append({"type": "web_search"})
         result = await asyncio.wait_for(
             processor.openai_client.create_text_response_with_tools(
                 messages=job_input,
-                tools=tools or [{"type": "web_search"}],
+                tools=tools,
                 model=model,
                 system_prompt=system_prompt,
                 reasoning_effort=effort,
@@ -190,7 +196,17 @@ async def _run_deep_research_job(*, processor, client, channel_id: str, thread_r
                                    "the research came back empty")
             return
         trailer = f"\n\n_deep research · {_fmt_duration(elapsed)} · effort {effort}_"
-        await _deliver_findings(processor, client, channel_id, thread_root, text + trailer, task)
+        posted = await _deliver_findings(processor, client, channel_id, thread_root,
+                                         text + trailer, task)
+        if not posted:
+            # send_message swallows Slack errors into None — a failed post must not be
+            # logged as a completed job, and the thread deserves a note (best-effort; if
+            # posting is broken the note fails too, but the ERROR log stays loud).
+            processor.log_error(
+                f"Deep research {job_id} finished but the findings post FAILED for {thread_key}")
+            await _deliver_failure(client, channel_id, thread_root,
+                                   "the findings were ready but posting them to Slack failed")
+            return
         processor.log_info(f"Deep research {job_id} completed for {thread_key} in {elapsed:.1f}s")
     except asyncio.CancelledError:
         # Shutdown/cancel — stay quiet and let finally clean up the registry.
