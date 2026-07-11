@@ -274,7 +274,7 @@ def test_envelope_respects_env_cap(monkeypatch):
     assert proc._build_pulse_envelope(client, "C1", None) is None
 
 
-# --------------------------------------------------------------- F14b attachment note
+# ------------------------------------------------- F14b/F25 attachment note
 
 def test_attachment_note_helper():
     from slack_client.channel_pulse import _attachment_note
@@ -288,16 +288,42 @@ def test_attachment_note_helper():
     ) == "[+1 image, +1 file]"
 
 
+def test_attachment_note_includes_filenames():
+    # F25: filenames are what read_document needs to reach a cross-thread file —
+    # a count-only note left the model unable to name a document from another thread.
+    from slack_client.channel_pulse import _attachment_note
+    assert _attachment_note(
+        [{"mimetype": "image/png", "name": "food.png"}]) == "[+1 image: food.png]"
+    assert _attachment_note(
+        [{"mimetype": "application/pdf", "name": "a.pdf"},
+         {"mimetype": "text/csv", "name": "b.csv"}]) == "[+2 files: a.pdf, b.csv]"
+
+
+def test_attachment_note_sanitizes_and_caps_filenames():
+    from slack_client.channel_pulse import _attachment_note
+    # Hostile name: brackets/backticks/quotes/newlines stripped so the note can't
+    # break the bracketed grammar or spoof another context line.
+    assert _attachment_note(
+        [{"mimetype": "application/pdf", "name": "x[y]`z\"w.pdf\n"}]) == "[+1 file: xyzw.pdf]"
+    # Display truncation.
+    long = _attachment_note([{"mimetype": "text/csv", "name": "n" * 200 + ".csv"}])
+    assert len(long) < 80
+    # At most 3 names, then +N more.
+    note = _attachment_note(
+        [{"mimetype": "text/csv", "name": f"f{i}.csv"} for i in range(5)])
+    assert note == "[+5 files: f0.csv, f1.csv, f2.csv, +2 more]"
+
+
 def test_record_appends_attachment_note_to_envelope_and_tail():
-    # F14b: a message carrying files surfaces a bracketed note that both the envelope
-    # line and the thread-tail entry inherit (folded in at record level).
+    # F14b/F25: a message carrying files surfaces a bracketed note (with filename) that
+    # both the envelope line and the thread-tail entry inherit (folded in at record level).
     p = ChannelPulse(size=10)
     p.record("C1", **_entry("100.0", text="what do we think?"),
              files=[{"mimetype": "image/png", "name": "food.png"}])
     env = p.render_envelope("C1")
-    assert "what do we think? [+1 image]" in env
+    assert "what do we think? [+1 image: food.png]" in env
     tail = p.render_thread_tail("C1", "100.0", before_ts="200.0")
-    assert "[+1 image]" in tail
+    assert "[+1 image: food.png]" in tail
 
 
 def test_record_without_files_leaves_text_untouched():
