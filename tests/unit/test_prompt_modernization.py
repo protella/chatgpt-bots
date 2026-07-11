@@ -12,7 +12,8 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from config import config
-from openai_client.api.responses import classify_intent as _classify_intent
+from openai_client.api.responses import (classify_intent as _classify_intent,
+                                          _parse_intent_and_ack)
 from message_processor.utilities import MessageUtilitiesMixin
 from message_processor.handlers.vision import VisionHandlerMixin, _VAGUE_VISION_ASKS
 from prompts import (
@@ -176,6 +177,83 @@ def test_classifier_prompt_token_budget():
     """Fires on every responded message and sits below the 1024-token prompt-cache
     threshold — must stay small. chars/4 proxy."""
     assert len(INTENT_CLASSIFIER_PROMPT) / 4 < 350
+
+
+# ------------------------------------------------- F19 intent ack parse
+
+@pytest.mark.parametrize("raw,intent,ack", [
+    ("vision ack", "vision", True),          # two tokens: intent + ack
+    ("new ack", "new_image", True),
+    ("edit noack", "edit_image", False),     # explicit noack
+    ("none", "text_only", False),            # one-word fallback -> noack
+    ("vision", "vision", False),
+    ("new banana", "new_image", False),      # garbage 2nd token never breaks routing
+    ("none whatever extra", "text_only", False),
+    ("garbage sentence here", "text_only", False),  # unmapped 1st token -> safe default
+    ("", "text_only", False),                # empty -> safe default
+    ("  vision   ACK  ", "vision", True),    # whitespace + case tolerant
+])
+def test_parse_intent_and_ack(raw, intent, ack):
+    assert _parse_intent_and_ack(raw) == (intent, ack)
+
+
+def test_classifier_return_ack_two_token(monkeypatch):
+    """return_ack=True unpacks (intent, ack) from the two-token model output."""
+    c = _Classifier("vision ack")
+    intent, ack = _run(c.classify_intent([], "look at this", return_ack=True))
+    assert intent == "vision" and ack is True
+
+
+def test_classifier_return_ack_defaults_noack_on_one_word():
+    """A one-word (legacy-shaped) output still parses; ack defaults False."""
+    c = _Classifier("none")
+    intent, ack = _run(c.classify_intent([], "hi", return_ack=True))
+    assert intent == "text_only" and ack is False
+
+
+def test_classifier_bare_return_unchanged_without_return_ack():
+    """Without return_ack the call still returns a bare intent string (back-compat)."""
+    c = _Classifier("new ack")
+    assert _run(c.classify_intent([], "draw a cat")) == "new_image"
+
+
+# ------------------------------------------------- F19 intent-path ack reaction
+
+def _ack_msg():
+    from base_client import Message
+    return Message(text="analyze this deck", user_id="U1", channel_id="C1",
+                   thread_id="99.0", metadata={"ts": "99.0"})
+
+
+def test_place_ack_reaction_uses_reservation_guard(monkeypatch):
+    """The intent-path ack routes through the F6 reservation guard on the triggering ts."""
+    monkeypatch.setattr(config, "ack_reaction_emoji", "eyes", raising=False)
+    proc = _Proc()
+    client = MagicMock()
+    client._reserve_and_react = AsyncMock(return_value={"ok": True})
+    client.react = AsyncMock()
+    _run(proc._place_ack_reaction(client, _ack_msg()))
+    client._reserve_and_react.assert_awaited_once_with("C1", "99.0", "eyes")
+    client.react.assert_not_awaited()
+
+
+def test_place_ack_reaction_falls_back_to_react(monkeypatch):
+    """A client without the guard still gets the reaction via plain react()."""
+    monkeypatch.setattr(config, "ack_reaction_emoji", "hourglass", raising=False)
+    proc = _Proc()
+    client = MagicMock(spec=["react"])
+    client.react = AsyncMock()
+    _run(proc._place_ack_reaction(client, _ack_msg()))
+    client.react.assert_awaited_once_with("C1", "99.0", "hourglass")
+
+
+def test_place_ack_reaction_is_silent_on_failure(monkeypatch):
+    """A wedged/failing Slack call never propagates — the turn continues."""
+    monkeypatch.setattr(config, "ack_reaction_emoji", "eyes", raising=False)
+    proc = _Proc()
+    client = MagicMock()
+    client._reserve_and_react = AsyncMock(side_effect=RuntimeError("slack down"))
+    _run(proc._place_ack_reaction(client, _ack_msg()))  # does not raise
 
 
 # ------------------------------------------------- new guidance present

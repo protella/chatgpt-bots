@@ -64,8 +64,9 @@ class TestPrompts:
         assert "attachments" in INTENT_CLASSIFIER_PROMPT             # vision requires files
         assert "URLs" in INTENT_CLASSIFIER_PROMPT                    # links are not images
         assert "logo" in INTENT_CLASSIFIER_PROMPT.lower()            # logo/icon -> new
-        # One-line output instruction
-        assert "Output exactly one word" in INTENT_CLASSIFIER_PROMPT
+        # Output instruction — F19 extended it to two tokens (intent + ack flag)
+        assert "Output exactly two tokens" in INTENT_CLASSIFIER_PROMPT
+        assert "<ack|noack>" in INTENT_CLASSIFIER_PROMPT
 
     def test_intent_classifier_backcompat_alias(self):
         """Old constant name still resolves (pre-modernization imports/tests)"""

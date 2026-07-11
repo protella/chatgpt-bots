@@ -80,6 +80,29 @@ class TestVerdictValidation:
         v = ParticipationEngine.validate_verdict({"action": "ignore", "reason": "x" * 999})
         assert len(v.reason) == 300
 
+    # F19: acknowledgment flag
+    def test_ack_absent_defaults_false(self):
+        assert ParticipationEngine.validate_verdict({"action": "respond"}).ack is False
+
+    def test_ack_true_on_respond(self):
+        assert ParticipationEngine.validate_verdict(
+            {"action": "respond", "ack": True}).ack is True
+
+    def test_ack_malformed_coerced_false(self):
+        # Only a literal True flips it; strings/ints/None never do.
+        for bad in ("true", 1, "yes", None, "ack"):
+            assert ParticipationEngine.validate_verdict(
+                {"action": "respond", "ack": bad}).ack is False
+
+    def test_ack_ignored_on_non_respond_actions(self):
+        # ack is meaningful only with respond — react/ignore/backoff never carry it.
+        assert ParticipationEngine.validate_verdict(
+            {"action": "ignore", "ack": True}).ack is False
+        assert ParticipationEngine.validate_verdict(
+            {"action": "react", "emoji": "eyes", "ack": True}).ack is False
+        assert ParticipationEngine.validate_verdict(
+            {"action": "backoff", "ack": True}).ack is False
+
 
 # ------------------------------------------------------------------- debounce + rails
 
@@ -216,6 +239,62 @@ class TestGateWiring:
         app, client, _ = _make_app({"action": "respond", "placement": "thread"})
         verdict = await app._run_participation_gate(_channel_msg(), client)
         assert verdict is not None and verdict.action == "respond"
+
+    # F19: acknowledgment reaction on respond+ack
+    @pytest.mark.asyncio
+    async def test_respond_ack_reacts_before_dispatch(self, monkeypatch):
+        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
+        monkeypatch.setattr(config, "enable_ack_reaction", True, raising=False)
+        monkeypatch.setattr(config, "ack_reaction_emoji", "eyes", raising=False)
+        app, client, _ = _make_app({"action": "respond", "ack": True})
+        verdict = await app._run_participation_gate(_channel_msg(), client)
+        assert verdict is not None and verdict.action == "respond" and verdict.ack is True
+        # reaction placed on the triggering message through the F6 reservation guard
+        client._reserve_and_react.assert_awaited_once_with("C1", "10.0", "eyes")
+
+    @pytest.mark.asyncio
+    async def test_respond_without_ack_no_reaction(self, monkeypatch):
+        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
+        monkeypatch.setattr(config, "enable_ack_reaction", True, raising=False)
+        app, client, _ = _make_app({"action": "respond"})
+        verdict = await app._run_participation_gate(_channel_msg(), client)
+        assert verdict is not None and verdict.action == "respond"
+        client._reserve_and_react.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ack_disabled_skips_reaction(self, monkeypatch):
+        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
+        monkeypatch.setattr(config, "enable_ack_reaction", False, raising=False)
+        app, client, _ = _make_app({"action": "respond", "ack": True})
+        verdict = await app._run_participation_gate(_channel_msg(), client)
+        assert verdict is not None and verdict.action == "respond"
+        client._reserve_and_react.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ack_emoji_configurable(self, monkeypatch):
+        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
+        monkeypatch.setattr(config, "enable_ack_reaction", True, raising=False)
+        monkeypatch.setattr(config, "ack_reaction_emoji", "hourglass_flowing_sand", raising=False)
+        app, client, _ = _make_app({"action": "respond", "ack": True})
+        await app._run_participation_gate(_channel_msg(), client)
+        client._reserve_and_react.assert_awaited_once_with("C1", "10.0", "hourglass_flowing_sand")
+
+    @pytest.mark.asyncio
+    async def test_react_verdict_ignores_ack_field(self, monkeypatch):
+        # A react verdict never acks even if the model leaks an ack field — only the
+        # react emoji is placed, once.
+        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
+        monkeypatch.setattr(config, "enable_ack_reaction", True, raising=False)
+        monkeypatch.setattr(config, "ack_reaction_emoji", "eyes", raising=False)
+        monkeypatch.setattr(config, "reaction_emojis", ["thumbsup"], raising=False)
+        app, client, _ = _make_app({"action": "react", "emoji": "thumbsup", "ack": True})
+        assert await app._run_participation_gate(_channel_msg(), client) is None
+        client._reserve_and_react.assert_awaited_once_with("C1", "10.0", "thumbsup")
 
     def test_is_unprompted_turn_excludes_name_hit(self):
         # F14: a name-hit respond is prompted in spirit — it must NOT burn the

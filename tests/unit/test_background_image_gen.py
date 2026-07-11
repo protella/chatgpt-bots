@@ -717,7 +717,9 @@ class _RoutingHost:
         self.db = None
         self.logger = MagicMock()
         self.logger.isEnabledFor = lambda *a, **k: False
-        self.openai_client = SimpleNamespace(classify_intent=AsyncMock(return_value=intent))
+        # F19: classify_intent(return_ack=True) yields (intent, ack); routing ignores ack.
+        self.openai_client = SimpleNamespace(
+            classify_intent=AsyncMock(return_value=(intent, False)))
         # Collaborators before/after the routing block — benign stubs.
         self._get_or_rebuild_thread_state = AsyncMock(return_value=self._state())
         self._build_participant_roster = MagicMock(return_value="")

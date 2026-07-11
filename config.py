@@ -468,6 +468,16 @@ class BotConfig:
     # wordless acknowledgement reaction.
     snooze_ack_emoji: str = field(default_factory=lambda: os.getenv("SNOOZE_ACK_EMOJI", "zipper_mouth_face").strip().strip(":"))
 
+    # F19: "I'm looking at it" acknowledgment reaction. When a reply will take real work
+    # (attachments, data/MCP lookups, multi-step tools, long-form output), the fast models
+    # that already look at every message — the participation classifier (unprompted turns)
+    # and the intent classifier (addressed turns) — flag it, and the bot drops this emoji
+    # on the triggering message BEFORE the slow work, Claude-Tag style. No timers/thresholds;
+    # purely additive (never the turn's response, no accounting); routed through the F6
+    # reservation guard; stays after the reply; fails silent.
+    enable_ack_reaction: bool = field(default_factory=lambda: os.getenv("ENABLE_ACK_REACTION", "true").lower() == "true")
+    ack_reaction_emoji: str = field(default_factory=lambda: os.getenv("ACK_REACTION_EMOJI", "eyes").strip().strip(":"))
+
     # Phase Q — conversational queueing (busy rejection retired). Messages arriving while a
     # conversation is mid-processing queue and are answered in one batched catch-up turn.
     # How long the finishing turn lingers (still holding the conversation lock) so stragglers
