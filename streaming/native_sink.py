@@ -23,7 +23,6 @@ from typing import Optional, Tuple
 
 from message_markers import (
     _fence_state,
-    continuation_trailer_markdown,
     entity_safe_cut,
     part_prefix_markdown,
 )
@@ -121,7 +120,7 @@ class NativeStreamCoordinator:
             return False, None
 
     async def _roll(self, raw_text: str) -> Tuple[bool, Optional[str]]:
-        """Close the current part with the continuation trailer and open the next one."""
+        """Close the current part and open the next one."""
         split = find_stream_split(raw_text, self.char_limit, floor=self._sent_raw_len())
         first = raw_text[:split]
         if not await self.session.update(self.base + first):
@@ -131,9 +130,10 @@ class NativeStreamCoordinator:
         # then reopen it (with the language hint) in the next part's base.
         in_block, lang = _fence_state(self.base + first)
         closing = "\n```" if in_block else ""
-        finished = await self.session.finish(
-            final_text=self.base + first + closing + continuation_trailer_markdown()
-        )
+        # No trailing "Continued in next message..." (user directive 2026-07-11): the next
+        # part's "Part N (continued)" header marks the seam by itself, and the rebuild
+        # merger fires on EITHER side's marker (thread_management merge is OR).
+        finished = await self.session.finish(final_text=self.base + first + closing)
         overflow = raw_text[split:].lstrip("\n")
         if not finished:
             self.failed = True
