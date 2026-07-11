@@ -85,10 +85,11 @@ class ChatBotV2:
             level = message.metadata.get("participation_level") or "judicious"
             pulse = getattr(client, "channel_pulse", None)
 
-            # F5 fix (b): register this message's ts as the channel's newest BEFORE the
-            # memory/topic awaits below — an older event delayed by that I/O must not
-            # overwrite a newer event's debounce marker and win the race.
-            engine.note_arrival(channel_id, ts)
+            # F5 fix (b): register this message's ts as its conversation's newest BEFORE
+            # the memory/topic awaits below — an older event delayed by that I/O must not
+            # overwrite a newer event's debounce marker and win the race. F21: the marker
+            # is conversation-scoped (message.thread_id is the thread root).
+            engine.note_arrival(channel_id, ts, message.thread_id)
 
             # F17: no hourly-cap hard rail — pacing is the classifier's judgment. The
             # unprompted-reply count is still tallied and fed to the engine as a signal

@@ -1303,6 +1303,41 @@ ts, in-memory only; envelope/tail line renders the compact summary (top-2, count
 omits when none; bot's own-message reactions still reach the feedback sink; render
 stays deterministic given ring state.
 
+## F21. Conversation-scoped debounce supersession (live-testing find 2026-07-11)
+
+**Gap (observed live):** the participation debounce's supersession marker is keyed per
+CHANNEL (`ParticipationEngine._latest[channel_id]`), so ANY newer message anywhere in
+the channel — a different thread, top-level while the pending message is in a thread —
+supersedes a pending evaluation and silently drops it. Observed: a top-level document
+question and an unrelated thread follow-up were both posted while another conversation
+was active in a different thread; both evaluations were superseded by the other
+conversation's newer messages and neither was ever judged or answered. The docstring's
+justification ("the newer message's evaluation, whose envelope includes this message,
+covers the batch") only holds within the SAME conversation — a verdict responds in the
+triggering message's own thread, so a superseded question in another thread gets
+nothing.
+
+**Design:** scope the supersession marker to the CONVERSATION, derived from data the
+gate already has (no new plumbing):
+- Key: `channel_id|thread_root` for thread replies (`thread_root != ts`), and the
+  shared `channel_id|top` for all top-level messages.
+- Thread replies collapse per-thread: a rapid burst in one thread still evaluates only
+  the newest (whose thread tail includes the burst); activity in OTHER threads or
+  top-level never kills it.
+- Top-level messages keep collapsing as one stream (`|top`): a rapid multi-line
+  top-level burst still yields one evaluation of the newest message (envelope includes
+  the rest) — unchanged from today except thread activity no longer supersedes it.
+- `note_arrival` stays monotonic per key (F5 fix b: called at gate entry before any
+  await); `evaluate()` checks its own conversation key after the debounce sleep.
+  `_latest` remains a small in-memory dict; keys are bounded by active conversations
+  between restarts (no eviction needed beyond process lifetime).
+
+**Tests:** thread-A pending evaluation survives a newer thread-B message and a newer
+top-level message (both evaluate); same-thread newer message still supersedes; rapid
+top-level burst still collapses to the newest; marker stays monotonic per conversation
+(stale older ts never clobbers a newer one); a top-level root message and its own
+first thread reply are distinct keys (reply keyed by root).
+
 ## Rollout / verification
 
 1. `make test` green after each change set (F4 → F1 → F2 → F3); `make lint` clean.
