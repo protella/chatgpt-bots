@@ -10,7 +10,6 @@ import ast
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
 
 from base_client import Message
 from main import ChatBotV2

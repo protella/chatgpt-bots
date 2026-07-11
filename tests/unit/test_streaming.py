@@ -1,8 +1,7 @@
 """Unit tests for streaming modules"""
 
 import pytest
-import time
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import patch
 from streaming.buffer import StreamingBuffer
 from streaming.fence_handler import FenceHandler
 from streaming.rate_limiter import RateLimitManager, CircuitState

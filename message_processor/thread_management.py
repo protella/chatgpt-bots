@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Dict, List, Optional
 
 from base_client import BaseClient, Message
@@ -237,7 +236,7 @@ class ThreadManagementMixin:
             self.log_error(f"Error summarizing document: {e}")
             # Check if it's a context length error
             if "context_length_exceeded" in str(e) or "context window" in str(e):
-                self.log_error(f"Document exceeds model context window for summarization")
+                self.log_error("Document exceeds model context window for summarization")
                 # Return truncated version with error marker
                 return f"[ERROR: Document too large for model context window]\n{content[:1000]}..."
             return content  # Return original if summarization fails for other reasons

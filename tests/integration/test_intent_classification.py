@@ -15,9 +15,9 @@ from tabulate import tabulate
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from openai_client import OpenAIClient
-from config import config
-from logger import setup_logger
+from openai_client import OpenAIClient  # noqa: E402
+from config import config  # noqa: E402
+from logger import setup_logger  # noqa: E402
 
 # Load environment variables
 load_dotenv()

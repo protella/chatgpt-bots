@@ -4,7 +4,7 @@ Pytest configuration and shared fixtures
 import os
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 import pytest
 import asyncio
 
@@ -19,7 +19,7 @@ os.environ['TESTING'] = 'true'
 # any DatabaseManager built in a test writes tagged migration backups into the
 # real data/backups/ — and backup retention cleanup could then delete real
 # backups older than 7 days.
-import tempfile
+import tempfile  # noqa: E402
 os.environ['DATABASE_DIR'] = tempfile.mkdtemp(prefix='pytest-bot-db-')
 
 @pytest.fixture

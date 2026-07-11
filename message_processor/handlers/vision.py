@@ -441,7 +441,7 @@ class VisionHandlerMixin:
                                     await asyncio.sleep(1.0)
                                     result = await client.update_message_streaming(channel_id, current_message_id, final_first_part)
                                     if not result["success"]:
-                                        self.log_error(f"Overflow retry failed - stopping stream")
+                                        self.log_error("Overflow retry failed - stopping stream")
                                         streaming_aborted = True
                                         return
 
@@ -472,7 +472,7 @@ class VisionHandlerMixin:
                                         buffer.mark_updated()
                                         self.log_info(f"Created vision overflow part {current_part}")
                                     else:
-                                        self.log_warning(f"Could not get message ID for overflow - continuing with current message")
+                                        self.log_warning("Could not get message ID for overflow - continuing with current message")
                                         buffer.reset()
                                         buffer.add_chunk(overflow_with_fence)
                                         buffer.mark_updated()

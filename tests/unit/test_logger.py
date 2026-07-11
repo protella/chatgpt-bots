@@ -4,10 +4,7 @@ Tests custom logging configuration and utilities
 """
 import pytest
 import logging
-import os
-import json
-from unittest.mock import patch, MagicMock, mock_open, call
-from io import StringIO
+from unittest.mock import patch
 from logger import setup_logger, log_session_start, log_session_end
 
 
@@ -61,7 +58,7 @@ class TestLoggerSetup:
     
     def test_logger_hierarchy(self):
         """Test logger hierarchy and inheritance"""
-        parent_logger = setup_logger("parent")
+        setup_logger("parent")
         child_logger = setup_logger("parent.child")
         
         # Child should inherit from parent

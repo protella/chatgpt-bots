@@ -4,9 +4,8 @@ import asyncio
 import json
 import re
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
-import pytest
 
 from mcp_manager import MCPManager
 from openai_client.api.responses import _collect_mcp_list_tools

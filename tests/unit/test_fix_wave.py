@@ -15,7 +15,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
 
 from thread_manager import AsyncThreadStateManager
 from message_processor.utilities import MessageUtilitiesMixin

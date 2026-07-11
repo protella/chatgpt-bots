@@ -1,6 +1,5 @@
 """D1 document-handler fixes: pptx support, router unification, timeout,
 zip-bomb guard, no-disk rule, and the generated supported-types message."""
-import asyncio
 import io
 import zipfile
 
@@ -174,7 +173,7 @@ def test_no_tempfile_usage_in_document_handler():
             if needle in line and not line.lstrip().startswith("#")
             and '"' not in line and "'" not in line or f"import {needle}" in line
         ]
-        assert not [l for l in code_lines if "import" in l], f"disk-touching usage: {code_lines}"
+        assert not [ln for ln in code_lines if "import" in ln], f"disk-touching usage: {code_lines}"
 
 
 def test_pandoc_fallback_uses_stdin():

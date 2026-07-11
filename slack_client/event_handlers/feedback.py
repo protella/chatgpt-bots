@@ -16,6 +16,7 @@ not wired into decisions yet.
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
 
 from config import config
 
@@ -52,8 +53,6 @@ def feedback_enabled() -> bool:
 # FIRST response of a conversation thread only (user feedback 2026-07-09: "we don't
 # need the feedback after every response"). Reactions stay the always-available
 # signal; a restart forgetting this set costs at most one extra thumbs row per thread.
-from collections import OrderedDict
-
 _FEEDBACK_OFFERED: "OrderedDict[str, None]" = OrderedDict()
 _FEEDBACK_OFFERED_MAX = 500
 
