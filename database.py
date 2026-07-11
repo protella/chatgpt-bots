@@ -2728,6 +2728,32 @@ class DatabaseManager(LoggerMixin):
                     documents.append(doc)
                 return documents
 
+    async def get_channel_documents_async(self, channel_id: str) -> List[Dict]:
+        """All documents shared anywhere in a channel (F22 channel-wide access).
+
+        thread_id is stored as "channel:thread"; a channel's documents are every row
+        whose thread_id starts with ``channel_id + ':'``. Channel ids are alphanumeric
+        (no LIKE metacharacters), so a plain prefix LIKE is safe and cannot escape the
+        channel — the privacy boundary is same-channel-only. Same row shape and
+        created_at ASC ordering as get_thread_documents_async."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(
+                "SELECT * FROM documents WHERE thread_id LIKE ? ORDER BY created_at ASC",
+                (f"{channel_id}:%",),
+            ) as cursor:
+                documents = []
+                async for row in cursor:
+                    doc = dict(row)
+                    if doc.get("page_structure"):
+                        doc["page_structure"] = json.loads(doc["page_structure"])
+                    if doc.get("metadata_json"):
+                        doc["metadata"] = json.loads(doc["metadata_json"])
+                        del doc["metadata_json"]
+                    documents.append(doc)
+                return documents
+
     async def get_document_by_filename_async(self, thread_id: str, filename: str) -> Optional[Dict]:
         """Async version of get_document_by_filename (newest matching row)."""
         async with aiosqlite.connect(self.db_path) as db:

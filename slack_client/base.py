@@ -87,6 +87,10 @@ class SlackBot(SlackMessageEventsMixin,
         # judgment (any standard emoji); an allowlist, when set, only constrains the choice.
         if config.enable_reactions and config.enable_react_tool:
             registry.register(self.get_react_tool_schema(), self.execute_react_tool)
+        # F23: cross-thread reply into a DIFFERENT thread of the current channel (write-scoped
+        # to this channel; muted target threads refused by the executor).
+        if config.enable_post_to_thread_tool:
+            registry.register(self.get_post_to_thread_tool_schema(), self.execute_post_to_thread)
         # F2: no_response_needed is exposed only on unprompted turns (participation_check),
         # via the per-request _unprompted_turn flag the text handler sets in a COPIED config.
         registry.register(
