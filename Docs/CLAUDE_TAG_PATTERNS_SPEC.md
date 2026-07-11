@@ -1682,3 +1682,45 @@ fires on commit only; verdict path end-to-end. F30 schema/gating/cap/snapshot-by
 happy trailer/error+timeout+failed-post notes/label fallback+memory/registry+shutdown/
 config defaults/forced web_search/coroutine close. Off-gate: drops app_mention,
 mentions_only answers, DMs ungated.
+
+## F30.1 — Claude-parity research status card + ack suppression (2026-07-11)
+
+**Trigger (user directive from Claude Tag screenshots):** keep the labelled APP identity as
+the only research voice — drop the model's NL "digging in" line — and give it Claude's
+live-updating todo card.
+
+1. Ack suppression (mechanical, mirrors background_owns_status): a successful
+   start_deep_research sets ToolContext.deep_research_started; handlers/text.py drops the
+   turn's reply — ONLY when nothing visible has streamed (committed preamble never
+   retracted); a started-but-empty native stream is torn down via _cleanup_silent_stream.
+   Prompt + tool schema both teach: write NOTHING after the call.
+2. Status card (_ResearchCard): ONE blocks message (section = todo list, context = "todos
+   as of H:MM"), SAME label as the findings (shared _research_label, 50-char bracket-safe).
+   Fallback `text` CONSTANT ("Deep research in progress…") — Slack badges "(edited)" on
+   text changes only, so blocks-only updates stay unbadged (the Claude trick). Lines tick
+   in from REAL tool events; 10-line loud cap ("… +N more steps"); finalizes to
+   "✓ Reported findings below." / "✗ hit a wall: …" / "✗ cancelled (bot shutting down)".
+   chat.update throttled to _card_throttle_s() = max(1.0, STREAMING_MIN_INTERVAL) — the
+   existing Slack ~1/sec knob, NOT a new magic number (user caught the drafted 4s) — with
+   coalescing + guaranteed trailing flush. Card ops best-effort, never kill the job.
+3. Tool-event observation: the job's ONE Responses call is consumed as an INTERNAL stream
+   (never streamed to Slack) via a new optional tool_event_callback on
+   create_streaming_response_with_tools (fired on output_item.done for web_search_call
+   with query when present, and non-errored mcp_call with server label); text + tools_used
+   rebuilt equivalent to the non-streaming path; deep_research_timeout bounds the whole
+   consumption. LIVE FIND: the OpenAIClient base wrapper didn't forward the new kwarg —
+   every job failed loudly (honest card ✗ + failure note) until e80f6c8; signature
+   regression test added. Lesson: module-seam stubs pass while the wrapper drifts.
+4. Facepile fix falls out: with the agent ack gone, the research identity is the only
+   extra byline in the thread (matches Claude's single-icon look).
+
+Ride-alongs same evening (user directives): "Continued in next message..." trailer dropped
+on send_message chunks + native-stream rolls (the next message's HEAD/Part-prefix alone
+marks the seam; merge condition is OR); ENABLE_LINK_PREVIEWS env toggle (default off:
+inline links, no unfurl cards, no unfurler "(edited)"); research trailer gained visible
+tool attribution ("· tools: web_search, datassential-production-ai").
+
+Live-verified (FDA front-of-package rule, 3m 21s): eyes ack + card only (NO model reply),
+card ticked real search queries live, capped at 10 lines "+6 more steps", finalized
+"✓ Reported findings below." before the 8-chunk labelled report with sources and the
+"_deep research · 3m 21s · effort high · tools: web_search_" trailer.
