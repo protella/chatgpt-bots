@@ -77,6 +77,18 @@ You are given the current memory (numbered) and the latest exchange. Respond wit
 Keep "content" to a single concise sentence. Output ONLY the JSON object."""
 
 
+# F16: compress ONE overlong external (MCP) tool output into a compact memory note so the
+# assistant can reuse it later instead of re-querying. The single most important rule is the
+# verbatim-preservation line: a summary that drops the URL/figure that made the result worth
+# keeping is worse than useless. {max_chars} is filled in at call time from
+# tool_result_digest_chars.
+TOOL_RESULT_SUMMARIZE_PROMPT = """You compress ONE external tool result into a compact note the assistant will reuse later instead of running the tool again.
+
+Rewrite the tool output as a SINGLE LINE of plain text, no more than {max_chars} characters. Preserve verbatim every URL, report title, date, figure, and ID exactly as written — those are the details that make the result reusable, so never paraphrase, abbreviate, reformat, or drop them. Cut only prose, boilerplate, and repetition to fit.
+
+Output ONLY the summary line — no preamble, no markdown, no quotes, no newlines."""
+
+
 LOCAL_TOOLS_GUIDANCE = """
 
 --- TOOLS ETIQUETTE ---

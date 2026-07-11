@@ -521,6 +521,15 @@ class BotConfig:
     tool_result_digest_chars: int = field(default_factory=lambda: int(os.getenv("TOOL_RESULT_DIGEST_CHARS", "2000")))
     # Per-turn total digest budget (chars, first-come order); calls past the cap store none.
     tool_result_turn_chars: int = field(default_factory=lambda: int(os.getenv("TOOL_RESULT_TURN_CHARS", "6000")))
+    # F16: instead of blindly truncating an overlong MCP output (which can amputate the URL/
+    # figure that made it worth keeping), summarize it ONCE at capture time with the utility
+    # model (low effort) — compress under tool_result_digest_chars, preserving URLs/titles/
+    # dates/figures/IDs verbatim. Off → today's pure truncation. Any summarizer error/timeout/
+    # overlong return also falls back to truncation, so the reply pipeline never blocks/raises.
+    enable_tool_result_summarization: bool = field(default_factory=lambda: os.getenv("ENABLE_TOOL_RESULT_SUMMARIZATION", "true").lower() == "true")
+    # Budget guard: feed the summarizer at most this many leading chars of an output so a
+    # pathological (huge) result can't blow up the utility call.
+    tool_result_summarize_input_chars: int = field(default_factory=lambda: int(os.getenv("TOOL_RESULT_SUMMARIZE_INPUT_CHARS", "20000")))
     # F14: provenance record shaping (env-backed; boot-constant so rebuild determinism holds).
     # Max tool entries recorded/replayed per turn — raised from 8: a late call may be the one
     # that mattered.
