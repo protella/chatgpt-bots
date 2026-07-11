@@ -1560,6 +1560,41 @@ matrix; mixin resilience without cache/identity. Live: "@Claude do you see…" �
 (pre-prompt-fix, reply withheld by the main model's own judgment) → after prompt fix,
 ignore ("The message explicitly addresses Claude, not ChatGPT").
 
+## F29. Channel people awareness (user directive 2026-07-11, modeled on Claude Tag)
+
+**Gap:** the bot had no ambient sense of WHO is around — no member count, no roster, and
+profile lookup existed only as an id-only history tool the model rarely found (a name is
+what it usually has). Claude Tag in the same channel demonstrated the target: durable
+people notes + on-demand lookups.
+
+**Design:**
+1. get_channel_context sends include_num_members=True; pulse gains recent_speakers()
+   (distinct names newest-first, self excluded, sanitized).
+2. Ambient "Channel people: ~N members; recently active: …" line on BOTH surfaces —
+   classifier signals (sharpens addressee/"you" resolution; prompt bullet: names there
+   are real, distinct participants) and the response suffix context.
+3. Persistent people layer = existing structures, no new store: DB user_info rows
+   (Slack stays source of truth) + channel-memory people facts.
+4. lookup_user tool: id, @mention, or display/real name → fresh users.info (title,
+   status, timezone, is_bot; NO email — carries over the retired tool's deliberate
+   profile-card-only rail); ambiguous name → candidates; unknown → hint.
+   list_channel_members: full pagination for a true count, first 50 names, loud
+   truncation. Both gated on ENABLE_PEOPLE_TOOLS (default true).
+5. Consolidation: fetch_user_profile (history tools, id-only) RETIRED — lookup_user
+   strictly subsumes it; two near-identical tools split the model's tool choice.
+6. Ride-along (user directive): placement rule rewritten — THREAD IS THE DEFAULT;
+   channel only for a genuinely one-line room-wide answer with no likely follow-up;
+   always thread when the message addressed multiple parties or another assistant will
+   likely answer too (all replies collect under the parent — threads need no "creation",
+   thread_ts IS the parent's ts).
+
+**Tests:** recent_speakers matrix; num_members extraction; people line on both surfaces
+incl. clean absence; lookup_user id/name/ambiguous/unknown paths + email-absent rail;
+member pagination cap + loud truncation; config gate; prompt substrings; retired-tool
+dispatch refusal. Live (one message): "who's in this channel and what's Claude's
+timezone?" → placement=thread, list_channel_members ok (5 members, correct names),
+lookup_user by NAME ok (Pacific Daylight Time), threaded native-streamed reply, 12s.
+
 ## Rollout / verification
 
 1. `make test` green after each change set (F4 → F1 → F2 → F3); `make lint` clean.
