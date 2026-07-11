@@ -9,13 +9,19 @@ deliver through the normal send path → cancel/await on shutdown.
 
 F30.1: the model's ack reply is SUPPRESSED (handlers/text.py drops it, cued by
 ``ToolContext.deep_research_started``). In its place the detached job posts a live-updating
-status card — the SAME labelled identity as the findings — that shows the task and ticks off
-tool activity as it happens, then reads "✓ Reported findings below." right before the report.
+status card — the SAME labelled identity as the findings — then reads
+"✓ Reported findings below." right before the report.
 
-The job runs its ONE Responses call as an INTERNAL stream (web_search + configured MCP
-servers, NO local tools) — never streamed to Slack; the stream is consumed only to observe
-web_search/MCP calls (driving the card) and to accumulate the final text + tools_used exactly
-as the non-streaming path did. It then posts the report with a compact provenance trailer.
+F30.2 (Claude-parity card content): the card's body lines are MODEL-AUTHORED milestones —
+the job carries ONE local tool, report_progress, and the model ticks goal-level
+accomplishments ("Searched X — found Y.") as it works. Raw web_search/MCP completions no
+longer add body lines; they bump live activity counters in the card's context line
+("todos as of H:MM · N web searches · …"). The headline ⏳ flips to ✅/❌ on finalize.
+
+The job runs a streaming TOOL LOOP internally (web_search + configured MCP servers +
+report_progress; round budget DEEP_RESEARCH_MAX_TOOL_ROUNDS) — never streamed to Slack; the
+stream is consumed only to observe tool activity (driving the card) and to accumulate the
+final text + tools_used. It then posts the report with a compact provenance trailer.
 Errors/timeouts finalize the card and post an honest one-line failure note — never silent.
 """
 from __future__ import annotations
@@ -40,6 +46,11 @@ _RESEARCH_JOB_INSTRUCTION = (
     "DETACHED background job: the user is not watching in real time and cannot answer "
     "follow-ups, so do not ask clarifying questions — investigate and report.\n\n"
     "TASK:\n{task}\n\n"
+    "As you work, keep the live status card honest with the report_progress tool: call it "
+    "once each time a major research goal completes, with a short past-tense line covering "
+    "what you did and what it yielded. Aim for 2-5 milestones across the whole job — "
+    "goal-level accomplishments, never one call per search — and report each one as you go; "
+    "finish all milestone reporting BEFORE you start writing the findings report.\n\n"
     "Cross-check multiple independent sources before stating a conclusion. Produce a clear, "
     "well-structured findings report that leads with the direct answer, supports each key "
     "claim with a source and a link, notes where sources disagree, and states honestly what "
@@ -77,6 +88,36 @@ def get_start_deep_research_schema() -> dict:
                 },
             },
             "required": ["task"],
+        },
+    }
+
+
+def get_report_progress_schema() -> dict:
+    """Function-tool schema for report_progress — the research job's ONLY local tool (F30.2).
+
+    The model ticks goal-level milestones onto the live status card as it works, so the card
+    reads as accomplished goals ('Searched X — found Y.') rather than a raw tool-call log."""
+    return {
+        "type": "function",
+        "name": "report_progress",
+        "description": (
+            "Add a completed milestone to the live status card the user is watching. Call it "
+            "each time a major research goal completes — NOT once per search. Pass one short "
+            "past-tense line stating what you investigated and what it yielded, e.g. "
+            "'Searched regulatory dockets and trade press for the final rule — found the "
+            "March 2026 Federal Register entry.' Report milestones as you go, and finish all "
+            "of them BEFORE you start writing the findings report."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "milestone": {
+                    "type": "string",
+                    "description": ("One short past-tense line: the goal that completed and "
+                                    "what it yielded."),
+                },
+            },
+            "required": ["milestone"],
         },
     }
 
@@ -135,11 +176,14 @@ def _now_label(clock: Callable[[], time.struct_time] = time.localtime) -> str:
 
 
 class _ResearchCard:
-    """Claude-parity live status card for a background research job (F30.1).
+    """Claude-parity live status card for a background research job (F30.1/F30.2).
 
-    Posts ONE blocks message — a section block whose mrkdwn is the todo list, plus a context
-    block "todos as of H:MM AM/PM" — with the same labelled identity as the findings, then
-    updates it in place as the job observes tool activity. chat.update is THROTTLED to at most
+    Posts ONE blocks message — a section block whose mrkdwn is the headline (⏳ + task gist,
+    flipping to ✅/❌ on finalize) plus the model-authored milestone lines (report_progress),
+    and a context block "todos as of H:MM AM/PM · N web searches · …" carrying live activity
+    counters — with the same labelled identity as the findings, then updates it in place.
+    Milestones are goal-level lines the model writes; raw tool events only bump the counters,
+    so the card never degenerates into a per-search log. chat.update is THROTTLED to at most
     one per ``_card_throttle_s()`` (STREAMING_MIN_INTERVAL) with a TRAILING flush, so the last event is never left
     unshown. The notification `text` is CONSTANT (``_CARD_FALLBACK_TEXT``) across every update
     so Slack never badges "(edited)". Every op is best-effort: a card failure is logged and
@@ -159,8 +203,11 @@ class _ResearchCard:
         self._clock = clock
         self._sleep = sleep
         self._now_label = now_label
-        self._gist_line = f"⏳ {_gist(task, 120)}"
-        self._steps: List[str] = []
+        self._task_gist = _gist(task, 120)
+        self._status_emoji = "⏳"
+        self._milestones: List[str] = []
+        self._web_searches = 0
+        self._mcp_calls: Dict[str, int] = {}
         self._terminal: Optional[str] = None
         self._dirty = False
         self._closed = False
@@ -170,21 +217,32 @@ class _ResearchCard:
 
     # --- rendering ---
     def _visible_lines(self) -> List[str]:
-        lines = [self._gist_line] + self._steps
+        lines = [f"{self._status_emoji} {self._task_gist}"] + self._milestones
         if len(lines) > _CARD_MAX_TODO_LINES:
             # Loud, counted tail collapse — never a silent cap.
             hidden = len(lines) - (_CARD_MAX_TODO_LINES - 1)
-            lines = lines[:_CARD_MAX_TODO_LINES - 1] + [f"… +{hidden} more steps"]
+            lines = lines[:_CARD_MAX_TODO_LINES - 1] + [f"… +{hidden} more milestones"]
         if self._terminal:
             lines.append(self._terminal)
         return lines
+
+    def _context_line(self) -> str:
+        """'todos as of H:MM' + live activity counters — the mechanical tool events live
+        here as counts, not as body lines."""
+        parts = [f"todos as of {self._now_label()}"]
+        if self._web_searches:
+            n = self._web_searches
+            parts.append(f"{n} web search{'es' if n != 1 else ''}")
+        for label, n in self._mcp_calls.items():
+            parts.append(f"{n} {label} call{'s' if n != 1 else ''}")
+        return " · ".join(parts)
 
     def _blocks(self) -> List[Dict[str, Any]]:
         return [
             {"type": "section",
              "text": {"type": "mrkdwn", "text": "\n".join(self._visible_lines())}},
             {"type": "context",
-             "elements": [{"type": "mrkdwn", "text": f"todos as of {self._now_label()}"}]},
+             "elements": [{"type": "mrkdwn", "text": self._context_line()}]},
         ]
 
     # --- posting / observing ---
@@ -212,23 +270,31 @@ class _ResearchCard:
                 self.channel_id, self.thread_root, _CARD_FALLBACK_TEXT, blocks)
         self.ts = ts
 
-    async def note_web_search(self, query: Optional[str]) -> None:
-        q = _gist(query, 60) if query else ""
-        self._steps.append(f"✓ searched the web: {q}" if q else "✓ searched the web")
+    async def add_milestone(self, text: str) -> None:
+        """A model-authored goal line (report_progress) — the card's body content."""
+        line = " ".join((text or "").split())
+        if not line:
+            return
+        self._milestones.append(f"✓ {_gist(line, 300)}")
+        await self._request_update()
+
+    async def note_web_search(self) -> None:
+        self._web_searches += 1
         await self._request_update()
 
     async def note_mcp(self, label: Optional[str]) -> None:
-        self._steps.append(f"✓ queried {label}" if label else "✓ queried an MCP server")
+        key = label or "MCP"
+        self._mcp_calls[key] = self._mcp_calls.get(key, 0) + 1
         await self._request_update()
 
     async def finalize_success(self) -> None:
-        await self._finalize("✓ Reported findings below.")
+        await self._finalize("✓ Reported findings below.", "✅")
 
     async def finalize_failure(self, reason: str) -> None:
-        await self._finalize(f"✗ hit a wall: {_gist(reason, 80)}")
+        await self._finalize(f"✗ hit a wall: {_gist(reason, 80)}", "❌")
 
     async def finalize_cancelled(self) -> None:
-        await self._finalize("✗ cancelled (bot shutting down)")
+        await self._finalize("✗ cancelled (bot shutting down)", "❌")
 
     # --- throttled update machinery ---
     async def _request_update(self) -> None:
@@ -260,10 +326,11 @@ class _ResearchCard:
             self._last_update = self._clock()
             await self._safe_update(self._blocks())
 
-    async def _finalize(self, terminal_line: str) -> None:
+    async def _finalize(self, terminal_line: str, status_emoji: str = "✅") -> None:
         """Force the final state out (bypassing the throttle) and close the card so any pending
-        trailing flush becomes a no-op."""
+        trailing flush becomes a no-op. Flips the headline ⏳ to the overall outcome emoji."""
         self._terminal = terminal_line
+        self._status_emoji = status_emoji
         if self._flush_task is not None and not self._flush_task.done():
             self._flush_task.cancel()
         async with self._lock:
@@ -285,14 +352,19 @@ class _ResearchCard:
 
 
 async def _consume_research_stream(processor, *, messages: List[Dict[str, Any]],
-                                   tools: List[Dict[str, Any]], model: str,
+                                   tools: List[Dict[str, Any]], registry: ToolRegistry,
+                                   tool_context: ToolContext, model: str,
                                    system_prompt: Optional[str], effort: str, verbosity: str,
                                    card: Optional["_ResearchCard"]) -> Dict[str, Any]:
-    """Run the job's ONE Responses call as an INTERNAL stream (never streamed to Slack).
+    """Run the job's Responses tool loop as an INTERNAL stream (never streamed to Slack).
 
-    Accumulates the final text exactly as the non-streaming path returned it, feeds observed
-    web_search/MCP completions to the status card, and rebuilds ``tools_used`` from those same
-    events (identical content to the non-streaming create_*_with_tools result). Returns
+    F30.2: this is the streaming TOOL LOOP, not a single call — ``registry`` carries the
+    job's one local tool (report_progress), so each model-authored milestone costs a round.
+    The round budget is DEEP_RESEARCH_MAX_TOOL_ROUNDS (the chat-turn cap of 4 would strangle
+    the 2-5 milestones the job instruction asks for). Accumulates the final round's text,
+    feeds observed web_search/MCP completions to the status card as activity counters, and
+    rebuilds ``tools_used`` from those same events (report_progress deliberately excluded —
+    the trailer attributes research sources, not card bookkeeping). Returns
     ``{"text", "tools_used"}``."""
     observed: List[str] = []
 
@@ -305,7 +377,7 @@ async def _consume_research_stream(processor, *, messages: List[Dict[str, Any]],
             if "web_search" not in observed:
                 observed.append("web_search")
             if card is not None:
-                await card.note_web_search(ev.get("query"))
+                await card.note_web_search()
         elif kind == "mcp":
             label = ev.get("server_label") or "mcp"
             if label not in observed:
@@ -313,12 +385,15 @@ async def _consume_research_stream(processor, *, messages: List[Dict[str, Any]],
             if card is not None:
                 await card.note_mcp(ev.get("server_label"))
 
-    text = await processor.openai_client.create_streaming_response_with_tools(
-        messages=messages, tools=tools, stream_callback=_stream_cb,
-        tool_callback=None, tool_event_callback=_on_event,
+    rounds_cap = max(1, int(getattr(config, "deep_research_max_tool_rounds", 10) or 10))
+    result = await processor.openai_client.create_streaming_response_with_tool_loop(
+        messages=messages, tools=tools, registry=registry, tool_context=tool_context,
+        stream_callback=_stream_cb, tool_callback=None, tool_event_callback=_on_event,
+        max_tool_rounds=rounds_cap, max_tool_calls=rounds_cap,
         model=model, system_prompt=system_prompt, reasoning_effort=effort,
         verbosity=verbosity, store=False)
-    return {"text": text or "", "tools_used": observed}
+    return {"text": (result.get("text") or "") if isinstance(result, dict) else (result or ""),
+            "tools_used": observed}
 
 
 async def execute_start_deep_research(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -413,22 +488,40 @@ async def _run_deep_research_job(*, processor, client, channel_id: str, thread_r
         await card.start()
     except Exception as e:  # noqa: BLE001 — a card failure must never kill the research
         processor.log_debug(f"Research card start failed: {e}")
+    # F30.2: the job's ONLY local tool — report_progress ticks model-authored milestones
+    # onto the card. A job-local registry + context, never the chat registry.
+    async def _report_progress(_ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
+        line = (args.get("milestone") or "").strip()
+        if not line:
+            return {"ok": False, "error": "missing_milestone",
+                    "message": "A milestone line is required."}
+        await card.add_milestone(line)
+        return {"ok": True}
+
+    job_registry = ToolRegistry()
+    job_registry.register(get_report_progress_schema(), _report_progress)
+    job_ctx = ToolContext(channel_id=channel_id, thread_ts=thread_root,
+                          trigger_ts=thread_root, client=client, processor=processor)
     try:
         # snapshot + an appended developer instruction to execute the task.
         job_input: List[Dict[str, Any]] = list(snapshot)
         job_input.append({"role": "developer",
                           "content": _RESEARCH_JOB_INSTRUCTION.format(task=task)})
-        # web_search + configured MCP servers, NO local tools (registry=None). web_search is
-        # FORCED into the job's tools regardless of the global toggle — this tool IS web
-        # research; a truthy MCP-only array must not silently strip it (Codex review find).
+        # web_search + configured MCP servers + report_progress (the job's one local tool).
+        # web_search is FORCED into the job's tools regardless of the global toggle — this
+        # tool IS web research; a truthy MCP-only array must not silently strip it (Codex
+        # review find).
         tools = processor._build_tools_array({}, model, registry=None) or []
         if not any(t.get("type") == "web_search" for t in tools):
             tools.append({"type": "web_search"})
-        # Internal streaming consumption bounds the WHOLE call by the deep-research timeout.
+        tools.append(get_report_progress_schema())
+        # Internal streaming consumption bounds the WHOLE tool loop by the deep-research
+        # timeout.
         result = await asyncio.wait_for(
             _consume_research_stream(
-                processor, messages=job_input, tools=tools, model=model,
-                system_prompt=system_prompt, effort=effort, verbosity=verbosity, card=card),
+                processor, messages=job_input, tools=tools, registry=job_registry,
+                tool_context=job_ctx, model=model, system_prompt=system_prompt,
+                effort=effort, verbosity=verbosity, card=card),
             timeout=timeout_s,
         )
         text = (result.get("text") or "").strip()
