@@ -172,6 +172,16 @@ def _research_label(processor, label_source: str) -> Optional[str]:
 # the top-level `text` changes, so keeping it fixed lets blocks-only updates stay unbadged.
 _CARD_FALLBACK_TEXT = "Deep research in progress…"
 _CARD_MAX_TODO_LINES = 10          # visible todo lines before the tail collapses to "+N more"
+_MILESTONE_GIST_CHARS = 300        # per-milestone gist cap (goal lines are 1-2 sentences)
+# Headline budget derived from Slack's REAL limit — a section block's text caps at 3000
+# chars — minus the worst-case rest of the body: (_CARD_MAX_TODO_LINES - 2) full milestone
+# lines ("✓ " + gist), the "+N more" overflow line, the terminal line, newlines, and the
+# status emoji (~150 chars of slack for those tail bits). Truncation only when the task
+# genuinely can't fit, never at an arbitrary width.
+_SECTION_TEXT_LIMIT = 3000
+_CARD_HEADLINE_CHARS = (_SECTION_TEXT_LIMIT
+                        - (_CARD_MAX_TODO_LINES - 2) * (_MILESTONE_GIST_CHARS + 2)
+                        - 150)
 
 
 def _card_throttle_s() -> float:
@@ -214,7 +224,7 @@ class _ResearchCard:
         self._clock = clock
         self._sleep = sleep
         self._now_label = now_label
-        self._task_gist = _gist(task, 120)
+        self._task_gist = _gist(task, _CARD_HEADLINE_CHARS)
         self._status_emoji = "⏳"
         self._milestones: List[str] = []
         self._web_searches = 0
@@ -286,7 +296,7 @@ class _ResearchCard:
         line = " ".join((text or "").split())
         if not line:
             return
-        self._milestones.append(f"✓ {_gist(line, 300)}")
+        self._milestones.append(f"✓ {_gist(line, _MILESTONE_GIST_CHARS)}")
         await self._request_update()
 
     async def note_web_search(self) -> None:
