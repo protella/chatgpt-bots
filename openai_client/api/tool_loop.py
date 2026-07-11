@@ -300,6 +300,8 @@ async def create_streaming_response_with_tool_loop(
     stream_callback: Callable[[Optional[str]], Any],
     tool_callback: Optional[Callable[[str, str], Any]] = None,
     prior_committed: bool = False,
+    max_tool_rounds: Optional[int] = None,
+    max_tool_calls: Optional[int] = None,
     **params: Any,
 ) -> Dict[str, Any]:
     """Streaming response with local tool execution.
@@ -311,7 +313,14 @@ async def create_streaming_response_with_tool_loop(
     this turn already exposed visible text (e.g. an MCP-failure retry after a partial
     reply), so a no_response_needed on this attempt is rejected rather than orphaning that
     partial as fake silence.
+
+    ``max_tool_rounds`` / ``max_tool_calls`` override the config chat-turn caps for callers
+    with a different round economy (F30.2: the research job spends a round per milestone
+    report, so the 4-round chat default would strangle it).
     """
+    rounds_cap = int(max_tool_rounds) if max_tool_rounds is not None else config.max_tool_rounds
+    calls_cap = (int(max_tool_calls) if max_tool_calls is not None
+                 else config.max_tool_calls_per_turn)
     input_items: List[Dict[str, Any]] = list(messages)
     tools_used_all: List[str] = []
     local_tool_calls: List[Dict[str, Any]] = []
@@ -361,7 +370,7 @@ async def create_streaming_response_with_tool_loop(
                 return await _handle_no_reply_terminal(
                     self, registry, tool_context, calls, terminal_call,
                     tools_used_all, local_tool_calls,
-                    remaining_budget=config.max_tool_calls_per_turn - total_calls)
+                    remaining_budget=calls_cap - total_calls)
             # A visible reply already began: no_response_needed is INVALID. Reject it
             # (feed an error back), run any siblings, and CONTINUE so the model completes
             # the reply into the same streamed message. WARNING = contract friction.
@@ -374,7 +383,7 @@ async def create_streaming_response_with_tool_loop(
                 self, registry, tool_context, sink, input_items, local_tool_calls, tool_callback,
                 result_overrides={id(terminal_call): _INVALID_NO_REPLY_RESULT})
             _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")])
-            if rounds >= config.max_tool_rounds or total_calls >= config.max_tool_calls_per_turn:
+            if rounds >= rounds_cap or total_calls >= calls_cap:
                 self.log_warning(
                     f"Tool loop cap hit ({rounds} rounds / {total_calls} calls) — forcing final answer"
                 )
@@ -388,7 +397,7 @@ async def create_streaming_response_with_tool_loop(
         )
         _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")])
 
-        if rounds >= config.max_tool_rounds or total_calls >= config.max_tool_calls_per_turn:
+        if rounds >= rounds_cap or total_calls >= calls_cap:
             self.log_warning(
                 f"Tool loop cap hit ({rounds} rounds / {total_calls} calls) — forcing final answer"
             )

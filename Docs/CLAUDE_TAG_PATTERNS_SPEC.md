@@ -1724,3 +1724,46 @@ Live-verified (FDA front-of-package rule, 3m 21s): eyes ack + card only (NO mode
 card ticked real search queries live, capped at 10 lines "+6 more steps", finalized
 "✓ Reported findings below." before the 8-chunk labelled report with sources and the
 "_deep research · 3m 21s · effort high · tools: web_search_" trailer.
+
+## F30.2 — Model-authored milestones on the research card (user directive 2026-07-11)
+
+User feedback on the live F30.1 card (FDA run screenshots): (a) the headline hourglass never
+resolved to an overall outcome; (b) the body was a per-search log — many bare "searched the
+web" lines (the OpenAI web_search_call action only carries a query for true "search" actions;
+page-opens/find-in-page carry a URL instead, hence the inconsistent suffixes), long enough
+that Slack collapsed the message behind "Show more"; (c) Claude's card reads as GOALS
+("Searched Reddit, HN, and X for staff statements — found a Head-of-Claude-Code explanation
+on HN."), not tool events — "maybe we try to make it more like this?".
+
+Design (Claude parity — the model authors its own todo list):
+1. report_progress tool: the research job now runs the streaming TOOL LOOP
+   (create_streaming_response_with_tool_loop) instead of a bare call, with a JOB-LOCAL
+   ToolRegistry carrying exactly ONE local tool — report_progress(milestone). The job
+   instruction asks for 2-5 goal-level past-tense milestones ("what you did — what it
+   yielded"), reported as they complete and all BEFORE the findings report is written
+   (intermediate-round text is discarded by the loop, so report-then-tick would lose text).
+   Each milestone renders "✓ {line}" on the card body. Empty milestones rejected
+   (structured error). Trailer tools attribution still rebuilt from server-tool events only
+   — report_progress is card bookkeeping, not a research source.
+2. Mechanical events → context-line counters: raw web_search/MCP completions no longer add
+   body lines; they bump live counters rendered in the context block — "todos as of H:MM ·
+   14 web searches · 3 datassential calls" (pluralized; unlabeled MCP buckets as "MCP").
+   Kills the per-search spam, the inconsistent query suffixes, and the "Show more" collapse
+   in one move, while the card still visibly breathes between milestones.
+3. Headline outcome flip: "⏳ {task}" → "✅ …" on success, "❌ …" on failure/cancel
+   (finalize also keeps the terminal line: "✓ Reported findings below." / "✗ hit a wall").
+4. Round budget: the tool loop's chat-turn caps (MAX_TOOL_ROUNDS=4) would strangle
+   milestone reporting (each report_progress costs a round), so
+   create_streaming_response_with_tool_loop gained max_tool_rounds/max_tool_calls override
+   kwargs (config defaults when absent; on cap → tool_choice="none", never an error) and
+   the job passes DEEP_RESEARCH_MAX_TOOL_ROUNDS (default 10 = the 5-milestone ceiling with
+   2x headroom — derived, not arbitrary). Signature-drift regression test added (wrapper
+   passes **params; the e80f6c8 lesson).
+5. Cap line renamed "… +N more milestones"; 10-line loud cap now nearly unreachable.
+6. .env dedup ride-along: the F30 block had been mirrored into .env twice (identical
+   values); removed the duplicate set, added DEEP_RESEARCH_MAX_TOOL_ROUNDS to both .env and
+   .env.example.
+
+Slack facts (answered same turn): the "Show more/Show less" collapse is Slack's own
+long-message truncation — no API control; the fix is a shorter card. The "(edited)" badge
+stays suppressed: milestones/counters are blocks-only updates on a constant fallback text.
