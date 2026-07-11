@@ -142,6 +142,62 @@ class TestDebounceAndRails:
         assert fake.calls == 1       # ONE engine call for the burst
 
     @pytest.mark.asyncio
+    async def test_thread_message_survives_newer_message_in_other_thread(self, monkeypatch):
+        """F21: supersession is conversation-scoped. A pending evaluation in thread A
+        must NOT be dropped because thread B (or another conversation) posted something
+        newer in the same channel during the debounce window."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
+        fake = _FakeClient({"action": "respond"})
+        engine = ParticipationEngine(fake)
+        a = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="10.5", text="question in thread A", thread_root_ts="10.0"))
+        await asyncio.sleep(0.01)
+        b = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="20.5", text="chatter in thread B", thread_root_ts="20.0"))
+        ra, rb = await asyncio.gather(a, b)
+        assert ra is not None and ra.action == "respond"   # thread A still judged
+        assert rb is not None and rb.action == "respond"
+        assert fake.calls == 2                             # both conversations evaluated
+
+    @pytest.mark.asyncio
+    async def test_thread_message_survives_newer_top_level(self, monkeypatch):
+        """F21: a newer TOP-LEVEL message must not supersede a pending thread reply."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
+        fake = _FakeClient({"action": "respond"})
+        engine = ParticipationEngine(fake)
+        a = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="10.5", text="thread question", thread_root_ts="10.0"))
+        await asyncio.sleep(0.01)
+        b = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="30.0", text="unrelated top-level"))  # roots key as |top
+        ra, rb = await asyncio.gather(a, b)
+        assert ra is not None and rb is not None
+        assert fake.calls == 2
+
+    @pytest.mark.asyncio
+    async def test_same_thread_burst_still_collapses(self, monkeypatch):
+        """F21: within ONE thread the old behavior holds — the newest message of a
+        rapid burst supersedes the older ones (its tail covers the batch)."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
+        fake = _FakeClient({"action": "respond"})
+        engine = ParticipationEngine(fake)
+        first = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="10.5", text="line one", thread_root_ts="10.0"))
+        await asyncio.sleep(0.01)
+        second = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="10.6", text="line two", thread_root_ts="10.0"))
+        r1, r2 = await asyncio.gather(first, second)
+        assert r1 is None            # superseded within the conversation
+        assert r2.action == "respond"
+        assert fake.calls == 1
+
+    def test_conv_key_root_vs_reply(self):
+        """A thread ROOT keys as top-level (thread_root == ts); its replies key by root."""
+        assert ParticipationEngine._conv_key("C1", "10.0", "10.0") == "C1|top"
+        assert ParticipationEngine._conv_key("C1", "10.5", "10.0") == "C1|10.0"
+        assert ParticipationEngine._conv_key("C1", "30.0", None) == "C1|top"
+
+    @pytest.mark.asyncio
     async def test_channels_debounce_independently(self, monkeypatch):
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.02, raising=False)
         fake = _FakeClient({"action": "ignore"})
