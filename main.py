@@ -135,6 +135,7 @@ class ChatBotV2:
                 sender_is_bot=message.metadata.get("participation_sender_bot") is True,
                 channel_topic=channel_topic,
                 capabilities=capabilities,
+                attachments=message.metadata.get("participation_attachments"),
                 pulse=pulse, thread_root_ts=message.thread_id,
             )
             if verdict is None:  # superseded by a newer message during debounce

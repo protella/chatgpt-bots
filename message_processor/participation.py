@@ -71,6 +71,8 @@ def render_capabilities_line(mcp_manager: Any = None) -> Optional[str]:
 
     - "web search" when config.enable_web_search;
     - "image generation and editing" (always true for this bot);
+    - "analyzing images and documents shared in chat" (F14b — vision/document flows
+      are core, so the classifier weighs "what do we think?" about an attached artifact);
     - one entry per MCP server when config.mcp_enabled_default AND mcp_manager is
       present AND has servers: each server's `server_description` (from
       mcp_config.json) falling back to its label. Servers iterate in insertion
@@ -82,6 +84,7 @@ def render_capabilities_line(mcp_manager: Any = None) -> Optional[str]:
     if getattr(config, "enable_web_search", False):
         caps.append("web search")
     caps.append("image generation and editing")
+    caps.append("analyzing images and documents shared in chat")
     if (getattr(config, "mcp_enabled_default", False)
             and mcp_manager is not None):
         try:
@@ -139,6 +142,7 @@ class ParticipationEngine:
                        sender_is_bot: bool = False,
                        channel_topic: Optional[str] = None,
                        capabilities: Optional[str] = None,
+                       attachments: Optional[str] = None,
                        pulse: Any = None,
                        thread_root_ts: Optional[str] = None) -> Optional[ParticipationVerdict]:
         """Debounced judgment. Returns None when superseded — a newer message in
@@ -174,6 +178,7 @@ class ParticipationEngine:
             "sender_is_bot": bool(sender_is_bot),
             "channel_topic": channel_topic,
             "capabilities": capabilities,
+            "attachments": attachments,
         }
         try:
             raw = await self.openai_client.classify_participation(text=text, signals=signals)
