@@ -10,7 +10,7 @@ from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_sdk.errors import SlackApiError
 
 from base_client import HistoryFetchError, Message, Response
-from config import SUPPORTED_CHAT_MODELS, config, pipeline_status_markers
+from config import SUPPORTED_CHAT_MODELS, config, pipeline_status_markers, valid_emoji_name
 from message_markers import (
     CONTINUATION_HEAD,
     continuation_trailer,
@@ -893,24 +893,29 @@ class SlackMessagingMixin:
     # --- react_to_message local tool (redesign Phase D) ---
 
     def get_react_tool_schema(self) -> dict:
-        """Function-tool schema for model-invoked reactions. The emoji enum is the
-        REACTION_EMOJIS allowlist, so the model can only pick vetted (on-brand) emoji."""
+        """Function-tool schema for model-invoked reactions. By default the model may pick
+        ANY standard Slack emoji shorthand name — choosing the right one IS the judgment.
+        If REACTION_EMOJIS is configured, it constrains the choice to that allowlist via an
+        enum (brand control)."""
         allowed = [e.strip().strip(":") for e in (config.reaction_emojis or []) if e and e.strip().strip(":")]
+        emoji_schema = {"type": "string",
+                        "description": "Any standard Slack emoji shorthand name (no colons), e.g. joy, tada, fire."}
+        if allowed:
+            emoji_schema["enum"] = allowed
         return {
             "type": "function",
             "name": "react_to_message",
             "description": (
-                "Add an emoji reaction to a Slack message, like a human colleague would — "
-                "sparingly and tastefully (an acknowledgment, a ✅ on a completed request, a "
-                "celebration). If a reaction alone fully answers the message, react and reply "
-                "with empty text. Defaults to the message you are answering. Call once per "
-                "emoji when asked for multiple."
+                "Add an emoji reaction to a Slack message, the way a teammate would — when "
+                "something lands, when you agree, when the room is already reacting, or to "
+                "acknowledge a completed request (a ✅, a celebration). If a reaction alone "
+                "fully answers the message, react and reply with empty text. Defaults to the "
+                "message you are answering. Call once per emoji when asked for multiple."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "emoji": {"type": "string", "enum": allowed,
-                              "description": "Reaction emoji name (no colons)."},
+                    "emoji": emoji_schema,
                     "ts": {"type": "string",
                            "description": "Optional ts of another recent message in this channel to react to."},
                 },
@@ -919,14 +924,17 @@ class SlackMessagingMixin:
         }
 
     async def execute_react_tool(self, ctx, args: dict) -> dict:
-        """Executor for react_to_message. Allowlist + per-message cap
+        """Executor for react_to_message. Syntactic emoji validation (Slack's invalid_name
+        is the semantic backstop) + optional REACTION_EMOJIS allowlist + per-message cap
         (REACTION_MAX_PER_MESSAGE distinct emoji); never raises (returns
         {"ok": False, ...} on any refusal/failure)."""
         if not (config.enable_reactions and config.enable_react_tool):
             return {"ok": False, "error": "disabled", "message": "Reactions are disabled."}
         emoji = (args.get("emoji") or "").strip().strip(":")
-        allowed = {e.strip().strip(":") for e in (config.reaction_emojis or [])}
-        if not emoji or emoji not in allowed:
+        if not valid_emoji_name(emoji):
+            return {"ok": False, "error": "invalid_emoji", "message": "Not a valid emoji shorthand name."}
+        allowed = {e.strip().strip(":") for e in (config.reaction_emojis or []) if e and e.strip().strip(":")}
+        if allowed and emoji not in allowed:
             return {"ok": False, "error": "emoji_not_allowed", "allowed": sorted(allowed)}
         channel_id = getattr(ctx, "channel_id", None)
         ts = (args.get("ts") or "").strip() or getattr(ctx, "trigger_ts", None) or getattr(ctx, "thread_ts", None)

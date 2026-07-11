@@ -83,7 +83,9 @@ class SlackBot(SlackMessageEventsMixin,
                 schema,
                 lambda ctx, args, _name=name: self.dispatch_history_tool_call(_name, args, ctx),
             )
-        if config.enable_reactions and config.enable_react_tool and config.reaction_emojis:
+        # F20: no longer gated on a non-empty REACTION_EMOJIS — the default is unrestricted
+        # judgment (any standard emoji); an allowlist, when set, only constrains the choice.
+        if config.enable_reactions and config.enable_react_tool:
             registry.register(self.get_react_tool_schema(), self.execute_react_tool)
         # F2: no_response_needed is exposed only on unprompted turns (participation_check),
         # via the per-request _unprompted_turn flag the text handler sets in a COPIED config.
