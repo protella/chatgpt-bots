@@ -15,7 +15,7 @@ from message_processor.utilities import MessageUtilitiesMixin
 class _WakeHost:
     def __init__(self):
         for n in ("_build_wake_envelope", "_wake_trigger_line", "_wake_sender_role",
-                  "_build_suffix_context"):
+                  "_wake_burst_line", "_build_suffix_context"):
             setattr(self, n, getattr(MessageUtilitiesMixin, n).__get__(self))
         self._escape_suffix_text = MessageUtilitiesMixin._escape_suffix_text
 
@@ -106,6 +106,40 @@ def test_unknown_root_omits_role():
         _msg(wake_source="ambient", sender_type="human"), _state(root_author=None))
     assert "sender: alice" in env
     assert "root author" not in env and "participant" not in env
+
+
+# ------------------------------------------------------------------- F27 burst line
+
+def test_burst_earlier_rendered():
+    env = _WakeHost()._build_wake_envelope(
+        _msg(wake_source="ambient", sender_type="human",
+             participation_burst_earlier=["first thought", "and this too"]), _state())
+    assert "Moments before this message, the same person also sent:" in env
+    assert '"first thought"' in env and '"and this too"' in env
+    assert "treat the burst as one combined request" in env
+
+
+def test_burst_earlier_absent_adds_nothing():
+    env = _WakeHost()._build_wake_envelope(
+        _msg(wake_source="ambient", sender_type="human"), _state())
+    assert "Moments before" not in env
+
+
+def test_burst_earlier_empty_or_malformed_adds_nothing():
+    for bad in ([], ["", "  "], "not a list", None, [123, None]):
+        env = _WakeHost()._build_wake_envelope(
+            _msg(wake_source="ambient", sender_type="human",
+                 participation_burst_earlier=bad), _state())
+        assert "Moments before" not in env
+
+
+def test_burst_earlier_escaped_and_capped():
+    env = _WakeHost()._build_wake_envelope(
+        _msg(wake_source="ambient", sender_type="human",
+             participation_burst_earlier=["a\nb[c]", "x" * 500]), _state())
+    # brackets/control chars from the carried text don't leak; long text is capped with …
+    assert "b[c]" not in env
+    assert "…" in env
 
 
 # ------------------------------------------------------------------- escaping / off
