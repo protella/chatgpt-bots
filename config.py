@@ -5,6 +5,7 @@ Handles all environment variables and default settings
 import logging
 import os
 import random
+import re
 from functools import lru_cache
 from dotenv import load_dotenv
 from typing import Optional, Dict, Any
@@ -25,6 +26,18 @@ def _env_list(var_name: str, default: list, sep: str = ",") -> list:
     items = [part.strip() for part in raw.split(sep)]
     items = [item for item in items if item]
     return items or list(default)
+
+
+# F20: syntactic gate for a Slack emoji shorthand name (no colons). Any name that passes
+# is offered to Slack's reactions.add, whose own invalid_name error is the semantic
+# backstop; this only rejects obvious garbage so a malformed model arg never hits the API.
+_EMOJI_NAME_RE = re.compile(r"^[a-z0-9_+'-]{1,64}$")
+
+
+def valid_emoji_name(name: str) -> bool:
+    """True if `name` is a syntactically plausible Slack emoji shorthand (lowercase name
+    charset, sane length; no colons)."""
+    return bool(name) and bool(_EMOJI_NAME_RE.match(name))
 
 
 def _resolve_repo_path(path: str) -> str:
@@ -386,11 +399,11 @@ class BotConfig:
 
     # --- Emoji reactions as a response (Phase 4) ---
     enable_reactions: bool = field(default_factory=lambda: os.getenv("ENABLE_REACTIONS", "true").lower() == "true")
-    # Vetted emoji the bot is allowed to use as a reaction-response (names, no colons).
-    # Env: REACTION_EMOJIS (comma-separated).
-    reaction_emojis: list = field(default_factory=lambda: _env_list("REACTION_EMOJIS", [
-        "thumbsup", "eyes", "white_check_mark", "raised_hands", "tada", "thinking_face", "+1",
-    ]))
+    # F20: OPTIONAL reaction allowlist (names, no colons). Default EMPTY = unrestricted —
+    # the bot may pick any standard Slack emoji (picking the right one is the judgment).
+    # When set via REACTION_EMOJIS, it is honored everywhere as an allowlist (tool-schema
+    # enum, executor, classifier verdict) for workspaces wanting brand control.
+    reaction_emojis: list = field(default_factory=lambda: _env_list("REACTION_EMOJIS", []))
     # F6: max distinct emoji the bot may place on a single message. Guards against
     # over-reaction while still letting a user who asks for several get several.
     reaction_max_per_message: int = field(default_factory=lambda: int(os.getenv("REACTION_MAX_PER_MESSAGE", "4")))

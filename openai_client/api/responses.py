@@ -1041,8 +1041,13 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
         f"- Assistant's unprompted replies in this channel in the last hour: "
         f"{int(signals.get('unprompted_last_hour') or 0)}"
     )
-    allow = list(getattr(config, "reaction_emojis", None) or ["eyes"])
-    lines.append(f"- Allowed reaction emoji: {', '.join(allow)}")
+    # F20: unrestricted by default (any standard Slack emoji); an explicit REACTION_EMOJIS
+    # allowlist, when set, is surfaced as the constrained choice. Fixed ordering (cache).
+    allow = [e.strip().strip(":") for e in (getattr(config, "reaction_emojis", None) or []) if e and e.strip().strip(":")]
+    if allow:
+        lines.append(f"- Allowed reaction emoji (choose one): {', '.join(allow)}")
+    else:
+        lines.append("- Reaction emoji: any standard Slack emoji name (shorthand, no colons)")
     if signals.get("directives"):
         lines.append(f"- Channel ground rules (honor them): {signals['directives']}")
     facts = signals.get("memory_facts") or []

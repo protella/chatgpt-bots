@@ -106,6 +106,10 @@ class ChannelPulse:
         # OUTER map is a whole-channel LRU (bounded like _thread_tails) so it can't grow
         # without limit; the inner window is bounded per-channel by _SEEN_TS_MAX.
         self._seen_ts: "OrderedDict[str, OrderedDict[str, bool]]" = OrderedDict()
+        # F20 social proof: channel -> OrderedDict(ts -> {emoji: count}) of OTHERS' (and the
+        # bot's) reactions, so envelope/tail lines can show what the room is reacting to.
+        # In-memory only; both maps LRU-bounded (per-channel by _SEEN_TS_MAX, channels below).
+        self._reactions: "OrderedDict[str, OrderedDict[str, Dict[str, int]]]" = OrderedDict()
 
     # ------------------------------------------------------------------ feed
 
@@ -292,6 +296,66 @@ class ChannelPulse:
         cutoff = now - 3600
         return sum(1 for t in dq if t >= cutoff)
 
+    # ------------------------------------------------------ reactions (F20)
+
+    @staticmethod
+    def _norm_reaction(emoji: Optional[str]) -> str:
+        """Base emoji shorthand for a reaction (colons stripped, skin-tone variant folded
+        to its base so 'thumbsup::skin-tone-2' counts as 'thumbsup')."""
+        return (emoji or "").strip().strip(":").split("::", 1)[0]
+
+    def add_reaction(self, channel_id: str, ts: str, emoji: str, count: int = 1) -> None:
+        """Accumulate a reaction on the message keyed by `ts` (zero-await, in-memory only).
+        Tracked even if the message itself isn't in the ring — a reaction that arrives before
+        the message event isn't lost. LRU-bounded per channel and across channels."""
+        if not channel_id or self._is_dm(channel_id) or not ts:
+            return
+        name = self._norm_reaction(emoji)
+        if not name:
+            return
+        chan = self._reactions.get(channel_id)
+        if chan is None:
+            chan = self._reactions[channel_id] = OrderedDict()
+        self._reactions.move_to_end(channel_id)
+        counts = chan.get(ts)
+        if counts is None:
+            counts = chan[ts] = {}
+        chan.move_to_end(ts)
+        counts[name] = counts.get(name, 0) + max(1, int(count))
+        while len(chan) > _SEEN_TS_MAX:
+            chan.popitem(last=False)
+        channels_max = int(getattr(config, "pulse_thread_tail_channels_max", 30))
+        while len(self._reactions) > max(1, channels_max):
+            self._reactions.popitem(last=False)
+
+    def remove_reaction(self, channel_id: str, ts: str, emoji: str) -> None:
+        """Decrement a reaction count (floor 0; empties are pruned). No-op when untracked."""
+        if not channel_id or not ts:
+            return
+        name = self._norm_reaction(emoji)
+        counts = (self._reactions.get(channel_id) or {}).get(ts)
+        if not name or not counts or name not in counts:
+            return
+        counts[name] -= 1
+        if counts[name] <= 0:
+            del counts[name]
+        if not counts:
+            chan = self._reactions.get(channel_id)
+            if chan is not None:
+                chan.pop(ts, None)
+
+    def render_reactions(self, channel_id: str, ts: str) -> str:
+        """Compact top-2 summary for a message ts, e.g. '[reactions: 3× joy, 1× fire]', or ""
+        when none. Deterministic given ring state: sorted by count desc then emoji name."""
+        counts = (self._reactions.get(channel_id) or {}).get(ts)
+        if not counts:
+            return ""
+        top = sorted(((c, name) for name, c in counts.items() if c > 0),
+                     key=lambda ci: (-ci[0], ci[1]))[:2]
+        if not top:
+            return ""
+        return "[reactions: " + ", ".join(f"{c}× {name}" for c, name in top) + "]"
+
     # ----------------------------------------------------- thread tail (F5)
 
     def thread_has_other_bot(self, channel_id: str, root_ts: Optional[str]) -> bool:
@@ -336,9 +400,15 @@ class ChannelPulse:
         # so all lines render in UTC — consistent within the block, which is what relative-gap
         # reasoning needs. Guarded so config-off leaves the tail byte-identical.
         stamp_on = getattr(config, "enable_message_timestamps", False)
+        # F20: append the room's reaction summary as the pinned last suffix on each line
+        # (F7-5 order: … → [reactions:]); omitted when the message has none.
+        def _rx(ts: str) -> str:
+            s = self.render_reactions(channel_id, ts)
+            return f" {s}" if s else ""
         lines = [
             f'- {(render_message_timestamp(e["ts"]) + " ") if stamp_on else ""}'
             f'{e["display_name"]} [{"bot" if e["is_bot"] else "human"}]: "{e["tail_text"]}"'
+            f'{_rx(e["ts"])}'
             for e in entries
         ]
         return (
@@ -372,7 +442,10 @@ class ChannelPulse:
             else:
                 where = "top-level"
             stamp = (render_message_timestamp(e["ts"]) + " ") if stamp_on else ""
-            lines.append(f'- {stamp}{e["display_name"]} ({where}): {e["text"]}')
+            # F20: pinned reaction summary suffix (F7-5 order), omitted when none.
+            rx = self.render_reactions(channel_id, e["ts"])
+            rx = f" {rx}" if rx else ""
+            lines.append(f'- {stamp}{e["display_name"]} ({where}): {e["text"]}{rx}')
         if not lines:
             return ""
         lines = lines[-max_lines:]

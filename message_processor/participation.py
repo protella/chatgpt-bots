@@ -27,7 +27,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from config import config
+from config import config, valid_emoji_name
 
 def _ts_key(ts: Any) -> tuple:
     """Numeric (seconds, microseconds) sort key for a Slack ts — never lexical, so
@@ -196,8 +196,10 @@ class ParticipationEngine:
     @staticmethod
     def validate_verdict(raw: Any) -> ParticipationVerdict:
         """Coerce a raw model dict into a safe verdict. Anything malformed →
-        ignore; a react emoji outside the allowlist falls back to the first
-        allowlisted emoji (same choice the old wake gate made)."""
+        ignore. F20: by default any syntactically valid standard emoji name is
+        accepted (a garbage name downgrades the react to ignore); when a
+        REACTION_EMOJIS allowlist is set, an off-list emoji falls back to the
+        first allowlisted emoji (the choice the old wake gate made)."""
         if not isinstance(raw, dict):
             return ParticipationVerdict(action="ignore", reason="malformed-verdict")
         action = str(raw.get("action") or "").strip().lower()
@@ -205,10 +207,13 @@ class ParticipationEngine:
             return ParticipationVerdict(action="ignore", reason="invalid-action")
         emoji = None
         if action == "react":
-            allow = list(getattr(config, "reaction_emojis", None) or ["eyes"])
+            allow = [e.strip().strip(":") for e in (getattr(config, "reaction_emojis", None) or []) if e and e.strip().strip(":")]
             emoji = str(raw.get("emoji") or "").strip().strip(":")
-            if emoji not in allow:
-                emoji = allow[0]
+            if allow:
+                if emoji not in allow:
+                    emoji = allow[0]
+            elif not valid_emoji_name(emoji):
+                return ParticipationVerdict(action="ignore", reason="react-no-valid-emoji")
         placement = str(raw.get("placement") or "thread").strip().lower()
         if placement not in VALID_PLACEMENTS:
             placement = "thread"
