@@ -107,8 +107,9 @@ async def test_lookup_by_bare_id():
     assert res["ok"] and res["id"] == "U07PETER"
     assert res["real_name"] == "Erin Evans" and res["title"] == "Engineer"
     assert res["timezone"] == "Eastern"
-    # Profile-CARD facts only: the retired fetch_user_profile's no-email rail carries over.
-    assert "email" not in res
+    # Workspace-visible profile data includes email (user decision 2026-07-11:
+    # the retired fetch_user_profile's no-email rail does NOT carry over).
+    assert res["email"] == "peter@x.com"
     api.users_info.assert_awaited_once_with(user="U07PETER")
 
 
