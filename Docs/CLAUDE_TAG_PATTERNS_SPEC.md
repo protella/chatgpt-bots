@@ -1468,6 +1468,68 @@ truncates and caps at 3+N; envelope/tail line carries the named note; schema + h
 guidance substrings; history-tool line includes file names; no-files messages
 unchanged.
 
+## F26. OCR text for scanned PDFs on later turns (user directive 2026-07-11)
+
+**Gap (live doc-matrix find):** an image-only PDF (no text layer) is fully readable on
+its attach turn — the native input_file route hands the model rendered pages — but on
+any LATER turn the content is re-derived by local extraction (pdfplumber→pypdf), which
+yields nothing for scans. read_document called safe_extract with ocr_images=False (page
+images are useless in a text tool result) and returned extraction_failed; the bot
+failed honestly but the document was effectively lost after its first turn. The old
+ocr_images=True path only ever produced base64 page IMAGES for vision, never text.
+
+**Design:**
+1. New system deps: tesseract-ocr (+poppler-utils, already required by pdf2image);
+   pytesseract added to requirements.in. Graceful degradation when the binary is
+   missing: log a warning, fall back to the previous honest-failure notes, never raise.
+2. document_handler gains an OCR-TEXT capability orthogonal to page-images-for-vision:
+   image-based PDF + ocr_text requested + ENABLE_PDF_OCR → render pages via pdf2image
+   at OCR_DPI and pytesseract each page into "[Page N]" structured content. The
+   attach-turn big-file local path (ocr_images=True) emits BOTH page images and OCR
+   text (better summaries for scans); the native route is untouched.
+3. read_document requests ocr_text=True (still ocr_images=False); OCR output lands in
+   the existing ExtractionCache, so OCR runs once per file per process.
+4. Config: ENABLE_PDF_OCR (default true), OCR_MAX_PAGES (default 20 — tesseract at
+   300 DPI ≈ 1–3 s/page, bounds worst case near the tool-call timeout; truncation is
+   LOUD via a bracketed note in content, never silent), OCR_DPI (default 300 —
+   tesseract accuracy; 150 was live-verified too low for small text).
+5. Memory contract note: pytesseract passes images to the tesseract binary via its own
+   internal temp files — documented alongside the existing poppler exception.
+
+**Tests:** mocked-pytesseract OCR content structure, loud truncation, missing-binary
+fallback, ENABLE_PDF_OCR=false skip, read_document scan path returns text; one real
+PIL-built image-only PDF → OCR round-trip (skipped when tesseract/poppler absent).
+
+## F27. Same-author burst = one combined answer; per-author top-level supersession (user directive 2026-07-11)
+
+**Gap (live find, flagged in doc-matrix wrap-up):** F21 keyed ALL top-level messages to
+one "channel|top" stream. Two consequences: a same-author fast-follow ("second
+thought" addendum) superseded the first message and the surviving reply only addressed
+the newest text — the first question went unanswered; and two DIFFERENT users' unrelated
+top-level questions inside the debounce window collapsed, silently dropping the older.
+User directive: a fast follow or addendum from the same person should be answered as
+one combined request; independent people get independent answers.
+
+**Design:**
+1. Top-level supersession key becomes per-author: "channel|top|{user_id}". Different
+   authors' top-level messages never supersede each other. Thread-reply keys stay
+   "channel|root" — in-thread cross-author collapse is safe because the reply lands
+   in-thread with full history context.
+2. Burst carry-forward: evaluate() registers (ts, text) in a bounded pending map; a
+   superseded message leaves its entry behind; the surviving evaluation collects all
+   strictly-older fresh entries in its key (freshness cutoff max(15 s, 5× debounce);
+   newest 3 carried, drops logged) as burst_earlier.
+3. burst_earlier rides the classifier signals (judge the burst as ONE combined
+   request) and the ParticipationVerdict; the gate puts it in
+   message.metadata["participation_burst_earlier"], and the wake envelope renders it
+   for the response turn: the same person also sent these moments earlier — the reply
+   must address all of it.
+
+**Tests:** different-author top-level no-supersede; same-author burst survivor carries
+the earlier text; 5-burst caps at newest 3; stale entries not carried; thread-reply
+collapse unchanged; pending cleanup after collection; gate metadata attach + envelope
+rendering.
+
 ## Rollout / verification
 
 1. `make test` green after each change set (F4 → F1 → F2 → F3); `make lint` clean.
