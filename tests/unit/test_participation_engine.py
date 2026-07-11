@@ -299,6 +299,16 @@ class TestBurstCarryForward:
         await asyncio.gather(first, second)
         assert cap.signals["burst_earlier"] == ["one"]
 
+    @pytest.mark.asyncio
+    async def test_channel_people_signal_reaches_classifier(self, monkeypatch):
+        # F29: the people summary passed to evaluate is forwarded in the classifier signals.
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.0, raising=False)
+        cap = _CapturingClient({"action": "ignore"})
+        engine = ParticipationEngine(cap)
+        await engine.evaluate(channel_id="C1", ts="1.0", text="hi", sender_id="U1",
+                              channel_people="~5 members; recently active: Alice")
+        assert cap.signals["channel_people"] == "~5 members; recently active: Alice"
+
     def test_burst_of_five_keeps_newest_three(self):
         """F27: a same-author burst of 5 carries only the newest 3 earlier messages."""
         eng = ParticipationEngine(MagicMock())

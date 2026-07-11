@@ -31,14 +31,17 @@ class _Client(SlackUtilitiesMixin):
 
 
 def _info_response(name="chatgpt-bot-test", topic="Github project for the bot: github.com/protella/chatgpt-bots",
-                   purpose="Bot testing sandbox", is_im=False):
-    return {"channel": {
+                   purpose="Bot testing sandbox", is_im=False, num_members=12):
+    channel = {
         "name": name,
         "topic": {"value": topic},
         "purpose": {"value": purpose},
         "is_im": is_im,
         "is_mpim": False,
-    }}
+    }
+    if num_members is not None:
+        channel["num_members"] = num_members
+    return {"channel": channel}
 
 
 # ---------------- get_channel_context ----------------
@@ -51,7 +54,30 @@ async def test_get_channel_context_returns_metadata():
         "name": "chatgpt-bot-test",
         "topic": "Github project for the bot: github.com/protella/chatgpt-bots",
         "purpose": "Bot testing sandbox",
+        "num_members": 12,
     }
+    # F29: the count is requested from the API (needed for the people signal/suffix line)
+    api.conversations_info.assert_awaited_once_with(channel="C123", include_num_members=True)
+
+
+@pytest.mark.asyncio
+async def test_get_channel_context_num_members_absent_is_none():
+    # Defensive: an API payload without num_members surfaces None, never a KeyError.
+    api = SimpleNamespace(conversations_info=AsyncMock(return_value=_info_response(num_members=None)))
+    ctx = await _Client(api).get_channel_context("C123")
+    assert ctx["num_members"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_cached_channel_context_sync_peek():
+    # The sync peek returns warmed cache data with no extra API call, and None before warmup.
+    api = SimpleNamespace(conversations_info=AsyncMock(return_value=_info_response()))
+    client = _Client(api)
+    assert client.get_cached_channel_context("C123") is None  # cold
+    await client.get_channel_context("C123")                  # warm it
+    peeked = client.get_cached_channel_context("C123")
+    assert peeked["num_members"] == 12
+    assert api.conversations_info.await_count == 1             # peek made no call
 
 
 @pytest.mark.asyncio

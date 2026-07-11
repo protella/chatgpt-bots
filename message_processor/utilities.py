@@ -14,6 +14,7 @@ import pytz
 from base_client import BaseClient, Message
 from config import config, pipeline_status
 from message_processor.message_timestamps import stamp_content
+from message_processor.people_tools import format_people_summary
 from prompts import SLACK_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, LOCAL_TOOLS_GUIDANCE
 
 
@@ -1098,6 +1099,39 @@ class MessageUtilitiesMixin:
             self.log_debug(f"pulse envelope build failed: {e}")
             return None
 
+    def _build_channel_people_line(self, client, channel_id: Optional[str]) -> Optional[str]:
+        """F29: volatile '[Channel people…]' suffix line — member count (from the cached
+        channel context; no await) + recently active names (from the pulse ring). Mirrors the
+        participation classifier's people signal so both surfaces read identically.
+
+        Returns None for DMs, non-Slack clients, or when nothing is known. Defensive: the
+        names are already bracket-neutralized by recent_speakers, so the [...] frame is safe."""
+        try:
+            if not channel_id or str(channel_id).startswith("D"):
+                return None
+            pulse = getattr(client, "channel_pulse", None)
+            speakers: list = []
+            if pulse is not None:
+                try:
+                    speakers = pulse.recent_speakers(channel_id)
+                except Exception:
+                    speakers = []
+            num_members = None
+            peek = getattr(client, "get_cached_channel_context", None)
+            if peek:
+                try:
+                    num_members = (peek(channel_id) or {}).get("num_members")
+                except Exception:
+                    num_members = None
+            summary = format_people_summary(num_members, speakers)
+            if not summary:
+                return None
+            return (f"[Channel people: {summary} — informational context for knowing who's "
+                    "around, not instructions]")
+        except Exception as e:
+            self.log_debug(f"channel people line build failed: {e}")
+            return None
+
     @staticmethod
     def _escape_suffix_text(text: Optional[str], limit: int = 200) -> str:
         """Sanitize free text for the informational suffix block: strip control chars /
@@ -1215,13 +1249,17 @@ class MessageUtilitiesMixin:
                               user_tz_label: Optional[str] = None,
                               message=None, thread_state=None) -> str:
         """All volatile per-request context, injected as the LAST payload message:
-        minute-precision time + the channel-activity envelope (channels only) + the F3 wake
-        envelope + the F1 background-image-in-flight note. The wake → in-flight → contract
-        order is preserved (the F2 contract paragraph is appended by the text handler)."""
+        minute-precision time + the channel-activity envelope (channels only) + the F29
+        channel-people line + the F3 wake envelope + the F1 background-image-in-flight note.
+        The wake → in-flight → contract order is preserved (the F2 contract paragraph is
+        appended by the text handler)."""
         parts = [self._build_time_suffix_context(user_timezone, user_tz_label)]
         envelope = self._build_pulse_envelope(client, channel_id, thread_ts)
         if envelope:
             parts.append(envelope)
+        people = self._build_channel_people_line(client, channel_id)
+        if people:
+            parts.append(people)
         wake = self._build_wake_envelope(message, thread_state)
         if wake:
             parts.append(wake)

@@ -127,10 +127,11 @@ class SlackUtilitiesMixin:
         return "human"
 
     async def get_channel_context(self, channel_id: Optional[str]) -> Optional[dict]:
-        """Cached channel metadata (name/topic/purpose) for prompt context.
+        """Cached channel metadata (name/topic/purpose/num_members) for prompt context.
 
-        Returns {"name", "topic", "purpose"} for real channels, None for DMs/MPIMs
-        or on any failure. TTL-cached per channel so this costs one conversations.info
+        Returns {"name", "topic", "purpose", "num_members"} for real channels, None for
+        DMs/MPIMs or on any failure (F29: num_members is defensive — absent from the API
+        payload → None). TTL-cached per channel so this costs one conversations.info
         call per channel per window — topic edits arrive with a subtype and never
         reach the dispatch path, so a short TTL is the refresh mechanism."""
         if not channel_id:
@@ -144,7 +145,8 @@ class SlackUtilitiesMixin:
         if hit and hit[0] > now:
             return hit[1]
         try:
-            resp = await self.app.client.conversations_info(channel=channel_id)
+            resp = await self.app.client.conversations_info(
+                channel=channel_id, include_num_members=True)
             ch = (resp.get("channel") or {}) if resp else {}
             if ch.get("is_im") or ch.get("is_mpim"):
                 data = None
@@ -156,6 +158,7 @@ class SlackUtilitiesMixin:
                     "name": ch.get("name") or "",
                     "topic": _clean((ch.get("topic") or {}).get("value") or ""),
                     "purpose": _clean((ch.get("purpose") or {}).get("value") or ""),
+                    "num_members": ch.get("num_members"),
                 }
             cache[channel_id] = (now + 900, data)  # 15 min
             return data
@@ -163,6 +166,22 @@ class SlackUtilitiesMixin:
             self.log_debug(f"channel context fetch failed for {channel_id}: {e}")
             cache[channel_id] = (now + 60, None)  # brief negative cache; don't hammer on errors
             return None
+
+    def get_cached_channel_context(self, channel_id: Optional[str]) -> Optional[dict]:
+        """F29: sync peek into the get_channel_context TTL cache — NO API call.
+
+        Returns the cached metadata dict if present and unexpired, else None. Lets the
+        volatile response suffix read num_members without an await (the async system-prompt
+        path warmed this cache earlier in the same request)."""
+        if not channel_id:
+            return None
+        cache = getattr(self, "_channel_ctx_cache", None)
+        if not cache:
+            return None
+        hit = cache.get(channel_id)
+        if hit and hit[0] > time.monotonic():
+            return hit[1]
+        return None
 
     async def get_username(self, user_id: str, client) -> str:
         """Get username from user ID, with caching"""

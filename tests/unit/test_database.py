@@ -574,3 +574,34 @@ class TestModalSessions:
         retrieved = temp_db.get_modal_session(session_id)
         assert retrieved == state
         assert len(retrieved["settings"]["custom_instructions"]) == 2500
+
+class TestGetAllUsersAsync:
+    """F29: get_all_users_async — name→id resolution source for lookup_user."""
+
+    @pytest.fixture
+    def temp_db(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = DatabaseManager("test")
+            db.db_path = f"{tmpdir}/test.db"
+            db.conn = sqlite3.connect(db.db_path, check_same_thread=False, isolation_level=None)
+            db.conn.row_factory = sqlite3.Row
+            db.init_schema()
+            yield db
+            db.conn.close()
+
+    @pytest.mark.asyncio
+    async def test_returns_all_persisted_users(self, temp_db):
+        await temp_db.get_or_create_user_async("U1", "alice")
+        await temp_db.save_user_info_async("U1", username="alice", real_name="Alice Ng",
+                                           email="alice@x.com", timezone="UTC",
+                                           tz_label="UTC", tz_offset=0)
+        await temp_db.get_or_create_user_async("U2", "bob")
+        rows = await temp_db.get_all_users_async()
+        by_id = {r["user_id"]: r for r in rows}
+        assert {"U1", "U2"} <= set(by_id)
+        assert by_id["U1"]["real_name"] == "Alice Ng"
+        assert by_id["U1"]["username"] == "alice"
+
+    @pytest.mark.asyncio
+    async def test_empty_when_no_users(self, temp_db):
+        assert await temp_db.get_all_users_async() == []

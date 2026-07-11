@@ -2577,6 +2577,24 @@ class DatabaseManager(LoggerMixin):
                 row = await cursor.fetchone()
                 return dict(row) if row else None
 
+    async def get_all_users_async(self) -> list:
+        """F29: all persisted user_info rows (user_id/username/real_name/email/tz), for
+        resolving a name → id when lookup_user is called with a name rather than a Slack id.
+        Read-only; returns a list of dicts (empty on any failure)."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                await db.execute("PRAGMA journal_mode=WAL")
+                async with db.execute(
+                    "SELECT user_id, username, real_name, email, timezone, tz_label "
+                    "FROM users"
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    return [dict(r) for r in rows]
+        except Exception as e:
+            logger.debug(f"DB: get_all_users_async failed: {e}")
+            return []
+
     async def get_user_preferences_async(self, user_id: str) -> Optional[Dict]:
         """
         Async version of get_user_preferences.
