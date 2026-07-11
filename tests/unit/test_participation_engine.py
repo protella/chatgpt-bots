@@ -349,6 +349,44 @@ class TestBurstCarryForward:
         assert r2.action == "respond"
         assert fake.calls == 1
 
+    @pytest.mark.asyncio
+    async def test_thread_cross_author_burst_not_carried(self, monkeypatch):
+        """F27: an in-thread cross-author burst collapses (F21) but the survivor must NOT
+        carry the superseded — possibly different-author — text: the render sites label it
+        "the same sender", so carrying it would misattribute. Carry is top-level-only."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
+        cap = _CapturingClient({"action": "respond"})
+        engine = ParticipationEngine(cap)
+        first = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="10.5", text="alice's words",
+            sender_id="U1", thread_root_ts="10.0"))
+        await asyncio.sleep(0.01)
+        second = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="10.6", text="bob's reply",
+            sender_id="U2", thread_root_ts="10.0"))   # different author, same thread
+        r1, r2 = await asyncio.gather(first, second)
+        assert r1 is None
+        assert r2.action == "respond"
+        assert not r2.burst_earlier                    # None/empty — no cross-author carry
+        assert cap.signals["burst_earlier"] == []      # classifier sees no burst texts
+
+    @pytest.mark.asyncio
+    async def test_thread_survivor_drains_bucket_despite_discard(self, monkeypatch):
+        """F27: a thread survivor discards the carry but must STILL drain its pending bucket
+        (memory hygiene) so a busy thread's bucket can't grow unbounded."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
+        fake = _FakeClient({"action": "respond"})
+        engine = ParticipationEngine(fake)
+        first = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="10.5", text="one",
+            sender_id="U1", thread_root_ts="10.0"))
+        await asyncio.sleep(0.01)
+        second = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="10.6", text="two",
+            sender_id="U1", thread_root_ts="10.0"))
+        await asyncio.gather(first, second)
+        assert not engine._pending.get("C1|10.0")      # bucket emptied
+
 
 # --------------------------------------------------------------- main.py gate wiring
 
