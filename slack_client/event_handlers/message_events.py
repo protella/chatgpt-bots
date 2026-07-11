@@ -438,6 +438,17 @@ class SlackMessageEventsMixin:
             return  # loop guard (also guarded upstream for DMs)
         if message.channel_id and not message.channel_id.startswith("D"):
             cs = await self._get_channel_settings(message.channel_id)
+            # Participation "off" means OFF — the modal promises "never respond in this
+            # channel", and that must include explicit @mentions (otherwise off collapses
+            # into mentions_only). This path only fires for app_mention wakes: DMs have no
+            # channel settings, and the channel-listening path gates itself upstream.
+            if wake_source == "app_mention":
+                from message_processor.participation import resolve_participation_level
+                if resolve_participation_level(cs) == "off":
+                    self.log_info(
+                        f"Participation OFF for {message.channel_id} — dropping @mention "
+                        f"(ts={event.get('ts')})")
+                    return
             if cs and cs.get("directives"):
                 message.metadata["channel_directives"] = cs["directives"]
         if sender_type == "other_bot":

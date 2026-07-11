@@ -180,3 +180,37 @@ async def test_human_sender_still_reaches_onboarding():
     await bot._handle_slack_message(_evt(user="UHUMAN"), bot.app.client)
     bot.db.get_user_preferences_async.assert_awaited()  # human goes through onboarding gate
     assert bot.message_handler.await_count == 1
+
+
+# --------------------------------------------------------------------------- off gates @mentions
+
+async def test_off_level_drops_app_mention():
+    """The modal promises "Off — never respond here, even when @mentioned": an explicit
+    @mention wake in a participation-off channel must be dropped before dispatch
+    (otherwise off collapses into mentions_only)."""
+    bot = _make_bot()
+    bot._get_channel_settings = AsyncMock(return_value={"participation_level": "off"})
+    await bot._handle_slack_message(
+        _evt(text="<@UBOT> testing"), bot.app.client, wake_source="app_mention")
+    bot.message_handler.assert_not_awaited()
+
+
+async def test_mentions_only_level_still_answers_app_mention():
+    bot = _make_bot()
+    bot.db.get_user_preferences_async = AsyncMock(return_value={"settings_completed": True})
+    bot._post_settings_button_if_new_thread = AsyncMock()
+    bot._get_channel_settings = AsyncMock(return_value={"participation_level": "mentions_only"})
+    await bot._handle_slack_message(
+        _evt(text="<@UBOT> testing"), bot.app.client, wake_source="app_mention")
+    assert bot.message_handler.await_count == 1
+
+
+async def test_off_level_does_not_gate_dm():
+    """DMs have no channel settings — the off gate is app_mention + channel only."""
+    bot = _make_bot()
+    bot.db.get_user_preferences_async = AsyncMock(return_value={"settings_completed": True})
+    bot._post_settings_button_if_new_thread = AsyncMock()
+    bot._maybe_set_assistant_thread_title = AsyncMock()  # DM path touches the assistant surface
+    await bot._handle_slack_message(
+        _evt(channel="D123", text="hi"), bot.app.client, wake_source="dm")
+    assert bot.message_handler.await_count == 1
