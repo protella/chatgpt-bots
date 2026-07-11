@@ -819,6 +819,54 @@ prefix coexists with `[used tools:]`/`[reactions:]` suffix annotations and foote
 stripping; summary head never stamped; flag off = byte-identical to pre-F10 content;
 classifier tail lines stamped; participation prompt line present.
 
+## F11. Capability manifest for the participation classifier (user request 2026-07-11)
+
+**Gap (user-observed, live):** "anyone know what menutrends says about gen z's favorite
+ice cream?" (+ its clarification) posted top-level in #chatgpt-bot-test were both
+classified `ignore` — "general question to the channel, not a direct request to
+ChatGPT." The assistant has exactly that data via the Datassential MCP server, but the
+classifier has NO inventory of the assistant's tools: the only capability hint is the
+generic F10 line ("when enabled, can search the web and use tools"). It therefore
+cannot weigh "well-suited to answer where a reply clearly adds value" (the `respond`
+bar) for open questions to the room that the assistant's tools uniquely cover. Fix must
+be GENERIC — driven by whatever MCP servers/tools are configured, nothing hardcoded for
+any specific server (user directive 2026-07-11).
+
+**Design:**
+1. **Capability line (pure function of config):** module-level helper in
+   `message_processor/participation.py`, e.g. `render_capabilities_line(mcp_manager) ->
+   Optional[str]`, composing a single semicolon-joined summary from already-loaded
+   config only — zero I/O, deterministic per process:
+   - "web search" when `config.enable_web_search`;
+   - "image generation and editing" (always true for this bot);
+   - one entry per MCP server when `config.mcp_enabled_default` and
+     `mcp_manager.has_mcp_servers()`: the server's `server_description` from
+     mcp_config.json, falling back to its label. Iterate `mcp_manager.servers` in
+     insertion order (stable per process → cache-friendly).
+   Returns None when nothing applies. No new config flag — inherits
+   `enable_participation_engine`.
+2. **Plumbing:** `_run_participation_gate` (main.py ~113) builds the line once via
+   `getattr(self.processor, "mcp_manager", None)` and passes `capabilities=` to
+   `engine.evaluate()`; `evaluate()` gains the kwarg and copies it into `signals`.
+3. **Signal rendering:** `classify_participation` (openai_client/api/responses.py)
+   renders it immediately after the alias identity line (both constant per process —
+   maximizes the shared deterministic prefix): `- The assistant's own tools/data
+   sources (weigh when judging whether it is well-suited to answer): {capabilities}`.
+   Omitted entirely when absent, like every other optional signal.
+4. **Prompt judgment rule:** PARTICIPATION_SYSTEM_PROMPT gains one rule: when the
+   signals list the assistant's tools/data sources, an OPEN question to the room
+   ("anyone know…?", "does anyone have…?") that those tools can answer directly is a
+   `respond` case — a colleague with the data at hand would speak up. This never
+   overrides the addressee rules: a message aimed at a named other party stays theirs.
+   Also generalize the F10 time line to point at the capabilities signal instead of
+   the vague "can … use tools" clause.
+
+**Tests:** `render_capabilities_line` — web-search flag on/off, MCP servers
+present/absent/`mcp_enabled_default` off, description fallback to label, deterministic
+across calls, None when empty; `evaluate()` forwards `capabilities` into signals;
+`classify_participation` payload contains the line when set and omits it when None
+(fixed position after alias line); prompt contains the open-question rule.
+
 ## Rollout / verification
 
 1. `make test` green after each change set (F4 → F1 → F2 → F3); `make lint` clean.

@@ -11,7 +11,9 @@ from typing import Optional
 from config import config
 from logger import log_session_start, log_session_end, main_logger
 from message_processor.base import MessageProcessor
-from message_processor.participation import (ParticipationEngine, snooze_expiry_iso)
+from message_processor.participation import (ParticipationEngine,
+                                             render_capabilities_line,
+                                             snooze_expiry_iso)
 from base_client import BaseClient, Message
 
 
@@ -110,6 +112,9 @@ class ChatBotV2:
                     channel_topic = None
 
             is_thread_reply = bool(ts and message.thread_id and message.thread_id != ts)
+            # F11: inventory of the assistant's own tools/data sources so the classifier
+            # can weigh whether it is well-suited to answer an open question to the room.
+            capabilities = render_capabilities_line(getattr(self.processor, "mcp_manager", None))
             verdict = await engine.evaluate(
                 channel_id=channel_id, ts=ts, text=message.text,
                 sender_name=message.metadata.get("user_real_name") or message.metadata.get("username"),
@@ -121,6 +126,7 @@ class ChatBotV2:
                 snoozed=message.metadata.get("participation_snoozed") is True,
                 sender_is_bot=message.metadata.get("participation_sender_bot") is True,
                 channel_topic=channel_topic,
+                capabilities=capabilities,
                 pulse=pulse, thread_root_ts=message.thread_id,
             )
             if verdict is None:  # superseded by a newer message during debounce

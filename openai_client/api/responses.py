@@ -948,6 +948,13 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
             + (f" (also answers to: {', '.join(aliases[1:])})" if len(aliases) > 1 else "")
             + ". Messages addressing it by name — even misspelled — are meant for it."
         )
+    # F11: the assistant's own tools/data sources, rendered immediately after the alias
+    # identity line — both constant per process, maximizing the shared cache prefix.
+    if signals.get("capabilities"):
+        lines.append(
+            "- The assistant's own tools/data sources (weigh when judging whether it is "
+            f"well-suited to answer): {signals['capabilities']}"
+        )
     if signals.get("sender_name"):
         lines.append(f"- Sender: {signals['sender_name']}")
     if signals.get("sender_is_bot"):
