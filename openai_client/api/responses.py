@@ -635,7 +635,8 @@ async def create_streaming_response_with_tools(
     prompt_cache_key: Optional[str] = None,
     usage_sink: Optional[Dict[str, Any]] = None,
     mcp_tools_sink: Optional[Dict[str, Any]] = None,
-    mcp_results_sink: Optional[List[Dict[str, Any]]] = None
+    mcp_results_sink: Optional[List[Dict[str, Any]]] = None,
+    tool_event_callback: Optional[Callable[[Dict[str, Any]], Any]] = None
 ) -> str:
     """
     Create streaming text response with tools (e.g., web search)
@@ -738,6 +739,19 @@ async def create_streaming_response_with_tools(
         # text deltas are preamble ("let me check…") — don't stream them to the user.
         saw_function_call = False
 
+        async def _emit_tool_event(payload: Dict[str, Any]) -> None:
+            """F30.1: hand a structured server-tool event to an internal observer (the deep
+            research card consumes web_search/mcp completions here). Best-effort — observation
+            must never break streaming; interactive callers pass no callback."""
+            if not tool_event_callback:
+                return
+            try:
+                r = tool_event_callback(payload)
+                if r is not None and hasattr(r, "__await__"):
+                    await r
+            except Exception as e:  # noqa: BLE001
+                self.log_warning(f"tool_event_callback error: {e}")
+
         # Process streaming events with timeout protection
         async for event in self._safe_stream_iteration(response, operation_type):
             try:
@@ -787,7 +801,19 @@ async def create_streaming_response_with_tools(
                     if hasattr(event, 'item'):
                         item = event.item
                         item_type = getattr(item, 'type', None)
-                        if item_type == 'mcp_call':
+                        if item_type == 'web_search_call':
+                            # F30.1: surface the completed web search (with its query when
+                            # available) to an internal observer. This mirrors the
+                            # non-streaming path's web_search_call detection, so tools_used
+                            # rebuilt from these events matches the create_*_with_tools result.
+                            action = getattr(item, 'action', None)
+                            query = None
+                            if isinstance(action, dict):
+                                query = action.get('query')
+                            elif action is not None:
+                                query = getattr(action, 'query', None)
+                            await _emit_tool_event({"kind": "web_search", "query": query})
+                        elif item_type == 'mcp_call':
                             server_label = getattr(item, 'server_label', None)
                             tool_error = getattr(item, 'error', None)
                             if tool_error:
@@ -795,6 +821,9 @@ async def create_streaming_response_with_tools(
                             # F12: capture the completed call's output text (skips errored/
                             # empty calls internally) for tool-result memory.
                             _capture_mcp_result(mcp_results_sink, item, server_label)
+                            # F30.1: surface the completed MCP call to the internal observer.
+                            if not tool_error:
+                                await _emit_tool_event({"kind": "mcp", "server_label": server_label})
                             if tool_callback and server_label:
                                 tool_id = f"mcp:{server_label}"
                                 try:

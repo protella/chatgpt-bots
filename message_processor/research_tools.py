@@ -1,23 +1,29 @@
-"""F30 — background deep-dive research jobs.
+"""F30 — background deep-dive research jobs (F30.1 — Claude-parity status card).
 
 A local tool (``start_deep_research``) for questions that genuinely need multi-source
-investigation. Instead of answering inline, the model kicks off a background job: it acks in
-one short line, the thread lock releases (chat keeps flowing), and a sourced findings report
-lands in the SAME thread minutes later. Mirrors the background image-generation pattern
+investigation. Instead of answering inline, the model kicks off a background job, the thread
+lock releases (chat keeps flowing), and a sourced findings report lands in the SAME thread
+minutes later. Mirrors the background image-generation pattern
 (``message_processor/handlers/image_gen.py``): snapshot context → detach an asyncio task →
 deliver through the normal send path → cancel/await on shutdown.
 
-The tool itself posts NOTHING (the model's own one-liner is the ack). The detached job makes
-ONE non-streaming Responses call with web_search + configured MCP servers and NO local tools,
-then posts the report with a compact provenance trailer. Errors/timeouts post an honest
-one-line failure note — never silent.
+F30.1: the model's ack reply is SUPPRESSED (handlers/text.py drops it, cued by
+``ToolContext.deep_research_started``). In its place the detached job posts a live-updating
+status card — the SAME labelled identity as the findings — that shows the task and ticks off
+tool activity as it happens, then reads "✓ Reported findings below." right before the report.
+
+The job runs its ONE Responses call as an INTERNAL stream (web_search + configured MCP
+servers, NO local tools) — never streamed to Slack; the stream is consumed only to observe
+web_search/MCP calls (driving the card) and to accumulate the final text + tools_used exactly
+as the non-streaming path did. It then posts the report with a compact provenance trailer.
+Errors/timeouts finalize the card and post an honest one-line failure note — never silent.
 """
 from __future__ import annotations
 
 import asyncio
 import copy
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 from config import clamp_effort, config
@@ -89,6 +95,224 @@ def _fmt_duration(seconds: float) -> str:
     return f"{m}m {s}s" if m else f"{s}s"
 
 
+def _research_label(processor, task: str) -> Optional[str]:
+    """The chat.postMessage username override for the labelled research surfaces (status card
+    AND findings), or None when labelling is off/disabled — so both carry the SAME identity.
+
+    Keeps the full bracketed label within Slack's 50-char server-side username cap. Returns
+    None when ENABLE_RESEARCH_LABEL is off, or once a labelled post has failed this process
+    (``_RESEARCH_LABEL_DISABLED_ATTR`` — likely a missing chat:write.customize scope)."""
+    if not getattr(config, "enable_research_label", True):
+        return None
+    if getattr(processor, _RESEARCH_LABEL_DISABLED_ATTR, False):
+        return None
+    alias = (config.bot_name_aliases or ["bot"])[0]
+    # Slack truncates chat.postMessage usernames at 50 chars SERVER-SIDE, so the gist budget
+    # is whatever keeps the full label, bracket included, within 50.
+    gist_budget = 50 - len(alias) - len(" [research: ") - 1
+    return f"{alias} [research: {_gist(task, max(gist_budget, 8))}]"
+
+
+# --- F30.1: live status card ---------------------------------------------------------------
+
+# CONSTANT notification fallback across every chat.update — Slack badges "(edited)" only when
+# the top-level `text` changes, so keeping it fixed lets blocks-only updates stay unbadged.
+_CARD_FALLBACK_TEXT = "Deep research in progress…"
+_CARD_MAX_TODO_LINES = 10          # visible todo lines before the tail collapses to "+N more"
+_CARD_THROTTLE_S = 4.0             # at most one chat.update this often (trailing flush honored)
+
+
+def _now_label(clock: Callable[[], time.struct_time] = time.localtime) -> str:
+    """Sender-local 'H:MM AM/PM' stamp for the card's context line."""
+    return time.strftime("%I:%M %p", clock()).lstrip("0")
+
+
+class _ResearchCard:
+    """Claude-parity live status card for a background research job (F30.1).
+
+    Posts ONE blocks message — a section block whose mrkdwn is the todo list, plus a context
+    block "todos as of H:MM AM/PM" — with the same labelled identity as the findings, then
+    updates it in place as the job observes tool activity. chat.update is THROTTLED to at most
+    one per ``_CARD_THROTTLE_S`` with a TRAILING flush, so the last event is never left
+    unshown. The notification `text` is CONSTANT (``_CARD_FALLBACK_TEXT``) across every update
+    so Slack never badges "(edited)". Every op is best-effort: a card failure is logged and
+    swallowed — it must NEVER kill the research job."""
+
+    def __init__(self, *, processor, client, channel_id: str, thread_root: str, task: str,
+                 label: Optional[str],
+                 clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], Any] = asyncio.sleep,
+                 now_label: Callable[[], str] = _now_label):
+        self.processor = processor
+        self.client = client
+        self.channel_id = channel_id
+        self.thread_root = thread_root
+        self.label = label
+        self.ts: Optional[str] = None
+        self._clock = clock
+        self._sleep = sleep
+        self._now_label = now_label
+        self._gist_line = f"⏳ {_gist(task, 120)}"
+        self._steps: List[str] = []
+        self._terminal: Optional[str] = None
+        self._dirty = False
+        self._closed = False
+        self._last_update: Optional[float] = None
+        self._flush_task: Optional[asyncio.Future] = None
+        self._lock = asyncio.Lock()
+
+    # --- rendering ---
+    def _visible_lines(self) -> List[str]:
+        lines = [self._gist_line] + self._steps
+        if len(lines) > _CARD_MAX_TODO_LINES:
+            # Loud, counted tail collapse — never a silent cap.
+            hidden = len(lines) - (_CARD_MAX_TODO_LINES - 1)
+            lines = lines[:_CARD_MAX_TODO_LINES - 1] + [f"… +{hidden} more steps"]
+        if self._terminal:
+            lines.append(self._terminal)
+        return lines
+
+    def _blocks(self) -> List[Dict[str, Any]]:
+        return [
+            {"type": "section",
+             "text": {"type": "mrkdwn", "text": "\n".join(self._visible_lines())}},
+            {"type": "context",
+             "elements": [{"type": "mrkdwn", "text": f"todos as of {self._now_label()}"}]},
+        ]
+
+    # --- posting / observing ---
+    async def start(self) -> None:
+        """Post the card immediately on job start. Labelled first; on a labelled-post failure
+        (missing scope?) remember it process-wide and fall back to an unlabeled card — it still
+        posts. A no-op when the client can't post cards."""
+        client = self.client
+        if not hasattr(client, "post_status_card"):
+            return
+        blocks = self._blocks()
+        ts = None
+        if self.label:
+            ts = await client.post_status_card(
+                self.channel_id, self.thread_root, _CARD_FALLBACK_TEXT, blocks,
+                username=self.label)
+            if ts is None:
+                setattr(self.processor, _RESEARCH_LABEL_DISABLED_ATTR, True)
+                self.processor.log_info(
+                    "Research card label post failed (missing chat:write.customize?) — "
+                    "posting unlabeled for the rest of this process")
+                self.label = None
+        if ts is None:
+            ts = await client.post_status_card(
+                self.channel_id, self.thread_root, _CARD_FALLBACK_TEXT, blocks)
+        self.ts = ts
+
+    async def note_web_search(self, query: Optional[str]) -> None:
+        q = _gist(query, 60) if query else ""
+        self._steps.append(f"✓ searched the web: {q}" if q else "✓ searched the web")
+        await self._request_update()
+
+    async def note_mcp(self, label: Optional[str]) -> None:
+        self._steps.append(f"✓ queried {label}" if label else "✓ queried an MCP server")
+        await self._request_update()
+
+    async def finalize_success(self) -> None:
+        await self._finalize("✓ Reported findings below.")
+
+    async def finalize_failure(self, reason: str) -> None:
+        await self._finalize(f"✗ hit a wall: {_gist(reason, 80)}")
+
+    async def finalize_cancelled(self) -> None:
+        await self._finalize("✗ cancelled (bot shutting down)")
+
+    # --- throttled update machinery ---
+    async def _request_update(self) -> None:
+        """Coalesce updates: flush now when the throttle window has elapsed, else schedule a
+        SINGLE trailing flush that renders the latest state (never leaving the card stale)."""
+        if self.ts is None or self._closed:
+            return
+        self._dirty = True
+        now = self._clock()
+        if self._last_update is None or (now - self._last_update) >= _CARD_THROTTLE_S:
+            await self._flush()
+        elif self._flush_task is None or self._flush_task.done():
+            delay = _CARD_THROTTLE_S - (now - self._last_update)
+            self._flush_task = asyncio.ensure_future(self._delayed_flush(delay))
+
+    async def _delayed_flush(self, delay: float) -> None:
+        try:
+            await self._sleep(delay)
+        except asyncio.CancelledError:
+            return
+        await self._flush()
+
+    async def _flush(self) -> None:
+        async with self._lock:
+            if self.ts is None or self._closed or not self._dirty:
+                return
+            self._dirty = False
+            self._last_update = self._clock()
+            await self._safe_update(self._blocks())
+
+    async def _finalize(self, terminal_line: str) -> None:
+        """Force the final state out (bypassing the throttle) and close the card so any pending
+        trailing flush becomes a no-op."""
+        self._terminal = terminal_line
+        if self._flush_task is not None and not self._flush_task.done():
+            self._flush_task.cancel()
+        async with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self.ts is None:
+                return
+            await self._safe_update(self._blocks())
+
+    async def _safe_update(self, blocks: List[Dict[str, Any]]) -> None:
+        if not hasattr(self.client, "update_status_card"):
+            return
+        try:
+            await self.client.update_status_card(
+                self.channel_id, self.ts, _CARD_FALLBACK_TEXT, blocks)
+        except Exception as e:  # noqa: BLE001 — card ops never break the research
+            self.processor.log_debug(f"Research card update failed: {e}")
+
+
+async def _consume_research_stream(processor, *, messages: List[Dict[str, Any]],
+                                   tools: List[Dict[str, Any]], model: str,
+                                   system_prompt: Optional[str], effort: str, verbosity: str,
+                                   card: Optional["_ResearchCard"]) -> Dict[str, Any]:
+    """Run the job's ONE Responses call as an INTERNAL stream (never streamed to Slack).
+
+    Accumulates the final text exactly as the non-streaming path returned it, feeds observed
+    web_search/MCP completions to the status card, and rebuilds ``tools_used`` from those same
+    events (identical content to the non-streaming create_*_with_tools result). Returns
+    ``{"text", "tools_used"}``."""
+    observed: List[str] = []
+
+    async def _stream_cb(_chunk):  # text deltas accumulate inside the API call, not posted
+        return None
+
+    async def _on_event(ev: Dict[str, Any]):
+        kind = ev.get("kind")
+        if kind == "web_search":
+            if "web_search" not in observed:
+                observed.append("web_search")
+            if card is not None:
+                await card.note_web_search(ev.get("query"))
+        elif kind == "mcp":
+            label = ev.get("server_label") or "mcp"
+            if label not in observed:
+                observed.append(label)
+            if card is not None:
+                await card.note_mcp(ev.get("server_label"))
+
+    text = await processor.openai_client.create_streaming_response_with_tools(
+        messages=messages, tools=tools, stream_callback=_stream_cb,
+        tool_callback=None, tool_event_callback=_on_event,
+        model=model, system_prompt=system_prompt, reasoning_effort=effort,
+        verbosity=verbosity, store=False)
+    return {"text": text or "", "tools_used": observed}
+
+
 async def execute_start_deep_research(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     """Executor: enforce the per-thread cap, snapshot the current turn's context by copy, and
     detach the job. Posts nothing itself — returns a structured result the model relays as its
@@ -146,6 +370,12 @@ async def execute_start_deep_research(ctx: ToolContext, args: Dict[str, Any]) ->
     if task_handle is not None and tm is not None and hasattr(tm, "attach_research_task"):
         tm.attach_research_task(thread_key, job_id, task_handle)
     processor.log_info(f"Deep research {job_id} started for {thread_key}: {_gist(task)!r}")
+    # F30.1: signal the turn's finalizer to DROP the model's ack reply — the status card the
+    # job posts is the acknowledgment. Set on the shared ToolContext the tool loop exposes.
+    try:
+        ctx.deep_research_started = True
+    except Exception:  # noqa: BLE001 — a defensive guard; ctx is a mutable dataclass
+        pass
     return {"ok": True, "status": "started", "task": _gist(task)}
 
 
@@ -153,8 +383,11 @@ async def _run_deep_research_job(*, processor, client, channel_id: str, thread_r
                                  thread_key: str, job_id: str, task: str,
                                  snapshot: List[Dict[str, Any]], system_prompt: Optional[str],
                                  model: str) -> None:
-    """The detached job: ONE non-streaming Responses call (web_search + MCP, no local tools),
-    then deliver the report (or an honest failure note) to the originating thread."""
+    """The detached job: post the live status card, run ONE Responses call consumed as an
+    INTERNAL stream (web_search + MCP, no local tools) to drive the card + accumulate the
+    report, finalize the card, then deliver the report (or an honest failure note) to the
+    originating thread. The card's final update always lands BEFORE the report so the thread
+    reads top-down: card(done) → report."""
     started = time.monotonic()
     effort = clamp_effort(model, getattr(config, "deep_research_reasoning_effort", "high") or "high")
     verbosity = getattr(config, "deep_research_verbosity", "medium") or "medium"
@@ -163,6 +396,15 @@ async def _run_deep_research_job(*, processor, client, channel_id: str, thread_r
     processor.log_info(
         f"Deep research {job_id} running for {thread_key} (model={model}, effort={effort}): "
         f"{_gist(task)!r}")
+    # F30.1: the live status card is the acknowledgment (the model's ack reply was suppressed).
+    # Post it immediately; it uses the same label as the findings (unlabeled if disabled).
+    card = _ResearchCard(processor=processor, client=client, channel_id=channel_id,
+                         thread_root=thread_root, task=task,
+                         label=_research_label(processor, task))
+    try:
+        await card.start()
+    except Exception as e:  # noqa: BLE001 — a card failure must never kill the research
+        processor.log_debug(f"Research card start failed: {e}")
     try:
         # snapshot + an appended developer instruction to execute the task.
         job_input: List[Dict[str, Any]] = list(snapshot)
@@ -174,25 +416,19 @@ async def _run_deep_research_job(*, processor, client, channel_id: str, thread_r
         tools = processor._build_tools_array({}, model, registry=None) or []
         if not any(t.get("type") == "web_search" for t in tools):
             tools.append({"type": "web_search"})
+        # Internal streaming consumption bounds the WHOLE call by the deep-research timeout.
         result = await asyncio.wait_for(
-            processor.openai_client.create_text_response_with_tools(
-                messages=job_input,
-                tools=tools,
-                model=model,
-                system_prompt=system_prompt,
-                reasoning_effort=effort,
-                verbosity=verbosity,
-                store=False,
-                return_metadata=True,
-            ),
+            _consume_research_stream(
+                processor, messages=job_input, tools=tools, model=model,
+                system_prompt=system_prompt, effort=effort, verbosity=verbosity, card=card),
             timeout=timeout_s,
         )
-        text = result.get("text") if isinstance(result, dict) else str(result or "")
-        text = (text or "").strip()
-        tools_used = (result.get("tools_used") or []) if isinstance(result, dict) else []
+        text = (result.get("text") or "").strip()
+        tools_used = result.get("tools_used") or []
         elapsed = time.monotonic() - started
         if not text:
             processor.log_warning(f"Deep research {job_id} produced no text")
+            await card.finalize_failure("the research came back empty")
             await _deliver_failure(client, channel_id, thread_root,
                                    "the research came back empty")
             return
@@ -200,6 +436,8 @@ async def _run_deep_research_job(*, processor, client, channel_id: str, thread_r
         # turns — the findings post is out-of-band, so it carries its own).
         tool_bit = f" · tools: {', '.join(tools_used)}" if tools_used else ""
         trailer = f"\n\n_deep research · {_fmt_duration(elapsed)} · effort {effort}{tool_bit}_"
+        # Card done BEFORE the findings post — the thread reads card(done) → report.
+        await card.finalize_success()
         posted = await _deliver_findings(processor, client, channel_id, thread_root,
                                          text + trailer, task)
         if not posted:
@@ -213,15 +451,23 @@ async def _run_deep_research_job(*, processor, client, channel_id: str, thread_r
             return
         processor.log_info(f"Deep research {job_id} completed for {thread_key} in {elapsed:.1f}s")
     except asyncio.CancelledError:
-        # Shutdown/cancel — stay quiet and let finally clean up the registry.
+        # Shutdown/cancel — best-effort final card update, then re-raise so the task cancels
+        # and finally cleans up the registry.
+        try:
+            await card.finalize_cancelled()
+        except Exception:  # noqa: BLE001
+            pass
         raise
     except asyncio.TimeoutError:
         processor.log_warning(f"Deep research {job_id} timed out after {timeout_s:.0f}s")
+        await card.finalize_failure("it ran past the time limit before finishing")
         await _deliver_failure(client, channel_id, thread_root,
                                "it ran past the time limit before finishing")
     except Exception as e:  # noqa: BLE001 — a job failure must post an honest note, never crash
         processor.log_error(f"Deep research {job_id} failed for {thread_key}: {e}", exc_info=True)
-        await _deliver_failure(client, channel_id, thread_root, str(e)[:200] or "an unexpected error")
+        reason = str(e)[:200] or "an unexpected error"
+        await card.finalize_failure(reason)
+        await _deliver_failure(client, channel_id, thread_root, reason)
     finally:
         if tm is not None and hasattr(tm, "finish_research"):
             tm.finish_research(thread_key, job_id)
@@ -233,15 +479,7 @@ async def _deliver_findings(processor, client, channel_id: str, thread_root: str
     record_own_reply pulse recording). Optionally label the post with a chat.postMessage
     username override; on any failure (likely missing chat:write.customize) disable the label
     for the rest of the process and retry the plain path — delivery must never break."""
-    label = None
-    if (getattr(config, "enable_research_label", True)
-            and not getattr(processor, _RESEARCH_LABEL_DISABLED_ATTR, False)):
-        alias = (config.bot_name_aliases or ["bot"])[0]
-        # Slack truncates chat.postMessage usernames at 50 chars SERVER-SIDE (verified
-        # live 2026-07-11 — a 61-char label lost its closing bracket in storage), so the
-        # gist budget is whatever keeps the full label, bracket included, within 50.
-        gist_budget = 50 - len(alias) - len(" [research: ") - 1
-        label = f"{alias} [research: {_gist(task, max(gist_budget, 8))}]"
+    label = _research_label(processor, task)
     posted = None
     if label:
         try:

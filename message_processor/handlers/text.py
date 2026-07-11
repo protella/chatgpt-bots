@@ -310,18 +310,21 @@ class TextHandlerMixin:
         local_tool_calls = []     # [{"name","ok"}] record of local tool executions
         terminal_action = None    # F2: "no_reply" when the model called no_response_needed
         no_reply_reason = None
+        deep_research_started = False  # F30.1: start_deep_research fired — drop this reply
         usage_info = {}           # response.usage lands here (usage-driven budgeting)
         mcp_discovered = {}       # mcp_list_tools payloads land here (discovery cache)
         mcp_results = []          # F12: completed mcp_call outputs land here (result memory)
         try:
             if tools and registry is not None:
                 # Local tools present — run the function-call loop (composes with
-                # web_search/MCP in the same tools array)
+                # web_search/MCP in the same tools array). Hold the tool_context so we can
+                # read back F30.1's deep_research_started signal after the loop.
+                tool_context = self._build_tool_context(message, client)
                 result = await self.openai_client.create_text_response_with_tool_loop(
                     messages=messages_for_api,
                     tools=tools,
                     registry=registry,
-                    tool_context=self._build_tool_context(message, client),
+                    tool_context=tool_context,
                     prior_committed=visible_already_committed,
                     model=model,
                     temperature=thread_config["temperature"],
@@ -340,6 +343,7 @@ class TextHandlerMixin:
                 local_tool_calls = result["local_tool_calls"]
                 terminal_action = result.get("terminal_action")
                 no_reply_reason = result.get("reason")
+                deep_research_started = bool(getattr(tool_context, "deep_research_started", False))
             elif tools:
                 # Generate response with tools
                 if retry_timeout:
@@ -437,6 +441,20 @@ class TextHandlerMixin:
         # Feed any mcp_list_tools discovery payloads into the informational cache
         for _label, _tools_payload in mcp_discovered.items():
             self.mcp_manager.cache_discovered_tools_payload(_label, _tools_payload)
+
+        # F30.1: a start_deep_research call succeeded this turn. The live status card the job
+        # posts IS the acknowledgment, so DROP the model's ack reply — nothing posts, no footer,
+        # no empty assistant turn, no quota burn. Non-streaming never commits text mid-flight,
+        # so we suppress unless an EARLIER attempt this turn already exposed text (F8), which we
+        # must never retract.
+        if deep_research_started and not visible_already_committed:
+            self.log_info("start_deep_research started — suppressing the turn's ack reply (card owns it)")
+            return Response(
+                type="text",
+                content="",
+                metadata={"model": thread_config.get("model"),
+                          "deep_research_started": True, "posted": False},
+            )
 
         # F2: explicit no-reply outcome. Nothing posts, no footer, no empty assistant turn
         # (we return before the append), and no post-response memory extraction (scheduled
@@ -1334,14 +1352,17 @@ class TextHandlerMixin:
             mcp_results = []       # F12: completed mcp_call outputs land here (result memory)
             terminal_action = None  # F2: "no_reply" when the loop honored no_response_needed
             no_reply_reason = None
+            deep_research_started = False  # F30.1: start_deep_research fired — drop this reply
             if tools and registry is not None:
                 # Local tools present — streaming function-call loop (intermediate tool
-                # rounds don't stream text; the final round streams normally)
+                # rounds don't stream text; the final round streams normally). Hold the
+                # tool_context so we can read back F30.1's deep_research_started signal.
+                tool_context = self._build_tool_context(message, client)
                 loop_result = await self.openai_client.create_streaming_response_with_tool_loop(
                     messages=messages_for_api,
                     tools=tools,
                     registry=registry,
-                    tool_context=self._build_tool_context(message, client),
+                    tool_context=tool_context,
                     stream_callback=stream_callback,
                     tool_callback=tool_callback,
                     prior_committed=visible_already_committed,
@@ -1361,6 +1382,7 @@ class TextHandlerMixin:
                 local_tool_calls = loop_result["local_tool_calls"]
                 terminal_action = loop_result.get("terminal_action")
                 no_reply_reason = loop_result.get("reason")
+                deep_research_started = bool(getattr(tool_context, "deep_research_started", False))
                 # Only EXTERNAL names (web_search/MCP) join the attribution list —
                 # local tool executions are recorded in local_tool_calls, not shown
                 local_names = {c.get("name") for c in local_tool_calls if c.get("name")}
@@ -1445,6 +1467,23 @@ class TextHandlerMixin:
                               # No visible content went out — must not burn the quota
                               # (streamed=True would otherwise read as posted).
                               "posted": False}
+                )
+
+            # F30.1: start_deep_research succeeded — the live status card the job posts IS the
+            # acknowledgment, so DROP this turn's ack reply. Suppress ONLY when nothing visible
+            # has streamed yet (a short ack stays buffered until finalize; committed text is
+            # never retracted). Runs BEFORE native finalize so any started-but-empty stream is
+            # torn down instead of flushed. If preamble already reached Slack, leave it alone.
+            if deep_research_started and not visible_content_delivered:
+                self.log_info("start_deep_research started — suppressing the turn's ack reply (card owns it)")
+                await self._cleanup_silent_stream(
+                    client, message.channel_id, native_coord, message_id, current_message_id,
+                    "deep_research")
+                return Response(
+                    type="text",
+                    content="",
+                    metadata={"streamed": True, "deep_research_started": True,
+                              "model": thread_config.get("model"), "posted": False}
                 )
 
             # Build list of tools used (unified attribution). EXTERNAL sources only

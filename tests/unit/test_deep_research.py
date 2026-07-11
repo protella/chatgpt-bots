@@ -7,7 +7,6 @@ registry / shutdown cancellation, and config defaults.
 """
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -58,6 +57,58 @@ def _ctx(processor, client, *, current_input=None, thread_ts="100.0", trigger_ts
         channel_id=channel_id, thread_ts=thread_ts, trigger_ts=trigger_ts,
         client=client, processor=processor, current_input=current_input or [],
         system_prompt="DEV PROMPT", model="gpt-5.6-sol")
+
+
+class _StreamStub:
+    """Stand-in for openai_client.create_streaming_response_with_tools (F30.1): records the
+    call kwargs, optionally fires tool_event_callback with synthetic web_search/mcp events,
+    then returns the accumulated text — or raises / stalls, to exercise the failure paths."""
+    def __init__(self, text="", events=None, raises=None, slow=False):
+        self.text = text
+        self.events = events or []
+        self.raises = raises
+        self.slow = slow
+        self.kwargs = None
+
+    async def __call__(self, **kwargs):
+        self.kwargs = kwargs
+        if self.slow:
+            await asyncio.sleep(5)
+        if self.raises is not None:
+            raise self.raises
+        cb = kwargs.get("tool_event_callback")
+        for ev in self.events:
+            if cb is not None:
+                r = cb(ev)
+                if r is not None and hasattr(r, "__await__"):
+                    await r
+        return self.text
+
+
+class _CardClient(_FakeClient):
+    """_FakeClient + the F30.1 status-card primitives, recording every card post/update."""
+    def __init__(self, fail_username=False, card_username_fails=False, card_ts="CARD.1"):
+        super().__init__(fail_username=fail_username)
+        self.card_posts = []    # (channel, thread, text, blocks, username)
+        self.card_updates = []  # (channel, ts, text, blocks)
+        self.card_username_fails = card_username_fails
+        self._card_ts = card_ts
+
+    async def post_status_card(self, channel_id, thread_id, text, blocks, username=None):
+        if username and self.card_username_fails:
+            return None
+        self.card_posts.append((channel_id, thread_id, text, blocks, username))
+        return self._card_ts
+
+    async def update_status_card(self, channel_id, ts, text, blocks):
+        self.card_updates.append((channel_id, ts, text, blocks))
+        return True
+
+
+def _card_body(update_or_post):
+    """The section block's mrkdwn text from a recorded card post/update tuple."""
+    blocks = update_or_post[3]
+    return blocks[0]["text"]["text"]
 
 
 # --------------------------------------------------------------- schema + gating
@@ -130,8 +181,8 @@ async def test_executor_starts_and_returns_ack(monkeypatch):
 async def test_snapshot_is_by_copy(monkeypatch):
     monkeypatch.setattr(config, "enable_deep_research", True)
     live_input = [{"role": "user", "content": "original question"}]
-    openai = SimpleNamespace(create_text_response_with_tools=AsyncMock(
-        return_value={"text": "findings", "tools_used": ["web_search"]}))
+    stub = _StreamStub(text="findings", events=[{"kind": "web_search", "query": "q"}])
+    openai = SimpleNamespace(create_streaming_response_with_tools=stub)
     proc = _FakeProcessor(openai_client=openai, tm=AsyncThreadStateManager())
     client = _FakeClient()
     ctx = _ctx(proc, client, current_input=live_input)
@@ -139,7 +190,7 @@ async def test_snapshot_is_by_copy(monkeypatch):
     # Mutate the LIVE input after the call — the job's snapshot must be unaffected.
     live_input.append({"role": "user", "content": "LATE addition"})
     await proc.scheduled[0]  # run the captured job
-    job_input = openai.create_text_response_with_tools.call_args.kwargs["messages"]
+    job_input = stub.kwargs["messages"]
     contents = [m.get("content") for m in job_input]
     assert "original question" in contents
     assert not any("LATE addition" == c for c in contents)
@@ -154,8 +205,8 @@ async def test_snapshot_is_by_copy(monkeypatch):
 async def test_happy_path_posts_findings_with_trailer(monkeypatch):
     monkeypatch.setattr(config, "enable_deep_research", True)
     monkeypatch.setattr(config, "enable_research_label", False)  # isolate the plain path
-    openai = SimpleNamespace(create_text_response_with_tools=AsyncMock(
-        return_value={"text": "# Findings\nThe answer is 42.", "tools_used": ["web_search"]}))
+    openai = SimpleNamespace(create_streaming_response_with_tools=_StreamStub(
+        text="# Findings\nThe answer is 42.", events=[{"kind": "web_search", "query": "the claim"}]))
     proc = _FakeProcessor(openai_client=openai, tm=AsyncThreadStateManager())
     client = _FakeClient()
     await rt._run_deep_research_job(
@@ -174,8 +225,8 @@ async def test_happy_path_posts_findings_with_trailer(monkeypatch):
 @pytest.mark.asyncio
 async def test_error_path_posts_failure_note(monkeypatch):
     monkeypatch.setattr(config, "enable_deep_research", True)
-    openai = SimpleNamespace(create_text_response_with_tools=AsyncMock(
-        side_effect=RuntimeError("boom")))
+    openai = SimpleNamespace(create_streaming_response_with_tools=_StreamStub(
+        raises=RuntimeError("boom")))
     proc = _FakeProcessor(openai_client=openai, tm=AsyncThreadStateManager())
     client = _FakeClient()
     await rt._run_deep_research_job(
@@ -191,10 +242,7 @@ async def test_timeout_path_posts_failure_note(monkeypatch):
     monkeypatch.setattr(config, "enable_deep_research", True)
     monkeypatch.setattr(config, "deep_research_timeout", 0.01)
 
-    async def _slow(*a, **k):
-        await asyncio.sleep(5)
-
-    openai = SimpleNamespace(create_text_response_with_tools=_slow)
+    openai = SimpleNamespace(create_streaming_response_with_tools=_StreamStub(slow=True))
     proc = _FakeProcessor(openai_client=openai, tm=AsyncThreadStateManager())
     client = _FakeClient()
     await rt._run_deep_research_job(
@@ -209,8 +257,7 @@ async def test_timeout_path_posts_failure_note(monkeypatch):
 async def test_job_clears_registry_on_finish(monkeypatch):
     monkeypatch.setattr(config, "enable_deep_research", True)
     monkeypatch.setattr(config, "enable_research_label", False)
-    openai = SimpleNamespace(create_text_response_with_tools=AsyncMock(
-        return_value={"text": "done", "tools_used": []}))
+    openai = SimpleNamespace(create_streaming_response_with_tools=_StreamStub(text="done"))
     tm = AsyncThreadStateManager()
     tm.register_research("C1:100.0", "j1", "t")
     proc = _FakeProcessor(openai_client=openai, tm=tm)
@@ -301,8 +348,8 @@ async def test_web_search_forced_into_job_tools(monkeypatch):
     the tool IS web research; a truthy array must not silently strip it."""
     monkeypatch.setattr(config, "enable_deep_research", True)
     monkeypatch.setattr(config, "enable_research_label", False)
-    openai = SimpleNamespace(create_text_response_with_tools=AsyncMock(
-        return_value={"text": "report", "tools_used": []}))
+    stub = _StreamStub(text="report")
+    openai = SimpleNamespace(create_streaming_response_with_tools=stub)
     proc = _FakeProcessor(openai_client=openai, tm=AsyncThreadStateManager())
     proc._build_tools_array = lambda cfg, model, registry=None: [
         {"type": "mcp", "server_label": "x"}]  # truthy, no web_search
@@ -310,7 +357,7 @@ async def test_web_search_forced_into_job_tools(monkeypatch):
         processor=proc, client=_FakeClient(), channel_id="C1", thread_root="100.0",
         thread_key="C1:100.0", job_id="j1", task="t",
         snapshot=[], system_prompt="DEV", model="gpt-5.6-sol")
-    tools = openai.create_text_response_with_tools.await_args.kwargs["tools"]
+    tools = stub.kwargs["tools"]
     assert {"type": "web_search"} in tools
     assert {"type": "mcp", "server_label": "x"} in tools
 
@@ -321,8 +368,7 @@ async def test_failed_findings_post_posts_failure_note(monkeypatch):
     the job posts an honest failure note instead of logging 'completed'."""
     monkeypatch.setattr(config, "enable_deep_research", True)
     monkeypatch.setattr(config, "enable_research_label", False)
-    openai = SimpleNamespace(create_text_response_with_tools=AsyncMock(
-        return_value={"text": "report", "tools_used": []}))
+    openai = SimpleNamespace(create_streaming_response_with_tools=_StreamStub(text="report"))
     proc = _FakeProcessor(openai_client=openai, tm=AsyncThreadStateManager())
 
     class _FailingThenNoteClient(_FakeClient):
@@ -358,3 +404,242 @@ async def test_schedule_failure_closes_coroutine(monkeypatch):
     assert res["ok"] is False and res["error"] == "schedule_failed"
     # Registry cleared — nothing left in flight for the thread.
     assert proc.thread_manager.research_in_flight_count("C1:100.0") == 0
+
+
+# ============================================================ F30.1 — status card + suppression
+
+# --------------------------------------------- ack suppression signal
+
+@pytest.mark.asyncio
+async def test_ack_suppression_flag_set_on_success(monkeypatch):
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    proc = _FakeProcessor(openai_client=SimpleNamespace(), tm=AsyncThreadStateManager())
+    ctx = _ctx(proc, _FakeClient())
+    res = await rt.execute_start_deep_research(ctx, {"task": "validate the claim about X"})
+    assert res["ok"] is True
+    assert ctx.deep_research_started is True  # the turn's finalizer drops the ack reply
+    proc.scheduled[0].close()
+
+
+@pytest.mark.asyncio
+async def test_ack_suppression_flag_not_set_on_cap(monkeypatch):
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    monkeypatch.setattr(config, "deep_research_max_per_thread", 1)
+    tm = AsyncThreadStateManager()
+    tm.register_research("C1:100.0", "j0", "x")  # already at the cap
+    proc = _FakeProcessor(openai_client=SimpleNamespace(), tm=tm)
+    ctx = _ctx(proc, _FakeClient())
+    res = await rt.execute_start_deep_research(ctx, {"task": "validate X"})
+    assert res["ok"] is False
+    assert ctx.deep_research_started is False  # rejection must NOT suppress a normal reply
+
+
+@pytest.mark.asyncio
+async def test_ack_suppression_flag_not_set_when_disabled(monkeypatch):
+    monkeypatch.setattr(config, "enable_deep_research", False)
+    ctx = _ctx(_FakeProcessor(), _FakeClient())
+    res = await rt.execute_start_deep_research(ctx, {"task": "X"})
+    assert res["ok"] is False
+    assert ctx.deep_research_started is False
+
+
+def test_prompts_bullet_updated():
+    from prompts import LOCAL_TOOLS_GUIDANCE
+    assert "will NOT be posted" in LOCAL_TOOLS_GUIDANCE
+    assert "write NOTHING after the call" in LOCAL_TOOLS_GUIDANCE
+
+
+# --------------------------------------------- streaming consumption
+
+@pytest.mark.asyncio
+async def test_consume_stream_returns_text_and_tools_equivalent():
+    """The internal streaming consumption accumulates the text and rebuilds tools_used from
+    observed events — deduped, in order — matching the old non-streaming metadata."""
+    stub = _StreamStub(text="the report", events=[
+        {"kind": "web_search", "query": "q1"},
+        {"kind": "mcp", "server_label": "datassential"},
+        {"kind": "web_search", "query": "q2"},  # duplicate web_search collapses to one
+    ])
+    proc = _FakeProcessor(openai_client=SimpleNamespace(
+        create_streaming_response_with_tools=stub))
+    out = await rt._consume_research_stream(
+        proc, messages=[{"role": "user", "content": "q"}], tools=[{"type": "web_search"}],
+        model="gpt-5.6-sol", system_prompt="DEV", effort="high", verbosity="medium", card=None)
+    assert out["text"] == "the report"
+    assert out["tools_used"] == ["web_search", "datassential"]
+    # store=False and no Slack streaming (tool_callback not used for status).
+    assert stub.kwargs["store"] is False
+
+
+# --------------------------------------------- card lifecycle on the job
+
+@pytest.mark.asyncio
+async def test_card_posted_on_job_start_with_label(monkeypatch):
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    monkeypatch.setattr(config, "enable_research_label", True)
+    monkeypatch.setattr(config, "bot_name_aliases", ["Sol"])
+    openai = SimpleNamespace(create_streaming_response_with_tools=_StreamStub(
+        text="findings body", events=[{"kind": "web_search", "query": "the claim"}]))
+    proc = _FakeProcessor(openai_client=openai, tm=AsyncThreadStateManager())
+    client = _CardClient()
+    await rt._run_deep_research_job(
+        processor=proc, client=client, channel_id="C1", thread_root="100.0",
+        thread_key="C1:100.0", job_id="j1", task="map the market",
+        snapshot=[{"role": "user", "content": "q"}], system_prompt="DEV", model="gpt-5.6-sol")
+    assert len(client.card_posts) == 1
+    _, thread, text, blocks, username = client.card_posts[0]
+    assert thread == "100.0"
+    assert text == rt._CARD_FALLBACK_TEXT                 # constant notification fallback
+    assert username and username.startswith("Sol [research:")  # same label as findings
+    assert blocks[0]["type"] == "section" and blocks[1]["type"] == "context"
+    assert blocks[1]["elements"][0]["text"].startswith("todos as of ")
+    # Final card update reads "Reported findings below." and lands BEFORE the report post.
+    assert client.card_updates
+    assert "✓ Reported findings below." in _card_body(client.card_updates[-1])
+    # Findings posted under the SAME label.
+    assert client.sent and client.sent[0][3] and client.sent[0][3].startswith("Sol [research:")
+    # Fallback text stays constant across every card update (no "(edited)" badge).
+    assert all(u[2] == rt._CARD_FALLBACK_TEXT for u in client.card_updates)
+
+
+@pytest.mark.asyncio
+async def test_card_unlabeled_when_label_disabled(monkeypatch):
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    monkeypatch.setattr(config, "enable_research_label", False)  # label off → card still posts
+    openai = SimpleNamespace(create_streaming_response_with_tools=_StreamStub(text="body"))
+    proc = _FakeProcessor(openai_client=openai, tm=AsyncThreadStateManager())
+    client = _CardClient()
+    await rt._run_deep_research_job(
+        processor=proc, client=client, channel_id="C1", thread_root="100.0",
+        thread_key="C1:100.0", job_id="j1", task="t", snapshot=[],
+        system_prompt="DEV", model="gpt-5.6-sol")
+    assert len(client.card_posts) == 1
+    assert client.card_posts[0][4] is None  # unlabeled
+
+
+@pytest.mark.asyncio
+async def test_card_failure_does_not_break_findings(monkeypatch):
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    monkeypatch.setattr(config, "enable_research_label", False)
+    openai = SimpleNamespace(create_streaming_response_with_tools=_StreamStub(
+        text="body", events=[{"kind": "web_search", "query": "q"}]))
+    proc = _FakeProcessor(openai_client=openai, tm=AsyncThreadStateManager())
+
+    class _BoomCardClient(_CardClient):
+        async def post_status_card(self, *a, **k):
+            raise RuntimeError("card down")
+        async def update_status_card(self, *a, **k):
+            raise RuntimeError("card down")
+
+    client = _BoomCardClient()
+    await rt._run_deep_research_job(
+        processor=proc, client=client, channel_id="C1", thread_root="100.0",
+        thread_key="C1:100.0", job_id="j1", task="t", snapshot=[],
+        system_prompt="DEV", model="gpt-5.6-sol")
+    assert len(client.sent) == 1 and "body" in client.sent[0][2]  # findings still posted
+
+
+@pytest.mark.asyncio
+async def test_card_label_failure_falls_back_unlabeled_and_remembers(monkeypatch):
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    monkeypatch.setattr(config, "enable_research_label", True)
+    monkeypatch.setattr(config, "bot_name_aliases", ["Sol"])
+    openai = SimpleNamespace(create_streaming_response_with_tools=_StreamStub(text="body"))
+    proc = _FakeProcessor(openai_client=openai, tm=AsyncThreadStateManager())
+    client = _CardClient(card_username_fails=True)  # labelled card post rejected (no scope)
+    await rt._run_deep_research_job(
+        processor=proc, client=client, channel_id="C1", thread_root="100.0",
+        thread_key="C1:100.0", job_id="j1", task="t", snapshot=[],
+        system_prompt="DEV", model="gpt-5.6-sol")
+    # Card fell back to an unlabeled post and remembered the failure process-wide.
+    assert len(client.card_posts) == 1 and client.card_posts[0][4] is None
+    assert getattr(proc, rt._RESEARCH_LABEL_DISABLED_ATTR) is True
+    # Findings also skip the label (plain post).
+    assert client.sent and client.sent[0][3] is None
+
+
+# --------------------------------------------- card rendering + throttle (isolated)
+
+def _bare_card(client, *, task="dig into the thing", label=None,
+               clock=None, sleep=None, now_label=None):
+    return rt._ResearchCard(
+        processor=_FakeProcessor(), client=client, channel_id="C1", thread_root="100.0",
+        task=task, label=label,
+        clock=clock or (lambda: 0.0),
+        sleep=sleep or (lambda d: asyncio.sleep(0)),
+        now_label=now_label or (lambda: "3:00 PM"))
+
+
+@pytest.mark.asyncio
+async def test_card_update_throttle_coalesces_with_trailing_flush():
+    clock = [0.0]
+    slept = []
+
+    async def _fake_sleep(d):
+        slept.append(d)
+
+    client = _CardClient()
+    card = _bare_card(client, clock=lambda: clock[0], sleep=_fake_sleep)
+    card.ts = "CARD.1"
+    await card.note_web_search("first")   # last_update None → immediate flush (#1)
+    assert len(client.card_updates) == 1
+    await card.note_web_search("second")  # within 4s window → schedule ONE trailing flush
+    await card.note_mcp("srv")            # still within window → no extra task/update
+    assert len(client.card_updates) == 1
+    assert card._flush_task is not None
+    clock[0] = 100.0
+    await card._flush_task                # trailing flush → update #2 with the LATEST state
+    assert len(client.card_updates) == 2
+    body = _card_body(client.card_updates[-1])
+    assert "second" in body and "queried srv" in body     # coalesced, not stale
+    assert slept and slept[0] <= rt._CARD_THROTTLE_S
+    assert all(u[2] == rt._CARD_FALLBACK_TEXT for u in client.card_updates)
+
+
+def test_card_todo_line_cap_is_loud_and_counted():
+    card = _bare_card(_CardClient())
+    for i in range(15):
+        card._steps.append(f"✓ step {i}")
+    lines = card._visible_lines()
+    # header + 15 steps = 16 logical lines → collapsed to exactly 10 visible.
+    assert len(lines) == rt._CARD_MAX_TODO_LINES
+    assert "… +7 more steps" in lines  # 16 - (10 - 1) = 7 hidden, counted
+
+
+@pytest.mark.asyncio
+async def test_card_final_states():
+    for finalize, needle in (
+        (lambda c: c.finalize_success(), "✓ Reported findings below."),
+        (lambda c: c.finalize_failure("everything broke"), "✗ hit a wall: everything broke"),
+        (lambda c: c.finalize_cancelled(), "✗ cancelled (bot shutting down)"),
+    ):
+        client = _CardClient()
+        card = _bare_card(client)
+        card.ts = "CARD.1"
+        await finalize(card)
+        assert needle in _card_body(client.card_updates[-1])
+        # Closed: later notes are no-ops (no stale update after the terminal line).
+        before = len(client.card_updates)
+        await card.note_web_search("late")
+        assert len(client.card_updates) == before
+
+
+@pytest.mark.asyncio
+async def test_card_steps_from_synthetic_tool_events():
+    client = _CardClient()
+    # Advancing clock so each note clears the throttle window and flushes immediately.
+    t = [0.0]
+
+    def _clk():
+        t[0] += rt._CARD_THROTTLE_S + 1.0
+        return t[0]
+
+    card = _bare_card(client, clock=_clk)
+    card.ts = "CARD.1"
+    await card.note_web_search("pricing trends 2026")
+    await card.note_mcp("datassential")
+    await card.note_web_search(None)  # no query → generic line
+    body = _card_body(client.card_updates[-1])
+    assert "✓ searched the web: pricing trends 2026" in body
+    assert "✓ queried datassential" in body
+    assert "✓ searched the web" in body  # generic (query-less) web search
