@@ -272,3 +272,35 @@ def test_envelope_respects_env_cap(monkeypatch):
     client.channel_pulse = _seeded_pulse()
     monkeypatch.setattr(config, "channel_pulse_envelope_max", 0)
     assert proc._build_pulse_envelope(client, "C1", None) is None
+
+
+# --------------------------------------------------------------- F14b attachment note
+
+def test_attachment_note_helper():
+    from slack_client.channel_pulse import _attachment_note
+    assert _attachment_note(None) == ""
+    assert _attachment_note([]) == ""
+    assert _attachment_note([{"mimetype": "image/png"}]) == "[+1 image]"
+    assert _attachment_note(
+        [{"mimetype": "application/pdf"}, {"mimetype": "text/csv"}]) == "[+2 files]"
+    assert _attachment_note(
+        [{"mimetype": "image/png"}, {"mimetype": "application/pdf"}]
+    ) == "[+1 image, +1 file]"
+
+
+def test_record_appends_attachment_note_to_envelope_and_tail():
+    # F14b: a message carrying files surfaces a bracketed note that both the envelope
+    # line and the thread-tail entry inherit (folded in at record level).
+    p = ChannelPulse(size=10)
+    p.record("C1", **_entry("100.0", text="what do we think?"),
+             files=[{"mimetype": "image/png", "name": "food.png"}])
+    env = p.render_envelope("C1")
+    assert "what do we think? [+1 image]" in env
+    tail = p.render_thread_tail("C1", "100.0", before_ts="200.0")
+    assert "[+1 image]" in tail
+
+
+def test_record_without_files_leaves_text_untouched():
+    p = ChannelPulse(size=10)
+    p.record("C1", **_entry("100.0", text="just talking"))
+    assert "[+" not in p.render_envelope("C1")

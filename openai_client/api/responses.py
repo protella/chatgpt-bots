@@ -985,6 +985,13 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
         )
     if signals.get("sender_name"):
         lines.append(f"- Sender: {signals['sender_name']}")
+    # F14b: attachment summary (count + kind + filenames only, no content), so an open
+    # opinion request about an uploaded artifact isn't misread as "no image exists".
+    if signals.get("attachments"):
+        lines.append(
+            f"- Attached to the message: {signals['attachments']}. The assistant can "
+            "view and analyze attachments."
+        )
     if signals.get("sender_is_bot"):
         lines.append(
             "- The sender is another bot/agent, not a human. Responding to a bot is fine "

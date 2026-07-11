@@ -9,6 +9,35 @@ from base_client import Message
 from config import config
 
 
+def _summarize_attachments(files: Any) -> Any:
+    """F14b: compact summary of a message's files for the participation classifier —
+    count + kind breakdown + filenames only, never content. Images (mimetype image/*)
+    and other files are counted separately; filenames render images-first.
+
+    Examples: "1 image (food.png)", "2 files (report.pdf, data.csv)",
+    "1 image, 1 file (chart.png, notes.pdf)". Returns None when there are no files."""
+    if not files:
+        return None
+    image_names, file_names = [], []
+    for f in files:
+        f = f or {}
+        name = f.get("name") or "file"
+        if str(f.get("mimetype", "") or "").startswith("image/"):
+            image_names.append(name)
+        else:
+            file_names.append(name)
+    parts = []
+    n_img, n_file = len(image_names), len(file_names)
+    if n_img:
+        parts.append(f"{n_img} image" + ("s" if n_img != 1 else ""))
+    if n_file:
+        parts.append(f"{n_file} file" + ("s" if n_file != 1 else ""))
+    if not parts:
+        return None
+    names = image_names + file_names
+    return f"{', '.join(parts)} ({', '.join(names)})"
+
+
 class SlackMessageEventsMixin:
     async def _event_to_message(self, event: Dict[str, Any], client) -> Message:
         """Convert a Slack event into the universal Message format (no side effects).
@@ -204,6 +233,7 @@ class SlackMessageEventsMixin:
                 sender_type=sender_type,
                 text=event.get("text", ""),
                 is_bot=sender_type != "human",
+                files=event.get("files"),
             )
         except Exception as e:
             self.log_debug(f"channel_pulse feed failed: {e}")
@@ -336,6 +366,11 @@ class SlackMessageEventsMixin:
                 message.metadata["participation_name_hit"] = True
             if sender_is_bot:
                 message.metadata["participation_sender_bot"] = True
+            # F14b: summarize any files so the classifier knows an artifact is attached
+            # (the gate got file_share through, but text-only signals hid the image).
+            attach_summary = _summarize_attachments(event.get("files"))
+            if attach_summary:
+                message.metadata["participation_attachments"] = attach_summary
         # Phase 7: carry per-channel ground rules + placement into the response pipeline.
         if cs:
             if cs.get("directives"):

@@ -42,7 +42,8 @@ class TestRenderCapabilitiesLine:
         monkeypatch.setattr(config, "mcp_enabled_default", False, raising=False)
         line = render_capabilities_line(None)
         assert "web search" not in line
-        assert line == "image generation and editing"
+        assert line == ("image generation and editing; "
+                        "analyzing images and documents shared in chat")
 
     def test_mcp_servers_present_render_descriptions(self, monkeypatch):
         monkeypatch.setattr(config, "enable_web_search", True, raising=False)
@@ -61,7 +62,8 @@ class TestRenderCapabilitiesLine:
         monkeypatch.setattr(config, "enable_web_search", True, raising=False)
         monkeypatch.setattr(config, "mcp_enabled_default", True, raising=False)
         line = render_capabilities_line(None)
-        assert line == "web search; image generation and editing"
+        assert line == ("web search; image generation and editing; "
+                        "analyzing images and documents shared in chat")
 
     def test_mcp_omitted_when_default_off(self, monkeypatch):
         monkeypatch.setattr(config, "enable_web_search", False, raising=False)
@@ -69,13 +71,15 @@ class TestRenderCapabilitiesLine:
         mcp = _FakeMCP({"datassential": {"server_description": "Food & bev data"}})
         line = render_capabilities_line(mcp)
         assert "Food & bev data" not in line
-        assert line == "image generation and editing"
+        assert line == ("image generation and editing; "
+                        "analyzing images and documents shared in chat")
 
     def test_mcp_omitted_when_no_servers(self, monkeypatch):
         monkeypatch.setattr(config, "enable_web_search", False, raising=False)
         monkeypatch.setattr(config, "mcp_enabled_default", True, raising=False)
         line = render_capabilities_line(_FakeMCP({}))
-        assert line == "image generation and editing"
+        assert line == ("image generation and editing; "
+                        "analyzing images and documents shared in chat")
 
     def test_description_falls_back_to_label(self, monkeypatch):
         monkeypatch.setattr(config, "enable_web_search", False, raising=False)
@@ -121,7 +125,8 @@ class TestRenderCapabilitiesLine:
                 raise RuntimeError("boom")
 
         line = render_capabilities_line(_Boom())
-        assert line == "image generation and editing"
+        assert line == ("image generation and editing; "
+                        "analyzing images and documents shared in chat")
 
 
 # ------------------------------------------------------- evaluate() forwards capabilities
@@ -230,3 +235,52 @@ class TestPromptRule:
         from prompts import PARTICIPATION_SYSTEM_PROMPT
         assert "OPEN question to the room" in PARTICIPATION_SYSTEM_PROMPT
         assert "tools/data sources" in PARTICIPATION_SYSTEM_PROMPT
+
+
+# ------------------------------------------------------ F14b attachment signals
+
+class TestF14bCapabilityEntry:
+    def test_analyzing_entry_unconditional(self, monkeypatch):
+        # Present regardless of web-search / MCP config — vision & document flows are core.
+        monkeypatch.setattr(config, "enable_web_search", False, raising=False)
+        monkeypatch.setattr(config, "mcp_enabled_default", False, raising=False)
+        assert "analyzing images and documents shared in chat" in render_capabilities_line(None)
+
+
+class TestF14bEvaluateForwardsAttachments:
+    @pytest.mark.asyncio
+    async def test_attachments_copied_into_signals(self, monkeypatch):
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
+        client = _CapturingClient()
+        engine = ParticipationEngine(client)
+        await engine.evaluate(channel_id="C1", ts="1.0", text="what do we think?",
+                              attachments="1 image (food.png)")
+        assert client.captured["attachments"] == "1 image (food.png)"
+
+    @pytest.mark.asyncio
+    async def test_attachments_defaults_none(self, monkeypatch):
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
+        client = _CapturingClient()
+        engine = ParticipationEngine(client)
+        await engine.evaluate(channel_id="C1", ts="1.0", text="hi")
+        assert client.captured["attachments"] is None
+
+
+class TestF14bClassifyPayload:
+    @pytest.mark.asyncio
+    async def test_attachment_line_present_when_set(self):
+        from openai_client.api.responses import classify_participation
+        llm = _FakeLLM()
+        await classify_participation(
+            llm, "what do we think? good marketing material?",
+            signals={"sender_name": "Peter", "attachments": "1 image (food.png)"})
+        prompt = llm.captured_input[1]["content"]
+        assert "Attached to the message: 1 image (food.png)." in prompt
+        assert "The assistant can view and analyze attachments." in prompt
+
+    @pytest.mark.asyncio
+    async def test_attachment_line_omitted_when_absent(self):
+        from openai_client.api.responses import classify_participation
+        llm = _FakeLLM()
+        await classify_participation(llm, "msg", signals={"sender_name": "Peter"})
+        assert "Attached to the message" not in llm.captured_input[1]["content"]
