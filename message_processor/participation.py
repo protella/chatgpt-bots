@@ -6,7 +6,7 @@ or back off — using real channel context (ChannelPulse envelope), channel memo
 operator directives, and the bot's own recent participation rate.
 
 Authority order (cheap → expensive), enforced in code not prompt:
-  prefilters (message_events: own message / subtype / level=off / snoozed /
+  prefilters (message_events: own message / subtype / level=off / muted-thread /
   addressed-short-circuit / mentions_only) → hard hourly throttle → debounce →
   ONE utility-model call → verdict.
 
@@ -24,7 +24,6 @@ modal writes both columns in lockstep so legacy readers stay consistent.
 from __future__ import annotations
 
 import asyncio
-import datetime
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -63,33 +62,6 @@ def resolve_participation_level(channel_settings: Optional[Dict[str, Any]]) -> s
             or getattr(config, "channel_response_mode", "tag_only")
             or "tag_only").strip().lower()
     return MODE_TO_LEVEL.get(mode, "mentions_only")
-
-
-def is_snoozed(channel_settings: Optional[Dict[str, Any]],
-               now: Optional[datetime.datetime] = None) -> bool:
-    """True while the channel's snoozed_until timestamp is in the future.
-
-    Snooze silences UNPROMPTED participation only — the addressed/mention path
-    never consults this."""
-    raw = (channel_settings or {}).get("snoozed_until")
-    if not raw:
-        return False
-    try:
-        expiry = datetime.datetime.fromisoformat(str(raw))
-        if expiry.tzinfo is None:
-            expiry = expiry.replace(tzinfo=datetime.timezone.utc)
-    except (ValueError, TypeError):
-        return False  # malformed → treat as not snoozed (fail open, mentions unaffected)
-    now = now or datetime.datetime.now(datetime.timezone.utc)
-    return expiry > now
-
-
-def snooze_expiry_iso(hours: Optional[float] = None,
-                      now: Optional[datetime.datetime] = None) -> str:
-    """ISO-8601 UTC expiry for a new snooze (deterministic given `now`)."""
-    hours = hours if hours is not None else getattr(config, "participation_snooze_hours", 4)
-    now = now or datetime.datetime.now(datetime.timezone.utc)
-    return (now + datetime.timedelta(hours=float(hours))).isoformat(timespec="seconds")
 
 
 def render_capabilities_line(mcp_manager: Any = None) -> Optional[str]:
@@ -181,7 +153,6 @@ class ParticipationEngine:
                        channel_activity: Optional[str] = None,
                        unprompted_last_hour: int = 0,
                        name_hit: bool = False,
-                       snoozed: bool = False,
                        sender_is_bot: bool = False,
                        channel_topic: Optional[str] = None,
                        capabilities: Optional[str] = None,
@@ -218,7 +189,6 @@ class ParticipationEngine:
             "unprompted_last_hour": int(unprompted_last_hour),
             "hourly_cap": self.hourly_cap(level),
             "name_hit": bool(name_hit),
-            "snoozed": bool(snoozed),
             "sender_is_bot": bool(sender_is_bot),
             "channel_topic": channel_topic,
             "capabilities": capabilities,

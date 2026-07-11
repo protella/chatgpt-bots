@@ -12,8 +12,7 @@ from config import config
 from logger import log_session_start, log_session_end, main_logger
 from message_processor.base import MessageProcessor
 from message_processor.participation import (ParticipationEngine,
-                                             render_capabilities_line,
-                                             snooze_expiry_iso)
+                                             render_capabilities_line)
 from base_client import BaseClient, Message
 
 
@@ -137,7 +136,6 @@ class ChatBotV2:
                 memory_facts=memory_facts, channel_activity=channel_activity,
                 unprompted_last_hour=unprompted,
                 name_hit=name_hit,
-                snoozed=message.metadata.get("participation_snoozed") is True,
                 sender_is_bot=message.metadata.get("participation_sender_bot") is True,
                 channel_topic=channel_topic,
                 capabilities=capabilities,
@@ -182,35 +180,71 @@ class ChatBotV2:
             return None
 
     async def _apply_backoff(self, message: Message, client: BaseClient):
-        """'Butt out' loop: ack with an emoji (no more words), snooze unprompted
-        participation for PARTICIPATION_SNOOZE_HOURS, and leave a durable memory
-        fact so the preference outlives the snooze. Mentions keep working."""
+        """'Butt out' loop (F15): ack with an emoji (no more words), permanently MUTE
+        THIS THREAD for unprompted participation, and write/update a durable channel-memory
+        fact so the classifier raises the bar channel-wide. No timer — nothing expires; the
+        model forgets/updates the fact (and the mute lifts) when re-invited. @-mentions and
+        name-hit summons in the muted thread still answer."""
         channel_id = message.channel_id
         react_ts = message.metadata.get("ts") or message.thread_id
+        thread_root = message.thread_id or react_ts
         if hasattr(client, "react"):
             try:
                 await client.react(channel_id, react_ts, config.snooze_ack_emoji)
             except Exception as e:
                 main_logger.debug(f"Backoff ack react failed: {e}")
         try:
-            expiry = snooze_expiry_iso()
-            await self.processor.db.set_channel_settings_async(
-                channel_id, snoozed_until=expiry, updated_by="participation_engine")
-            main_logger.info(f"Participation backoff: {channel_id} snoozed until {expiry}")
+            newly = await self.processor.db.add_muted_thread_async(
+                channel_id, thread_root, updated_by="participation_engine")
+            main_logger.info(
+                f"Participation backoff: muted thread {channel_id}:{thread_root} "
+                f"(newly={newly})")
         except Exception as e:
-            main_logger.warning(f"Backoff snooze write failed: {e}")
+            main_logger.warning(f"Backoff thread-mute write failed: {e}")
         try:
             if getattr(config, "enable_channel_memory", True) and self.processor.db:
-                import datetime
-                day = datetime.datetime.fromtimestamp(
-                    float(react_ts), tz=datetime.timezone.utc).date().isoformat()
-                await self.processor.db.add_channel_memory_async(
-                    channel_id,
-                    f"On {day} the channel asked for less unprompted participation from the assistant.",
-                    author="participation_engine",
-                )
+                await self._record_backoff_memory(message, react_ts)
         except Exception as e:
             main_logger.debug(f"Backoff memory write failed: {e}")
+
+    async def _record_backoff_memory(self, message: Message, react_ts: str):
+        """Write or UPDATE (never duplicate) the channel-memory fact recording a butt-out.
+
+        One fact per thread — keyed by author=`participation_engine:<thread_root>` so a repeat
+        backoff on the same thread refreshes that row's date/text instead of piling up
+        duplicates, while butt-outs in DIFFERENT threads accrue as distinct facts (the
+        classifier reads REPEATED facts as observe-only)."""
+        import datetime
+        channel_id = message.channel_id
+        thread_root = message.thread_id or react_ts
+        try:
+            day = datetime.datetime.fromtimestamp(
+                float(react_ts), tz=datetime.timezone.utc).date().isoformat()
+        except (ValueError, TypeError, OSError):
+            day = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+        who = (message.metadata.get("user_real_name")
+               or message.metadata.get("username") or "a teammate")
+        topic = self._backoff_topic(message.text)
+        content = (f"{day}: {who} told the assistant to butt out of {topic} — "
+                   f"raise the bar for unprompted replies in this channel.")
+        marker = f"participation_engine:{thread_root}"
+        existing = await self.processor.db.get_channel_memory_async(channel_id)
+        prior = next((f for f in (existing or []) if f.get("author") == marker), None)
+        if prior:
+            await self.processor.db.update_channel_memory_async(prior["id"], content)
+        else:
+            await self.processor.db.add_channel_memory_async(
+                channel_id, content, author=marker)
+
+    @staticmethod
+    def _backoff_topic(text: Optional[str]) -> str:
+        """A short, single-line topic phrase for the butt-out memory fact, derived from the
+        triggering message. Collapses whitespace and truncates so the stored fact stays a
+        readable one-liner."""
+        cleaned = " ".join((text or "").split())
+        if not cleaned:
+            return "this conversation"
+        return (cleaned[:80] + "…") if len(cleaned) > 80 else cleaned
 
     async def handle_message(self, message: Message, client: BaseClient):
         """Handle incoming message from any platform"""
