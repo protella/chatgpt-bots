@@ -325,13 +325,32 @@ class TestReadDocumentTool:
         assert "2.7 percent" in out["matches"][0]["context"]
 
     @pytest.mark.asyncio
-    async def test_query_no_match_gives_navigation_hint(self):
+    async def test_query_no_match_returns_full_small_doc(self):
+        # F25: a literal-substring miss must not dead-end — a small doc comes back whole
+        # so one call answers the question even when the query phrasing doesn't match.
         dt = self._fresh_cache()
+        text = "Backup vendor: Meridian Foods (code MF-2210)"
         with patch.object(dt._document_handler, "safe_extract_content_async",
-                          AsyncMock(return_value={"content": "nothing to see"})):
+                          AsyncMock(return_value={"content": text})):
+            out = await dt.execute_read_document(_ctx([dict(DOC_ROW)]),
+                                                 {"file_id": "F42", "query": "backup vendor code"})
+        assert out["ok"] is True and out["matches"] == []
+        assert out["content"] == text
+        assert out["has_more"] is False
+        assert "FULL document" in out["note"]
+
+    @pytest.mark.asyncio
+    async def test_query_no_match_returns_doc_start_with_navigation(self):
+        # F25: on a large doc, the miss includes the START slice + next_offset.
+        dt = self._fresh_cache()
+        text = "nothing to see " * 500  # > SLICE_CHARS
+        with patch.object(dt._document_handler, "safe_extract_content_async",
+                          AsyncMock(return_value={"content": text})):
             out = await dt.execute_read_document(_ctx([dict(DOC_ROW)]),
                                                  {"file_id": "F42", "query": "unicorns"})
         assert out["ok"] is True and out["matches"] == []
+        assert out["content"] == text[:dt.SLICE_CHARS]
+        assert out["has_more"] is True and out["next_offset"] == dt.SLICE_CHARS
         assert "offset" in out["note"]
 
     @pytest.mark.asyncio
