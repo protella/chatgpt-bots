@@ -13,6 +13,8 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
+from config import config
+
 # The external `_Used Tools:_` attribution footer (handlers/text.py appends this to the
 # VISIBLE message). It is deliberately user-facing chrome and must never reach model
 # context. END-anchored: the remainder after the footer must be ONLY optional
@@ -22,10 +24,21 @@ from typing import Any, Dict, List, Optional
 _USED_TOOLS_FOOTER_RE = re.compile(
     r'\n\n_Used Tools:.+?_(?=(?:\n\[(?:used tools|reactions):[^\n\]]*\])*\s*$)')
 
-# Budgets (spec F7): <=8 entries/turn, gist <=~80 chars, annotation <=~160 chars.
-MAX_PROVENANCE_ENTRIES = 8
-MAX_GIST_CHARS = 80
-MAX_ANNOTATION_CHARS = 160
+# Budgets (F7, now env-backed per F14): entries/turn (config.tool_provenance_max_entries,
+# default 20), gist chars (config.tool_provenance_gist_chars, default 80), annotation line
+# budget (config.tool_provenance_line_budget, default 300). Read at CALL time via the tiny
+# accessors below so annotation rendering stays a pure function of (row, config) — config is
+# boot-constant, so rebuild determinism holds, and tests can monkeypatch the singleton.
+def _max_provenance_entries() -> int:
+    return int(getattr(config, "tool_provenance_max_entries", 20))
+
+
+def _max_gist_chars() -> int:
+    return int(getattr(config, "tool_provenance_gist_chars", 80))
+
+
+def _max_annotation_chars() -> int:
+    return int(getattr(config, "tool_provenance_line_budget", 300))
 
 # F12: marker appended to a per-call MCP result digest when it is cut to the char cap.
 TRUNCATION_MARKER = "… [truncated]"
@@ -85,7 +98,7 @@ def gist_from_arguments(arguments: Any) -> str:
 
     Names are NOT included (the record carries tool_name separately). Nested values are
     summarized by kind+size, scalars are stringified and per-value capped; the whole gist
-    is capped at MAX_GIST_CHARS. Returns "" when there are no usable args."""
+    is capped at config.tool_provenance_gist_chars. Returns "" when there are no usable args."""
     if isinstance(arguments, str):
         try:
             arguments = json.loads(arguments or "{}")
@@ -93,15 +106,16 @@ def gist_from_arguments(arguments: Any) -> str:
             return ""
     if not isinstance(arguments, dict) or not arguments:
         return ""
+    max_gist = _max_gist_chars()
     parts: List[str] = []
     for key, value in arguments.items():
         rendered = _gist_render_value(key, value).replace("\n", " ").replace("\r", " ").strip()
         if len(rendered) > 30:
             rendered = rendered[:27] + "…"
         parts.append(f"{key}={rendered}")
-        if len(", ".join(parts)) >= MAX_GIST_CHARS:
+        if len(", ".join(parts)) >= max_gist:
             break
-    return ", ".join(parts)[:MAX_GIST_CHARS]
+    return ", ".join(parts)[:max_gist]
 
 
 def build_provenance(local_tool_calls: Optional[List[Dict[str, Any]]],
@@ -111,26 +125,27 @@ def build_provenance(local_tool_calls: Optional[List[Dict[str, Any]]],
     Local tool calls (the confabulation risk — history fetches, reactions, memory ops)
     come first with their arg-derived gists; external/built-in names (web_search, MCP)
     follow with empty gists (server-side calls expose no args here). Capped at
-    MAX_PROVENANCE_ENTRIES."""
+    config.tool_provenance_max_entries."""
+    max_gist = _max_gist_chars()
     out: List[Dict[str, str]] = []
     for call in local_tool_calls or []:
         name = call.get("name")
         if not name:
             continue
-        out.append({"tool_name": str(name), "gist": (call.get("gist") or "")[:MAX_GIST_CHARS]})
+        out.append({"tool_name": str(name), "gist": (call.get("gist") or "")[:max_gist]})
     for name in external_names or []:
         if name:
             out.append({"tool_name": str(name), "gist": ""})
-    return out[:MAX_PROVENANCE_ENTRIES]
+    return out[:_max_provenance_entries()]
 
 
 def render_used_tools_annotation(tools: Optional[List[Dict[str, Any]]]) -> str:
     """Render the reinjected annotation line, e.g.
     ``[used tools: fetch_channel_history(limit=50), web_search]``.
 
-    Gists are included when the whole line fits MAX_ANNOTATION_CHARS; otherwise it
-    degrades to names only. Pure function of the (immutable) rows, so every rebuild
-    renders identically (determinism invariant F7-5)."""
+    Gists are included when the whole line fits config.tool_provenance_line_budget; otherwise
+    it degrades to names only. Pure function of the (immutable) rows and boot-constant config,
+    so every rebuild renders identically (determinism invariant F7-5)."""
     if not tools:
         return ""
     names: List[str] = []
@@ -149,7 +164,7 @@ def render_used_tools_annotation(tools: Optional[List[Dict[str, Any]]]) -> str:
     if not names:
         return ""
     full = f"[used tools: {', '.join(with_gist)}]"
-    if len(full) <= MAX_ANNOTATION_CHARS:
+    if len(full) <= _max_annotation_chars():
         return full
     return f"[used tools: {', '.join(names)}]"
 
