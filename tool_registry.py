@@ -38,6 +38,10 @@ class ToolContext:
     current_input: Optional[List[Any]] = None
     system_prompt: Optional[str] = None
     model: Optional[str] = None
+    # F30.1: set True by execute_start_deep_research on a successful start, so the turn's
+    # finalizer (handlers/text.py) can DROP the model's ack reply — the research status card
+    # the job posts is the acknowledgment. Read back from the same context the loop shares.
+    deep_research_started: bool = False
 
 
 Executor = Callable[[ToolContext, Dict[str, Any]], Awaitable[Dict[str, Any]]]

@@ -653,6 +653,37 @@ class SlackMessagingMixin:
             self.log_error(f"Could not update message: {e}")
             return False
 
+    async def post_status_card(self, channel_id: str, thread_id: str, text: str,
+                               blocks: list, username: Optional[str] = None) -> Optional[str]:
+        """F30.1: post a blocks status card (e.g. the deep-research todo card). Returns the
+        posted ts, or None on failure. `text` is the CONSTANT notification fallback; `blocks`
+        carry the visible card. `username` optionally labels the poster (needs the
+        chat:write.customize scope; without it Slack raises missing_scope → None so the caller
+        can retry unlabeled). Best-effort — never raises."""
+        try:
+            kwargs = dict(channel=channel_id, thread_ts=thread_id, text=text, blocks=blocks,
+                          unfurl_links=False, unfurl_media=False)
+            if username:
+                kwargs["username"] = username
+            result = await self.app.client.chat_postMessage(**kwargs)
+            return result.get("ts")
+        except SlackApiError as e:
+            self.log_warning(f"Status card post failed: {e}")
+            return None
+
+    async def update_status_card(self, channel_id: str, ts: str, text: str,
+                                 blocks: list) -> bool:
+        """F30.1: update a blocks status card in place. `text` MUST stay CONSTANT across
+        updates (Slack badges '(edited)' only when the top-level text changes; blocks-only
+        edits don't badge). Best-effort — returns False on failure, never raises."""
+        try:
+            await self.app.client.chat_update(
+                channel=channel_id, ts=ts, text=text, blocks=blocks)
+            return True
+        except SlackApiError as e:
+            self.log_debug(f"Status card update failed: {e}")
+            return False
+
     async def _replies_page_with_retry(self, kwargs: Dict, attempts: int = 3):
         """One conversations.replies page, honoring Retry-After on 429s (R1).
 
