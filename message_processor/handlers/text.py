@@ -6,7 +6,7 @@ from typing import Any, List, Optional
 
 from base_client import BaseClient, Message, Response
 from config import config, pipeline_status
-from prompts import NO_REPLY_CONTRACT_SUFFIX
+from prompts import NO_REPLY_CONTRACT_SUFFIX, CONTINUATION_NO_REPLY_SUFFIX
 from message_markers import (
     CONTINUATION_HEAD,
     continuation_trailer,
@@ -52,28 +52,41 @@ class TextHandlerMixin:
 
     def _materialize_request_tools(self, client: BaseClient, thread_config: dict,
                                    message: Message, tools_disabled: bool):
-        """F2: resolve this attempt's tool exposure ONCE, up front. Returns
-        (registry_or_None, request_config, no_reply_tool_available).
+        """F2/F18: resolve this attempt's tool exposure ONCE, up front. Returns
+        (registry_or_None, request_config, no_reply_tool_available, no_reply_suffix).
 
         request_config is a COPY of the shared thread_config with `_unprompted_turn` set on
-        participation-gated turns — the shared dict is never mutated. no_reply_tool_available
-        is derived from the resolved schema set (so it's False whenever the tool isn't
-        actually exposed — timeout retries that drop the registry, config off, prompted
-        turns), and that single flag drives both the tools array and the suffix paragraph."""
-        unprompted = bool((message.metadata or {}).get("participation_check") is True)
+        turns that get the silence option — the shared dict is never mutated. Two paths
+        qualify: F2 participation-gated (unprompted) turns, and F18 thread-continuation
+        turns (wake_source == "thread_continuation"), a 1:1 reply routed straight to the
+        main model. DMs and @-mention/name-summons turns get neither the tool nor a suffix.
+        no_reply_tool_available is derived from the resolved schema set (so it's False
+        whenever the tool isn't actually exposed — timeout retries that drop the registry,
+        config off, prompted turns), and drives the tools array. no_reply_suffix is the
+        matching volatile contract paragraph (F2 vs F18 wording) or None — both key off the
+        same exposure so instruction and tool can never disagree."""
+        meta = message.metadata or {}
+        unprompted = bool(meta.get("participation_check") is True)
+        continuation = (not unprompted
+                        and meta.get("wake_source") == "thread_continuation")
+        expose_no_reply = unprompted or continuation
         request_config = dict(thread_config)
-        if unprompted:
+        if expose_no_reply:
             request_config["_unprompted_turn"] = True
         if tools_disabled:
-            return None, request_config, False
+            return None, request_config, False, None
         registry = self._get_tool_registry(client, request_config)
         no_reply_available = False
-        if registry is not None and unprompted and config.enable_no_reply_tool:
+        no_reply_suffix = None
+        if registry is not None and expose_no_reply and config.enable_no_reply_tool:
             no_reply_available = any(
                 s.get("name") == "no_response_needed"
                 for s in registry.schemas(request_config)
             )
-        return registry, request_config, no_reply_available
+            if no_reply_available:
+                no_reply_suffix = (CONTINUATION_NO_REPLY_SUFFIX if continuation
+                                   else NO_REPLY_CONTRACT_SUFFIX)
+        return registry, request_config, no_reply_available, no_reply_suffix
 
     def _build_tool_context(self, message: Message, client: BaseClient) -> ToolContext:
         """Per-request context handed to local tool executors."""
@@ -216,20 +229,21 @@ class TextHandlerMixin:
         retry_timeout = 60.0 if retry_count > 0 else None
         # F2: resolve this attempt's tool exposure ONCE. The timeout-retry path runs the
         # loop-less API, so it disables the registry — and (Codex finding 19) that same
-        # flag must drop the suffix paragraph, which falls out of no_reply_available below.
-        registry, request_config, no_reply_available = self._materialize_request_tools(
+        # flag must drop the suffix paragraph, which falls out of no_reply_suffix below.
+        registry, request_config, no_reply_available, no_reply_suffix = self._materialize_request_tools(
             client, thread_config, message, tools_disabled=bool(retry_timeout))
 
         # Prompt-cache hygiene: volatile context (minute-precision time + channel-activity
         # envelope + F1 in-flight note) rides at the SUFFIX (last message), never in the
-        # system prompt, so the cached prefix survives across turns. F2's contract paragraph
-        # rides the same slot, appended only when the no_response_needed tool is exposed.
+        # system prompt, so the cached prefix survives across turns. F2/F18's contract
+        # paragraph rides the same slot, appended only when the no_response_needed tool is
+        # exposed (F2 unprompted vs F18 continuation wording, chosen in _materialize).
         suffix = self._build_suffix_context(client, message.channel_id,
                                             thread_state.thread_ts,
                                             user_timezone, user_tz_label,
                                             message=message, thread_state=thread_state)
-        if no_reply_available:
-            suffix = f"{suffix}\n\n{NO_REPLY_CONTRACT_SUFFIX}"
+        if no_reply_suffix:
+            suffix = f"{suffix}\n\n{no_reply_suffix}"
         messages_for_api = messages_for_api + [{
             "role": "developer",
             "content": suffix,
@@ -634,20 +648,21 @@ class TextHandlerMixin:
         # F2: resolve this turn's tool exposure ONCE. Streaming retries fall back to the
         # non-streaming path, so tools are never disabled here (tools_disabled=False).
         # request_config carries the per-turn _unprompted_turn flag that exposes
-        # no_response_needed; no_reply_available drives the contract suffix — both mirror
-        # the non-streaming path so unprompted streamed turns get the same contract.
-        registry, request_config, no_reply_available = self._materialize_request_tools(
+        # no_response_needed; no_reply_suffix drives the contract paragraph — both mirror
+        # the non-streaming path so unprompted/continuation streamed turns get the same
+        # contract (F2 unprompted vs F18 continuation wording).
+        registry, request_config, no_reply_available, no_reply_suffix = self._materialize_request_tools(
             client, thread_config, message, tools_disabled=False)
 
         # Prompt-cache hygiene: volatile context (minute-precision time + channel-activity
         # envelope) rides at the SUFFIX (last message), never in the system prompt, so the
-        # cached prefix survives across turns. F2's contract paragraph rides the same slot.
+        # cached prefix survives across turns. F2/F18's contract paragraph rides the same slot.
         suffix = self._build_suffix_context(client, message.channel_id,
                                             thread_state.thread_ts,
                                             user_timezone, user_tz_label,
                                             message=message, thread_state=thread_state)
-        if no_reply_available:
-            suffix = f"{suffix}\n\n{NO_REPLY_CONTRACT_SUFFIX}"
+        if no_reply_suffix:
+            suffix = f"{suffix}\n\n{no_reply_suffix}"
         messages_for_api = messages_for_api + [{
             "role": "developer",
             "content": suffix,
