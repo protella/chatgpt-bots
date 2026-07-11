@@ -1165,6 +1165,83 @@ omits when none); image/file kind breakdown; capability line includes the analyz
 entry; pulse line carries the attachment note; end-to-end: file_share event → dispatch
 → signals contain the summary.
 
+## F18. Silence option on thread-continuation turns (live gap 2026-07-11)
+
+**Live failure:** in a 1:1 thread with the bot, "claude, what are your thoughts?"
+dispatched via the deterministic direct_continuation fast path
+(participation_check=False — Claude had never posted in that thread, so the other-bot
+escape didn't fire) straight to the main model. The model RECOGNIZED it wasn't the
+addressee but had no way to stay silent — F2 exposes `no_response_needed` on
+UNPROMPTED turns only — so it posted "I'll let Claude take this one—rare bot
+restraint": words about not saying words. (The classifier layer is fine: Claude's
+actual reply a minute later was engine-judged and correctly ignored.)
+
+**Design (judgment-based, no string matching; the fast path stays cheap):**
+1. **Expose the silence tool on continuation turns:** channel turns with
+   `wake_source == "thread_continuation"` get the `no_response_needed` terminal tool
+   exactly like unprompted turns do (find the F2 exposure gate and widen it). DMs and
+   @-mention/name-summons turns stay as-is (genuinely addressed — no silence option).
+2. **Contract suffix variant for continuations** (prompts.py, alongside
+   NO_REPLY_CONTRACT_SUFFIX; same volatile-developer-suffix delivery, never in the
+   system prompt): you're seeing this because the thread has been a 1:1 conversation
+   with you — but check the latest message's addressee yourself: if it opens with or
+   names a DIFFERENT person or agent ("claude, …", "Dana, can you…"), it is theirs —
+   end with no_response_needed. NEVER post a placeholder announcing you're staying
+   quiet or deferring to the addressee; silence means silence. Otherwise reply
+   normally.
+3. **F2 plumbing parity:** whatever accounting/streaming guards the unprompted
+   no-reply path has (the F2 revision + retry no_reply guard from 2ae0b79) must cover
+   the continuation path identically — audit those call sites rather than assuming.
+
+**Tests:** continuation channel turn exposes the tool + suffix (unprompted wording vs
+continuation wording each present on their own path); DM and mention turns expose
+neither; model calling no_response_needed on a continuation turn yields NO posted
+message (and no footer/reaction side effects); normal continuation replies unaffected;
+suffix is volatile (not in rebuilt history).
+
+## F19. Acknowledgment reaction while working (user request 2026-07-11; redesigned same day)
+
+**Rationale (user):** Claude Tag commonly drops a quick reaction (👀-style) on the
+message it was asked about — "I'm looking at it, gimme a sec" — when the answer will
+take a moment. Our bot never opts for reactions this way. A first-draft timer design
+(react if no reply within 3s) was REJECTED by the user: the bot never answers in 3s,
+so it degenerates to reacting to everything, and the threshold is an arbitrary number.
+Redesign: the ack is a JUDGMENT made by the fast models that already look at every
+message — no timers, no thresholds.
+
+**Design:**
+1. **Unprompted channel messages — the participation verdict carries it.** The verdict
+   JSON gains an optional `"ack": true` (meaningful only with `action: "respond"`):
+   the classifier sets it when the reply is worth giving AND implies real work —
+   analyzing attachments, data/MCP lookups, multi-step tool use, long-form output —
+   vs. a quick conversational reply (no ack). PARTICIPATION_SYSTEM_PROMPT documents
+   the field with that judgment guidance; validate_verdict coerces it safely (absent/
+   malformed → false). On a respond+ack verdict the gate immediately adds
+   `ACK_REACTION_EMOJI` to the triggering message, then dispatches the turn as usual.
+   Zero additional model calls.
+2. **Addressed turns (mentions, DMs, name summons, continuations) — the intent
+   classifier carries it.** INTENT_CLASSIFIER_PROMPT's output extends from exactly one
+   word to `<intent> <ack|noack>` (two tokens, same call — parse defensively, default
+   noack; keep the one-word parse working as fallback so a misbehaving output can't
+   break intent routing). Guidance mirrors pt 1, plus the deterministic signals it
+   already sees: vision/new/edit intents and attachment-bearing messages are natural
+   acks; quick text answers are not. On ack, the processor places the reaction as soon
+   as classification returns (~1-2s in), before any slow work starts.
+3. **Shared rails:** the reaction goes through the F6 reservation guard (never
+   double-add with a later gate/model reaction), is purely additive (never counts as
+   the turn's response, no participation accounting), stays after the reply
+   (Claude-style "seen" marker), and fails silent. Image-generation turns already show
+   the enhancement/status UX — the ack is still fine there (it lives on the USER's
+   message), but the classifier may reasonably skip it; no special-casing.
+4. Config: `ENABLE_ACK_REACTION` (default true), `ACK_REACTION_EMOJI` (default eyes).
+   No delay knob.
+
+**Tests:** verdict ack parsed/coerced (absent, true, malformed); respond+ack → gate
+reacts then dispatches; respond without ack → no reaction; react/ignore/backoff
+verdicts ignore the field; intent output two-token parse + one-word fallback + garbage
+default; ack intent → reaction before handler runs; reservation guard consulted;
+config off → field ignored everywhere; emoji configurable.
+
 ## Rollout / verification
 
 1. `make test` green after each change set (F4 → F1 → F2 → F3); `make lint` clean.
