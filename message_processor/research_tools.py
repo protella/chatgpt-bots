@@ -59,8 +59,9 @@ def get_start_deep_research_schema() -> dict:
             "factual question — where a sourced, cross-checked report clearly beats a quick "
             "answer. The job runs after this turn ends and posts its findings back to THIS "
             "thread in a few minutes. Do NOT use it for anything a single web_search answers "
-            "inline, or for opinions/chit-chat. After calling it, reply with ONE short line "
-            "telling the requester the findings will land here shortly — no fake progress."
+            "inline, or for opinions/chit-chat. Calling it posts a live status card that "
+            "acknowledges the request on its own — your reply text will NOT be posted, so "
+            "write NOTHING after the call and no preamble before it."
         ),
         "parameters": {
             "type": "object",
@@ -119,7 +120,13 @@ def _research_label(processor, task: str) -> Optional[str]:
 # the top-level `text` changes, so keeping it fixed lets blocks-only updates stay unbadged.
 _CARD_FALLBACK_TEXT = "Deep research in progress…"
 _CARD_MAX_TODO_LINES = 10          # visible todo lines before the tail collapses to "+N more"
-_CARD_THROTTLE_S = 4.0             # at most one chat.update this often (trailing flush honored)
+
+
+def _card_throttle_s() -> float:
+    """Card chat.update floor. Not a new magic number: Slack's real constraint on message
+    updates is ~1/sec per message, already encoded as STREAMING_MIN_INTERVAL — the same knob
+    the streaming path throttles on. Floor of 1.0 enforced."""
+    return max(1.0, float(getattr(config, "streaming_min_interval", 1.0) or 1.0))
 
 
 def _now_label(clock: Callable[[], time.struct_time] = time.localtime) -> str:
@@ -133,7 +140,7 @@ class _ResearchCard:
     Posts ONE blocks message — a section block whose mrkdwn is the todo list, plus a context
     block "todos as of H:MM AM/PM" — with the same labelled identity as the findings, then
     updates it in place as the job observes tool activity. chat.update is THROTTLED to at most
-    one per ``_CARD_THROTTLE_S`` with a TRAILING flush, so the last event is never left
+    one per ``_card_throttle_s()`` (STREAMING_MIN_INTERVAL) with a TRAILING flush, so the last event is never left
     unshown. The notification `text` is CONSTANT (``_CARD_FALLBACK_TEXT``) across every update
     so Slack never badges "(edited)". Every op is best-effort: a card failure is logged and
     swallowed — it must NEVER kill the research job."""
@@ -231,10 +238,11 @@ class _ResearchCard:
             return
         self._dirty = True
         now = self._clock()
-        if self._last_update is None or (now - self._last_update) >= _CARD_THROTTLE_S:
+        throttle = _card_throttle_s()
+        if self._last_update is None or (now - self._last_update) >= throttle:
             await self._flush()
         elif self._flush_task is None or self._flush_task.done():
-            delay = _CARD_THROTTLE_S - (now - self._last_update)
+            delay = throttle - (now - self._last_update)
             self._flush_task = asyncio.ensure_future(self._delayed_flush(delay))
 
     async def _delayed_flush(self, delay: float) -> None:
