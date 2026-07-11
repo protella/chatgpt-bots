@@ -167,6 +167,7 @@ async def test_happy_path_posts_findings_with_trailer(monkeypatch):
     assert thread == "100.0"
     assert "The answer is 42." in text
     assert "_deep research ·" in text and "effort" in text  # trailer
+    assert "tools: web_search" in text  # visible tool attribution in the trailer
     assert username is None
 
 
