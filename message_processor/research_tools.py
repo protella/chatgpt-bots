@@ -86,6 +86,15 @@ def get_start_deep_research_schema() -> dict:
                         "conversational context that isn't restated here."
                     ),
                 },
+                "label": {
+                    "type": "string",
+                    "description": (
+                        "SHORT topic tag for the research byline — 2-5 words, under 30 "
+                        "characters, e.g. 'fast-casual 2026 performance'. A tag, not a "
+                        "sentence: it renders as '[research: <label>]' next to every post "
+                        "from this job, and Slack hard-truncates long bylines."
+                    ),
+                },
             },
             "required": ["task"],
         },
@@ -137,13 +146,15 @@ def _fmt_duration(seconds: float) -> str:
     return f"{m}m {s}s" if m else f"{s}s"
 
 
-def _research_label(processor, task: str) -> Optional[str]:
+def _research_label(processor, label_source: str) -> Optional[str]:
     """The chat.postMessage username override for the labelled research surfaces (status card
     AND findings), or None when labelling is off/disabled — so both carry the SAME identity.
 
-    Keeps the full bracketed label within Slack's 50-char server-side username cap. Returns
-    None when ENABLE_RESEARCH_LABEL is off, or once a labelled post has failed this process
-    (``_RESEARCH_LABEL_DISABLED_ATTR`` — likely a missing chat:write.customize scope)."""
+    ``label_source`` is the model's short topic tag when it gave one (Claude-parity byline),
+    else the full task text. Keeps the full bracketed label within Slack's 50-char
+    server-side username cap. Returns None when ENABLE_RESEARCH_LABEL is off, or once a
+    labelled post has failed this process (``_RESEARCH_LABEL_DISABLED_ATTR`` — likely a
+    missing chat:write.customize scope)."""
     if not getattr(config, "enable_research_label", True):
         return None
     if getattr(processor, _RESEARCH_LABEL_DISABLED_ATTR, False):
@@ -152,7 +163,7 @@ def _research_label(processor, task: str) -> Optional[str]:
     # Slack truncates chat.postMessage usernames at 50 chars SERVER-SIDE, so the gist budget
     # is whatever keeps the full label, bracket included, within 50.
     gist_budget = 50 - len(alias) - len(" [research: ") - 1
-    return f"{alias} [research: {_gist(task, max(gist_budget, 8))}]"
+    return f"{alias} [research: {_gist(label_source, max(gist_budget, 8))}]"
 
 
 # --- F30.1: live status card ---------------------------------------------------------------
@@ -405,6 +416,10 @@ async def execute_start_deep_research(ctx: ToolContext, args: Dict[str, Any]) ->
     task = (args.get("task") or "").strip()
     if not task:
         return {"ok": False, "error": "missing_task", "message": "A research task is required."}
+    # Optional short byline tag (Claude-parity): a 2-5 word topic beats a truncated task gist
+    # inside Slack's 50-char username cap. Whitespace-collapsed; _research_label still
+    # bracket-safe-gists it, so an overlong tag degrades gracefully.
+    label_hint = " ".join((args.get("label") or "").split())
     processor = getattr(ctx, "processor", None)
     client = getattr(ctx, "client", None)
     if processor is None or client is None:
@@ -440,7 +455,8 @@ async def execute_start_deep_research(ctx: ToolContext, args: Dict[str, Any]) ->
     coro = _run_deep_research_job(
         processor=processor, client=client, channel_id=channel_id,
         thread_root=thread_root, thread_key=thread_key, job_id=job_id,
-        task=task, snapshot=snapshot, system_prompt=system_prompt, model=model)
+        task=task, label_hint=label_hint, snapshot=snapshot,
+        system_prompt=system_prompt, model=model)
     try:
         task_handle = processor._schedule_async_call(coro)
     except Exception as e:  # scheduling failed — the job will never run; clear the registry
@@ -465,7 +481,7 @@ async def execute_start_deep_research(ctx: ToolContext, args: Dict[str, Any]) ->
 async def _run_deep_research_job(*, processor, client, channel_id: str, thread_root: str,
                                  thread_key: str, job_id: str, task: str,
                                  snapshot: List[Dict[str, Any]], system_prompt: Optional[str],
-                                 model: str) -> None:
+                                 model: str, label_hint: str = "") -> None:
     """The detached job: post the live status card, run ONE Responses call consumed as an
     INTERNAL stream (web_search + MCP, no local tools) to drive the card + accumulate the
     report, finalize the card, then deliver the report (or an honest failure note) to the
@@ -481,9 +497,11 @@ async def _run_deep_research_job(*, processor, client, channel_id: str, thread_r
         f"{_gist(task)!r}")
     # F30.1: the live status card is the acknowledgment (the model's ack reply was suppressed).
     # Post it immediately; it uses the same label as the findings (unlabeled if disabled).
+    # The byline prefers the model's short topic tag over a truncated task gist.
+    label_source = label_hint or task
     card = _ResearchCard(processor=processor, client=client, channel_id=channel_id,
                          thread_root=thread_root, task=task,
-                         label=_research_label(processor, task))
+                         label=_research_label(processor, label_source))
     try:
         await card.start()
     except Exception as e:  # noqa: BLE001 — a card failure must never kill the research
@@ -540,7 +558,7 @@ async def _run_deep_research_job(*, processor, client, channel_id: str, thread_r
         # Card done BEFORE the findings post — the thread reads card(done) → report.
         await card.finalize_success()
         posted = await _deliver_findings(processor, client, channel_id, thread_root,
-                                         text + trailer, task)
+                                         text + trailer, label_source)
         if not posted:
             # send_message swallows Slack errors into None — a failed post must not be
             # logged as a completed job, and the thread deserves a note (best-effort; if
@@ -575,12 +593,13 @@ async def _run_deep_research_job(*, processor, client, channel_id: str, thread_r
 
 
 async def _deliver_findings(processor, client, channel_id: str, thread_root: str,
-                            text: str, task: str) -> Optional[str]:
+                            text: str, label_source: str) -> Optional[str]:
     """Post the findings through the normal send path (inherits markdown conversion +
     record_own_reply pulse recording). Optionally label the post with a chat.postMessage
-    username override; on any failure (likely missing chat:write.customize) disable the label
+    username override built from ``label_source`` (the model's short topic tag, falling back
+    to the task text); on any failure (likely missing chat:write.customize) disable the label
     for the rest of the process and retry the plain path — delivery must never break."""
-    label = _research_label(processor, task)
+    label = _research_label(processor, label_source)
     posted = None
     if label:
         try:
