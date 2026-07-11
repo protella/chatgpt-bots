@@ -433,13 +433,15 @@ class OpenAIClient(LoggerMixin):
         last_user_message: str,
         has_attached_images: bool = False,
         max_retries: int = 2,
-    ) -> str:
+        return_ack: bool = False,
+    ):
         return await responses_api.classify_intent(
             self,
             messages=messages,
             last_user_message=last_user_message,
             has_attached_images=has_attached_images,
             max_retries=max_retries,
+            return_ack=return_ack,
         )
 
     async def classify_wake(
