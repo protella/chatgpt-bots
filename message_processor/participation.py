@@ -24,10 +24,21 @@ modal writes both columns in lockstep so legacy readers stay consistent.
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from config import config, valid_emoji_name
+
+logger = logging.getLogger(__name__)
+
+# F27: cap the number of distinct conversation streams the burst-carry map tracks, so a
+# long-lived process can't accumulate one pending bucket per (channel, author) forever.
+_MAX_PENDING_KEYS = 512
+# F27: how many earlier same-author messages a survivor may carry into one combined reply.
+_MAX_BURST_CARRY = 3
+
 
 def _ts_key(ts: Any) -> tuple:
     """Numeric (seconds, microseconds) sort key for a Slack ts — never lexical, so
@@ -37,6 +48,12 @@ def _ts_key(ts: Any) -> tuple:
         return (int(s or 0), int((frac + "000000")[:6]))
     except (ValueError, TypeError):
         return (0, 0)
+
+
+def _ts_seconds(ts: Any) -> float:
+    """Float seconds for a Slack ts, for freshness-window arithmetic (F27)."""
+    secs, micros = _ts_key(ts)
+    return secs + micros / 1_000_000.0
 
 
 VALID_ACTIONS = ("respond", "react", "ignore", "backoff")
@@ -111,6 +128,10 @@ class ParticipationVerdict:
     # lookups, multi-step tools, long-form output). The gate drops ACK_REACTION_EMOJI on
     # the triggering message before dispatching. Coerced safely (absent/malformed → False).
     ack: bool = False
+    # F27: earlier messages from the SAME sender that this survivor carries forward, so its
+    # single reply covers the whole same-author burst. Oldest-first, newest 3 at most.
+    # Attached by evaluate() after validate_verdict returns (validate_verdict stays pure).
+    burst_earlier: Optional[List[str]] = None
 
 
 class ParticipationEngine:
@@ -121,35 +142,102 @@ class ParticipationEngine:
         # conversation key -> newest pending message ts (debounce supersession marker).
         # F21: keyed per CONVERSATION, not per channel — a question in one thread must
         # never be silently dropped because an unrelated conversation posted something
-        # newer elsewhere in the channel.
+        # newer elsewhere in the channel. F27: top-level streams are now keyed per SENDER
+        # too, so two different people's unrelated top-level questions never collide.
         self._latest: Dict[str, str] = {}
+        # F27: burst carry-forward. conversation key -> OrderedDict[ts -> text] of messages
+        # seen in that stream but not yet consumed. A superseded evaluation leaves its entry
+        # for the burst's survivor (the newest message) to collect, so ONE reply can cover
+        # a same-author fast-follow rather than answering only the latest fragment. Bounded
+        # by _MAX_PENDING_KEYS; each bucket self-drains when its survivor runs.
+        self._pending: "OrderedDict[str, OrderedDict[str, str]]" = OrderedDict()
 
     @staticmethod
-    def _conv_key(channel_id: str, ts: str, thread_root: Optional[str]) -> str:
-        """F21 supersession scope: thread replies key by their root; all top-level
-        messages share one "top" stream (a rapid top-level burst still collapses to
-        its newest, whose envelope covers the rest)."""
+    def _conv_key(channel_id: str, ts: str, thread_root: Optional[str],
+                  sender_id: Optional[str] = None) -> str:
+        """Supersession scope. F21: thread replies key by their root (cross-author collapse
+        in a thread is safe — the reply lands in-thread with full history). F27: top-level
+        messages key per SENDER, so a same-author fast-follow supersedes (and gets carried
+        into one combined reply) while two DIFFERENT people's unrelated top-level questions
+        stay independent and are both answered."""
         if thread_root and thread_root != ts:
             return f"{channel_id}|{thread_root}"
-        return f"{channel_id}|top"
+        return f"{channel_id}|top|{sender_id or 'unknown'}"
 
     def note_arrival(self, channel_id: str, ts: Optional[str],
-                     thread_root: Optional[str] = None) -> None:
+                     thread_root: Optional[str] = None,
+                     sender_id: Optional[str] = None) -> None:
         """Register a message's ts as its conversation's newest — MONOTONICALLY (F5 fix b).
 
         Called at gate entry, BEFORE any await, so an older event delayed by memory/topic
         I/O can never overwrite a newer event's marker and win the debounce. Only a
-        genuinely newer Slack ts advances the marker."""
+        genuinely newer Slack ts advances the marker. F27: sender_id scopes the top-level
+        stream key so a monotonic advance is per-author."""
         if not channel_id or not ts:
             return
-        key = self._conv_key(channel_id, ts, thread_root)
+        key = self._conv_key(channel_id, ts, thread_root, sender_id)
         current = self._latest.get(key)
         if current is None or _ts_key(ts) > _ts_key(current):
             self._latest[key] = ts
 
+    def _register_pending(self, key: str, ts: str, text: Optional[str]) -> None:
+        """F27: record (ts, text) in its conversation's pending bucket so a later survivor
+        can carry it. Evicts the oldest bucket once the map exceeds _MAX_PENDING_KEYS."""
+        bucket = self._pending.get(key)
+        if bucket is None:
+            bucket = OrderedDict()
+            self._pending[key] = bucket
+        bucket[ts] = text or ""
+        self._pending.move_to_end(key)
+        while len(self._pending) > _MAX_PENDING_KEYS:
+            self._pending.popitem(last=False)
+
+    def _collect_burst(self, key: str, own_ts: str, debounce_seconds: float) -> List[str]:
+        """F27: called by the survivor of a debounce window. Collect-and-remove every
+        pending entry in `key` strictly older than own_ts (oldest-first) plus own entry;
+        drop entries older than own_ts − max(15, 5×debounce) seconds as stale leftovers
+        (a survivor that never ran must not leak minutes-old texts into a fresh burst);
+        cap the carried texts at the newest _MAX_BURST_CARRY, logging any further drop."""
+        bucket = self._pending.get(key)
+        if not bucket:
+            return []
+        own_key = _ts_key(own_ts)
+        window = max(15.0, 5.0 * float(debounce_seconds or 0.0))
+        cutoff = _ts_seconds(own_ts) - window
+        carried: List[tuple] = []  # (ts_key, text), strictly-older + fresh
+        stale_dropped = 0
+        for pts in list(bucket.keys()):
+            if pts == own_ts:
+                del bucket[pts]  # own entry — remove, never carry
+                continue
+            pkey = _ts_key(pts)
+            if pkey >= own_key:
+                continue  # newer/equal — leave for its own survivor
+            text = bucket.pop(pts)  # collect-and-remove (removal prevents later leak)
+            if _ts_seconds(pts) < cutoff:
+                stale_dropped += 1
+                continue
+            carried.append((pkey, text))
+        if not bucket:
+            self._pending.pop(key, None)
+        if stale_dropped:
+            logger.debug(
+                "F27: dropped %d stale pending entr%s from burst %s (older than freshness window)",
+                stale_dropped, "y" if stale_dropped == 1 else "ies", key)
+        carried.sort(key=lambda kt: kt[0])  # oldest-first
+        texts = [t for _, t in carried]
+        if len(texts) > _MAX_BURST_CARRY:
+            dropped = len(texts) - _MAX_BURST_CARRY
+            logger.debug(
+                "F27: burst %s carried %d messages; keeping newest %d, dropping %d oldest",
+                key, len(texts), _MAX_BURST_CARRY, dropped)
+            texts = texts[-_MAX_BURST_CARRY:]
+        return texts
+
     # ------------------------------------------------------------- evaluate
 
     async def evaluate(self, *, channel_id: str, ts: str, text: str,
+                       sender_id: Optional[str] = None,
                        sender_name: Optional[str] = None,
                        is_thread_reply: bool = False,
                        level: str = "judicious",
@@ -164,17 +252,25 @@ class ParticipationEngine:
                        attachments: Optional[str] = None,
                        pulse: Any = None,
                        thread_root_ts: Optional[str] = None) -> Optional[ParticipationVerdict]:
-        """Debounced judgment. Returns None when superseded — a newer message in
-        the SAME conversation (this thread, or the top-level stream — F21) arrived
-        during the debounce window, and ITS evaluation (whose tail/envelope includes
-        this message) covers the batch. Activity in other conversations never
-        supersedes."""
-        self.note_arrival(channel_id, ts, thread_root_ts)  # monotonic; a stale caller can't clobber a newer marker
+        """Debounced judgment. Returns None when superseded — a newer message in the SAME
+        conversation (this thread, or this sender's top-level stream — F21/F27) arrived
+        during the debounce window. F27: the survivor of a same-author top-level burst
+        collects the superseded siblings' texts into burst_earlier so its ONE reply covers
+        the whole burst; a superseded evaluation returns None but LEAVES its pending entry
+        for that survivor. Activity in other conversations (or from other senders at top
+        level) never supersedes."""
+        key = self._conv_key(channel_id, ts, thread_root_ts, sender_id)
+        self.note_arrival(channel_id, ts, thread_root_ts, sender_id)  # monotonic; a stale caller can't clobber a newer marker
+        self._register_pending(key, ts, text)  # F27: enroll before the await so the survivor can find us
         wait = max(0.0, float(getattr(config, "participation_debounce_seconds", 3.0)))
         if wait:
             await asyncio.sleep(wait)
-        if self._latest.get(self._conv_key(channel_id, ts, thread_root_ts)) != ts:
-            return None
+        if self._latest.get(key) != ts:
+            return None  # superseded — our pending entry stays for the burst's survivor
+
+        # F27: we survived the debounce — drain this stream's pending siblings (same author
+        # at top level, or same thread) into a burst we must cover in one reply.
+        burst_earlier = self._collect_burst(key, ts, wait)
 
         # F5: render the thread tail HERE (after the debounce + supersession check) —
         # pure in-memory, zero latency, reflecting thread state at classification time.
@@ -200,12 +296,18 @@ class ParticipationEngine:
             "channel_topic": channel_topic,
             "capabilities": capabilities,
             "attachments": attachments,
+            "burst_earlier": burst_earlier,
         }
         try:
             raw = await self.openai_client.classify_participation(text=text, signals=signals)
         except Exception:
             raw = None  # fail-safe: silence, never spam
-        return self.validate_verdict(raw)
+        verdict = self.validate_verdict(raw)
+        # F27: attach AFTER validate_verdict (which stays pure) so the survivor's reply can
+        # be told about the earlier same-author messages it must also address.
+        if burst_earlier:
+            verdict.burst_earlier = burst_earlier
+        return verdict
 
     # ------------------------------------------------------------- validate
 

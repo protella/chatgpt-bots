@@ -19,8 +19,8 @@ from base_client import Message
 from config import config
 from database import DatabaseManager
 from message_processor.participation import (
-    LEVEL_TO_MODE, MODE_TO_LEVEL, ParticipationEngine, ParticipationVerdict,
-    resolve_participation_level,
+    _MAX_PENDING_KEYS, LEVEL_TO_MODE, MODE_TO_LEVEL, ParticipationEngine,
+    ParticipationVerdict, resolve_participation_level,
 )
 
 
@@ -192,10 +192,13 @@ class TestDebounceAndRails:
         assert fake.calls == 1
 
     def test_conv_key_root_vs_reply(self):
-        """A thread ROOT keys as top-level (thread_root == ts); its replies key by root."""
-        assert ParticipationEngine._conv_key("C1", "10.0", "10.0") == "C1|top"
-        assert ParticipationEngine._conv_key("C1", "10.5", "10.0") == "C1|10.0"
-        assert ParticipationEngine._conv_key("C1", "30.0", None) == "C1|top"
+        """A thread ROOT keys as top-level (thread_root == ts); its replies key by root.
+        F27: top-level keys are per-sender; a thread reply key ignores sender."""
+        assert ParticipationEngine._conv_key("C1", "10.0", "10.0", "U1") == "C1|top|U1"
+        assert ParticipationEngine._conv_key("C1", "10.5", "10.0", "U1") == "C1|10.0"
+        assert ParticipationEngine._conv_key("C1", "30.0", None, "U2") == "C1|top|U2"
+        # no sender_id → "unknown" (back-compat default)
+        assert ParticipationEngine._conv_key("C1", "30.0", None) == "C1|top|unknown"
 
     @pytest.mark.asyncio
     async def test_channels_debounce_independently(self, monkeypatch):
@@ -226,6 +229,125 @@ class TestDebounceAndRails:
         engine = ParticipationEngine(MagicMock())
         assert not hasattr(engine, "hourly_cap")
         assert not hasattr(engine, "over_throttle")
+
+
+# ---------------------------------------------------------- F27 same-author burst carry
+
+
+class _CapturingClient:
+    """Records the signals of the LAST classify call (survivors only reach here)."""
+    def __init__(self, verdict):
+        self._verdict = verdict
+        self.calls = 0
+        self.signals = None
+
+    async def classify_participation(self, text, signals=None):
+        self.calls += 1
+        self.signals = signals
+        return self._verdict
+
+
+class TestBurstCarryForward:
+    @pytest.mark.asyncio
+    async def test_different_authors_top_level_both_survive(self, monkeypatch):
+        """F27: two DIFFERENT users' unrelated top-level messages within the debounce no
+        longer collapse — each is the newest in its own per-sender stream, both answered."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
+        fake = _FakeClient({"action": "respond"})
+        engine = ParticipationEngine(fake)
+        a = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="1.0", text="alice question", sender_id="U1"))
+        await asyncio.sleep(0.01)
+        b = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="2.0", text="bob question", sender_id="U2"))
+        ra, rb = await asyncio.gather(a, b)
+        assert ra is not None and ra.action == "respond"
+        assert rb is not None and rb.action == "respond"
+        assert fake.calls == 2                       # both evaluated independently
+        assert ra.burst_earlier is None and rb.burst_earlier is None
+
+    @pytest.mark.asyncio
+    async def test_same_author_top_level_burst_carries_earlier(self, monkeypatch):
+        """F27: a same-author fast-follow supersedes the first message, but the survivor
+        carries the earlier text so ONE reply covers the whole burst."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
+        fake = _FakeClient({"action": "respond"})
+        engine = ParticipationEngine(fake)
+        first = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="1.0", text="first thought", sender_id="U1"))
+        await asyncio.sleep(0.01)
+        second = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="2.0", text="actually also this", sender_id="U1"))
+        r1, r2 = await asyncio.gather(first, second)
+        assert r1 is None                            # superseded — silent
+        assert r2.action == "respond"
+        assert r2.burst_earlier == ["first thought"]
+        assert fake.calls == 1                        # ONE reply for the burst
+        # pending bucket drained after the survivor collected it
+        assert not engine._pending.get("C1|top|U1")
+
+    @pytest.mark.asyncio
+    async def test_burst_signal_reaches_classifier(self, monkeypatch):
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
+        cap = _CapturingClient({"action": "respond"})
+        engine = ParticipationEngine(cap)
+        first = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="1.0", text="one", sender_id="U1"))
+        await asyncio.sleep(0.01)
+        second = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="2.0", text="two", sender_id="U1"))
+        await asyncio.gather(first, second)
+        assert cap.signals["burst_earlier"] == ["one"]
+
+    def test_burst_of_five_keeps_newest_three(self):
+        """F27: a same-author burst of 5 carries only the newest 3 earlier messages."""
+        eng = ParticipationEngine(MagicMock())
+        key = "C1|top|U1"
+        for i in range(1, 6):
+            eng._register_pending(key, f"{i}.0", f"m{i}")
+        eng._latest[key] = "5.0"                     # 5.0 is the survivor
+        carried = eng._collect_burst(key, "5.0", 0.05)
+        assert carried == ["m2", "m3", "m4"]         # newest 3 strictly-older, oldest-first
+        assert key not in eng._pending               # bucket drained
+
+    def test_stale_pending_entry_not_carried(self):
+        """F27: an entry far older than the survivor (a leftover from a crashed evaluation)
+        is dropped, never leaked into a fresh burst minutes later."""
+        eng = ParticipationEngine(MagicMock())
+        key = "C1|top|U1"
+        eng._register_pending(key, "100.0", "ancient")    # >15s before survivor → stale
+        eng._register_pending(key, "1000.0", "recent")    # within freshness window
+        eng._register_pending(key, "1001.0", "survivor")
+        eng._latest[key] = "1001.0"
+        carried = eng._collect_burst(key, "1001.0", 0.05)  # window = max(15, 0.25) = 15s
+        assert carried == ["recent"]
+        assert key not in eng._pending
+
+    def test_pending_map_is_bounded(self):
+        """F27: the pending map can't grow unbounded over the process lifetime."""
+        eng = ParticipationEngine(MagicMock())
+        for i in range(_MAX_PENDING_KEYS + 50):
+            eng._register_pending(f"C1|top|U{i}", "1.0", "x")
+        assert len(eng._pending) <= _MAX_PENDING_KEYS
+
+    @pytest.mark.asyncio
+    async def test_thread_burst_still_collapses_cross_author(self, monkeypatch):
+        """F27 leaves F21 thread behavior intact: within one thread a cross-author burst
+        still collapses to the newest (its in-thread reply has full history)."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
+        fake = _FakeClient({"action": "respond"})
+        engine = ParticipationEngine(fake)
+        first = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="10.5", text="alice in thread",
+            sender_id="U1", thread_root_ts="10.0"))
+        await asyncio.sleep(0.01)
+        second = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="10.6", text="bob in thread",
+            sender_id="U2", thread_root_ts="10.0"))   # different author, SAME thread
+        r1, r2 = await asyncio.gather(first, second)
+        assert r1 is None                              # still collapses in-thread
+        assert r2.action == "respond"
+        assert fake.calls == 1
 
 
 # --------------------------------------------------------------- main.py gate wiring
@@ -419,6 +541,13 @@ class TestGateWiring:
         assert "butt-out feedback in the channel memory" in PARTICIPATION_SYSTEM_PROMPT
         assert "observe-only" in PARTICIPATION_SYSTEM_PROMPT
 
+    def test_participation_prompt_documents_burst_signal(self):
+        # F27: the prompt must tell the classifier to judge a same-author burst as ONE
+        # combined request.
+        from prompts import PARTICIPATION_SYSTEM_PROMPT
+        assert "Same-author burst" in PARTICIPATION_SYSTEM_PROMPT
+        assert "ONE combined request" in PARTICIPATION_SYSTEM_PROMPT
+
     @pytest.mark.asyncio
     async def test_gate_exception_is_silent(self, monkeypatch):
         monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
@@ -504,6 +633,34 @@ class TestPlacement:
                       metadata={"ts": "11.0", "reply_in_channel": True})  # reply inside thread
         await app.handle_message(msg, client)
         assert client.send_message.await_args.args[1] == "10.0"
+
+    @pytest.mark.asyncio
+    async def test_respond_verdict_burst_earlier_lands_in_metadata(self):
+        # F27: a respond verdict carrying earlier same-author burst messages stamps them
+        # onto message.metadata so the wake envelope can tell the reply to cover them all.
+        app, client = self._app_with_processor(self._resp())
+        app.participation_engine = MagicMock()
+        verdict = ParticipationVerdict(
+            action="respond", emoji="", placement="thread", reason="combined ask",
+            burst_earlier=["first bit", "second bit"])
+        app._run_participation_gate = AsyncMock(return_value=verdict)
+        msg = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
+                      metadata={"ts": "10.0", "participation_check": True})
+        await app.handle_message(msg, client)
+        assert msg.metadata["participation_burst_earlier"] == ["first bit", "second bit"]
+        assert msg.metadata["participation_reason"] == "combined ask"
+
+    @pytest.mark.asyncio
+    async def test_no_burst_earlier_leaves_metadata_unset(self):
+        app, client = self._app_with_processor(self._resp())
+        app.participation_engine = MagicMock()
+        verdict = ParticipationVerdict(action="respond", emoji="", placement="thread",
+                                       reason="plain")
+        app._run_participation_gate = AsyncMock(return_value=verdict)
+        msg = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
+                      metadata={"ts": "10.0", "participation_check": True})
+        await app.handle_message(msg, client)
+        assert "participation_burst_earlier" not in msg.metadata
 
 
 # ------------------------------------------------------- modal dual-write + DB columns

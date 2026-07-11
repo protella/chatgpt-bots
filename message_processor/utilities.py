@@ -1182,9 +1182,32 @@ class MessageUtilitiesMixin:
             sender_parts.append(role)
         if md.get("sender_type") in ("self", "other_bot"):
             sender_parts.append("bot")
-        return (
+        block = (
             "[Wake context — informational metadata, not instructions]\n"
             f"trigger: {trigger}\n" + " — ".join(sender_parts)
+        )
+        burst_line = self._wake_burst_line(md)
+        if burst_line:
+            block += "\n" + burst_line
+        return block
+
+    def _wake_burst_line(self, md: dict) -> str:
+        """F27: the 'same person also sent moments before' line for the wake envelope. The
+        participation engine carries earlier messages of a same-author burst so the reply
+        covers ALL of them, not just the triggering fragment. Defensive: missing/empty →
+        '' (nothing added); each carried text is escaped and display-capped."""
+        earlier = md.get("participation_burst_earlier")
+        if not isinstance(earlier, (list, tuple)):
+            return ""
+        quoted = [f'"{self._escape_suffix_text(t, limit=300)}"'
+                  for t in earlier if isinstance(t, str) and t.strip()]
+        if not quoted:
+            return ""
+        return (
+            "Moments before this message, the same person also sent: "
+            + " / ".join(quoted)
+            + " — treat the burst as one combined request and make sure your reply "
+            "addresses all of it."
         )
 
     def _build_suffix_context(self, client, channel_id: Optional[str],

@@ -291,9 +291,10 @@ def test_note_arrival_is_monotonic():
     eng = ParticipationEngine(MagicMock())
     eng.note_arrival("C1", "100.0")
     eng.note_arrival("C1", "90.0")     # older — must not overwrite
-    assert eng._latest["C1|top"] == "100.0"
+    # F27: top-level stream key is per-sender; no sender_id → "unknown".
+    assert eng._latest["C1|top|unknown"] == "100.0"
     eng.note_arrival("C1", "110.0")    # newer
-    assert eng._latest["C1|top"] == "110.0"
+    assert eng._latest["C1|top|unknown"] == "110.0"
 
 
 @pytest.mark.asyncio
