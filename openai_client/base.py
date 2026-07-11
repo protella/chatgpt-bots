@@ -365,6 +365,7 @@ class OpenAIClient(LoggerMixin):
         prompt_cache_key: Optional[str] = None,
         usage_sink: Optional[Dict[str, Any]] = None,
         mcp_tools_sink: Optional[Dict[str, Any]] = None,
+        tool_event_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> str:
         return await responses_api.create_streaming_response_with_tools(
             self,
@@ -383,6 +384,7 @@ class OpenAIClient(LoggerMixin):
             prompt_cache_key=prompt_cache_key,
             usage_sink=usage_sink,
             mcp_tools_sink=mcp_tools_sink,
+            tool_event_callback=tool_event_callback,
         )
 
     async def create_text_response_with_tool_loop(
