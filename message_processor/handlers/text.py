@@ -123,6 +123,7 @@ class TextHandlerMixin:
             client=client,
             db=self.db,
             is_dm=bool(channel_id and str(channel_id).startswith("D")),
+            processor=self,  # F30: start_deep_research reaches openai_client/scheduling/thread_manager
         )
 
     @staticmethod

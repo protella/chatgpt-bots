@@ -420,7 +420,8 @@ class SlackMessagingMixin:
 
     async def send_message(self, channel_id: str, thread_id: str, text: str,
                            blocks: Optional[list] = None,
-                           meta_out: Optional[dict] = None) -> Optional[str]:
+                           meta_out: Optional[dict] = None,
+                           username: Optional[str] = None) -> Optional[str]:
         """Send a text message to Slack, splitting if needed.
 
         Returns the posted message ts (the FIRST chunk's ts when split), or None on
@@ -454,6 +455,11 @@ class SlackMessagingMixin:
                 if composed is not None:
                     # text stays as the notification fallback; blocks carry the visible reply.
                     post_kwargs["blocks"] = composed
+                # F30: optional username override (labelled research findings). Needs the
+                # chat:write.customize scope; without it Slack raises missing_scope and this
+                # whole send returns None, so the caller retries the plain path.
+                if username:
+                    post_kwargs["username"] = username
                 result = await self.app.client.chat_postMessage(**post_kwargs)
                 posted_ts = result.get("ts")
                 # Report footer attachment only AFTER Slack returns a ts — a post that never
@@ -476,11 +482,10 @@ class SlackMessagingMixin:
                     if i < last:
                         body = f"{body}{continuation_trailer()}"
                     try:
-                        result = await self.app.client.chat_postMessage(
-                            channel=channel_id,
-                            thread_ts=thread_id,
-                            text=body
-                        )
+                        chunk_kwargs = dict(channel=channel_id, thread_ts=thread_id, text=body)
+                        if username:
+                            chunk_kwargs["username"] = username  # F30: labelled findings
+                        result = await self.app.client.chat_postMessage(**chunk_kwargs)
                         if first_ts is None:
                             first_ts = result.get("ts")
                     except SlackApiError as chunk_error:
