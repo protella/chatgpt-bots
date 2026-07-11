@@ -92,6 +92,39 @@ def snooze_expiry_iso(hours: Optional[float] = None,
     return (now + datetime.timedelta(hours=float(hours))).isoformat(timespec="seconds")
 
 
+def render_capabilities_line(mcp_manager: Any = None) -> Optional[str]:
+    """Semicolon-joined inventory of the assistant's own tools/data sources, for
+    the participation classifier (F11). Pure function of already-loaded config +
+    mcp_manager.servers — zero I/O, deterministic per process.
+
+    - "web search" when config.enable_web_search;
+    - "image generation and editing" (always true for this bot);
+    - one entry per MCP server when config.mcp_enabled_default AND mcp_manager is
+      present AND has servers: each server's `server_description` (from
+      mcp_config.json) falling back to its label. Servers iterate in insertion
+      order (stable per process → cache-friendly).
+
+    Nothing is hardcoded for any specific server. Returns None when the list would
+    be empty (never happens in practice — image gen is unconditional — but guard)."""
+    caps: List[str] = []
+    if getattr(config, "enable_web_search", False):
+        caps.append("web search")
+    caps.append("image generation and editing")
+    if (getattr(config, "mcp_enabled_default", False)
+            and mcp_manager is not None):
+        try:
+            has_servers = mcp_manager.has_mcp_servers()
+        except Exception:
+            has_servers = False
+        if has_servers:
+            for label, server_config in mcp_manager.servers.items():
+                desc = (server_config or {}).get("server_description") or label
+                caps.append(str(desc))
+    if not caps:
+        return None
+    return "; ".join(caps)
+
+
 @dataclass
 class ParticipationVerdict:
     action: str = "ignore"
@@ -151,6 +184,7 @@ class ParticipationEngine:
                        snoozed: bool = False,
                        sender_is_bot: bool = False,
                        channel_topic: Optional[str] = None,
+                       capabilities: Optional[str] = None,
                        pulse: Any = None,
                        thread_root_ts: Optional[str] = None) -> Optional[ParticipationVerdict]:
         """Debounced judgment. Returns None when superseded — a newer message in
@@ -187,6 +221,7 @@ class ParticipationEngine:
             "snoozed": bool(snoozed),
             "sender_is_bot": bool(sender_is_bot),
             "channel_topic": channel_topic,
+            "capabilities": capabilities,
         }
         try:
             raw = await self.openai_client.classify_participation(text=text, signals=signals)
