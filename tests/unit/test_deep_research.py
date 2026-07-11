@@ -592,7 +592,7 @@ async def test_card_update_throttle_coalesces_with_trailing_flush():
     assert len(client.card_updates) == 2
     body = _card_body(client.card_updates[-1])
     assert "second" in body and "queried srv" in body     # coalesced, not stale
-    assert slept and slept[0] <= rt._CARD_THROTTLE_S
+    assert slept and slept[0] <= rt._card_throttle_s()
     assert all(u[2] == rt._CARD_FALLBACK_TEXT for u in client.card_updates)
 
 
@@ -631,7 +631,7 @@ async def test_card_steps_from_synthetic_tool_events():
     t = [0.0]
 
     def _clk():
-        t[0] += rt._CARD_THROTTLE_S + 1.0
+        t[0] += rt._card_throttle_s() + 1.0
         return t[0]
 
     card = _bare_card(client, clock=_clk)
@@ -643,3 +643,13 @@ async def test_card_steps_from_synthetic_tool_events():
     assert "✓ searched the web: pricing trends 2026" in body
     assert "✓ queried datassential" in body
     assert "✓ searched the web" in body  # generic (query-less) web search
+
+
+def test_card_throttle_derives_from_streaming_min_interval(monkeypatch):
+    """Not a magic number: the card update floor is STREAMING_MIN_INTERVAL (Slack's
+    ~1/sec message-update guidance), floored at 1.0."""
+    assert rt._card_throttle_s() == max(1.0, float(config.streaming_min_interval))
+    monkeypatch.setattr(config, "streaming_min_interval", 2.5)
+    assert rt._card_throttle_s() == 2.5
+    monkeypatch.setattr(config, "streaming_min_interval", 0.2)  # below Slack's floor
+    assert rt._card_throttle_s() == 1.0
