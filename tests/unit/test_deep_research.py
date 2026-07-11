@@ -653,3 +653,12 @@ def test_card_throttle_derives_from_streaming_min_interval(monkeypatch):
     assert rt._card_throttle_s() == 2.5
     monkeypatch.setattr(config, "streaming_min_interval", 0.2)  # below Slack's floor
     assert rt._card_throttle_s() == 1.0
+
+
+def test_base_wrapper_accepts_tool_event_callback():
+    """Regression (live find): the job calls through OpenAIClient's wrapper, which must
+    accept and forward tool_event_callback — the module function alone isn't enough."""
+    import inspect
+    from openai_client.base import OpenAIClient
+    params = inspect.signature(OpenAIClient.create_streaming_response_with_tools).parameters
+    assert "tool_event_callback" in params
