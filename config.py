@@ -604,6 +604,16 @@ class BotConfig:
     # Process-lifetime LRU of extracted document text (never persisted) so iterating on one
     # document doesn't re-download/re-extract per question.
     doc_extraction_cache_size: int = field(default_factory=lambda: int(os.getenv("DOC_EXTRACTION_CACHE_SIZE", "20")))
+    # OCR text from image-only/scanned PDFs on later turns (read_document) and on the big-file
+    # local path. Requires the tesseract-ocr + poppler-utils system packages; if absent the
+    # handler logs a warning and falls back to the honest "scanned, not extractable" note.
+    enable_pdf_ocr: bool = field(default_factory=lambda: os.getenv("ENABLE_PDF_OCR", "true").lower() == "true")
+    # Max pages OCR'd per document. tesseract at 300 DPI runs ~1-3 s/page, so 20 pages bounds
+    # worst-case OCR near the tool-call timeout; beyond this a loud truncation note is prepended.
+    ocr_max_pages: int = field(default_factory=lambda: int(os.getenv("OCR_MAX_PAGES", "20")))
+    # Render DPI for OCR. tesseract accuracy needs ~300 DPI — 150 was live-verified too low for
+    # small text (it is fine for the vision page-image path, which uses its own lower DPI).
+    ocr_dpi: int = field(default_factory=lambda: int(os.getenv("OCR_DPI", "300")))
 
     # --- On-demand Slack history-fetch tools (Phase 8) ---
     # Read-only + privacy-scoped (public or bot-member channels only), so default ON. Wired to
