@@ -42,11 +42,25 @@ def _make_bot():
     bot.app.client = MagicMock()
 
     async def _fake_event_to_message(event, client):
+        # Mirror the real _event_to_message file plumbing (both the @-mention and
+        # channel-listening paths share it), so gate tests can assert the dispatched
+        # Message carries files from a file_share event.
+        attachments = []
+        for f in event.get("files", []) or []:
+            mimetype = f.get("mimetype", "")
+            attachments.append({
+                "type": "image" if mimetype.startswith("image/") else "file",
+                "url": f.get("url_private"),
+                "id": f.get("id"),
+                "name": f.get("name"),
+                "mimetype": mimetype,
+            })
         return Message(
             text=event.get("text", ""),
             user_id=event.get("user"),
             channel_id=event.get("channel"),
             thread_id=event.get("thread_ts") or event.get("ts"),
+            attachments=attachments,
             metadata={"ts": event.get("ts")},
         )
 
@@ -85,6 +99,77 @@ async def test_subtype_skipped(tag_only):
     bot = _make_bot()
     await bot._handle_channel_message(_evt(subtype="channel_join", text="ChatGPT hi"), bot.app.client)
     bot.message_handler.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_message_changed_subtype_excluded_from_gate(tag_only):
+    # F14: non-content subtypes (edits/deletes) still never drive a response.
+    bot = _make_bot()
+    await bot._handle_channel_message(
+        _evt(subtype="message_changed", text="ChatGPT hi"), bot.app.client)
+    bot.message_handler.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_file_share_reaches_gate_and_plumbs_files(tag_only):
+    # F14: an image/file upload arrives as subtype 'file_share' — it must proceed
+    # through the response gate (was dropped before) AND carry its files onto the
+    # dispatched Message so intent classification can route the vision/document flow.
+    bot = _make_bot()
+    file_meta = {
+        "id": "F123", "name": "poster.png", "mimetype": "image/png",
+        "url_private": "https://files.slack.com/poster.png",
+    }
+    await bot._handle_channel_message(
+        _evt(subtype="file_share", text="ChatGPT good marketing material?",
+             files=[file_meta]),
+        bot.app.client)
+    bot.message_handler.assert_called_once()
+    msg = bot.message_handler.call_args[0][0]
+    assert msg.metadata.get("participation_name_hit") is True
+    assert msg.attachments and msg.attachments[0]["type"] == "image"
+    assert msg.attachments[0]["id"] == "F123"
+
+
+@pytest.mark.asyncio
+async def test_thread_broadcast_subtype_reaches_gate(tag_only):
+    # F14: a thread reply also broadcast to channel arrives as 'thread_broadcast' —
+    # real content, so it reaches the gate (engine judges the name-hit).
+    bot = _make_bot()
+    await bot._handle_channel_message(
+        _evt(subtype="thread_broadcast", text="ChatGPT what do you think?",
+             thread_ts="50.0", ts="60.0"),
+        bot.app.client)
+    bot.message_handler.assert_called_once()
+    msg = bot.message_handler.call_args[0][0]
+    assert msg.metadata.get("participation_name_hit") is True
+
+
+@pytest.mark.asyncio
+async def test_real_event_to_message_extracts_files(tag_only):
+    # F14: the SHARED _event_to_message (both the @-mention and channel paths call it)
+    # extracts event files into attachments — proving the channel path plumbs files
+    # identically to the mention path. Image mimetypes classify as 'image', others 'file'.
+    bot = _Bot.__new__(_Bot)
+    bot.bot_user_id = "UBOT"
+    bot.user_cache = {}
+    bot.db = MagicMock()
+    bot.db.get_user_info_async = AsyncMock(return_value=None)
+    bot._clean_mentions = lambda t: t
+    bot.get_username = AsyncMock(return_value="Human")
+    bot.get_user_timezone = AsyncMock(return_value="UTC")
+    bot.classify_sender = lambda e: "human"
+    event = _evt(
+        subtype="file_share", text="what do we think?",
+        files=[
+            {"id": "F1", "name": "poster.png", "mimetype": "image/png",
+             "url_private": "https://files.slack.com/poster.png"},
+            {"id": "F2", "name": "brief.pdf", "mimetype": "application/pdf",
+             "url_private": "https://files.slack.com/brief.pdf"},
+        ])
+    msg = await bot._event_to_message(event, bot.app.client if hasattr(bot, "app") else MagicMock())
+    assert [a["type"] for a in msg.attachments] == ["image", "file"]
+    assert [a["id"] for a in msg.attachments] == ["F1", "F2"]
 
 
 @pytest.mark.asyncio

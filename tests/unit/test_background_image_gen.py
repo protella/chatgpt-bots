@@ -690,7 +690,7 @@ async def test_two_parallel_jobs_one_thread_both_deliver(mock_env, monkeypatch):
 def test_max_concurrent_config_default(monkeypatch):
     from config import BotConfig
     monkeypatch.delenv("MAX_CONCURRENT_IMAGE_GENERATIONS", raising=False)
-    assert BotConfig().max_concurrent_image_generations == 3
+    assert BotConfig().max_concurrent_image_generations == 5
 
 
 def test_classifier_prompt_has_acknowledgment_rule():

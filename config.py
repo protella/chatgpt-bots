@@ -327,8 +327,9 @@ class BotConfig:
     enable_background_image_gen: bool = field(default_factory=lambda: os.getenv("ENABLE_BACKGROUND_IMAGE_GEN", "true").lower() == "true")
     # F13 — how many background image generations may run concurrently in ONE thread.
     # A new_image request past this cap gets a friendly "already N cooking" rejection;
-    # edits still wait for the in-flight image regardless. Per-thread.
-    max_concurrent_image_generations: int = field(default_factory=lambda: int(os.getenv("MAX_CONCURRENT_IMAGE_GENERATIONS", "3")))
+    # edits still wait for the in-flight image regardless. Per-thread; there is deliberately
+    # NO global cap (F14).
+    max_concurrent_image_generations: int = field(default_factory=lambda: int(os.getenv("MAX_CONCURRENT_IMAGE_GENERATIONS", "5")))
     # Rotating loading messages shown in the assistant thread's transient bubble.
     # Sourced from a message file (one per line, # comments ok) — see
     # status_messages/loading_messages.generic.txt. Brand them by pointing
@@ -426,7 +427,11 @@ class BotConfig:
     # ENABLE_CHANNEL_LISTENING is false (no channel events arrive). Supersedes the old
     # CHANNEL_CONTEXT_WINDOW follow-up.
     enable_channel_pulse: bool = field(default_factory=lambda: os.getenv("ENABLE_CHANNEL_PULSE", "true").lower() == "true")
-    channel_pulse_size: int = field(default_factory=lambda: int(os.getenv("CHANNEL_PULSE_SIZE", "30")))
+    channel_pulse_size: int = field(default_factory=lambda: int(os.getenv("CHANNEL_PULSE_SIZE", "60")))
+    # Head-first char cap for the channel-activity envelope + thread labels (F14).
+    pulse_text_truncate: int = field(default_factory=lambda: int(os.getenv("PULSE_TEXT_TRUNCATE", "300")))
+    # Tail-first char cap for the F5 per-thread participation-classifier context (F14).
+    pulse_tail_text_truncate: int = field(default_factory=lambda: int(os.getenv("PULSE_TAIL_TEXT_TRUNCATE", "400")))
     # Max "[Recent channel activity]" lines injected (at the SUFFIX — volatile, cache hygiene)
     # when responding in a channel. 0 disables the envelope without disabling the buffer.
     channel_pulse_envelope_max: int = field(default_factory=lambda: int(os.getenv("CHANNEL_PULSE_ENVELOPE_MAX", "15")))
@@ -454,8 +459,11 @@ class BotConfig:
     # evaluation of the latest state (someone typing four short lines ≠ four verdicts).
     participation_debounce_seconds: float = field(default_factory=lambda: float(os.getenv("PARTICIPATION_DEBOUNCE_SECONDS", "3")))
     # Hard rail (code, not prompt): max unprompted replies per channel per hour. Over the cap
-    # the engine isn't even called. "active" channels get 2x. Mentions are never throttled.
-    max_unprompted_replies_per_hour: int = field(default_factory=lambda: int(os.getenv("MAX_UNPROMPTED_REPLIES_PER_HOUR", "6")))
+    # the engine isn't even called. "active" channels get 2x. Mentions and name-hits are never
+    # throttled. F14: this is a pure runaway brake against classifier misfires / bot-reply
+    # loops — pacing is the classifier's job via its unprompted-count signal, hence the high
+    # default.
+    max_unprompted_replies_per_hour: int = field(default_factory=lambda: int(os.getenv("MAX_UNPROMPTED_REPLIES_PER_HOUR", "30")))
     # "Butt out" snooze: hours of no unprompted participation after a backoff verdict.
     participation_snooze_hours: float = field(default_factory=lambda: float(os.getenv("PARTICIPATION_SNOOZE_HOURS", "4")))
     # Emoji used to acknowledge a backoff request without more words.
@@ -512,6 +520,16 @@ class BotConfig:
     tool_result_digest_chars: int = field(default_factory=lambda: int(os.getenv("TOOL_RESULT_DIGEST_CHARS", "2000")))
     # Per-turn total digest budget (chars, first-come order); calls past the cap store none.
     tool_result_turn_chars: int = field(default_factory=lambda: int(os.getenv("TOOL_RESULT_TURN_CHARS", "6000")))
+    # F14: provenance record shaping (env-backed; boot-constant so rebuild determinism holds).
+    # Max tool entries recorded/replayed per turn — raised from 8: a late call may be the one
+    # that mattered.
+    tool_provenance_max_entries: int = field(default_factory=lambda: int(os.getenv("TOOL_PROVENANCE_MAX_ENTRIES", "20")))
+    # Per-call arg-gist char cap.
+    tool_provenance_gist_chars: int = field(default_factory=lambda: int(os.getenv("TOOL_PROVENANCE_GIST_CHARS", "80")))
+    # "[used tools: …]" annotation line budget; over it the line degrades to names only.
+    tool_provenance_line_budget: int = field(default_factory=lambda: int(os.getenv("TOOL_PROVENANCE_LINE_BUDGET", "300")))
+    # Age (days) after which tool-use provenance rows are swept by the cleanup worker (F7/F14).
+    tool_usage_retention_days: int = field(default_factory=lambda: int(os.getenv("TOOL_USAGE_RETENTION_DAYS", "90")))
 
     # --- Per-message timestamps (F10) ---
     # Prefix every message in model-visible thread context with a deterministic local

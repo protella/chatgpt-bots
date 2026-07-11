@@ -102,6 +102,37 @@ class TestBotConfig:
         config = BotConfig()
         assert config.reaction_max_per_message == 4
 
+    def test_f14_cap_overhaul_defaults(self, mock_env):
+        """F14 new/changed defaults: 30 / 5 / 60 / 300 / 400 / 20 / 80 / 300 / 90."""
+        config = BotConfig()
+        assert config.max_unprompted_replies_per_hour == 30
+        assert config.max_concurrent_image_generations == 5
+        assert config.channel_pulse_size == 60
+        assert config.pulse_text_truncate == 300
+        assert config.pulse_tail_text_truncate == 400
+        assert config.tool_provenance_max_entries == 20
+        assert config.tool_provenance_gist_chars == 80
+        assert config.tool_provenance_line_budget == 300
+        assert config.tool_usage_retention_days == 90
+
+    @patch.dict(os.environ, {
+        "MAX_UNPROMPTED_REPLIES_PER_HOUR": "3", "CHANNEL_PULSE_SIZE": "12",
+        "PULSE_TEXT_TRUNCATE": "111", "PULSE_TAIL_TEXT_TRUNCATE": "222",
+        "TOOL_PROVENANCE_MAX_ENTRIES": "7", "TOOL_PROVENANCE_GIST_CHARS": "40",
+        "TOOL_PROVENANCE_LINE_BUDGET": "150", "TOOL_USAGE_RETENTION_DAYS": "30",
+    })
+    def test_f14_env_overrides_respected(self, mock_env):
+        """F14 caps are env-backed and honor overrides."""
+        config = BotConfig()
+        assert config.max_unprompted_replies_per_hour == 3
+        assert config.channel_pulse_size == 12
+        assert config.pulse_text_truncate == 111
+        assert config.pulse_tail_text_truncate == 222
+        assert config.tool_provenance_max_entries == 7
+        assert config.tool_provenance_gist_chars == 40
+        assert config.tool_provenance_line_budget == 150
+        assert config.tool_usage_retention_days == 30
+
     def test_no_reply_tool_default_enabled(self, mock_env):
         """ENABLE_NO_REPLY_TOOL defaults to True"""
         config = BotConfig()

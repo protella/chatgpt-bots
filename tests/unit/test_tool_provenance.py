@@ -102,7 +102,7 @@ def test_gist_never_leaks_opaque_string_values():
 
 def test_gist_is_length_capped():
     big = '{"prompt": "' + "x" * 500 + '"}'
-    assert len(tp.gist_from_arguments(big)) <= tp.MAX_GIST_CHARS
+    assert len(tp.gist_from_arguments(big)) <= config.tool_provenance_gist_chars
 
 
 def test_build_provenance_combines_local_then_external_and_caps():
@@ -114,8 +114,8 @@ def test_build_provenance_combines_local_then_external_and_caps():
         {"tool_name": "react_to_message", "gist": "emoji=eyes"},
         {"tool_name": "web_search", "gist": ""},
     ]
-    many = [{"name": f"t{i}", "ok": True, "gist": ""} for i in range(20)]
-    assert len(tp.build_provenance(many, ["a", "b", "c"])) == tp.MAX_PROVENANCE_ENTRIES
+    many = [{"name": f"t{i}", "ok": True, "gist": ""} for i in range(30)]
+    assert len(tp.build_provenance(many, ["a", "b", "c"])) == config.tool_provenance_max_entries
 
 
 def test_render_prefers_gists_then_degrades_to_names():
@@ -128,6 +128,15 @@ def test_render_prefers_gists_then_degrades_to_names():
     rendered = tp.render_used_tools_annotation(long)
     assert "(" not in rendered and rendered.startswith("[used tools: tool_0, ")
     assert tp.render_used_tools_annotation([]) == ""
+
+
+def test_render_annotation_carries_more_than_eight_entries():
+    # F14: the record used to cap at 8; a 12-entry turn must now render every entry
+    # (default budget 20 entries / 300-char line), so a late-but-load-bearing call isn't dropped.
+    tools = [{"tool_name": f"tool_{i}", "gist": ""} for i in range(12)]
+    rendered = tp.render_used_tools_annotation(tools)
+    assert "tool_8" in rendered and "tool_11" in rendered
+    assert rendered.count(",") == 11  # all 12 names present
 
 
 def test_strip_footer_and_anti_shielding():
@@ -197,6 +206,22 @@ async def test_db_age_sweep_deletes_old_rows(temp_db):
     temp_db.conn.commit()
     temp_db.delete_old_tool_usage(days=90)
     assert await temp_db.get_thread_tool_usage_async("C1:100.0") == {}
+
+
+@pytest.mark.asyncio
+async def test_db_age_sweep_honors_config_retention_days(temp_db, monkeypatch):
+    # F14: the sweep window comes from config.tool_usage_retention_days (wired at the
+    # cleanup call site). A row aged 50 days survives the default 90 but not a 30-day window.
+    await temp_db.save_tool_usage_async("C1", "101.0", "C1:100.0", [{"tool_name": "a", "gist": ""}])
+    temp_db.conn.execute(
+        "UPDATE message_tool_usage SET created_at = datetime('now', '-50 days')")
+    temp_db.conn.commit()
+    monkeypatch.setattr(config, "tool_usage_retention_days", 90, raising=False)
+    temp_db.delete_old_tool_usage(days=config.tool_usage_retention_days)
+    assert await temp_db.get_thread_tool_usage_async("C1:100.0") != {}  # within 90d window
+    monkeypatch.setattr(config, "tool_usage_retention_days", 30, raising=False)
+    temp_db.delete_old_tool_usage(days=config.tool_usage_retention_days)
+    assert await temp_db.get_thread_tool_usage_async("C1:100.0") == {}  # past 30d window
 
 
 @pytest.mark.asyncio
