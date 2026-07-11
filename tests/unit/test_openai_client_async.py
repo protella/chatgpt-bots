@@ -142,6 +142,29 @@ class TestAsyncOpenAIClient:
         assert result == "text_only"  # "none" gets mapped to "text_only"
 
     @pytest.mark.asyncio
+    async def test_classify_intent_return_ack_through_facade(self, client, mock_async_openai):
+        """F19 regression: return_ack must be forwarded by the OpenAIClient facade
+        (openai_client/base.py), not just accepted by the api-layer function — the
+        processor calls the facade, and mocked-processor tests can't catch a
+        signature drift here."""
+        mock_content = MagicMock()
+        mock_content.text = "vision ack"
+
+        mock_item = MagicMock()
+        mock_item.content = [mock_content]
+
+        mock_response = MagicMock()
+        mock_response.output = [mock_item]
+
+        client.client.responses.create.return_value = mock_response
+
+        messages = [{"role": "user", "content": "what's in this image?"}]
+
+        result = await client.classify_intent(messages, "what's in this image?", return_ack=True)
+
+        assert result == ("vision", True)
+
+    @pytest.mark.asyncio
     async def test_generate_image(self, client, mock_async_openai):
         """Test image generation"""
         # Setup mock response for enhancement
