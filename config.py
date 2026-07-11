@@ -643,6 +643,11 @@ class BotConfig:
     # Per-thread cap on concurrent research jobs (friendly structured rejection at the cap, which
     # the model relays). Deliberately per-thread, no global cap — mirrors image gen's choice.
     deep_research_max_per_thread: int = field(default_factory=lambda: max(1, int(os.getenv("DEEP_RESEARCH_MAX_PER_THREAD", "2"))))
+    # F30.2: the job's tool-loop round budget. Each report_progress milestone costs one round,
+    # the job instruction asks for 2-5 milestones, so 10 = that ceiling with 2x headroom — the
+    # chat-turn MAX_TOOL_ROUNDS (4) would strangle milestone reporting. On cap the loop forces
+    # a final answer (tool_choice="none"), never an error.
+    deep_research_max_tool_rounds: int = field(default_factory=lambda: max(1, int(os.getenv("DEEP_RESEARCH_MAX_TOOL_ROUNDS", "10"))))
     # Label the findings post with a chat.postMessage username override ("<bot> [research: …]").
     # Needs the chat:write.customize scope, which the app may not have — on the first failure the
     # process falls back to plain posts for the rest of its life. Never breaks delivery.
