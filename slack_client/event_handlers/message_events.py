@@ -237,7 +237,7 @@ class SlackMessageEventsMixin:
         # Phase F: participation levels (off / mentions_only / judicious / active).
         # participation_level wins over the legacy response_mode; both map cleanly
         # (off≡off, tag_only≡mentions_only, auto_respond≡judicious).
-        from message_processor.participation import is_snoozed, resolve_participation_level
+        from message_processor.participation import resolve_participation_level
         level = resolve_participation_level(cs)
         if level == "off":
             return
@@ -263,6 +263,22 @@ class SlackMessageEventsMixin:
         # another bot is never a continuation — it goes to the engine or nowhere.
         ts = event.get("ts")
         thread_ts = event.get("thread_ts")
+
+        # F15 muted-thread pre-gate: a thread told to "butt out" is permanently opted out of
+        # UNPROMPTED participation (replaces the old channel-wide snooze timer). Cheap check
+        # before any model call or replies fetch. A name-hit summons still reaches the engine
+        # (told to be quiet ≠ deaf); direct @-mentions arrive via app_mention and never hit
+        # this path. Unlike the old snooze this logs when it drops (silent drops were a
+        # live-debugging pain).
+        thread_root = thread_ts or ts
+        muted_threads = (cs or {}).get("muted_threads") or []
+        if thread_root in muted_threads and not name_hit:
+            self.log_debug(
+                f"Muted-thread pre-gate: dropping unprompted message in {channel_id} "
+                f"thread {thread_root} (ts={ts})"
+            )
+            return
+
         sender_is_bot = self.classify_sender(event) != "human"
         direct_continuation = False
         if not sender_is_bot and thread_ts and thread_ts != ts:
@@ -284,15 +300,9 @@ class SlackMessageEventsMixin:
         # must never trigger a judgment-free reply, that's a loop seed).
         engine_on = getattr(config, "enable_participation_engine", True)
         participation_check = False
-        snoozed = is_snoozed(cs)
         if direct_continuation:
             pass  # respond directly
         elif engine_on and (level in ("judicious", "active") or name_hit):
-            # Snooze prefilter: silences UNPROMPTED engagement only. Name-bearing
-            # messages still reach the engine with a snoozed signal — told to be
-            # quiet ≠ deaf, but the engine decides if this is a genuine summons.
-            if snoozed and not name_hit:
-                return
             participation_check = True
         elif not engine_on and name_hit and not sender_is_bot:
             pass  # legacy deterministic name wake (engine disabled)
@@ -324,8 +334,6 @@ class SlackMessageEventsMixin:
             message.metadata["participation_check"] = True
             if name_hit:
                 message.metadata["participation_name_hit"] = True
-            if snoozed:
-                message.metadata["participation_snoozed"] = True
             if sender_is_bot:
                 message.metadata["participation_sender_bot"] = True
         # Phase 7: carry per-channel ground rules + placement into the response pipeline.

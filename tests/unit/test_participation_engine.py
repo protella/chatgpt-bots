@@ -1,13 +1,12 @@
 """Phase F — ParticipationEngine: verdict validation, level/mode mapping, debounce,
-throttle rails, snooze lifecycle, backoff writes, placement wiring, modal dual-write,
-DB columns/migration, and the busy-rejection needs_refresh fix.
+throttle rails, backoff thread-mute + memory writes (F15), placement wiring, modal
+dual-write, DB columns/migration, and the busy-rejection needs_refresh fix.
 
 All stubbed I/O — no live bot, no legacy suite.
 """
 from __future__ import annotations
 
 import asyncio
-import datetime
 import inspect
 import sqlite3
 import tempfile
@@ -20,7 +19,7 @@ from config import config
 from database import DatabaseManager
 from message_processor.participation import (
     LEVEL_TO_MODE, MODE_TO_LEVEL, ParticipationEngine, ParticipationVerdict,
-    is_snoozed, resolve_participation_level, snooze_expiry_iso,
+    resolve_participation_level,
 )
 
 
@@ -50,29 +49,6 @@ class TestLevelResolution:
     def test_garbage_degrades_safe(self, monkeypatch):
         monkeypatch.setattr(config, "channel_response_mode", "banana", raising=False)
         assert resolve_participation_level({"participation_level": "loud"}) == "mentions_only"
-
-
-# ------------------------------------------------------------------------ snooze
-
-class TestSnooze:
-    def test_future_snooze_active(self):
-        cs = {"snoozed_until": snooze_expiry_iso(hours=1)}
-        assert is_snoozed(cs) is True
-
-    def test_past_snooze_expired(self):
-        past = (datetime.datetime.now(datetime.timezone.utc)
-                - datetime.timedelta(hours=1)).isoformat(timespec="seconds")
-        assert is_snoozed({"snoozed_until": past}) is False
-
-    def test_absent_and_malformed_not_snoozed(self):
-        assert is_snoozed(None) is False
-        assert is_snoozed({}) is False
-        assert is_snoozed({"snoozed_until": "not-a-date"}) is False
-
-    def test_expiry_deterministic_given_now(self):
-        now = datetime.datetime(2026, 7, 9, 12, 0, tzinfo=datetime.timezone.utc)
-        assert snooze_expiry_iso(hours=4, now=now) == snooze_expiry_iso(hours=4, now=now)
-        assert "16:00" in snooze_expiry_iso(hours=4, now=now)
 
 
 # ----------------------------------------------------------------- verdict validation
@@ -186,6 +162,8 @@ def _make_app(verdict, pulse=None, engine_enabled=True, monkeypatch=None):
     app.processor.db.get_channel_memory_async = AsyncMock(return_value=[])
     app.processor.db.set_channel_settings_async = AsyncMock()
     app.processor.db.add_channel_memory_async = AsyncMock()
+    app.processor.db.update_channel_memory_async = AsyncMock()
+    app.processor.db.add_muted_thread_async = AsyncMock(return_value=True)
     client = MagicMock()
     client.channel_pulse = pulse
     client.react = AsyncMock()
@@ -261,7 +239,9 @@ class TestGateWiring:
         client._reserve_and_react.assert_awaited_once_with("C1", "10.0", "eyes")
 
     @pytest.mark.asyncio
-    async def test_backoff_snoozes_reacts_and_writes_memory(self, monkeypatch):
+    async def test_backoff_mutes_thread_reacts_and_writes_memory(self, monkeypatch):
+        # F15: backoff acks with the emoji, MUTES THE THREAD (not a channel-wide timer),
+        # and writes a dated butt-out memory fact. snoozed_until is never written.
         monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
         monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
         monkeypatch.setattr(config, "snooze_ack_emoji", "zipper_mouth_face", raising=False)
@@ -269,11 +249,39 @@ class TestGateWiring:
         app, client, _ = _make_app({"action": "backoff"})
         assert await app._run_participation_gate(_channel_msg(), client) is None
         client.react.assert_awaited_once_with("C1", "10.0", "zipper_mouth_face")
-        snooze_call = app.processor.db.set_channel_settings_async.await_args
-        assert snooze_call.args[0] == "C1"
-        assert snooze_call.kwargs["snoozed_until"]  # a future ISO stamp
+        # thread muted (DB-backed), keyed by the thread root ts
+        mute_call = app.processor.db.add_muted_thread_async.await_args
+        assert mute_call.args[0] == "C1" and mute_call.args[1] == "10.0"
+        # no snooze timer written
+        app.processor.db.set_channel_settings_async.assert_not_awaited()
+        # dated butt-out fact, authored with the thread marker (for dedup on repeat)
         mem_call = app.processor.db.add_channel_memory_async.await_args
-        assert "less unprompted participation" in mem_call.args[1]
+        assert "butt out" in mem_call.args[1]
+        assert "raise the bar for unprompted replies" in mem_call.args[1]
+        assert mem_call.kwargs["author"] == "participation_engine:10.0"
+
+    @pytest.mark.asyncio
+    async def test_backoff_updates_existing_memory_fact_not_duplicate(self, monkeypatch):
+        # F15: a repeat butt-out on the SAME thread UPDATES the prior fact (matched by its
+        # participation_engine:<thread> author) instead of adding a duplicate row.
+        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
+        monkeypatch.setattr(config, "enable_channel_memory", True, raising=False)
+        app, client, _ = _make_app({"action": "backoff"})
+        app.processor.db.get_channel_memory_async = AsyncMock(return_value=[
+            {"id": 7, "author": "participation_engine:10.0", "content": "old fact"},
+        ])
+        assert await app._run_participation_gate(_channel_msg(), client) is None
+        app.processor.db.update_channel_memory_async.assert_awaited_once()
+        assert app.processor.db.update_channel_memory_async.await_args.args[0] == 7
+        app.processor.db.add_channel_memory_async.assert_not_awaited()
+
+    def test_participation_prompt_has_butt_out_memory_line(self):
+        # F15: the classifier learns about butt-out feedback through channel memory —
+        # the prompt must tell it how to weigh recorded/repeated butt-out facts.
+        from prompts import PARTICIPATION_SYSTEM_PROMPT
+        assert "butt-out feedback in the channel memory" in PARTICIPATION_SYSTEM_PROMPT
+        assert "observe-only" in PARTICIPATION_SYSTEM_PROMPT
 
     @pytest.mark.asyncio
     async def test_gate_exception_is_silent(self, monkeypatch):
@@ -398,6 +406,27 @@ class TestDBAndModal:
         assert row["participation_level"] is None
         assert row["snoozed_until"] is None
 
+    def test_muted_threads_set_get_preserve_clear(self, temp_db):
+        # F15: muted_threads round-trips as a Python list (stored as JSON), is preserved
+        # when omitted, and clears on None/[].
+        temp_db.set_channel_settings("C1", muted_threads=["10.0", "20.5"])
+        assert temp_db.get_channel_settings("C1")["muted_threads"] == ["10.0", "20.5"]
+        temp_db.set_channel_settings("C1", directives="rule")  # omitted → preserved
+        assert temp_db.get_channel_settings("C1")["muted_threads"] == ["10.0", "20.5"]
+        temp_db.set_channel_settings("C1", muted_threads=None)  # cleared
+        assert temp_db.get_channel_settings("C1")["muted_threads"] == []
+        # no row → empty list, never a crash
+        assert temp_db.get_channel_settings("C2") is None
+
+    def test_add_muted_thread_persists_and_dedupes(self, temp_db):
+        # F15: mute is DB-backed (survives restart — a fresh get sees it) and idempotent.
+        assert asyncio.run(temp_db.add_muted_thread_async("C1", "10.0")) is True
+        assert asyncio.run(temp_db.add_muted_thread_async("C1", "10.0")) is False  # dedup
+        assert asyncio.run(temp_db.add_muted_thread_async("C1", "30.0")) is True
+        # read back through a fresh async connection (simulates restart — state is durable)
+        row = asyncio.run(temp_db.get_channel_settings_async("C1"))
+        assert row["muted_threads"] == ["10.0", "30.0"]
+
     def test_migration_adds_columns_to_legacy_table(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = f"{tmpdir}/legacy.db"
@@ -420,21 +449,22 @@ class TestDBAndModal:
                 db.init_schema()  # runs migrations
                 cols = [c[1] for c in db.conn.execute("PRAGMA table_info(channel_settings)")]
                 assert "participation_level" in cols and "snoozed_until" in cols
+                assert "muted_threads" in cols  # F15 migration
                 db.conn.close()
 
-    def test_modal_participation_select_and_snooze_block(self):
+    def test_modal_participation_select_no_snooze_block(self):
+        # F15: the snooze early-resume control is retired — the modal never renders it.
         from settings_modal import SettingsModal
         builder = SettingsModal.__new__(SettingsModal)
         view = builder.build_channel_settings_modal(
-            "C1", {"participation_level": "active",
-                   "snoozed_until": snooze_expiry_iso(hours=1)}, "tag_only")
+            "C1", {"participation_level": "active"}, "tag_only")
         blocks = {b.get("block_id"): b for b in view["blocks"] if b.get("block_id")}
         sel = blocks["participation_block"]["element"]
         assert sel["action_id"] == "participation_level"
         assert sel["initial_option"]["value"] == "active"
         values = [o["value"] for o in sel["options"]]
         assert values == ["inherit", "mentions_only", "judicious", "active", "off"]
-        assert "snooze_block" in blocks  # snoozed → early-resume control rendered
+        assert "snooze_block" not in blocks
 
     def test_modal_legacy_mode_row_maps_and_no_snooze_block(self):
         from settings_modal import SettingsModal

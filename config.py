@@ -464,9 +464,10 @@ class BotConfig:
     # loops — pacing is the classifier's job via its unprompted-count signal, hence the high
     # default.
     max_unprompted_replies_per_hour: int = field(default_factory=lambda: int(os.getenv("MAX_UNPROMPTED_REPLIES_PER_HOUR", "30")))
-    # "Butt out" snooze: hours of no unprompted participation after a backoff verdict.
-    participation_snooze_hours: float = field(default_factory=lambda: float(os.getenv("PARTICIPATION_SNOOZE_HOURS", "4")))
-    # Emoji used to acknowledge a backoff request without more words.
+    # F15: "butt out" backoff no longer snoozes on a timer — it permanently mutes THAT
+    # thread (channel_settings.muted_threads) and writes a durable channel-memory fact.
+    # PARTICIPATION_SNOOZE_HOURS is retired. The ack emoji stays — a backoff still gets a
+    # wordless acknowledgement reaction.
     snooze_ack_emoji: str = field(default_factory=lambda: os.getenv("SNOOZE_ACK_EMOJI", "zipper_mouth_face").strip().strip(":"))
 
     # Phase Q — conversational queueing (busy rejection retired). Messages arriving while a
