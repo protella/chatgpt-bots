@@ -449,8 +449,10 @@ class SlackMessagingMixin:
 
             # Check if we need to split the message
             if len(formatted_text) <= self.MAX_MESSAGE_LENGTH:
-                # Single message
-                post_kwargs = dict(channel=channel_id, thread_ts=thread_id, text=formatted_text)
+                # Single message. Link previews are suppressed (user directive 2026-07-11):
+                # links stay inline; no unfurl cards, and no Slack-unfurler "(edited)" marks.
+                post_kwargs = dict(channel=channel_id, thread_ts=thread_id, text=formatted_text,
+                                   unfurl_links=False, unfurl_media=False)
                 composed = self._compose_reply_with_footer(formatted_text, blocks) if blocks else None
                 if composed is not None:
                     # text stays as the notification fallback; blocks carry the visible reply.
@@ -482,9 +484,11 @@ class SlackMessagingMixin:
                     body = chunk
                     if i > 0:
                         body = f"{CONTINUATION_HEAD}\n\n{body}"
-                    if i < last:
-                        body = f"{body}{continuation_trailer()}"
-                    chunk_kwargs = dict(channel=channel_id, thread_ts=thread_id, text=body)
+                    # No "Continued in next message..." trailer (user directive 2026-07-11):
+                    # the "...continued" HEAD on the next chunk alone marks the seam, and the
+                    # rebuild merger fires on EITHER marker (thread_management merge is OR).
+                    chunk_kwargs = dict(channel=channel_id, thread_ts=thread_id, text=body,
+                                        unfurl_links=False, unfurl_media=False)
                     if username:
                         chunk_kwargs["username"] = username  # F30: labelled findings
                     posted = False
