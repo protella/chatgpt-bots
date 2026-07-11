@@ -116,6 +116,20 @@ NO_REPLY_CONTRACT_SUFFIX = (
 )
 
 
+# F18: volatile developer-suffix variant for thread-CONTINUATION turns (wake_source ==
+# "thread_continuation") — a 1:1 thread reply routed straight to the main model. Same
+# volatile delivery + exposure conditions as NO_REPLY_CONTRACT_SUFFIX (never in the system
+# prompt, never in rebuilt history), but the wording addresses the real failure: the model
+# is the thread's usual voice yet the latest message may be addressed to someone else.
+CONTINUATION_NO_REPLY_SUFFIX = (
+    "[You're seeing this because this thread has been a 1:1 conversation with you — but "
+    "check the latest message's addressee yourself: if it opens with or names a DIFFERENT "
+    "person or agent (\"claude, …\", \"Dana, can you…\"), it's theirs, not yours — end with "
+    "no_response_needed. NEVER post a placeholder announcing you're staying quiet or "
+    "deferring to them; silence means silence. Otherwise reply normally.]"
+)
+
+
 INTENT_CLASSIFIER_PROMPT = """Classify the user's LATEST message into exactly one intent:
 
 - new — wants an image generated (create, draw, visualize, "show me" something visual). Logos, icons, and "what does X look like" are "new" even as questions.

@@ -57,19 +57,23 @@ class _MatHost:
         self._client = SimpleNamespace(tool_registry=registry)
 
 
-def _msg(participation=False):
+def _msg(participation=False, wake_source=None):
     md = {"ts": "1.1"}
     if participation:
         md["participation_check"] = True
+    if wake_source:
+        md["wake_source"] = wake_source
     return SimpleNamespace(metadata=md, channel_id="C1")
 
 
 def test_materialize_unprompted_exposes_tool_without_mutating_shared(mock_env):
+    from prompts import NO_REPLY_CONTRACT_SUFFIX
     host = _MatHost(_registry_with_no_reply())
     shared = {"model": "gpt-5"}
-    registry, request_config, available = host._materialize_request_tools(
+    registry, request_config, available, suffix = host._materialize_request_tools(
         host._client, shared, _msg(participation=True), tools_disabled=False)
     assert available is True
+    assert suffix == NO_REPLY_CONTRACT_SUFFIX  # F2 unprompted wording
     assert request_config["_unprompted_turn"] is True
     assert "_unprompted_turn" not in shared  # copied, never mutated
     assert registry is not None
@@ -77,19 +81,70 @@ def test_materialize_unprompted_exposes_tool_without_mutating_shared(mock_env):
 
 def test_materialize_prompted_turn_no_tool(mock_env):
     host = _MatHost(_registry_with_no_reply())
-    registry, request_config, available = host._materialize_request_tools(
+    registry, request_config, available, suffix = host._materialize_request_tools(
         host._client, {"model": "gpt-5"}, _msg(participation=False), tools_disabled=False)
     assert available is False
+    assert suffix is None
     assert "_unprompted_turn" not in request_config
 
 
 def test_materialize_timeout_retry_drops_tool_and_paragraph(mock_env):
     host = _MatHost(_registry_with_no_reply())
-    registry, request_config, available = host._materialize_request_tools(
+    registry, request_config, available, suffix = host._materialize_request_tools(
         host._client, {"model": "gpt-5"}, _msg(participation=True), tools_disabled=True)
     # Retry disables the registry — so the tool AND the suffix paragraph fall away.
     assert registry is None
     assert available is False
+    assert suffix is None
+
+
+# ------------------------------------------------- F18 continuation exposure
+
+def test_materialize_continuation_exposes_tool_with_continuation_suffix(mock_env):
+    from prompts import CONTINUATION_NO_REPLY_SUFFIX, NO_REPLY_CONTRACT_SUFFIX
+    host = _MatHost(_registry_with_no_reply())
+    shared = {"model": "gpt-5"}
+    registry, request_config, available, suffix = host._materialize_request_tools(
+        host._client, shared, _msg(wake_source="thread_continuation"), tools_disabled=False)
+    assert available is True
+    assert request_config["_unprompted_turn"] is True  # drives the tool's enabled gate
+    assert "_unprompted_turn" not in shared  # copied, never mutated
+    assert registry is not None
+    # F18 wording on the continuation path — NOT the F2 unprompted paragraph.
+    assert suffix == CONTINUATION_NO_REPLY_SUFFIX
+    assert suffix != NO_REPLY_CONTRACT_SUFFIX
+
+
+def test_materialize_continuation_hidden_when_config_off(mock_env, monkeypatch):
+    monkeypatch.setattr(config, "enable_no_reply_tool", False)
+    host = _MatHost(_registry_with_no_reply())
+    registry, request_config, available, suffix = host._materialize_request_tools(
+        host._client, {"model": "gpt-5"}, _msg(wake_source="thread_continuation"),
+        tools_disabled=False)
+    assert available is False
+    assert suffix is None
+
+
+def test_materialize_mention_wake_no_tool(mock_env):
+    """@-mention / name-summons turns (wake_source name_mention/app_mention) are genuinely
+    addressed — no silence option, no suffix, tool hidden."""
+    host = _MatHost(_registry_with_no_reply())
+    for src in ("app_mention", "name_mention", "dm", "ambient"):
+        registry, request_config, available, suffix = host._materialize_request_tools(
+            host._client, {"model": "gpt-5"}, _msg(wake_source=src), tools_disabled=False)
+        assert available is False, src
+        assert suffix is None, src
+        assert "_unprompted_turn" not in request_config, src
+
+
+def test_materialize_continuation_timeout_retry_drops_tool_and_paragraph(mock_env):
+    host = _MatHost(_registry_with_no_reply())
+    registry, request_config, available, suffix = host._materialize_request_tools(
+        host._client, {"model": "gpt-5"}, _msg(wake_source="thread_continuation"),
+        tools_disabled=True)
+    assert registry is None
+    assert available is False
+    assert suffix is None
 
 
 # ------------------------------------------------------------- tool-loop terminal
@@ -419,3 +474,15 @@ def test_contract_paragraph_wording():
     assert NO_REPLY_CONTRACT_SUFFIX.startswith("[You joined this conversation uninvited.")
     assert "no_response_needed" in NO_REPLY_CONTRACT_SUFFIX
     assert NO_REPLY_CONTRACT_SUFFIX.endswith("over filler.]")
+
+
+def test_continuation_paragraph_wording():
+    from prompts import CONTINUATION_NO_REPLY_SUFFIX, NO_REPLY_CONTRACT_SUFFIX
+    # F18: continuation wording — 1:1-thread framing, self-check the addressee, silence
+    # means silence (never a "staying quiet" placeholder). Distinct from the F2 paragraph.
+    assert CONTINUATION_NO_REPLY_SUFFIX.startswith("[You're seeing this because this thread")
+    assert "1:1 conversation with you" in CONTINUATION_NO_REPLY_SUFFIX
+    assert "no_response_needed" in CONTINUATION_NO_REPLY_SUFFIX
+    assert "silence means silence" in CONTINUATION_NO_REPLY_SUFFIX
+    assert CONTINUATION_NO_REPLY_SUFFIX.endswith("reply normally.]")
+    assert CONTINUATION_NO_REPLY_SUFFIX != NO_REPLY_CONTRACT_SUFFIX
