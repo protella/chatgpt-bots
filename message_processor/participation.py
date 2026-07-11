@@ -193,11 +193,15 @@ class ParticipationEngine:
             self._pending.popitem(last=False)
 
     def _collect_burst(self, key: str, own_ts: str, debounce_seconds: float) -> List[str]:
-        """F27: called by the survivor of a debounce window. Collect-and-remove every
-        pending entry in `key` strictly older than own_ts (oldest-first) plus own entry;
-        drop entries older than own_ts − max(15, 5×debounce) seconds as stale leftovers
-        (a survivor that never ran must not leak minutes-old texts into a fresh burst);
-        cap the carried texts at the newest _MAX_BURST_CARRY, logging any further drop."""
+        """F27: called by the survivor of a debounce window to DRAIN its pending bucket.
+        Collect-and-remove every pending entry in `key` strictly older than own_ts
+        (oldest-first) plus own entry; drop entries older than own_ts − max(15, 5×debounce)
+        seconds as stale leftovers (a survivor that never ran must not leak minutes-old
+        texts into a fresh burst); cap the returned texts at the newest _MAX_BURST_CARRY,
+        logging any further drop. The draining is unconditional (memory hygiene for every
+        stream, thread or top-level); evaluate() decides whether to CARRY the result — only
+        top-level survivors do, where the per-sender key guarantees the texts are same-author.
+        Thread survivors call this to empty their bucket but discard the returned list."""
         bucket = self._pending.get(key)
         if not bucket:
             return []
@@ -254,12 +258,22 @@ class ParticipationEngine:
                        thread_root_ts: Optional[str] = None) -> Optional[ParticipationVerdict]:
         """Debounced judgment. Returns None when superseded — a newer message in the SAME
         conversation (this thread, or this sender's top-level stream — F21/F27) arrived
-        during the debounce window. F27: the survivor of a same-author top-level burst
+        during the debounce window. F27: the survivor of a same-author TOP-LEVEL burst
         collects the superseded siblings' texts into burst_earlier so its ONE reply covers
         the whole burst; a superseded evaluation returns None but LEAVES its pending entry
         for that survivor. Activity in other conversations (or from other senders at top
-        level) never supersedes."""
+        level) never supersedes.
+
+        Burst CARRY is top-level-only: a top-level stream key (channel|top|<sender>) is
+        per-author, so its collected siblings are guaranteed same-sender. A thread key
+        (channel|root) still collapses cross-author (F21) and its survivor may be a
+        DIFFERENT author than the superseded messages — carrying those would misattribute
+        them, and the render sites label the carried text "the same sender". So thread
+        survivors still DRAIN their bucket (load-bearing memory hygiene — a busy thread's
+        bucket must not grow unbounded) but DISCARD the texts; in-thread coverage already
+        works pre-F27 because the reply lands in-thread with full history."""
         key = self._conv_key(channel_id, ts, thread_root_ts, sender_id)
+        is_top_level = not (thread_root_ts and thread_root_ts != ts)
         self.note_arrival(channel_id, ts, thread_root_ts, sender_id)  # monotonic; a stale caller can't clobber a newer marker
         self._register_pending(key, ts, text)  # F27: enroll before the await so the survivor can find us
         wait = max(0.0, float(getattr(config, "participation_debounce_seconds", 3.0)))
@@ -268,9 +282,11 @@ class ParticipationEngine:
         if self._latest.get(key) != ts:
             return None  # superseded — our pending entry stays for the burst's survivor
 
-        # F27: we survived the debounce — drain this stream's pending siblings (same author
-        # at top level, or same thread) into a burst we must cover in one reply.
-        burst_earlier = self._collect_burst(key, ts, wait)
+        # F27: we survived the debounce — always drain this stream's pending siblings (bucket
+        # hygiene), but only CARRY them as a burst at top level, where the per-sender key
+        # guarantees they are the same author. Thread survivors drain-and-discard.
+        collected = self._collect_burst(key, ts, wait)
+        burst_earlier = collected if is_top_level else []
 
         # F5: render the thread tail HERE (after the debounce + supersession check) —
         # pure in-memory, zero latency, reflecting thread state at classification time.
