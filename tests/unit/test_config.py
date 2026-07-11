@@ -550,3 +550,21 @@ class TestBotConfig:
         assert "custom_instructions" not in thread_config
         assert thread_config["model"] == 'gpt-5-mini'
         assert thread_config["temperature"] == 0.5
+
+class TestDocExtractionWorkers:
+    """DOC_EXTRACTION_WORKERS sizes the shared extraction thread pool (user-exposed:
+    OCR can hold a worker 1-2 min, and queue wait counts against READ_DOCUMENT_TIMEOUT)."""
+
+    def test_default_is_five(self):
+        config = BotConfig()
+        assert config.doc_extraction_workers == 5
+
+    @patch.dict(os.environ, {"DOC_EXTRACTION_WORKERS": "8"})
+    def test_env_override(self):
+        config = BotConfig()
+        assert config.doc_extraction_workers == 8
+
+    @patch.dict(os.environ, {"DOC_EXTRACTION_WORKERS": "0"})
+    def test_floor_of_one(self):
+        config = BotConfig()
+        assert config.doc_extraction_workers == 1

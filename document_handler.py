@@ -36,8 +36,11 @@ EXTRACTION_TIMEOUT_SECONDS = 30
 MAX_OFFICE_DECOMPRESSED_BYTES = 200 * 1024 * 1024
 # Dedicated bounded pool so a slow parse can't exhaust the default executor.
 # NOTE: a timed-out parse keeps its worker thread until it finishes — the pool
-# being bounded (2) caps how many can be stuck at once.
-_EXTRACTION_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="doc-extract")
+# being bounded caps how many can be stuck at once. Size via DOC_EXTRACTION_WORKERS
+# (default 5): OCR can hold a worker ~1-2 min and queue wait counts against the
+# read_document timeout, so concurrent scans need parallel workers.
+_EXTRACTION_EXECUTOR = ThreadPoolExecutor(max_workers=config.doc_extraction_workers,
+                                          thread_name_prefix="doc-extract")
 # Supported document MIME types
 SUPPORTED_DOCUMENT_MIMETYPES = {
     # PDF documents
