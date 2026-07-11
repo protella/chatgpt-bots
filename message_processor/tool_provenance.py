@@ -27,6 +27,9 @@ MAX_PROVENANCE_ENTRIES = 8
 MAX_GIST_CHARS = 80
 MAX_ANNOTATION_CHARS = 160
 
+# F12: marker appended to a per-call MCP result digest when it is cut to the char cap.
+TRUNCATION_MARKER = "… [truncated]"
+
 # Structural arg keys whose values describe the SHAPE of a call (pagination/sizing/
 # time-window) and are safe to persist — but ONLY when the value passes a per-key type
 # check, so a caller can't smuggle content through a whitelisted key (e.g.
@@ -133,6 +136,10 @@ def render_used_tools_annotation(tools: Optional[List[Dict[str, Any]]]) -> str:
     names: List[str] = []
     with_gist: List[str] = []
     for entry in tools:
+        # F12: result-digest entries are a distinct class rendered by
+        # render_tool_results_annotation — never list them on the [used tools:] line.
+        if entry.get("result_digest"):
+            continue
         name = entry.get("tool_name")
         if not name:
             continue
@@ -145,3 +152,66 @@ def render_used_tools_annotation(tools: Optional[List[Dict[str, Any]]]) -> str:
     if len(full) <= MAX_ANNOTATION_CHARS:
         return full
     return f"[used tools: {', '.join(names)}]"
+
+
+def build_result_digests(mcp_results: Optional[List[Dict[str, Any]]],
+                         per_call_chars: int, per_turn_chars: int) -> List[Dict[str, str]]:
+    """Build the F12 result-digest entries ``[{"tool_name", "result_digest"}]`` from the
+    captured ``mcp_call`` outputs (``[{"tool_name", "output"}]``, capture order).
+
+    ONLY MCP outputs reach this — local Slack-fetch/read_document results never do
+    (CLAUDE.md content rules; the caller passes MCP outputs only). Each output is
+    newline-flattened (kept to one annotation line, and so a digest can't smuggle a fake
+    ``[reactions: …]`` line into context), truncated to ``per_call_chars`` with a
+    ``… [truncated]`` marker, and the turn is bounded by ``per_turn_chars`` in first-come
+    order — once the running total reaches the cap, later calls store NO digest."""
+    out: List[Dict[str, str]] = []
+    used = 0
+    for entry in mcp_results or []:
+        name = entry.get("tool_name")
+        output = entry.get("output")
+        if not name or not output:
+            continue
+        if used >= per_turn_chars:
+            break  # turn budget spent — later calls store no digest
+        text = str(output).replace("\r", " ").replace("\n", " ").strip()
+        if not text:
+            continue
+        if len(text) > per_call_chars:
+            text = text[:per_call_chars] + TRUNCATION_MARKER
+        out.append({"tool_name": str(name), "result_digest": text})
+        used += len(text)
+    return out
+
+
+def render_tool_results_annotation(tools: Optional[List[Dict[str, Any]]]) -> str:
+    """Render the F12 reinjected block — one ``[tool results: <tool_name> → <digest>]``
+    line per stored MCP digest, joined deterministically.
+
+    Pure function of the immutable rows (F7-5 standard). Entries without a
+    ``result_digest`` (the used-tools entries, and every old pre-F12 row) yield nothing."""
+    if not tools:
+        return ""
+    lines: List[str] = []
+    for entry in tools:
+        digest = entry.get("result_digest")
+        name = entry.get("tool_name")
+        if not digest or not name:
+            continue
+        lines.append(f"[tool results: {name} → {digest}]")
+    return "\n".join(lines)
+
+
+def render_provenance_annotations(tools: Optional[List[Dict[str, Any]]]) -> str:
+    """Combined reinjection block in pinned order: ``[used tools: …]`` first, then the
+    F12 ``[tool results: …]`` lines. The reactions annotation (rebuild-only) follows this
+    block at the call site, keeping the strip → used-tools → tool-results → reactions
+    order. Pure function of the immutable rows."""
+    parts: List[str] = []
+    used = render_used_tools_annotation(tools)
+    if used:
+        parts.append(used)
+    results = render_tool_results_annotation(tools)
+    if results:
+        parts.append(results)
+    return "\n".join(parts)

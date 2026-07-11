@@ -2160,37 +2160,56 @@ class DatabaseManager(LoggerMixin):
     def _merge_tool_provenance(existing: List[Dict], new: List[Dict]) -> List[Dict]:
         """Merge two provenance lists (existing first, then new), ORDER-preserving.
 
-        A tool that genuinely ran more than once in a turn (same name, different gists) is
-        kept as multiple entries. Only EXACT duplicates (same name AND gist) are deduped, and
-        an empty-gist placeholder is UPGRADED in place by a later non-empty gist for the same
-        tool (the same execution, refined). A re-persist thus accumulates without dropping or
-        double-counting. Capped at 8 entries (MAX_PROVENANCE_ENTRIES)."""
-        merged: List[Dict] = []
+        Two entry classes coexist: F7 used-tools entries (name + gist) and F12 result-digest
+        entries (name + result_digest). They never collapse into each other.
+
+        Used-tools: a tool that genuinely ran more than once (same name, different gists) is
+        kept as multiple entries; only EXACT duplicates (same name AND gist) are deduped; an
+        empty-gist placeholder is UPGRADED in place by a later non-empty gist for the same
+        tool. Capped at 8 (MAX_PROVENANCE_ENTRIES).
+
+        Result-digests (F12): deduped by (name, digest) so re-persist is idempotent but two
+        distinct outputs from the same server are both kept. Already char-bounded at capture,
+        so NOT subject to the 8-entry used-tools cap; appended AFTER the used-tools entries
+        (matches the pinned [used tools:] → [tool results:] render order). Old rows (no
+        result_digest) merge exactly as before."""
+        used: List[Dict] = []
+        results: List[Dict] = []
+        seen_results = set()
         for entry in list(existing or []) + list(new or []):
             if not isinstance(entry, dict):
                 continue
             name = entry.get("tool_name")
             if not name:
                 continue
+            digest = entry.get("result_digest")
+            if digest:
+                key = (name, digest)
+                if key in seen_results:
+                    continue  # exact (name, digest) duplicate — idempotent re-persist
+                seen_results.add(key)
+                results.append({"tool_name": name, "result_digest": digest})
+                continue
             gist = entry.get("gist") or ""
-            if any(m["tool_name"] == name and m["gist"] == gist for m in merged):
+            if any(m["tool_name"] == name and m["gist"] == gist for m in used):
                 continue  # exact duplicate — dedupe
             if gist.strip():
                 placeholder = next(
-                    (m for m in merged if m["tool_name"] == name and not m["gist"].strip()), None)
+                    (m for m in used if m["tool_name"] == name and not m["gist"].strip()), None)
                 if placeholder is not None:
                     placeholder["gist"] = gist  # upgrade empty placeholder in place
                     continue
-            elif any(m["tool_name"] == name and m["gist"].strip() for m in merged):
+            elif any(m["tool_name"] == name and m["gist"].strip() for m in used):
                 continue  # empty gist already covered by a non-empty entry for this tool
-            merged.append({"tool_name": name, "gist": gist})
-        return merged[:8]
+            used.append({"tool_name": name, "gist": gist})
+        return used[:8] + results
 
     async def save_tool_usage_async(self, channel_id: str, message_ts: str,
                                     thread_key: str, tools: List[Dict]) -> None:
         """Persist a reply's tool-use provenance (F7), keyed by channel+ts.
 
-        `tools` is the compact [{"tool_name","gist"}] record (names + arg gists only).
+        `tools` is the compact [{"tool_name","gist"}] record (names + arg gists), with
+        optional F12 [{"tool_name","result_digest"}] MCP result-memory entries appended.
         Idempotent on (channel_id, message_ts): a re-persist MERGES with the existing row
         (union by tool_name, preferring a non-empty gist) rather than last-write-wins, so a
         second pass can't drop tools recorded by the first. Best-effort — the caller wraps
