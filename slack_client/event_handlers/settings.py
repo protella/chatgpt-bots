@@ -246,9 +246,7 @@ class SlackSettingsHandlersMixin:
             ric_selected = state.get('reply_in_channel_block', {}).get('reply_in_channel', {}).get('selected_options') or []
             reply_in_channel = len(ric_selected) > 0
 
-            # Snooze early-resume (checkbox only rendered while snoozed).
-            snooze_selected = state.get('snooze_block', {}).get('clear_snooze', {}).get('selected_options') or []
-            extra = {"snoozed_until": None} if len(snooze_selected) > 0 else {}
+            # F15: the snooze early-resume control is retired (thread mutes replace the timer).
 
             # Shared response settings (model/effort/verbosity): 'inherit' clears to NULL
             # so the asker's personal preferences apply again.
@@ -272,7 +270,6 @@ class SlackSettingsHandlersMixin:
                     reasoning_effort=channel_effort,
                     verbosity=channel_verbosity,
                     updated_by=user_id,
-                    **extra,
                 )
                 default_level = MODE_TO_LEVEL.get(getattr(config, 'channel_response_mode', 'tag_only'), 'mentions_only')
                 effective = level_sel if level_sel != 'inherit' else f"inherit ({default_level})"

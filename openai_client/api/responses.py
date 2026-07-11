@@ -1006,11 +1006,6 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
             "party wins: the assistant's name is then just part of the topic (a possessive "
             "or reference like \"the chatgpt bot's repo\"), not a summons."
         )
-    if signals.get("snoozed"):
-        lines.append(
-            "- This channel recently told the assistant to quiet down (currently snoozed). "
-            "Respond ONLY if this message unmistakably summons the assistant; otherwise ignore."
-        )
     lines.append(f"- Strictness: {signals.get('strictness') or 'judicious'}")
     lines.append(
         f"- Assistant's unprompted replies in this channel in the last hour: "

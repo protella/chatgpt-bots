@@ -21,6 +21,28 @@ logger = logging.getLogger(__name__)
 _UNSET = object()
 
 
+def _decode_muted_threads(raw) -> List[str]:
+    """Parse the channel_settings.muted_threads JSON column into a list of thread ts
+    strings. Malformed/absent → empty list (fail open — a bad blob never silences)."""
+    if not raw:
+        return []
+    try:
+        val = json.loads(raw)
+        return [str(t) for t in val] if isinstance(val, list) else []
+    except (ValueError, TypeError):
+        return []
+
+
+def _encode_muted_threads(val) -> Optional[str]:
+    """Serialize a list of thread ts strings for storage. None/empty → NULL."""
+    if not val:
+        return None
+    try:
+        return json.dumps([str(t) for t in val])
+    except (ValueError, TypeError):
+        return None
+
+
 class DatabaseManager(LoggerMixin):
     """
     Manages SQLite database operations for bot persistence.
@@ -310,6 +332,7 @@ class DatabaseManager(LoggerMixin):
                 reply_in_channel BOOLEAN DEFAULT 0,
                 participation_level TEXT,
                 snoozed_until TEXT,
+                muted_threads TEXT,
                 model TEXT,
                 reasoning_effort TEXT,
                 verbosity TEXT,
@@ -376,6 +399,12 @@ class DatabaseManager(LoggerMixin):
             if cs_columns and 'snoozed_until' not in cs_columns:
                 self.log_info("DB: Adding snoozed_until column to channel_settings")
                 self.conn.execute("ALTER TABLE channel_settings ADD COLUMN snoozed_until TEXT")
+                self.conn.commit()
+            # F15: muted_threads (JSON list) — threads permanently opted out of unprompted
+            # participation via a "butt out" backoff. Replaces the snoozed_until timer rail.
+            if cs_columns and 'muted_threads' not in cs_columns:
+                self.log_info("DB: Adding muted_threads column to channel_settings")
+                self.conn.execute("ALTER TABLE channel_settings ADD COLUMN muted_threads TEXT")
                 self.conn.commit()
             # Shared per-channel model/effort/verbosity overrides (NULL = inherit)
             for col in ("model", "reasoning_effort", "verbosity"):
@@ -880,7 +909,7 @@ class DatabaseManager(LoggerMixin):
         """Get per-channel settings (Phase 7). Returns a dict or None if the channel has no row."""
         cursor = self.conn.execute(
             "SELECT response_mode, directives, reply_in_channel, participation_level, "
-            "snoozed_until, model, reasoning_effort, verbosity, updated_ts, updated_by "
+            "snoozed_until, muted_threads, model, reasoning_effort, verbosity, updated_ts, updated_by "
             "FROM channel_settings WHERE channel_id = ?",
             (channel_id,)
         )
@@ -893,6 +922,7 @@ class DatabaseManager(LoggerMixin):
             "reply_in_channel": bool(row["reply_in_channel"]),
             "participation_level": row["participation_level"],
             "snoozed_until": row["snoozed_until"],
+            "muted_threads": _decode_muted_threads(row["muted_threads"]),
             "model": row["model"],
             "reasoning_effort": row["reasoning_effort"],
             "verbosity": row["verbosity"],
@@ -903,14 +933,16 @@ class DatabaseManager(LoggerMixin):
     def set_channel_settings(self, channel_id: str, response_mode=_UNSET,
                              directives=_UNSET, reply_in_channel=_UNSET,
                              participation_level=_UNSET, snoozed_until=_UNSET,
+                             muted_threads=_UNSET,
                              model=_UNSET, reasoning_effort=_UNSET, verbosity=_UNSET,
                              updated_by: Optional[str] = None):
-        """Upsert per-channel settings (Phase 7; Phase F adds participation_level/snoozed_until).
+        """Upsert per-channel settings (Phase 7; Phase F adds participation_level/snoozed_until;
+        F15 adds muted_threads).
 
         Omitted fields are preserved. An explicit value sets it; an explicit None CLEARS it
         (→ NULL) so the modal's "inherit from global default" stores NULL rather than a literal
-        string (NULL then resolves to the global default at read time). snoozed_until=None
-        clears an active snooze.
+        string (NULL then resolves to the global default at read time). muted_threads takes a
+        Python list (stored as JSON); None/[] clears it.
         """
         existing = self.get_channel_settings(channel_id) or {}
         new_mode = existing.get("response_mode", "tag_only") if response_mode is _UNSET else response_mode
@@ -918,27 +950,29 @@ class DatabaseManager(LoggerMixin):
         new_ric = existing.get("reply_in_channel", False) if reply_in_channel is _UNSET else reply_in_channel
         new_level = existing.get("participation_level") if participation_level is _UNSET else participation_level
         new_snooze = existing.get("snoozed_until") if snoozed_until is _UNSET else snoozed_until
+        new_muted = existing.get("muted_threads") if muted_threads is _UNSET else muted_threads
         new_model = existing.get("model") if model is _UNSET else model
         new_effort = existing.get("reasoning_effort") if reasoning_effort is _UNSET else reasoning_effort
         new_verb = existing.get("verbosity") if verbosity is _UNSET else verbosity
         self.conn.execute("""
             INSERT INTO channel_settings (channel_id, response_mode, directives, reply_in_channel,
-                                          participation_level, snoozed_until, model, reasoning_effort,
-                                          verbosity, updated_ts, updated_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                                          participation_level, snoozed_until, muted_threads, model,
+                                          reasoning_effort, verbosity, updated_ts, updated_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
             ON CONFLICT(channel_id) DO UPDATE SET
                 response_mode=excluded.response_mode,
                 directives=excluded.directives,
                 reply_in_channel=excluded.reply_in_channel,
                 participation_level=excluded.participation_level,
                 snoozed_until=excluded.snoozed_until,
+                muted_threads=excluded.muted_threads,
                 model=excluded.model,
                 reasoning_effort=excluded.reasoning_effort,
                 verbosity=excluded.verbosity,
                 updated_ts=CURRENT_TIMESTAMP,
                 updated_by=excluded.updated_by
         """, (channel_id, new_mode, new_dir, 1 if new_ric else 0, new_level, new_snooze,
-              new_model, new_effort, new_verb, updated_by))
+              _encode_muted_threads(new_muted), new_model, new_effort, new_verb, updated_by))
         self.conn.commit()
         logger.debug(f"Saved channel_settings for {channel_id}: mode={new_mode}, level={new_level}")
 
@@ -2303,7 +2337,7 @@ class DatabaseManager(LoggerMixin):
             await db.execute("PRAGMA journal_mode=WAL")
             async with db.execute(
                 "SELECT response_mode, directives, reply_in_channel, participation_level, "
-                "snoozed_until, model, reasoning_effort, verbosity, updated_ts, updated_by "
+                "snoozed_until, muted_threads, model, reasoning_effort, verbosity, updated_ts, updated_by "
                 "FROM channel_settings WHERE channel_id = ?",
                 (channel_id,)
             ) as cursor:
@@ -2316,6 +2350,7 @@ class DatabaseManager(LoggerMixin):
                     "reply_in_channel": bool(row["reply_in_channel"]),
                     "participation_level": row["participation_level"],
                     "snoozed_until": row["snoozed_until"],
+                    "muted_threads": _decode_muted_threads(row["muted_threads"]),
                     "model": row["model"],
                     "reasoning_effort": row["reasoning_effort"],
                     "verbosity": row["verbosity"],
@@ -2326,13 +2361,15 @@ class DatabaseManager(LoggerMixin):
     async def set_channel_settings_async(self, channel_id: str, response_mode=_UNSET,
                                          directives=_UNSET, reply_in_channel=_UNSET,
                                          participation_level=_UNSET, snoozed_until=_UNSET,
+                                         muted_threads=_UNSET,
                                          model=_UNSET, reasoning_effort=_UNSET, verbosity=_UNSET,
                                          updated_by: Optional[str] = None):
-        """Async version of set_channel_settings (Phase F adds participation_level/snoozed_until).
+        """Async version of set_channel_settings (Phase F adds participation_level/snoozed_until;
+        F15 adds muted_threads).
 
         Omitted fields are preserved; an explicit None CLEARS the column to NULL (so the modal's
-        "inherit" selection resolves to the global default at read time; snoozed_until=None
-        clears an active snooze).
+        "inherit" selection resolves to the global default at read time). muted_threads takes a
+        Python list (stored as JSON); None/[] clears it.
         """
         existing = await self.get_channel_settings_async(channel_id) or {}
         new_mode = existing.get("response_mode", "tag_only") if response_mode is _UNSET else response_mode
@@ -2340,6 +2377,7 @@ class DatabaseManager(LoggerMixin):
         new_ric = existing.get("reply_in_channel", False) if reply_in_channel is _UNSET else reply_in_channel
         new_level = existing.get("participation_level") if participation_level is _UNSET else participation_level
         new_snooze = existing.get("snoozed_until") if snoozed_until is _UNSET else snoozed_until
+        new_muted = existing.get("muted_threads") if muted_threads is _UNSET else muted_threads
         new_model = existing.get("model") if model is _UNSET else model
         new_effort = existing.get("reasoning_effort") if reasoning_effort is _UNSET else reasoning_effort
         new_verb = existing.get("verbosity") if verbosity is _UNSET else verbosity
@@ -2347,24 +2385,40 @@ class DatabaseManager(LoggerMixin):
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("""
                 INSERT INTO channel_settings (channel_id, response_mode, directives, reply_in_channel,
-                                              participation_level, snoozed_until, model, reasoning_effort,
-                                              verbosity, updated_ts, updated_by)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                                              participation_level, snoozed_until, muted_threads, model,
+                                              reasoning_effort, verbosity, updated_ts, updated_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
                 ON CONFLICT(channel_id) DO UPDATE SET
                     response_mode=excluded.response_mode,
                     directives=excluded.directives,
                     reply_in_channel=excluded.reply_in_channel,
                     participation_level=excluded.participation_level,
                     snoozed_until=excluded.snoozed_until,
+                    muted_threads=excluded.muted_threads,
                     model=excluded.model,
                     reasoning_effort=excluded.reasoning_effort,
                     verbosity=excluded.verbosity,
                     updated_ts=CURRENT_TIMESTAMP,
                     updated_by=excluded.updated_by
             """, (channel_id, new_mode, new_dir, 1 if new_ric else 0, new_level, new_snooze,
-                  new_model, new_effort, new_verb, updated_by))
+                  _encode_muted_threads(new_muted), new_model, new_effort, new_verb, updated_by))
             await db.commit()
             logger.debug(f"Saved channel_settings for {channel_id} (async): mode={new_mode}, level={new_level}")
+
+    async def add_muted_thread_async(self, channel_id: str, thread_ts: str,
+                                     updated_by: Optional[str] = None) -> bool:
+        """F15: permanently mute a thread for unprompted participation (a "butt out"
+        backoff). Read-modify-write of the channel's muted_threads list; idempotent —
+        re-muting an already-muted thread is a no-op. Returns True when newly added."""
+        if not channel_id or not thread_ts:
+            return False
+        existing = await self.get_channel_settings_async(channel_id) or {}
+        muted = list(existing.get("muted_threads") or [])
+        if str(thread_ts) in muted:
+            return False
+        muted.append(str(thread_ts))
+        await self.set_channel_settings_async(channel_id, muted_threads=muted, updated_by=updated_by)
+        return True
 
     # --- Per-channel memory (Phase 9), async variants ---
     async def get_channel_memory_async(self, channel_id: str) -> List[Dict]:

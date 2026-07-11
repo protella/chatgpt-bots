@@ -248,29 +248,37 @@ async def test_engine_disabled_makes_auto_respond_mentions_only(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_snoozed_channel_skips_unprompted_but_not_addressed(monkeypatch):
-    from message_processor.participation import snooze_expiry_iso
+async def test_muted_thread_skips_unprompted_but_not_addressed(monkeypatch):
+    # F15: a "butt out" muted thread drops UNPROMPTED messages in that thread pre-gate,
+    # but a name-hit summons in the same thread still reaches the engine (told to be quiet
+    # ≠ deaf; @-mentions arrive via app_mention and never touch this path).
     monkeypatch.setattr(config, "channel_response_mode", "auto_respond", raising=False)
     monkeypatch.setattr(config, "bot_name_aliases", ["ChatGPT"], raising=False)
     monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
     bot = _make_bot()
-    snoozed = {"response_mode": "auto_respond", "snoozed_until": snooze_expiry_iso(hours=1)}
+    bot._thread_participation = AsyncMock(return_value=(False, 1, 0))  # no 1:1 continuation
+    muted = {"response_mode": "auto_respond", "muted_threads": ["50.0"]}
 
     async def _cs(channel_id):
-        return snoozed
+        return muted
 
     bot._get_channel_settings = _cs
-    # unprompted while snoozed → silent, no dispatch
-    await bot._handle_channel_message(_evt(text="anyone know the q3 numbers?"), bot.app.client)
+    # unprompted reply in the muted thread → silent, no dispatch
+    await bot._handle_channel_message(
+        _evt(text="anyone know the q3 numbers?", thread_ts="50.0", ts="60.0"), bot.app.client)
     bot.message_handler.assert_not_called()
-    # name-bearing while snoozed → still reaches the engine (told to be quiet ≠ deaf),
-    # carrying both signals so the model can require a genuine summons.
-    await bot._handle_channel_message(_evt(ts="102.1", text="ChatGPT you there?"), bot.app.client)
+    # name-bearing in the muted thread → still reaches the engine
+    await bot._handle_channel_message(
+        _evt(text="ChatGPT you there?", thread_ts="50.0", ts="61.0"), bot.app.client)
     bot.message_handler.assert_called_once()
     msg = bot.message_handler.call_args[0][0]
     assert msg.metadata.get("participation_check") is True
     assert msg.metadata.get("participation_name_hit") is True
-    assert msg.metadata.get("participation_snoozed") is True
+    # a message in a DIFFERENT (unmuted) thread participates normally
+    bot.message_handler.reset_mock()
+    await bot._handle_channel_message(
+        _evt(text="anyone free to review?", thread_ts="99.0", ts="99.5"), bot.app.client)
+    bot.message_handler.assert_called_once()
 
 
 @pytest.mark.asyncio

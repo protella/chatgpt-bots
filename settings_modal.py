@@ -116,7 +116,7 @@ class SettingsModal(LoggerMixin):
         inherits the global default; that is represented by the "inherit" option here, and the
         submission handler stores None (NULL) for it so the global default keeps applying.
         """
-        from message_processor.participation import MODE_TO_LEVEL, VALID_LEVELS, is_snoozed
+        from message_processor.participation import MODE_TO_LEVEL, VALID_LEVELS
 
         from config import SUPPORTED_CHAT_MODELS, GPT56_EFFORTS, GPT55_EFFORTS
 
@@ -237,21 +237,9 @@ class SettingsModal(LoggerMixin):
              "label": {"type": "plain_text", "text": "Verbosity"}},
         ]
 
-        # Phase F: while snoozed ("butt out"), offer an early resume.
-        if is_snoozed(cs):
-            snooze_option = {
-                "text": {"type": "plain_text", "text": "Resume unprompted participation now"},
-                "value": "clear_snooze",
-            }
-            blocks.append(
-                {"type": "input", "block_id": "snooze_block", "optional": True,
-                 "element": {"type": "checkboxes", "action_id": "clear_snooze",
-                             "options": [snooze_option]},
-                 "label": {"type": "plain_text", "text": "Snoozed"},
-                 "hint": {"type": "plain_text",
-                          "text": f"The channel asked me to pipe down (until {cs.get('snoozed_until')} UTC). "
-                                  f"@mentions still work while snoozed."}}
-            )
+        # F15: the channel-wide snooze timer (and its early-resume control) is retired.
+        # "Butt out" now mutes the specific thread; unmuting happens by addressing the bot
+        # there, and the model forgets/updates the standing memory fact — no modal surface.
 
         return {
             "type": "modal",
