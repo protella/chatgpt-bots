@@ -199,6 +199,57 @@ def build_result_digests(mcp_results: Optional[List[Dict[str, Any]]],
     return out
 
 
+async def build_result_digests_summarized(
+    mcp_results: Optional[List[Dict[str, Any]]],
+    openai_client: Any,
+    per_call_chars: int,
+    per_turn_chars: int,
+    input_chars: int,
+) -> List[Dict[str, str]]:
+    """F16 capture-time variant of :func:`build_result_digests`: an MCP output longer than
+    ``per_call_chars`` is SUMMARIZED once (utility model, low effort) instead of hard-cut,
+    so the URL/figure/title that made it worth keeping survives.
+
+    Restructure honesty: the pure/deterministic budget + truncation logic stays in the sync
+    :func:`build_result_digests`. This async pre-pass ONLY does the utility calls — it
+    replaces each overlong output with its single-line summary (already under the cap) and
+    hands the result to the pure builder, which then applies the unchanged per-turn budget in
+    capture order (summaries count toward it) and truncates anything left over. Determinism
+    holds because summarization happens ONCE here at persist time; the stored digest is
+    immutable and rebuild never re-summarizes (F7-5).
+
+    Fallback is total: on ANY summarizer error/timeout, an empty return, or a summary that
+    is still over the cap, the ORIGINAL output is passed through unchanged so the pure
+    builder applies today's ``… [truncated]`` behavior. The summarizer is fed at most the
+    first ``input_chars`` of each output (budget guard). Never raises; never blocks on
+    outputs that don't need summarizing."""
+    prepared: List[Dict[str, Any]] = []
+    for entry in mcp_results or []:
+        name = entry.get("tool_name")
+        output = entry.get("output")
+        if not name or not output:
+            prepared.append(entry)  # let the pure builder skip it uniformly
+            continue
+        text = str(output)
+        if len(text) <= per_call_chars:
+            prepared.append(entry)  # fits already — no utility call (verbatim path)
+            continue
+        summary = None
+        try:
+            summary = await openai_client.summarize_tool_result(text[:input_chars], per_call_chars)
+        except Exception:
+            summary = None  # defensive: the client contract is non-raising, but never trust it
+        if summary:
+            flat = str(summary).replace("\r", " ").replace("\n", " ").strip()
+            # A summary that overshoots the cap is a failed summary — fall back to truncation
+            # of the ORIGINAL output rather than truncating a lossy paraphrase.
+            if flat and len(flat) <= per_call_chars:
+                prepared.append({"tool_name": name, "output": flat})
+                continue
+        prepared.append(entry)  # summarizer failed/overlong → original → pure truncation
+    return build_result_digests(prepared, per_call_chars, per_turn_chars)
+
+
 def render_tool_results_annotation(tools: Optional[List[Dict[str, Any]]]) -> str:
     """Render the F12 reinjected block — one ``[tool results: <tool_name> → <digest>]``
     line per stored MCP digest, joined deterministically.

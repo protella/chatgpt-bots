@@ -18,6 +18,7 @@ from tool_registry import ToolContext
 from message_processor.tool_provenance import (
     build_provenance,
     build_result_digests,
+    build_result_digests_summarized,
     render_provenance_annotations,
     strip_used_tools_footer,
 )
@@ -474,9 +475,17 @@ class TextHandlerMixin:
         if config.enable_tool_provenance:
             tool_provenance = build_provenance(local_tool_calls, tools_actually_used)
             # F12: attach MCP result digests (result memory) alongside the names/gists.
+            # F16: when summarization is on, overlong outputs are compressed by the utility
+            # model here at persist time (once) instead of hard-truncated; off → today's cut.
             if config.enable_tool_result_memory:
-                tool_provenance += build_result_digests(
-                    mcp_results, config.tool_result_digest_chars, config.tool_result_turn_chars)
+                if config.enable_tool_result_summarization:
+                    tool_provenance += await build_result_digests_summarized(
+                        mcp_results, self.openai_client,
+                        config.tool_result_digest_chars, config.tool_result_turn_chars,
+                        config.tool_result_summarize_input_chars)
+                else:
+                    tool_provenance += build_result_digests(
+                        mcp_results, config.tool_result_digest_chars, config.tool_result_turn_chars)
             annotation = render_provenance_annotations(tool_provenance)
             if annotation:
                 stored_content = f"{strip_used_tools_footer(response_text)}\n{annotation}"
@@ -1612,9 +1621,17 @@ class TextHandlerMixin:
             if config.enable_tool_provenance:
                 tool_provenance = build_provenance(local_tool_calls, tools_used)
                 # F12: attach MCP result digests (result memory) alongside the names/gists.
+                # F16: summarization (when on) compresses overlong outputs once here rather
+                # than hard-truncating; off → today's cut.
                 if config.enable_tool_result_memory:
-                    tool_provenance += build_result_digests(
-                        mcp_results, config.tool_result_digest_chars, config.tool_result_turn_chars)
+                    if config.enable_tool_result_summarization:
+                        tool_provenance += await build_result_digests_summarized(
+                            mcp_results, self.openai_client,
+                            config.tool_result_digest_chars, config.tool_result_turn_chars,
+                            config.tool_result_summarize_input_chars)
+                    else:
+                        tool_provenance += build_result_digests(
+                            mcp_results, config.tool_result_digest_chars, config.tool_result_turn_chars)
                 annotation = render_provenance_annotations(tool_provenance)
                 if annotation:
                     stored_content = f"{strip_used_tools_footer(response_text)}\n{annotation}"
