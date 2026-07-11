@@ -201,7 +201,9 @@ async def execute_read_document(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
         extracted = await _document_handler.safe_extract_content_async(
             data, doc.get("mime_type") or "application/octet-stream",
             doc.get("filename") or "document",
-            ocr_images=False)  # tool returns text slices; page images are useless here
+            # Text slices only: page images are useless in a tool result, but OCR TEXT
+            # rescues image-only/scanned PDFs that yield nothing from local extraction.
+            ocr_images=False, ocr_text=True)
         text = (extracted or {}).get("content")
         if not text:
             return {"ok": False, "error": "extraction_failed",
