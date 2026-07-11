@@ -40,6 +40,28 @@ def _delivered_stream_ts(native_coord, native_finalized: bool,
     return current_message_id if content_delivered else None
 
 
+def native_stream_place_in_channel(message: Message) -> bool:
+    """Whether the native-stream coordinator should target the channel top level
+    (thread_ts None) instead of the thread — this must MATCH where main.py will
+    actually post the reply, or chat.startStream is created against the wrong target.
+
+    main.py stamps its final placement decision (which honors the participation
+    engine's per-message placement verdict) into metadata["place_in_channel"]; that
+    stamp WINS. Recomputing from the channel's reply_in_channel setting alone ignored
+    a "thread" verdict on a top-level trigger: the reply threaded, but the coordinator
+    was built with thread=None, so native streaming silently fell back to legacy (and
+    the F8 attached footer never rode — the reply grew a separate footer message).
+    The recompute survives only as a fallback for paths that bypass the stamp."""
+    meta = message.metadata or {}
+    if "place_in_channel" in meta:
+        return bool(meta.get("place_in_channel"))
+    is_top_level_trigger = meta.get("ts") == message.thread_id
+    return (
+        bool(meta.get("reply_in_channel")) and is_top_level_trigger
+        and bool(message.channel_id) and not message.channel_id.startswith("D")
+    )
+
+
 class TextHandlerMixin:
     def _get_tool_registry(self, client: BaseClient, thread_config: dict):
         """The client's local-tool registry, or None when the loop can't/shouldn't run."""
@@ -876,14 +898,7 @@ class TextHandlerMixin:
         native_coord = None
         if (hasattr(client, "supports_native_streaming") and client.supports_native_streaming()
                 and hasattr(client, "begin_native_stream")):
-            # Same placement rule as main.py's indicator: reply_in_channel channels
-            # get a top-level message (thread_ts None); everything else threads.
-            meta = message.metadata or {}
-            is_top_level_trigger = meta.get("ts") == message.thread_id
-            place_in_channel = (
-                bool(meta.get("reply_in_channel")) and is_top_level_trigger
-                and bool(message.channel_id) and not message.channel_id.startswith("D")
-            )
+            place_in_channel = native_stream_place_in_channel(message)
             native_coord = NativeStreamCoordinator(
                 client, message.channel_id,
                 None if place_in_channel else message.thread_id,
