@@ -615,18 +615,22 @@ class MessageProcessor(ThreadManagementMixin,
                     intent = "new_image"
                     self.log_debug("No recent images found, treating ambiguous as new generation")
             
-            # F1: one in-flight background generation per thread. A new image request
-            # (new/edit) while the previous generation is still running is intentionally
-            # rejected — it posts automatically when ready, and a second concurrent job
-            # would cross-talk on the shared status/latch. Conversational turns are
-            # unaffected (they flow normally, with the suffix in-flight note).
-            _gen_in_flight = (
-                intent in ("new_image", "edit_image")
-                and self.thread_manager.generation_in_flight(thread_key) is not None
-            )
+            # F13: several concurrent background generations per thread (F1's one-slot rule
+            # was a deferral, not a constraint). A NEW image request mid-flight dispatches
+            # ANOTHER parallel job while under the per-thread cap; at the cap it's rejected
+            # with a count-aware message. An EDIT mid-flight still waits — you can't edit an
+            # image you haven't seen yet. (ambiguous_image is already resolved above: it
+            # clarifies when there's a recent image, otherwise it became new_image and flows
+            # through the cap gate — misrouted chat degrades to chat, never a canned reject.)
+            _gens_in_flight = self.thread_manager.generations_in_flight(thread_key)
+            _gen_count = len(_gens_in_flight)
+            _edit_wait = intent == "edit_image" and _gen_count > 0
+            _new_at_cap = (intent == "new_image"
+                           and _gen_count >= config.max_concurrent_image_generations)
+            _gen_reject = _edit_wait or _new_at_cap
 
             # Update thinking indicator if generating/editing image (only for non-streaming)
-            if intent in ["new_image", "edit_image"] and not _gen_in_flight:
+            if intent in ["new_image", "edit_image"] and not _gen_reject:
                 # Only show the image thinking message if we're not streaming
                 # (on status-only DMs this routes to the composer status)
                 # Note: We check global streaming here since we don't have thread_config yet
@@ -634,9 +638,16 @@ class MessageProcessor(ThreadManagementMixin,
                     self._update_thinking_for_image(client, message.channel_id, thinking_id, thread_id=message.thread_id)
 
             # Generate response based on intent
-            if _gen_in_flight:
-                self.log_info(f"Image intent '{intent}' rejected — a generation is already in flight on {thread_key}")
-                rejection_msg = "Still working on the previous image — ask me again once it lands."
+            if _gen_reject:
+                if _edit_wait:
+                    self.log_info(f"Edit intent deferred — {_gen_count} generation(s) still in flight on {thread_key}")
+                    rejection_msg = ("I'm still finishing up an image in this thread — give me a "
+                                     "moment until it lands, then I can edit it.")
+                else:  # _new_at_cap
+                    self.log_info(f"New-image intent rejected — at cap ({_gen_count}) on {thread_key}")
+                    noun = "image" if _gen_count == 1 else "images"
+                    rejection_msg = (f"I've already got {_gen_count} {noun} cooking in this thread — "
+                                     "ask again once one lands.")
                 # Record the exchange in warm state so a conversational turn BEFORE the
                 # generation lands can see it (the background refresh only repairs it later).
                 message_ts = message.metadata.get("ts") if message.metadata else None
@@ -734,7 +745,10 @@ class MessageProcessor(ThreadManagementMixin,
             # wins the lock next can't slip in before the latch is set (Codex finding 11).
             if response is not None and response.type in ("image", "background"):
                 try:
-                    self.thread_manager.mark_upload_started(thread_key)
+                    # F13: key the latch on the generation_id (background) so overlapping
+                    # jobs each hold their own token; the sync image path has none (None).
+                    self.thread_manager.mark_upload_started(
+                        thread_key, (response.metadata or {}).get("generation_id"))
                 except Exception as latch_error:
                     self.log_warning(f"Failed to mark upload started for {thread_key}: {latch_error}")
 

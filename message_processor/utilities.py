@@ -1111,20 +1111,27 @@ class MessageUtilitiesMixin:
 
     def _build_generation_inflight_note(self, channel_id: Optional[str],
                                         thread_ts: Optional[str]) -> Optional[str]:
-        """F1: volatile suffix line telling the model a background image generation is
-        still running in this thread, so a follow-up turn doesn't claim it's done or kick
-        off a second one. Returns None when nothing is in flight."""
+        """F1/F13: volatile suffix line telling the model that background image
+        generation(s) are still running in this thread, so a follow-up turn doesn't
+        claim they're done or kick off another unasked. Lists EVERY in-flight prompt
+        summary (F13 allows several concurrent). Returns None when nothing is in flight."""
         try:
             if not channel_id or thread_ts is None or not hasattr(self, "thread_manager"):
                 return None
-            entry = self.thread_manager.generation_in_flight(f"{channel_id}:{thread_ts}")
-            if not entry:
+            entries = self.thread_manager.generations_in_flight(f"{channel_id}:{thread_ts}")
+            if not entries:
                 return None
-            summary = self._escape_suffix_text(entry.get("prompt_summary"))
+            summaries = [self._escape_suffix_text(e.get("prompt_summary")) for e in entries]
+            if len(summaries) == 1:
+                subject, pronoun = f'An image for "{summaries[0]}" is', "it is"
+            else:
+                subject = (f"{len(summaries)} images ("
+                           + ", ".join(f'"{s}"' for s in summaries) + ") are")
+                pronoun = "they are"
             return (
-                f'[An image for "{summary}" is currently being generated in this thread '
-                "and will be posted automatically when ready. Don't claim it is done and "
-                "don't start another image unless asked.]"
+                f"[{subject} currently being generated in this thread and will be posted "
+                f"automatically when ready. Don't claim {pronoun} done and don't start "
+                "another image unless asked.]"
             )
         except Exception as e:
             self.log_debug(f"in-flight note build failed: {e}")

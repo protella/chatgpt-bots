@@ -920,6 +920,67 @@ reactions); warm append matches later rebuild render for the same row; compactio
 boundary skip; flag off = no digests stored and none rendered (provenance names still
 work); prompt instruction present.
 
+## F13. Parallel image generations + acknowledgment-safe intent routing (user request 2026-07-11)
+
+**Live failures (same thread, 2026-07-11):** (1) "when you're done, can you make one for
+gen alpha?" during a generation hit F1's one-slot rejection. User directive: a NEW image
+request during a generation should simply run as another parallel background job (F1's
+one-in-flight rule was a deferral — Codex finding 12 — not a technical constraint);
+edits are different — "can't edit something you haven't seen yet" — so the wait message
+stays correct for edit intents. (2) "ok" — an acknowledgment of the rejection — was
+classified `new_image` (continuation rule + image-heavy context) and got the SAME canned
+rejection; pre-F1 routing would have fired a spurious generation off it. User directive:
+NO string-specific hardcoding ("ok" lists) — fix via general classifier judgment so any
+regular chat mid-generation flows normally.
+
+**Design:**
+1. **Registry goes multi-entry** (thread_manager.py:406-548):
+   `_active_generations: Dict[thread_key, Dict[generation_id, entry]]`.
+   `register_generation` adds an entry; `finish_generation` stays ID-conditional;
+   `generation_in_flight(thread_key)` is replaced by
+   `generations_in_flight(thread_key) -> List[dict]` (ordered by `started_at`; adapt the
+   few call sites — base.py:625, utilities.py:1120, watchdog, `cancel_generations`).
+   Watchdog force-clears per-entry (stale entry never touches a newer sibling).
+2. **Cap:** new config `max_concurrent_image_generations` (env
+   `MAX_CONCURRENT_IMAGE_GENERATIONS`, default 3, per thread). Under the cap, a
+   `new_image` intent mid-flight dispatches a normal F1 background job — own
+   enhancement stream (inline under the lock, so enhancements serialize naturally), own
+   checklist message, own generation_id. At the cap: friendly rejection that reflects
+   reality ("I've already got N images cooking in this thread — ask again once one
+   lands.").
+3. **Intent routing** (base.py:611-640): `new_image` → dispatch (cap-gated, pt 2);
+   `edit_image` → keep the wait message, reworded to say an image is still being
+   generated; `ambiguous_image` → fall through to the NORMAL ambiguous handling
+   (clarifying conversation) instead of the canned rejection — misrouted chat must
+   degrade to chat, never to a canned image reply.
+4. **Volatile suffix** (utilities.py:1120): render ALL in-flight entries — one bracketed
+   note listing each prompt summary — same instructions (posted automatically when
+   ready; don't claim done; don't start another unless asked).
+5. **Upload latch** (thread_manager.py:474-498): `mark_upload_started`/`wait_for_uploads`
+   must tolerate overlapping generations — count-based or per-generation-id set;
+   `wait_for_uploads` waits for all outstanding uploads on the thread; release stays
+   idempotent per generation_id.
+6. **Classifier judgment rule (general — the no-hardcoding directive):**
+   INTENT_CLASSIFIER_PROMPT gains one disambiguation rule: acknowledgments, assent,
+   thanks, and commentary about pending or completed work are `none` — a continuation
+   counts as an image intent only when it adds or changes a concrete visual request.
+   (Illustrative examples permitted in the rule; no string matching in code.)
+7. **Delivery independence:** each job already owns its `publish_image` +
+   `mark_needs_refresh`; verify two jobs on the SAME thread landing close together
+   don't cross-talk (registry, latch, checklist, refresh) — extend the existing
+   two-threads-concurrently test to two-jobs-one-thread.
+8. Out of scope: edit targeting after multiple deliveries (latest-image-wins behavior
+   unchanged); `ENABLE_BACKGROUND_IMAGE_GEN=false` sync path (inherently serial;
+   unchanged).
+
+**Tests** (extend `tests/unit/test_background_image_gen.py`): registry holds 2 entries,
+ID-conditional finish leaves the sibling; cap: (cap+1)th request rejected with the
+count message, others dispatch; two parallel jobs one thread both deliver (no latch/
+checklist/refresh cross-talk); edit mid-flight → wait message; ambiguous mid-flight →
+normal ambiguous path (no canned rejection); suffix lists every in-flight summary;
+watchdog clears only the stale entry; classifier prompt contains the acknowledgment
+rule; config default 3 wired.
+
 ## Rollout / verification
 
 1. `make test` green after each change set (F4 → F1 → F2 → F3); `make lint` clean.

@@ -462,15 +462,16 @@ class ImageGenerationMixin:
                     await client.clear_assistant_status(channel_id, thread_id)
             except Exception:
                 pass
-            # ID-conditional clear: a watchdog-cleared zombie must never clear a newer
-            # job or release its latch. finish_generation returns True only when THIS job
-            # is still the registered one.
-            cleared = self.thread_manager.finish_generation(thread_key, generation_id)
-            if cleared:
-                try:
-                    self.thread_manager.mark_upload_finished(thread_key)
-                except Exception:
-                    pass
+            # ID-conditional clear (F1): finish_generation removes only THIS job's registry
+            # entry, never a sibling's. F13: the upload latch is per-generation_id, so
+            # releasing my own token is always safe (it can't drop a sibling's outstanding
+            # upload) — release it unconditionally so a watchdog-cleared-but-still-running
+            # job doesn't leak its latch token.
+            self.thread_manager.finish_generation(thread_key, generation_id)
+            try:
+                self.thread_manager.mark_upload_finished(thread_key, generation_id)
+            except Exception:
+                pass
             # Next turn rebuilds the transcript from Slack (now has the posted image).
             self.thread_manager.mark_needs_refresh(thread_key)
 
