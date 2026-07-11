@@ -61,6 +61,17 @@ class ChatBotV2:
         
         main_logger.info("Initialization complete")
     
+    @staticmethod
+    def _is_unprompted_turn(message: Message) -> bool:
+        """F14: whether a posted channel reply counts as UNPROMPTED for pulse pacing.
+
+        A participation-gated turn is unprompted UNLESS it was woken by a name-hit — being
+        called by name is prompted in spirit (like an @-mention), so its reply must not
+        burn the runaway-brake budget."""
+        md = message.metadata or {}
+        return (md.get("participation_check") is True
+                and md.get("participation_name_hit") is not True)
+
     async def _run_participation_gate(self, message: Message, client: BaseClient):
         """Phase F gate for UNPROMPTED channel messages: hard rails → debounce →
         ONE engine call → act. Returns a verdict only for action='respond';
@@ -81,8 +92,11 @@ class ChatBotV2:
             engine.note_arrival(channel_id, ts)
 
             # Hard rail BEFORE any model call. Mentions never route through this gate,
-            # so the throttle can't silence an addressed message.
-            if engine.over_throttle(pulse, channel_id, level):
+            # so the throttle can't silence an addressed message. F14: a name_hit is
+            # name-addressed too (talked TO, not merely about) — it must bypass the hourly
+            # runaway brake as well; the engine still judges whether it's a genuine summons.
+            name_hit = message.metadata.get("participation_name_hit") is True
+            if not name_hit and engine.over_throttle(pulse, channel_id, level):
                 main_logger.debug(f"Participation gate: hourly cap reached in {channel_id} — silent")
                 return None
 
@@ -122,7 +136,7 @@ class ChatBotV2:
                 directives=message.metadata.get("channel_directives"),
                 memory_facts=memory_facts, channel_activity=channel_activity,
                 unprompted_last_hour=unprompted,
-                name_hit=message.metadata.get("participation_name_hit") is True,
+                name_hit=name_hit,
                 snoozed=message.metadata.get("participation_snoozed") is True,
                 sender_is_bot=message.metadata.get("participation_sender_bot") is True,
                 channel_topic=channel_topic,
@@ -373,7 +387,7 @@ class ChatBotV2:
                         upload_manager.mark_upload_started(upload_thread_key)
 
                     from message_processor.image_delivery import publish_image
-                    unprompted = bool(message.metadata and message.metadata.get("participation_check") is True)
+                    unprompted = self._is_unprompted_turn(message)
                     # F4: if the handler threaded a live ProgressChecklist, it owns the
                     # status surface — publish_image does the "Uploading…" step + completes
                     # it in place (keeping the accumulated steps + history marker). Only the
@@ -468,7 +482,7 @@ class ChatBotV2:
                         try:
                             client.channel_pulse.record_bot_reply(
                                 message.channel_id, message.metadata.get("ts"),
-                                unprompted=message.metadata.get("participation_check") is True,
+                                unprompted=self._is_unprompted_turn(message),
                             )
                         except Exception as e:
                             main_logger.debug(f"participation stat record failed: {e}")
@@ -607,7 +621,8 @@ class ChatBotV2:
                             # PRAGMA foreign_keys is never enabled, so these need their own
                             # age sweep, same as documents).
                             try:
-                                self.processor.db.delete_old_tool_usage()
+                                self.processor.db.delete_old_tool_usage(
+                                    days=config.tool_usage_retention_days)
                             except Exception as e:
                                 main_logger.debug(f"Tool-usage sweep skipped: {e}")
 

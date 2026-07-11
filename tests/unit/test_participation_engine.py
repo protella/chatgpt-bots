@@ -218,12 +218,37 @@ class TestGateWiring:
         assert fake.calls == 0  # rail fires BEFORE the model
 
     @pytest.mark.asyncio
+    async def test_name_hit_bypasses_throttle_rail(self, monkeypatch):
+        # F14: a name-addressed message must reach the engine even when the hourly
+        # runaway brake is at/over cap — only the classifier decides if it's a summons.
+        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
+        monkeypatch.setattr(config, "max_unprompted_replies_per_hour", 2, raising=False)
+        app, client, fake = _make_app({"action": "respond"}, pulse=_FakePulse(2))
+        verdict = await app._run_participation_gate(
+            _channel_msg(participation_name_hit=True), client)
+        assert verdict is not None and verdict.action == "respond"
+        assert fake.calls == 1  # rail skipped — the engine still judged
+
+    @pytest.mark.asyncio
     async def test_respond_verdict_passes_through(self, monkeypatch):
         monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
         monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
         app, client, _ = _make_app({"action": "respond", "placement": "thread"})
         verdict = await app._run_participation_gate(_channel_msg(), client)
         assert verdict is not None and verdict.action == "respond"
+
+    def test_is_unprompted_turn_excludes_name_hit(self):
+        # F14: a name-hit respond is prompted in spirit — it must NOT burn the
+        # unprompted runaway-brake budget; an ambient participation reply still does.
+        from main import ChatBotV2
+        assert ChatBotV2._is_unprompted_turn(_channel_msg()) is True
+        assert ChatBotV2._is_unprompted_turn(
+            _channel_msg(participation_name_hit=True)) is False
+        # A non-gated (e.g. @-mention / DM) turn is never unprompted.
+        assert ChatBotV2._is_unprompted_turn(
+            Message(text="hi", user_id="U1", channel_id="C1", thread_id="10.0",
+                    metadata={"ts": "10.0"})) is False
 
     @pytest.mark.asyncio
     async def test_react_verdict_reacts_and_stays_silent(self, monkeypatch):

@@ -256,12 +256,14 @@ def test_merge_dedupes_result_by_name_and_digest_but_keeps_distinct_outputs():
 
 def test_merge_result_entries_not_subject_to_used_tools_cap():
     from database import DatabaseManager as DM
-    used = [{"tool_name": f"t{i}", "gist": ""} for i in range(12)]
+    from config import config
+    cap = config.tool_provenance_max_entries  # F14: env-backed (default 20)
+    used = [{"tool_name": f"t{i}", "gist": ""} for i in range(cap + 5)]
     results = [{"tool_name": "srv", "result_digest": f"R{i}"} for i in range(5)]
     out = DM._merge_tool_provenance(used, results)
     used_out = [e for e in out if "result_digest" not in e]
     res_out = [e for e in out if "result_digest" in e]
-    assert len(used_out) == 8    # used-tools capped at 8
+    assert len(used_out) == cap  # used-tools capped at config.tool_provenance_max_entries
     assert len(res_out) == 5     # all char-bounded result digests survive
 
 

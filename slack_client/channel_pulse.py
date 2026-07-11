@@ -31,8 +31,9 @@ from typing import Any, Dict, List, Optional
 from config import config
 from message_processor.message_timestamps import render_message_timestamp
 
-TEXT_TRUNCATE = 300      # head-first cap for the channel-activity envelope + thread labels
-TAIL_TEXT_TRUNCATE = 400  # tail-first cap for the F5 per-thread classifier context
+# F14: truncation caps are env-backed config (config.pulse_text_truncate /
+# config.pulse_tail_text_truncate), read at use time so they stay monkeypatchable and
+# aren't frozen at import.
 THREAD_LABEL_WORDS = 6
 _SEEN_TS_MAX = 512  # per-channel dedup window for idempotent record() by (channel, ts)
 
@@ -58,10 +59,13 @@ def _sanitize_name(name: Optional[str]) -> str:
     return cleaned or "someone"
 
 
-def _escape_tail_text(text: str, limit: int = TAIL_TEXT_TRUNCATE) -> str:
+def _escape_tail_text(text: str, limit: Optional[int] = None) -> str:
     """Tail representation for a classifier entry: last `limit` chars, newlines/controls
     normalized and quotes escaped so a multi-line message can't inject a fake speaker
-    line (round-2 fix — spoof resistance)."""
+    line (round-2 fix — spoof resistance). `limit` defaults to config.pulse_tail_text_truncate
+    (read at call time, F14)."""
+    if limit is None:
+        limit = int(getattr(config, "pulse_tail_text_truncate", 400))
     raw = text or ""
     tail = raw[-limit:]
     cleaned = "".join(ch if (ch.isprintable() or ch == " ") else " " for ch in tail)
@@ -148,7 +152,7 @@ class ChannelPulse:
             "user_id": user_id,
             "display_name": display_name or user_id or ("bot" if is_bot else "unknown"),
             "sender_type": sender_type,
-            "text": (text or "")[:TEXT_TRUNCATE],
+            "text": (text or "")[:int(getattr(config, "pulse_text_truncate", 300))],
             "is_bot": is_bot,
         }
         buf = self._buffers.setdefault(channel_id, deque(maxlen=self.size))

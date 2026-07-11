@@ -166,6 +166,13 @@ class SlackMessageEventsMixin:
         "tombstone", "reminder_add", "pinned_item", "unpinned_item",
     })
 
+    # Content-bearing subtypes that DO drive a RESPONSE (F14): file/image/doc uploads
+    # arrive as `file_share` and thread→channel broadcasts as `thread_broadcast`. Both
+    # carry real content (and, for file_share, a `files` array) and must reach the
+    # response gate so intent classification can route vision/document flows. Every
+    # OTHER subtype (edits/deletes/joins/topic churn) stays excluded from the gate.
+    _RESPONSE_GATE_CONTENT_SUBTYPES = frozenset({"file_share", "thread_broadcast"})
+
     async def _feed_channel_pulse(self, event: Dict[str, Any]) -> None:
         """F5 fix (a): the single reliable semantic feed into the ambient ring buffer.
         Covers channel message events (including other apps' `bot_message` posts) and
@@ -214,7 +221,12 @@ class SlackMessageEventsMixin:
         await self._feed_channel_pulse(event)
         # Ignore non-real messages (edits, deletes, joins, message_changed, etc.) for the
         # RESPONSE gate — they never drive a reply (awareness already captured above).
-        if event.get("subtype"):
+        # EXCEPTION (F14): content-bearing subtypes (file_share uploads, thread_broadcast)
+        # ARE real content and proceed through the gate; _event_to_message plumbs any
+        # `files` onto the Message exactly as the @-mention path does, so downstream intent
+        # classification can route vision/document flows.
+        subtype = event.get("subtype")
+        if subtype and subtype not in self._RESPONSE_GATE_CONTENT_SUBTYPES:
             return
         # Loop guard FIRST: never act on our own posts.
         if self.is_own_message(event):

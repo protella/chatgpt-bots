@@ -981,6 +981,115 @@ normal ambiguous path (no canned rejection); suffix lists every in-flight summar
 watchdog clears only the stale entry; classifier prompt contains the acknowledgment
 rule; config default 3 wired.
 
+## F14. Gate correctness + cap overhaul (user directives 2026-07-11)
+
+**Live failures + user cap review:** (1) a channel message with an attached image
+("what do we think? good marketing material?") produced NO dispatch — message_events.py
+:217 drops every subtyped message from the response gate, and Slack delivers uploads as
+subtype `file_share`; channel file/image/doc questions have been invisible since
+channel listening shipped. User: "any files, images, docs, etc. need to get through."
+(2) "chatgpt?" (name_hit=True) was silenced by the hourly-cap hard rail, which runs
+BEFORE the classifier; only true @-mentions bypass the gate. (3) The user audited every
+wave-introduced cap; decisions below are theirs.
+
+**Design:**
+1. **Content subtypes reach the response gate.** `file_share` and `thread_broadcast`
+   are real content — let them through the gate (other subtypes: edits/deletes/joins
+   etc. stay excluded). Files on the event must ride the constructed Message exactly as
+   the @-mention path plumbs them (metadata/files), so downstream intent classification
+   can route vision/document flows. Verify the full path: gate → respond verdict →
+   vision analysis works for an unprompted channel image question (unit-test the
+   plumbing; the pulse feed already handles these subtypes — unchanged).
+2. **Name-addressed messages can't be throttled.** `name_hit=True` skips the
+   `over_throttle` hard rail (the classifier still judges — being talked ABOUT still
+   ignores). When the verdict is respond on a name_hit message, do NOT count the reply
+   as unprompted in pulse accounting (being called by name is prompted in spirit, like
+   an @-mention).
+3. **Cap value changes (user-decided):**
+   - `MAX_UNPROMPTED_REPLIES_PER_HOUR` default 6 → **30**: demoted from pacing
+     mechanism to pure runaway brake (classifier misfires / bot-reply loops). Pacing is
+     the classifier's job via its existing unprompted-count signal. Update the
+     .env.example comment to say exactly this.
+   - `MAX_CONCURRENT_IMAGE_GENERATIONS` default 3 → **5** (scope stays per-thread;
+     there is deliberately NO global cap — document that in .env.example).
+   - `CHANNEL_PULSE_SIZE` default 30 → **60** (fast top-level conversations).
+4. **Hardcoded caps become env-backed config** (all with .env.example entries stating
+   purpose + default): pulse truncation `PULSE_TEXT_TRUNCATE` (300) and
+   `PULSE_TAIL_TEXT_TRUNCATE` (400); provenance `MAX_PROVENANCE_ENTRIES` → env
+   `TOOL_PROVENANCE_MAX_ENTRIES` default **20** (was 8 — user: the 9th call may be the
+   one that mattered); `TOOL_PROVENANCE_GIST_CHARS` (80) and
+   `TOOL_PROVENANCE_LINE_BUDGET` default **300** (was 160); tool-usage retention
+   `TOOL_USAGE_RETENTION_DAYS` (90). Module constants become config reads; annotation
+   rendering stays a pure function of (row, config) — config is boot-constant, so
+   rebuild determinism holds.
+5. Unchanged by user decision: envelope 15 lines, debounce 3s, classifier 512 output
+   floor, digest caps (see F16 for the smarter path).
+
+**Tests:** file_share event with files reaches the gate and plumbs files through to a
+vision-routable Message; thread_broadcast passes; message_changed/join still excluded;
+name_hit skips the throttle rail at cap; name_hit respond not counted unprompted
+(non-name-hit still counted); new defaults wired (30/5/60/20/300/90); env overrides
+respected; provenance annotation renders >8 entries; retention sweep uses config days.
+
+## F15. Participation feedback: memory-scoped, not timer-scoped (user directive 2026-07-11)
+
+**Rationale (user + Claude Tag insight):** our "backoff" verdict sets
+`channel_settings.snoozed_until = now+4h` — a channel-wide mute that silently drops
+every unnamed message and quietly expires. Claude Tag's model (screenshot 2026-07-11):
+feedback is scoped by context — a "butt out" kills THAT conversation immediately and
+permanently, raises the bar channel-wide as judgment (not a hard gate), repeated
+feedback becomes a standing channel-memory rule, and nothing quietly expires.
+
+**Design:**
+1. **Backoff verdict → thread mute + memory fact (replaces the timer).** On backoff:
+   (a) permanently mute THAT thread for unprompted participation — persisted (e.g.
+   `muted_threads` list on channel_settings JSON), enforced as a cheap pre-gate check;
+   direct @-mentions/name-summons in the muted thread still answer (user can always
+   re-invite). (b) Write/update a channel-memory fact via the existing memory system
+   recording the feedback with an absolute date ("2026-07-11: <user> told the assistant
+   to butt out of <topic/thread> — raise the bar for unprompted replies here"). The
+   classifier already receives memory facts; PARTICIPATION_SYSTEM_PROMPT gains one line:
+   recorded butt-out feedback means default to ignore unless value is unmistakable;
+   REPEATED feedback facts mean observe-only (respond only when addressed).
+2. **Remove the snooze timer rail:** `snoozed_until` no longer set by backoff; the
+   is_snoozed hard-drop in the dispatch path is deleted (existing rows just expire
+   inert; leave the column). The snooze ack reaction stays (acknowledge the feedback).
+3. **De-escalation is explicit:** "you can speak up again" etc. is ordinary memory-tool
+   territory — the model updates/forgets the fact (LOCAL_TOOLS_GUIDANCE already covers
+   standing-feedback updates); unmuting a thread happens by addressing the bot there.
+4. Config: `ENABLE_PARTICIPATION_ENGINE` still governs everything; no new flag — this
+   replaces behavior behind the same feature. `PARTICIPATION_SNOOZE_HOURS` and the
+   modal/settings surface that exposes snooze (settings_modal.py, event_handlers/
+   settings.py — check) are removed/marked deprecated in .env.example.
+
+**Tests:** backoff mutes the thread (unprompted drop pre-gate) but @-mention/name-hit
+in that thread still answers; mute persists across restart (DB-backed); memory fact
+written with absolute date, updated not duplicated on repeat; classifier prompt line
+present; snoozed_until no longer written and no longer dropped on; ack emoji still
+fires; de-escalation: forgetting the fact restores normal judgment.
+
+## F16. MCP digest summarization instead of blind truncation (user directive 2026-07-11)
+
+**Rationale:** F12 digests hard-cut at TOOL_RESULT_DIGEST_CHARS — a cut can amputate
+the link/figure that made the result worth keeping. User: have luna summarize long
+outputs at low effort, preserving the important details.
+
+**Design:** at capture time (once, before persist — stored digest stays immutable, so
+F7-5 determinism holds), an MCP output longer than `tool_result_digest_chars` is
+summarized by the utility model (low effort, existing utility plumbing): instruction =
+compress to under the cap PRESERVING verbatim every URL, report title, date, figure,
+and ID; plain text, one line. Fallback on any error/timeout: today's truncation (never
+block the reply). Budget guard: input to the summarizer capped (e.g. first
+`TOOL_RESULT_SUMMARIZE_INPUT_CHARS`, default 20000, env-backed) so a pathological
+output can't blow up the utility call. New flag `ENABLE_TOOL_RESULT_SUMMARIZATION`
+(default true); off = pure truncation. Per-turn budget unchanged (summaries count
+toward TOOL_RESULT_TURN_CHARS in capture order).
+
+**Tests:** short output → stored verbatim, no utility call; long output → summarizer
+called, result stored once, under cap, rebuild renders the STORED text (no re-summarize
+on rebuild); summarizer failure → truncation fallback with marker; flag off → today's
+behavior; input guard applied; URLs/figures asserted preserved in the prompt contract.
+
 ## Rollout / verification
 
 1. `make test` green after each change set (F4 → F1 → F2 → F3); `make lint` clean.

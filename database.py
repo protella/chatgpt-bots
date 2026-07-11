@@ -2166,11 +2166,12 @@ class DatabaseManager(LoggerMixin):
         Used-tools: a tool that genuinely ran more than once (same name, different gists) is
         kept as multiple entries; only EXACT duplicates (same name AND gist) are deduped; an
         empty-gist placeholder is UPGRADED in place by a later non-empty gist for the same
-        tool. Capped at 8 (MAX_PROVENANCE_ENTRIES).
+        tool. Capped at config.tool_provenance_max_entries (F14; default 20, was 8) so the
+        persisted row honors the same budget build_provenance applies.
 
         Result-digests (F12): deduped by (name, digest) so re-persist is idempotent but two
         distinct outputs from the same server are both kept. Already char-bounded at capture,
-        so NOT subject to the 8-entry used-tools cap; appended AFTER the used-tools entries
+        so NOT subject to the used-tools entry cap; appended AFTER the used-tools entries
         (matches the pinned [used tools:] → [tool results:] render order). Old rows (no
         result_digest) merge exactly as before."""
         used: List[Dict] = []
@@ -2202,7 +2203,8 @@ class DatabaseManager(LoggerMixin):
             elif any(m["tool_name"] == name and m["gist"].strip() for m in used):
                 continue  # empty gist already covered by a non-empty entry for this tool
             used.append({"tool_name": name, "gist": gist})
-        return used[:8] + results
+        from config import config
+        return used[:int(getattr(config, "tool_provenance_max_entries", 20))] + results
 
     async def save_tool_usage_async(self, channel_id: str, message_ts: str,
                                     thread_key: str, tools: List[Dict]) -> None:
