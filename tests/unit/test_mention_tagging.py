@@ -40,8 +40,25 @@ def test_inbound_self_and_other_mixed():
     assert "@peter" in out and BOT not in out
 
 
-def test_inbound_unknown_id_stripped():
-    assert resolve_inbound_mentions("<@U07UNKNOWN1> hi", {}) == "hi"
+def test_inbound_unknown_id_renders_addressee_marker():
+    """An unresolved mention must NEVER vanish: stripping "<@other-bot> can you…" down to
+    "can you…" destroyed the addressee signal and the participation classifier read the
+    question as aimed at THIS bot (live misfire 2026-07-11). Ugly-but-visible beats gone."""
+    assert resolve_inbound_mentions("<@U07UNKNOWN1> hi", {}) == "@U07UNKNOWN1 hi"
+
+
+def test_inbound_unknown_bot_mention_keeps_question_addressed_elsewhere():
+    out = resolve_inbound_mentions("<@U07UNKNOWN1> I heard that you keep track of channels?", {})
+    assert out.startswith("@U07UNKNOWN1 ")
+    assert "I heard that you keep track" in out
+
+
+def test_extract_mention_ids_orders_and_strips_labels():
+    from slack_client.formatting.text import extract_mention_ids
+    text = f"<@{PETER}> ask <@U07UNKNOWN1|bob> and <@{CLAUDE}>"
+    assert extract_mention_ids(text) == [PETER, "U07UNKNOWN1", CLAUDE]
+    assert extract_mention_ids("") == []
+    assert extract_mention_ids(None) == []
 
 
 def test_inbound_inline_label_used_when_uncached():
@@ -169,5 +186,6 @@ def test_mixin_format_text_encodes_then_converts():
 
 def test_mixin_resilient_without_identity_or_cache():
     stub = _FmtStub(user_cache={}, bot_user_id=None)
-    # falls back to legacy strip behavior, never errors
-    assert stub._clean_mentions("<@U07UNKNOWN1> hello") == "hello"
+    # No cache/identity: never errors, and the unresolved mention stays VISIBLE as an
+    # addressee marker (silent stripping caused the 2026-07-11 misdirected-reply misfire).
+    assert stub._clean_mentions("<@U07UNKNOWN1> hello") == "@U07UNKNOWN1 hello"
