@@ -57,9 +57,10 @@ Judgment rules:
 - Recorded butt-out feedback in the channel memory (a teammate telling the assistant to pipe down or stay out) means default to ignore unless the value of replying is unmistakable; REPEATED such facts mean observe-only — respond only when the assistant is genuinely addressed.
 - Strictness: "judicious" means default restraint; "active" means the channel has opted into more proactive participation (still not noisy or chatty); "mentions_only" means the channel only wants the assistant when called on — respond only to a genuine summons, otherwise ignore (react only if unmistakably aimed at the assistant).
 - "placement": "thread" (start/continue a thread on the message — right for anything long, technical, or likely to spawn back-and-forth) or "channel" (answer at channel level — right for a quick, brief reply to a top-level message that the whole room benefits from seeing inline). Channel placement only takes effect where the channel has opted into top-level replies; elsewhere it is coerced to thread — that is expected, don't fight it.
+- "ack": true/false — meaningful ONLY with action "respond". Set true when the reply is worth giving AND will take real work — analyzing attachments, data/MCP lookups, multi-step tool use, or long-form output — so the assistant drops a quick "I'm on it" reaction before it starts. A fast conversational reply gets ack:false. Omit or false for react/ignore/backoff.
 
 Output ONLY a JSON object, no prose, exactly this shape:
-{"action": "respond" | "react" | "ignore" | "backoff", "emoji": "<name from the allowed list, only when action=react>", "placement": "thread" | "channel", "reason": "<one short sentence>"}"""
+{"action": "respond" | "react" | "ignore" | "backoff", "emoji": "<name from the allowed list, only when action=react>", "placement": "thread" | "channel", "ack": true | false, "reason": "<one short sentence>"}"""
 
 
 MEMORY_EXTRACTION_SYSTEM_PROMPT = """You maintain a small long-term memory for an AI assistant scoped to ONE Slack channel. After each exchange you decide whether there is a DURABLE, channel-relevant fact worth remembering for future conversations.
@@ -132,19 +133,21 @@ CONTINUATION_NO_REPLY_SUFFIX = (
 
 INTENT_CLASSIFIER_PROMPT = """Classify the user's LATEST message into exactly one intent:
 
-- new — wants an image generated (create, draw, visualize, "show me" something visual). Logos, icons, and "what does X look like" are "new" even as questions.
-- edit — wants an existing (generated or shown) image modified: adjust, fix, change, recolor, enhance.
+- new — wants an image generated (create, draw, visualize, "show me" something visual). Logos, icons, "what does X look like" are "new".
+- edit — wants an existing image modified: adjust, fix, change, recolor, enhance.
 - vision — wants uploaded/attached files analyzed. Requires actual attachments on the message.
 - ambiguous — image-related but the target or intent is unclear.
-- none — everything else: chat, code (incl. SVG/HTML/CSS), URL/website questions, data lookups.
+- none — everything else: chat, code (SVG/HTML/CSS), URL/website questions, data lookups.
 
-Disambiguation rules (learned from production):
-1. Continuations ("again", "another", "one more") match the PREVIOUS response type: after an image → new; after text/data → none.
-2. "vision" requires attachments in metadata — never infer from wording; questions without files are never "vision".
-3. Data verbs (pull, fetch, get, show, update) are image requests only with image language ("show me an image of…" → new; "show me the data" → none); URLs are not images.
-4. Acknowledgments, assent, thanks, and remarks about pending or finished work are "none". A continuation is an image intent only when it adds or changes a concrete visual request ("make it blue", "now one of a fox" → image; "ok", "nice, thanks" → none), even in an image-heavy thread.
+Disambiguation (from production):
+1. Continuations ("again", "another") match the PREVIOUS response type: after an image → new; after text/data → none.
+2. "vision" needs attachments in metadata — never infer from wording; questions without files are never "vision".
+3. Data verbs (pull, fetch, get, show) mean an image only with image language ("show me an image of…" → new; "show me the data" → none); URLs are not images.
+4. Acknowledgments, thanks, and remarks about pending/finished work are "none"; a continuation is an image intent only when it adds or changes a concrete visual request.
 
-Output exactly one word: new, edit, vision, ambiguous, or none."""
+Then judge the ack flag: "ack" if answering means real work — attachments, data lookups, multi-step tools, long output (vision/new/edit lean ack); else "noack".
+
+Output exactly two tokens, intent then ack: "<new|edit|vision|ambiguous|none> <ack|noack>" (e.g. "vision ack")."""
 
 # Back-compat alias (pre-modernization name); prefer INTENT_CLASSIFIER_PROMPT.
 IMAGE_INTENT_SYSTEM_PROMPT = INTENT_CLASSIFIER_PROMPT
