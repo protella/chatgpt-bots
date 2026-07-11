@@ -199,10 +199,12 @@ class SlackHistoryToolMixin:
                 }
                 # F25: surface attached-file names so the model can reach a document
                 # seen in fetched history via read_document (names, never content).
+                # Cap = 10, Slack's own per-message attachment max — every file on a
+                # message stays discoverable by name.
                 if m.get("files"):
                     names = [f.get("name") for f in m["files"] if isinstance(f, dict) and f.get("name")]
                     if names:
-                        entry["files"] = names[:5]
+                        entry["files"] = names[:10]
                 # Emoji reactions on the message (who reacted with what) — lets the
                 # model answer reaction questions with current data, since in-memory
                 # thread state only carries reactions present at capture time.

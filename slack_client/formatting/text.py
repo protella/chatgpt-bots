@@ -12,15 +12,30 @@ _MENTION_RE = re.compile(r'<@([^>]+)>')
 _AT_TOKEN_RE = re.compile(r"(?<![<\w])@([A-Za-z][\w.'-]*)")
 
 
+def extract_mention_ids(text):
+    """All user/bot ids <@…>-mentioned in raw inbound text (labels stripped, order kept).
+
+    Used by the event handlers to warm the user cache BEFORE resolve_inbound_mentions,
+    so a first-ever mention of any user or bot (e.g. a co-resident assistant) renders
+    as "@Name" instead of hitting the unknown-id fallback."""
+    if not text:
+        return []
+    return [m.group(1).split('|', 1)[0].strip() for m in _MENTION_RE.finditer(text)]
+
+
 def resolve_inbound_mentions(text, user_cache=None, bot_user_id=None):
     """Resolve raw Slack <@ID> mentions in inbound text into a readable form.
 
     - the bot's own mention is removed (it's just the trigger)
     - other users resolve to "@DisplayName" when known in user_cache (so the model sees who
       was addressed) or to the inline "|label" if present
-    - unknown ids are stripped (legacy behavior) so no raw <@ID> ever reaches the model
+    - unknown ids render as "@<id>" — NEVER silently stripped. Deleting an unresolved
+      mention destroys the addressee signal: "<@Claude's-id> can you…" became "can you…",
+      and the participation classifier read the question as aimed at THIS bot (live
+      misfire 2026-07-11). A plain "@U…" token is ugly but keeps "someone else was
+      addressed" visible; raw <@ID> bracket syntax still never reaches the model.
 
-    Resilient: with no cache/identity it degrades to the original strip behavior.
+    Resilient: with no cache/identity every non-self mention still renders readable.
     """
     if not text:
         return text
@@ -39,7 +54,7 @@ def resolve_inbound_mentions(text, user_cache=None, bot_user_id=None):
             label = inner.split('|', 1)[1].strip()
             if label:
                 return f'@{label}'
-        return ''  # unknown id -> strip (legacy fallback)
+        return f'@{uid}'  # unresolved -> visible addressee marker, never a silent strip
 
     return _MENTION_RE.sub(repl, text).strip()
 

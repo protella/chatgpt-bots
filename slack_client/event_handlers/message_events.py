@@ -52,6 +52,20 @@ class SlackMessageEventsMixin:
         if bot_user_id:
             from slack_client.formatting.text import text_mentions_user
             mentioned_self = text_mentions_user(text, bot_user_id)
+        # Warm the user cache for every mentioned id BEFORE cleaning, so a first-ever
+        # mention of any user or bot (e.g. a co-resident assistant) resolves to "@Name".
+        # An unresolved mention must never vanish — stripping "<@other-bot> can you…"
+        # down to "can you…" made the participation classifier read the question as
+        # aimed at THIS bot (live misfire 2026-07-11). Best-effort: on lookup failure
+        # the resolver now renders "@<id>", still a visible addressee marker.
+        from slack_client.formatting.text import extract_mention_ids
+        user_cache = getattr(self, "user_cache", {}) or {}
+        for uid in extract_mention_ids(text):
+            if uid and uid != bot_user_id and uid not in user_cache:
+                try:
+                    await self.get_username(uid, client)
+                except Exception as e:
+                    self.log_debug(f"Mention warm-up lookup failed for {uid}: {e}")
         text = self._clean_mentions(text)
 
         # Process attachments (files)
