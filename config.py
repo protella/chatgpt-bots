@@ -608,6 +608,9 @@ class BotConfig:
     # Process-lifetime LRU of extracted document text (never persisted) so iterating on one
     # document doesn't re-download/re-extract per question.
     doc_extraction_cache_size: int = field(default_factory=lambda: int(os.getenv("DOC_EXTRACTION_CACHE_SIZE", "20")))
+    # F29: people-awareness tools — lookup_user (profile by id/@name/display name) and
+    # list_channel_members (current-channel roster). Workspace-visible profile data only.
+    enable_people_tools: bool = field(default_factory=lambda: os.getenv("ENABLE_PEOPLE_TOOLS", "true").lower() == "true")
     # OCR text from image-only/scanned PDFs on later turns (read_document) and on the big-file
     # local path. Requires the tesseract-ocr + poppler-utils system packages; if absent the
     # handler logs a warning and falls back to the honest "scanned, not extractable" note.
