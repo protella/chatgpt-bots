@@ -429,16 +429,17 @@ class BotConfig:
     enable_channel_pulse: bool = field(default_factory=lambda: os.getenv("ENABLE_CHANNEL_PULSE", "true").lower() == "true")
     channel_pulse_size: int = field(default_factory=lambda: int(os.getenv("CHANNEL_PULSE_SIZE", "60")))
     # Head-first char cap for the channel-activity envelope + thread labels (F14).
-    pulse_text_truncate: int = field(default_factory=lambda: int(os.getenv("PULSE_TEXT_TRUNCATE", "300")))
+    pulse_text_truncate: int = field(default_factory=lambda: int(os.getenv("PULSE_TEXT_TRUNCATE", "500")))
     # Tail-first char cap for the F5 per-thread participation-classifier context (F14).
-    pulse_tail_text_truncate: int = field(default_factory=lambda: int(os.getenv("PULSE_TAIL_TEXT_TRUNCATE", "400")))
+    pulse_tail_text_truncate: int = field(default_factory=lambda: int(os.getenv("PULSE_TAIL_TEXT_TRUNCATE", "500")))
     # Max "[Recent channel activity]" lines injected (at the SUFFIX — volatile, cache hygiene)
     # when responding in a channel. 0 disables the envelope without disabling the buffer.
     channel_pulse_envelope_max: int = field(default_factory=lambda: int(os.getenv("CHANNEL_PULSE_ENVELOPE_MAX", "15")))
     # F5: per-thread tail ring for the participation classifier. The pulse keeps the last
-    # N messages of each active thread (their last 400 chars, sender-typed) so the wake
-    # judge can resolve who "you" addresses. 0 disables recording + the signal.
-    participation_thread_tail: int = field(default_factory=lambda: int(os.getenv("PARTICIPATION_THREAD_TAIL", "6")))
+    # N messages of each active thread (their last N chars, sender-typed) so the wake
+    # judge can resolve who "you" addresses. 0 disables recording + the signal. F17: 15
+    # (busy threads out-chatter 6 lines — match the envelope).
+    participation_thread_tail: int = field(default_factory=lambda: int(os.getenv("PARTICIPATION_THREAD_TAIL", "15")))
     # Max distinct threads whose tails are retained per channel (whole-thread LRU eviction).
     pulse_thread_tails_max: int = field(default_factory=lambda: int(os.getenv("PULSE_THREAD_TAILS_MAX", "50")))
     # Global bound on how many channels retain thread-tail rings (outer-map LRU).
@@ -458,12 +459,9 @@ class BotConfig:
     # Rapid-fire messages in the same channel within this window collapse into ONE engine
     # evaluation of the latest state (someone typing four short lines ≠ four verdicts).
     participation_debounce_seconds: float = field(default_factory=lambda: float(os.getenv("PARTICIPATION_DEBOUNCE_SECONDS", "3")))
-    # Hard rail (code, not prompt): max unprompted replies per channel per hour. Over the cap
-    # the engine isn't even called. "active" channels get 2x. Mentions and name-hits are never
-    # throttled. F14: this is a pure runaway brake against classifier misfires / bot-reply
-    # loops — pacing is the classifier's job via its unprompted-count signal, hence the high
-    # default.
-    max_unprompted_replies_per_hour: int = field(default_factory=lambda: int(os.getenv("MAX_UNPROMPTED_REPLIES_PER_HOUR", "30")))
+    # F17: the hourly-cap hard rail is gone. Unprompted replies are still counted and fed to
+    # the classifier as a signal, but pacing is the model's judgment, not a numeric ceiling —
+    # MAX_UNPROMPTED_REPLIES_PER_HOUR is retired (frontier models don't run away unless asked).
     # F15: "butt out" backoff no longer snoozes on a timer — it permanently mutes THAT
     # thread (channel_settings.muted_threads) and writes a durable channel-memory fact.
     # PARTICIPATION_SNOOZE_HOURS is retired. The ack emoji stays — a backoff still gets a

@@ -85,11 +85,17 @@ class TestBotConfig:
         assert config.api_timeout_image > config.api_timeout_read
 
     def test_thread_tail_defaults(self, mock_env):
-        """F5 thread-tail knobs default to 6 / 50 / 30."""
+        """F17: thread-tail default raised 6 → 15 (50 / 30 unchanged)."""
         config = BotConfig()
-        assert config.participation_thread_tail == 6
+        assert config.participation_thread_tail == 15
         assert config.pulse_thread_tails_max == 50
         assert config.pulse_thread_tail_channels_max == 30
+
+    @patch.dict(os.environ, {"PARTICIPATION_THREAD_TAIL": "9"})
+    def test_thread_tail_env_override(self, mock_env):
+        """PARTICIPATION_THREAD_TAIL honors env overrides."""
+        config = BotConfig()
+        assert config.participation_thread_tail == 9
 
     @patch.dict(os.environ, {"PARTICIPATION_THREAD_TAIL": "0"})
     def test_thread_tail_disabled(self, mock_env):
@@ -103,28 +109,32 @@ class TestBotConfig:
         assert config.reaction_max_per_message == 4
 
     def test_f14_cap_overhaul_defaults(self, mock_env):
-        """F14 new/changed defaults: 30 / 5 / 60 / 300 / 400 / 20 / 80 / 300 / 90."""
+        """F14/F17 defaults: 5 / 60 / 500 / 500 / 20 / 80 / 300 / 90 (F17 raised the
+        two pulse truncations to 500; the hourly cap knob is gone entirely)."""
         config = BotConfig()
-        assert config.max_unprompted_replies_per_hour == 30
         assert config.max_concurrent_image_generations == 5
         assert config.channel_pulse_size == 60
-        assert config.pulse_text_truncate == 300
-        assert config.pulse_tail_text_truncate == 400
+        assert config.pulse_text_truncate == 500
+        assert config.pulse_tail_text_truncate == 500
         assert config.tool_provenance_max_entries == 20
         assert config.tool_provenance_gist_chars == 80
         assert config.tool_provenance_line_budget == 300
         assert config.tool_usage_retention_days == 90
 
+    def test_hourly_cap_config_removed(self, mock_env):
+        """F17: MAX_UNPROMPTED_REPLIES_PER_HOUR is retired — no config attribute."""
+        config = BotConfig()
+        assert not hasattr(config, "max_unprompted_replies_per_hour")
+
     @patch.dict(os.environ, {
-        "MAX_UNPROMPTED_REPLIES_PER_HOUR": "3", "CHANNEL_PULSE_SIZE": "12",
+        "CHANNEL_PULSE_SIZE": "12",
         "PULSE_TEXT_TRUNCATE": "111", "PULSE_TAIL_TEXT_TRUNCATE": "222",
         "TOOL_PROVENANCE_MAX_ENTRIES": "7", "TOOL_PROVENANCE_GIST_CHARS": "40",
         "TOOL_PROVENANCE_LINE_BUDGET": "150", "TOOL_USAGE_RETENTION_DAYS": "30",
     })
     def test_f14_env_overrides_respected(self, mock_env):
-        """F14 caps are env-backed and honor overrides."""
+        """F14/F17 caps are env-backed and honor overrides."""
         config = BotConfig()
-        assert config.max_unprompted_replies_per_hour == 3
         assert config.channel_pulse_size == 12
         assert config.pulse_text_truncate == 111
         assert config.pulse_tail_text_truncate == 222

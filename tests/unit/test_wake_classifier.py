@@ -36,11 +36,13 @@ class _FakeLLM:
         self._exc = exc
         self.client = MagicMock()
         self.captured_input = None
+        self.captured_kwargs = None
 
     async def _safe_api_call(self, *a, **k):
         if self._exc:
             raise self._exc
         self.captured_input = k.get("input")
+        self.captured_kwargs = k
         return _FakeResp(self._text)
 
     def log_debug(self, *a, **k):
@@ -85,7 +87,7 @@ async def test_signals_render_into_prompt_deterministically():
     llm = _FakeLLM(text='{"action": "ignore"}')
     signals = {
         "sender_name": "Peter", "is_thread_reply": True, "strictness": "active",
-        "directives": "only deploys", "unprompted_last_hour": 3, "hourly_cap": 12,
+        "directives": "only deploys", "unprompted_last_hour": 3,
         "memory_facts": [{"id": 2, "content": "demos are Fridays"},
                          {"id": 1, "content": "Peter owns deploys"}],
         "channel_activity": "[Recent channel activity]\n- Peter (top-level): hi",
@@ -99,6 +101,9 @@ async def test_signals_render_into_prompt_deterministically():
     assert "only deploys" in first
     assert "[#1] Peter owns deploys; [#2] demos are Fridays" in first  # id-sorted
     assert "[Recent channel activity]" in first
+    # F17: unprompted count is still fed as a signal, but with no cap phrasing.
+    assert "unprompted replies in this channel in the last hour: 3" in first
+    assert "self-throttle cap" not in first
 
 
 @pytest.mark.asyncio
@@ -112,6 +117,27 @@ async def test_sender_is_bot_signal_renders_judgment_line():
     llm2 = _FakeLLM(text='{"action": "ignore"}')
     await classify_participation(llm2, "msg", signals={})
     assert "another bot/agent" not in llm2.captured_input[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_f17_utility_output_floor_is_1024():
+    # F17: the utility output ceiling is 1024 on every utility call site — the
+    # participation classifier, the memory extractor, and the tool-result summarizer.
+    # (utility_max_tokens defaults to 20; the floor is what prevents a verdict/JSON
+    # from being cut off mid-reasoning and manifesting as unjustified silence.)
+    from openai_client.api.responses import extract_memory, summarize_tool_result
+
+    llm = _FakeLLM(text='{"action": "ignore"}')
+    await classify_participation(llm, "msg")
+    assert llm.captured_kwargs["max_output_tokens"] == 1024
+
+    llm2 = _FakeLLM(text='{"action": "none"}')
+    await extract_memory(llm2, "some exchange")
+    assert llm2.captured_kwargs["max_output_tokens"] == 1024
+
+    llm3 = _FakeLLM(text="a summary")
+    await summarize_tool_result(llm3, "x" * 5000, 200)
+    assert llm3.captured_kwargs["max_output_tokens"] == 1024
 
 
 @pytest.mark.asyncio

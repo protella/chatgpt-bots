@@ -1,6 +1,7 @@
 """Phase F — ParticipationEngine: verdict validation, level/mode mapping, debounce,
-throttle rails, backoff thread-mute + memory writes (F15), placement wiring, modal
-dual-write, DB columns/migration, and the busy-rejection needs_refresh fix.
+uncapped participation (F17: no hourly-cap rail), backoff thread-mute + memory writes
+(F15), placement wiring, modal dual-write, DB columns/migration, and the busy-rejection
+needs_refresh fix.
 
 All stubbed I/O — no live bot, no legacy suite.
 """
@@ -140,14 +141,12 @@ class TestDebounceAndRails:
         v = await ParticipationEngine(_Boom()).evaluate(channel_id="C1", ts="1.0", text="x")
         assert v.action == "ignore"
 
-    def test_hourly_cap_and_active_multiplier(self, monkeypatch):
-        monkeypatch.setattr(config, "max_unprompted_replies_per_hour", 6, raising=False)
+    def test_hourly_cap_rail_removed(self):
+        # F17: the hourly-cap hard rail is gone entirely — no hourly_cap/over_throttle
+        # methods remain on the engine (pacing is the classifier's judgment now).
         engine = ParticipationEngine(MagicMock())
-        assert engine.hourly_cap("judicious") == 6
-        assert engine.hourly_cap("active") == 12
-        assert engine.over_throttle(_FakePulse(6), "C1", "judicious") is True
-        assert engine.over_throttle(_FakePulse(6), "C1", "active") is False
-        assert engine.over_throttle(None, "C1", "judicious") is False
+        assert not hasattr(engine, "hourly_cap")
+        assert not hasattr(engine, "over_throttle")
 
 
 # --------------------------------------------------------------- main.py gate wiring
@@ -188,25 +187,27 @@ class TestGateWiring:
         assert fake.calls == 0
 
     @pytest.mark.asyncio
-    async def test_throttle_skips_engine_call(self, monkeypatch):
-        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
-        monkeypatch.setattr(config, "max_unprompted_replies_per_hour", 2, raising=False)
-        app, client, fake = _make_app({"action": "respond"}, pulse=_FakePulse(2))
-        assert await app._run_participation_gate(_channel_msg(), client) is None
-        assert fake.calls == 0  # rail fires BEFORE the model
-
-    @pytest.mark.asyncio
-    async def test_name_hit_bypasses_throttle_rail(self, monkeypatch):
-        # F14: a name-addressed message must reach the engine even when the hourly
-        # runaway brake is at/over cap — only the classifier decides if it's a summons.
+    async def test_high_unprompted_count_still_reaches_engine(self, monkeypatch):
+        # F17: no hourly-cap rail — even a very high recorded unprompted count never
+        # silences a turn before the model sees it. The classifier alone decides.
         monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
         monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        monkeypatch.setattr(config, "max_unprompted_replies_per_hour", 2, raising=False)
-        app, client, fake = _make_app({"action": "respond"}, pulse=_FakePulse(2))
+        app, client, fake = _make_app({"action": "respond"}, pulse=_FakePulse(40))
+        verdict = await app._run_participation_gate(_channel_msg(), client)
+        assert verdict is not None and verdict.action == "respond"
+        assert fake.calls == 1  # engine judged despite 40 unprompted replies on record
+
+    @pytest.mark.asyncio
+    async def test_name_hit_still_reaches_engine(self, monkeypatch):
+        # F17: a name-addressed message reaches the engine like any other — only the
+        # classifier decides if it's a genuine summons.
+        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
+        app, client, fake = _make_app({"action": "respond"}, pulse=_FakePulse(40))
         verdict = await app._run_participation_gate(
             _channel_msg(participation_name_hit=True), client)
         assert verdict is not None and verdict.action == "respond"
-        assert fake.calls == 1  # rail skipped — the engine still judged
+        assert fake.calls == 1
 
     @pytest.mark.asyncio
     async def test_respond_verdict_passes_through(self, monkeypatch):

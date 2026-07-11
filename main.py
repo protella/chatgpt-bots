@@ -90,14 +90,10 @@ class ChatBotV2:
             # overwrite a newer event's debounce marker and win the race.
             engine.note_arrival(channel_id, ts)
 
-            # Hard rail BEFORE any model call. Mentions never route through this gate,
-            # so the throttle can't silence an addressed message. F14: a name_hit is
-            # name-addressed too (talked TO, not merely about) — it must bypass the hourly
-            # runaway brake as well; the engine still judges whether it's a genuine summons.
+            # F17: no hourly-cap hard rail — pacing is the classifier's judgment. The
+            # unprompted-reply count is still tallied and fed to the engine as a signal
+            # (below), but a high count never silences a turn before the model sees it.
             name_hit = message.metadata.get("participation_name_hit") is True
-            if not name_hit and engine.over_throttle(pulse, channel_id, level):
-                main_logger.debug(f"Participation gate: hourly cap reached in {channel_id} — silent")
-                return None
 
             channel_activity = None
             unprompted = 0
