@@ -8,7 +8,6 @@ import tempfile
 import os
 import json
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock, patch, Mock
 from database import DatabaseManager
 
 
@@ -357,7 +356,7 @@ class TestDatabaseBackup:
             # Cleanup
             for backup_file in backup_files:
                 os.remove(os.path.join("data/backups", backup_file))
-        except Exception as e:
+        except Exception:
             # Backup might fail in test environment
             # Just pass the test if backup not supported
             pass
@@ -520,7 +519,6 @@ class TestModalSessions:
 
     def test_cleanup_old_modal_sessions(self, temp_db):
         """Test cleaning up old modal sessions"""
-        import time
 
         # Create sessions with different ages
         old_session_id = "old-session"

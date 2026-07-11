@@ -7,7 +7,6 @@ markers derived from the variants.
 """
 import pytest
 
-import config as config_module
 from config import (
     BotConfig,
     config,

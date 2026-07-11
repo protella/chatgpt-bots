@@ -11,8 +11,7 @@ from typing import Optional
 from config import config
 from logger import log_session_start, log_session_end, main_logger
 from message_processor.base import MessageProcessor
-from message_processor.participation import (ParticipationEngine, resolve_participation_level,
-                                             snooze_expiry_iso)
+from message_processor.participation import (ParticipationEngine, snooze_expiry_iso)
 from base_client import BaseClient, Message
 
 

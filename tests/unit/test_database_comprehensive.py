@@ -5,11 +5,7 @@ Tests for improved coverage of SQLite database operations
 import pytest
 import sqlite3
 import tempfile
-import os
-import json
-import asyncio
-from datetime import datetime, timedelta
-from unittest.mock import MagicMock, patch, Mock, AsyncMock
+from unittest.mock import patch
 from database import DatabaseManager
 
 
@@ -42,8 +38,8 @@ class TestDatabaseManagerComprehensive:
         """Test that __init__ creates necessary directories"""
         from config import config as bot_config
         with patch('os.makedirs') as mock_makedirs:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                db = DatabaseManager("test")
+            with tempfile.TemporaryDirectory():
+                DatabaseManager("test")
 
                 # Should create the database dir and its backups subdir
                 # (conftest redirects DATABASE_DIR to a tmp dir for tests)

@@ -4,7 +4,6 @@ Provides time-based update triggering and display-safe text with fence closing
 """
 
 import time
-from typing import Optional
 from logger import LoggerMixin
 from .fence_handler import FenceHandler
 

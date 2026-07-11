@@ -3,11 +3,8 @@ Unit tests for message_processor.py module
 Tests the core message processing logic
 """
 import pytest
-import base64
-import time
 from io import BytesIO
-from unittest.mock import MagicMock, patch, Mock, call, AsyncMock
-from datetime import datetime
+from unittest.mock import MagicMock, patch, Mock
 from message_processor.base import MessageProcessor
 from base_client import Message, Response
 
@@ -44,7 +41,6 @@ class TestMessageProcessor:
     @pytest.fixture
     def mock_openai_client(self):
         """Create a mock OpenAI client"""
-        from openai_client import ImageData
         mock = MagicMock()
         mock.classify_intent.return_value = "chat"
         mock.get_response.return_value = "Hello from AI"
@@ -104,7 +100,7 @@ class TestMessageProcessor:
         """Test MessageProcessor initialization with database"""
         mock_db = MagicMock()
         with patch('message_processor.base.AsyncThreadStateManager') as mock_thread_manager:
-            with patch('message_processor.base.OpenAIClient') as mock_openai:
+            with patch('message_processor.base.OpenAIClient'):
                 processor = MessageProcessor(db=mock_db)
 
                 assert processor.db is mock_db
@@ -204,7 +200,7 @@ class TestMessageProcessor:
         mock_client.send_message = AsyncMock()
 
         # Process message
-        response = await processor.process_message(message, mock_client)
+        await processor.process_message(message, mock_client)
 
         # Should clear timeout flag
         assert thread_state.had_timeout is False
@@ -329,7 +325,7 @@ class TestMessageProcessorDiagnostics:
     
     def test_diagnostic_thread_state_tracking(self):
         """Diagnostic: Track thread state during processing"""
-        with patch('message_processor.base.AsyncThreadStateManager') as mock_thread:
+        with patch('message_processor.base.AsyncThreadStateManager'):
             with patch('message_processor.base.OpenAIClient'):
                 processor = MessageProcessor()
                 

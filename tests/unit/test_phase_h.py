@@ -497,7 +497,8 @@ class TestOpenUserSettingsHandler:
         host = _settings_host()
         handler = host.app.actions["open_user_settings"]
         client = SimpleNamespace(views_open=AsyncMock(), chat_postEphemeral=AsyncMock())
-        body = _action_body(); body.pop("trigger_id")
+        body = _action_body()
+        body.pop("trigger_id")
         await handler(ack=AsyncMock(), body=body, client=client)
         client.views_open.assert_not_awaited()
         client.chat_postEphemeral.assert_not_awaited()

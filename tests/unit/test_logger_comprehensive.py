@@ -4,11 +4,8 @@ Tests for improved coverage of logging functionality
 """
 import pytest
 import logging
-import os
-import tempfile
 import sys
-from unittest.mock import patch, MagicMock, Mock, call
-from io import StringIO
+from unittest.mock import patch, Mock
 from logger import setup_logger, log_session_start, log_session_end, ColoredFormatter, LoggerMixin
 
 

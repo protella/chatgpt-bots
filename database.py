@@ -2254,31 +2254,6 @@ class DatabaseManager(LoggerMixin):
             self.log_debug(f"DB: get_thread_tool_usage_async failed (non-fatal): {e}")
         return result
 
-    async def get_thread_config_async(self, thread_id: str) -> Optional[Dict]:
-        """
-        Async version of get_thread_config.
-
-        Args:
-            thread_id: Thread identifier
-
-        Returns:
-            Configuration dictionary or None
-        """
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            await db.execute("PRAGMA journal_mode=WAL")
-
-            async with db.execute(
-                "SELECT config_json FROM threads WHERE thread_id = ?",
-                (thread_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-
-                if row and row["config_json"]:
-                    return json.loads(row["config_json"])
-
-                return None
-
     async def save_thread_config_async(self, thread_id: str, config: Dict):
         """
         Async version of save_thread_config.
@@ -2490,10 +2465,7 @@ class DatabaseManager(LoggerMixin):
                 await db.commit()
                 return dict(row)
 
-            # Create new user with defaults from config
-            from config import BotConfig
-            config = BotConfig()
-
+            # Create new user
             await db.execute("""
                 INSERT INTO users (user_id, username, created_at, last_seen)
                 VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
@@ -2821,69 +2793,6 @@ class DatabaseManager(LoggerMixin):
             await db.execute(query, values)
             await db.commit()
             return True
-
-    async def get_or_create_thread_async(self, thread_id: str, channel_id: str, user_id: Optional[str] = None) -> Dict:
-        """
-        Async version of get_or_create_thread.
-
-        Args:
-            thread_id: Thread identifier
-            channel_id: Channel identifier
-            user_id: Optional user identifier
-
-        Returns:
-            Thread data dictionary
-        """
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            await db.execute("PRAGMA journal_mode=WAL")
-
-            # Try to get existing thread
-            async with db.execute(
-                "SELECT * FROM threads WHERE thread_id = ?",
-                (thread_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-
-            if row:
-                return dict(row)
-
-            # Create new thread
-            thread_ts = thread_id.split(":", 1)[1] if ":" in thread_id else thread_id
-
-            # Get user config if user_id provided
-            config = {}
-            if user_id:
-                user_prefs = await self.get_user_preferences_async(user_id)
-                if user_prefs:
-                    # Extract relevant config from user preferences
-                    config = {
-                        'model': user_prefs.get('model'),
-                        'reasoning_effort': user_prefs.get('reasoning_effort'),
-                        'verbosity': user_prefs.get('verbosity'),
-                        'temperature': user_prefs.get('temperature'),
-                        'top_p': user_prefs.get('top_p'),
-                        'enable_web_search': user_prefs.get('enable_web_search'),
-                        'enable_streaming': user_prefs.get('enable_streaming'),
-                        'enable_mcp': user_prefs.get('enable_mcp')
-                    }
-                    # Remove None values
-                    config = {k: v for k, v in config.items() if v is not None}
-
-            await db.execute("""
-                INSERT INTO threads (thread_id, channel_id, thread_ts, config_json)
-                VALUES (?, ?, ?, ?)
-            """, (thread_id, channel_id, thread_ts, json.dumps(config) if config else None))
-
-            await db.commit()
-
-            # Return the created thread
-            async with db.execute(
-                "SELECT * FROM threads WHERE thread_id = ?",
-                (thread_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                return dict(row) if row else {}
 
     async def get_thread_config_async(self, thread_id: str) -> Optional[Dict]:
         """

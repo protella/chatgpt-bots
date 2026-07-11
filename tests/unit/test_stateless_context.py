@@ -7,10 +7,8 @@ deterministic rebuild serialization (prompt-cache hygiene), date-only prefix +
 minute-time suffix, the summary-aware system-prompt note, reactions annotations,
 and prompt_cache_key plumbing.
 """
-import asyncio
 import json
 import os
-import sqlite3
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -507,8 +505,6 @@ def test_summary_note_wording_is_stable(temp_db):
     without = _sys_prompt(proc, has_trimmed_messages=False)
     assert "has been summarized in a summary message above" in with_note
     assert "summarized" not in without
-    # deterministic: no counts or timestamps in the note
-    note = with_note.replace(without[:without.index("Today's date:")], "")
     assert "Note: The beginning of this conversation has been summarized" in with_note
 
 

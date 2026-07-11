@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import Any, List, Optional, Set
-from openai import APIError, APIStatusError
+from typing import Any, List, Optional
 
 from base_client import BaseClient, Message, Response
 from config import config, pipeline_status
@@ -1052,7 +1051,7 @@ class TextHandlerMixin:
                                 error_msg = f"{final_first_part}\n\n{config.error_emoji} *Streaming interrupted at message overflow. Partial response shown above.*"
                                 try:
                                     await client.update_message_streaming(message.channel_id, current_message_id, error_msg)
-                                except:
+                                except Exception:
                                     pass
                                 return  # Exit callback
 
@@ -1189,7 +1188,7 @@ class TextHandlerMixin:
                                                 self.log_info(f"Retry {retry_count} successful after exception")
                                                 buffer.mark_updated()
                                                 break
-                                        except:
+                                        except Exception:
                                             pass
                                         retry_count += 1
                             else:
@@ -1229,7 +1228,7 @@ class TextHandlerMixin:
                                             error_msg = f"{buffer.get_complete_text()}\n\n{config.error_emoji} *Streaming interrupted after multiple failures.*"
                                             try:
                                                 await client.update_message_streaming(message.channel_id, current_message_id, error_msg)
-                                            except:
+                                            except Exception:
                                                 pass
                                             return
                                 except Exception as retry_error:
@@ -1245,7 +1244,7 @@ class TextHandlerMixin:
                                                 self.log_info(f"Retry {retry_count} successful after exception")
                                                 buffer.mark_updated()
                                                 break
-                                        except:
+                                        except Exception:
                                             pass
                                         retry_count += 1
 
@@ -1439,7 +1438,7 @@ class TextHandlerMixin:
                 # Return an error response to prevent saving incomplete data
                 return Response(
                     type="error",
-                    content=f"Streaming was interrupted. Partial response was shown but may be incomplete.",
+                    content="Streaming was interrupted. Partial response was shown but may be incomplete.",
                     metadata={"streaming_aborted": True}
                 )
 
@@ -1726,7 +1725,7 @@ class TextHandlerMixin:
 
             # Retry request - streaming preserved for MCP failures, non-streaming for other errors
             if failed_mcp_server:
-                self.log_info(f"Retrying with streaming (excluding failed MCP server)")
+                self.log_info("Retrying with streaming (excluding failed MCP server)")
             else:
                 self.log_info("Falling back to non-streaming due to error")
 

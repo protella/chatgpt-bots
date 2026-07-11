@@ -3,15 +3,13 @@ Integration tests for streaming functionality with real OpenAI API
 """
 
 import pytest
-import asyncio
 import time
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch
 from threading import Event
 from message_processor.base import MessageProcessor
 from openai_client import OpenAIClient
 from base_client import Message
 from streaming.buffer import StreamingBuffer
-from config import BotConfig
 
 
 class TestStreamingIntegration:
@@ -67,7 +65,7 @@ class TestStreamingIntegration:
             {"role": "user", "content": "Write the word 'TESTING' letter by letter"}
         ]
         
-        response = client.create_streaming_response(
+        client.create_streaming_response(
             messages=messages,
             stream_callback=buffer_callback,
             temperature=0.3
@@ -182,7 +180,7 @@ class TestStreamingIntegration:
             
             mock_stream.side_effect = streaming_with_cancel
             
-            response = client.create_streaming_response(
+            client.create_streaming_response(
                 messages=messages,
                 stream_callback=callback_with_cancel
             )
@@ -248,11 +246,11 @@ class TestStreamingIntegration:
         ]
         
         try:
-            response = client.create_streaming_response(
+            client.create_streaming_response(
                 messages=messages,
                 stream_callback=callback_with_error_tracking
             )
-        except:
+        except Exception:
             pass  # Error expected
         
         # Should have captured some chunks before error
@@ -376,8 +374,7 @@ class TestStreamingEdgeCases:
         client = OpenAIClient()
         
         chunks = []
-        timeout_occurred = False
-        
+
         def timeout_callback(chunk):
             chunks.append(chunk)
             # Simulate slow processing
@@ -396,7 +393,7 @@ class TestStreamingEdgeCases:
             assert response is not None
         except Exception as e:
             if "timeout" in str(e).lower():
-                timeout_occurred = True
+                pass
         
         # Should have received some chunks even with slow processing
         # (unless timeout was very aggressive)

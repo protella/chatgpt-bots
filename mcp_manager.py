@@ -71,7 +71,7 @@ class MCPManager(LoggerMixin):
 
             # Expected format: {"mcpServers": {"server_label": {...}, ...}}
             if "mcpServers" not in config_data:
-                self.log_error(f"Invalid MCP config format: missing 'mcpServers' key")
+                self.log_error("Invalid MCP config format: missing 'mcpServers' key")
                 return False
 
             # Validate mcpServers is a dictionary
@@ -133,7 +133,7 @@ class MCPManager(LoggerMixin):
 
             # Warn if no valid servers after validation
             if len(self.servers) == 0:
-                self.log_warning(f"MCP config loaded but no valid servers found")
+                self.log_warning("MCP config loaded but no valid servers found")
                 return False
 
             self.log_info(f"Loaded {len(self.servers)} valid MCP server(s) from {config_path}")

@@ -2,8 +2,7 @@
 Unit tests for thread_manager.py module
 """
 import time
-import pytest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock
 from thread_manager import ThreadState, AssetLedger
 
 

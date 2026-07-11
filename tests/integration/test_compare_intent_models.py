@@ -19,9 +19,9 @@ sys.path.insert(0, parent_dir)
 project_root = os.path.dirname(parent_dir)
 sys.path.insert(0, project_root)
 
-from openai_client import OpenAIClient
-from config import config
-from logger import setup_logger
+from openai_client import OpenAIClient  # noqa: E402
+from config import config  # noqa: E402
+from logger import setup_logger  # noqa: E402
 
 # Load environment variables
 load_dotenv()

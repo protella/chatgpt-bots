@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from typing import Dict, List, Optional
 
 import re
@@ -315,7 +314,7 @@ class ImageEditMixin:
                                 progress_task.cancel()
                                 self.log_debug("Cancelled progress updater after image editing")
 
-                        except Exception as e:
+                        except Exception:
                             # Cancel progress updater on error
                             if progress_task and not progress_task.done():
                                 progress_task.cancel()

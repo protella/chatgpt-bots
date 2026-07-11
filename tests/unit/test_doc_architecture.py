@@ -5,9 +5,6 @@ Covers: the content-drop migration, attach-time summary flow, gap-honest
 prompt, labeled injection, read_document (query/offset/LRU/file_deleted),
 native input_file gating, spreadsheet schema-first, and guidance presence.
 """
-import asyncio
-import base64
-import sqlite3
 import inspect
 
 import pytest
