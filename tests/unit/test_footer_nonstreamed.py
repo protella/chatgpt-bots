@@ -206,3 +206,71 @@ async def test_main_suppresses_separate_footer_when_send_failed():
 
     assert resp.metadata.get("posted") is False
     client.maybe_post_response_footer.assert_not_awaited()
+
+
+# ------------------------------------- split hardening (Codex review, user-directed)
+
+def _slack_error(msg="rate_limited", retry_after=None):
+    from slack_sdk.errors import SlackApiError
+    resp = MagicMock()
+    resp.headers = {"Retry-After": str(retry_after)} if retry_after is not None else {}
+    return SlackApiError(msg, resp)
+
+
+@pytest.mark.asyncio
+async def test_split_chunk_retries_once_and_succeeds(monkeypatch):
+    """A transiently failing chunk is retried once (honoring Retry-After) — the full
+    message still posts and no truncation note appears."""
+    import asyncio as _asyncio
+    sleeps = []
+
+    async def _fake_sleep(s):
+        sleeps.append(s)
+    monkeypatch.setattr(_asyncio, "sleep", _fake_sleep)
+    b = _Bot()
+    calls = {"n": 0}
+
+    async def _post(**kw):
+        calls["n"] += 1
+        if calls["n"] == 2:  # first attempt of chunk 2 fails
+            raise _slack_error(retry_after=3)
+        return {"ok": True, "ts": f"{calls['n']}.0"}
+    b.app.client.chat_postMessage = AsyncMock(side_effect=_post)
+    long_text = ("para one " * 300) + "\n\n" + ("para two " * 300)  # forces a split
+    ts = await b.send_message("C1", "T1", long_text)
+    assert ts == "1.0"
+    assert sleeps == [3.0]  # Retry-After honored
+    texts = [c.kwargs["text"] for c in b.app.client.chat_postMessage.await_args_list]
+    assert not any("cut off" in t for t in texts)  # no truncation note
+
+
+@pytest.mark.asyncio
+async def test_split_aborts_with_loud_note_when_chunk_fails_twice(monkeypatch):
+    """A chunk that fails both attempts ABORTS the remainder and posts a loud
+    truncation note (silent partial delivery is never acceptable)."""
+    import asyncio as _asyncio
+
+    async def _fake_sleep(s):
+        pass
+    monkeypatch.setattr(_asyncio, "sleep", _fake_sleep)
+    b = _Bot()
+    calls = {"n": 0}
+
+    async def _post(**kw):
+        if "cut off" in kw.get("text", ""):
+            return {"ok": True, "ts": "99.0"}  # the note itself posts
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"ok": True, "ts": "1.0"}  # chunk 1 ok
+        raise _slack_error()  # chunk 2 fails on every attempt
+    b.app.client.chat_postMessage = AsyncMock(side_effect=_post)
+    long_text = ("para one " * 300) + "\n\n" + ("para two " * 300) + "\n\n" + ("para three " * 300)
+    meta = {}
+    ts = await b.send_message("C1", "T1", long_text, meta_out=meta)
+    assert ts == "1.0"  # first chunk's ts still returned (message exists)
+    assert meta["split_truncated"] is True
+    texts = [c.kwargs["text"] for c in b.app.client.chat_postMessage.await_args_list]
+    note = [t for t in texts if "cut off" in t]
+    assert len(note) == 1 and "failed to post" in note[0]
+    # No chunk posted AFTER the failure other than the note (abort, not skip-and-continue).
+    assert texts.index(note[0]) == len(texts) - 1
