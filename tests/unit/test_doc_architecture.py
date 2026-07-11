@@ -307,6 +307,16 @@ class TestScannedPdfOcr:
         assert out["ocr_text_used"] is True
         assert "INVOICE TOTAL 500" in out["content"]
 
+    def test_read_document_registered_with_extended_timeout(self):
+        # read_document may download + render + OCR a scan, so it must register with the
+        # longer read_document_timeout, not the generic 20s tool_call_timeout.
+        import message_processor.document_tools as dt
+        from tool_registry import ToolRegistry
+        reg = ToolRegistry()
+        dt.register_document_tools(reg)
+        assert reg._tools["read_document"]["timeout"] == config.read_document_timeout
+        assert config.read_document_timeout > config.tool_call_timeout
+
     @pytest.mark.asyncio
     async def test_read_document_returns_ocr_text_for_scan(self):
         # read_document path: a scanned doc that yields nothing locally now comes back ok.

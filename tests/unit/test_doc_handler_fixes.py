@@ -134,6 +134,31 @@ async def test_extraction_timeout_returns_placeholder(handler, monkeypatch):
     assert result["filename"] == "slow.pdf"
 
 
+@pytest.mark.asyncio
+async def test_ocr_text_extends_executor_timeout(handler, monkeypatch):
+    # OCR is subprocess+CPU heavy and far exceeds the 30s non-OCR cap, so ocr_text=True
+    # widens the inner timeout to max(30, 30 + ocr_max_pages*5) — otherwise this cap would
+    # abort an OCR run the outer per-tool timeout now permits. Verified without sleeping.
+    from config import config
+
+    monkeypatch.setattr(config, "ocr_max_pages", 4)  # extended => 30 + 4*5 = 50
+    monkeypatch.setattr(handler, "safe_extract_content", lambda *a, **k: {"content": "x"})
+    captured = {}
+    real_wait_for = dh.asyncio.wait_for
+
+    async def spy_wait_for(awaitable, timeout):
+        captured["timeout"] = timeout
+        return await real_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr(dh.asyncio, "wait_for", spy_wait_for)
+
+    await handler.safe_extract_content_async(b"x", "application/pdf", "s.pdf", ocr_text=True)
+    assert captured["timeout"] == 50
+    # Non-OCR calls keep the existing 30s cap.
+    await handler.safe_extract_content_async(b"x", "application/pdf", "s.pdf", ocr_text=False)
+    assert captured["timeout"] == dh.EXTRACTION_TIMEOUT_SECONDS
+
+
 # --- zip-bomb guard ---
 
 def _make_zip_bomb() -> bytes:

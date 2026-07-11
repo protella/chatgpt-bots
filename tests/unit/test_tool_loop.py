@@ -102,6 +102,42 @@ class TestToolRegistry:
         out = await reg.dispatch(ToolContext(), "echo", "{}")
         assert out["ok"] is False and out["error"] == "timeout"
 
+    @pytest.mark.asyncio
+    async def test_per_tool_timeout_overrides_config(self, monkeypatch):
+        # A generous global cap must not save a tool with its own tiny per-tool timeout.
+        monkeypatch.setattr(config, "tool_call_timeout", 100.0)
+        reg = ToolRegistry()
+        async def slow(ctx, args):
+            await asyncio.sleep(1)
+        reg.register({"type": "function", "name": "slow", "parameters": {}},
+                     slow, timeout=0.05)
+        out = await reg.dispatch(ToolContext(), "slow", "{}")
+        assert out["ok"] is False and out["error"] == "timeout"
+        assert "0s" in out["message"]  # honest: reports the per-tool number, not config's
+
+    @pytest.mark.asyncio
+    async def test_default_tools_still_use_config_timeout(self, monkeypatch):
+        # timeout=None (the default) falls through to config.tool_call_timeout.
+        monkeypatch.setattr(config, "tool_call_timeout", 0.05)
+        async def slow(ctx, args):
+            await asyncio.sleep(1)
+        reg = _registry_with(executor=slow)  # registered without a per-tool timeout
+        out = await reg.dispatch(ToolContext(), "echo", "{}")
+        assert out["ok"] is False and out["error"] == "timeout"
+
+    @pytest.mark.asyncio
+    async def test_per_tool_timeout_allows_slow_run_config_would_abort(self, monkeypatch):
+        # The whole point: a run longer than the global cap succeeds under a larger per-tool one.
+        monkeypatch.setattr(config, "tool_call_timeout", 0.02)
+        reg = ToolRegistry()
+        async def okish(ctx, args):
+            await asyncio.sleep(0.1)
+            return {"ok": True}
+        reg.register({"type": "function", "name": "okish", "parameters": {}},
+                     okish, timeout=5.0)
+        out = await reg.dispatch(ToolContext(), "okish", "{}")
+        assert out == {"ok": True}
+
     def test_enabled_gate_hides_schema(self):
         reg = ToolRegistry()
         reg.register({"type": "function", "name": "gated", "parameters": {}},
