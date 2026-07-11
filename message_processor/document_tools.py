@@ -68,7 +68,8 @@ def get_read_document_schema() -> Dict[str, Any]:
         "type": "function",
         "name": "read_document",
         "description": (
-            "Read the full content of a document shared in this conversation. Document "
+            "Read the full content of a document shared in this channel (current conversation "
+            "checked first). Document "
             "summaries in context are SUMMARIES — use this tool whenever you need specific "
             "figures, quotes, table values, or sections a summary doesn't literally contain. "
             "Provide query to search inside the document, or offset to read sequentially."
@@ -154,9 +155,23 @@ async def execute_read_document(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
     except Exception as e:
         return {"ok": False, "error": f"document_lookup_failed: {e}"}
 
+    # F22: resolve against the CURRENT thread first (same-name in both threads → this
+    # thread's wins); on a miss, fall back channel-wide (newest match) so a file dropped
+    # in another conversation in this channel is still readable. Same channel only — the
+    # channel-wide lookup prefix-matches thread_id on channel_id, never crossing channels.
+    origin: Optional[str] = None
     doc = _resolve_document(docs or [], file_id, filename)
+    channel_docs: Optional[List[Dict[str, Any]]] = None
     if not doc:
-        known = [d.get("filename") for d in (docs or [])][-5:]
+        try:
+            channel_docs = await ctx.db.get_channel_documents_async(ctx.channel_id)
+        except Exception as e:
+            return {"ok": False, "error": f"document_lookup_failed: {e}"}
+        doc = _resolve_document(channel_docs or [], file_id, filename)
+        if doc:
+            origin = "shared in another conversation in this channel"
+    if not doc:
+        known = [d.get("filename") for d in (channel_docs or docs or [])][-5:]
         return {"ok": False, "error": "document_not_found",
                 "known_documents": known,
                 "hint": "Use the filename or file_id from the document summary in context."}
@@ -191,6 +206,10 @@ async def execute_read_document(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
 
     total = len(text)
     base = {"ok": True, "filename": doc.get("filename"), "total_chars": total}
+    if origin:
+        # Channel-wide hit: tell the model the file came from elsewhere so it attributes
+        # honestly ("from a file shared in another thread") rather than implying it was here.
+        base["origin"] = origin
 
     if query:
         matches = _query_slices(text, query)

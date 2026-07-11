@@ -516,6 +516,9 @@ class BotConfig:
     tool_result_max_chars: int = field(default_factory=lambda: int(os.getenv("TOOL_RESULT_MAX_CHARS", "20000")))
     # Model-invoked emoji reactions (redesign Phase D) — allowlist still REACTION_EMOJIS.
     enable_react_tool: bool = field(default_factory=lambda: os.getenv("ENABLE_REACT_TOOL", "true").lower() == "true")
+    # Model-invoked cross-thread reply tool (F23): post a reply into a DIFFERENT thread in the
+    # CURRENT channel (never cross-channel). Default ON; a muted target thread is refused.
+    enable_post_to_thread_tool: bool = field(default_factory=lambda: os.getenv("ENABLE_POST_TO_THREAD_TOOL", "true").lower() == "true")
     # --- Explicit no-reply terminal tool (F2) ---
     # Exposes a `no_response_needed` tool on UNPROMPTED (participation-gated) turns so the
     # model can end without posting instead of emitting filler. Off → tool hidden, suffix

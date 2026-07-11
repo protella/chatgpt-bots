@@ -1048,6 +1048,82 @@ class SlackMessagingMixin:
             # pending (nothing evictable then); now that this call resolved, sweep again.
             self._trim_reaction_guard(guard, ts_map, time.monotonic())
 
+    def get_post_to_thread_tool_schema(self) -> dict:
+        """F23: schema for the cross-thread reply tool. CURRENT CHANNEL ONLY — there is no
+        channel_id param; cross-channel posting is out of scope (a write boundary, unlike the
+        read tools that can reach other channels)."""
+        return {
+            "type": "function",
+            "name": "post_to_thread",
+            "description": (
+                "Post a reply into a DIFFERENT thread in THIS channel. Use when a reply "
+                "belongs somewhere other than the current conversation — someone asked you to "
+                "answer a message over in another thread, or you're closing a loop you were "
+                "part of elsewhere. Acknowledge briefly in the current thread rather than "
+                "duplicating the whole answer in both places. Only targets threads in the "
+                "current channel; there is no way to post to another channel."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "thread_ts": {
+                        "type": "string",
+                        "description": "Root ts of the target conversation (a top-level message's ts "
+                                       "targets its thread). Must be a ts you have actually seen in "
+                                       "context or from a tool — never guess one.",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "The reply to post, in normal markdown (converted to Slack "
+                                       "formatting automatically).",
+                    },
+                },
+                "required": ["thread_ts", "text"],
+            },
+        }
+
+    async def execute_post_to_thread(self, ctx, args: dict) -> dict:
+        """Executor for post_to_thread (F23). Posts a markdown-converted reply into another
+        thread of the CURRENT channel via the standard messaging layer (which also records the
+        own-reply pulse, keeping the rings truthful). Never raises — every refusal/failure is an
+        {"ok": False, ...} result. Runs inside an addressed/judged turn, so no unprompted
+        accounting is added."""
+        if not config.enable_post_to_thread_tool:
+            return {"ok": False, "error": "disabled", "message": "Cross-thread posting is disabled."}
+        channel_id = getattr(ctx, "channel_id", None)
+        if not channel_id:
+            return {"ok": False, "error": "no_channel", "message": "No channel to post into."}
+        target = (args.get("thread_ts") or "").strip()
+        text = (args.get("text") or "").strip()
+        if not target:
+            return {"ok": False, "error": "missing_thread_ts", "message": "A target thread_ts is required."}
+        if not text:
+            return {"ok": False, "error": "empty_text", "message": "Nothing to post — text was empty."}
+        # Posting into the CURRENT conversation would double-post alongside the normal reply.
+        current = getattr(ctx, "thread_ts", None)
+        trigger = getattr(ctx, "trigger_ts", None)
+        if target == current or target == trigger:
+            return {"ok": False, "error": "same_thread",
+                    "message": "That's the current thread — just reply normally instead."}
+        # F15 rail: a thread the user muted is opted out of the bot contributing there. Relay
+        # that instead of violating it.
+        try:
+            cs = await ctx.db.get_channel_settings_async(channel_id)
+            muted = (cs or {}).get("muted_threads") or []
+        except Exception:
+            muted = []
+        if target in muted:
+            return {"ok": False, "error": "thread_muted_by_user",
+                    "message": "That thread was muted — the user asked the bot to stay out of it."}
+        try:
+            posted_ts = await self.send_message(channel_id, target, text)
+        except Exception as e:
+            self.log_warning(f"post_to_thread: send failed for {channel_id}/{target}: {e}")
+            return {"ok": False, "error": "post_failed", "message": "Could not post to that thread."}
+        if not posted_ts:
+            return {"ok": False, "error": "post_failed", "message": "Could not post to that thread."}
+        return {"ok": True, "thread_ts": target, "posted_ts": posted_ts}
+
     def get_no_reply_tool_schema(self) -> dict:
         """Function-tool schema for the F2 terminal no-reply action (unprompted turns only)."""
         return {
