@@ -57,9 +57,11 @@ class TestBotConfig:
         assert config.enable_progress_checklist is False
 
     def test_progress_checklist_prefer_message_default_enabled(self, mock_env):
-        """PROGRESS_CHECKLIST_PREFER_MESSAGE defaults to True"""
+        """PROGRESS_CHECKLIST_PREFER_MESSAGE defaults to False — where Slack's native
+        assistant status exists it is the ONLY progress surface (a forced checklist
+        message triple-displays the same text: message + in-thread status + composer)."""
         config = BotConfig()
-        assert config.progress_checklist_prefer_message is True
+        assert config.progress_checklist_prefer_message is False
 
     @patch.dict(os.environ, {"PROGRESS_CHECKLIST_PREFER_MESSAGE": "false"})
     def test_progress_checklist_prefer_message_disabled(self, mock_env):
