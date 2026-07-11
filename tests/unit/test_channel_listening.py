@@ -12,7 +12,8 @@ import pytest
 from base_client import Message
 from config import config
 from message_processor.utilities import build_roster_text
-from slack_client.event_handlers.message_events import SlackMessageEventsMixin
+from slack_client.event_handlers.message_events import (
+    SlackMessageEventsMixin, _summarize_attachments)
 from slack_client.utilities import SlackUtilitiesMixin
 
 
@@ -129,6 +130,39 @@ async def test_file_share_reaches_gate_and_plumbs_files(tag_only):
     assert msg.metadata.get("participation_name_hit") is True
     assert msg.attachments and msg.attachments[0]["type"] == "image"
     assert msg.attachments[0]["id"] == "F123"
+
+
+def test_summarize_attachments_kind_breakdown():
+    # F14b: count + kind breakdown + filenames only (no content).
+    assert _summarize_attachments(None) is None
+    assert _summarize_attachments([]) is None
+    assert _summarize_attachments(
+        [{"name": "food.png", "mimetype": "image/png"}]) == "1 image (food.png)"
+    assert _summarize_attachments([
+        {"name": "report.pdf", "mimetype": "application/pdf"},
+        {"name": "data.csv", "mimetype": "text/csv"},
+    ]) == "2 files (report.pdf, data.csv)"
+    # Mixed: images counted/listed first.
+    assert _summarize_attachments([
+        {"name": "chart.png", "mimetype": "image/png"},
+        {"name": "notes.pdf", "mimetype": "application/pdf"},
+    ]) == "1 image, 1 file (chart.png, notes.pdf)"
+
+
+@pytest.mark.asyncio
+async def test_file_share_sets_participation_attachments_signal(tag_only):
+    # F14b end-to-end: a file_share that reaches the engine gate carries an attachment
+    # summary in metadata so the classifier isn't blind to the uploaded artifact.
+    bot = _make_bot()
+    await bot._handle_channel_message(
+        _evt(subtype="file_share", text="ChatGPT good marketing material?",
+             files=[{"id": "F1", "name": "poster.png", "mimetype": "image/png",
+                     "url_private": "https://files.slack.com/poster.png"}]),
+        bot.app.client)
+    bot.message_handler.assert_called_once()
+    msg = bot.message_handler.call_args[0][0]
+    assert msg.metadata.get("participation_check") is True
+    assert msg.metadata.get("participation_attachments") == "1 image (poster.png)"
 
 
 @pytest.mark.asyncio

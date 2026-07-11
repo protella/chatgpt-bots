@@ -1140,6 +1140,31 @@ references); tail default 15 / truncation 500s wired with env overrides; utility
 1024 on both call sites; prompt clauses present (voice banter + classifier banter);
 existing anti-loop rules untouched (bot-sender signal line still rendered).
 
+## F14b. Attachment-aware participation signals (live gap 2026-07-11)
+
+**Live failure (first F14 live test):** the file_share gate fix works — the channel
+image + "what do we think? good marketing material?" dispatched — but the classifier
+voted ignore with reason "open opinion request WITHOUT AN ATTACHED IMAGE": signals
+carry only text, so it concluded no image exists. The gate got files through; the
+classifier is still blind to them.
+
+**Design:**
+1. **Attachment signal:** message_events dispatch passes an attachment summary into
+   `engine.evaluate(attachments=...)` (built from the event's files: count + kind,
+   e.g. "1 image (food.png)" / "2 files (report.pdf, data.csv)"; filenames only, no
+   content). `classify_participation` renders it next to the sender line: "- Attached
+   to the message: {summary}. The assistant can view and analyze attachments."
+2. **Capability line:** `render_capabilities_line` adds "analyzing images and
+   documents shared in chat" (unconditional — vision/document flows are core), so the
+   F11 open-question rule covers "what do we think?" about an attached artifact.
+3. **Pulse awareness:** pulse lines for messages with files append a bracketed note
+   (e.g. "[+1 image]") so envelope/tail context reflects attachments too.
+
+**Tests:** evaluate forwards attachments into signals; payload renders the line (and
+omits when none); image/file kind breakdown; capability line includes the analyzing
+entry; pulse line carries the attachment note; end-to-end: file_share event → dispatch
+→ signals contain the summary.
+
 ## Rollout / verification
 
 1. `make test` green after each change set (F4 → F1 → F2 → F3); `make lint` clean.

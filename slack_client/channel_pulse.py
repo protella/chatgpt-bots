@@ -59,6 +59,23 @@ def _sanitize_name(name: Optional[str]) -> str:
     return cleaned or "someone"
 
 
+def _attachment_note(files: Any) -> str:
+    """F14b: a compact bracketed note ("[+1 image]", "[+2 files]", "[+1 image, +1 file]")
+    for a pulse line whose message carried files, so envelope/tail context reflects
+    attachments too. Counts only — no filenames or content. Empty string when no files."""
+    if not files:
+        return ""
+    images = sum(1 for f in files
+                 if str((f or {}).get("mimetype", "") or "").startswith("image/"))
+    others = len(files) - images
+    parts = []
+    if images:
+        parts.append(f"+{images} image" + ("s" if images != 1 else ""))
+    if others:
+        parts.append(f"+{others} file" + ("s" if others != 1 else ""))
+    return f"[{', '.join(parts)}]" if parts else ""
+
+
 def _escape_tail_text(text: str, limit: Optional[int] = None) -> str:
     """Tail representation for a classifier entry: last `limit` chars, newlines/controls
     normalized and quotes escaped so a multi-line message can't inject a fake speaker
@@ -137,13 +154,20 @@ class ChannelPulse:
 
     def record(self, channel_id: str, *, ts: str, thread_ts: Optional[str],
                user_id: Optional[str], display_name: Optional[str],
-               sender_type: str, text: str, is_bot: bool) -> None:
+               sender_type: str, text: str, is_bot: bool,
+               files: Any = None) -> None:
         """Feed one message event into the channel's rings (idempotent by (channel, ts)).
-        DMs are excluded."""
+        DMs are excluded. F14b: `files` (if any) appends a bracketed attachment note to
+        the recorded text, so both the envelope and thread-tail rendering inherit it."""
         if not channel_id or self._is_dm(channel_id) or not ts:
             return
         if self._already_recorded(channel_id, ts):
             return
+        # F14b: fold an attachment note into the text at record level (zero-await) so the
+        # envelope line and the thread-tail entry both surface "[+1 image]" etc.
+        note = _attachment_note(files)
+        if note:
+            text = f"{text} {note}" if (text or "").strip() else note
         # Slack sets thread_ts == ts on thread roots; normalize roots/top-level to None
         norm_thread_ts = thread_ts if (thread_ts and thread_ts != ts) else None
         entry = {
@@ -241,6 +265,7 @@ class ChannelPulse:
                 sender_type=sender_type,
                 text=m.get("text", ""),
                 is_bot=sender_type != "human",
+                files=m.get("files"),
             )
         # Backfill arrives out of live order; re-sort the ring by ts once.
         buf = self._buffers.get(channel_id)
