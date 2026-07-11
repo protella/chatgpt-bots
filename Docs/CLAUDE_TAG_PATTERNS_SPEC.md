@@ -1406,6 +1406,29 @@ text to the target thread; muted-thread refusal; current-thread refusal; empty-t
 refusal; record_own_reply called with the target thread; used-tools provenance line
 includes post_to_thread; never-raises contract on Slack API failure.
 
+## F24. Reaction-preference rule (user directive 2026-07-11)
+
+**Gap (observed live):** "Hey guys, please respond to any user requests while I'm out,
+brb" — Claude Tag acknowledged with a single 👍; our bot posted a full sentence. User:
+"if a msg can be responded to with a simple reaction, that's all that's needed." The
+react verdict exists (F20) but nothing states a PREFERENCE for it when a reaction fully
+carries the reply, and "aimed at the assistant" biases the classifier toward respond.
+
+**Design (prompt-only, two layers):**
+1. PARTICIPATION_SYSTEM_PROMPT: add to the react/respond judgment — when a single
+   emoji fully carries the needed reply (a "got it" to an instruction or delegation,
+   an FYI, agreement that needs no elaboration), prefer "react" over "respond"; words
+   are for when they ADD something (information, an answer, a real question back).
+   If another person or agent has already acknowledged with a reaction, a text reply
+   restating it is noise — react likewise or stay silent.
+2. LOCAL_TOOLS_GUIDANCE (addressed turns): broaden the existing reaction-only rule
+   beyond "thanks!" to the same cases — acknowledgments, delegations, FYIs ("please
+   handle X while I'm out" → 👍 + empty text).
+No new config; the intent classifier is NOT touched (cache budget).
+
+**Tests:** prompt substrings at both layers (preference wording present; delegation/FYI
+example present; redundant-acknowledgment rule present).
+
 ## Rollout / verification
 
 1. `make test` green after each change set (F4 → F1 → F2 → F3); `make lint` clean.
