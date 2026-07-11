@@ -6,6 +6,7 @@ participation stats, feed-before-gates wiring, and flag gating.
 """
 
 import pytest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from slack_client.channel_pulse import ChannelPulse
@@ -45,6 +46,39 @@ def test_own_and_ignored_messages_still_recorded():
     p.record("C1", **_entry("2.0", text="claude said", name="Claude", sender="other_bot"))
     env = p.render_envelope("C1")
     assert "bot said" in env and "claude said" in env
+
+
+# ---------------------------------------------------------- recent_speakers (F29)
+
+def test_recent_speakers_distinct_newest_first_excludes_self():
+    p = ChannelPulse(size=10)
+    p.record("C1", **_entry("1.0", name="Alice"))
+    p.record("C1", **_entry("2.0", name="Bob"))
+    p.record("C1", **_entry("3.0", name="Alice"))                 # dupe (older instance drops)
+    p.record("C1", **_entry("4.0", name="ChatGPT", sender="self"))  # bot's own reply excluded
+    p.record("C1", **_entry("5.0", name="Claude", sender="other_bot"))  # other bot KEPT
+    assert p.recent_speakers("C1") == ["Claude", "Alice", "Bob"]
+
+
+def test_recent_speakers_respects_limit():
+    p = ChannelPulse(size=10)
+    for i in range(5):
+        p.record("C1", **_entry(f"{i}.0", name=f"U{i}"))
+    assert p.recent_speakers("C1", limit=2) == ["U4", "U3"]
+
+
+def test_recent_speakers_unknown_channel_and_dm():
+    p = ChannelPulse(size=10)
+    assert p.recent_speakers("C-nope") == []
+    p.record("D1", **_entry("1.0", name="Alice"))  # DM never recorded
+    assert p.recent_speakers("D1") == []
+
+
+def test_recent_speakers_neutralizes_bracket_names():
+    p = ChannelPulse(size=10)
+    p.record("C1", **_entry("1.0", name="Claude [bot]"))
+    # Brackets are folded so the name can't forge/close a [Channel people: …] frame.
+    assert p.recent_speakers("C1") == ["Claude (bot)"]
 
 
 # ------------------------------------------------------------------- backfill
@@ -252,6 +286,51 @@ def test_envelope_rides_suffix_not_system_prompt():
     # DM: envelope absent, time still present
     dm_suffix = proc._build_suffix_context(client, "D1", None)
     assert "[Recent channel activity" not in dm_suffix
+
+
+# ----------------------------------------------- F29 channel-people suffix line
+
+def _people_client(pulse, num_members=12):
+    client = SimpleNamespace(
+        channel_pulse=pulse,
+        get_cached_channel_context=lambda cid: {"num_members": num_members},
+    )
+    return client
+
+
+def test_channel_people_line_in_suffix():
+    proc = _bind_utils()
+    client = _people_client(_seeded_pulse(), num_members=12)
+    line = proc._build_channel_people_line(client, "C1")
+    assert line is not None
+    assert "Channel people: ~12 members; recently active:" in line
+    assert "Cara" in line and "Bob" in line   # active speakers surfaced
+    # And it rides the assembled suffix.
+    suffix = proc._build_suffix_context(client, "C1", None)
+    assert "[Channel people:" in suffix
+
+
+def test_channel_people_line_absent_pieces_skip_cleanly():
+    proc = _bind_utils()
+    # No count available (peek returns None) but speakers present → speakers-only line.
+    client = SimpleNamespace(channel_pulse=_seeded_pulse(),
+                             get_cached_channel_context=lambda cid: None)
+    line = proc._build_channel_people_line(client, "C1")
+    assert line is not None and "recently active:" in line and "members" not in line
+
+
+def test_channel_people_line_none_when_nothing_known():
+    proc = _bind_utils()
+    empty = ChannelPulse(size=5)  # no messages → no speakers
+    client = SimpleNamespace(channel_pulse=empty,
+                             get_cached_channel_context=lambda cid: None)
+    assert proc._build_channel_people_line(client, "C1") is None
+
+
+def test_channel_people_line_none_for_dm():
+    proc = _bind_utils()
+    client = _people_client(_seeded_pulse())
+    assert proc._build_channel_people_line(client, "D1") is None
     # And the envelope never appears in the system prompt builder's output — the
     # system prompt has no pulse/client access at all; assert the source contract.
     import inspect

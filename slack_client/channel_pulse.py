@@ -437,6 +437,40 @@ class ChannelPulse:
             + "\n".join(lines)
         )
 
+    # ---------------------------------------------------------- people (F29)
+
+    def recent_speakers(self, channel_id: str, limit: int = 8) -> List[str]:
+        """F29: distinct human-readable sender names from the channel ring, newest-first,
+        EXCLUDING the bot's own posts (sender_type == 'self'). Other bots/agents (e.g. a
+        second assistant) are kept — they're real participants. Names are neutralized the
+        same way the classifier tail neutralizes them (no bracket/control-char spoofing).
+
+        Pure in-memory, zero-await, never raises; [] for an unknown channel or a DM."""
+        try:
+            buf = self._buffers.get(channel_id)
+            if not buf:
+                return []
+            seen: set = set()
+            names: List[str] = []
+            cap = max(1, int(limit))
+            for e in reversed(buf):  # newest-first
+                if e.get("sender_type") == "self":
+                    continue
+                raw = e.get("display_name")
+                if not (raw or "").strip():
+                    continue
+                name = _sanitize_name(raw)
+                key = name.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                names.append(name)
+                if len(names) >= cap:
+                    break
+            return names
+        except Exception:
+            return []
+
     # -------------------------------------------------------------- envelope
 
     def render_envelope(self, channel_id: str, exclude_thread_ts: Optional[str] = None,

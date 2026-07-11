@@ -13,6 +13,7 @@ from logger import log_session_start, log_session_end, main_logger
 from message_processor.base import MessageProcessor
 from message_processor.participation import (ParticipationEngine,
                                              render_capabilities_line)
+from message_processor.people_tools import format_people_summary
 from base_client import BaseClient, Message
 
 
@@ -115,13 +116,26 @@ class ChatBotV2:
                 memory_facts = []
 
             channel_topic = None
+            num_members = None
             fetch_ctx = getattr(client, "get_channel_context", None)
             if fetch_ctx:
                 try:
                     ctx = await fetch_ctx(channel_id)
                     channel_topic = (ctx or {}).get("topic") or None
+                    num_members = (ctx or {}).get("num_members")
                 except Exception:
                     channel_topic = None
+                    num_members = None
+
+            # F29: people signal — member count + recently active names (from the pulse ring)
+            # — so the classifier can resolve WHO a message (and its "you") is aimed at.
+            recent_names = []
+            if pulse is not None:
+                try:
+                    recent_names = pulse.recent_speakers(channel_id)
+                except Exception:
+                    recent_names = []
+            channel_people = format_people_summary(num_members, recent_names)
 
             is_thread_reply = bool(ts and message.thread_id and message.thread_id != ts)
             # F11: inventory of the assistant's own tools/data sources so the classifier
@@ -138,6 +152,7 @@ class ChatBotV2:
                 name_hit=name_hit,
                 sender_is_bot=message.metadata.get("participation_sender_bot") is True,
                 channel_topic=channel_topic,
+                channel_people=channel_people,
                 capabilities=capabilities,
                 attachments=message.metadata.get("participation_attachments"),
                 pulse=pulse, thread_root_ts=message.thread_id,

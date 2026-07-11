@@ -120,6 +120,20 @@ async def test_sender_is_bot_signal_renders_judgment_line():
 
 
 @pytest.mark.asyncio
+async def test_channel_people_signal_renders_and_skips_cleanly():
+    # F29: the people signal surfaces who's around; absent, the line stays out.
+    llm = _FakeLLM(text='{"action": "ignore"}')
+    await classify_participation(llm, "msg", signals={
+        "channel_people": "~12 members; recently active: Erin Evans, Claude"})
+    prompt = llm.captured_input[1]["content"]
+    assert "Channel people (who's around): ~12 members; recently active: Erin Evans, Claude" in prompt
+
+    llm2 = _FakeLLM(text='{"action": "ignore"}')
+    await classify_participation(llm2, "msg", signals={})
+    assert "Channel people" not in llm2.captured_input[1]["content"]
+
+
+@pytest.mark.asyncio
 async def test_f17_utility_output_floor_is_1024():
     # F17: the utility output ceiling is 1024 on every utility call site — the
     # participation classifier, the memory extractor, and the tool-result summarizer.
@@ -176,6 +190,22 @@ def test_prompt_carries_second_person_continuity_rule():
     from prompts import PARTICIPATION_SYSTEM_PROMPT
     assert '"You" belongs to whoever the sender has been talking to' in PARTICIPATION_SYSTEM_PROMPT
     assert "helpful third voice" in PARTICIPATION_SYSTEM_PROMPT
+
+
+def test_prompt_carries_channel_people_rule():
+    # F29: the people signal is teaching material for addressee resolution — names there
+    # are real, distinct participants; an unknown name is never assumed to be the assistant.
+    from prompts import PARTICIPATION_SYSTEM_PROMPT
+    assert "Channel people" in PARTICIPATION_SYSTEM_PROMPT
+    assert "never assume an unknown name is the assistant" in PARTICIPATION_SYSTEM_PROMPT
+
+
+def test_local_tools_guidance_carries_people_tools():
+    # F29: the main model is taught both tools and the discoverability + freshness lessons.
+    from prompts import LOCAL_TOOLS_GUIDANCE
+    for needle in ("lookup_user", "list_channel_members", "who is X",
+                   "never need their Slack id", "THIS turn"):
+        assert needle in LOCAL_TOOLS_GUIDANCE
 
 
 def test_participation_uses_dedicated_reasoning_effort():
