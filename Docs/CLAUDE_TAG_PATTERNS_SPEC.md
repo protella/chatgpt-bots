@@ -1767,3 +1767,10 @@ Design (Claude parity — the model authors its own todo list):
 Slack facts (answered same turn): the "Show more/Show less" collapse is Slack's own
 long-message truncation — no API control; the fix is a shorter card. The "(edited)" badge
 stays suppressed: milestones/counters are blocks-only updates on a constant fallback text.
+
+Follow-up (same evening): the byline still truncated — the full restated task never fits the
+~30-char gist budget inside Slack's 50-char username cap. Claude's bracket tag is a short
+TOPIC, not the task: start_deep_research gained an optional `label` param (2-5 words, <30
+chars); card + findings bylines prefer it over the task gist (fallback unchanged,
+bracket-safe either way). Live-verified: "ChatGPT [research: 2026 US egg outlook]" (39
+chars, whole) on the card and every findings chunk — one byline, one facepile icon.
