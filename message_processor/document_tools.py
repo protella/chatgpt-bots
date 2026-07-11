@@ -220,8 +220,18 @@ async def execute_read_document(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
         base["query"] = query
         base["matches"] = matches
         if not matches:
-            base["note"] = ("No literal match; try a shorter or different term, "
-                            "or read sequentially with offset.")
+            # F25: a literal-substring miss must not dead-end the call — hand back the
+            # document start (the whole document when it fits one slice) so the model
+            # can answer or navigate instead of concluding the value isn't in the file.
+            base["content"] = text[:SLICE_CHARS]
+            base["has_more"] = SLICE_CHARS < total
+            if base["has_more"]:
+                base["next_offset"] = SLICE_CHARS
+                base["note"] = ("No literal match for the query; the document START is "
+                                "included — read on with offset or retry a shorter term.")
+            else:
+                base["note"] = ("No literal match for the query; the FULL document "
+                                "content is included above.")
         return base
 
     start = max(0, int(offset or 0))

@@ -1455,6 +1455,12 @@ only because the filename had been typed verbatim in a visible message.
 4. history tool message rendering: append "[files: name, …]" to messages that carry
    files (same sanitization), so fetch_thread_messages/fetch_channel_history reveal
    names.
+5. Query miss must not dead-end (2nd field test: read_document → ok, but
+   query="backup vendor code" had no literal match against "Backup vendor: … (code
+   MF-2210)" and the model accepted the empty result as "not in the document"): a
+   no-match query response now INCLUDES the document start as content (the whole
+   document when it fits one slice), with has_more/next_offset navigation — one call
+   always yields something answerable.
 No resolver changes — F22's lookup order and privacy boundary untouched.
 
 **Tests:** attachment note renders single/multiple names, sanitizes hostile names,
