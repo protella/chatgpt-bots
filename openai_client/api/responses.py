@@ -7,7 +7,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 from config import config, clamp_effort
 from prompts import (INTENT_CLASSIFIER_PROMPT, MEMORY_EXTRACTION_SYSTEM_PROMPT,
-                     PARTICIPATION_SYSTEM_PROMPT, WAKE_CLASSIFIER_SYSTEM_PROMPT)
+                     PARTICIPATION_SYSTEM_PROMPT, TOOL_RESULT_SUMMARIZE_PROMPT,
+                     WAKE_CLASSIFIER_SYSTEM_PROMPT)
 
 
 def _capture_usage(usage_sink, response):
@@ -1129,6 +1130,51 @@ async def extract_memory(self, exchange_text: str, existing_memory: Optional[Lis
     except Exception as e:
         self.log_warning(f"Memory extraction failed ({e}); skipping write")
         return {"action": "none"}
+
+
+async def summarize_tool_result(self, text: str, max_chars: int) -> Optional[str]:
+    """F16: compress ONE overlong MCP tool output to a single line under ``max_chars``,
+    preserving URLs/titles/dates/figures/IDs verbatim (utility model, low effort).
+
+    Best-effort and NON-BLOCKING for the reply pipeline: returns the summary string, or
+    ``None`` on any error/timeout/empty output so the caller falls back to today's
+    truncation. Never raises. The caller applies the input-char budget guard before
+    calling, so ``text`` is already bounded."""
+    conversation_messages = [
+        {"role": "developer", "content": TOOL_RESULT_SUMMARIZE_PROMPT.format(max_chars=max_chars)},
+        {"role": "user", "content": f"Tool output:\n{text}\n\nRespond with ONLY the single-line summary."},
+    ]
+
+    request_params = {
+        "model": config.utility_model,
+        "input": conversation_messages,
+        "max_output_tokens": max(512, config.utility_max_tokens),
+        "store": False,
+    }
+    # Utility model is a GPT-5-series reasoning model; temperature fixed to 1.0. Low effort
+    # per F16 — enough to summarize while preserving verbatim spans, without burning latency.
+    request_params["temperature"] = 1.0
+    request_params["reasoning"] = {"effort": clamp_effort(config.utility_model, "low")}
+    request_params["text"] = {"verbosity": config.utility_verbosity}
+
+    try:
+        response = await self._safe_api_call(
+            self.client.responses.create,
+            operation_type="intent_classification",
+            **request_params,
+        )
+        result = ""
+        if response.output:
+            for item in response.output:
+                if hasattr(item, "content") and item.content:
+                    for content in item.content:
+                        if hasattr(content, "text"):
+                            result += content.text
+        result = result.strip()
+        return result or None
+    except Exception as e:
+        self.log_warning(f"Tool-result summarization failed ({e}); falling back to truncation")
+        return None
 
 
 async def classify_intent(

@@ -1090,6 +1090,56 @@ called, result stored once, under cap, rebuild renders the STORED text (no re-su
 on rebuild); summarizer failure → truncation fallback with marker; flag off → today's
 behavior; input guard applied; URLs/figures asserted preserved in the prompt contract.
 
+## F17. Uncapped conversational participation + teammate voice (user directives 2026-07-11)
+
+**Rationale (user, with Claude Tag screenshots from #tech-coding-with-ai):** Claude
+banters with the team across a multi-person thread — witty, brief, self-aware
+("Somebody had to. The leaderboard said 1st — I just followed the data 🙂"; "1st among
+the machines — I'll take 'best of a flawed generation'") — without being re-named each
+message and without any numeric ceiling. Our model: 1:1 thread continuations already
+bypass the gate (direct_continuation), but MULTI-person conversation routes every
+message through the engine and each un-named reply burns the hourly cap. User: "this
+needs to be supported without cap — the classifier can determine if it should respond";
+frontier models won't run away unless asked. Also: adopt that voice as the bot's own.
+
+**Design:**
+1. **Remove the hourly-cap hard rail entirely.** Delete the `over_throttle` pre-gate
+   check (main.py) and `ParticipationEngine.hourly_cap`/`over_throttle`
+   (participation.py). Pacing is judgment: keep counting unprompted replies (pulse) and
+   keep feeding the count to the classifier as a signal, reworded without cap language:
+   "Assistant's unprompted replies in this channel in the last hour: N" — the existing
+   "if it has spoken recently and adds only marginal value, ignore" rule is the pacing.
+   `MAX_UNPROMPTED_REPLIES_PER_HOUR` is removed from config; .env.example entry deleted
+   (one-line note in the commit message; anti-loop protection remains: bot-sender
+   judgment rules + F5 other-bot tail check are untouched).
+2. **Signal-context numbers (user-decided):** `PARTICIPATION_THREAD_TAIL` 6 → **15**
+   (busy threads out-chatter 6 lines; match the envelope); `PULSE_TEXT_TRUNCATE` 300 →
+   **500** and `PULSE_TAIL_TEXT_TRUNCATE` 400 → **500** (both are "up to" caps — short
+   messages unaffected).
+3. **Utility output floor 512 → 1024** (openai_client/api/responses.py, both `max(512,`
+   sites): it is a CEILING on generation, not a spend — you pay only for tokens
+   actually produced, and a verdict cut off mid-reasoning manifests as unjustified
+   silence (fail-safe = ignore). 1024 removes the cutoff class outright.
+4. **Teammate voice (SLACK_SYSTEM_PROMPT):** revise the Voice paragraph and add a
+   banter clause, reconciled with the existing "sharp coworker" base: a personable
+   teammate, not an assistant-at-a-desk; when the room is bantering — including teasing
+   aimed at the bot — reply in kind: brief, witty, one beat, matching the room's
+   energy; light self-aware humor about being a bot lands well; never force a joke,
+   never do bits when someone needs real help; brevity is the soul of channel-level
+   wit (one line beats three). Keep the existing truthfulness/precision rules intact —
+   playful register never licenses invented facts.
+5. **Classifier follows suit (PARTICIPATION_SYSTEM_PROMPT):** one line — playful
+   banter or teasing genuinely directed AT the assistant is a respond case (a short
+   quip is the value) or a react; it is not "marginal value" to ignore. Addressee rules
+   still dominate (banter between humans stays theirs).
+
+**Tests:** over_throttle/hourly_cap gone (gate never silences on count; grep-level +
+behavior test: 40 unprompted replies recorded, next message still reaches the engine);
+signal line rendered without cap phrasing; config removals clean (no dangling
+references); tail default 15 / truncation 500s wired with env overrides; utility floor
+1024 on both call sites; prompt clauses present (voice banter + classifier banter);
+existing anti-loop rules untouched (bot-sender signal line still rendered).
+
 ## Rollout / verification
 
 1. `make test` green after each change set (F4 → F1 → F2 → F3); `make lint` clean.

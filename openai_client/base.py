@@ -467,6 +467,12 @@ class OpenAIClient(LoggerMixin):
         conservative — any failure → {"action": "none"} (no write)."""
         return await responses_api.extract_memory(self, exchange_text=exchange_text, existing_memory=existing_memory)
 
+    async def summarize_tool_result(self, text: str, max_chars: int) -> Optional[str]:
+        """F16: compress ONE overlong MCP tool output to a single line under max_chars,
+        preserving URLs/titles/dates/figures/IDs verbatim. Returns None on any failure
+        (caller falls back to truncation); never raises."""
+        return await responses_api.summarize_tool_result(self, text=text, max_chars=max_chars)
+
     async def _safe_api_call(
         self,
         api_method: Callable,

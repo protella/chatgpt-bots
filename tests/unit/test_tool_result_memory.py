@@ -406,3 +406,158 @@ def test_prompt_has_tool_results_trust_instruction():
     assert "[tool results:" in SLACK_SYSTEM_PROMPT
     # the retraction half is present
     assert "never retract" in SLACK_SYSTEM_PROMPT.lower()
+
+
+# ------------------------------------------------------- F16 digest summarization
+
+def _summarizer_client(**kwargs):
+    """A fake openai_client exposing only the async summarize_tool_result hook F16 uses."""
+    client = MagicMock()
+    client.summarize_tool_result = AsyncMock(**kwargs)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_f16_short_output_stored_verbatim_no_utility_call():
+    # Output already under the cap: stored verbatim, summarizer NEVER invoked.
+    client = _summarizer_client(return_value="unused")
+    out = await tp.build_result_digests_summarized(
+        [{"tool_name": "reportpro", "output": "Ice Cream 2025-12-10 link=http://x/1"}],
+        client, per_call_chars=2000, per_turn_chars=6000, input_chars=20000)
+    assert out == [{"tool_name": "reportpro",
+                    "result_digest": "Ice Cream 2025-12-10 link=http://x/1"}]
+    client.summarize_tool_result.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_f16_long_output_summarized_once_under_cap_single_line():
+    summary = "Ice Cream report 2025-12-10 p.25 link=http://x/14813"
+    client = _summarizer_client(return_value=summary)
+    out = await tp.build_result_digests_summarized(
+        [{"tool_name": "reportpro", "output": "y" * 5000}],
+        client, per_call_chars=100, per_turn_chars=6000, input_chars=20000)
+    assert client.summarize_tool_result.call_count == 1
+    digest = out[0]["result_digest"]
+    assert digest == summary
+    assert len(digest) <= 100
+    assert "\n" not in digest
+    assert tp.TRUNCATION_MARKER not in digest  # summarized, not cut
+
+
+@pytest.mark.asyncio
+async def test_f16_summary_newlines_flattened_to_single_line():
+    client = _summarizer_client(return_value="line one\nline two\rlink=http://x/1")
+    out = await tp.build_result_digests_summarized(
+        [{"tool_name": "srv", "output": "z" * 5000}],
+        client, per_call_chars=200, per_turn_chars=6000, input_chars=20000)
+    assert out[0]["result_digest"] == "line one line two link=http://x/1"
+
+
+@pytest.mark.asyncio
+async def test_f16_rebuild_renders_stored_text_without_resummarizing():
+    client = _summarizer_client(return_value="kept 2025-12-10 link=http://x/1")
+    out = await tp.build_result_digests_summarized(
+        [{"tool_name": "reportpro", "output": "q" * 5000}],
+        client, per_call_chars=100, per_turn_chars=6000, input_chars=20000)
+    assert client.summarize_tool_result.call_count == 1
+    # Rendering the STORED digest is a pure function — repeated renders are identical and
+    # never re-invoke the summarizer (summarization happened once at persist time, F7-5).
+    first = tp.render_tool_results_annotation(out)
+    second = tp.render_tool_results_annotation(out)
+    assert first == second == "[tool results: reportpro → kept 2025-12-10 link=http://x/1]"
+    assert client.summarize_tool_result.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_f16_summarizer_raises_falls_back_to_truncation():
+    client = _summarizer_client(side_effect=TimeoutError("boom"))
+    out = await tp.build_result_digests_summarized(
+        [{"tool_name": "srv", "output": "y" * 5000}],
+        client, per_call_chars=100, per_turn_chars=6000, input_chars=20000)
+    digest = out[0]["result_digest"]
+    assert digest == "y" * 100 + tp.TRUNCATION_MARKER
+
+
+@pytest.mark.asyncio
+async def test_f16_summarizer_returns_none_falls_back_to_truncation():
+    client = _summarizer_client(return_value=None)
+    out = await tp.build_result_digests_summarized(
+        [{"tool_name": "srv", "output": "y" * 5000}],
+        client, per_call_chars=100, per_turn_chars=6000, input_chars=20000)
+    assert out[0]["result_digest"] == "y" * 100 + tp.TRUNCATION_MARKER
+
+
+@pytest.mark.asyncio
+async def test_f16_overlong_summary_falls_back_to_truncation():
+    # A summary that still overshoots the cap is a failed summary: truncate the ORIGINAL.
+    client = _summarizer_client(return_value="s" * 500)
+    out = await tp.build_result_digests_summarized(
+        [{"tool_name": "srv", "output": "y" * 5000}],
+        client, per_call_chars=100, per_turn_chars=6000, input_chars=20000)
+    assert out[0]["result_digest"] == "y" * 100 + tp.TRUNCATION_MARKER
+
+
+@pytest.mark.asyncio
+async def test_f16_input_guard_caps_chars_fed_to_summarizer():
+    client = _summarizer_client(return_value="short link=http://x/1")
+    await tp.build_result_digests_summarized(
+        [{"tool_name": "srv", "output": "y" * 30000}],
+        client, per_call_chars=2000, per_turn_chars=6000, input_chars=20000)
+    (text_arg, max_arg), _ = client.summarize_tool_result.call_args
+    assert len(text_arg) == 20000            # fed at most the first input_chars
+    assert max_arg == 2000                    # asked to compress under the per-call cap
+
+
+@pytest.mark.asyncio
+async def test_f16_per_turn_budget_counts_summaries_in_capture_order():
+    # Two summarized digests (60 chars each) fill a 100-char turn budget; the third stores none.
+    client = _summarizer_client(return_value="s" * 60)
+    out = await tp.build_result_digests_summarized(
+        [{"tool_name": "a", "output": "y" * 5000},
+         {"tool_name": "b", "output": "y" * 5000},
+         {"tool_name": "c", "output": "y" * 5000}],
+        client, per_call_chars=200, per_turn_chars=100, input_chars=20000)
+    assert [e["tool_name"] for e in out] == ["a", "b"]
+
+
+def test_f16_flag_off_pure_truncation_no_client():
+    # Flag off (config.enable_tool_result_summarization) → text.py calls the pure sync
+    # builder, which takes no client and simply truncates — today's behavior preserved.
+    out = tp.build_result_digests(
+        [{"tool_name": "srv", "output": "y" * 5000}], per_call_chars=100, per_turn_chars=6000)
+    assert out[0]["result_digest"] == "y" * 100 + tp.TRUNCATION_MARKER
+
+
+@pytest.mark.asyncio
+async def test_f16_summarize_tool_result_method_wires_utility_call():
+    """The openai_client hook feeds the verbatim-preservation prompt + low effort to the
+    utility model and returns the model's single-line text (None on failure)."""
+    from openai_client.api import responses as R
+
+    fake = MagicMock()
+    fake.log_info = fake.log_debug = fake.log_warning = fake.log_error = lambda *a, **k: None
+    resp = SimpleNamespace(
+        output=[SimpleNamespace(content=[SimpleNamespace(text="Ice Cream link=http://x/1")])])
+    fake._safe_api_call = AsyncMock(return_value=resp)
+
+    result = await R.summarize_tool_result(fake, text="y" * 5000, max_chars=2000)
+    assert result == "Ice Cream link=http://x/1"
+    params = fake._safe_api_call.call_args.kwargs
+    assert params["model"] == config.utility_model
+    assert params["reasoning"]["effort"] == "low"       # F16: low effort
+    assert params["store"] is False
+    dev = params["input"][0]["content"]
+    assert "Preserve verbatim every URL, report title, date, figure, and ID" in dev
+
+    # Any API error → None (caller truncates instead).
+    fake._safe_api_call = AsyncMock(side_effect=RuntimeError("timeout"))
+    assert await R.summarize_tool_result(fake, text="y" * 5000, max_chars=2000) is None
+
+
+def test_f16_summarize_prompt_has_verbatim_preservation_contract():
+    from prompts import TOOL_RESULT_SUMMARIZE_PROMPT
+    assert "Preserve verbatim every URL, report title, date, figure, and ID" in TOOL_RESULT_SUMMARIZE_PROMPT
+    assert "SINGLE LINE" in TOOL_RESULT_SUMMARIZE_PROMPT
+    # {max_chars} is filled at call time from the per-call cap
+    assert "{max_chars}" in TOOL_RESULT_SUMMARIZE_PROMPT
+    assert "2000 characters" in TOOL_RESULT_SUMMARIZE_PROMPT.format(max_chars=2000)
