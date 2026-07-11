@@ -601,6 +601,10 @@ class BotConfig:
     # read_document tool: on-demand document access (download from Slack CDN -> extract in
     # memory -> return the requested slice). The DB holds summary + metadata + ref only.
     enable_read_document_tool: bool = field(default_factory=lambda: os.getenv("ENABLE_READ_DOCUMENT_TOOL", "true").lower() == "true")
+    # Per-tool timeout for read_document, overriding the generic tool_call_timeout (20s): it may
+    # download + render + OCR a scanned PDF, whose worst case (ocr_max_pages x ~3-5 s/page at 300
+    # DPI, plus poppler render) far exceeds 20s. Default 120s covers a 20-page scan comfortably.
+    read_document_timeout: float = field(default_factory=lambda: float(os.getenv("READ_DOCUMENT_TIMEOUT", "120.0")))
     # Process-lifetime LRU of extracted document text (never persisted) so iterating on one
     # document doesn't re-download/re-extract per question.
     doc_extraction_cache_size: int = field(default_factory=lambda: int(os.getenv("DOC_EXTRACTION_CACHE_SIZE", "20")))

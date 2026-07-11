@@ -47,11 +47,16 @@ class ToolRegistry:
         schema: Dict[str, Any],
         executor: Executor,
         enabled: Optional[Callable[[dict], bool]] = None,
+        timeout: Optional[float] = None,
     ) -> None:
         name = schema.get("name")
         if not name:
             raise ValueError("Tool schema must have a 'name'")
-        self._tools[name] = {"schema": schema, "executor": executor, "enabled": enabled}
+        # timeout=None → the shared config.tool_call_timeout. A tool with a heavier
+        # worst case (e.g. read_document, which may download + render + OCR a scan)
+        # sets its own longer bound so the generic 20s cap can't abort it.
+        self._tools[name] = {"schema": schema, "executor": executor,
+                             "enabled": enabled, "timeout": timeout}
 
     def schemas(self, thread_config: Optional[dict] = None) -> List[Dict[str, Any]]:
         """Schemas of the tools enabled for this request (a failing gate hides the tool)."""
@@ -84,13 +89,14 @@ class ToolRegistry:
         if not isinstance(args, dict):
             return {"ok": False, "error": "bad_arguments", "message": "Arguments must be a JSON object."}
 
+        timeout = tool.get("timeout")
+        if timeout is None:
+            timeout = config.tool_call_timeout
         try:
-            return await asyncio.wait_for(
-                tool["executor"](ctx, args), timeout=config.tool_call_timeout
-            )
+            return await asyncio.wait_for(tool["executor"](ctx, args), timeout=timeout)
         except asyncio.TimeoutError:
             return {"ok": False, "error": "timeout",
-                    "message": f"Tool '{name}' timed out after {config.tool_call_timeout:.0f}s."}
+                    "message": f"Tool '{name}' timed out after {timeout:.0f}s."}
         except Exception as e:  # noqa: BLE001 — a tool bug must not kill the response
             return {"ok": False, "error": "execution_error", "message": str(e)[:500]}
 

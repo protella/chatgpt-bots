@@ -248,4 +248,7 @@ async def execute_read_document(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
 
 def register_document_tools(registry: ToolRegistry) -> None:
     """Register read_document (gated on ENABLE_READ_DOCUMENT_TOOL by the caller)."""
-    registry.register(get_read_document_schema(), execute_read_document)
+    # Longer per-tool timeout than the generic 20s: a scanned-PDF read may download +
+    # render + OCR, which the shared cap would abort before the ExtractionCache ever fills.
+    registry.register(get_read_document_schema(), execute_read_document,
+                      timeout=config.read_document_timeout)

@@ -116,6 +116,13 @@ class DocumentHandler(LoggerMixin):
         test enforces the routing table itself. The executor offload matters doubly
         for ocr_text=True: OCR is subprocess+CPU heavy and must not block the loop.
         """
+        # OCR (subprocess + CPU per page) blows past the 30s non-OCR cap on real scans,
+        # so widen the inner executor timeout to match the worst case the outer per-tool
+        # timeout now permits — otherwise this cap would abort an OCR run the tool allows.
+        extraction_timeout = EXTRACTION_TIMEOUT_SECONDS
+        if ocr_text:
+            extraction_timeout = max(EXTRACTION_TIMEOUT_SECONDS,
+                                     30 + config.ocr_max_pages * 5)
         loop = asyncio.get_running_loop()
         try:
             return await asyncio.wait_for(
@@ -125,16 +132,16 @@ class DocumentHandler(LoggerMixin):
                                                       ocr_images=ocr_images,
                                                       ocr_text=ocr_text),
                 ),
-                timeout=EXTRACTION_TIMEOUT_SECONDS,
+                timeout=extraction_timeout,
             )
         except asyncio.TimeoutError:
-            self.log_error(f"Extraction timed out after {EXTRACTION_TIMEOUT_SECONDS}s for {filename}")
+            self.log_error(f"Extraction timed out after {extraction_timeout}s for {filename}")
             return {
                 'content': f'[Unable to parse {filename} - extraction timed out]',
                 'filename': filename,
                 'mime_type': mime_type,
                 'size_bytes': len(file_data),
-                'error': f'Extraction timed out after {EXTRACTION_TIMEOUT_SECONDS}s',
+                'error': f'Extraction timed out after {extraction_timeout}s',
                 'format': 'error',
             }
     def is_document_file(self, filename: str, mimetype: Optional[str] = None) -> bool:
