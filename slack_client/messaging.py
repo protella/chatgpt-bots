@@ -470,8 +470,11 @@ class SlackMessagingMixin:
             else:
                 _set_attached(False)  # split replies never attach the footer
                 # Split into multiple messages, "Continued..." style (shared markers so
-                # the rebuild-side stripper always recognizes them). One chunk failing
-                # must not abort the rest.
+                # the rebuild-side stripper always recognizes them). A failed chunk is
+                # retried once (honoring a rate-limit Retry-After); if it STILL fails the
+                # remainder is ABORTED — later chunks around a hole read worse than an
+                # honest cut — and a loud truncation note posts in its place. Silent
+                # partial delivery is never acceptable (Codex review find).
                 chunks = self._split_message(formatted_text)
                 last = len(chunks) - 1
                 first_ts = None
@@ -481,15 +484,46 @@ class SlackMessagingMixin:
                         body = f"{CONTINUATION_HEAD}\n\n{body}"
                     if i < last:
                         body = f"{body}{continuation_trailer()}"
-                    try:
-                        chunk_kwargs = dict(channel=channel_id, thread_ts=thread_id, text=body)
-                        if username:
-                            chunk_kwargs["username"] = username  # F30: labelled findings
-                        result = await self.app.client.chat_postMessage(**chunk_kwargs)
-                        if first_ts is None:
-                            first_ts = result.get("ts")
-                    except SlackApiError as chunk_error:
-                        self.log_error(f"Error sending message chunk {i + 1}/{last + 1}: {chunk_error}")
+                    chunk_kwargs = dict(channel=channel_id, thread_ts=thread_id, text=body)
+                    if username:
+                        chunk_kwargs["username"] = username  # F30: labelled findings
+                    posted = False
+                    for attempt in (1, 2):
+                        try:
+                            result = await self.app.client.chat_postMessage(**chunk_kwargs)
+                            if first_ts is None:
+                                first_ts = result.get("ts")
+                            posted = True
+                            break
+                        except SlackApiError as chunk_error:
+                            self.log_error(
+                                f"Error sending message chunk {i + 1}/{last + 1} "
+                                f"(attempt {attempt}/2): {chunk_error}")
+                            if attempt == 2:
+                                break
+                            # Honor Slack's Retry-After on 429s; brief pause otherwise.
+                            delay = 1.0
+                            try:
+                                delay = float(getattr(chunk_error, "response", None)
+                                              .headers.get("Retry-After", 1))
+                            except Exception:
+                                pass
+                            await asyncio.sleep(min(max(delay, 0.5), 30.0))
+                    if not posted:
+                        missing = last + 1 - i
+                        self.log_error(
+                            f"Aborting split post after chunk {i + 1}/{last + 1} failed twice — "
+                            f"{missing} part(s) not delivered")
+                        if meta_out is not None:
+                            meta_out["split_truncated"] = True
+                        try:
+                            await self.app.client.chat_postMessage(
+                                channel=channel_id, thread_ts=thread_id,
+                                text=(f"⚠️ This message was cut off — the remaining {missing} "
+                                      f"part(s) failed to post to Slack."))
+                        except SlackApiError:
+                            pass  # posting is broken; the ERROR log above stays loud
+                        break
                 # Record the full reply once, keyed on the first chunk's ts.
                 self._record_own_reply_pulse(channel_id, thread_id, first_ts, text)
                 return first_ts
