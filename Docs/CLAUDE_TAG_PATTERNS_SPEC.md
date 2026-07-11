@@ -1429,6 +1429,39 @@ No new config; the intent classifier is NOT touched (cache budget).
 **Tests:** prompt substrings at both layers (preference wording present; delegation/FYI
 example present; redundant-acknowledgment rule present).
 
+## F25. Document discoverability for channel-wide access (live find 2026-07-11)
+
+**Gap (observed live, first F22 field test):** asked for "the backup vendor code in
+that vendor contract pdf from the review thread", the bot tried search_slack (unavail),
+fetched history, and gave up WITHOUT calling read_document — wrongly reporting the
+value unknowable. Three compounding causes: (1) read_document's schema/hint say to use
+"the filename or file_id from the document summary in context" — a fresh thread has no
+summary, so the model correctly concluded the tool didn't apply; (2) pulse attachment
+notes are counts only ("[+1 file]", F14b) — no filename to pass; (3) the history tool
+renders messages only, skipping file names. The one earlier cross-thread success worked
+only because the filename had been typed verbatim in a visible message.
+
+**Design:**
+1. Pulse `_attachment_note` includes filenames (F14b revision): "[+1 file: q2_units.csv]",
+   "[+2 files: a.pdf, b.docx]" — sanitized (strip brackets/backticks/newlines), each name
+   truncated ~48 chars, at most 3 named then "+N more". Envelope and thread-tail lines
+   inherit automatically.
+2. read_document schema description + document_not_found hint: the filename may come
+   from ANYWHERE in this channel (an attachment note, an earlier thread, the
+   known_documents list) — no summary needed; the tool searches the whole channel.
+3. LOCAL_TOOLS_GUIDANCE read_document bullet: state cross-thread reads explicitly —
+   "a file shared in another thread of this channel is readable too: call read_document
+   with its filename".
+4. history tool message rendering: append "[files: name, …]" to messages that carry
+   files (same sanitization), so fetch_thread_messages/fetch_channel_history reveal
+   names.
+No resolver changes — F22's lookup order and privacy boundary untouched.
+
+**Tests:** attachment note renders single/multiple names, sanitizes hostile names,
+truncates and caps at 3+N; envelope/tail line carries the named note; schema + hint +
+guidance substrings; history-tool line includes file names; no-files messages
+unchanged.
+
 ## Rollout / verification
 
 1. `make test` green after each change set (F4 → F1 → F2 → F3); `make lint` clean.

@@ -59,10 +59,22 @@ def _sanitize_name(name: Optional[str]) -> str:
     return cleaned or "someone"
 
 
+def _safe_filename(name: Any) -> str:
+    """F25: a filename rendered into a context line — strip characters that could break
+    the bracketed note or spoof another line (brackets/backticks/quotes/newlines),
+    truncate to a sane display length."""
+    cleaned = "".join(ch for ch in str(name or "")
+                      if ch.isprintable() and ch not in "[]`\"'\n\r")
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:48]
+
+
 def _attachment_note(files: Any) -> str:
-    """F14b: a compact bracketed note ("[+1 image]", "[+2 files]", "[+1 image, +1 file]")
-    for a pulse line whose message carried files, so envelope/tail context reflects
-    attachments too. Counts only — no filenames or content. Empty string when no files."""
+    """F14b/F25: a compact bracketed note for a pulse line whose message carried files,
+    so envelope/tail context reflects attachments too — WITH filenames (F25: names are
+    what read_document needs to reach a file from another thread; counts alone left the
+    model unable to name a cross-thread document). At most 3 names, then "+N more".
+    Empty string when no files."""
     if not files:
         return ""
     images = sum(1 for f in files
@@ -73,7 +85,15 @@ def _attachment_note(files: Any) -> str:
         parts.append(f"+{images} image" + ("s" if images != 1 else ""))
     if others:
         parts.append(f"+{others} file" + ("s" if others != 1 else ""))
-    return f"[{', '.join(parts)}]" if parts else ""
+    if not parts:
+        return ""
+    names = [n for n in (_safe_filename((f or {}).get("name")) for f in files) if n]
+    label = ", ".join(parts)
+    if names:
+        shown = ", ".join(names[:3])
+        more = f", +{len(names) - 3} more" if len(names) > 3 else ""
+        return f"[{label}: {shown}{more}]"
+    return f"[{label}]"
 
 
 def _escape_tail_text(text: str, limit: Optional[int] = None) -> str:

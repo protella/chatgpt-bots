@@ -68,22 +68,25 @@ def get_read_document_schema() -> Dict[str, Any]:
         "type": "function",
         "name": "read_document",
         "description": (
-            "Read the full content of a document shared in this channel (current conversation "
-            "checked first). Document "
-            "summaries in context are SUMMARIES — use this tool whenever you need specific "
-            "figures, quotes, table values, or sections a summary doesn't literally contain. "
-            "Provide query to search inside the document, or offset to read sequentially."
+            "Read the full content of a document shared ANYWHERE in this channel — the current "
+            "conversation is checked first, then every other thread. No summary needs to be in "
+            "context: a filename seen in an attachment note (\"[+1 file: report.pdf]\"), in "
+            "fetched history, or mentioned in chat is enough. Document summaries in context are "
+            "SUMMARIES — use this tool whenever you need specific figures, quotes, table values, "
+            "or sections a summary doesn't literally contain. Provide query to search inside the "
+            "document, or offset to read sequentially."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "file_id": {
                     "type": "string",
-                    "description": "Slack file id from the document summary header (preferred).",
+                    "description": "Slack file id from the document summary header (preferred when known).",
                 },
                 "filename": {
                     "type": "string",
-                    "description": "Document filename (used when file_id is unknown).",
+                    "description": "Document filename — from a summary, an attachment note, fetched "
+                                   "history, or chat (used when file_id is unknown).",
                 },
                 "query": {
                     "type": "string",
@@ -174,7 +177,8 @@ async def execute_read_document(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
         known = [d.get("filename") for d in (channel_docs or docs or [])][-5:]
         return {"ok": False, "error": "document_not_found",
                 "known_documents": known,
-                "hint": "Use the filename or file_id from the document summary in context."}
+                "hint": "Pass a filename from known_documents, an attachment note, or fetched "
+                        "history — any file shared in this channel is reachable, no summary needed."}
 
     doc_file_id = doc.get("file_id")
     url_private = doc.get("url_private")
