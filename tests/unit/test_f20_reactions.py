@@ -43,6 +43,25 @@ def test_local_tools_guidance_softened():
     assert "one emoji per target message" in g
 
 
+# ------------------------------------------------------------------ F24: reaction-preference
+
+def test_f24_participation_prompt_prefers_react():
+    p = prompts.PARTICIPATION_SYSTEM_PROMPT
+    # preference wording: react over respond when an emoji fully carries the reply
+    assert 'PREFER "react" over "respond"' in p
+    # delegation/FYI example present
+    assert "instruction or delegation" in p and "FYI" in p
+    # redundant-acknowledgment rule present
+    assert "ALREADY acknowledged with a reaction" in p
+
+
+def test_f24_local_tools_guidance_broadened():
+    g = prompts.LOCAL_TOOLS_GUIDANCE
+    # broadened beyond "thanks!" to acknowledgments/delegations/FYIs
+    assert "got it" in g and "delegation" in g and "FYI" in g
+    assert "while I'm out" in g
+
+
 # ------------------------------------------------------------------ point 2: schema enum
 
 def _mixin_host():
