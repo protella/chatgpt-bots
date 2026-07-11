@@ -23,15 +23,15 @@ from thread_manager import AsyncThreadStateManager
 async def test_registry_register_and_finish_id_conditional():
     tm = AsyncThreadStateManager(db=None)
     tm.register_generation("C:T", "gen1", "a cat")
-    assert tm.generation_in_flight("C:T")["generation_id"] == "gen1"
+    assert tm.generations_in_flight("C:T")[0]["generation_id"] == "gen1"
 
     # A stale id must not clear the current entry.
     assert tm.finish_generation("C:T", "OLD") is False
-    assert tm.generation_in_flight("C:T") is not None
+    assert len(tm.generations_in_flight("C:T")) == 1
 
     # The matching id clears it.
     assert tm.finish_generation("C:T", "gen1") is True
-    assert tm.generation_in_flight("C:T") is None
+    assert tm.generations_in_flight("C:T") == []
 
 
 @pytest.mark.asyncio
@@ -39,8 +39,8 @@ async def test_registry_watchdog_clears_stale(monkeypatch):
     tm = AsyncThreadStateManager(db=None)
     tm.register_generation("C:T", "gen1", "a cat")
     # Backdate the entry beyond api_timeout_image + 30s.
-    tm._active_generations["C:T"]["started_at"] -= (config.api_timeout_image + 60)
-    assert tm.generation_in_flight("C:T") is None
+    tm._active_generations["C:T"]["gen1"]["started_at"] -= (config.api_timeout_image + 60)
+    assert tm.generations_in_flight("C:T") == []
     assert "C:T" not in tm._active_generations
 
 
@@ -303,16 +303,16 @@ async def test_handoff_returns_background_without_awaiting_generation(mock_env, 
     # The slow call has NOT run yet — the turn returned immediately (lock releases).
     oc.generate_image.assert_not_awaited()
     # Registered, and only the USER message was appended (no assistant breadcrumb).
-    assert host.thread_manager.generation_in_flight("C1:T1")["generation_id"] == gid
+    assert host.thread_manager.generations_in_flight("C1:T1")[0]["generation_id"] == gid
     assert [m["role"] for m in ts.messages] == ["user"]
 
     # Drain the background job.
-    await host.thread_manager._active_generations["C1:T1"]["task"]
+    await host.thread_manager._active_generations["C1:T1"][gid]["task"]
     oc.generate_image.assert_awaited_once()
     client.send_image.assert_awaited_once()
     host.db.save_image_metadata_async.assert_awaited_once()
     # Registry cleared and a rebuild flagged for the next turn.
-    assert host.thread_manager.generation_in_flight("C1:T1") is None
+    assert host.thread_manager.generations_in_flight("C1:T1") == []
     assert host.thread_manager.consume_needs_refresh("C1:T1") is True
 
 
@@ -330,7 +330,7 @@ async def test_config_off_runs_inline(mock_env, monkeypatch):
     # Inline: generation ran during the turn and a normal image response came back.
     assert resp.type == "image"
     oc.generate_image.assert_awaited_once()
-    assert host.thread_manager.generation_in_flight("C1:T1") is None
+    assert host.thread_manager.generations_in_flight("C1:T1") == []
 
 
 @pytest.mark.asyncio
@@ -346,12 +346,13 @@ async def test_background_moderation_block(mock_env, monkeypatch):
         "a banned thing", _thread_state(), client, "C1", "think1", _message(),
         allow_background=True)
     assert resp.type == "background"
-    await host.thread_manager._active_generations["C1:T1"]["task"]
+    gid = resp.metadata["generation_id"]
+    await host.thread_manager._active_generations["C1:T1"][gid]["task"]
 
     # Friendly moderation notice posted; no image; registry cleared.
     client.send_message.assert_awaited_once()
     client.send_image.assert_not_awaited()
-    assert host.thread_manager.generation_in_flight("C1:T1") is None
+    assert host.thread_manager.generations_in_flight("C1:T1") == []
 
 
 # --------------------------------------------------------------------------- suffix note
@@ -552,3 +553,290 @@ async def test_abort_checklist_clears_mirrored_status_and_deletes_message():
     await host._abort_checklist(c, client, "C1", "T1")
     client.delete_message.assert_awaited_once_with("C1", "posted1")
     client.clear_assistant_status.assert_awaited_once_with("C1", "T1")
+
+
+# ============================================================ F13: parallel generations
+
+# --------------------------------------------------------------------- multi-entry registry
+
+@pytest.mark.asyncio
+async def test_registry_multi_entry_id_conditional_finish():
+    tm = AsyncThreadStateManager(db=None)
+    tm.register_generation("C:T", "genA", "a cat")
+    tm.register_generation("C:T", "genB", "a dog")
+    # Both live concurrently on the same thread (F13).
+    assert {e["generation_id"] for e in tm.generations_in_flight("C:T")} == {"genA", "genB"}
+
+    # Finishing ONE leaves the sibling untouched.
+    assert tm.finish_generation("C:T", "genA") is True
+    assert [e["generation_id"] for e in tm.generations_in_flight("C:T")] == ["genB"]
+    # An already-finished id is a no-op (never disturbs the sibling).
+    assert tm.finish_generation("C:T", "genA") is False
+    assert [e["generation_id"] for e in tm.generations_in_flight("C:T")] == ["genB"]
+
+    # Last one out drops the thread bucket entirely.
+    assert tm.finish_generation("C:T", "genB") is True
+    assert tm.generations_in_flight("C:T") == []
+    assert "C:T" not in tm._active_generations
+
+
+@pytest.mark.asyncio
+async def test_watchdog_clears_only_stale_sibling():
+    tm = AsyncThreadStateManager(db=None)
+    tm.register_generation("C:T", "old", "a cat")
+    tm.register_generation("C:T", "fresh", "a dog")
+    # Backdate ONLY the old entry beyond the watchdog horizon.
+    tm._active_generations["C:T"]["old"]["started_at"] -= (config.api_timeout_image + 60)
+    remaining = tm.generations_in_flight("C:T")
+    assert [e["generation_id"] for e in remaining] == ["fresh"]
+    assert "old" not in tm._active_generations["C:T"]
+
+
+# ------------------------------------------------------------- multi-generation upload latch
+
+@pytest.mark.asyncio
+async def test_upload_latch_waits_for_all_and_releases_per_generation():
+    tm = AsyncThreadStateManager(db=None)
+    key = "C:T"
+    tm.mark_upload_started(key, "genA")
+    tm.mark_upload_started(key, "genB")
+
+    waiter = asyncio.create_task(tm.wait_for_uploads(key, timeout=5.0))
+    await asyncio.sleep(0)
+    assert not waiter.done()  # blocked: two uploads outstanding
+
+    # genA landing (idempotent — even called twice) must NOT release genB's waiter.
+    tm.mark_upload_finished(key, "genA")
+    tm.mark_upload_finished(key, "genA")
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    # The last outstanding upload lands → the waiter unblocks.
+    tm.mark_upload_finished(key, "genB")
+    await asyncio.wait_for(waiter, timeout=1.0)
+
+    # Nothing outstanding now → immediate return.
+    await asyncio.wait_for(tm.wait_for_uploads(key, timeout=1.0), timeout=1.0)
+
+
+def test_upload_latch_sync_token_is_serial_and_idempotent():
+    # The sync path passes no generation_id — a single shared "__sync__" token that
+    # releases idempotently.
+    tm = AsyncThreadStateManager(db=None)
+    key = "C:T"
+    tm.mark_upload_started(key)          # base.py guard (generation_id None)
+    tm.mark_upload_started(key)          # main.py image branch (same token, deduped)
+    assert tm._upload_pending[key] == {"__sync__"}
+    tm.mark_upload_finished(key)
+    assert not tm._upload_pending.get(key)
+    tm.mark_upload_finished(key)         # idempotent second release
+
+
+# ------------------------------------------------------------------- suffix lists all entries
+
+def test_inflight_suffix_lists_every_entry():
+    tm = AsyncThreadStateManager(db=None)
+    host = _SuffixHost(tm)
+    tm.register_generation("C1:T1", "genA", "a red cat")
+    tm.register_generation("C1:T1", "genB", "a blue dog")
+    note = host._build_generation_inflight_note("C1", "T1")
+    assert note is not None
+    # Every in-flight summary is named, with plural phrasing.
+    assert "a red cat" in note and "a blue dog" in note
+    assert "2 images" in note
+    assert "they are" in note
+
+
+# ------------------------------------------------------------- two parallel jobs, one thread
+
+@pytest.mark.asyncio
+async def test_two_parallel_jobs_one_thread_both_deliver(mock_env, monkeypatch):
+    monkeypatch.setattr(config, "enable_background_image_gen", True)
+    monkeypatch.setattr(config, "get_thread_config_async",
+                        AsyncMock(return_value=_thread_config()))
+    client, oc = _bg_client(), _bg_openai()
+    host = _BgHost(client, oc, db=SimpleNamespace(save_image_metadata_async=AsyncMock()))
+    ts = _thread_state()
+
+    r1 = await host._handle_image_generation(
+        "a cat", ts, client, "C1", "think1", _message(), allow_background=True)
+    r2 = await host._handle_image_generation(
+        "a dog", ts, client, "C1", "think2", _message(), allow_background=True)
+    assert r1.type == r2.type == "background"
+    g1, g2 = r1.metadata["generation_id"], r2.metadata["generation_id"]
+    assert g1 != g2
+    # Both registered concurrently on the SAME thread.
+    assert {e["generation_id"] for e in host.thread_manager.generations_in_flight("C1:T1")} == {g1, g2}
+
+    # Drain BOTH background jobs (task handles captured by the harness's scheduler).
+    await asyncio.gather(*host._tasks)
+
+    # Both delivered independently — no checklist/latch/refresh cross-talk.
+    assert oc.generate_image.await_count == 2
+    assert client.send_image.await_count == 2
+    assert host.db.save_image_metadata_async.await_count == 2
+    persisted_ids = {c.kwargs["metadata"].get("generation_id")
+                     for c in host.db.save_image_metadata_async.await_args_list}
+    assert persisted_ids == {g1, g2}
+    # Registry fully cleared; a rebuild flagged (both jobs called mark_needs_refresh).
+    assert host.thread_manager.generations_in_flight("C1:T1") == []
+    assert host.thread_manager.consume_needs_refresh("C1:T1") is True
+    # Two ledger entries, one per delivered image.
+    assert len(host.thread_manager.get_or_create_asset_ledger("T1").images) == 2
+
+
+# ------------------------------------------------------------------------- wiring / config
+
+def test_max_concurrent_config_default(monkeypatch):
+    from config import BotConfig
+    monkeypatch.delenv("MAX_CONCURRENT_IMAGE_GENERATIONS", raising=False)
+    assert BotConfig().max_concurrent_image_generations == 3
+
+
+def test_classifier_prompt_has_acknowledgment_rule():
+    from prompts import INTENT_CLASSIFIER_PROMPT
+    text = INTENT_CLASSIFIER_PROMPT.lower()
+    # General judgment rule (no hardcoded string lists in code): acknowledgments are none,
+    # a continuation is an image intent only when it names a concrete visual change.
+    assert "acknowledgment" in text
+    assert "adds or changes a concrete visual request" in text
+
+
+# ---------------------------------------------------------- intent routing (process_message)
+
+class _RoutingHost:
+    """Binds the REAL process_message on a minimal host with a real thread_manager, so
+    the F13 mid-flight intent routing (cap gate / edit-wait / ambiguous fall-through) is
+    exercised end to end. Every collaborator the routing doesn't care about is stubbed."""
+    from message_processor.base import MessageProcessor
+    process_message = MessageProcessor.process_message
+
+    def __init__(self, manager, intent, has_recent_image=False):
+        from base_client import Response as _R
+        self.thread_manager = manager
+        self.db = None
+        self.logger = MagicMock()
+        self.logger.isEnabledFor = lambda *a, **k: False
+        self.openai_client = SimpleNamespace(classify_intent=AsyncMock(return_value=intent))
+        # Collaborators before/after the routing block — benign stubs.
+        self._get_or_rebuild_thread_state = AsyncMock(return_value=self._state())
+        self._build_participant_roster = MagicMock(return_value="")
+        self._build_channel_memory_text = AsyncMock(return_value=None)
+        self._build_channel_info = AsyncMock(return_value=None)
+        self._get_system_prompt = MagicMock(return_value="sys")
+        self._process_attachments = AsyncMock(return_value=([], [], []))
+        self._build_user_content = MagicMock(return_value="uc")
+        self._has_recent_image = AsyncMock(return_value=has_recent_image)
+        self._update_status = MagicMock()
+        self._update_thinking_for_image = MagicMock()
+        # Dispatch sentinel — a real dispatch returns a background Response.
+        self.dispatched = _R(type="background", content="",
+                             metadata={"generation_id": "dispatched", "background_owns_status": True})
+        self._handle_image_generation = AsyncMock(return_value=self.dispatched)
+        self._handle_image_edit = AsyncMock()
+        self._handle_image_modification = AsyncMock()
+        # Phase Q drain hook (finally) — no-op here (empty queue).
+        self._dispatch_pending_batch = AsyncMock()
+        self._notify_drain_failure = AsyncMock()
+
+    @staticmethod
+    def _state():
+        return SimpleNamespace(
+            thread_ts="111.0", channel_id="C123", messages=[], config_overrides={},
+            had_timeout=False, current_model="gpt-5.6-sol", participants={},
+            root_author=None, channel_directives=None, system_prompt=None,
+            pending_clarification=None, has_trimmed_messages=False,
+            has_shown_80_percent_warning=True)
+
+    def _format_user_content_with_username(self, text, message):
+        return text
+
+    def _add_message_with_token_management(self, thread_state, role, content, **k):
+        thread_state.messages.append({"role": role, "content": content})
+
+    async def _pre_trim_messages_for_api(self, messages, *a, **k):
+        return messages
+
+    async def _inject_image_analyses(self, messages, *a, **k):
+        return messages
+
+    def log_info(self, *a, **k): pass
+    log_debug = log_warning = log_error = log_info
+
+
+def _routing_message():
+    from base_client import Message
+    return Message(text="do the thing", user_id="U1", channel_id="C123",
+                   thread_id="111.0", attachments=[],
+                   metadata={"ts": "111.0", "username": "U1"})
+
+
+def _patch_thread_config(monkeypatch):
+    monkeypatch.setattr(config, "get_thread_config_async", AsyncMock(return_value={
+        "model": "gpt-5.6-sol", "enable_web_search": False, "custom_instructions": None,
+        "enable_streaming": False}))
+
+
+@pytest.mark.asyncio
+async def test_new_image_under_cap_dispatches_parallel_job(mock_env, monkeypatch):
+    _patch_thread_config(monkeypatch)
+    monkeypatch.setattr(config, "max_concurrent_image_generations", 3)
+    tm = AsyncThreadStateManager(db=None)
+    tm.register_generation("C123:111.0", "gen1", "a cat")  # one already running, under cap
+    host = _RoutingHost(tm, intent="new_image")
+
+    resp = await host.process_message(_routing_message(), client=MagicMock(), thinking_id=None)
+
+    # Under the cap → another background job is dispatched (not rejected).
+    host._handle_image_generation.assert_awaited_once()
+    assert resp is host.dispatched
+
+
+@pytest.mark.asyncio
+async def test_new_image_at_cap_rejected_with_count(mock_env, monkeypatch):
+    _patch_thread_config(monkeypatch)
+    monkeypatch.setattr(config, "max_concurrent_image_generations", 3)
+    tm = AsyncThreadStateManager(db=None)
+    for i in range(3):  # at the cap
+        tm.register_generation("C123:111.0", f"gen{i}", "a cat")
+    host = _RoutingHost(tm, intent="new_image")
+
+    resp = await host.process_message(_routing_message(), client=MagicMock(), thinking_id=None)
+
+    # At the cap → friendly, count-aware rejection; NO new job dispatched.
+    host._handle_image_generation.assert_not_awaited()
+    assert resp.type == "text"
+    assert "3 images cooking" in resp.content
+
+
+@pytest.mark.asyncio
+async def test_edit_mid_flight_gets_wait_message(mock_env, monkeypatch):
+    _patch_thread_config(monkeypatch)
+    tm = AsyncThreadStateManager(db=None)
+    tm.register_generation("C123:111.0", "gen1", "a cat")
+    host = _RoutingHost(tm, intent="edit_image")
+
+    resp = await host.process_message(_routing_message(), client=MagicMock(), thinking_id=None)
+
+    # Edit can't touch an unseen image → wait message, no edit handler run.
+    host._handle_image_edit.assert_not_awaited()
+    host._handle_image_modification.assert_not_awaited()
+    assert resp.type == "text"
+    assert "still finishing up" in resp.content
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_mid_flight_falls_through_to_clarification(mock_env, monkeypatch):
+    _patch_thread_config(monkeypatch)
+    tm = AsyncThreadStateManager(db=None)
+    tm.register_generation("C123:111.0", "gen1", "a cat")
+    # Ambiguous WITH a recent image → the normal clarifying conversation, never a canned
+    # image rejection (misrouted chat must degrade to chat).
+    host = _RoutingHost(tm, intent="ambiguous_image", has_recent_image=True)
+
+    resp = await host.process_message(_routing_message(), client=MagicMock(), thinking_id=None)
+
+    host._handle_image_generation.assert_not_awaited()
+    host._handle_image_edit.assert_not_awaited()
+    assert resp.type == "text"
+    assert "Would you like me to" in resp.content  # clarification, not a rejection

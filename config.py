@@ -325,6 +325,10 @@ class BotConfig:
     # inline behavior (generation holds the lock), minus the shared-delivery bug fixes
     # which apply to both paths. Image EDIT stays synchronous either way this phase.
     enable_background_image_gen: bool = field(default_factory=lambda: os.getenv("ENABLE_BACKGROUND_IMAGE_GEN", "true").lower() == "true")
+    # F13 — how many background image generations may run concurrently in ONE thread.
+    # A new_image request past this cap gets a friendly "already N cooking" rejection;
+    # edits still wait for the in-flight image regardless. Per-thread.
+    max_concurrent_image_generations: int = field(default_factory=lambda: int(os.getenv("MAX_CONCURRENT_IMAGE_GENERATIONS", "3")))
     # Rotating loading messages shown in the assistant thread's transient bubble.
     # Sourced from a message file (one per line, # comments ok) — see
     # status_messages/loading_messages.generic.txt. Brand them by pointing
