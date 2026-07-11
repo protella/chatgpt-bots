@@ -618,6 +618,11 @@ class BotConfig:
     # Render DPI for OCR. tesseract accuracy needs ~300 DPI — 150 was live-verified too low for
     # small text (it is fine for the vision page-image path, which uses its own lower DPI).
     ocr_dpi: int = field(default_factory=lambda: int(os.getenv("OCR_DPI", "300")))
+    # Concurrent document extractions (thread pool size). Extraction work is subprocess/CPU
+    # (pdfplumber, poppler render, tesseract) off the event loop; a worst-case 20-page OCR can
+    # hold one worker for ~1-2 min, and queue wait counts against READ_DOCUMENT_TIMEOUT, so
+    # size this above the number of scans you expect to land at once. Floor of 1 enforced.
+    doc_extraction_workers: int = field(default_factory=lambda: max(1, int(os.getenv("DOC_EXTRACTION_WORKERS", "5"))))
 
     # --- On-demand Slack history-fetch tools (Phase 8) ---
     # Read-only + privacy-scoped (public or bot-member channels only), so default ON. Wired to
