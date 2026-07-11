@@ -11,7 +11,7 @@ from message_markers import (
 )
 from message_processor.message_timestamps import sender_timezone, stamp_content
 from message_processor.tool_provenance import (
-    render_used_tools_annotation,
+    render_provenance_annotations,
     strip_used_tools_footer,
 )
 
@@ -1020,14 +1020,15 @@ class ThreadManagementMixin:
                     if hist_msg.user_id and hist_msg.user_id not in ("bot", "unknown"):
                         thread_state.participants[hist_msg.user_id] = username
                 
-                # F7: for OUR OWN turns, strip the external _Used Tools:_ footer (never model
-                # context) then append the deterministic [used tools: …] annotation from the
-                # persisted rows — pinned order: footer-strip → used-tools → reactions, so no
-                # trailing annotation can shield the footer from stripping. Guarded by the
-                # flag so config-off leaves rebuilt content exactly as today.
+                # F7/F12: for OUR OWN turns, strip the external _Used Tools:_ footer (never
+                # model context) then append the deterministic provenance block from the
+                # persisted row — pinned order: footer-strip → [used tools:] → [tool results:]
+                # (F12) → [reactions:], so no trailing annotation can shield the footer from
+                # stripping. Guarded by the flag so config-off leaves rebuilt content exactly
+                # as today; old rows without result digests render the used-tools line alone.
                 if config.enable_tool_provenance and is_self:
                     content = strip_used_tools_footer(content)
-                    used_note = render_used_tools_annotation(
+                    used_note = render_provenance_annotations(
                         tool_usage_by_ts.get(hist_msg.metadata.get("ts")))
                     if used_note:
                         content = f"{content}\n{used_note}" if content else used_note

@@ -17,7 +17,8 @@ from streaming import FenceHandler, NativeStreamCoordinator, RateLimitManager, S
 from tool_registry import ToolContext
 from message_processor.tool_provenance import (
     build_provenance,
-    render_used_tools_annotation,
+    build_result_digests,
+    render_provenance_annotations,
     strip_used_tools_footer,
 )
 
@@ -273,6 +274,7 @@ class TextHandlerMixin:
         no_reply_reason = None
         usage_info = {}           # response.usage lands here (usage-driven budgeting)
         mcp_discovered = {}       # mcp_list_tools payloads land here (discovery cache)
+        mcp_results = []          # F12: completed mcp_call outputs land here (result memory)
         try:
             if tools and registry is not None:
                 # Local tools present — run the function-call loop (composes with
@@ -292,7 +294,8 @@ class TextHandlerMixin:
                     store=False,
                     prompt_cache_key=thread_key,
                     usage_sink=usage_info,
-                    mcp_tools_sink=mcp_discovered
+                    mcp_tools_sink=mcp_discovered,
+                    mcp_results_sink=mcp_results
                 )
                 response_text = result["text"]
                 tools_actually_used = result["tools_used"]
@@ -332,7 +335,8 @@ class TextHandlerMixin:
                         return_metadata=True,
                         prompt_cache_key=thread_key,
                         usage_sink=usage_info,
-                        mcp_tools_sink=mcp_discovered
+                        mcp_tools_sink=mcp_discovered,
+                        mcp_results_sink=mcp_results
                     )
                     response_text = result["text"]
                     tools_actually_used = result["tools_used"]
@@ -469,7 +473,11 @@ class TextHandlerMixin:
         stored_content = response_text
         if config.enable_tool_provenance:
             tool_provenance = build_provenance(local_tool_calls, tools_actually_used)
-            annotation = render_used_tools_annotation(tool_provenance)
+            # F12: attach MCP result digests (result memory) alongside the names/gists.
+            if config.enable_tool_result_memory:
+                tool_provenance += build_result_digests(
+                    mcp_results, config.tool_result_digest_chars, config.tool_result_turn_chars)
+            annotation = render_provenance_annotations(tool_provenance)
             if annotation:
                 stored_content = f"{strip_used_tools_footer(response_text)}\n{annotation}"
 
@@ -1283,6 +1291,7 @@ class TextHandlerMixin:
             local_tool_calls = []  # [{"name","ok"}] record of local tool executions
             usage_info = {}        # response.usage lands here (usage-driven budgeting)
             mcp_discovered = {}    # mcp_list_tools payloads land here (discovery cache)
+            mcp_results = []       # F12: completed mcp_call outputs land here (result memory)
             terminal_action = None  # F2: "no_reply" when the loop honored no_response_needed
             no_reply_reason = None
             if tools and registry is not None:
@@ -1305,7 +1314,8 @@ class TextHandlerMixin:
                     store=False,
                     prompt_cache_key=thread_key,
                     usage_sink=usage_info,
-                    mcp_tools_sink=mcp_discovered
+                    mcp_tools_sink=mcp_discovered,
+                    mcp_results_sink=mcp_results
                 )
                 response_text = loop_result["text"]
                 local_tool_calls = loop_result["local_tool_calls"]
@@ -1333,7 +1343,8 @@ class TextHandlerMixin:
                     store=False,  # Match the existing behavior
                     prompt_cache_key=thread_key,
                     usage_sink=usage_info,
-                    mcp_tools_sink=mcp_discovered
+                    mcp_tools_sink=mcp_discovered,
+                    mcp_results_sink=mcp_results
                 )
             else:
                 # Generate response without tools
@@ -1600,7 +1611,11 @@ class TextHandlerMixin:
             stored_content = response_text
             if config.enable_tool_provenance:
                 tool_provenance = build_provenance(local_tool_calls, tools_used)
-                annotation = render_used_tools_annotation(tool_provenance)
+                # F12: attach MCP result digests (result memory) alongside the names/gists.
+                if config.enable_tool_result_memory:
+                    tool_provenance += build_result_digests(
+                        mcp_results, config.tool_result_digest_chars, config.tool_result_turn_chars)
+                annotation = render_provenance_annotations(tool_provenance)
                 if annotation:
                     stored_content = f"{strip_used_tools_footer(response_text)}\n{annotation}"
 

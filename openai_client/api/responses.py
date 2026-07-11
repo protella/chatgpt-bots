@@ -52,6 +52,25 @@ def _collect_mcp_list_tools(mcp_tools_sink, item):
         pass
 
 
+def _capture_mcp_result(mcp_results_sink, item, server_label):
+    """F12: harvest a completed mcp_call's output text into the caller's sink as
+    {"tool_name", "output"} (capture order). MCP outputs are external derived artifacts —
+    safe to persist, unlike local Slack-fetch/document results. Errored or empty calls are
+    skipped, and truncation/budgeting happen later in build_result_digests. Never raises."""
+    if mcp_results_sink is None:
+        return
+    try:
+        if getattr(item, "error", None):
+            return  # a failed call's "output" isn't a usable result
+        output = getattr(item, "output", None)
+        if not output:
+            return
+        mcp_results_sink.append({"tool_name": server_label or "mcp", "output": str(output)})
+    except Exception:
+        # Result capture must never interfere with response processing
+        pass
+
+
 async def create_text_response(
     self,
     messages: List[Dict[str, Any]],
@@ -187,7 +206,8 @@ async def create_text_response_with_tools(
     tool_choice: Optional[str] = None,
     prompt_cache_key: Optional[str] = None,
     usage_sink: Optional[Dict[str, Any]] = None,
-    mcp_tools_sink: Optional[Dict[str, Any]] = None
+    mcp_tools_sink: Optional[Dict[str, Any]] = None,
+    mcp_results_sink: Optional[List[Dict[str, Any]]] = None
 ) -> str:
     """
     Create text response with tools (e.g., web search)
@@ -293,6 +313,9 @@ async def create_text_response_with_tools(
                         tools_actually_used.append(server_label)
                     elif not server_label and "mcp" not in tools_actually_used:
                         tools_actually_used.append("mcp")
+                    # F12: capture the completed call's output text (MCP results are external
+                    # derived artifacts, safe to persist). Skip errored/empty calls.
+                    _capture_mcp_result(mcp_results_sink, item, server_label)
                 elif item_type == "web_search_call":
                     if "web_search" not in tools_actually_used:
                         tools_actually_used.append("web_search")
@@ -589,7 +612,8 @@ async def create_streaming_response_with_tools(
     tool_choice: Optional[str] = None,
     prompt_cache_key: Optional[str] = None,
     usage_sink: Optional[Dict[str, Any]] = None,
-    mcp_tools_sink: Optional[Dict[str, Any]] = None
+    mcp_tools_sink: Optional[Dict[str, Any]] = None,
+    mcp_results_sink: Optional[List[Dict[str, Any]]] = None
 ) -> str:
     """
     Create streaming text response with tools (e.g., web search)
@@ -746,6 +770,9 @@ async def create_streaming_response_with_tools(
                             tool_error = getattr(item, 'error', None)
                             if tool_error:
                                 self.log_warning(f"MCP call error: {tool_error}")
+                            # F12: capture the completed call's output text (skips errored/
+                            # empty calls internally) for tool-result memory.
+                            _capture_mcp_result(mcp_results_sink, item, server_label)
                             if tool_callback and server_label:
                                 tool_id = f"mcp:{server_label}"
                                 try:

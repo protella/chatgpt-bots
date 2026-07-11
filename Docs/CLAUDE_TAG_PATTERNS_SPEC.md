@@ -867,6 +867,59 @@ across calls, None when empty; `evaluate()` forwards `capabilities` into signals
 `classify_participation` payload contains the line when set and omits it when None
 (fixed position after alias line); prompt contains the open-question rule.
 
+## F12. Tool-result memory for MCP calls (user request 2026-07-11)
+
+**Live failure:** in the F11 verification thread the bot cited a real ReportPro result
+("Ice Cream, 2025-12-10, p. 25" — verified by querying the MCP directly, link
+`reportpro.datassential.com/details/14813` was IN the tool output). On the follow-up
+"do you have a link?" the link was gone — F7 stores tool NAMES + arg gists only, no
+results — so the bot re-queried; the MCP's RAG (another team's server, NOT fixable on
+our side) failed the title→link lookup and said "no exact match", and the model then
+RETRACTED its own correct citation. Claude Tag doesn't have this failure mode: its
+threads are persistent agentic conversations where tool_use/tool_result blocks remain
+in context, so prior results (links, figures, titles) are simply still there. User
+directive: stop losing this context.
+
+**Design (extends F7; same tables, same annotation machinery):**
+1. **Capture results — MCP calls only.** Completed `mcp_call` items carry their
+   `output` text; capture it on BOTH the streaming and non-streaming Responses paths
+   wherever F7 already collects the call for attribution/provenance. Scope rule (the
+   CLAUDE.md lines that F7 pt 1 was protecting): LOCAL Slack-fetch tools stay
+   names-only (their results are conversation content — Slack is the only transcript,
+   never mirrored to DB) and `read_document` stays names-only (document content never
+   persists). MCP outputs are external derived artifacts — same class as the image
+   analyses/document summaries the DB already holds. `web_search` unchanged (results
+   aren't exposed as a retrievable item field).
+2. **Persist:** each entry in `message_tool_usage.tools_json` gains an optional
+   `result_digest` key — additive JSON, no schema migration; old rows (no key) render
+   exactly as today. Digest = the output text truncated to
+   `TOOL_RESULT_DIGEST_CHARS` (default 2000) per call with a `… [truncated]` marker,
+   and `TOOL_RESULT_TURN_CHARS` (default 6000) total per turn (first-come order; later
+   calls past the cap store no digest). Rows remain immutable once written; F7's age
+   sweep already covers retention.
+3. **Reinject:** rebuild AND warm append render a new annotation block after
+   `[used tools: …]` and before `[reactions: …]` (pinned order extended by one):
+   `[tool results: <tool_name> → <digest>]`, one line per stored digest, joined
+   deterministically. Pure function of the immutable row (F7-5 standard). Compaction
+   boundary rule unchanged (no annotation at/behind `boundary_ts`). Re-verify the
+   end-anchored `_Used Tools:_` footer strip still fires with the extra block present.
+4. **Prompt (the retraction half):** SLACK_SYSTEM_PROMPT — alongside the existing
+   provenance-trust instruction — gains: `[tool results: …]` annotations are the
+   authoritative record of what past tool calls returned; reuse them (links, figures,
+   report titles) instead of re-querying, and never retract a previously-cited fact
+   merely because a new search fails to re-find it — retrieval variance is normal;
+   say the earlier citation stands and that the new lookup came up empty.
+5. Config: `ENABLE_TOOL_RESULT_MEMORY` (default true), effective only when
+   `ENABLE_TOOL_PROVENANCE` is also on (results ride on provenance rows).
+
+**Tests:** mcp_call output captured on streaming + non-streaming paths; local tools
+and read_document never store digests; per-call and per-turn truncation; old rows
+without `result_digest` render as today (annotation absent); rebuild renders the block
+deterministically and in the pinned order (strip → used-tools → tool-results →
+reactions); warm append matches later rebuild render for the same row; compaction
+boundary skip; flag off = no digests stored and none rendered (provenance names still
+work); prompt instruction present.
+
 ## Rollout / verification
 
 1. `make test` green after each change set (F4 → F1 → F2 → F3); `make lint` clean.

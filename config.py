@@ -496,6 +496,19 @@ class BotConfig:
     # confabulating. Off → nothing captured, nothing persisted, no annotation.
     enable_tool_provenance: bool = field(default_factory=lambda: os.getenv("ENABLE_TOOL_PROVENANCE", "true").lower() == "true")
 
+    # --- Tool-result memory for MCP calls (F12, extends F7) ---
+    # Additionally capture the OUTPUT text of completed mcp_call items and replay it as a
+    # "[tool results: <server> → <digest>]" block after "[used tools: …]", so the model can
+    # reuse a prior MCP result (links, figures, report titles) instead of re-querying (and
+    # retracting when the re-query misses). MCP outputs only — local Slack-fetch/read_document
+    # results never persist. Effective only when enable_tool_provenance is also on (results
+    # ride on provenance rows). Off → names-only provenance exactly as F7.
+    enable_tool_result_memory: bool = field(default_factory=lambda: os.getenv("ENABLE_TOOL_RESULT_MEMORY", "true").lower() == "true")
+    # Per-call digest cap (chars); the output is truncated with a "… [truncated]" marker.
+    tool_result_digest_chars: int = field(default_factory=lambda: int(os.getenv("TOOL_RESULT_DIGEST_CHARS", "2000")))
+    # Per-turn total digest budget (chars, first-come order); calls past the cap store none.
+    tool_result_turn_chars: int = field(default_factory=lambda: int(os.getenv("TOOL_RESULT_TURN_CHARS", "6000")))
+
     # --- Per-message timestamps (F10) ---
     # Prefix every message in model-visible thread context with a deterministic local
     # timestamp ("[Fri 2026-07-10 9:17 PM EDT]") rendered from the message's Slack ts in
