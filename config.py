@@ -627,6 +627,27 @@ class BotConfig:
     # size this above the number of scans you expect to land at once. Floor of 1 enforced.
     doc_extraction_workers: int = field(default_factory=lambda: max(1, int(os.getenv("DOC_EXTRACTION_WORKERS", "5"))))
 
+    # --- F30: background deep-research jobs ---
+    # A local tool (start_deep_research) that detaches a genuine multi-source research
+    # question into a background job: the model acks in one line, the thread lock releases,
+    # and a sourced findings report lands in the same thread minutes later (mirrors the
+    # background image-gen pattern). Off → the tool is not registered.
+    enable_deep_research: bool = field(default_factory=lambda: os.getenv("ENABLE_DEEP_RESEARCH", "true").lower() == "true")
+    # The detached job runs at its own (higher) reasoning effort — a real report is worth the
+    # spend. Routed through clamp_effort against the thread's model.
+    deep_research_reasoning_effort: str = field(default_factory=lambda: os.getenv("DEEP_RESEARCH_REASONING_EFFORT", "high"))
+    deep_research_verbosity: str = field(default_factory=lambda: os.getenv("DEEP_RESEARCH_VERBOSITY", "medium"))
+    # Hard wall-clock bound on one research job (it makes one non-streaming Responses call with
+    # web_search + MCP). On timeout the job posts an honest failure note — never silent.
+    deep_research_timeout: float = field(default_factory=lambda: float(os.getenv("DEEP_RESEARCH_TIMEOUT", "600")))
+    # Per-thread cap on concurrent research jobs (friendly structured rejection at the cap, which
+    # the model relays). Deliberately per-thread, no global cap — mirrors image gen's choice.
+    deep_research_max_per_thread: int = field(default_factory=lambda: max(1, int(os.getenv("DEEP_RESEARCH_MAX_PER_THREAD", "2"))))
+    # Label the findings post with a chat.postMessage username override ("<bot> [research: …]").
+    # Needs the chat:write.customize scope, which the app may not have — on the first failure the
+    # process falls back to plain posts for the rest of its life. Never breaks delivery.
+    enable_research_label: bool = field(default_factory=lambda: os.getenv("ENABLE_RESEARCH_LABEL", "true").lower() == "true")
+
     # --- On-demand Slack history-fetch tools (Phase 8) ---
     # Read-only + privacy-scoped (public or bot-member channels only), so default ON. Wired to
     # the model through the local function-call loop (ENABLE_TOOL_LOOP).

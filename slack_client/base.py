@@ -24,6 +24,7 @@ from tool_registry import ToolRegistry
 from message_processor.memory_tools import register_memory_tools
 from message_processor.document_tools import register_document_tools
 from message_processor.people_tools import register_people_tools
+from message_processor.research_tools import register_research_tools
 
 
 class SlackBot(SlackMessageEventsMixin,
@@ -106,6 +107,8 @@ class SlackBot(SlackMessageEventsMixin,
             register_document_tools(registry)  # summary+ref rows; content re-derived in memory
         if config.enable_people_tools:
             register_people_tools(registry)  # F29: profile lookup + channel roster (Slack-visible only)
+        if config.enable_deep_research:
+            register_research_tools(registry)  # F30: start_deep_research (detached background job)
         return registry
 
     # Async versions required by BaseClient

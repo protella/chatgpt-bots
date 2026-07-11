@@ -31,6 +31,13 @@ class ToolContext:
     client: Any = None                    # platform client (e.g. SlackBot)
     db: Any = None
     is_dm: bool = False
+    # F30: exposed by the tool loop so a detached job (start_deep_research) can snapshot the
+    # CURRENT turn's full conversation by deep-copying `current_input` at call time. The
+    # developer prompt rides separately in `system_prompt`; `model` is the thread's model.
+    processor: Any = None                 # MessageProcessor (openai_client, scheduling, thread_manager)
+    current_input: Optional[List[Any]] = None
+    system_prompt: Optional[str] = None
+    model: Optional[str] = None
 
 
 Executor = Callable[[ToolContext, Dict[str, Any]], Awaitable[Dict[str, Any]]]

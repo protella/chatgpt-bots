@@ -236,7 +236,8 @@ def test_registry_gating_on_enable_people_tools():
              patch.object(config, "enable_reactions", False), \
              patch.object(config, "enable_search_tool", False), \
              patch.object(config, "enable_post_to_thread_tool", False), \
-             patch.object(config, "enable_read_document_tool", False):
+             patch.object(config, "enable_read_document_tool", False), \
+             patch.object(config, "enable_deep_research", False):
             with patch.object(SlackBot, "get_history_tools_for_openai", return_value=[], create=True):
                 registry = SlackBot._build_tool_registry(bot)
         return {s["name"] for s in registry.schemas()}
