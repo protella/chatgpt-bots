@@ -118,20 +118,34 @@ class ParticipationEngine:
 
     def __init__(self, openai_client):
         self.openai_client = openai_client
-        # channel -> newest pending message ts (debounce supersession marker)
+        # conversation key -> newest pending message ts (debounce supersession marker).
+        # F21: keyed per CONVERSATION, not per channel — a question in one thread must
+        # never be silently dropped because an unrelated conversation posted something
+        # newer elsewhere in the channel.
         self._latest: Dict[str, str] = {}
 
-    def note_arrival(self, channel_id: str, ts: Optional[str]) -> None:
-        """Register a message's ts as the channel's newest — MONOTONICALLY (F5 fix b).
+    @staticmethod
+    def _conv_key(channel_id: str, ts: str, thread_root: Optional[str]) -> str:
+        """F21 supersession scope: thread replies key by their root; all top-level
+        messages share one "top" stream (a rapid top-level burst still collapses to
+        its newest, whose envelope covers the rest)."""
+        if thread_root and thread_root != ts:
+            return f"{channel_id}|{thread_root}"
+        return f"{channel_id}|top"
+
+    def note_arrival(self, channel_id: str, ts: Optional[str],
+                     thread_root: Optional[str] = None) -> None:
+        """Register a message's ts as its conversation's newest — MONOTONICALLY (F5 fix b).
 
         Called at gate entry, BEFORE any await, so an older event delayed by memory/topic
         I/O can never overwrite a newer event's marker and win the debounce. Only a
         genuinely newer Slack ts advances the marker."""
         if not channel_id or not ts:
             return
-        current = self._latest.get(channel_id)
+        key = self._conv_key(channel_id, ts, thread_root)
+        current = self._latest.get(key)
         if current is None or _ts_key(ts) > _ts_key(current):
-            self._latest[channel_id] = ts
+            self._latest[key] = ts
 
     # ------------------------------------------------------------- evaluate
 
@@ -151,13 +165,15 @@ class ParticipationEngine:
                        pulse: Any = None,
                        thread_root_ts: Optional[str] = None) -> Optional[ParticipationVerdict]:
         """Debounced judgment. Returns None when superseded — a newer message in
-        the same channel arrived during the debounce window, and ITS evaluation
-        (whose envelope includes this message) covers the batch."""
-        self.note_arrival(channel_id, ts)  # monotonic; a stale caller can't clobber a newer marker
+        the SAME conversation (this thread, or the top-level stream — F21) arrived
+        during the debounce window, and ITS evaluation (whose tail/envelope includes
+        this message) covers the batch. Activity in other conversations never
+        supersedes."""
+        self.note_arrival(channel_id, ts, thread_root_ts)  # monotonic; a stale caller can't clobber a newer marker
         wait = max(0.0, float(getattr(config, "participation_debounce_seconds", 3.0)))
         if wait:
             await asyncio.sleep(wait)
-        if self._latest.get(channel_id) != ts:
+        if self._latest.get(self._conv_key(channel_id, ts, thread_root_ts)) != ts:
             return None
 
         # F5: render the thread tail HERE (after the debounce + supersession check) —
