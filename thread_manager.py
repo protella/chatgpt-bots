@@ -409,6 +409,10 @@ class AsyncThreadStateManager(LoggerMixin):
         # (suffix in-flight notes + image-intent routing/cap) and shutdown (cancel/await
         # the tasks). All access is synchronous == atomic on the loop.
         self._active_generations: Dict[str, Dict[str, dict]] = {}
+        # F30 — background deep-research registry, parallel to _active_generations:
+        # thread_key -> {job_id -> {job_id, task, started_at, task_summary}}. Used for the
+        # per-thread concurrency cap and shutdown (cancel/await the tasks).
+        self._active_research: Dict[str, Dict[str, dict]] = {}
         # Threads whose warm in-memory state is missing at least one Slack message
         # (e.g. a message dropped from an overfull pending queue, or a crash mid-queue).
         # The next request on that thread refetches from Slack (the transcript) before
@@ -582,6 +586,57 @@ class AsyncThreadStateManager(LoggerMixin):
             except asyncio.TimeoutError:
                 self.log_warning("Timed out awaiting generation tasks during shutdown")
         self._active_generations.clear()
+
+    # --- F30: background deep-research registry (parallel to image generations) ---
+
+    def register_research(self, thread_key: str, job_id: str, task_summary: str,
+                          task: Optional[asyncio.Task] = None):
+        """Register an in-flight background research job for this thread. Additive — a thread
+        can hold several concurrent jobs (bounded by DEEP_RESEARCH_MAX_PER_THREAD at the tool)."""
+        self._active_research.setdefault(thread_key, {})[job_id] = {
+            "job_id": job_id,
+            "task": task,
+            "started_at": time.monotonic(),
+            "task_summary": task_summary,
+        }
+
+    def attach_research_task(self, thread_key: str, job_id: str, task: asyncio.Task):
+        """Store the scheduled task handle (minted after the id, needed for shutdown).
+        ID-conditional so a stale job can't overwrite a newer registration."""
+        entry = self._active_research.get(thread_key, {}).get(job_id)
+        if entry is not None:
+            entry["task"] = task
+
+    def finish_research(self, thread_key: str, job_id: str) -> bool:
+        """Clear ONE in-flight research job by id (never touches a sibling); returns True iff
+        an entry was removed. The thread's bucket is dropped once its last job finishes."""
+        bucket = self._active_research.get(thread_key)
+        if bucket is not None and job_id in bucket:
+            bucket.pop(job_id, None)
+            if not bucket:
+                self._active_research.pop(thread_key, None)
+            return True
+        return False
+
+    def research_in_flight_count(self, thread_key: str) -> int:
+        """How many research jobs are currently in flight for this thread (for the cap)."""
+        return len(self._active_research.get(thread_key) or {})
+
+    async def cancel_research_jobs(self, timeout: float = 5.0):
+        """Cancel and await all registered research tasks (shutdown). Bounded so a wedged
+        job can't stall shutdown."""
+        tasks = [e["task"] for bucket in self._active_research.values()
+                 for e in bucket.values() if e.get("task")]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
+            except asyncio.TimeoutError:
+                self.log_warning("Timed out awaiting research jobs during shutdown")
+        self._active_research.clear()
 
     def _start_async_watchdog(self):
         """Start the background task that monitors for stuck locks"""

@@ -226,6 +226,12 @@ async def create_text_response_with_tool_loop(
     rounds = 0
     total_calls = 0
     tool_choice: Optional[str] = None
+    # F30: expose this turn's live input (stable reference — appended in place across rounds)
+    # plus the developer prompt/model, so a detached job can snapshot the full context by copy.
+    if tool_context is not None:
+        tool_context.current_input = input_items
+        tool_context.system_prompt = params.get("system_prompt")
+        tool_context.model = params.get("model")
 
     while True:
         sink: List[Dict[str, Any]] = []
@@ -312,6 +318,12 @@ async def create_streaming_response_with_tool_loop(
     rounds = 0
     total_calls = 0
     tool_choice: Optional[str] = None
+    # F30: expose this turn's live input (stable reference) + developer prompt/model so a
+    # detached job can snapshot the full context by copy (see create_text_response_with_tool_loop).
+    if tool_context is not None:
+        tool_context.current_input = input_items
+        tool_context.system_prompt = params.get("system_prompt")
+        tool_context.model = params.get("model")
     # F2: track whether any visible reply text has streamed to Slack this turn. The round's
     # returned text is exactly what was forwarded to the stream callback (pre-tool-call
     # preamble is committed; post-call text is suppressed), so this is the committed-text

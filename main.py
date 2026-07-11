@@ -771,6 +771,12 @@ class ChatBotV2:
                 await tm.cancel_generations(timeout=5.0)
             except Exception as e:
                 main_logger.warning(f"Error cancelling background generations: {e}")
+        # F30: same for in-flight background deep-research jobs.
+        if tm is not None and hasattr(tm, "cancel_research_jobs"):
+            try:
+                await tm.cancel_research_jobs(timeout=5.0)
+            except Exception as e:
+                main_logger.warning(f"Error cancelling background research jobs: {e}")
 
         # Stop the client (this should interrupt any stuck operations)
         if self.client:

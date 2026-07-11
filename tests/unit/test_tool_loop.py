@@ -710,12 +710,14 @@ class TestProcessorGlue:
             "type": "function", "name": "post_to_thread", "parameters": {}}
         monkeypatch.setattr(config, "enable_read_document_tool", True)
         monkeypatch.setattr(config, "enable_people_tools", True)
+        monkeypatch.setattr(config, "enable_deep_research", True)
         registry = SlackBot._build_tool_registry(s)
         names = {t["name"] for t in registry.schemas()}
         assert names == {"fetch_channel_history", "fetch_thread_messages",
                          "react_to_message", "search_slack", "post_to_thread",
                          "remember_fact", "update_fact", "forget_fact",
-                         "read_document", "lookup_user", "list_channel_members"}
+                         "read_document", "lookup_user", "list_channel_members",
+                         "start_deep_research"}
 
     def test_registry_builder_search_gated_off(self, monkeypatch):
         from slack_client.base import SlackBot
