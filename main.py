@@ -169,6 +169,26 @@ class ChatBotV2:
                 await self._apply_backoff(message, client)
                 return None
             if verdict.action == "respond":
+                # F19: on a respond+ack verdict, drop the "I'm looking at it" reaction on
+                # the triggering message BEFORE dispatching the turn — the classifier judged
+                # the reply implies real work. Purely additive (no accounting), through the
+                # F6 reservation guard, fails silent. Only respond verdicts ever ack.
+                if verdict.ack and getattr(config, "enable_ack_reaction", True):
+                    ack_ts = message.metadata.get("ts") or message.thread_id
+                    if ack_ts:
+                        try:
+                            if hasattr(client, "_reserve_and_react"):
+                                await asyncio.wait_for(
+                                    client._reserve_and_react(channel_id, ack_ts, config.ack_reaction_emoji),
+                                    timeout=config.tool_call_timeout)
+                            elif hasattr(client, "react"):
+                                await asyncio.wait_for(
+                                    client.react(channel_id, ack_ts, config.ack_reaction_emoji),
+                                    timeout=config.tool_call_timeout)
+                        except asyncio.TimeoutError:
+                            main_logger.debug("Ack reaction timed out")
+                        except Exception as e:
+                            main_logger.debug(f"Ack reaction failed: {e}")
                 return verdict
             return None  # ignore
         except Exception as e:

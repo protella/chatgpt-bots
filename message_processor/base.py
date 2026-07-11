@@ -381,6 +381,12 @@ class MessageProcessor(ThreadManagementMixin,
                 
                 return Response(type="error", content=error_msg)
             
+            # F19: acknowledgment flag from the intent classifier (addressed turns).
+            # Set by whichever classification branch runs; drives the "I'm looking at it"
+            # reaction placed right after classification, before any slow work. Branches
+            # that don't call the classifier (e.g. no-text image uploads) leave it False.
+            ack = False
+
             # Check if we're handling a clarification response
             if thread_state.pending_clarification:
                 self.log_debug("Processing clarification response")
@@ -400,10 +406,11 @@ class MessageProcessor(ThreadManagementMixin,
                 
                 # Use already-trimmed thread state for intent classification
                 # Only mark as having attachments if there are actual image uploads
-                intent = await self.openai_client.classify_intent(
+                intent, ack = await self.openai_client.classify_intent(
                     trimmed_history_for_intent,  # Documents truncated for classification
                     combined_context,
-                    has_attached_images=len(image_inputs) > 0
+                    has_attached_images=len(image_inputs) > 0,
+                    return_ack=True,
                 )
 
                 # Check if intent classification failed
@@ -489,10 +496,11 @@ class MessageProcessor(ThreadManagementMixin,
                     
                     # Only mark as having attachments if there are actual image uploads
                     # Documents shouldn't affect image intent classification
-                    intent = await self.openai_client.classify_intent(
+                    intent, ack = await self.openai_client.classify_intent(
                         trimmed_history_for_intent,  # Trimmed conversation history (without current)
                         intent_text,  # Current message (potentially trimmed/summarized)
-                        has_attached_images=len(image_inputs) > 0
+                        has_attached_images=len(image_inputs) > 0,
+                        return_ack=True,
                     )
                     # If intent classification times out, it returns 'text_only' by default
                     # For uploaded images, override to vision if we got text_only (likely from timeout)
@@ -562,13 +570,21 @@ class MessageProcessor(ThreadManagementMixin,
                     trimmed_history_for_intent.append(msg_copy)
                 
                 # Only mark as having attachments if there are actual image uploads
-                intent = await self.openai_client.classify_intent(
+                intent, ack = await self.openai_client.classify_intent(
                     trimmed_history_for_intent,  # Trimmed conversation history (without current)
                     intent_text,  # Current message (potentially trimmed/summarized)
-                    has_attached_images=False  # Documents alone don't count as image attachments
+                    has_attached_images=False,  # Documents alone don't count as image attachments
+                    return_ack=True,
                 )
-            
+
             self.log_debug(f"Classified intent: {intent}")
+
+            # F19: place the "I'm looking at it" reaction as soon as classification
+            # returns, before any slow work (image gen, vision, tool loops). Purely
+            # additive — through the F6 reservation guard so a later model/gate reaction
+            # never double-adds — and fails silent. Never counts as the turn's response.
+            if ack and getattr(config, "enable_ack_reaction", True):
+                await self._place_ack_reaction(client, message)
             
             # Handle ambiguous intent
             if intent == "ambiguous_image":

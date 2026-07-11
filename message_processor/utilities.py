@@ -1329,6 +1329,33 @@ class MessageUtilitiesMixin:
         else:
             self.log_debug("Client doesn't support message updates")
 
+    async def _place_ack_reaction(self, client: BaseClient, message: Message):
+        """F19: drop the "I'm looking at it" acknowledgment reaction on the triggering
+        message (addressed-turn path — the intent classifier judged real work ahead).
+
+        Routed through the F6 reservation guard so a later model/gate reaction honestly
+        sees the slot consumed and never double-adds; bounded by the tool-call timeout so
+        a wedged Slack call can't stall the turn; purely additive and fails silent (a
+        missed ack reaction is never worth failing a turn over)."""
+        channel_id = message.channel_id
+        react_ts = (message.metadata.get("ts") if message.metadata else None) or message.thread_id
+        if not react_ts:
+            return
+        emoji = config.ack_reaction_emoji
+        try:
+            if hasattr(client, "_reserve_and_react"):
+                await asyncio.wait_for(
+                    client._reserve_and_react(channel_id, react_ts, emoji),
+                    timeout=config.tool_call_timeout)
+            elif hasattr(client, "react"):
+                await asyncio.wait_for(
+                    client.react(channel_id, react_ts, emoji),
+                    timeout=config.tool_call_timeout)
+        except asyncio.TimeoutError:
+            self.log_debug("Ack reaction timed out")
+        except Exception as e:
+            self.log_debug(f"Ack reaction failed: {e}")
+
     async def _start_progress_updater_async(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], operation: str = "request", emoji: Optional[str] = None):
         """Start an async task that updates thinking message periodically
 

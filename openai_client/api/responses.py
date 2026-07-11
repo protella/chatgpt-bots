@@ -11,6 +11,27 @@ from prompts import (INTENT_CLASSIFIER_PROMPT, MEMORY_EXTRACTION_SYSTEM_PROMPT,
                      WAKE_CLASSIFIER_SYSTEM_PROMPT)
 
 
+_INTENT_WORD_MAP = {
+    "new": "new_image", "edit": "edit_image", "vision": "vision",
+    "ambiguous": "ambiguous_image", "none": "text_only",
+}
+
+
+def _parse_intent_and_ack(result: str) -> tuple:
+    """F19: parse the classifier's '<intent> <ack|noack>' output defensively.
+
+    Two tokens → (intent, ack); one token → (intent, noack). A garbage second token
+    is simply not "ack" → noack, and never disturbs intent routing. A stray full
+    sentence (long/unmapped first token) falls back to text_only, exactly as the old
+    one-word contract did. Returns the mapped intent label, ack bool."""
+    tokens = (result or "").strip().lower().split()
+    word = tokens[0] if tokens else ""
+    ack = len(tokens) >= 2 and tokens[1] == "ack"
+    if not word or len(word) > 20:
+        word = "none"
+    return _INTENT_WORD_MAP.get(word, "text_only"), ack
+
+
 def _capture_usage(usage_sink, response):
     """Copy response.usage into the caller's sink (usage-driven context budgeting)."""
     if usage_sink is None or response is None:
@@ -957,9 +978,10 @@ async def classify_wake(self, text: str, signals: Optional[Dict[str, Any]] = Non
 async def classify_participation(self, text: str, signals: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Phase F participation judgment — ONE utility-model call, strict JSON out.
 
-    Returns the raw verdict dict {"action", "emoji", "placement", "reason"}; the caller
-    (ParticipationEngine.validate_verdict) coerces/validates it. Best-effort and
-    CONSERVATIVE: any failure or unparseable output returns {"action": "ignore"}.
+    Returns the raw verdict dict {"action", "emoji", "placement", "ack", "reason"}; the
+    caller (ParticipationEngine.validate_verdict) coerces/validates it (F19 "ack" is the
+    optional respond-turn acknowledgment flag). Best-effort and CONSERVATIVE: any failure
+    or unparseable output returns {"action": "ignore"}.
 
     Prompt construction is deterministic: signal lines render in a fixed order so
     identical inputs produce identical payloads."""
@@ -1188,8 +1210,9 @@ async def classify_intent(
     messages: List[Dict[str, Any]],
     last_user_message: str,
     has_attached_images: bool = False,
-    max_retries: int = 2
-) -> str:
+    max_retries: int = 2,
+    return_ack: bool = False,
+):
     """
     Classify user intent using a lightweight model with retry logic
 
@@ -1198,10 +1221,14 @@ async def classify_intent(
         last_user_message: The latest user message to classify
         has_attached_images: Whether the current message has images attached
         max_retries: Number of retry attempts on timeout (default: 2)
+        return_ack: F19 — when True, return (intent, ack_bool) instead of a bare
+            intent string. ack reflects the classifier's '<intent> <ack|noack>'
+            second token (defaults noack; a garbage token never breaks routing).
 
     Returns:
-        Intent classification: 'new_image', 'modify_image', or 'text_only'
-        Returns 'error' if classification fails after retries
+        Intent classification: 'new_image', 'edit_image', 'vision',
+        'ambiguous_image', or 'text_only' (bare str, or (intent, ack) when
+        return_ack). Returns 'error' (or ('error', False)) if it fails after retries.
     """
     # Build properly structured conversation
     conversation_messages = []
@@ -1250,8 +1277,8 @@ async def classify_intent(
     
     # Add classification instruction as final user message
     conversation_messages.append({
-        "role": "user", 
-        "content": "Based on this conversation, classify the user's latest message. Respond with ONLY one of: new, edit, vision, ambiguous, or none."
+        "role": "user",
+        "content": "Based on this conversation, classify the user's latest message. Respond with exactly two tokens: the intent (new, edit, vision, ambiguous, or none) then the ack flag (ack or noack)."
     })
     
     # Debug logging
@@ -1296,35 +1323,17 @@ async def classify_intent(
                             result += content.text
         
         result = result.strip().lower()
-        
-        # Validate that we got a single word response
-        if ' ' in result or len(result) > 20:
-            # Classifier returned a full sentence instead of a word
-            self.log_error(f"Classifier returned invalid response (expected single word): '{result[:100]}...'")
-            result = "none"  # Default to text_only for safety
-        
+
+        # F19: parse '<intent> <ack|noack>' defensively — two tokens carry the ack
+        # flag, one token falls back to noack, a stray sentence → text_only. The old
+        # single-word contract is a strict subset of this.
+        intent, ack = _parse_intent_and_ack(result)
+
         # Debug logging
         self.log_debug(f"Image check raw result: '{result}' for message: '{last_user_message[:50]}...'")
-        
-        # Map the 5-state classifier results to intent categories
-        if result == "new":
-            intent = "new_image"
-        elif result == "edit":
-            intent = "edit_image"
-        elif result == "vision":
-            intent = "vision"
-        elif result == "ambiguous":
-            intent = "ambiguous_image"
-        elif result == "none":
-            intent = "text_only"
-        else:
-            # Fallback for unexpected responses
-            self.log_warning(f"Unexpected classifier result: '{result}', defaulting to text_only")
-            intent = "text_only"
-        
-        self.log_debug(f"Classified intent: {intent}")
-        return intent
-        
+        self.log_debug(f"Classified intent: {intent} (ack={ack})")
+        return (intent, ack) if return_ack else intent
+
     except TimeoutError:
         # On timeout, retry with exponential backoff
         for retry in range(1, max_retries + 1):
@@ -1352,43 +1361,30 @@ async def classify_intent(
 
                 result = result.strip().lower()
 
-                # Validate and map result
-                if ' ' in result or len(result) > 20:
-                    result = "none"
+                # F19: same two-token parse as the main path.
+                intent, ack = _parse_intent_and_ack(result)
 
-                # Map to intent
-                if result == "new":
-                    intent = "new_image"
-                elif result == "edit":
-                    intent = "edit_image"
-                elif result == "ambiguous":
-                    intent = "ambiguous_image"
-                elif result == "vision":
-                    intent = "vision"
-                else:
-                    intent = "text_only"
-
-                self.log_info(f"Intent classification succeeded on retry {retry}: {intent}")
-                return intent
+                self.log_info(f"Intent classification succeeded on retry {retry}: {intent} (ack={ack})")
+                return (intent, ack) if return_ack else intent
 
             except TimeoutError:
                 if retry == max_retries:
                     self.log_error(f"Intent classification failed after {max_retries} retries")
-                    return 'error'  # Return error to trigger proper error handling
+                    return ('error', False) if return_ack else 'error'  # Trigger proper error handling
                 continue
             except Exception as retry_error:
                 self.log_error(f"Retry {retry} failed with error: {retry_error}")
                 if retry == max_retries:
-                    return 'error'
+                    return ('error', False) if return_ack else 'error'
                 continue
 
         # Should not reach here, but failsafe
-        return 'error'
+        return ('error', False) if return_ack else 'error'
 
     except Exception as e:
         self.log_error(f"Error classifying intent: {e}")
         self.log_error(f"Exception type: {type(e).__name__}")
-        return 'error'  # Return error instead of defaulting to text
+        return ('error', False) if return_ack else 'error'  # Return error instead of defaulting to text
 
 async def _create_text_response_with_timeout(
     self,
