@@ -13,6 +13,7 @@ import pytz
 
 from base_client import BaseClient, Message
 from config import config, pipeline_status
+from message_processor.message_timestamps import stamp_content
 from prompts import SLACK_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, LOCAL_TOOLS_GUIDANCE
 
 
@@ -59,16 +60,23 @@ class MessageUtilitiesMixin:
             Content prefixed with username (e.g., "Alice: Hello")
         """
         username = message.metadata.get("username", "User") if message.metadata else "User"
-        
+
         # Handle special content formats
         if not content or content.strip() == "":
-            return f"{username}:"
-        elif content.startswith("[") and content.endswith("]"):
-            # Special bracketed content (e.g., "[uploaded image]")
-            return f"{username}: {content}"
+            formatted = f"{username}:"
         else:
-            # Normal text content
-            return f"{username}: {content}"
+            # Normal + special bracketed content (e.g. "[uploaded image]") render alike
+            formatted = f"{username}: {content}"
+
+        # F10: prefix the deterministic per-message timestamp using THIS message's own ts
+        # + the sender's timezone (warm inbound sender == triggering user, so both ride the
+        # Message metadata). Same ts+tz the later rebuild uses, so the two render identically.
+        # Guarded so config-off returns pre-F10 content unchanged.
+        if config.enable_message_timestamps and message.metadata:
+            formatted = stamp_content(
+                formatted, message.metadata.get("ts"),
+                message.metadata.get("user_timezone") or "UTC")
+        return formatted
 
     def _build_user_content(self, text: str, image_inputs: List[Dict],
                             file_inputs: Optional[List[Dict]] = None) -> Any:

@@ -53,7 +53,10 @@ def test_numeric_ts_exclusion_not_lexical():
     assert "before ten" in out
 
 
-def test_last_400_tail_vs_300_head_envelope():
+def test_last_400_tail_vs_300_head_envelope(monkeypatch):
+    # This test is about head/tail truncation, not F10 stamps; the stamp's "Thu" would
+    # trip the `"T" not in env` head-only assertion, so disable it here.
+    monkeypatch.setattr(config, "enable_message_timestamps", False)
     p = ChannelPulse()
     head = "H" * 500
     tail = "T" * 500

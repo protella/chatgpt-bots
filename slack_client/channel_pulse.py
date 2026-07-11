@@ -29,6 +29,7 @@ from collections import OrderedDict, deque
 from typing import Any, Dict, List, Optional
 
 from config import config
+from message_processor.message_timestamps import render_message_timestamp
 
 TEXT_TRUNCATE = 300      # head-first cap for the channel-activity envelope + thread labels
 TAIL_TEXT_TRUNCATE = 400  # tail-first cap for the F5 per-thread classifier context
@@ -301,8 +302,14 @@ class ChannelPulse:
         entries = sorted(by_ts.values(), key=lambda e: _ts_key(e["ts"]))[-max_entries:]
         if not entries:
             return ""
+        # F10: prefix each tail line with the message timestamp so the classifier can judge
+        # staleness / time gaps. The pulse ring holds no per-sender tz (record() is zero-await),
+        # so all lines render in UTC — consistent within the block, which is what relative-gap
+        # reasoning needs. Guarded so config-off leaves the tail byte-identical.
+        stamp_on = getattr(config, "enable_message_timestamps", False)
         lines = [
-            f'- {e["display_name"]} [{"bot" if e["is_bot"] else "human"}]: "{e["tail_text"]}"'
+            f'- {(render_message_timestamp(e["ts"]) + " ") if stamp_on else ""}'
+            f'{e["display_name"]} [{"bot" if e["is_bot"] else "human"}]: "{e["tail_text"]}"'
             for e in entries
         ]
         return (
@@ -322,6 +329,9 @@ class ChannelPulse:
         if not buf or max_lines <= 0:
             return ""
         labels = self._thread_labels.get(channel_id, {})
+        # F10: same UTC per-message stamp as the thread tail, so the classifier sees when
+        # each activity line happened (guarded; config-off leaves the envelope unchanged).
+        stamp_on = getattr(config, "enable_message_timestamps", False)
         lines: List[str] = []
         for e in buf:
             root = e["thread_ts"] or e["ts"]
@@ -332,7 +342,8 @@ class ChannelPulse:
                 where = f'in thread "{label}…"' if label else "in a thread"
             else:
                 where = "top-level"
-            lines.append(f'- {e["display_name"]} ({where}): {e["text"]}')
+            stamp = (render_message_timestamp(e["ts"]) + " ") if stamp_on else ""
+            lines.append(f'- {stamp}{e["display_name"]} ({where}): {e["text"]}')
         if not lines:
             return ""
         lines = lines[-max_lines:]

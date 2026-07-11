@@ -10,6 +10,7 @@ from message_markers import (
     starts_as_continuation,
     strip_continuation_markers,
 )
+from message_processor.message_timestamps import sender_timezone, stamp_content
 from message_processor.tool_provenance import (
     render_used_tools_annotation,
     strip_used_tools_footer,
@@ -1037,6 +1038,18 @@ class ThreadManagementMixin:
                 reactions_note = self._render_reactions_annotation(hist_msg.metadata.get("reactions"))
                 if reactions_note:
                     content = f"{content}\n{reactions_note}" if content else reactions_note
+
+                # F10: prefix a deterministic per-message timestamp so the model can reason
+                # about elapsed time between turns. A pure PREFIX — applied AFTER the pinned
+                # end-anchored suffix annotations above, so it never disturbs the footer-strip
+                # → [used tools:] → [reactions:] order. Rendered from the message's immutable
+                # ts in the SENDER's cached timezone (self turns and unknown/other-bot senders
+                # fall back to UTC — no per-message API lookup). Guarded so config-off leaves
+                # rebuilt content byte-identical.
+                if config.enable_message_timestamps:
+                    stamp_tz = "UTC" if is_self else sender_timezone(
+                        hist_msg.metadata, hist_msg.user_id, getattr(client, "user_cache", None))
+                    content = stamp_content(content, hist_msg.metadata.get("ts"), stamp_tz)
 
                 # Track message metadata for preservation
                 message_metadata = {}

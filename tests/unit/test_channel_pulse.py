@@ -100,7 +100,10 @@ def _seeded_pulse():
     return p
 
 
-def test_envelope_thread_vs_top_level_lines():
+def test_envelope_thread_vs_top_level_lines(monkeypatch):
+    # About the thread-vs-top-level line format, not F10 stamps — disable the stamp so the
+    # exact-line assertions stay readable (stamped-envelope coverage lives in F10 tests).
+    monkeypatch.setattr(config, "enable_message_timestamps", False)
     env = _seeded_pulse().render_envelope("C1")
     assert '- Alice (top-level): deploy question here' in env
     assert '- Bob (in thread "deploy question here…"): reply inside deploy thread' in env
