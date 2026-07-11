@@ -1576,20 +1576,22 @@ people notes + on-demand lookups.
 3. Persistent people layer = existing structures, no new store: DB user_info rows
    (Slack stays source of truth) + channel-memory people facts.
 4. lookup_user tool: id, @mention, or display/real name → fresh users.info (title,
-   status, timezone, is_bot; NO email — carries over the retired tool's deliberate
-   profile-card-only rail); ambiguous name → candidates; unknown → hint.
+   status, timezone, is_bot, email — the retired tool's no-email rail was reversed by
+   user decision 2026-07-11: workspace-visible profile data is fair game);
+   ambiguous name → candidates; unknown → hint.
    list_channel_members: full pagination for a true count, first 50 names, loud
    truncation. Both gated on ENABLE_PEOPLE_TOOLS (default true).
 5. Consolidation: fetch_user_profile (history tools, id-only) RETIRED — lookup_user
    strictly subsumes it; two near-identical tools split the model's tool choice.
-6. Ride-along (user directive): placement rule rewritten — THREAD IS THE DEFAULT;
-   channel only for a genuinely one-line room-wide answer with no likely follow-up;
-   always thread when the message addressed multiple parties or another assistant will
-   likely answer too (all replies collect under the parent — threads need no "creation",
-   thread_ts IS the parent's ts).
+6. Ride-along (user directive): placement rule rewritten — lean toward thread (softened
+   2026-07-11 from a hard "channel only when ALL of…" gate, which overshot); channel
+   stays fine for short room-wide answers, quick conversational beats, or channel-level
+   discussions; prefer thread for long replies, likely back-and-forth, multi-party
+   addressing, or when another assistant will likely answer too (all replies collect
+   under the parent — threads need no "creation", thread_ts IS the parent's ts).
 
 **Tests:** recent_speakers matrix; num_members extraction; people line on both surfaces
-incl. clean absence; lookup_user id/name/ambiguous/unknown paths + email-absent rail;
+incl. clean absence; lookup_user id/name/ambiguous/unknown paths + email included;
 member pagination cap + loud truncation; config gate; prompt substrings; retired-tool
 dispatch refusal. Live (one message): "who's in this channel and what's Claude's
 timezone?" → placement=thread, list_channel_members ok (5 members, correct names),
