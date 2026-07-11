@@ -97,6 +97,24 @@ async def test_public_channel_allowed(bot):
 
 
 @pytest.mark.asyncio
+async def test_fetch_surfaces_attached_file_names(bot):
+    # F25: file NAMES ride the fetched entry (never content) so the model can reach a
+    # document seen in history via read_document. Messages without files are unchanged.
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": False}}
+    bot.app.client.conversations_history.return_value = {
+        "messages": [
+            {"user": "U1", "ts": "1.1", "text": "contract attached",
+             "files": [{"name": "vendor_contract.pdf", "mimetype": "application/pdf"}]},
+            {"user": "U2", "ts": "1.2", "text": "no files here"},
+        ]
+    }
+    res = await bot.fetch_history_tool("C_PUBLIC")
+    assert res["ok"] is True
+    assert res["messages"][0]["files"] == ["vendor_contract.pdf"]
+    assert "files" not in res["messages"][1]
+
+
+@pytest.mark.asyncio
 async def test_private_member_allowed(bot):
     bot.app.client.conversations_info.return_value = {"channel": {"is_private": True, "is_member": True}}
     bot.app.client.conversations_history.return_value = {"messages": [{"user": "U1", "ts": "1.1", "text": "secret-ok"}]}

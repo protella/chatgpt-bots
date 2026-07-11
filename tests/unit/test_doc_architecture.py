@@ -462,7 +462,26 @@ class TestReadDocumentTool:
     def test_schema_description_mentions_channel_scope(self):
         from message_processor.document_tools import get_read_document_schema
         desc = get_read_document_schema()["description"]
-        assert "current conversation checked first" in desc
+        assert "ANYWHERE in this channel" in desc
+        assert "current conversation is checked first" in desc
+        # F25: the model must know no in-context summary is required and that attachment
+        # notes / history are valid filename sources — its absence made it skip the tool
+        # and wrongly declare a cross-thread file unreachable (live 2026-07-11).
+        assert "No summary needs to be in context" in desc
+        assert "attachment note" in desc
+
+    def test_not_found_hint_teaches_channel_wide_reach(self):
+        # F25: the miss hint must not imply a summary is required.
+        import inspect
+        from message_processor import document_tools as dt
+        src = inspect.getsource(dt.execute_read_document)
+        assert "any file shared in this channel is reachable" in src
+
+    def test_guidance_teaches_cross_thread_reads(self):
+        # F25: LOCAL_TOOLS_GUIDANCE explicitly licenses cross-thread reads by filename.
+        from prompts import LOCAL_TOOLS_GUIDANCE
+        assert "ANOTHER thread of this channel is readable too" in LOCAL_TOOLS_GUIDANCE
+        assert "never declare a channel file unreachable without trying it" in LOCAL_TOOLS_GUIDANCE
 
     @pytest.mark.asyncio
     async def test_channel_wide_prefix_isolation_at_db(self, tmp_path):

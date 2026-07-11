@@ -197,6 +197,12 @@ class SlackHistoryToolMixin:
                     "ts": m.get("ts"),
                     "text": m.get("text", ""),
                 }
+                # F25: surface attached-file names so the model can reach a document
+                # seen in fetched history via read_document (names, never content).
+                if m.get("files"):
+                    names = [f.get("name") for f in m["files"] if isinstance(f, dict) and f.get("name")]
+                    if names:
+                        entry["files"] = names[:5]
                 # Emoji reactions on the message (who reacted with what) — lets the
                 # model answer reaction questions with current data, since in-memory
                 # thread state only carries reactions present at capture time.
