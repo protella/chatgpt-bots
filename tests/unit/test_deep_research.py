@@ -653,6 +653,27 @@ def test_card_headline_starts_with_hourglass():
     assert card._visible_lines()[0].startswith("⏳ ")
 
 
+def test_card_headline_budget_derives_from_slack_section_limit():
+    """Not a magic number: the headline cap is Slack's 3000-char section-block text limit
+    minus the worst-case rest of the body — a realistic restated task shows WHOLE."""
+    assert rt._CARD_HEADLINE_CHARS == (
+        rt._SECTION_TEXT_LIMIT
+        - (rt._CARD_MAX_TODO_LINES - 2) * (rt._MILESTONE_GIST_CHARS + 2)
+        - 150)
+    task = ("Produce a sourced, cross-checked report as of July 11, 2026 on what happened "
+            "to the U.S. egg supply and egg prices during 2026, whether the avian flu "
+            "situation resolved, and where retail and foodservice egg prices are heading "
+            "for the rest of the year, separating actuals from forecasts.")
+    card = _bare_card(_CardClient(), task=task)
+    assert card._visible_lines()[0] == f"⏳ {task}"  # untruncated
+    # And the worst-case full body still fits Slack's real section limit.
+    card._task_gist = "x" * rt._CARD_HEADLINE_CHARS
+    for i in range(15):
+        card._milestones.append("✓ " + "m" * rt._MILESTONE_GIST_CHARS)
+    card._terminal = "✗ hit a wall: " + "r" * 80
+    assert len("\n".join(card._visible_lines())) <= rt._SECTION_TEXT_LIMIT
+
+
 @pytest.mark.asyncio
 async def test_card_counters_in_context_line_not_body():
     """F30.2: raw tool events bump the context-line counters (with pluralization); the
