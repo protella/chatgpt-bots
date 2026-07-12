@@ -452,6 +452,50 @@ class ChatBotV2:
                             await client.maybe_post_response_footer(message, response)
                         except Exception as e:
                             main_logger.debug(f"Response footer skipped: {e}")
+
+                    # F32: upload any code-interpreter artifacts AFTER the answer lands, so the
+                    # thread reads "explanation, then the chart" rather than the reverse. Runs
+                    # even for an empty-text turn (a chart that speaks for itself). Strictly
+                    # best-effort: the reply is already posted and an upload failure must never
+                    # turn a delivered answer into an error.
+                    artifact_containers = (response.metadata or {}).get("artifact_containers") or []
+                    # Only hang files under an answer that actually landed. If a non-empty reply
+                    # failed to post, a chart arriving alone with no explanation is worse than
+                    # no chart. (A files-only turn has empty content by design — still publish.)
+                    reply_landed = (response.metadata or {}).get("posted") is not False
+                    files_only = not (response.content or "").strip()
+                    if artifact_containers and (reply_landed or files_only):
+                        try:
+                            from message_processor.artifacts import publish_artifacts
+                            # Whole-phase bound: the answer is already visible, but this still
+                            # holds the turn open, and a wedged upload must not stall the next
+                            # message in the thread.
+                            published = await asyncio.wait_for(
+                                publish_artifacts(
+                                    openai_client=self.processor.openai_client,
+                                    client=client,
+                                    channel_id=message.channel_id,
+                                    thread_id=post_thread_id,
+                                    thread_key=f"{message.channel_id}:{message.thread_id}",
+                                    container_ids=artifact_containers,
+                                    db=getattr(self.processor, "db", None),
+                                    message_ts=(message.metadata or {}).get("ts"),
+                                    container_manager=getattr(
+                                        self.processor, "container_manager", None),
+                                ),
+                                timeout=config.artifact_publish_timeout,
+                            )
+                            if published:
+                                main_logger.info(
+                                    f"Published {len(published)} artifact(s) to the thread")
+                        except asyncio.TimeoutError:
+                            main_logger.error("Artifact publishing timed out — reply already posted")
+                        except Exception as e:
+                            main_logger.error(f"Artifact publishing failed: {e}", exc_info=True)
+                    elif artifact_containers:
+                        main_logger.warning(
+                            "Reply did not post — suppressing its artifacts (a file with no "
+                            "answer above it reads as a bug)")
                 elif response.type == "image":
                     # Latch: the upload + DB row land after the thread lock released, so a
                     # fast follow-up "edit it" must wait for this to finish (or time out).
@@ -699,6 +743,17 @@ class ChatBotV2:
                                     days=config.tool_usage_retention_days)
                             except Exception as e:
                                 main_logger.debug(f"Tool-usage sweep skipped: {e}")
+
+                            # F32: reap code-interpreter containers for threads that have gone
+                            # quiet. The containers themselves idle-expired long ago (20-minute
+                            # API ceiling), so this is mostly dropping their rows — a revived
+                            # thread just gets a fresh container on its next turn.
+                            try:
+                                cm = getattr(self.processor, "container_manager", None)
+                                if cm is not None:
+                                    await cm.reap()
+                            except Exception as e:
+                                main_logger.debug(f"Container reap skipped: {e}")
 
                             # Scheduled database backup. Until now backup_database()
                             # was only ever called by the one-time migrations, so a

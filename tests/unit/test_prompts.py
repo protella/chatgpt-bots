@@ -74,8 +74,20 @@ class TestPrompts:
 
     def test_intent_classifier_is_trimmed(self):
         """The classifier fires on every responded message and sits below OpenAI's
-        1024-token cache threshold — it must stay small. chars/4 proxy < 350 tokens."""
-        assert len(INTENT_CLASSIFIER_PROMPT) / 4 < 350
+        1024-token cache threshold — it must stay small. chars/4 proxy < 420 tokens.
+
+        Budget raised from 350 (see test_prompt_modernization for the full rationale): the
+        prompt was pinned at 1399/1400 chars and its `new` bullet treated "visualize" as an
+        image trigger, routing charts to the image model."""
+        assert len(INTENT_CLASSIFIER_PROMPT) / 4 < 420
+
+    def test_intent_classifier_never_routes_charts_to_the_image_model(self):
+        """The bug this guards: gpt-image-1 DRAWS a chart — inventing both the numbers and the
+        category names — instead of the sandbox COMPUTING one from the user's actual data."""
+        new_bullet = INTENT_CLASSIFIER_PROMPT.split("- edit")[0]
+        assert "visualize" not in new_bullet.lower()
+        assert "chart" in INTENT_CLASSIFIER_PROMPT.lower()
+        assert '"none", never "new"' in INTENT_CLASSIFIER_PROMPT
 
     def test_image_analysis_prompt_defined(self):
         assert IMAGE_ANALYSIS_PROMPT is not None

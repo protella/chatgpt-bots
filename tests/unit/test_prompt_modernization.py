@@ -175,8 +175,14 @@ def test_classifier_five_label_contract(word, expected):
 
 def test_classifier_prompt_token_budget():
     """Fires on every responded message and sits below the 1024-token prompt-cache
-    threshold — must stay small. chars/4 proxy."""
-    assert len(INTENT_CLASSIFIER_PROMPT) / 4 < 350
+    threshold — must stay small. chars/4 proxy.
+
+    Raised 350 -> 420 to buy the rule-5 chart fix. The old prompt was 1399/1400 chars — pinned
+    to the character — and its `new` bullet listed "visualize" as an image trigger, so "chart
+    it" reached gpt-image-1, which drew a chart with invented numbers AND invented categories.
+    Fitting under 350 meant deleting production-hardened disambiguation rules; ~40 tokens per
+    classifier call is the cheaper side of that trade, and 420 is still far under 1024."""
+    assert len(INTENT_CLASSIFIER_PROMPT) / 4 < 420
 
 
 # ------------------------------------------------- F19 intent ack parse

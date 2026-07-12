@@ -140,12 +140,22 @@ def test_render_annotation_carries_more_than_eight_entries():
 
 
 def test_strip_footer_and_anti_shielding():
-    assert tp.strip_used_tools_footer("hi\n\n_Used Tools: web_search_") == "hi"
+    assert tp.strip_used_tools_footer("hi\n\n_Tools Used: web_search_") == "hi"
     # A trailing [used tools:]/[reactions:] annotation must NOT shield the footer.
-    shielded = "hi\n\n_Used Tools: web_search_\n[used tools: web_search]\n[reactions: :eyes: x1]"
+    shielded = "hi\n\n_Tools Used: web_search_\n[used tools: web_search]\n[reactions: :eyes: x1]"
     assert tp.strip_used_tools_footer(shielded) == "hi\n[used tools: web_search]\n[reactions: :eyes: x1]"
     assert tp.strip_used_tools_footer("no footer here") == "no footer here"
     assert tp.strip_used_tools_footer(None) is None
+
+
+def test_strip_footer_still_catches_the_legacy_wording():
+    """The footer was renamed "Used Tools" -> "Tools Used" on 2026-07-11, but Slack is the
+    transcript: every reply posted before then still carries the old wording and comes back
+    on every rebuild. If the stripper stops matching it, stale chrome leaks into model context."""
+    assert tp.strip_used_tools_footer("hi\n\n_Used Tools: web_search_") == "hi"
+    legacy_shielded = "hi\n\n_Used Tools: web_search_\n[used tools: web_search]"
+    assert tp.strip_used_tools_footer(legacy_shielded) == "hi\n[used tools: web_search]"
+    assert tp.strip_used_tools_footer("hi\n\n_Used Tools: a, b (failed: c)_") == "hi"
 
 
 # ------------------------------------------------------------------ DB layer

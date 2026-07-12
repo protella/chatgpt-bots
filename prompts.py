@@ -112,6 +112,44 @@ You have function tools for acting inside Slack (fetching channel/thread history
 --- END TOOLS ETIQUETTE ---"""
 
 
+# F32: appended when the code_interpreter tool is in the tools array. Static text (prompt-cache
+# safe). Two jobs: get the model to COMPUTE instead of eyeballing, and make it stop writing the
+# `sandbox:` download links that are dead on arrival in Slack.
+CODE_INTERPRETER_GUIDANCE = """
+
+--- DATA ANALYSIS & ARTIFACTS ---
+You can run Python in a sandbox (code interpreter). Files attached to this conversation are
+already mounted in the sandbox's working directory — list it and load them directly.
+
+- COMPUTE, don't eyeball. For any real question about attached data — totals, counts, averages,
+  outliers, trends, joins, "which is biggest" — write code and read the actual answer off the
+  output. Never eyeball a table or do arithmetic in your head, and never work from a truncated
+  document summary when the file itself is loadable. A number you computed beats a number you
+  estimated, every time.
+- EVERY file you save in the sandbox is automatically uploaded into this Slack thread. So:
+  - Save what you want the user to have: a chart (PNG), a cleaned dataset (CSV/XLSX), a report
+    (PDF), a diagram (PNG, via graphviz). Give it a real filename (`revenue_by_region.png`, not
+    `output.png`) — the user sees that name.
+  - Save NOTHING you don't want posted. Keep intermediates in memory; don't write scratch files
+    to disk. If you only need a number, print it — don't save a file to get it.
+  - Save each thing ONCE, and don't also display it inline — that posts the same chart twice.
+- Say NOTHING about the attachments. No download link, no markdown link, no `sandbox:` path, and
+  no "Attached: chart.png" line — Slack already shows every file's name and a preview right under
+  your message, so announcing them just repeats what the user can see. Write the answer as if the
+  files are simply there, because they are. Refer to one by name only when the sentence genuinely
+  needs it ("the outliers in the scatter are all Q4").
+- Charts: use matplotlib (plotly can't export images here). Label the axes and give it a title.
+  If you put value labels on the bars, FORMAT THEM — pass the number through an f-string
+  (f"{v:,.0f}"), never a bare format code like "%,d", which prints literally and looks broken.
+  One clear chart beats three cluttered ones; don't produce a chart nobody asked for when a
+  sentence would do.
+- Lead with the finding, not the method. "North leads at 65,316 units — about 7% above West" is
+  the answer; the code is plumbing, and nobody wants it pasted back at them unless they asked.
+- The sandbox has NO internet: it cannot fetch a URL, install a package, or reach any internal
+  system. Everything it works on has to arrive as an attachment or in your code.
+--- END DATA ANALYSIS & ARTIFACTS ---"""
+
+
 # F2: volatile developer-suffix paragraph, added only on UNPROMPTED turns where the
 # no_response_needed tool is exposed. Never in the system prompt (cache hygiene) and never
 # on prompted/config-off turns (LOCAL_TOOLS_GUIDANCE deliberately doesn't advertise it).
@@ -136,19 +174,27 @@ CONTINUATION_NO_REPLY_SUFFIX = (
 )
 
 
+# Deliberately just over the old 350-token guardrail (see tests). The bug it buys out: the
+# original `new` bullet listed "visualize" as an image trigger, so "chart it" / "visualize the
+# results" routed to gpt-image-1, which DREW a bar chart with invented numbers and invented
+# region names — a fabrication that looks exactly like a real matplotlib plot. Charts are
+# COMPUTED in the code sandbox; the only alternative to these ~40 extra tokens was deleting
+# production-hardened disambiguation rules, and the prompt is still far below the 1024-token
+# cache threshold that actually matters.
 INTENT_CLASSIFIER_PROMPT = """Classify the user's LATEST message into exactly one intent:
 
-- new — wants an image generated (create, draw, visualize, "show me" something visual). Logos, icons, "what does X look like" are "new".
+- new — wants a PICTURE generated: create, draw, illustrate, render. Logos, icons, artwork, "what does X look like".
 - edit — wants an existing image modified: adjust, fix, change, recolor, enhance.
 - vision — wants uploaded/attached files analyzed. Requires actual attachments on the message.
 - ambiguous — image-related but the target or intent is unclear.
-- none — everything else: chat, code (SVG/HTML/CSS), URL/website questions, data lookups.
+- none — everything else: chat, code (SVG/HTML/CSS), URL/website questions, data lookups, and EVERY chart/graph/plot of data.
 
 Disambiguation (from production):
 1. Continuations ("again", "another") match the PREVIOUS response type: after an image → new; after text/data → none.
 2. "vision" needs attachments in metadata — never infer from wording; questions without files are never "vision".
 3. Data verbs (pull, fetch, get, show) mean an image only with image language ("show me an image of…" → new; "show me the data" → none); URLs are not images.
 4. Acknowledgments, thanks, and remarks about pending/finished work are "none"; a continuation is an image intent only when it adds or changes a concrete visual request.
+5. Charting DATA is "none", never "new" — "chart it", "graph this", "plot revenue", "visualize the results" are computed from real numbers, not drawn.
 
 Then judge the ack flag: "ack" if answering means real work — attachments, data lookups, multi-step tools, long output (vision/new/edit lean ack); else "noack".
 

@@ -15,6 +15,11 @@ from message_markers import (
 )
 from streaming import FenceHandler, NativeStreamCoordinator, RateLimitManager, StreamingBuffer
 from tool_registry import ToolContext
+from message_processor.artifacts import collect_container_ids, strip_sandbox_links
+from message_processor.containers import AUTO_CONTAINER
+from message_processor.tool_provenance import (strip_provenance_echo,
+                                               visible_attribution_tools)
+from openai_client.container_errors import is_container_gone, persistent_container_ids
 from message_processor.tool_provenance import (
     build_provenance,
     build_result_digests,
@@ -142,8 +147,14 @@ class TextHandlerMixin:
                               retry_count: int = 0,
                               failed_mcp_server: Optional[str] = None,
                               _context_retry: bool = False,
-                              visible_already_committed: bool = False) -> Response:
+                              visible_already_committed: bool = False,
+                              artifacts_acc: Optional[List[dict]] = None) -> Response:
         """Handle text-only response generation.
+
+        ``artifacts_acc`` (F32): container ids seen by EARLIER attempts this turn. Each attempt
+        used to start a fresh sink, so an attempt that ran code interpreter and then failed (an
+        MCP error, a timeout) lost its container — and the file it had already written in the
+        sandbox was never published. The accumulator is shared across every retry of a turn.
 
         ``visible_already_committed`` (F8): True when an earlier attempt this turn already
         exposed visible text (e.g. a streaming attempt that failed mid-reply). It is passed
@@ -179,6 +190,7 @@ class TextHandlerMixin:
                 user_content, thread_state, client, message, thinking_id, attachment_urls,
                 exclude_mcp_server=failed_mcp_server,
                 visible_already_committed=visible_already_committed,
+                artifacts_acc=artifacts_acc,
             )
         
         # Fall back to non-streaming logic
@@ -246,7 +258,7 @@ class TextHandlerMixin:
         # Pass the model for dynamic knowledge cutoff (respecting user prefs)
         web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
         model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
-        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_directives=getattr(thread_state, 'channel_directives', None), channel_info=await self._build_channel_info(client, message.channel_id))
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_directives=getattr(thread_state, 'channel_directives', None), channel_info=await self._build_channel_info(client, message.channel_id), code_interpreter_enabled=thread_config.get('enable_code_interpreter', config.enable_code_interpreter))
 
         # Determine timeout based on retry attempt (needed to resolve tool exposure below)
         retry_timeout = 60.0 if retry_count > 0 else None
@@ -290,8 +302,10 @@ class TextHandlerMixin:
         # `registry` and `request_config` were resolved once above (F2) — request_config
         # carries the per-turn _unprompted_turn flag so no_response_needed is exposed only
         # where it should be; the timeout-retry path already nulled the registry there.
+        ci_container = await self._resolve_ci_container(request_config, thread_key)
         tools = self._build_tools_array(request_config, model,
-                                        exclude_mcp_server=failed_mcp_server, registry=registry)
+                                        exclude_mcp_server=failed_mcp_server, registry=registry,
+                                        ci_container=ci_container)
 
         # Start progress updater for fallback/retry scenarios (streaming already has one)
         # This provides the cycling status messages during long-running API calls
@@ -314,6 +328,13 @@ class TextHandlerMixin:
         usage_info = {}           # response.usage lands here (usage-driven budgeting)
         mcp_discovered = {}       # mcp_list_tools payloads land here (discovery cache)
         mcp_results = []          # F12: completed mcp_call outputs land here (result memory)
+        # F32: shared across every attempt this turn — a container a FAILED attempt used still
+        # holds files the model wrote, and they must still reach the user.
+        artifacts = artifacts_acc if artifacts_acc is not None else []
+        # F32: a container that died mid-turn lands here. The API layer already recovered the
+        # call (it retried with an ephemeral sandbox); this is so we drop the stale DB binding
+        # instead of offering the same dead id to the next turn.
+        containers_gone: List[str] = []
         try:
             if tools and registry is not None:
                 # Local tools present — run the function-call loop (composes with
@@ -336,7 +357,9 @@ class TextHandlerMixin:
                     prompt_cache_key=thread_key,
                     usage_sink=usage_info,
                     mcp_tools_sink=mcp_discovered,
-                    mcp_results_sink=mcp_results
+                    mcp_results_sink=mcp_results,
+                    artifacts_sink=artifacts,
+                    container_gone_sink=containers_gone
                 )
                 response_text = result["text"]
                 tools_actually_used = result["tools_used"]
@@ -359,7 +382,9 @@ class TextHandlerMixin:
                         verbosity=thread_config.get("verbosity"),
                         store=False,
                         timeout_seconds=retry_timeout,
-                        return_metadata=True
+                        return_metadata=True,
+                        artifacts_sink=artifacts,
+                        container_gone_sink=containers_gone
                     )
                     response_text = result["text"]
                     tools_actually_used = result["tools_used"]
@@ -378,7 +403,9 @@ class TextHandlerMixin:
                         prompt_cache_key=thread_key,
                         usage_sink=usage_info,
                         mcp_tools_sink=mcp_discovered,
-                        mcp_results_sink=mcp_results
+                        mcp_results_sink=mcp_results,
+                        artifacts_sink=artifacts,
+                        container_gone_sink=containers_gone
                     )
                     response_text = result["text"]
                     tools_actually_used = result["tools_used"]
@@ -421,7 +448,8 @@ class TextHandlerMixin:
                     user_content, thread_state, client, message, thinking_id,
                     attachment_urls, retry_count=retry_count,
                     failed_mcp_server=failed_mcp_server, _context_retry=True,
-                    visible_already_committed=visible_already_committed
+                    visible_already_committed=visible_already_committed,
+                    artifacts_acc=artifacts
                 )
             raise
         finally:
@@ -433,7 +461,17 @@ class TextHandlerMixin:
                 except asyncio.CancelledError:
                     pass
                 self.log_debug("Cancelled progress updater - API call completed")
-        
+
+        # F32: the model links its artifacts with `sandbox:/mnt/data/...` URIs, which are dead
+        # to the user — the real file arrives as a Slack upload. Strip them before the text is
+        # stored, attributed, or posted, so the dead link never reaches anyone.
+        await self._drop_dead_containers(containers_gone, thread_key)
+        artifact_containers = collect_container_ids(artifacts)
+        # Unconditional: a stray sandbox link must never reach the user, even on a turn where
+        # we captured no container (the strip is a cheap no-op when there's nothing to strip).
+        # Same for a `[used tools: …]` line the model echoed back from its own context.
+        response_text = strip_provenance_echo(strip_sandbox_links(response_text))
+
         # Record the API's authoritative context size on the thread
         thread_state.record_usage(usage_info.get("input_tokens", 0),
                                   usage_info.get("output_tokens", 0))
@@ -486,7 +524,18 @@ class TextHandlerMixin:
         # glitch): decide the empty outcome HERE, before any assistant-state append or
         # post-response memory cleanup — never persist an empty assistant turn. main.py
         # logs the WARNING and burns no quota.
+        # F32 exception: empty text WITH artifacts is not a glitch — the model built a chart
+        # and let it speak for itself. Post no text, but still publish the files (main.py
+        # keys artifact delivery off the metadata, not off the content).
         if not (response_text or "").strip():
+            if artifact_containers:
+                self.log_info("Empty text with artifacts — publishing files only")
+                return Response(
+                    type="text",
+                    content="",
+                    metadata={"model": thread_config.get("model"), "posted": False,
+                              "artifact_containers": artifact_containers}
+                )
             self.log_warning("Empty non-streaming response without a terminal action — posting nothing")
             return Response(
                 type="text",
@@ -496,23 +545,27 @@ class TextHandlerMixin:
 
         # Attribution lists only EXTERNAL sources (web_search + MCP servers). Local
         # context tools (history fetches, reactions, memory ops) are plumbing, not
-        # sources — never shown.
+        # sources — never shown. Same for code_interpreter: it is the model doing its own
+        # arithmetic, not a place the information came from (visible_attribution_tools).
+        # Filtered into a SEPARATE list — tools_actually_used still feeds the F7 provenance
+        # record, which the model needs in order to answer "how did you get that?".
         local_names = {c.get("name") for c in local_tool_calls if c.get("name")}
         tools_actually_used = [t for t in tools_actually_used if t not in local_names]
+        attribution_tools = visible_attribution_tools(tools_actually_used)
 
         # Top-level channel replies stay chrome-free; attribution rides only in
         # threads and DMs.
         show_attribution = not bool((message.metadata or {}).get("place_in_channel"))
 
         # Use the actual tools that were invoked (from response metadata)
-        if (tools_actually_used or failed_mcp_server) and show_attribution:
+        if (attribution_tools or failed_mcp_server) and show_attribution:
             # Add unified tools note at the END
-            if tools_actually_used:
+            if attribution_tools:
                 # Show successful tools
                 if failed_mcp_server:
-                    tools_note = f"\n\n_Used Tools: {', '.join(tools_actually_used)} (failed: {failed_mcp_display})_"
+                    tools_note = f"\n\n_Tools Used: {', '.join(attribution_tools)} (failed: {failed_mcp_display})_"
                 else:
-                    tools_note = f"\n\n_Used Tools: {', '.join(tools_actually_used)}_"
+                    tools_note = f"\n\n_Tools Used: {', '.join(attribution_tools)}_"
             else:
                 # Only failed MCP, no successful tools
                 tools_note = f"\n\n_MCP server '{failed_mcp_display}' could not be reached. Response generated without external tools._"
@@ -557,7 +610,8 @@ class TextHandlerMixin:
             type="text",
             content=response_text,
             metadata={"model": thread_config.get("model"),
-                      "tool_provenance": tool_provenance}
+                      "tool_provenance": tool_provenance,
+                      "artifact_containers": artifact_containers}
         )
 
     async def _cleanup_silent_stream(self, client, channel_id: str, native_coord,
@@ -584,7 +638,8 @@ class TextHandlerMixin:
                                       message: Message, thinking_id: Optional[str] = None,
                                       attachment_urls: Optional[List[str]] = None,
                                       exclude_mcp_server=None,
-                                      visible_already_committed: bool = False) -> Response:
+                                      visible_already_committed: bool = False,
+                                      artifacts_acc: Optional[List[dict]] = None) -> Response:
         """Handle text-only response generation with streaming support.
 
         exclude_mcp_server accepts a single label or a set of labels (exclusions
@@ -598,7 +653,8 @@ class TextHandlerMixin:
         if not hasattr(client, 'supports_streaming') or not client.supports_streaming():
             self.log_debug("Client doesn't support streaming, falling back to non-streaming")
             return await self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls, retry_count=0,
-                                                    visible_already_committed=visible_already_committed)
+                                                    visible_already_committed=visible_already_committed,
+                                                    artifacts_acc=artifacts_acc)
         
         # Get streaming configuration from client
         streaming_config = client.get_streaming_config() if hasattr(client, 'get_streaming_config') else {}
@@ -684,7 +740,7 @@ class TextHandlerMixin:
         # Pass the model for dynamic knowledge cutoff (respecting user prefs)
         web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
         model = config.web_search_model or thread_config["model"] if web_search_enabled else thread_config["model"]
-        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_directives=getattr(thread_state, 'channel_directives', None), channel_info=await self._build_channel_info(client, message.channel_id))
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_directives=getattr(thread_state, 'channel_directives', None), channel_info=await self._build_channel_info(client, message.channel_id), code_interpreter_enabled=thread_config.get('enable_code_interpreter', config.enable_code_interpreter))
 
         # F2: resolve this turn's tool exposure ONCE. Streaming retries fall back to the
         # non-streaming path, so tools are never disabled here (tools_disabled=False).
@@ -729,7 +785,8 @@ class TextHandlerMixin:
             # We need a way to post a message and get its ID - this would depend on client implementation
             self.log_warning("No thinking_id provided for streaming - falling back to non-streaming")
             return await self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls, retry_count=0,
-                                                    visible_already_committed=visible_already_committed)
+                                                    visible_already_committed=visible_already_committed,
+                                                    artifacts_acc=artifacts_acc)
         
         async def stream_status_update(status_msg: str) -> dict:
             """Tool/phase status during streaming: edit the placeholder when one
@@ -751,14 +808,16 @@ class TextHandlerMixin:
             "web_search": False,
             "file_search": False,
             "image_generation": False,
-            "mcp": False
+            "mcp": False,
+            "code_interpreter": False
         }
 
         # Track search counts
         search_counts = {
             "web_search": 0,
             "file_search": 0,
-            "mcp": 0
+            "mcp": 0,
+            "code_interpreter": 0
         }
 
         # Track which MCP servers were used
@@ -802,6 +861,17 @@ class TextHandlerMixin:
                             self.log_warning(f"Failed to update web search status: {result.get('error', 'Unknown error')}")
                     except Exception as e:
                         self.log_error(f"Error updating web search status: {e}")
+                elif tool_type == "code_interpreter":
+                    # F32: the sandbox can churn for a while on a real dataset — say so, or
+                    # the user watches a silent spinner and assumes we hung.
+                    if not tool_states["code_interpreter"]:
+                        tool_states["code_interpreter"] = True
+                        search_counts["code_interpreter"] += 1
+                    status_msg = f"{config.code_interpreter_emoji} Analyzing the data..."
+                    try:
+                        await stream_status_update(status_msg)
+                    except Exception as e:
+                        self.log_debug(f"Code interpreter status update failed: {e}")
                 elif tool_type == "file_search":
                     if not tool_states["file_search"]:
                         tool_states["file_search"] = True
@@ -1343,13 +1413,18 @@ class TextHandlerMixin:
             # Local tools ride along via the registry (function-call loop). registry +
             # request_config were resolved once above (F2) so no_response_needed is exposed
             # on unprompted streamed turns.
+            ci_container = await self._resolve_ci_container(request_config, thread_key)
             tools = self._build_tools_array(request_config, model,
-                                            exclude_mcp_server=exclude_mcp_server, registry=registry)
+                                            exclude_mcp_server=exclude_mcp_server, registry=registry,
+                                            ci_container=ci_container)
 
             local_tool_calls = []  # [{"name","ok"}] record of local tool executions
             usage_info = {}        # response.usage lands here (usage-driven budgeting)
             mcp_discovered = {}    # mcp_list_tools payloads land here (discovery cache)
             mcp_results = []       # F12: completed mcp_call outputs land here (result memory)
+            # F32: shared across every attempt this turn (see _handle_text_response).
+            artifacts = artifacts_acc if artifacts_acc is not None else []
+            containers_gone: List[str] = []   # F32 (see _handle_text_response)
             terminal_action = None  # F2: "no_reply" when the loop honored no_response_needed
             no_reply_reason = None
             deep_research_started = False  # F30.1: start_deep_research fired — drop this reply
@@ -1376,7 +1451,9 @@ class TextHandlerMixin:
                     prompt_cache_key=thread_key,
                     usage_sink=usage_info,
                     mcp_tools_sink=mcp_discovered,
-                    mcp_results_sink=mcp_results
+                    mcp_results_sink=mcp_results,
+                    artifacts_sink=artifacts,
+                    container_gone_sink=containers_gone
                 )
                 response_text = loop_result["text"]
                 local_tool_calls = loop_result["local_tool_calls"]
@@ -1406,7 +1483,9 @@ class TextHandlerMixin:
                     prompt_cache_key=thread_key,
                     usage_sink=usage_info,
                     mcp_tools_sink=mcp_discovered,
-                    mcp_results_sink=mcp_results
+                    mcp_results_sink=mcp_results,
+                    artifacts_sink=artifacts,
+                    container_gone_sink=containers_gone
                 )
             else:
                 # Generate response without tools
@@ -1423,6 +1502,15 @@ class TextHandlerMixin:
                     prompt_cache_key=thread_key,
                     usage_sink=usage_info
                 )
+
+            # F32: artifacts the model produced this turn. The reply text may carry dead
+            # `sandbox:/mnt/data/...` links to them — strip those before the text is stored or
+            # finalized. A streamed link may flash on screen mid-stream; the finalize below
+            # rewrites the message with the clean text, and the system prompt tells the model
+            # not to emit them in the first place.
+            await self._drop_dead_containers(containers_gone, thread_key)
+            artifact_containers = collect_container_ids(artifacts)
+            response_text = strip_provenance_echo(strip_sandbox_links(response_text))
 
             # Record the API's authoritative context size on the thread
             thread_state.record_usage(usage_info.get("input_tokens", 0),
@@ -1491,6 +1579,11 @@ class TextHandlerMixin:
             tools_used = []
             if search_counts["web_search"] > 0:
                 tools_used.append("web_search")
+            # F32: streamed turns rebuild attribution from these counters (the streaming API
+            # helper returns text only), so without this a streamed analysis publishes a chart
+            # with no "Used Tools: code_interpreter" note, while the non-streaming path shows it.
+            if search_counts["code_interpreter"] > 0:
+                tools_used.append("code_interpreter")
             if mcp_servers_used:
                 # Group MCP servers under a single MCP label
                 mcp_list = ", ".join(sorted(mcp_servers_used))
@@ -1507,19 +1600,22 @@ class TextHandlerMixin:
             show_attribution = not bool((message.metadata or {}).get("place_in_channel"))
 
             # Add unified tools note at the END if any tools were used
-            # This works for both paginated and non-paginated responses
-            if (tools_used or exclude_mcp_server) and show_attribution:
-                if tools_used:
+            # This works for both paginated and non-paginated responses.
+            # code_interpreter is filtered out here (internal processing, not a source) but stays
+            # in tools_used for the F7 provenance record.
+            attribution_tools = visible_attribution_tools(tools_used)
+            if (attribution_tools or exclude_mcp_server) and show_attribution:
+                if attribution_tools:
                     # Show successful tools
                     if exclude_mcp_server:
-                        tools_note = f"\n\n_Used Tools: {', '.join(tools_used)} (failed: {exclude_mcp_display})_"
+                        tools_note = f"\n\n_Tools Used: {', '.join(attribution_tools)} (failed: {exclude_mcp_display})_"
                     else:
-                        tools_note = f"\n\n_Used Tools: {', '.join(tools_used)}_"
+                        tools_note = f"\n\n_Tools Used: {', '.join(attribution_tools)}_"
                 else:
                     # Only failed MCP, no successful tools
                     tools_note = f"\n\n_MCP server '{exclude_mcp_display}' could not be reached. Response generated without external tools._"
                 response_text = response_text + tools_note
-                self.log_info(f"Added tools attribution: {', '.join(tools_used) if tools_used else 'none'}{' with failure note' if exclude_mcp_server else ''}")
+                self.log_info(f"Added tools attribution: {', '.join(attribution_tools) if attribution_tools else 'none'}{' with failure note' if exclude_mcp_server else ''}")
 
             # Check if streaming was aborted due to failures
             if streaming_aborted:
@@ -1550,8 +1646,11 @@ class TextHandlerMixin:
                         and hasattr(client, "attachable_footer_blocks")):
                     footer_blocks = client.attachable_footer_blocks(
                         message.channel_id, thread_config.get("model"))
+                # F32: the buffer holds what was streamed, which may still contain the dead
+                # sandbox link — clean the text the finalize actually commits.
+                final_streamed = strip_provenance_echo(strip_sandbox_links(buffer.get_complete_text()))
                 native_finalized = await native_coord.finalize(
-                    buffer.get_complete_text(), suffix=suffix, blocks=footer_blocks)
+                    final_streamed, suffix=suffix, blocks=footer_blocks)
                 current_message_id = native_coord.current_ts or current_message_id
                 if native_finalized:
                     current_part = native_coord.part
@@ -1590,9 +1689,9 @@ class TextHandlerMixin:
                         if (tools_used or exclude_mcp_server) and show_attribution:
                             if tools_used:
                                 if exclude_mcp_server:
-                                    tools_note = f"\n\n_Used Tools: {', '.join(tools_used)} (failed: {exclude_mcp_display})_"
+                                    tools_note = f"\n\n_Tools Used: {', '.join(tools_used)} (failed: {exclude_mcp_display})_"
                                 else:
-                                    tools_note = f"\n\n_Used Tools: {', '.join(tools_used)}_"
+                                    tools_note = f"\n\n_Tools Used: {', '.join(tools_used)}_"
                             else:
                                 tools_note = f"\n\n_MCP server '{exclude_mcp_display}' could not be reached. Response generated without external tools._"
                             final_part_text = final_part_text + tools_note
@@ -1647,8 +1746,11 @@ class TextHandlerMixin:
                     else:
                         self.log_debug("Sending final update to ensure loading indicator is removed")
                     try:
-                        # Handle empty response
-                        if not response_text:
+                        # Handle empty response. F32: empty text WITH artifacts is not a
+                        # failure — the model built a chart and let it speak for itself.
+                        # Apologizing directly above the chart that's about to land reads
+                        # as a bug to the user.
+                        if not response_text and not artifact_containers:
                             response_text = "I apologize, but I couldn't generate a response. OpenAI either didn't respond or returned an empty response. Please try again."
                             self.log_warning("Empty response detected, using fallback message")
                         
@@ -1761,9 +1863,11 @@ class TextHandlerMixin:
                           # no delivered ts must not burn the unprompted quota (main.py's
                           # streamed=True fallback would otherwise read as posted).
                           "posted": bool(delivered_ts and (response_text or "").strip()),
-                          "model": thread_config.get("model")}
+                          "model": thread_config.get("model"),
+                          # F32: main.py uploads these after the reply lands.
+                          "artifact_containers": artifact_containers}
             )
-            
+
         except Exception as e:
             # Usage-estimator backstop: on a context-window rejection, compact the
             # thread before the standard non-streaming fallback retries below.
@@ -1795,6 +1899,17 @@ class TextHandlerMixin:
                 else:
                     # Log MCP failures at INFO level - they're handled gracefully
                     self.log_info(f"MCP server '{failed_mcp_server}' unavailable - retrying request without it")
+            elif is_container_gone(e):
+                # The container died mid-STREAM. `_create_with_container_recovery` cannot catch
+                # this: responses.create(stream=True) returns immediately and the 404 only
+                # surfaces seconds later, out of the SSE iterator. Unbind it here so the
+                # non-streaming fallback below re-resolves onto a fresh container instead of
+                # replaying the dead id. Handled, not exceptional — logging it as an ERROR with a
+                # traceback (which is what happened before) reads like a bug in production.
+                self.log_warning(
+                    f"Code-interpreter container expired mid-stream; recreating and continuing "
+                    f"without it: {e}")
+                await self._drop_dead_containers(persistent_container_ids(tools), thread_key)
             else:
                 # Unexpected errors - log as ERROR
                 self.log_error(f"Error in streaming response generation: {e}")
@@ -1806,6 +1921,15 @@ class TextHandlerMixin:
             if progress_task and not progress_task.done():
                 progress_task.cancel()
                 self.log_debug("Cancelled progress updater due to error")
+
+            # A native stream must be STOPPED before its message can be touched. Slack rejects
+            # chat.update on a message still in streaming state (`streaming_state_conflict`), so
+            # skipping this left the half-written message orphaned AND un-editable — and then the
+            # fallback below posted the answer a SECOND time. That is the "42 / 42" duplicate:
+            # both were real messages, one abandoned mid-stream and one from the retry.
+            if native_coord is not None and native_coord.started and not native_coord.finished:
+                if not await native_coord.abandon():
+                    self.log_warning("Native stream abandon failed before non-streaming fallback")
 
             # Try to remove the loading indicator if we have a visible message —
             # the lazy legacy seed (status-only DMs) lives in current_message_id,
@@ -1824,6 +1948,19 @@ class TextHandlerMixin:
                     await client.update_message_streaming(message.channel_id, cleanup_ts, error_text)
                 except Exception as cleanup_error:
                     self.log_debug(f"Could not remove loading indicator: {cleanup_error}")
+
+            # The partial the abandoned stream left behind is a dead artifact of a failed attempt:
+            # the retry below re-answers from scratch and posts its own message. Delete it, or the
+            # user reads the same answer twice.
+            if (native_coord is not None and native_coord.started
+                    and native_coord.current_ts and not failed_mcp_server):
+                try:
+                    if await client.delete_message(message.channel_id, native_coord.current_ts):
+                        self.log_debug("Deleted abandoned partial stream before non-streaming fallback")
+                        if native_coord.current_ts == cleanup_ts:
+                            cleanup_ts = None
+                except Exception as e:  # noqa: BLE001 — a lingering partial beats a lost answer
+                    self.log_warning(f"Could not delete abandoned partial stream: {e}")
 
             # Retry request - streaming preserved for MCP failures, non-streaming for other errors
             if failed_mcp_server:
@@ -1848,7 +1985,8 @@ class TextHandlerMixin:
             return await self._handle_text_response(
                 user_content, thread_state, client, message, thinking_id,
                 attachment_urls, retry_count=1, failed_mcp_server=failed_mcp_servers,
-                visible_already_committed=visible_content_delivered
+                visible_already_committed=visible_content_delivered,
+                artifacts_acc=artifacts
             )
 
     @staticmethod
@@ -1890,9 +2028,45 @@ class TextHandlerMixin:
             self.log_warning("MCP failure (HTTP 424) without a recoverable server label")
         return None
 
+    async def _resolve_ci_container(self, thread_config: dict, thread_key: str):
+        """The container to give code_interpreter this turn (id, or `auto` as fallback).
+
+        Resolved here rather than in `_build_tools_array` because binding a thread to a
+        container needs I/O (a DB read, sometimes a create + liveness check) and that builder
+        is synchronous and called from several paths.
+        """
+        if not thread_config.get('enable_code_interpreter', config.enable_code_interpreter):
+            return None
+        manager = getattr(self, "container_manager", None)
+        if manager is None:
+            return AUTO_CONTAINER
+        try:
+            return await manager.get_or_create(thread_key)
+        except Exception as e:  # noqa: BLE001 — a container problem must never cost the tool
+            self.log_warning(f"Container resolution failed, using an ephemeral one: {e}")
+            return AUTO_CONTAINER
+
+    async def _drop_dead_containers(self, containers_gone: list, thread_key: str) -> None:
+        """Forget a container that died mid-turn.
+
+        The API layer already rescued the call (it retried against an ephemeral sandbox), so the
+        reply is fine. This just stops us offering the same corpse to the next turn, which would
+        cost it a pointless retrieve() round-trip. Scoped by id so we cannot unbind a container a
+        concurrent turn has already put in its place.
+        """
+        manager = getattr(self, "container_manager", None)
+        if not containers_gone or manager is None:
+            return
+        for container_id in dict.fromkeys(containers_gone):
+            try:
+                await manager.invalidate(thread_key, container_id)
+            except Exception as e:  # noqa: BLE001 — bookkeeping must never break a turn
+                self.log_warning(f"Could not invalidate dead container {container_id}: {e}")
+
     def _build_tools_array(self, thread_config: dict, model: str,
                            exclude_mcp_server=None,
-                           registry=None) -> Optional[List[dict]]:
+                           registry=None,
+                           ci_container=None) -> Optional[List[dict]]:
         """
         Build tools array for OpenAI API based on user preferences and model.
 
@@ -1925,6 +2099,24 @@ class TextHandlerMixin:
         if web_search_enabled:
             tools.append({"type": "web_search"})
             self.log_debug("Added web_search to tools array")
+
+        # F32: code_interpreter — server-side Python sandbox. Gives the model real
+        # computation over attached data (files on the turn auto-mount in the container)
+        # and lets it produce artifacts (charts/PDFs/spreadsheets) that we upload to the
+        # thread. Per-thread override wins over the global default, like web_search.
+        #
+        # `ci_container` is the thread's persistent container id, resolved by the caller via
+        # _resolve_ci_container so the sandbox keeps its state across turns. Callers that
+        # don't resolve one (or where it failed) get `auto`: a fresh throwaway container, so
+        # the tool works, just without continuity.
+        code_interpreter_enabled = thread_config.get('enable_code_interpreter',
+                                                     config.enable_code_interpreter)
+        if code_interpreter_enabled:
+            container = ci_container or AUTO_CONTAINER
+            tools.append({"type": "code_interpreter", "container": container})
+            self.log_debug(
+                f"Added code_interpreter to tools array (container="
+                f"{container if isinstance(container, str) else 'auto'})")
 
         # Add MCP tools if enabled AND model is GPT-5 AND MCP servers configured
         mcp_enabled = thread_config.get('enable_mcp', config.mcp_enabled_default)

@@ -542,6 +542,12 @@ async def _run_deep_research_job(*, processor, client, channel_id: str, thread_r
         tools = processor._build_tools_array({}, model, registry=None) or []
         if not any(t.get("type") == "web_search" for t in tools):
             tools.append({"type": "web_search"})
+        # F32: strip code_interpreter. The shared builder adds it whenever the global flag is
+        # on, but this job has no artifact sink and its own delivery path — so it would run
+        # code, bill us for the container, write files, possibly promise them in the report,
+        # and then drop them on the floor. Publishing research artifacts is a real feature;
+        # inheriting them by accident is not it.
+        tools = [t for t in tools if t.get("type") != "code_interpreter"]
         tools.append(get_report_progress_schema())
         # Internal streaming consumption bounds the WHOLE tool loop by the deep-research
         # timeout.

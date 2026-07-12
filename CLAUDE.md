@@ -139,9 +139,47 @@ Supported models: **gpt-5.6-sol** (default), **gpt-5.6-terra**, **gpt-5.6-luna**
 
 ### Image Processing Flow
 1. Intent classification determines image vs text response
-2. Image generation uses `gpt-image-1` model
+2. Image generation defaults to **`gpt-image-2`** (`GPT_IMAGE_MODEL`); `gpt-image-1` and
+   `gpt-image-1-mini` remain selectable per-user in `/settings`. The v2 param surface differs —
+   see `_is_image_v2()` in `openai_client/api/images.py` (no transparent background, fidelity
+   auto-handled, arbitrary WxH sizes).
 3. Vision analysis stores full context (not shown to user)
 4. Edit operations use previous analysis for context
+5. **Charts/graphs/plots are NOT image generation.** They are computed in the code-interpreter
+   sandbox from real data. The classifier must route them to `none` — an image model draws a
+   plausible-looking chart with invented numbers *and invented categories*. See F32 below.
+
+### Code Interpreter + Artifacts (F32)
+The model writes and runs Python in an **OpenAI-hosted container** — this is the "scratch space",
+so the no-disk rule (pitfall 6a) holds with **zero new local dependencies**. Files it writes are
+downloaded and uploaded into the Slack thread (`message_processor/artifacts.py`).
+
+**Containers are THREAD-SCOPED and persisted** (`message_processor/containers.py`,
+`thread_containers` table). One container per `channel:thread_ts`, reused across turns so sandbox
+state survives the turn boundary. **The API caps idle life at 20 minutes** (`expires_after.minutes`
+must be ≤ 20 — 60 returns HTTP 400), so a revived thread necessarily gets a fresh, empty one.
+Reaped in the daily cleanup worker. Any failure degrades to `{"type":"auto"}` (ephemeral
+container) — never to a missing tool.
+
+Two traps that already shipped bugs once each:
+- **File citations are useless here.** They only appear if the model writes a `sandbox:` link,
+  which our prompt forbids. The container **LISTING** (`source == "assistant"`, fails closed) is
+  the only artifact source. A citation-driven v1 passed every unit test and published zero files.
+- **A reused container's listing is CUMULATIVE** — turn 2 sees turn 1's files. Published file ids
+  are persisted (`published_files_json`) because the in-memory dedupe dies with the process.
+
+**Sandbox capabilities** (probed live 2026-07-12, Python 3.13):
+- *Data*: pandas, numpy, scipy, sklearn, statsmodels, sympy, numba, networkx, h5py
+- *Charts*: matplotlib, seaborn, plotly, wordcloud, graphviz + `dot`, pydot
+- *Office*: **python-docx, openpyxl, xlsxwriter, python-pptx** — plus **LibreOffice/`soffice`** and
+  **pandoc** for format conversion. (`xlrd` and `pyarrow`/`fastparquet` are absent.)
+- *PDF*: pypdf, reportlab, fpdf, weasyprint, `pdftoppm`. (`PyPDF2` is absent — use `pypdf`.)
+- *Images/media*: PIL, cv2, imageio, cairosvg, svglib, **ffmpeg**, moviepy, **tesseract**/pytesseract
+- *Archives*: `zipfile`, `tarfile`, `zip`/`unzip` binaries
+- *Geo*: geopandas, shapely, folium
+- **NO network egress.** `pip install` fails at DNS; exfiltration is impossible. Bytes must be
+  *pushed in* via `containers.files.create(container_id, file=…)` — which needs a known container
+  id, i.e. only works now that containers are persisted.
 
 ### Scanned / Image-Only PDF Handling
 - On the attach turn, PDFs within the native limits ride the message as `input_file`

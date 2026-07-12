@@ -257,6 +257,32 @@ Flags: `ENABLE_DEEP_RESEARCH` (default **on**), `DEEP_RESEARCH_REASONING_EFFORT`
 (on — the byline needs the `chat:write.customize` scope; without it the bot posts plainly rather
 than failing).
 
+### 📊 Feature - It can write and run code, and hand you the file
+
+Ask for a chart, a cleaned-up spreadsheet, a summary of the numbers in a CSV you dropped in the
+thread — the bot now writes Python, runs it in a sandbox, and uploads whatever it produced back
+into the thread as a real file.
+
+- **The numbers are real.** Charts are computed from your actual data, not drawn. Previously
+  "chart this" could be mistaken for an image request, and the image model would draw a
+  plausible-looking chart with invented numbers and invented labels. That is fixed: charting data
+  goes to the sandbox, always.
+- **The file comes back.** Anything the code writes — `.png`, `.xlsx`, `.docx`, `.pptx`, `.csv`,
+  `.pdf` — is uploaded into the thread. The sandbox ships with pandas, matplotlib, openpyxl,
+  python-docx, python-pptx, LibreOffice, ffmpeg and more. Executables, archives and
+  macro-enabled Office files are never handed back.
+- **The scratch space survives the turn.** Each thread (channel or DM) gets its own sandbox, so a
+  follow-up like "now add a trendline" reuses what was already computed instead of starting over.
+  It goes cold after ~20 minutes idle — an API limit — and a revived thread quietly gets a fresh
+  one.
+- **Internal steps stay internal.** The "Tools Used" footer is there to tell you where outside
+  facts came from (web search, Datassential). Running code isn't an outside source, so it no
+  longer shows up there.
+
+Flags: `ENABLE_CODE_INTERPRETER` (default **on**), `ARTIFACT_MAX_FILES` (4), `ARTIFACT_MAX_MB`
+(25), `ARTIFACT_ALLOWED_EXTENSIONS`, `CODE_INTERPRETER_CONTAINER_TTL_MINUTES` (20 — the API
+maximum), `CODE_INTERPRETER_CONTAINER_REUSE_MINUTES` (15).
+
 ### 💬 Feature - Reactions that read like a colleague's
 
 - **"I'm on it."** When a request implies real work — files to read, data to look up, several

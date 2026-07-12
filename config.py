@@ -8,7 +8,7 @@ import random
 import re
 from functools import lru_cache
 from dotenv import load_dotenv
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 
 load_dotenv()
@@ -652,6 +652,58 @@ class BotConfig:
     # Needs the chat:write.customize scope, which the app may not have — on the first failure the
     # process falls back to plain posts for the rest of its life. Never breaks delivery.
     enable_research_label: bool = field(default_factory=lambda: os.getenv("ENABLE_RESEARCH_LABEL", "true").lower() == "true")
+
+    # --- F32: code interpreter + artifacts ---
+    # OpenAI's server-side code_interpreter tool: the model writes and runs Python in an
+    # OpenAI-hosted container. Two things this buys us, both verified live 2026-07-11:
+    #   1. REAL computation over attached data. Files already riding the turn as `input_file`
+    #      parts auto-materialize in the container's /mnt/data — no Files API objects are
+    #      created, so nothing of the user's data persists on OpenAI's side (same ephemeral
+    #      request-body boundary as the native-PDF path). A 5000-row CSV summed exactly.
+    #   2. ARTIFACTS. Files the code writes are read back off the container LISTING; we download
+    #      the bytes and upload them to Slack. The container is the scratch space, so the
+    #      no-disk rule (CLAUDE.md pitfall 6a) holds with ZERO new local dependencies.
+    # The sandbox has no network egress (pip install and exfiltration both impossible).
+    enable_code_interpreter: bool = field(default_factory=lambda: os.getenv("ENABLE_CODE_INTERPRETER", "true").lower() == "true")
+    # Containers are THREAD-SCOPED and persisted: one container per channel/thread, its id kept
+    # in `thread_containers` and reused across turns, so the model's working state survives the
+    # turn boundary ("clean that up" -> "now chart it" lands in the same /mnt/data).
+    #
+    # HARD API CEILING (probed live 2026-07-12): expires_after.minutes must be <= 20 — asking for
+    # 60 returns HTTP 400 "integer above maximum value". So a container CANNOT be held longer
+    # than 20 minutes of idle, and "persistent" means warm-within-an-active-conversation. A
+    # revived thread always gets a fresh, empty container; that is the API's rule, not a choice.
+    code_interpreter_container_ttl_minutes: int = field(
+        default_factory=lambda: min(20, max(1, int(os.getenv("CODE_INTERPRETER_CONTAINER_TTL_MINUTES", "20")))))
+    # Only reuse a stored container if we used it this recently. Held under the TTL so we don't
+    # hand the API an id that idle-expired in the gap. Liveness is still CONFIRMED with a
+    # retrieve() before reuse — the DB records when *we* last used it, which is not the same as
+    # when the container was last active (an API call that failed never touched it).
+    code_interpreter_container_reuse_minutes: int = field(
+        default_factory=lambda: max(1, int(os.getenv("CODE_INTERPRETER_CONTAINER_REUSE_MINUTES", "15"))))
+    # Max artifacts published per turn. The model can write many intermediate files; only the
+    # ones it cites get published, and this bounds a runaway loop from flooding the thread.
+    artifact_max_files: int = field(default_factory=lambda: max(1, int(os.getenv("ARTIFACT_MAX_FILES", "4"))))
+    # Per-file size ceiling for an outbound artifact. Slack's own limit is far higher; this is
+    # our guard against uploading something absurd. Oversized artifacts are dropped with a note.
+    artifact_max_mb: int = field(default_factory=lambda: max(1, int(os.getenv("ARTIFACT_MAX_MB", "25"))))
+    # Outbound allowlist by extension. Deliberately excludes executables, archives, and macro-
+    # enabled Office formats (.xlsm/.docm) — the bot must not hand anyone active content.
+    # HTML/SVG are excluded by default too: Slack won't render them inline anyway, and they can
+    # carry script. Set ARTIFACT_ALLOWED_EXTENSIONS to override (comma-separated, no dots).
+    artifact_allowed_extensions: List[str] = field(default_factory=lambda: [
+        e.strip().lower().lstrip(".")
+        for e in os.getenv(
+            "ARTIFACT_ALLOWED_EXTENSIONS",
+            "png,jpg,jpeg,gif,webp,pdf,csv,tsv,json,txt,md,xlsx,docx,pptx"
+        ).split(",") if e.strip()
+    ])
+    # Whole-phase bound on downloading + uploading a turn's artifacts. The answer is already
+    # posted by then, but the turn is still held open, so a wedged upload would stall the next
+    # message in the thread.
+    artifact_publish_timeout: float = field(default_factory=lambda: float(os.getenv("ARTIFACT_PUBLISH_TIMEOUT", "120")))
+    # Status-line emoji while the sandbox is running code.
+    code_interpreter_emoji: str = field(default_factory=lambda: os.getenv("CODE_INTERPRETER_EMOJI", "📊"))
 
     # Link previews (unfurl cards) on the bot's posted messages. Default OFF (user
     # preference 2026-07-11, matching Claude Tag): links stay inline, and Slack's
