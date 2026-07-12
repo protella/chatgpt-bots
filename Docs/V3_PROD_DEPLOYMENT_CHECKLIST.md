@@ -24,11 +24,16 @@ read-only survey of the live prod box. Nothing here has been executed yet.
 
 - [ ] **Push the 86 local commits** and confirm `origin/master` has them (prod pulls from
       `https://github.com/protella/chatgpt-bots.git`).
-- [ ] Decide the two posture questions below — they change what goes in `.env`:
-  - [ ] **`ENABLE_CHANNEL_LISTENING`** — ships **off**. Off = prod behaves as today (mentions + DMs).
-        Leave off for the first deploy; flip it later as a separate, observable change.
-  - [ ] **`ENABLE_DEEP_RESEARCH`** — ships **on**, and works in DMs. Each job is minutes of
-        `high`-effort model time. Conscious yes/no before it's live to the whole workspace.
+**Feature posture for prod (decided):** everything **on**, *except* the feedback strip.
+- `ENABLE_CHANNEL_LISTENING = "true"` — the bot participates in channels it's invited to.
+  **This makes the `message.channels` / `message.groups` / `message.mpim` events and the
+  `channels:history` / `groups:history` / `mpim:history` scopes REQUIRED** in the manifest (step 9),
+  not optional. Per-channel behavior is still governed by `CHANNEL_RESPONSE_MODE` (default
+  `tag_only`) and the ⚙️ Configure button, so channels start conservative.
+- `ENABLE_DEEP_RESEARCH = "true"` — live in channels and DMs.
+- `ENABLE_FEEDBACK_BUTTONS = "false"` — **off**: no 👍/👎 strip under DM/assistant replies.
+  (Thumbs *reactions* on bot messages are still recorded passively — that's a separate,
+  zero-cost path and needs no flag.)
 
 ## 2. Take a manual backup and stop the bot
 
@@ -105,12 +110,14 @@ OPENAI_KEY_PERSONAL     # unused by this bot
 ```
 BOT_NAME_ALIASES = "ChatGPT"                                          # prod bot has NO "-dev"
 STATUS_LOADING_MESSAGES_FILE = "status_messages/loading_messages.datassential.txt"
-ENABLE_CHANNEL_LISTENING = "false"                                    # per the step-1 decision
-ENABLE_DEEP_RESEARCH = "true"                                         # per the step-1 decision
+ENABLE_CHANNEL_LISTENING = "true"                                     # all features on in prod
+ENABLE_DEEP_RESEARCH = "true"
+ENABLE_FEEDBACK_BUTTONS = "false"                                     # the one feature we leave off
 SLACK_NATIVE_STREAMING = "false"                                      # validate live before enabling
 ```
-The other ~85 new keys can be omitted — each has a working default, and `.env.example` documents
-every one inline if you want to pin them.
+The other ~84 new keys can be omitted — each has a working default (and every remaining feature
+defaults **on**, which is the posture we want), and `.env.example` documents each one inline if you
+prefer to pin them explicitly.
 
 ### 6d. Consider — log levels
 Prod runs `DEBUG` across the board. v3 is considerably chattier (channel pulse, participation
@@ -170,7 +177,7 @@ search:read.files · search:read.users
 Add to event subscriptions:
 ```
 reaction_added · reaction_removed · app_home_opened · app_context_changed
-(message.channels / message.groups / message.mpim only if channel listening goes on)
+message.channels · message.groups · message.mpim     ← REQUIRED: channel listening is on in prod
 ```
 Also add the `agent_view` block (agent description + suggested prompts) from
 `slack_app_manifest.example.yml`. **Reinstall the app to the workspace** so the new scopes take effect.
@@ -211,6 +218,10 @@ Everyone's model/effort resets to `gpt-5.6-sol` / `medium` — that's intended, 
       (byline missing ⇒ `chat:write.customize` didn't take)
 - [ ] MCP: startup log shows one reachable/unreachable line per server; a Datassential question works
 - [ ] Status bubble shows the **Datassential** loading messages, not the generic ones
+- [ ] **Channel listening**: in a channel the bot is in, @-mention it → it answers; post an unrelated
+      human-to-human message → it stays out. (If it answers nothing at all, the `message.channels`
+      event subscription didn't take.)
+- [ ] **No 👍/👎 strip** under DM replies (feedback buttons are off in prod)
 - [ ] Next day: `Scheduled database backup complete (7-day retention)` appears in the log
 
 ## 12. Rollback
