@@ -3,6 +3,11 @@
 Everything that has to happen on **beastbox** beyond `git pull`. Written 2026-07-11 from a
 read-only survey of the live prod box. Nothing here has been executed yet.
 
+> **Living document.** v3 work is still landing (pinning/canvas support among it). Re-check the
+> `.env` deltas (step 6) and manifest scopes (step 9) against `.env.example` and
+> `slack_app_manifest.example.yml` immediately before running the upgrade — those two files are the
+> source of truth, this is the operator's map.
+
 ## Prod as it stands today
 
 | | |
@@ -171,9 +176,14 @@ Add to bot scopes:
 ```
 assistant:write · chat:write.customize · pins:read · reactions:read · reactions:write
 users:read.email · emoji:read · channels:read · groups:read · mpim:read
+channels:history · groups:history · mpim:history      ← REQUIRED: channel listening is on
 search:read.public · search:read.private · search:read.im · search:read.mpim
 search:read.files · search:read.users
+bookmarks:read · bookmarks:write · canvases:read · canvases:write · pins:write
 ```
+The last line is **staged for the pinning/canvas work still in flight** — no v3 code calls those
+APIs yet. They're included deliberately so this one reinstall covers that feature too, instead of
+needing a second reinstall in a week.
 Add to event subscriptions:
 ```
 reaction_added · reaction_removed · app_home_opened · app_context_changed
