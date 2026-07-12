@@ -21,8 +21,38 @@ from config import config
 # `[used tools: …]` / `[reactions: …]` annotation lines then end-of-string, so a
 # following annotation can never shield the footer from stripping (F7-4) while an
 # unrelated trailing bracket line no longer triggers a false match.
+# Matches BOTH wordings: the footer reads "_Tools Used: …_" as of 2026-07-11, but Slack is the
+# transcript and every reply posted before that still carries the old "_Used Tools: …_". Rebuilds
+# read those old messages back, so the stripper must keep catching them or the stale chrome starts
+# leaking into model context.
 _USED_TOOLS_FOOTER_RE = re.compile(
-    r'\n\n_Used Tools:.+?_(?=(?:\n\[(?:used tools|reactions):[^\n\]]*\])*\s*$)')
+    r'\n\n_(?:Tools Used|Used Tools):.+?_(?=(?:\n\[(?:used tools|reactions):[^\n\]]*\])*\s*$)')
+
+# The model ECHOES its own annotations. `[used tools: …]` / `[tool results: …]` are injected into
+# context as a record of what it previously did — and having seen them on every prior assistant
+# turn, it happily writes one itself, which then ships to the user as gibberish chrome (observed
+# live: a reply that read "56,088\n[used tools: code_interpreter]"). These lines are OURS to write
+# and never the model's, so they are stripped from generated text unconditionally.
+_PROVENANCE_ECHO_RE = re.compile(
+    r'\n*^\[(?:used tools|tool results):[^\n\]]*\]\s*$', re.MULTILINE)
+
+
+def strip_provenance_echo(text: str) -> str:
+    """Remove any `[used tools: …]` / `[tool results: …]` line the MODEL wrote itself."""
+    if not text or "[used tools:" not in text and "[tool results:" not in text:
+        return text
+    return _PROVENANCE_ECHO_RE.sub("", text).strip()
+
+
+# Attribution answers "where did this information come from" — so it lists EXTERNAL sources only.
+# code_interpreter is internal processing (the model doing arithmetic in a sandbox), not a source,
+# and surfacing it just adds noise to every computed answer.
+ATTRIBUTION_HIDDEN_TOOLS = {"code_interpreter"}
+
+
+def visible_attribution_tools(tools_used) -> List[str]:
+    """The tools worth telling the user about: external data sources, not internal plumbing."""
+    return [t for t in (tools_used or []) if t not in ATTRIBUTION_HIDDEN_TOOLS]
 
 # Budgets (F7, now env-backed per F14): entries/turn (config.tool_provenance_max_entries,
 # default 20), gist chars (config.tool_provenance_gist_chars, default 80), annotation line
@@ -82,7 +112,10 @@ def _gist_render_value(key: str, value: Any) -> str:
 
 
 def strip_used_tools_footer(content: Any) -> Any:
-    """Remove the external `_Used Tools:_` footer from an assistant message body.
+    """Remove the external `_Tools Used:_` footer from an assistant message body.
+
+    Also removes the legacy `_Used Tools:_` wording, which is still present on every reply
+    posted before 2026-07-11 and comes back on every rebuild (Slack is the transcript).
 
     A no-op for non-strings and for content without the footer. Used both at API-send
     time (keep external chrome out of model context) and BEFORE appending the F7

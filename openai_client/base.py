@@ -8,6 +8,7 @@ from openai import AsyncOpenAI
 
 from config import config
 from logger import LoggerMixin
+from openai_client.container_errors import is_container_gone
 
 from .api import images as image_api
 from .api import responses as responses_api
@@ -202,6 +203,13 @@ class OpenAIClient(LoggerMixin):
                 if is_mcp_error:
                     # MCP errors are handled gracefully by retry logic - log as WARNING
                     self.log_warning(f"MCP server connection failed after {elapsed:.2f}s: {error_msg}")
+                elif is_container_gone(e):
+                    # A code-interpreter container that idle-expires mid-stream is handled by the
+                    # caller (it unbinds the container and re-runs without it), exactly like the
+                    # MCP case above. Logging it as an ERROR-with-traceback made a recovered turn
+                    # look like a crash in production.
+                    self.log_warning(
+                        f"Code-interpreter container expired mid-stream after {elapsed:.2f}s: {error_msg}")
                 else:
                     # Unexpected errors - log as ERROR with stack trace
                     self.log_error(f"Stream error after {elapsed:.2f}s: {e}")
@@ -296,6 +304,13 @@ class OpenAIClient(LoggerMixin):
         prompt_cache_key: Optional[str] = None,
         usage_sink: Optional[Dict[str, Any]] = None,
         mcp_tools_sink: Optional[Dict[str, Any]] = None,
+        # Pre-existing gap found while wiring F32: handlers/text.py has always passed
+        # mcp_results_sink here, but this wrapper never accepted it — so the no-tool-loop
+        # branch (ENABLE_TOOL_LOOP=false with web_search/MCP on) raised TypeError. The
+        # tool-loop path forwards **params straight through and so never hit it.
+        mcp_results_sink: Optional[List[Dict[str, Any]]] = None,
+        artifacts_sink: Optional[List[Dict[str, Any]]] = None,
+        container_gone_sink: Optional[List[str]] = None,
     ) -> str:
         return await responses_api.create_text_response_with_tools(
             self,
@@ -313,6 +328,9 @@ class OpenAIClient(LoggerMixin):
             prompt_cache_key=prompt_cache_key,
             usage_sink=usage_sink,
             mcp_tools_sink=mcp_tools_sink,
+            mcp_results_sink=mcp_results_sink,
+            artifacts_sink=artifacts_sink,
+            container_gone_sink=container_gone_sink,
         )
 
     async def create_streaming_response(
@@ -365,7 +383,12 @@ class OpenAIClient(LoggerMixin):
         prompt_cache_key: Optional[str] = None,
         usage_sink: Optional[Dict[str, Any]] = None,
         mcp_tools_sink: Optional[Dict[str, Any]] = None,
+        # Same pre-existing gap as the non-streaming wrapper above — handlers/text.py passes
+        # this on the no-tool-loop branch and it was never accepted here.
+        mcp_results_sink: Optional[List[Dict[str, Any]]] = None,
         tool_event_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        artifacts_sink: Optional[List[Dict[str, Any]]] = None,
+        container_gone_sink: Optional[List[str]] = None,
     ) -> str:
         return await responses_api.create_streaming_response_with_tools(
             self,
@@ -384,7 +407,10 @@ class OpenAIClient(LoggerMixin):
             prompt_cache_key=prompt_cache_key,
             usage_sink=usage_sink,
             mcp_tools_sink=mcp_tools_sink,
+            mcp_results_sink=mcp_results_sink,
             tool_event_callback=tool_event_callback,
+            artifacts_sink=artifacts_sink,
+            container_gone_sink=container_gone_sink,
         )
 
     async def create_text_response_with_tool_loop(
@@ -693,6 +719,8 @@ class OpenAIClient(LoggerMixin):
         store: bool = False,
         timeout_seconds: float = 60.0,
         return_metadata: bool = False,
+        artifacts_sink: Optional[List[Dict[str, Any]]] = None,
+        container_gone_sink: Optional[List[str]] = None,
     ) -> str:
         return await responses_api._create_text_response_with_tools_with_timeout(
             self,
@@ -708,6 +736,8 @@ class OpenAIClient(LoggerMixin):
             store=store,
             timeout_seconds=timeout_seconds,
             return_metadata=return_metadata,
+            artifacts_sink=artifacts_sink,
+            container_gone_sink=container_gone_sink,
         )
 
 

@@ -4,7 +4,7 @@ import asyncio
 import random
 import time
 from collections import OrderedDict
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_sdk.errors import SlackApiError
@@ -595,6 +595,52 @@ class SlackMessagingMixin:
                 
         except SlackApiError as e:
             self.log_error(f"Error uploading image: {e}")
+            return None
+
+    async def send_file(self, channel_id: str, thread_id: str, file_data,
+                        filename: str, title: Optional[str] = None,
+                        initial_comment: str = "") -> Optional[Dict[str, Any]]:
+        """F32: upload an arbitrary file (BytesIO) and return its full Slack identity.
+
+        Distinct from send_image, which returns a bare URL: an artifact has to be findable
+        again, so callers get {"file_id", "url_private", "permalink"} to persist. The
+        file_id is what `read_document` looks up, so without it the model could never
+        re-read its own artifact.
+
+        Returns None on any failure — the caller decides whether that's fatal (for an
+        artifact it never is: the text answer already landed).
+        """
+        try:
+            result = await self.app.client.files_upload_v2(
+                channel=channel_id,
+                thread_ts=thread_id,
+                file=file_data,
+                filename=filename,
+                title=title or filename,
+                initial_comment=initial_comment or "",
+            )
+            files = (result or {}).get("files") or []
+            if not files:
+                self.log_warning(f"File uploaded but no file info returned: {filename}")
+                return None
+            info = files[0]
+            file_id = info.get("id")
+            url = info.get("url_private") or info.get("permalink")
+            if not file_id or not url:
+                # Without an id we could never find this file again, and the caller would
+                # persist a ref that points at nothing. A response we can't use is not success.
+                self.log_warning(
+                    f"File upload returned no usable identity (id={file_id!r}): {filename}")
+                return None
+            identity = {"file_id": file_id, "url_private": url,
+                        "permalink": info.get("permalink")}
+            self.log_info(f"File uploaded: {filename} (id={file_id})")
+            return identity
+        except SlackApiError as e:
+            self.log_error(f"Error uploading file '{filename}': {e}")
+            return None
+        except Exception as e:  # noqa: BLE001 — an upload problem must never break the turn
+            self.log_error(f"Unexpected error uploading file '{filename}': {e}")
             return None
 
     async def send_thinking_indicator(self, channel_id: str, thread_id: str) -> Optional[str]:

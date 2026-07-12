@@ -106,6 +106,20 @@ class BaseClient(ABC, LoggerMixin):
         """Send an image (async version)"""
         pass
 
+    async def send_file(self, channel_id: str, thread_id: str, file_data,
+                        filename: str, title: Optional[str] = None,
+                        initial_comment: str = "") -> Optional[Dict[str, Any]]:
+        """F32: upload an arbitrary file, returning its platform identity
+        ({"file_id", "url_private", "permalink"}) or None.
+
+        Deliberately NOT abstract: a platform that can't take file uploads is a platform
+        where artifacts simply don't publish, not one that fails to construct. The default
+        declines honestly so the caller drops the artifact and still posts its answer.
+        """
+        self.log_warning(f"send_file not implemented for {self.__class__.__name__} — "
+                         f"dropping artifact '{filename}'")
+        return None
+
     @abstractmethod
     def send_thinking_indicator(self, channel_id: str, thread_id: str) -> Optional[str]:
         """Send a thinking/processing indicator"""

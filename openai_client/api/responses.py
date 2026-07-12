@@ -6,6 +6,8 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from config import config, clamp_effort
+from openai_client.container_errors import (demote_container_tools, is_container_gone,
+                                            persistent_container_ids)
 from prompts import (INTENT_CLASSIFIER_PROMPT, MEMORY_EXTRACTION_SYSTEM_PROMPT,
                      PARTICIPATION_SYSTEM_PROMPT, TOOL_RESULT_SUMMARIZE_PROMPT,
                      WAKE_CLASSIFIER_SYSTEM_PROMPT)
@@ -41,6 +43,47 @@ def _capture_usage(usage_sink, response):
         return
     usage_sink["input_tokens"] = getattr(usage, "input_tokens", 0) or 0
     usage_sink["output_tokens"] = getattr(usage, "output_tokens", 0) or 0
+
+
+async def _create_with_container_recovery(self, request_params: Dict[str, Any],
+                                         operation_type: str,
+                                         container_gone_sink: Optional[List[str]] = None,
+                                         **safe_call_kwargs):
+    """`responses.create`, surviving a container that died since we verified it.
+
+    The tool loop makes one Responses call per round with minutes of tool work between them, so
+    a container confirmed alive at turn start can idle-expire before round 3. That 404 would
+    otherwise fail the whole turn — the user gets an error instead of an answer, which is never
+    a fair price for a sandbox nicety.
+
+    On a container 404 we demote the tools array to `{"type": "auto"}` (a fresh throwaway
+    container) and retry the SAME call once. Local tools already executed this turn are not
+    replayed: only this one API call repeats. The dead id lands in `container_gone_sink` so the
+    caller can drop its DB binding.
+    """
+    try:
+        return await self._safe_api_call(
+            self.client.responses.create, operation_type=operation_type,
+            **safe_call_kwargs, **request_params)
+    except Exception as e:  # noqa: BLE001 — re-raised below unless it is a dead container
+        if not is_container_gone(e):
+            raise
+        demoted, changed = demote_container_tools(request_params.get("tools"))
+        if not changed:
+            # A 404 mentioning "container" but no explicit container of ours to blame. Retrying
+            # would fail identically.
+            raise
+
+        dead = persistent_container_ids(request_params.get("tools"))
+        if container_gone_sink is not None:
+            container_gone_sink.extend(dead)
+        self.log_warning(
+            f"Container {dead} died mid-turn — retrying this call with an ephemeral sandbox")
+
+        retry_params = {**request_params, "tools": demoted}
+        return await self._safe_api_call(
+            self.client.responses.create, operation_type=operation_type,
+            **safe_call_kwargs, **retry_params)
 
 
 def _collect_mcp_list_tools(mcp_tools_sink, item):
@@ -90,6 +133,27 @@ def _capture_mcp_result(mcp_results_sink, item, server_label):
         mcp_results_sink.append({"tool_name": server_label or "mcp", "output": str(output)})
     except Exception:
         # Result capture must never interfere with response processing
+        pass
+
+
+def _note_container(artifacts_sink, item):
+    """F32: record the code-interpreter container so the caller can LIST the files it wrote.
+
+    The container listing is the only artifact source. We deliberately do NOT harvest
+    `container_file_citation` annotations: they appear only when the model writes a
+    `sandbox:` link (which we forbid — dead in Slack), the listing is a strict superset of
+    them anyway, and a citation could name the USER'S OWN mounted attachment, which the
+    listing's `source == "assistant"` filter would otherwise have excluded.
+
+    Never raises: losing a container costs files, not the response.
+    """
+    if artifacts_sink is None:
+        return
+    try:
+        container_id = getattr(item, "container_id", None)
+        if container_id:
+            artifacts_sink.append({"container_id": container_id})
+    except Exception:
         pass
 
 
@@ -229,7 +293,9 @@ async def create_text_response_with_tools(
     prompt_cache_key: Optional[str] = None,
     usage_sink: Optional[Dict[str, Any]] = None,
     mcp_tools_sink: Optional[Dict[str, Any]] = None,
-    mcp_results_sink: Optional[List[Dict[str, Any]]] = None
+    mcp_results_sink: Optional[List[Dict[str, Any]]] = None,
+    artifacts_sink: Optional[List[Dict[str, Any]]] = None,
+    container_gone_sink: Optional[List[str]] = None
 ) -> str:
     """
     Create text response with tools (e.g., web search)
@@ -312,12 +378,11 @@ async def create_text_response_with_tools(
         operation_type = "text_normal"
 
         # API call with enforced timeout wrapper
-        response = await self._safe_api_call(
-            self.client.responses.create,
-            operation_type=operation_type,
-            **request_params
+        response = await _create_with_container_recovery(
+            self, request_params, operation_type,
+            container_gone_sink=container_gone_sink,
         )
-        
+
         _capture_usage(usage_sink, response)
 
         # Extract text from response and detect tool usage
@@ -341,6 +406,19 @@ async def create_text_response_with_tools(
                 elif item_type == "web_search_call":
                     if "web_search" not in tools_actually_used:
                         tools_actually_used.append("web_search")
+                elif item_type == "code_interpreter_call":
+                    # F32: the model ran Python in the sandbox. Record the container so the
+                    # caller can LIST the files it wrote.
+                    #
+                    # Why listing and not annotations: a `container_file_citation` annotation
+                    # only appears when the model writes a `sandbox:` markdown link to the
+                    # file — and we explicitly tell it not to (those links are dead in Slack).
+                    # Verified live: prompt says "no links" -> 0 annotations, files still on
+                    # disk in the container. The container listing is the source of truth;
+                    # annotations are a bonus when the model happens to cite.
+                    if "code_interpreter" not in tools_actually_used:
+                        tools_actually_used.append("code_interpreter")
+                    _note_container(artifacts_sink, item)
                 elif item_type == "function_call" and function_call_sink is not None:
                     # Local function call — collected for the tool loop, not part of the text
                     function_call_sink.append({
@@ -579,6 +657,12 @@ async def create_streaming_response(
                                 result = tool_callback("image_generation", "generating")
                             elif event_type == "response.image_generation_call.completed":
                                 result = tool_callback("image_generation", "completed")
+                            elif event_type == "response.code_interpreter_call.in_progress":
+                                result = tool_callback("code_interpreter", "started")
+                            elif event_type == "response.code_interpreter_call.interpreting":
+                                result = tool_callback("code_interpreter", "interpreting")
+                            elif event_type == "response.code_interpreter_call.completed":
+                                result = tool_callback("code_interpreter", "completed")
                             elif event_type == "response.mcp_list_tools.in_progress":
                                 result = tool_callback("mcp", "discovering_tools")
                             elif event_type == "response.mcp_list_tools.completed":
@@ -636,7 +720,9 @@ async def create_streaming_response_with_tools(
     usage_sink: Optional[Dict[str, Any]] = None,
     mcp_tools_sink: Optional[Dict[str, Any]] = None,
     mcp_results_sink: Optional[List[Dict[str, Any]]] = None,
-    tool_event_callback: Optional[Callable[[Dict[str, Any]], Any]] = None
+    tool_event_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    artifacts_sink: Optional[List[Dict[str, Any]]] = None,
+    container_gone_sink: Optional[List[str]] = None
 ) -> str:
     """
     Create streaming text response with tools (e.g., web search)
@@ -728,10 +814,9 @@ async def create_streaming_response_with_tools(
         else:
             operation_type = "text_normal"  # 2.5 minutes
 
-        response = await self._safe_api_call(
-            self.client.responses.create,
-            operation_type=operation_type,
-            **request_params
+        response = await _create_with_container_recovery(
+            self, request_params, operation_type,
+            container_gone_sink=container_gone_sink,
         )
 
         complete_text = ""
@@ -851,6 +936,12 @@ async def create_streaming_response_with_tools(
                         elif item_type == 'mcp_list_tools' and mcp_tools_sink is not None:
                             # Tool discovery payload — informational cache (server -> tools)
                             _collect_mcp_list_tools(mcp_tools_sink, item)
+                        elif item_type == 'code_interpreter_call':
+                            # F32: record the container so its files can be listed after the
+                            # stream. This — not the annotations below — is what actually
+                            # surfaces artifacts, since we tell the model never to write the
+                            # `sandbox:` links that would produce a citation.
+                            _note_container(artifacts_sink, item)
                     continue
                 elif event_type in ["response.done", "response.completed"]:
                     _capture_usage(usage_sink, getattr(event, "response", None))
@@ -894,6 +985,12 @@ async def create_streaming_response_with_tools(
                                 result = tool_callback("image_generation", "generating")
                             elif event_type == "response.image_generation_call.completed":
                                 result = tool_callback("image_generation", "completed")
+                            elif event_type == "response.code_interpreter_call.in_progress":
+                                result = tool_callback("code_interpreter", "started")
+                            elif event_type == "response.code_interpreter_call.interpreting":
+                                result = tool_callback("code_interpreter", "interpreting")
+                            elif event_type == "response.code_interpreter_call.completed":
+                                result = tool_callback("code_interpreter", "completed")
                             elif event_type == "response.mcp_list_tools.in_progress":
                                 result = tool_callback("mcp", "discovering_tools")
                             elif event_type == "response.mcp_list_tools.completed":
@@ -939,6 +1036,11 @@ async def create_streaming_response_with_tools(
         if is_mcp_error:
             # MCP errors are handled gracefully by retry logic - log as WARNING without stack trace
             self.log_warning(f"MCP connection failed during streaming (will retry without failed server): {error_msg}")
+        elif is_container_gone(e):
+            # Handled upstream (the binding is dropped and the turn re-runs without it), same as
+            # the MCP case — a recovered turn must not leave a crash-shaped traceback behind.
+            self.log_warning(
+                f"Code-interpreter container expired during streaming (will retry without it): {error_msg}")
         else:
             # Unexpected errors - log as ERROR with stack trace
             self.log_error(f"Error creating streaming response with tools: {e}", exc_info=True)
@@ -1562,7 +1664,9 @@ async def _create_text_response_with_tools_with_timeout(
     timeout_seconds: float = 60.0,
     return_metadata: bool = False,
     function_call_sink: Optional[List[Dict[str, Any]]] = None,
-    tool_choice: Optional[str] = None
+    tool_choice: Optional[str] = None,
+    artifacts_sink: Optional[List[Dict[str, Any]]] = None,
+    container_gone_sink: Optional[List[str]] = None
 ) -> str:
     """
     Create text response with tools and custom timeout (for retry scenarios)
@@ -1634,11 +1738,10 @@ async def _create_text_response_with_tools_with_timeout(
         operation_type = "text_normal"
 
         # API call with custom timeout
-        response = await self._safe_api_call(
-            self.client.responses.create,
-            operation_type=operation_type,
+        response = await _create_with_container_recovery(
+            self, request_params, operation_type,
+            container_gone_sink=container_gone_sink,
             timeout_seconds=timeout_seconds,
-            **request_params
         )
 
         # Extract text from response and detect tool usage
@@ -1659,6 +1762,19 @@ async def _create_text_response_with_tools_with_timeout(
                 elif item_type == "web_search_call":
                     if "web_search" not in tools_actually_used:
                         tools_actually_used.append("web_search")
+                elif item_type == "code_interpreter_call":
+                    # F32: the model ran Python in the sandbox. Record the container so the
+                    # caller can LIST the files it wrote.
+                    #
+                    # Why listing and not annotations: a `container_file_citation` annotation
+                    # only appears when the model writes a `sandbox:` markdown link to the
+                    # file — and we explicitly tell it not to (those links are dead in Slack).
+                    # Verified live: prompt says "no links" -> 0 annotations, files still on
+                    # disk in the container. The container listing is the source of truth;
+                    # annotations are a bonus when the model happens to cite.
+                    if "code_interpreter" not in tools_actually_used:
+                        tools_actually_used.append("code_interpreter")
+                    _note_container(artifacts_sink, item)
                 elif item_type == "function_call" and function_call_sink is not None:
                     # Local function call — collected for the tool loop, not part of the text
                     function_call_sink.append({

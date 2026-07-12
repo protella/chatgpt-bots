@@ -133,6 +133,9 @@ def test_build_tools_array_excludes_multiple_servers():
     with patch("message_processor.handlers.text.config") as cfg:
         cfg.enable_web_search = False
         cfg.mcp_enabled_default = True
+        # F32: this test is about MCP exclusion — keep code_interpreter out of the array so
+        # it stays focused (a MagicMock config would otherwise read as enabled).
+        cfg.enable_code_interpreter = False
         tools = h._build_tools_array({"enable_web_search": False, "enable_mcp": True},
                                      "gpt-5.5", exclude_mcp_server={"a", "c"})
     labels = [t["server_label"] for t in tools]

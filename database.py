@@ -135,6 +135,32 @@ class DatabaseManager(LoggerMixin):
             )
         """)
 
+        # F32: thread-scoped code-interpreter containers. One OpenAI container per thread, so
+        # the model's sandbox state (files in /mnt/data, loaded dataframes) survives the turn
+        # boundary within a conversation.
+        #
+        # `published_files_json` is NOT bookkeeping fluff — it is a correctness guard. A reused
+        # container's listing still contains every file from earlier turns, so without a durable
+        # record of what we already uploaded, a bot restart mid-conversation would re-post turn
+        # 1's chart on turn 2 (the in-memory dedupe dies with the process). It lives here, next
+        # to the container id, because it is meaningless once the container is gone.
+        #
+        # No FK: PRAGMA foreign_keys is never enabled, and a container can outlive its threads
+        # row. Rows are swept by age in the daily cleanup instead.
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS thread_containers (
+                thread_id TEXT PRIMARY KEY,
+                container_id TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                published_files_json TEXT
+            )
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_thread_containers_last_used
+            ON thread_containers(last_used_at)
+        """)
+
         # Images table (no base64 storage)
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS images (
@@ -1651,8 +1677,142 @@ class DatabaseManager(LoggerMixin):
         if cursor.rowcount > 0:
             self.log_info(f"DB: Cleaned up {cursor.rowcount} tool-usage rows older than {days} days")
 
+    # F32: thread-scoped code-interpreter containers
+    #
+    # Every staleness cutoff below is computed IN SQL with datetime('now', …). last_used_at
+    # defaults to CURRENT_TIMESTAMP, which SQLite writes in UTC — a Python datetime.now()
+    # cutoff would be LOCAL time and, on this host (UTC-4), would judge every container
+    # four hours fresher than it is. Same trap as delete_old_tool_usage above.
+
+    # EVERY mutation below is conditional on `container_id`, not just `thread_id`. A row can be
+    # rebound to a NEW container at any moment (the old one expired, a turn recreated it), and a
+    # thread_id-only write then lands on the wrong container: the daily reaper, having selected
+    # stale container X, would delete the row for its live replacement Y; and a late publication
+    # for X would write X's file ids into Y's dedupe list, suppressing Y's real artifacts.
+    _CONTAINER_PUBLISHED_CAP = 2048  # ~8x what one 20-minute container could plausibly hold
+
+    @staticmethod
+    def _container_row(row) -> Optional[Dict]:
+        if not row:
+            return None
+        result = dict(row)
+        try:
+            result["published_files"] = json.loads(result.get("published_files_json") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            result["published_files"] = []
+        return result
+
+    def get_thread_container(self, thread_id: str) -> Optional[Dict]:
+        """The thread's container binding, regardless of age.
+
+        Deliberately NOT age-filtered. Age belongs to container *selection* only. The dedupe
+        record must stay readable for as long as the binding exists: a single turn can run
+        longer than the reuse window (a tool loop with slow tools), and if publication could no
+        longer read its own published-file list it would re-post every earlier artifact still
+        sitting in the container.
+        """
+        cursor = self.conn.execute("""
+            SELECT thread_id, container_id, published_files_json, created_at, last_used_at
+            FROM thread_containers WHERE thread_id = ?
+        """, (thread_id,))
+        return self._container_row(cursor.fetchone())
+
+    def get_fresh_thread_container(self, thread_id: str, reuse_minutes: int) -> Optional[Dict]:
+        """The thread's container, but ONLY if we used it within `reuse_minutes`.
+
+        A row older than that is not returned: the container has almost certainly idle-expired
+        (20-minute API ceiling), and handing OpenAI a dead id would fail the whole turn.
+        Callers treat None as "create a fresh one".
+        """
+        cursor = self.conn.execute("""
+            SELECT thread_id, container_id, published_files_json, created_at, last_used_at
+            FROM thread_containers
+            WHERE thread_id = ? AND last_used_at > datetime('now', ?)
+        """, (thread_id, f"-{int(reuse_minutes)} minutes"))
+        return self._container_row(cursor.fetchone())
+
+    def save_thread_container(self, thread_id: str, container_id: str):
+        """Bind a NEW container to a thread, clearing the published-file record.
+
+        The reset is deliberate: a new container starts empty, so nothing has been published
+        out of it yet. Carrying the old ids forward would let a stale id suppress a genuinely
+        new artifact that happened to reuse it.
+        """
+        self.conn.execute("""
+            INSERT INTO thread_containers (thread_id, container_id, created_at, last_used_at,
+                                           published_files_json)
+            VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '[]')
+            ON CONFLICT(thread_id) DO UPDATE SET
+                container_id = excluded.container_id,
+                created_at = CURRENT_TIMESTAMP,
+                last_used_at = CURRENT_TIMESTAMP,
+                published_files_json = '[]'
+        """, (thread_id, container_id))
+        self.conn.commit()
+
+    def touch_thread_container(self, thread_id: str, container_id: str):
+        """Mark this container as used now (keeps it inside the reuse window)."""
+        self.conn.execute("""
+            UPDATE thread_containers SET last_used_at = CURRENT_TIMESTAMP
+            WHERE thread_id = ? AND container_id = ?
+        """, (thread_id, container_id))
+        self.conn.commit()
+
+    def add_published_container_files(self, thread_id: str, container_id: str,
+                                      file_ids: List[str]):
+        """Durably record container file ids already handled, so they are never posted twice.
+
+        Holds two kinds of id, and treats them identically because their effect is identical —
+        "not eligible for publication": files we uploaded to Slack, and files already sitting in
+        the container when a turn started (the baseline). Without this record a bot restart
+        mid-conversation re-posts every earlier artifact still in the reused container.
+        """
+        if not file_ids:
+            return
+        cursor = self.conn.execute(
+            "SELECT published_files_json FROM thread_containers "
+            "WHERE thread_id = ? AND container_id = ?", (thread_id, container_id))
+        row = cursor.fetchone()
+        if not row:
+            # The row was rebound to a different container while this turn ran. These ids belong
+            # to a container that no longer backs this thread; writing them would corrupt the
+            # new container's dedupe list.
+            return
+        try:
+            existing = json.loads(row["published_files_json"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            existing = []
+        merged = list(dict.fromkeys([*existing, *file_ids]))[-self._CONTAINER_PUBLISHED_CAP:]
+        self.conn.execute("""
+            UPDATE thread_containers SET published_files_json = ?
+            WHERE thread_id = ? AND container_id = ?
+        """, (json.dumps(merged), thread_id, container_id))
+        self.conn.commit()
+
+    def delete_thread_container(self, thread_id: str, container_id: Optional[str] = None):
+        """Forget a container binding (it expired, or the API told us it is gone).
+
+        `container_id` scopes the delete so a slow reaper cannot drop a binding that a live turn
+        has already replaced. Omitted only where the caller genuinely means "whatever is bound".
+        """
+        if container_id is None:
+            self.conn.execute("DELETE FROM thread_containers WHERE thread_id = ?", (thread_id,))
+        else:
+            self.conn.execute(
+                "DELETE FROM thread_containers WHERE thread_id = ? AND container_id = ?",
+                (thread_id, container_id))
+        self.conn.commit()
+
+    def get_expired_thread_containers(self, older_than_minutes: int) -> List[Dict]:
+        """Rows whose container is certainly dead — for the daily reap."""
+        cursor = self.conn.execute("""
+            SELECT thread_id, container_id FROM thread_containers
+            WHERE last_used_at <= datetime('now', ?)
+        """, (f"-{int(older_than_minutes)} minutes",))
+        return [dict(r) for r in cursor.fetchall()]
+
     # User operations
-    
+
     def get_or_create_user(self, user_id: str, username: Optional[str] = None) -> Dict:
         """
         Get existing user or create new one with defaults.
@@ -2914,6 +3074,35 @@ class DatabaseManager(LoggerMixin):
                     self.log_info(f"Cleaned up {cursor.rowcount} modal sessions older than {hours} hours")
         except Exception as e:
             self.log_error(f"Failed to cleanup modal sessions: {e}")
+
+    # F32 container async wrappers. asyncio.to_thread over the sync methods, matching
+    # get_or_create_thread_async — these run on the message path, so they must not block
+    # the event loop on SQLite.
+
+    async def get_thread_container_async(self, thread_id: str) -> Optional[Dict]:
+        return await asyncio.to_thread(self.get_thread_container, thread_id)
+
+    async def get_fresh_thread_container_async(self, thread_id: str,
+                                               reuse_minutes: int) -> Optional[Dict]:
+        return await asyncio.to_thread(self.get_fresh_thread_container, thread_id, reuse_minutes)
+
+    async def save_thread_container_async(self, thread_id: str, container_id: str):
+        return await asyncio.to_thread(self.save_thread_container, thread_id, container_id)
+
+    async def touch_thread_container_async(self, thread_id: str, container_id: str):
+        return await asyncio.to_thread(self.touch_thread_container, thread_id, container_id)
+
+    async def add_published_container_files_async(self, thread_id: str, container_id: str,
+                                                  file_ids: List[str]):
+        return await asyncio.to_thread(
+            self.add_published_container_files, thread_id, container_id, file_ids)
+
+    async def delete_thread_container_async(self, thread_id: str,
+                                            container_id: Optional[str] = None):
+        return await asyncio.to_thread(self.delete_thread_container, thread_id, container_id)
+
+    async def get_expired_thread_containers_async(self, older_than_minutes: int) -> List[Dict]:
+        return await asyncio.to_thread(self.get_expired_thread_containers, older_than_minutes)
 
     async def get_user_timezone_async(self, user_id: str) -> Optional[str]:
         """
