@@ -2,8 +2,8 @@
 python-dotenv>=1.0.0
 openai>=2.45.0  # GPT-5.6 family support (max effort literal, prompt_cache_options)
 slack_bolt>=1.27.0
+slack_sdk>=3.43.0  # imported directly (WebClient, SlackApiError); do not rely on slack_bolt's transitive pin
 Pillow>=11.0.0
-requests>=2.32.0
 croniter>=6.0.0
 pytz>=2024.1
 
@@ -12,7 +12,6 @@ concurrent-log-handler>=0.9.28
 
 # Async dependencies
 aiosqlite>=0.20.0
-aiofiles>=25.1.0
 aiohttp>=3.10.0
 
 # Testing dependencies
