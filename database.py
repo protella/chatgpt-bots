@@ -7,6 +7,8 @@ import sqlite3
 import aiosqlite
 import json
 import os
+import re
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any, Tuple
 import logging
@@ -386,9 +388,75 @@ class DatabaseManager(LoggerMixin):
         # Run migrations for existing databases
         self._run_migrations()
     
-    def _run_migrations(self):
-        """Run database migrations to update schema for existing databases."""
+    @contextmanager
+    def _migration_step(self, name: str):
+        """Run one migration phase in isolation.
+
+        A raising phase is logged LOUDLY (named, with a traceback) and the
+        remaining phases still run. Previously the whole migration body sat under
+        a single try/except, so one bad step silently skipped every later step and
+        the bot then served traffic on a half-migrated schema.
+        """
         try:
+            yield
+        except Exception as e:
+            self.log_error(f"DB: Migration step '{name}' FAILED: {e}", exc_info=True)
+
+    def _is_pre_v3_database(self) -> bool:
+        """True when this database still has the pre-v3 (v2.x) shape.
+
+        Cheap, read-only, and deliberately conservative — it must NOT fire on a
+        brand-new database (init_schema's CREATE TABLE IF NOT EXISTS block runs
+        immediately before the migrations, so a fresh DB already has `documents`
+        and `user_preferences`) nor on an already-migrated one (second boot).
+
+        Legacy signals, any one of which is decisive:
+        - the `messages` mirror table exists (dropped by the v3 mirror-drop)
+        - `documents.content` exists (dropped by the v3 doc-content-drop)
+        - `user_preferences` is missing the `gpt56_migrated` sentinel AND already
+          holds rows. The sentinel is added by the migration, not by CREATE TABLE,
+          so a fresh DB also lacks it — the row check is what distinguishes real
+          user preferences (about to be bulk-overwritten) from an empty new table.
+        """
+        cursor = self.conn.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='messages'
+        """)
+        if cursor.fetchone():
+            return True
+
+        cursor = self.conn.execute("PRAGMA table_info(documents)")
+        if any(col[1] == 'content' for col in cursor.fetchall()):
+            return True
+
+        cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
+        up_columns = [col[1] for col in cursor.fetchall()]
+        if up_columns and 'gpt56_migrated' not in up_columns:
+            cursor = self.conn.execute("SELECT 1 FROM user_preferences LIMIT 1")
+            if cursor.fetchone():
+                return True
+
+        return False
+
+    def _run_migrations(self):
+        """Run database migrations to update schema for existing databases.
+
+        Each phase is isolated by `_migration_step` so a failure is loud and
+        contained instead of silently skipping every later phase.
+        """
+        # Rollback path FIRST: snapshot the database before any migration writes to
+        # it. The gpt-5.6 swap below bulk-overwrites every user's model/effort, and
+        # the two destructive drops each take their own tagged backup only AFTER
+        # that swap has already run — so without this, no backup can restore what
+        # users actually picked. Runs at most once per database (see detection).
+        with self._migration_step("pre-v3 backup"):
+            if self._is_pre_v3_database():
+                self.log_info(
+                    "DB: Pre-v3 database detected — backup tagged pre-v3-upgrade before migrating"
+                )
+                self.backup_database(tag="pre-v3-upgrade")
+
+        with self._migration_step("channel_settings columns"):
             # Phase F: participation_level + snoozed_until on channel_settings
             cursor = self.conn.execute("PRAGMA table_info(channel_settings)")
             cs_columns = [col[1] for col in cursor.fetchall()]
@@ -413,61 +481,66 @@ class DatabaseManager(LoggerMixin):
                     self.conn.execute(f"ALTER TABLE channel_settings ADD COLUMN {col} TEXT")
                     self.conn.commit()
 
+        with self._migration_step("images.message_ts"):
             # Check if message_ts column exists in images table
             cursor = self.conn.execute("PRAGMA table_info(images)")
             columns = [col[1] for col in cursor.fetchall()]
-            
+
             if 'message_ts' not in columns:
                 self.log_info("DB: Adding message_ts column to images table")
                 self.conn.execute("""
-                    ALTER TABLE images 
+                    ALTER TABLE images
                     ADD COLUMN message_ts TEXT
                 """)
                 self.conn.commit()
                 self.log_info("DB: Successfully added message_ts column")
-            
+
+        with self._migration_step("users.real_name"):
             # Check if real_name column exists in users table
             cursor = self.conn.execute("PRAGMA table_info(users)")
             columns = [col[1] for col in cursor.fetchall()]
-            
+
             if 'real_name' not in columns:
                 self.log_info("DB: Adding real_name column to users table")
                 self.conn.execute("""
-                    ALTER TABLE users 
+                    ALTER TABLE users
                     ADD COLUMN real_name TEXT
                 """)
                 self.conn.commit()
                 self.log_info("DB: Successfully added real_name column")
-            
+
+        with self._migration_step("user_preferences.custom_instructions"):
             # Check if custom_instructions column exists in user_preferences table
             cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
             columns = [col[1] for col in cursor.fetchall()]
-            
+
             if 'custom_instructions' not in columns:
                 self.log_info("DB: Adding custom_instructions column to user_preferences table")
                 self.conn.execute("""
-                    ALTER TABLE user_preferences 
+                    ALTER TABLE user_preferences
                     ADD COLUMN custom_instructions TEXT
                 """)
                 self.conn.commit()
                 self.log_info("DB: Successfully added custom_instructions column")
-            
+
+        with self._migration_step("users.email"):
             # Check if email column exists in users table
             cursor = self.conn.execute("PRAGMA table_info(users)")
             columns = [col[1] for col in cursor.fetchall()]
-            
+
             if 'email' not in columns:
                 self.log_info("DB: Adding email column to users table")
                 self.conn.execute("""
-                    ALTER TABLE users 
+                    ALTER TABLE users
                     ADD COLUMN email TEXT
                 """)
                 self.conn.commit()
                 self.log_info("DB: Successfully added email column")
-            
+
+        with self._migration_step("user_preferences table"):
             # Check if user_preferences table exists
             cursor = self.conn.execute("""
-                SELECT name FROM sqlite_master 
+                SELECT name FROM sqlite_master
                 WHERE type='table' AND name='user_preferences'
             """)
             if not cursor.fetchone():
@@ -476,18 +549,18 @@ class DatabaseManager(LoggerMixin):
                     CREATE TABLE user_preferences (
                         slack_user_id TEXT PRIMARY KEY,
                         slack_email TEXT,
-                        
+
                         -- Model settings
                         model TEXT DEFAULT 'gpt-5.6-sol',
                         reasoning_effort TEXT DEFAULT 'medium',
                         verbosity TEXT DEFAULT 'low',
                         temperature REAL DEFAULT 0.8,
                         top_p REAL DEFAULT 1.0,
-                        
+
                         -- Feature toggles
                         enable_web_search BOOLEAN DEFAULT 1,
                         enable_streaming BOOLEAN DEFAULT 1,
-                        
+
                         -- Image settings
                         image_model TEXT DEFAULT 'gpt-image-2',
                         image_size TEXT DEFAULT '1024x1024',
@@ -511,6 +584,7 @@ class DatabaseManager(LoggerMixin):
                 self.conn.commit()
                 self.log_info("DB: Successfully created user_preferences table")
 
+        with self._migration_step("user_preferences.image_quality"):
             # Check if image_quality column exists in user_preferences table
             cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
             columns = [col[1] for col in cursor.fetchall()]
@@ -524,6 +598,7 @@ class DatabaseManager(LoggerMixin):
                 self.conn.commit()
                 self.log_info("DB: Successfully added image_quality column")
 
+        with self._migration_step("user_preferences.image_background"):
             # Check if image_background column exists in user_preferences table
             cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
             columns = [col[1] for col in cursor.fetchall()]
@@ -537,6 +612,7 @@ class DatabaseManager(LoggerMixin):
                 self.conn.commit()
                 self.log_info("DB: Successfully added image_background column")
 
+        with self._migration_step("user_preferences.enable_mcp"):
             # Check if enable_mcp column exists in user_preferences table
             cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
             columns = [col[1] for col in cursor.fetchall()]
@@ -550,6 +626,7 @@ class DatabaseManager(LoggerMixin):
                 self.conn.commit()
                 self.log_info("DB: Successfully added enable_mcp column")
 
+        with self._migration_step("user_preferences.image_model"):
             # Check if image_model column exists in user_preferences table
             cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
             columns = [col[1] for col in cursor.fetchall()]
@@ -574,6 +651,7 @@ class DatabaseManager(LoggerMixin):
                     f"{row_count} existing user(s) to gpt-image-2"
                 )
 
+        with self._migration_step("gpt-5.5 swap"):
             # One-time bulk swap: migrate every user still on a pre-5.5 model to gpt-5.5.
             # Gated by a sentinel migration marker so it ran exactly once back when older
             # models were still selectable. (Superseded by the normalizer below, kept so
@@ -596,8 +674,9 @@ class DatabaseManager(LoggerMixin):
                     f"DB: One-time migration — swapped {swapped} user(s) to gpt-5.5"
                 )
 
-            self._migrate_gpt56()
+        self._migrate_gpt56()
 
+        with self._migration_step("settings_completed backfill"):
             # One-time backfill: mark long-standing users as settings_completed.
             # Earlier versions of the bot only flipped settings_completed=True when
             # the user saved with "global" scope. Users who only ever saved thread-scope
@@ -618,6 +697,7 @@ class DatabaseManager(LoggerMixin):
                     f"DB: Backfilled settings_completed=1 for {backfilled} pre-existing user(s)"
                 )
 
+        with self._migration_step("mirror drop"):
             # Phase S one-time cleanup: drop the message mirror. Slack is the only
             # transcript now — context is always rebuilt from conversations.replies.
             # Guarded on table existence so it runs exactly once per database; the
@@ -652,6 +732,7 @@ class DatabaseManager(LoggerMixin):
                     f"(backup tagged pre-v3-mirror-drop in {self.db_dir}/backups)"
                 )
 
+        with self._migration_step("doc-content drop"):
             # Doc-architecture (D2) one-time cleanup: drop documents.content.
             # Same hard rule as the mirror drop — no file/document content at rest;
             # rows keep summary + metadata + the Slack CDN ref. Guarded on the
@@ -691,6 +772,7 @@ class DatabaseManager(LoggerMixin):
                     self.log_warning(f"DB: Could not drop documents.content column: {col_err}")
                 self.conn.commit()
 
+        with self._migration_step("mcp_tools table"):
             # Check if mcp_tools table exists
             cursor = self.conn.execute("""
                 SELECT name FROM sqlite_master
@@ -716,8 +798,6 @@ class DatabaseManager(LoggerMixin):
                 """)
                 self.conn.commit()
                 self.log_info("DB: Successfully created mcp_tools table")
-        except Exception as e:
-            self.log_error(f"DB: Migration error: {e}", exc_info=True)
 
     def _migrate_gpt56(self):
         """GPT-5.6 model-lineup migration (2026-07-09).
@@ -733,88 +813,94 @@ class DatabaseManager(LoggerMixin):
            model rejects are clamped (`minimal` is a 400 on 5.6 -> none;
            `max` doesn't exist on 5.5 -> xhigh). Guarantees the API layer
            never receives a dropped model name or an unsupported effort.
+
+        Both parts are individually isolated: a failure in the one-time swap must
+        not take the every-startup normalizers down with it, since those are what
+        keep the API layer from ever seeing a dropped model or a rejected effort.
         """
-        cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
-        columns = [col[1] for col in cursor.fetchall()]
-        if 'gpt56_migrated' not in columns:
-            self.conn.execute("""
-                ALTER TABLE user_preferences
-                ADD COLUMN gpt56_migrated INTEGER DEFAULT 0
+        with self._migration_step("gpt-5.6 migration"):
+            cursor = self.conn.execute("PRAGMA table_info(user_preferences)")
+            columns = [col[1] for col in cursor.fetchall()]
+            if 'gpt56_migrated' not in columns:
+                self.conn.execute("""
+                    ALTER TABLE user_preferences
+                    ADD COLUMN gpt56_migrated INTEGER DEFAULT 0
+                """)
+                cursor = self.conn.execute("""
+                    UPDATE user_preferences
+                    SET model = 'gpt-5.6-sol', reasoning_effort = 'medium', gpt56_migrated = 1
+                    WHERE gpt56_migrated = 0
+                """)
+                swapped = cursor.rowcount
+                self.conn.commit()
+                self.log_info(
+                    f"DB: One-time GPT-5.6 migration — swapped {swapped} user(s) to "
+                    f"gpt-5.6-sol with medium reasoning"
+                )
+
+        with self._migration_step("gpt-5.6 normalizers"):
+            supported = "('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5')"
+            cursor = self.conn.execute(f"""
+                UPDATE user_preferences
+                SET model = 'gpt-5.6-sol'
+                WHERE model IS NOT NULL AND model NOT IN {supported}
             """)
+            if cursor.rowcount:
+                self.log_info(
+                    f"DB: Normalized {cursor.rowcount} user(s) from dropped models to gpt-5.6-sol"
+                )
             cursor = self.conn.execute("""
                 UPDATE user_preferences
-                SET model = 'gpt-5.6-sol', reasoning_effort = 'medium', gpt56_migrated = 1
-                WHERE gpt56_migrated = 0
+                SET reasoning_effort = 'none'
+                WHERE model LIKE 'gpt-5.6%' AND reasoning_effort = 'minimal'
             """)
-            swapped = cursor.rowcount
+            if cursor.rowcount:
+                self.log_info(
+                    f"DB: Clamped reasoning minimal->none for {cursor.rowcount} user(s) on 5.6 models"
+                )
+            cursor = self.conn.execute("""
+                UPDATE user_preferences
+                SET reasoning_effort = 'xhigh'
+                WHERE model = 'gpt-5.5' AND reasoning_effort = 'max'
+            """)
+            if cursor.rowcount:
+                self.log_info(
+                    f"DB: Clamped reasoning max->xhigh for {cursor.rowcount} user(s) on gpt-5.5"
+                )
+            cursor = self.conn.execute(f"""
+                UPDATE threads
+                SET config_json = json_set(config_json, '$.model', 'gpt-5.6-sol')
+                WHERE config_json IS NOT NULL
+                  AND json_extract(config_json, '$.model') IS NOT NULL
+                  AND json_extract(config_json, '$.model') NOT IN {supported}
+            """)
+            if cursor.rowcount:
+                self.log_info(
+                    f"DB: Normalized {cursor.rowcount} thread override(s) to gpt-5.6-sol"
+                )
+            cursor = self.conn.execute("""
+                UPDATE threads
+                SET config_json = json_set(config_json, '$.reasoning_effort', 'none')
+                WHERE config_json IS NOT NULL
+                  AND json_extract(config_json, '$.model') LIKE 'gpt-5.6%'
+                  AND json_extract(config_json, '$.reasoning_effort') = 'minimal'
+            """)
+            if cursor.rowcount:
+                self.log_info(
+                    f"DB: Clamped {cursor.rowcount} thread override(s) minimal->none on 5.6 models"
+                )
+            cursor = self.conn.execute("""
+                UPDATE threads
+                SET config_json = json_set(config_json, '$.reasoning_effort', 'xhigh')
+                WHERE config_json IS NOT NULL
+                  AND json_extract(config_json, '$.model') = 'gpt-5.5'
+                  AND json_extract(config_json, '$.reasoning_effort') = 'max'
+            """)
+            if cursor.rowcount:
+                self.log_info(
+                    f"DB: Clamped {cursor.rowcount} thread override(s) max->xhigh on gpt-5.5"
+                )
             self.conn.commit()
-            self.log_info(
-                f"DB: One-time GPT-5.6 migration — swapped {swapped} user(s) to "
-                f"gpt-5.6-sol with medium reasoning"
-            )
-
-        supported = "('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5')"
-        cursor = self.conn.execute(f"""
-            UPDATE user_preferences
-            SET model = 'gpt-5.6-sol'
-            WHERE model IS NOT NULL AND model NOT IN {supported}
-        """)
-        if cursor.rowcount:
-            self.log_info(
-                f"DB: Normalized {cursor.rowcount} user(s) from dropped models to gpt-5.6-sol"
-            )
-        cursor = self.conn.execute("""
-            UPDATE user_preferences
-            SET reasoning_effort = 'none'
-            WHERE model LIKE 'gpt-5.6%' AND reasoning_effort = 'minimal'
-        """)
-        if cursor.rowcount:
-            self.log_info(
-                f"DB: Clamped reasoning minimal->none for {cursor.rowcount} user(s) on 5.6 models"
-            )
-        cursor = self.conn.execute("""
-            UPDATE user_preferences
-            SET reasoning_effort = 'xhigh'
-            WHERE model = 'gpt-5.5' AND reasoning_effort = 'max'
-        """)
-        if cursor.rowcount:
-            self.log_info(
-                f"DB: Clamped reasoning max->xhigh for {cursor.rowcount} user(s) on gpt-5.5"
-            )
-        cursor = self.conn.execute(f"""
-            UPDATE threads
-            SET config_json = json_set(config_json, '$.model', 'gpt-5.6-sol')
-            WHERE config_json IS NOT NULL
-              AND json_extract(config_json, '$.model') IS NOT NULL
-              AND json_extract(config_json, '$.model') NOT IN {supported}
-        """)
-        if cursor.rowcount:
-            self.log_info(
-                f"DB: Normalized {cursor.rowcount} thread override(s) to gpt-5.6-sol"
-            )
-        cursor = self.conn.execute("""
-            UPDATE threads
-            SET config_json = json_set(config_json, '$.reasoning_effort', 'none')
-            WHERE config_json IS NOT NULL
-              AND json_extract(config_json, '$.model') LIKE 'gpt-5.6%'
-              AND json_extract(config_json, '$.reasoning_effort') = 'minimal'
-        """)
-        if cursor.rowcount:
-            self.log_info(
-                f"DB: Clamped {cursor.rowcount} thread override(s) minimal->none on 5.6 models"
-            )
-        cursor = self.conn.execute("""
-            UPDATE threads
-            SET config_json = json_set(config_json, '$.reasoning_effort', 'xhigh')
-            WHERE config_json IS NOT NULL
-              AND json_extract(config_json, '$.model') = 'gpt-5.5'
-              AND json_extract(config_json, '$.reasoning_effort') = 'max'
-        """)
-        if cursor.rowcount:
-            self.log_info(
-                f"DB: Clamped {cursor.rowcount} thread override(s) max->xhigh on gpt-5.5"
-            )
-        self.conn.commit()
 
     # Thread operations
     def get_or_create_thread(self, thread_id: str, channel_id: str, user_id: Optional[str] = None) -> Dict:
@@ -2030,23 +2116,32 @@ class DatabaseManager(LoggerMixin):
         self.cleanup_old_backups()
     
     def cleanup_old_backups(self):
-        """Remove backups older than 7 days."""
+        """Remove SCHEDULED backups older than 7 days.
+
+        Only untagged nightly backups ({platform}_{date}_{time}.db) are pruned.
+        Tagged backups ({platform}_{tag}_{date}_{time}.db — pre-v3-upgrade and the
+        two migration drops) are an operator's only rollback path out of an
+        irreversible upgrade, and retention must never eat them: the nightly backup
+        calls this on every run, so a 7-day sweep would delete the pre-upgrade
+        snapshot exactly one week after the upgrade. They are removed by hand.
+        """
         cutoff = datetime.now() - timedelta(days=7)
+        # Untagged shape only: platform_YYYYMMDD_HHMMSS.db — anything with an extra
+        # segment carries a tag and is kept.
+        scheduled = re.compile(rf"^{re.escape(self.platform)}_(\d{{8}})_(\d{{6}})\.db$")
 
         for filename in os.listdir(f"{self.db_dir}/backups"):
-            if filename.startswith(f"{self.platform}_") and filename.endswith(".db"):
-                try:
-                    # Parse timestamp from filename
-                    parts = filename.replace(".db", "").split("_")
-                    if len(parts) >= 3:
-                        date_str = parts[-2] + parts[-1]
-                        file_date = datetime.strptime(date_str, "%Y%m%d%H%M%S")
-                        if file_date < cutoff:
-                            os.remove(f"{self.db_dir}/backups/{filename}")
-                            logger.info(f"Removed old backup: {filename}")
-                            
-                except Exception as e:
-                    logger.warning(f"Error processing backup file {filename}: {e}")
+            match = scheduled.match(filename)
+            if not match:
+                continue
+            try:
+                file_date = datetime.strptime(match.group(1) + match.group(2), "%Y%m%d%H%M%S")
+                if file_date < cutoff:
+                    os.remove(f"{self.db_dir}/backups/{filename}")
+                    logger.info(f"Removed old backup: {filename}")
+
+            except Exception as e:
+                logger.warning(f"Error processing backup file {filename}: {e}")
     
     def cleanup_old_threads(self):
         """Remove threads older than 3 months."""

@@ -8,6 +8,8 @@ import tempfile
 import os
 import json
 from datetime import datetime, timedelta
+from pathlib import Path
+from unittest.mock import Mock
 from database import DatabaseManager
 
 
@@ -362,10 +364,35 @@ class TestDatabaseBackup:
             pass
     
     def test_cleanup_old_backups(self, temp_db):
-        """Test cleaning up old backup files"""
-        # This would test the cleanup_old_backups method
-        # when it's implemented in the database module
-        pass
+        """Old scheduled backups are pruned; TAGGED migration backups are never touched.
+
+        The nightly backup calls cleanup_old_backups() on every run, so a blanket
+        7-day sweep would delete the pre-v3-upgrade rollback snapshot exactly one
+        week after the upgrade — the moment you'd want it.
+        """
+        backups = Path(temp_db.db_dir) / "backups"
+        backups.mkdir(parents=True, exist_ok=True)
+        plat = temp_db.platform
+
+        old = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d_%H%M%S")
+        recent = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d_%H%M%S")
+
+        stale_nightly = backups / f"{plat}_{old}.db"
+        fresh_nightly = backups / f"{plat}_{recent}.db"
+        tagged = [
+            backups / f"{plat}_pre-v3-upgrade_{old}.db",
+            backups / f"{plat}_pre-v3-mirror-drop_{old}.db",
+            backups / f"{plat}_pre-v3-doc-content-drop_{old}.db",
+        ]
+        for f in [stale_nightly, fresh_nightly, *tagged]:
+            f.write_bytes(b"")
+
+        temp_db.cleanup_old_backups()
+
+        assert not stale_nightly.exists(), "an old untagged nightly backup should be pruned"
+        assert fresh_nightly.exists(), "a recent nightly backup must survive"
+        for f in tagged:
+            assert f.exists(), f"tagged migration backup must never be auto-deleted: {f.name}"
 
 
 class TestDatabaseContract:
@@ -605,3 +632,264 @@ class TestGetAllUsersAsync:
     @pytest.mark.asyncio
     async def test_empty_when_no_users(self, temp_db):
         assert await temp_db.get_all_users_async() == []
+
+
+# --------------------------------------------------------------------------
+# v3 migration safety: pre-migration backup + per-step error isolation
+# --------------------------------------------------------------------------
+
+def _backups(tmp_path, match):
+    """Backup filenames under tmp_path/backups containing `match`."""
+    backup_dir = tmp_path / "backups"
+    if not backup_dir.exists():
+        return []
+    return [f for f in os.listdir(str(backup_dir)) if match in f]
+
+
+def _make_legacy_db(db):
+    """Turn a freshly-created v3 database back into a pre-v3 (v2.x) one.
+
+    The three legacy markers the v3 migrations key off: the `messages` mirror
+    table, `documents.content`, and the missing `gpt56_migrated` sentinel.
+    """
+    db.conn.execute("""
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id TEXT, role TEXT,
+            content TEXT, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            message_ts TEXT, metadata_json TEXT)
+    """)
+    db.conn.execute("INSERT INTO messages (thread_id, role, content) VALUES ('C1:1','user','hi')")
+    db.conn.execute("ALTER TABLE documents ADD COLUMN content TEXT")
+    db.conn.execute("ALTER TABLE user_preferences DROP COLUMN gpt56_migrated")
+
+
+class _ExplodingConn:
+    """Connection proxy that raises on one specific statement (sqlite3.Connection
+    is a C type and won't take a monkeypatched .execute)."""
+
+    def __init__(self, real, boom_on):
+        self._real = real
+        self._boom_on = boom_on
+
+    def execute(self, sql, *args, **kwargs):
+        if self._boom_on in sql:
+            raise sqlite3.OperationalError("swap exploded")
+        return self._real.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class TestV3MigrationBackup:
+    """The v3 migrations bulk-overwrite every user's model/effort BEFORE the two
+    destructive drops take their tagged backups — so a pre-migration snapshot is
+    the only thing that can restore what users actually picked."""
+
+    def test_pre_v3_backup_is_taken_before_the_gpt56_model_swap(self, tmp_path, monkeypatch):
+        """The whole point of the fix: the pre-v3-upgrade backup must contain the
+        user's ORIGINAL model, not the post-swap gpt-5.6-sol."""
+        monkeypatch.setenv("DATABASE_DIR", str(tmp_path))
+        from database import DatabaseManager
+
+        db = DatabaseManager("slack")
+        _make_legacy_db(db)
+        db.conn.execute(
+            "INSERT INTO user_preferences (slack_user_id, model, reasoning_effort) "
+            "VALUES ('U1', 'gpt-4o', 'high')"
+        )
+        db.conn.close()
+
+        # Restart on the legacy database: migrations run.
+        db2 = DatabaseManager("slack")
+
+        # The swap did happen (live DB is on the new lineup) ...
+        live = db2.conn.execute(
+            "SELECT model, reasoning_effort FROM user_preferences WHERE slack_user_id='U1'"
+        ).fetchone()
+        assert (live["model"], live["reasoning_effort"]) == ("gpt-5.6-sol", "medium")
+
+        # ... and exactly one pre-v3-upgrade backup was taken.
+        pre = _backups(tmp_path, "pre-v3-upgrade")
+        assert len(pre) == 1, f"expected 1 pre-v3-upgrade backup, got {pre}"
+
+        # ORDERING PROOF: the backup still holds the user's original choice.
+        snap = sqlite3.connect(str(tmp_path / "backups" / pre[0]))
+        snap.row_factory = sqlite3.Row
+        row = snap.execute(
+            "SELECT model, reasoning_effort FROM user_preferences WHERE slack_user_id='U1'"
+        ).fetchone()
+        assert (row["model"], row["reasoning_effort"]) == ("gpt-4o", "high")
+        # And it is a genuine pre-migration snapshot: the mirror is still there.
+        assert snap.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'"
+        ).fetchone() is not None
+        snap.close()
+
+        # The two existing tagged backups are untouched by this fix.
+        assert len(_backups(tmp_path, "pre-v3-mirror-drop")) == 1
+        assert len(_backups(tmp_path, "pre-v3-doc-content-drop")) == 1
+
+        # Second boot on the now-migrated DB adds no further pre-v3 backup.
+        db2.conn.close()
+        db3 = DatabaseManager("slack")
+        assert len(_backups(tmp_path, "pre-v3-upgrade")) == 1
+        db3.conn.close()
+
+    def test_mirror_drop_backup_is_too_late_on_its_own(self, tmp_path, monkeypatch):
+        """Regression guard for the bug: the pre-v3-mirror-drop backup — the only
+        rollback path before this fix — already has the swapped model in it."""
+        monkeypatch.setenv("DATABASE_DIR", str(tmp_path))
+        from database import DatabaseManager
+
+        db = DatabaseManager("slack")
+        _make_legacy_db(db)
+        db.conn.execute(
+            "INSERT INTO user_preferences (slack_user_id, model, reasoning_effort) "
+            "VALUES ('U1', 'gpt-4o', 'high')"
+        )
+        db.conn.close()
+
+        db2 = DatabaseManager("slack")
+        mirror = _backups(tmp_path, "pre-v3-mirror-drop")[0]
+        snap = sqlite3.connect(str(tmp_path / "backups" / mirror))
+        row = snap.execute(
+            "SELECT model FROM user_preferences WHERE slack_user_id='U1'").fetchone()
+        assert row[0] == "gpt-5.6-sol"  # already lost — hence the earlier backup
+        snap.close()
+        db2.conn.close()
+
+    def test_fresh_v3_database_takes_no_pre_v3_backup(self, tmp_path, monkeypatch):
+        """A brand-new database must not produce a backup, and neither must a
+        second _run_migrations() on the already-migrated result."""
+        monkeypatch.setenv("DATABASE_DIR", str(tmp_path))
+        from database import DatabaseManager
+
+        db = DatabaseManager("slack")  # fresh: CREATE TABLE block + migrations
+        assert _backups(tmp_path, "pre-v3-upgrade") == []
+        assert _backups(tmp_path, ".db") == []  # no backups at all on a fresh DB
+        assert db._is_pre_v3_database() is False
+
+        # Users exist now; re-running migrations must still take nothing (the
+        # gpt56_migrated sentinel marks the DB as already on the v3 lineup).
+        db.conn.execute(
+            "INSERT INTO user_preferences (slack_user_id, model) VALUES ('U1', 'gpt-5.5')")
+        db._run_migrations()
+        assert _backups(tmp_path, "pre-v3-upgrade") == []
+        # ... and the one-time swap did not re-fire on the user's live choice.
+        assert db.conn.execute(
+            "SELECT model FROM user_preferences WHERE slack_user_id='U1'"
+        ).fetchone()[0] == "gpt-5.5"
+        db.conn.close()
+
+    def test_detection_ignores_missing_sentinel_on_an_empty_prefs_table(self, tmp_path, monkeypatch):
+        """The sentinel is planted by the migration, not by CREATE TABLE — so an
+        empty user_preferences without it is a fresh DB, not a legacy one."""
+        monkeypatch.setenv("DATABASE_DIR", str(tmp_path))
+        from database import DatabaseManager
+
+        db = DatabaseManager("slack")
+        db.conn.execute("ALTER TABLE user_preferences DROP COLUMN gpt56_migrated")
+        assert db._is_pre_v3_database() is False  # no rows -> nothing to lose
+
+        db.conn.execute(
+            "INSERT INTO user_preferences (slack_user_id, model) VALUES ('U1', 'gpt-4o')")
+        assert db._is_pre_v3_database() is True   # real prefs about to be overwritten
+        db.conn.close()
+
+
+class TestMigrationStepIsolation:
+    """One failing phase must be loud and contained, never silently skip the rest."""
+
+    def test_failing_first_step_does_not_block_later_steps(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATABASE_DIR", str(tmp_path))
+        from database import DatabaseManager
+
+        db = DatabaseManager("slack")
+        db.conn.execute("ALTER TABLE user_preferences DROP COLUMN gpt56_migrated")
+        db.conn.execute(
+            "INSERT INTO user_preferences (slack_user_id, model) VALUES ('U1', 'gpt-4o')")
+        db.conn.execute("DROP TABLE mcp_tools")  # recreated by the LAST migration step
+
+        errors = []
+        monkeypatch.setattr(db, "log_error", lambda msg, **kw: errors.append(msg))
+        monkeypatch.setattr(
+            db, "_is_pre_v3_database",
+            Mock(side_effect=RuntimeError("detection exploded")))
+
+        db._run_migrations()  # must not raise
+
+        assert any("Migration step 'pre-v3 backup' FAILED" in e for e in errors)
+        assert any("detection exploded" in e for e in errors)
+        # A middle step still landed ...
+        assert db.conn.execute(
+            "SELECT model FROM user_preferences WHERE slack_user_id='U1'"
+        ).fetchone()[0] == "gpt-5.6-sol"
+        # ... and so did the last one.
+        tables = {r[0] for r in db.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "mcp_tools" in tables
+        db.conn.close()
+
+    def test_failing_mirror_drop_leaves_data_intact_and_later_steps_run(self, tmp_path, monkeypatch):
+        """A destructive step that fails must abort BEFORE dropping anything, and
+        the steps behind it must still run."""
+        monkeypatch.setenv("DATABASE_DIR", str(tmp_path))
+        from database import DatabaseManager
+
+        db = DatabaseManager("slack")
+        _make_legacy_db(db)
+        db.conn.execute("DROP TABLE mcp_tools")  # last migration step's artifact
+
+        real_backup = db.backup_database
+
+        def flaky_backup(tag=None):
+            if tag == "pre-v3-mirror-drop":
+                raise RuntimeError("backup device full")
+            return real_backup(tag=tag)
+
+        errors = []
+        monkeypatch.setattr(db, "log_error", lambda msg, **kw: errors.append(msg))
+        monkeypatch.setattr(db, "backup_database", flaky_backup)
+
+        db._run_migrations()  # must not raise
+
+        assert any("Migration step 'mirror drop' FAILED" in e for e in errors)
+        tables = {r[0] for r in db.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        # The drop never happened — no backup, no destruction.
+        assert "messages" in tables
+        # The later steps still ran: mcp_tools recreated ...
+        assert "mcp_tools" in tables
+        # ... and the doc-content drop (which comes after the mirror drop) landed.
+        doc_cols = [c[1] for c in db.conn.execute("PRAGMA table_info(documents)")]
+        assert "content" not in doc_cols
+        db.conn.close()
+
+    def test_failing_gpt56_swap_still_runs_the_normalizers(self, tmp_path, monkeypatch):
+        """The normalizers are what keep a dropped model from reaching the API —
+        a broken one-time swap must not take them down with it."""
+        monkeypatch.setenv("DATABASE_DIR", str(tmp_path))
+        from database import DatabaseManager
+
+        db = DatabaseManager("slack")
+        db.conn.execute(
+            "INSERT INTO user_preferences (slack_user_id, model, reasoning_effort) "
+            "VALUES ('U1', 'gpt-4.1', 'high')")  # dropped model -> normalizer coerces it
+        # Force the one-time swap path (sentinel absent), then make it blow up.
+        db.conn.execute("ALTER TABLE user_preferences DROP COLUMN gpt56_migrated")
+
+        errors = []
+        monkeypatch.setattr(db, "log_error", lambda msg, **kw: errors.append(msg))
+
+        real_conn = db.conn
+        db.conn = _ExplodingConn(real_conn, "gpt56_migrated INTEGER DEFAULT 0")
+        try:
+            db._run_migrations()  # must not raise
+        finally:
+            db.conn = real_conn
+
+        assert any("Migration step 'gpt-5.6 migration' FAILED" in e for e in errors)
+        assert db.conn.execute(
+            "SELECT model FROM user_preferences WHERE slack_user_id='U1'"
+        ).fetchone()[0] == "gpt-5.6-sol"  # normalizer still ran
+        db.conn.close()

@@ -700,6 +700,20 @@ class ChatBotV2:
                             except Exception as e:
                                 main_logger.debug(f"Tool-usage sweep skipped: {e}")
 
+                            # Scheduled database backup. Until now backup_database()
+                            # was only ever called by the one-time migrations, so a
+                            # steady-state bot took no backups at all despite the
+                            # documented "automatic backups with 7-day retention".
+                            # Untagged on purpose: cleanup_old_backups() (a tail-call
+                            # of backup_database) prunes untagged dailies at 7 days.
+                            # Isolated — a failed backup must never kill the cleanup
+                            # worker or the bot.
+                            try:
+                                self.processor.db.backup_database()
+                                main_logger.info("Scheduled database backup complete (7-day retention)")
+                            except Exception as e:
+                                main_logger.error(f"Scheduled database backup FAILED: {e}")
+
                         stats = self.processor.get_stats()
                         main_logger.info(f"Cleanup complete. Stats: {stats}")
                 except asyncio.CancelledError:
