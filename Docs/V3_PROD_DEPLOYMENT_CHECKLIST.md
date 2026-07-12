@@ -167,10 +167,17 @@ reachable — if the key didn't resolve, the log names the missing variable.
 
 ## 9. Slack app — rebuild the manifest and reinstall
 
+> **The merged manifest is already on the box**: `slack_app_manifest.v3.yml` in the prod folder.
+> Copy its contents into api.slack.com/apps → *ChatGPT Slackbot* → **App Manifest**, save, reinstall.
+> Prod's previous manifest is untouched at `slack_app_manifest.yml` (your rollback reference).
+> It keeps prod's identity (name, colour, `ChatGPT` display name, `/chatgpt-settings`,
+> `configure_thread_settings`) and adds the v3 surface. It also **drops the four unused user
+> scopes** — prod has no user token and no code reads one; paste the `user:` block back if you
+> want them retained.
+
 The prod Slack app is a **separate app** from dev. Its manifest needs the v3 scopes and events, and
-**a missing scope degrades a feature silently rather than erroring**. Keep prod's names:
-bot display name **`ChatGPT`** (no `-dev`), slash command **`/chatgpt-settings`**, shortcut callback
-**`configure_thread_settings`**.
+**a missing scope degrades a feature silently rather than erroring**. The reference list below is
+what that file contains.
 
 Add to bot scopes:
 ```
