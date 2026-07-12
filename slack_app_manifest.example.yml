@@ -86,6 +86,7 @@ settings:
       - message.im
       - message.mpim
       - reaction_added
+      - reaction_removed
       - app_home_opened       # agent_view lifecycle (current)
       - app_context_changed   # agent_view lifecycle (current)
       - assistant_thread_started           # legacy agent surface — remove after code migrates
