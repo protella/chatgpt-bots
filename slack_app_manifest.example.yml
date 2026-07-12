@@ -50,6 +50,10 @@ oauth_config:
     bot:
       - app_mentions:read
       - assistant:write
+      - bookmarks:read       # bookmarks.list
+      - bookmarks:write      # bookmarks.add / edit / remove
+      - canvases:read        # canvases.sections.lookup
+      - canvases:write       # canvases.create / conversations.canvases.create / canvases.edit
       - channels:history
       - channels:join
       - channels:read
@@ -66,7 +70,8 @@ oauth_config:
       - im:write
       - mpim:history
       - mpim:read
-      - pins:read
+      - pins:read            # pins.list — required by the fetch_pinned_messages tool
+      - pins:write           # pins.add / pins.remove
       - reactions:read
       - reactions:write
       - search:read.public
