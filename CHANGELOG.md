@@ -4,17 +4,40 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-> Shipping as **v3.0.0** — a major release. The three headlines: a new model lineup
+> Shipping as **v3.0.0** — a major release. The headlines: a new model lineup
 > (GPT-5.6 Sol/Terra/Luna), the bot can now act like a real channel teammate
-> (off by default), and conversation history now lives in Slack, not the database.
-> Follow the Upgrade Instructions below in order; total hands-on time is a few minutes.
+> (off by default), it can run **deep research jobs in the background**, and conversation
+> history now lives in Slack, not the database.
+> Follow the Upgrade Instructions below in order — steps 2 and 5 are the ones that bite.
 
 ### 📦 Upgrade Instructions (start here)
+
+**0. Back up your database first.** v3's first boot runs irreversible migrations. The bot
+now takes its own `pre-v3-upgrade` backup before touching anything, but a copy of
+`data/slack.db` you made yourself is the one you can trust.
 
 **1. Update dependencies**
 ```bash
 make install   # pip install --require-hashes -r requirements.txt (openai >= 2.45.0)
 ```
+
+**1b. Install the system packages** — new in v3, and easy to miss because everything
+"works" without them:
+```bash
+apt-get install poppler-utils tesseract-ocr pandoc   # Linux
+brew install poppler tesseract pandoc                # macOS
+```
+`tesseract` + `poppler` are what make scanned PDFs readable (`ENABLE_PDF_OCR`, **on by
+default**); `pandoc` is the `.docx` fallback extractor. Without them those documents quietly
+degrade to a "couldn't extract text" note instead of erroring — so a host built without them
+silently loses the capability. (`python-magic` is *no longer* a dependency, so libmagic is no
+longer needed.)
+
+**1c. Check your SQLite** — `python3 -c "import sqlite3; print(sqlite3.sqlite_version)"` must
+report **3.35 or newer**. The migration that removes stored document text uses
+`ALTER TABLE … DROP COLUMN`, which doesn't exist below 3.35; on an older SQLite the bot logs a
+warning, carries on, and *leaves document content in the database* — exactly what v3 promises
+it won't do.
 
 **2. Update your `.env`** — compare against the reorganized `.env.example`. Everything new has a sane default if omitted; the items that matter:
 
@@ -30,19 +53,27 @@ Delete (no longer used):
 DISCORD_TOKEN / DISCORD_ALLOWED_CHANNEL_IDS / DISCORD_LOG_LEVEL
 GPT4_MAX_TOKENS
 THREAD_MAX_TOKEN_COUNT
+MAX_UNPROMPTED_REPLIES_PER_HOUR   # the hourly cap is gone — pacing is the model's judgment
+PARTICIPATION_SNOOZE_HOURS        # "butt out" now mutes the thread durably, no timer
 ```
 
-New keys worth a decision (see `.env.example` for the full annotated list — there's a
-whole new "Channel participation & UX" section at the bottom):
+New keys worth a decision (see `.env.example` for the full annotated list — every knob is
+documented inline there):
 - `ENABLE_CHANNEL_LISTENING=false` — the master switch for teammate behavior in channels.
   **Off by default: the bot behaves exactly as before (mentions + DMs) until you flip it.**
-- `BOT_NAME_ALIASES=ChatGPT` — set per environment (e.g. `ChatGPT-Dev` for a dev bot)
+- `BOT_NAME_ALIASES=ChatGPT` — names the bot answers to without an `@`. **Set this per
+  environment** (e.g. `ChatGPT-Dev` on a dev install), or the dev bot will answer to the
+  prod bot's name.
+- `ENABLE_DEEP_RESEARCH=true` — **on by default, and it works in DMs too.** Each job is
+  minutes of model time at `high` effort; turn it off if that's not a bill you want.
+- `SLACK_NATIVE_STREAMING=false` — native streaming is built and tested but ships off;
+  validate live in your workspace before enabling
+- `ENABLE_LINK_PREVIEWS=false` — links in the bot's posts stay inline; set true for Slack's
+  preview cards (this is a change from v2 behavior, where Slack unfurled them)
 - `STATUS_LOADING_MESSAGES_FILE` — optional branded "working…" messages for the
   thread status indicator: point it at your own text file, one message per line,
   plain text (no emoji — the status surface doesn't render them). Unset = a bundled
   set of 100 generic ones (`status_messages/loading_messages.generic.txt`).
-- `SLACK_NATIVE_STREAMING=false` — native streaming is built and tested but ships off;
-  validate live in your workspace before enabling
 - `ENABLE_FEEDBACK_BUTTONS=true` — 👍/👎 under DM/assistant responses
 
 **3. Migrate `mcp_config.json` secrets (recommended, not breaking)** — literal keys still
@@ -55,22 +86,37 @@ Also new: per-server `"enabled": false`, and auth uses the `headers` object shap
 (see README — the previously documented `authorization` shape never worked).
 
 **4. Rebuild your Slack app manifest and reinstall.** Copy
-`slack_app_manifest.example.yml` over your environment copy (keep your names/commands)
-and reinstall the app. New since v2.5: `agent_view` block, bot scopes
-`search:read.public/private/im/mpim/files/users`, `reactions:read`, `emoji:read`,
-`assistant:write`, and events `reaction_added`, `app_home_opened`,
-`app_context_changed` (legacy `assistant_thread_*` events stay during the transition).
-Optional: subscribe `reaction_removed` if you want thumb reactions un-counted when removed.
+`slack_app_manifest.example.yml` over your environment copy (keep your names/commands) and
+reinstall the app — the new scopes need re-consent, and a missing one degrades a feature
+silently. New since v2.5: the `agent_view` block; bot scopes
+`search:read.public/private/im/mpim/files/users`, `reactions:read`, `reactions:write`,
+`pins:read`, `users:read.email`, `chat:write.customize`, `assistant:write`, `emoji:read`; and
+events `reaction_added`, `reaction_removed`, `app_home_opened`, `app_context_changed` (the
+legacy `assistant_thread_*` events stay subscribed during the transition).
 
-**5. First startup runs three automatic DB migrations** — each takes a tagged backup
-into `data/backups/` first (your rollback path). Watch for these log lines:
-- `DB: Mirror-drop migration complete — removed N cached message rows` (backup tagged
-  `pre-v3-mirror-drop`) — the DB no longer stores conversation transcripts
-- `DB: Doc-content-drop migration complete` (backup tagged `pre-v3-doc-content-drop`)
-  — the DB no longer stores document content
+Two of those are easy to skip and annoying to debug: **`chat:write.customize`** is what puts
+the "[research: …]" byline on findings posts (without it the bot silently falls back to plain
+posts), and **`users:read.email`** is what lets it answer "what's her email?" instead of
+shrugging.
+
+**5. First startup migrates the database automatically.** It takes a `pre-v3-upgrade` backup
+into `data/backups/` before touching anything, then two more tagged backups before each
+destructive step. Watch for these lines, in order:
+- `DB: Pre-v3 database detected — backup tagged pre-v3-upgrade before migrating` — **this is
+  your rollback point.** Keep it.
 - `DB: One-time GPT-5.6 migration — swapped N user(s) to gpt-5.6-sol with medium reasoning`
-  — everyone moves to the new default; users can re-pick model/effort globally,
-  per channel, and per thread afterward
+  — everyone moves to the new default (their old model/effort choice is not preserved; they
+  can re-pick globally, per channel, and per thread afterward)
+- `Created backup: …pre-v3-mirror-drop…` → `DB: Mirror-drop migration complete — removed N
+  cached message row(s)` — the DB stops storing conversation transcripts
+- `Created backup: …pre-v3-doc-content-drop…` → `DB: Doc-content-drop migration complete` —
+  the DB stops storing document content
+- Anything reading `DB: Migration step '<name>' FAILED` means that step did not complete.
+  The remaining steps still run, and the bot will start — but don't leave it there.
+
+From then on the database backs itself up nightly (7-day retention) as part of the scheduled
+cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
+retention** — they're your rollback path, so nothing deletes them but you.
 
 ### 🚀 Feature - GPT-5.6 model family (Sol / Terra / Luna)
 
@@ -107,9 +153,8 @@ DMs behave as before.
 #### Added
 - **Channel-wide listening with judgment**: a lightweight participation engine sees
   channel messages and decides — respond, react with an emoji, stay silent, or back
-  off. Hard rails included: a per-channel hourly cap on unprompted replies
-  (`MAX_UNPROMPTED_REPLIES_PER_HOUR`), rapid-fire debouncing, and "ignore" as the
-  default verdict.
+  off. Pacing is the model's own judgment (it sees how often it has spoken up
+  recently), backed by rapid-fire debouncing and "ignore" as the default verdict.
 - **Per-channel participation levels** — off / mentions-only / judicious / active —
   set by anyone via the **⚙️ Configure** button under bot responses (plus channel
   directives and reply placement, as before)
@@ -120,9 +165,11 @@ DMs behave as before.
   personal preferences. A "My personal settings" button inside the modal opens your
   own settings without a second button in chat.
 - **"Quiet down" works like you'd hope**: telling the bot to pipe down gets a 🤐 and
-  snoozes unprompted participation for 4 hours (mentions still answered). Standing
-  feedback ("stay out of here unless tagged", "keep answers short in this channel")
-  is remembered durably as a channel preference.
+  permanently mutes unprompted participation *in that thread* — no timer to wait out,
+  and mentions and name-summons still answer. It also writes a dated note to channel
+  memory, so the bar goes up channel-wide. Standing feedback ("stay out of here unless
+  tagged", "keep answers short in this channel") is remembered durably as a channel
+  preference.
 - **Per-channel memory, model-managed**: the bot decides what's durable
   (decisions, conventions, preferences) and remembers/updates/forgets it via its own
   tools; facts are recalled in future conversations in that channel
@@ -135,15 +182,118 @@ DMs behave as before.
   profiles — all fetched live, nothing stored. Search is permission-gated in code
   (public/private channels only by default) and only possible while handling a real
   triggering message.
-- **Emoji reactions** as a response type, both engine-chosen and model-invoked
-  (allowlisted via `REACTION_EMOJIS`)
+- **Emoji reactions** as a response type, both engine-chosen and model-invoked. The bot
+  picks from the full standard emoji set by default; set `REACTION_EMOJIS` to a list if
+  you want to constrain it to brand-approved reactions.
+
+- **It knows what it can actually do**: an open question to the room ("anyone know what
+  our data says about X?") gets an answer when the bot's own tools or MCP servers can
+  answer it. Previously it stayed quiet because the part of it that decides whether to
+  speak had no idea what the rest of it was capable of. Nothing is hardcoded — the list
+  follows whatever servers and tools you've configured.
+- **Files dropped in a channel reach it**: a photo, PDF, or spreadsheet posted with a
+  question ("what do we think — good enough to send?") now gets a reply. Slack delivers
+  uploads as a special kind of message that the bot was discarding before it ever got to
+  the "should I answer this?" decision, so *every* channel file question had been invisible.
+- **It knows who's in the room**: the bot sees roughly who's around and recently active,
+  which sharpens its read of who "you" refers to. It can also look someone up by name or
+  @mention (title, timezone, whether they're a bot) and list the channel's members when
+  that's what you're asking about.
+- **A fast follow-up gets one answer, not two**: post a question and then a "second
+  thought — also…" a moment later and the bot answers both in a single reply. Two people
+  asking different things at the same moment still get their own answers (previously the
+  first one could be silently dropped).
+- **It can hold a real conversation**: the bot can now take part in a genuine multi-person
+  back-and-forth without needing to be re-named in every message, and it banters back
+  briefly when the room (or a jab aimed at it) invites it.
 
 #### Changed
 - **No more "busy" rejections anywhere**: messages arriving while the bot is working
   are queued and answered together in one coherent catch-up reply (DMs, threads, and
   channels). The old "I'm busy, try again" behavior is retired.
-- **Replies thread by default** in channels; genuine top-level replies are reserved
-  for answers the whole channel needs
+- **Replies lean toward threads** in channels — long answers, likely back-and-forths, and
+  busy rooms go in a thread; a short answer the whole channel needs can still land at
+  channel level.
+
+#### Fixed
+- **"Off" now really means off.** Setting a channel's participation level to *off* still
+  answered @-mentions there — the modal promised "never respond in this channel" and the
+  bot replied anyway. Off is now fully silent in that channel (DMs are unaffected), and
+  genuinely different from "mentions only".
+- **A message addressed to someone else is never hijacked.** "@Claude, I heard you can…"
+  in a channel could be answered *by this bot*, cheerfully explaining another assistant's
+  internals as if they were its own. Unresolved @-mentions were being stripped out of the
+  text entirely, destroying the very signal that said who was being spoken to. Mentions are
+  now preserved, and an explicit @-mention of someone else is the strongest possible signal
+  that a message isn't for the bot — it outranks channel ground rules and standing
+  instructions to be proactive.
+- **Questions in other threads stop vanishing.** Rapid-fire chatter in one thread could
+  silently cancel the pending evaluation of an unrelated message elsewhere in the channel,
+  so it was never judged and never answered. Each conversation is now debounced on its own.
+
+### 🔬 Feature - Deep research, in the background
+
+Some questions deserve more than a fifteen-second answer and one web search. The bot can now
+recognize those and go do the work properly — in DMs and channels alike, in the default config.
+
+- **It detaches the job and keeps talking.** Ask something that genuinely needs digging
+  ("what happened to egg prices this year, and what's the H2 outlook?") and the bot spins the
+  research off into a background job, then posts a sourced report back into the thread minutes
+  later. The conversation stays usable the whole time — you can ask other things, and it answers.
+- **You can watch it work.** A single live status card sits in the thread while the job runs,
+  showing the goals it has completed in its own words ("Cross-checked USDA and BLS price series
+  — wholesale fell first, retail followed with a lag") plus a running count of what it's been
+  doing: *todos as of 7:36 PM · 23 web searches · 2 datassential calls*. The card finishes with
+  a ✅ and "Reported findings below", or an honest ❌ and the reason.
+- **The findings arrive under their own byline** — "ChatGPT [research: 2026 US egg outlook]" —
+  so a long report is clearly the research job talking, not the bot interrupting the chat. It
+  closes with what it used: *deep research · 4m 56s · effort high · tools: web_search*.
+- **Nothing fails silently.** An API error, a timeout, an empty result, or a failed post each
+  surface as one honest line in the thread. Two jobs per thread run at once; ask for a third and
+  it says so.
+
+Flags: `ENABLE_DEEP_RESEARCH` (default **on**), `DEEP_RESEARCH_REASONING_EFFORT` (high),
+`DEEP_RESEARCH_TIMEOUT` (600s), `DEEP_RESEARCH_MAX_PER_THREAD` (2), and `ENABLE_RESEARCH_LABEL`
+(on — the byline needs the `chat:write.customize` scope; without it the bot posts plainly rather
+than failing).
+
+### 💬 Feature - Reactions that read like a colleague's
+
+- **"I'm on it."** When a request implies real work — files to read, data to look up, several
+  steps to run — the bot drops a 👀 on your message immediately and then goes and does it, so
+  you're not left wondering whether it heard you. No timers and no extra model calls; it's a
+  judgment the bot already makes. Set the emoji with `ACK_REACTION_EMOJI` (default `eyes`) or
+  turn it off with `ENABLE_ACK_REACTION`.
+- **Sometimes the reaction *is* the reply.** "Please cover for me while I'm out, brb" now gets a
+  single 👍 instead of a paragraph. When one emoji fully carries the answer — an acknowledgment,
+  an FYI, agreement that needs no elaboration — the bot prefers it to writing, and it won't
+  restate in words what someone else already said with a reaction.
+- **It reacts like a person would**: joining a laugh, thumbs-upping good news or a fix it helped
+  with. Others having already reacted makes it *more* likely to join in, not less. Most messages
+  still get nothing, and it stays away from anything heated or personal.
+- **The emoji palette is now open by default.** The bot picks whatever emoji actually fits, from
+  the full standard set. `REACTION_EMOJIS` is still there if you want to hold it to a
+  brand-approved list — set it and the restriction is enforced everywhere.
+- **Ask for several reactions and you get several.** The bot was hard-limited to one emoji per
+  message on several layers, so a request for three would get one — and it would sometimes follow
+  up by claiming it was "showing restraint". Up to `REACTION_MAX_PER_MESSAGE` (default 4) now.
+- **It remembers the reactions it placed**, so asking "why did you react with 🎉?" no longer gets
+  a confused denial or an answer about someone else's reaction.
+
+### 🕰️ Feature - The bot can reason about time and remember what it found
+
+- **Every message it reads is stamped with when it was said**, in the sender's own timezone. So
+  "last night", "before the meeting", and "you asked me this an hour ago" now mean something, and
+  it can tell a stale thread from a live one. Toggle with `ENABLE_MESSAGE_TIMESTAMPS`.
+- **It stops losing — and retracting — what it looked up.** It would cite a real report with a
+  link, then on "can you send me that link?" find the link gone from its memory, re-run the
+  lookup, miss, and *retract its own correct answer*. Results from your data servers are now
+  remembered alongside the reply, and it's explicitly forbidden from taking back a fact it
+  already gave you just because a fresh search didn't turn it up again.
+- **Long results get summarized, not guillotined.** An overlong tool result used to be chopped at
+  a character count, which could amputate the very link or figure that made it worth keeping. It's
+  now summarized once — preserving every URL, title, date, figure, and ID verbatim — and falls
+  back to plain truncation if anything goes wrong.
 
 ### 🗄️ Changed - Slack is now the only transcript
 
@@ -168,6 +318,39 @@ DMs behave as before.
 - **Privacy**: document content is never stored and never touches disk — the bot keeps
   only a summary and a reference to the file in Slack, and processes files in memory.
   Deleting a file from Slack removes its content from the bot's reach entirely.
+- **Files are readable across the channel, not just in the thread they landed in**: a CSV
+  shared in one thread can be read from another thread in the same channel, and the bot says
+  where it came from ("shared in another conversation in this channel"). Same channel only —
+  never across channels, and DMs stay private to the DM.
+- **…and it can actually find them.** Filenames now show up in what the bot sees of channel
+  activity and history, so "the vendor contract PDF from the review thread" is enough to go on.
+  A search inside a document that matches nothing no longer dead-ends — it comes back with the
+  content and a way to navigate it, so one look always yields something answerable.
+- **Scanned PDFs stay readable after the first turn.** An image-only or scanned PDF was legible
+  on the turn you uploaded it and effectively lost afterward. Its pages are now OCR'd on demand,
+  so "what's the vendor code in that contract?" still works days later. Requires the
+  `tesseract-ocr` and `poppler-utils` system packages (see the Upgrade Instructions); without
+  them it degrades to an honest "scanned document, text not extractable" note rather than
+  failing. Gated by `ENABLE_PDF_OCR` (default on) and bounded by `OCR_MAX_PAGES` (20) — past
+  the cap it says loudly that it truncated, and never pretends otherwise.
+
+### 🧵 Feature - The bot can answer in a different thread
+
+- "Go back and answer that question in the other thread" now works: the bot acknowledges briefly
+  where you are, and posts the real answer where it belongs. Same channel only, never
+  cross-channel, and it refuses to post into a thread someone has told it to stay out of.
+  Toggle with `ENABLE_POST_TO_THREAD_TOOL` (default on).
+
+### 🔗 Changed - Quieter, sturdier message delivery
+
+- **Links no longer explode into preview cards.** The bot's posts keep links inline, which also
+  stops Slack's link unfurler from stamping an "(edited)" badge on them. Set
+  `ENABLE_LINK_PREVIEWS=true` to get the preview cards back.
+- **No more "Continued in next message…" trailers** on long split replies — the next message
+  already says "…continued", so the seam was being announced twice.
+- **A long reply can't silently lose its middle.** If part of a split message fails to post, the
+  bot retries it once and, if that fails too, says so loudly ("⚠️ This message was cut off…")
+  instead of leaving a hole you'd never notice.
 
 ### 👍 Feature - Response feedback
 
@@ -276,6 +459,11 @@ DMs behave as before.
 - **Discord support removed**: the V2 Discord bot was never built (the launcher was a
   "Coming Soon" stub). The bot is Slack-only.
 - **`legacy/` (V1 bots) deleted** — still available in early git history
+- **`extract_metrics.py` deleted** — the usage-report script read the `messages` table, which
+  no longer exists, so it could not run against a v3 database. Still in git history if it's
+  worth rewriting against the new schema.
+- **`python-magic` dropped from the dependencies** — nothing imported it, and it pulled in a
+  `libmagic` system requirement for no reason.
 
 ### 🧪 Changed - Test suite restored
 
@@ -287,21 +475,26 @@ DMs behave as before.
 
 - Image generation and editing now show an accumulating checklist that ticks off each
   step in place ("✓ Enhanced prompt → ✓ Generated image → Uploading…") instead of a
-  single status line that overwrites itself. It posts as a real, visible message in the
-  thread so the steps are always there to watch, and — where Slack also shows the little
-  "working…" status under the composer — the current step is mirrored there too. Toggle
-  the whole checklist with `ENABLE_PROGRESS_CHECKLIST` (default on); set
-  `PROGRESS_CHECKLIST_PREFER_MESSAGE=false` to go back to the status-line-only behavior.
+  single status line that overwrites itself. Where Slack has a native status surface the
+  checklist lives there and nowhere else — Slack already shows it both in-thread and under
+  the composer, so posting a third copy as a message was noise. Surfaces without a native
+  status still get a real checklist message. Toggle the whole thing with
+  `ENABLE_PROGRESS_CHECKLIST` (default on); set `PROGRESS_CHECKLIST_PREFER_MESSAGE=true` if
+  you want the extra visible thread message on top.
 
 ### 🖼️ Feature - Image generation no longer freezes the conversation
 
 - Creating a new image used to hold the thread while the model worked, so anything you
   said in the meantime had to wait. Image generation now runs in the background: the
   image posts automatically when it's ready and you can keep chatting the whole time.
-  If you ask for another image while one is still cooking, the bot tells you it's still
-  working rather than starting a second one. Image editing is unchanged this release.
-  Toggle with `ENABLE_BACKGROUND_IMAGE_GEN` (default on); image jobs get their own
-  longer time budget via `API_TIMEOUT_IMAGE` (default 300s).
+  Ask for a second image while the first is still cooking and it simply runs too — up to
+  `MAX_CONCURRENT_IMAGE_GENERATIONS` (default 5) per thread. Edits still wait their turn
+  (you can't edit an image that doesn't exist yet). Toggle with `ENABLE_BACKGROUND_IMAGE_GEN`
+  (default on); image jobs get their own longer time budget via `API_TIMEOUT_IMAGE`
+  (default 300s).
+- An acknowledgment while an image is generating ("ok", "thanks", "nice") is no longer
+  misread as a request for another picture — a follow-up only counts as an image request
+  when it actually adds or changes something visual.
 - Fixed: the "✨ Enhanced Prompt" preview had stopped appearing on most surfaces (it was
   tied to a status message that newer Slack surfaces don't create) — it now posts as its
   own message so you can always see the prompt the image was built from.
@@ -315,9 +508,9 @@ DMs behave as before.
   made before any text appears, and once the bot has begun a visible reply it always
   finishes it rather than vanishing mid-sentence. Toggle with `ENABLE_NO_REPLY_TOOL`
   (default on).
-- Fixed: a channel turn that ended in only an emoji reaction could still count against the
-  bot's hourly self-started-reply budget — reactions and deliberate silence no longer burn
-  that budget.
+- It also applies to threads the bot is already part of: in a 1:1 thread, a message clearly
+  aimed at someone else ("claude, what do you think?") no longer earns a reply about not
+  replying. And the bot never posts a placeholder announcing that it's staying quiet.
 
 ### 🧭 Feature - The bot knows why it woke up
 
@@ -337,21 +530,10 @@ DMs behave as before.
   instead of the bot assuming "you" means itself and barging in. This closes a live case
   where it answered a question aimed at another participant. The thread context is internal
   only (never posted, never stored) and costs no extra API calls. Tune how much it sees with
-  `PARTICIPATION_THREAD_TAIL` (default 6 messages; 0 turns it off).
+  `PARTICIPATION_THREAD_TAIL` (default 15 messages; 0 turns it off).
 - The bot's awareness of channel activity is now more reliable: it takes in other apps'
   messages and its own posted replies (not just people's), so its sense of who-said-what to
   whom is complete.
-
-### 🎉 Feature - The bot can add several reactions when you ask for them
-
-- Asking the bot for multiple emoji reactions on a message now works — previously it would
-  add only one (and could even follow up by claiming it was "showing restraint"), because
-  it was hard-limited to a single reaction per message on several layers, including the
-  quick-decision path that sometimes answered such a request with a lone auto-reaction. It
-  still reacts sparingly by default (most messages get none), but when you explicitly ask
-  for several distinct emoji it adds them, up to a safety cap. Set the cap with
-  `REACTION_MAX_PER_MESSAGE` (default 4). Reacting with the same emoji twice remains a
-  harmless no-op.
 
 ### 🧠 Feature - The bot now remembers which tools it used
 
@@ -400,9 +582,8 @@ DMs behave as before.
   details like result counts, never the content of your request.
 - After a hiccup mid-reply, the bot finishes the reply instead of occasionally going quiet
   and leaving a half-written message stranded.
-- Longer replies that get split into parts, or that briefly failed to send, now behave
-  correctly: split replies still get their settings footer, and a reply that didn't
-  actually send no longer counts against the bot's quiet-hours self-reply budget.
+- Longer replies that get split into parts still get their settings footer, and a reply
+  that never actually sent is no longer remembered as if it had been said.
 - In busy channels, a delayed duplicate of an old message can no longer resurface as if
   it were new, and the bot's channel-awareness memory no longer grows without bound.
 - When the bot decides to stay silent and just add reactions, it can no longer slip one
@@ -415,11 +596,31 @@ DMs behave as before.
   the moment it finished uploading — so a follow-up "edit that" always finds it.
 - If saving an image's details briefly fails after it was already posted, the bot no
   longer tells you the post failed — the image you can see is treated as posted.
-- A reply that failed to send, ended in only an emoji reaction, or was deliberate silence
-  no longer counts against the bot's hourly self-started-reply budget.
 - Assorted internal cleanups: no lingering "Generating…" status when a background image is
   in flight, no duplicate "Enhanced Prompt" messages on some surfaces, and the bot
   remembers an "I'm still working on the last image" reply in-context right away.
+
+### 🛡️ Fixed - Upgrade safety (for the operator, not the user)
+
+- **The v3 migrations now take a backup before they change anything.** The one-time move of
+  every user to GPT-5.6 ran *before* the first tagged backup was written, so neither backup
+  could restore the model and effort people had actually chosen. A `pre-v3-upgrade` backup is
+  now taken at the top of the run, before any write.
+- **A failed migration can no longer silently skip the rest.** Every step shared one
+  error handler that swallowed the exception and abandoned the remaining steps, leaving the
+  bot serving traffic on a half-migrated schema with one quiet line in the log. Each step now
+  fails on its own, loudly and by name, and the others still run.
+- **The database actually backs itself up now.** The docs have long promised nightly backups
+  with 7-day retention; in practice `backup_database()` was only ever called by the migrations,
+  so after the upgrade no backup was ever taken again. It now runs as part of the nightly
+  cleanup — and backup retention no longer deletes the tagged migration backups, which it
+  would have started doing (7 days after the upgrade, to the day) the moment backups became
+  a nightly event.
+- **`reaction_removed` is subscribed in the example manifest.** The bot has always handled the
+  event, but the manifest never asked for it — so reaction counts could go up and never down.
+- Fixed two bugs hiding behind duplicate function definitions: threads created through the async
+  path skipped their activity-touch and user-config copy, and the OpenAI client leaked its HTTP
+  session on shutdown.
 
 ## [2.5.1] - 2026-05-11
 
