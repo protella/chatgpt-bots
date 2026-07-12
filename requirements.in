@@ -30,7 +30,6 @@ python-docx>=1.0.0
 python-pptx>=1.0.0
 openpyxl>=3.1.5
 pandas>=2.2.0
-python-magic>=0.4.27
 tabulate>=0.10.0
 pdf2image>=1.17.0  # For converting PDF pages to images (requires poppler-utils)
 pytesseract>=0.3.13  # OCR text from scanned PDFs (requires tesseract-ocr system package)
