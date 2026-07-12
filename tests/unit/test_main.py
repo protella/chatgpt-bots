@@ -1117,6 +1117,94 @@ class TestChatBotV2CleanupTaskCoverage:
     @patch('main.asyncio.sleep')
     @patch('datetime.datetime')
     @pytest.mark.asyncio
+    async def test_cleanup_task_takes_database_backup(self, mock_datetime, mock_sleep, mock_croniter_class, mock_logger, mock_config, bot):
+        """The scheduled cleanup is the only steady-state backup trigger — without
+        it backup_database() is called by the one-time migrations and never again,
+        despite the documented 'automatic backups with 7-day retention'."""
+        mock_config.cleanup_schedule = "0 0 * * *"
+        mock_config.cleanup_max_age_hours = 48
+        mock_config.tool_usage_retention_days = 30
+
+        mock_cron = Mock()
+        mock_croniter_class.return_value = mock_cron
+        mock_datetime.datetime.now.return_value = Mock()
+
+        mock_next_run = Mock()
+        mock_next_run.strftime.return_value = "2023-01-01 00:00:00"
+        mock_cron.get_next.return_value = mock_next_run
+        mock_time_diff = Mock()
+        mock_time_diff.total_seconds.return_value = 0
+        mock_next_run.__sub__ = Mock(return_value=mock_time_diff)
+
+        call_count = 0
+
+        async def mock_sleep_side_effect(seconds):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 1:
+                bot.running = False
+            return
+
+        mock_sleep.side_effect = mock_sleep_side_effect
+
+        await bot.start_cleanup_task()
+        await bot.cleanup_task
+
+        # Untagged so cleanup_old_backups()'s 7-day retention prunes it
+        bot.processor.db.backup_database.assert_called_once_with()
+        mock_logger.info.assert_any_call(
+            "Scheduled database backup complete (7-day retention)")
+
+    @patch('main.config')
+    @patch('main.main_logger')
+    @patch('croniter.croniter')
+    @patch('main.asyncio.sleep')
+    @patch('datetime.datetime')
+    @pytest.mark.asyncio
+    async def test_cleanup_task_survives_backup_failure(self, mock_datetime, mock_sleep, mock_croniter_class, mock_logger, mock_config, bot):
+        """A failing backup must never kill the cleanup worker or the bot."""
+        mock_config.cleanup_schedule = "0 0 * * *"
+        mock_config.cleanup_max_age_hours = 48
+        mock_config.tool_usage_retention_days = 30
+        bot.processor.db.backup_database.side_effect = OSError("No space left on device")
+
+        mock_cron = Mock()
+        mock_croniter_class.return_value = mock_cron
+        mock_datetime.datetime.now.return_value = Mock()
+
+        mock_next_run = Mock()
+        mock_next_run.strftime.return_value = "2023-01-01 00:00:00"
+        mock_cron.get_next.return_value = mock_next_run
+        mock_time_diff = Mock()
+        mock_time_diff.total_seconds.return_value = 0
+        mock_next_run.__sub__ = Mock(return_value=mock_time_diff)
+
+        call_count = 0
+
+        async def mock_sleep_side_effect(seconds):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 1:
+                bot.running = False
+            return
+
+        mock_sleep.side_effect = mock_sleep_side_effect
+
+        await bot.start_cleanup_task()
+        await bot.cleanup_task  # must not raise
+
+        mock_logger.error.assert_any_call(
+            "Scheduled database backup FAILED: No space left on device")
+        # Cleanup itself still completed — the failure was contained
+        bot.processor.get_stats.assert_called()
+        mock_logger.info.assert_any_call("Cleanup complete. Stats: {'threads': 10, 'cleaned': 2}")
+
+    @patch('main.config')
+    @patch('main.main_logger')
+    @patch('croniter.croniter')
+    @patch('main.asyncio.sleep')
+    @patch('datetime.datetime')
+    @pytest.mark.asyncio
     async def test_cleanup_task_handles_general_error(self, mock_datetime, mock_sleep, mock_croniter_class, mock_logger, mock_config, bot):
         """Test cleanup task handles general errors and retries"""
         mock_config.cleanup_schedule = "0 0 * * *"
