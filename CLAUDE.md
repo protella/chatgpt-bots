@@ -22,13 +22,14 @@ python3 -m pip install --require-hashes -r requirements.txt
 mkdir -p data data/backups
 ```
 
-**System dependencies (scanned-PDF handling):** the bot needs the `poppler-utils`
-and `tesseract-ocr` system packages installed for image-only/scanned PDFs —
-poppler renders PDF pages to images and tesseract OCRs them to text (controlled by
-`ENABLE_PDF_OCR`). Install with `apt-get install poppler-utils tesseract-ocr`
-(Linux) or `brew install poppler tesseract` (macOS). Both are optional: if absent,
-OCR and page-image rendering degrade gracefully to an honest "scanned document, text
-not extractable" note rather than failing.
+**System dependencies (document handling):** `poppler-utils` and `tesseract-ocr` for
+image-only/scanned PDFs — poppler renders PDF pages to images and tesseract OCRs them to
+text (controlled by `ENABLE_PDF_OCR`) — plus `pandoc`, the fallback extractor for `.docx`
+(`document_handler.py` shells out to it when python-docx comes up short). Install with
+`apt-get install poppler-utils tesseract-ocr pandoc` (Linux) or
+`brew install poppler tesseract pandoc` (macOS). All three are optional: if absent, the
+affected documents degrade gracefully to an honest "text not extractable" note rather than
+failing.
 
 ### Dependency Management (pip-tools two-file layout)
 - **`requirements.in`** — human-edited source of truth. Top-level deps with `>=` floor constraints.
