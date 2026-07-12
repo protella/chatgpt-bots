@@ -684,8 +684,11 @@ class TestProcessorGlue:
         h = MagicMock()
         h.log_debug = MagicMock()
         h.mcp_manager.has_mcp_servers.return_value = False
+        # F32: code_interpreter off — this test asserts the registry-less array shape,
+        # not the sandbox tool (which has its own coverage in test_artifacts.py).
         tools = TextHandlerMixin._build_tools_array(
-            h, {"enable_web_search": True, "enable_mcp": False}, "gpt-5.5")
+            h, {"enable_web_search": True, "enable_mcp": False,
+                "enable_code_interpreter": False}, "gpt-5.5")
         assert tools == [{"type": "web_search"}]
 
     def test_registry_builder_registers_history_react_and_search(self, monkeypatch):

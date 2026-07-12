@@ -11,6 +11,7 @@ from thread_manager import AsyncThreadStateManager
 from openai_client import OpenAIClient
 from config import config, pipeline_status
 from logger import LoggerMixin
+from .containers import ContainerManager
 from .message_timestamps import stamp_content
 from .thread_management import ThreadManagementMixin
 from .handlers.text import TextHandlerMixin
@@ -43,6 +44,9 @@ class MessageProcessor(ThreadManagementMixin,
         self.image_url_handler = ImageURLHandler()
         self.document_handler = DocumentHandler() if DOCUMENT_HANDLER_AVAILABLE else None
         self.db = db  # Database manager
+
+        # F32: thread-scoped code-interpreter containers (sandbox state survives the turn).
+        self.container_manager = ContainerManager(self.openai_client, db=db)
 
         # Initialize MCP Manager
         self.mcp_manager = MCPManager(db=db)
@@ -185,8 +189,19 @@ class MessageProcessor(ThreadManagementMixin,
             channel_info = await self._build_channel_info(client, message.channel_id)
             thread_state.system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"], web_search_enabled, thread_state.has_trimmed_messages, thread_config.get('custom_instructions'), participant_roster=participant_roster, channel_directives=thread_state.channel_directives, channel_memory=channel_memory_text, channel_info=channel_info)
             
-            # Process any attachments (images, documents, and other files)
-            image_inputs, document_inputs, unsupported_files = await self._process_attachments(message, client, thinking_id)
+            # F32: ONE artifact sink for the whole turn. The timeout/MCP retries below re-enter
+            # the text handler; a per-attempt sink would drop the container id of an attempt that
+            # ran code interpreter and then failed, stranding the file it wrote in the sandbox.
+            turn_artifacts: list = []
+
+            # Process any attachments (images, documents, and other files).
+            # The CI setting must be the PER-THREAD one, resolved the same way the tools array
+            # resolves it — a spreadsheet is only worth mounting when the sandbox that reads it
+            # will actually be there.
+            image_inputs, document_inputs, unsupported_files = await self._process_attachments(
+                message, client, thinking_id,
+                code_interpreter_enabled=thread_config.get(
+                    'enable_code_interpreter', config.enable_code_interpreter))
             
             # Files that were accepted but couldn't be fetched/processed create an
             # obligation: use them or tell the user they failed — never answer as
@@ -240,14 +255,19 @@ class MessageProcessor(ThreadManagementMixin,
             file_inputs = []
             if document_inputs:
                 enhanced_text = self._build_message_with_documents(base_text_with_username, document_inputs)
-                # Native-eligible PDFs additionally ride this turn as input_file
-                # parts so the model sees text + rendered pages (Phase D2).
+                # Native-eligible files additionally ride this turn as input_file parts:
+                # PDFs so the model sees text + rendered pages (Phase D2), and F32
+                # spreadsheets/CSVs so they auto-mount in the code-interpreter sandbox and
+                # can actually be computed over. The mimetype MUST come from the document —
+                # hard-coding application/pdf here would hand the API a CSV wearing a PDF
+                # content type.
                 for doc in document_inputs:
                     if doc.get("native") and doc.get("file_data_b64"):
+                        mimetype = doc.get("mimetype") or "application/pdf"
                         file_inputs.append({
                             "type": "input_file",
                             "filename": doc.get("filename", "document.pdf"),
-                            "file_data": f"data:application/pdf;base64,{doc['file_data_b64']}",
+                            "file_data": f"data:{mimetype};base64,{doc['file_data_b64']}",
                         })
 
             user_content = self._build_user_content(enhanced_text, image_inputs, file_inputs)
@@ -715,7 +735,8 @@ class MessageProcessor(ThreadManagementMixin,
                         self._update_status(client, message.channel_id, thinking_id, status_msg, emoji=config.analyze_emoji, thread_id=message.thread_id)
                         
                         # Documents are already in enhanced_text, just process as text with vision intent
-                        response = await self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0)
+                        response = await self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0,
+                                                                   artifacts_acc=turn_artifacts)
                     elif image_inputs and document_inputs:
                         # Both images and documents - use two-call approach
                         total_files = len(image_inputs) + len(document_inputs)
@@ -753,7 +774,8 @@ class MessageProcessor(ThreadManagementMixin,
                         message
                     )
             else:
-                response = await self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0)
+                response = await self._handle_text_response(user_content, thread_state, client, message, thinking_id, retry_count=0,
+                                                                   artifacts_acc=turn_artifacts)
             
             # F1 latch relocation (TOCTOU fix): the image upload + DB row land AFTER this
             # lock releases (main.py sync path, or the background job). Mark the upload
@@ -936,7 +958,8 @@ class MessageProcessor(ThreadManagementMixin,
                                 enhanced_text if 'enhanced_text' in locals() else user_content,
                                 thread_state, client, message, thinking_id,
                                 attachment_urls if 'attachment_urls' in locals() else None,
-                                retry_count=1
+                                retry_count=1,
+                                artifacts_acc=turn_artifacts
                             )
 
                         self.log_info(f"Retry successful for {operation_type}")
@@ -948,7 +971,8 @@ class MessageProcessor(ThreadManagementMixin,
                             enhanced_text if 'enhanced_text' in locals() else user_content,
                             thread_state, client, message, thinking_id,
                             attachment_urls if 'attachment_urls' in locals() else None,
-                            retry_count=1
+                            retry_count=1,
+                            artifacts_acc=turn_artifacts
                         )
                         self.log_info(f"Retry successful for {operation_type}")
                         return response

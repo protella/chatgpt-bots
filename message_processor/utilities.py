@@ -15,7 +15,8 @@ from base_client import BaseClient, Message
 from config import config, pipeline_status
 from message_processor.message_timestamps import stamp_content
 from message_processor.people_tools import format_people_summary
-from prompts import SLACK_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, LOCAL_TOOLS_GUIDANCE
+from prompts import (SLACK_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, LOCAL_TOOLS_GUIDANCE,
+                     CODE_INTERPRETER_GUIDANCE)
 
 
 def build_roster_text(participants, user_cache=None, bot_user_id=None):
@@ -47,6 +48,19 @@ def build_roster_text(participants, user_cache=None, bot_user_id=None):
         "<@USER_ID> (exactly, with the angle brackets). Never put a person's plain name inside "
         "angle brackets. Known participants:\n" + lines
     )
+
+
+# F32: spreadsheet/data types that ride the turn as native input_file parts so they
+# AUTO-MOUNT in the code-interpreter container (/mnt/data), letting the model compute over the
+# real file instead of eyeballing a truncated text extraction. The bytes travel in the request
+# body exactly like a native PDF's — no Files API object is created, so nothing of the user's
+# data persists on OpenAI's side.
+CI_MOUNTABLE_MIMETYPES = {
+    "text/csv",
+    "text/tab-separated-values",
+    "application/vnd.ms-excel",                                              # .xls
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",     # .xlsx
+}
 
 
 class MessageUtilitiesMixin:
@@ -97,21 +111,36 @@ class MessageUtilitiesMixin:
             return text
 
     def _native_file_eligible(self, mimetype: str, size_bytes: int,
-                              total_pages: Optional[int]) -> bool:
+                              total_pages: Optional[int],
+                              code_interpreter_enabled: Optional[bool] = None) -> bool:
         """Decide native input_file vs local extraction for the attach turn.
 
-        Native (model sees text + rendered pages) requires ALL of:
-        - ENABLE_NATIVE_FILE_INPUT on
-        - PDF (the API renders pages only for PDFs; other types go local)
-        - within the API request ceilings (<= NATIVE_FILE_MAX_MB, and
-          <= NATIVE_FILE_MAX_PAGES when the page count is known)
-        Everything else — non-PDF types, oversized PDFs, unknown-page scans
-        over the limit, flag off — uses the local extraction path, which is a
-        permanent first-class citizen (it also serves read_document).
+        Two ways to qualify:
+        - PDF: the API renders its pages, so the model sees text + page images.
+        - F32 — a spreadsheet/CSV *when code interpreter is on*: it auto-mounts in the
+          sandbox so the model can actually compute over it. Without this, a 50k-row CSV
+          reaches the model only as truncated extracted text and every "total" it reports is
+          arithmetic done in its head. Gated on the tool being enabled, because mounting a
+          file the model has no sandbox to open is just wasted tokens.
+
+        Either way the file must fit the API request ceilings (<= NATIVE_FILE_MAX_MB, and
+        <= NATIVE_FILE_MAX_PAGES when a page count is known).
+
+        Everything else uses local extraction, which stays a first-class citizen: it runs for
+        native files too (feeding the summary, the schema, and read_document).
         """
         if not config.enable_native_file_input:
             return False
-        if mimetype != "application/pdf":
+        # Resolve the SAME way _build_tools_array does. Reading the global here while the tools
+        # array reads the per-thread override desynchronizes the two: a thread with CI off would
+        # still ship spreadsheet bytes the model has no sandbox to open, and a thread with CI on
+        # under a global default of off would get the tool but not the file it was turned on for.
+        if code_interpreter_enabled is None:
+            code_interpreter_enabled = config.enable_code_interpreter
+        is_pdf = mimetype == "application/pdf"
+        is_mountable_data = (code_interpreter_enabled
+                             and mimetype in CI_MOUNTABLE_MIMETYPES)
+        if not (is_pdf or is_mountable_data):
             return False
         if size_bytes > config.native_file_max_mb * 1024 * 1024:
             return False
@@ -318,7 +347,8 @@ class MessageUtilitiesMixin:
         self,
         message: Message,
         client: BaseClient,
-        thinking_id: Optional[str] = None
+        thinking_id: Optional[str] = None,
+        code_interpreter_enabled: Optional[bool] = None
     ) -> Tuple[List[Dict], List[Dict], List[Dict]]:
         """Process message attachments and extract images/documents from URLs in text
         
@@ -459,7 +489,8 @@ class MessageUtilitiesMixin:
                             # spreadsheet schema, and warms the read_document cache.
                             native = self._native_file_eligible(
                                 mimetype, len(document_data),
-                                extracted_content.get("total_pages"))
+                                extracted_content.get("total_pages"),
+                                code_interpreter_enabled=code_interpreter_enabled)
 
                             if native:
                                 # Model reads the actual PDF this turn (text +
@@ -930,7 +961,8 @@ class MessageUtilitiesMixin:
                           participant_roster: Optional[str] = None,
                           channel_directives: Optional[str] = None,
                           channel_memory: Optional[str] = None,
-                          channel_info: Optional[dict] = None) -> str:
+                          channel_info: Optional[dict] = None,
+                          code_interpreter_enabled: Optional[bool] = None) -> str:
         """Get the appropriate system prompt based on the client platform with user's timezone, name, email, model, web search capability, trimming status, and custom instructions"""
         client_name = client.name.lower()
         
@@ -1051,6 +1083,15 @@ class MessageUtilitiesMixin:
         if config.enable_tool_loop and tool_registry is not None and tool_registry.has_tools():
             local_tools_context = LOCAL_TOOLS_GUIDANCE
 
+        # F32: sandbox/artifact etiquette, included exactly when code_interpreter actually
+        # rides the tools array. The caller resolves that the SAME way _build_tools_array does
+        # (per-thread override, then global) and passes the answer in — deriving it from the
+        # global flag here would promise a sandbox the thread doesn't have, or hand the model
+        # the tool with none of the rules. Static text — safe in the cached prefix.
+        if code_interpreter_enabled is None:
+            code_interpreter_enabled = config.enable_code_interpreter
+        code_interpreter_context = CODE_INTERPRETER_GUIDANCE if code_interpreter_enabled else ""
+
         # Prompt-cache hygiene: the system prompt is the START of every request payload,
         # so anything volatile here busts the OpenAI prefix cache for the whole thread.
         # Only the DATE lives here (one bust per day). The minute-precision time is
@@ -1058,7 +1099,7 @@ class MessageUtilitiesMixin:
         # channel_memory / roster / directives change rarely — acceptable in the prefix.
         time_context = f"\n\nToday's date: {current_time.strftime('%A, %B %d, %Y')} ({timezone_display})\nThe precise current time is provided at the end of the conversation."
 
-        return base_prompt + user_context + model_context + web_search_context + local_tools_context + trimming_context + custom_instructions_context + channel_info_context + channel_directives_context + channel_memory_context + (participant_roster or "") + time_context
+        return base_prompt + user_context + model_context + web_search_context + local_tools_context + code_interpreter_context + trimming_context + custom_instructions_context + channel_info_context + channel_directives_context + channel_memory_context + (participant_roster or "") + time_context
 
     def _build_time_suffix_context(self, user_timezone: str = "UTC",
                                    user_tz_label: Optional[str] = None) -> str:
