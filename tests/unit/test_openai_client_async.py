@@ -121,50 +121,6 @@ class TestAsyncOpenAIClient:
         assert result == "Tool response"
 
     @pytest.mark.asyncio
-    async def test_classify_intent(self, client, mock_async_openai):
-        """Test intent classification"""
-        # Setup mock response
-        mock_content = MagicMock()
-        mock_content.text = "none"
-
-        mock_item = MagicMock()
-        mock_item.content = [mock_content]
-
-        mock_response = MagicMock()
-        mock_response.output = [mock_item]
-
-        client.client.responses.create.return_value = mock_response
-
-        messages = [{"role": "user", "content": "Hello bot"}]
-
-        result = await client.classify_intent(messages, "Hello bot")
-
-        assert result == "text_only"  # "none" gets mapped to "text_only"
-
-    @pytest.mark.asyncio
-    async def test_classify_intent_return_ack_through_facade(self, client, mock_async_openai):
-        """F19 regression: return_ack must be forwarded by the OpenAIClient facade
-        (openai_client/base.py), not just accepted by the api-layer function — the
-        processor calls the facade, and mocked-processor tests can't catch a
-        signature drift here."""
-        mock_content = MagicMock()
-        mock_content.text = "vision ack"
-
-        mock_item = MagicMock()
-        mock_item.content = [mock_content]
-
-        mock_response = MagicMock()
-        mock_response.output = [mock_item]
-
-        client.client.responses.create.return_value = mock_response
-
-        messages = [{"role": "user", "content": "what's in this image?"}]
-
-        result = await client.classify_intent(messages, "what's in this image?", return_ack=True)
-
-        assert result == ("vision", True)
-
-    @pytest.mark.asyncio
     async def test_generate_image(self, client, mock_async_openai):
         """Test image generation"""
         # Setup mock response for enhancement
@@ -215,19 +171,13 @@ class TestAsyncOpenAIClient:
             mock_event.type = "response.done"
             yield mock_event
 
-        # Mock prompt enhancement
-        mock_enhance_content = MagicMock()
-        mock_enhance_content.text = "Enhanced question"
-        mock_enhance_item = MagicMock()
-        mock_enhance_item.content = [mock_enhance_content]
-        mock_enhance_response = MagicMock()
-        mock_enhance_response.output = [mock_enhance_item]
-
-        # First call is enhancement (non-streaming), second is analysis (streaming)
-        client.client.responses.create.side_effect = [
-            mock_enhance_response,  # Enhancement
-            mock_stream()  # Analysis stream
-        ]
+        # ONE call: the analysis stream. analyze_images used to make a utility-model
+        # "enhancement" call first, and this mock used to feed it a response for that. When the
+        # enhancement hop was removed, the leftover first element became what the STREAM LOOP
+        # consumed — and async-iterating a bare MagicMock never terminates, so the loop
+        # accumulated fake deltas until the process died. Never leave a spare side_effect
+        # lying around: an unconsumed mock is not inert, it is the next call's input.
+        client.client.responses.create.side_effect = [mock_stream()]
 
         images = [base64.b64encode(b"fake_image_data").decode()]
 
@@ -245,6 +195,60 @@ class TestAsyncOpenAIClient:
 
         assert result == "This is an image"
         assert chunks == ["This is ", "an image"]
+
+    # --- a vision stream that never ends must not take the process with it -----------------
+    # Regression tests for a real incident. A stale mock left analyze_images async-iterating a
+    # bare MagicMock, which yields delta events forever. `output_text += chunk` on a non-string
+    # does not raise: str.__add__ returns NotImplemented, Python falls back to the mock's
+    # __radd__, and output_text silently BECOMES a mock retaining the previous one. It grew to
+    # 30GB and the kernel OOM-killed the dev box.
+
+    @pytest.mark.asyncio
+    async def test_non_text_delta_ends_the_stream(self, client, mock_async_openai):
+        async def endless_mock_deltas():
+            created = MagicMock()
+            created.type = "response.created"
+            yield created
+            while True:  # exactly what a MagicMock stream looks like from the inside
+                ev = MagicMock()
+                ev.type = "response.output_text.delta"
+                ev.delta = MagicMock()          # NOT a string
+                yield ev
+
+        client.client.responses.create.side_effect = [endless_mock_deltas()]
+
+        # stream_callback is what selects the STREAMING branch — the one with the loop.
+        result = await asyncio.wait_for(
+            client.analyze_images([base64.b64encode(b"x").decode()], "what is this?",
+                                  stream_callback=lambda _c: None),
+            timeout=15)
+
+        # It must terminate, and must not hand back a mock masquerading as text.
+        assert isinstance(result, str)
+
+    @pytest.mark.asyncio
+    async def test_endless_text_stream_is_truncated(self, client, mock_async_openai):
+        from openai_client.api import vision as vision_api
+
+        async def endless_text():
+            created = MagicMock()
+            created.type = "response.created"
+            yield created
+            while True:
+                ev = MagicMock()
+                ev.type = "response.output_text.delta"
+                ev.delta = "x" * 1000
+                yield ev
+
+        client.client.responses.create.side_effect = [endless_text()]
+
+        result = await asyncio.wait_for(
+            client.analyze_images([base64.b64encode(b"x").decode()], "what is this?",
+                                  stream_callback=lambda _c: None),
+            timeout=30)
+
+        assert isinstance(result, str)
+        assert len(result) <= vision_api._MAX_ANALYSIS_CHARS
 
     @pytest.mark.asyncio
     async def test_close(self, client):

@@ -325,11 +325,11 @@ async def test_participation_ignore_never_touches_status_or_indicator():
 # ---------------- sink selection in the text handler ----------------
 
 def test_streaming_handlers_wire_the_shared_native_sink():
-    """Source guard: both streaming handlers must build NativeStreamCoordinator
+    """Source guard: the streaming handler must build NativeStreamCoordinator
     (never a private reimplementation) and never inline marker literals — the
     rebuild merger only recognizes the message_markers shapes (R2 rule)."""
     import pathlib
-    for rel in ("message_processor/handlers/text.py", "message_processor/handlers/vision.py"):
+    for rel in ("message_processor/handlers/text.py",):
         src = pathlib.Path(rel).read_text()
         assert "NativeStreamCoordinator(" in src, f"{rel} lost the native sink wiring"
         assert "Continued in next message" not in src, f"{rel} inlines a marker literal"

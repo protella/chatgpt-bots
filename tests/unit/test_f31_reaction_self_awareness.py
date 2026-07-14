@@ -155,6 +155,7 @@ async def test_verdict_react_path_records_own_reaction(monkeypatch):
     message = SimpleNamespace(
         channel_id="C1", thread_id="100.0", user_id="U9",
         text="Fable limit removed for everyone?",
+        attachments=[],  # real Message defaults this to [] in __post_init__; the gate reads it
         metadata={"ts": "100.0", "participation_level": "judicious"})
 
     result = await bot._run_participation_gate(message, host)

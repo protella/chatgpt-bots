@@ -15,7 +15,9 @@ from message_markers import (
 )
 from streaming import FenceHandler, NativeStreamCoordinator, RateLimitManager, StreamingBuffer
 from tool_registry import ToolContext
-from message_processor.artifacts import collect_container_ids, strip_sandbox_links
+from message_processor import canvas_tools, file_mount, image_catalog, image_tools, thread_files
+from message_processor.artifacts import (collect_container_ids, stream_safe_text, strip_citation_markers,
+                                         strip_sandbox_links)
 from message_processor.containers import AUTO_CONTAINER
 from message_processor.tool_provenance import (strip_provenance_echo,
                                                visible_attribution_tools)
@@ -100,6 +102,15 @@ class TextHandlerMixin:
         request_config = dict(thread_config)
         if expose_no_reply:
             request_config["_unprompted_turn"] = True
+        # Was the bot actually ADDRESSED by a person? A stricter question than "was this turn
+        # unprompted", and a different one: `_unprompted_turn` is set for every channel message
+        # that went through the participation gate, INCLUDING one that called the bot by name.
+        # That is right for no_reply (a named turn may still deserve silence) but wrong for a
+        # destructive tool, which must be available exactly when a human asked for it and
+        # withheld exactly when the model is acting on its own initiative. Being called by name
+        # is prompted in spirit — the same judgment main.py::_is_unprompted_turn already makes.
+        request_config["_addressed_turn"] = (
+            not unprompted or meta.get("participation_name_hit") is True)
         if tools_disabled:
             return None, request_config, False, None
         registry = self._get_tool_registry(client, request_config)
@@ -115,10 +126,13 @@ class TextHandlerMixin:
                                    else NO_REPLY_CONTRACT_SUFFIX)
         return registry, request_config, no_reply_available, no_reply_suffix
 
-    def _build_tool_context(self, message: Message, client: BaseClient) -> ToolContext:
+    def _build_tool_context(self, message: Message, client: BaseClient,
+                            request_config: Optional[dict] = None,
+                            ci_container=None) -> ToolContext:
         """Per-request context handed to local tool executors."""
         meta = message.metadata or {}
         channel_id = message.channel_id
+        cfg = request_config or {}
         return ToolContext(
             channel_id=channel_id,
             thread_ts=message.thread_id,
@@ -129,7 +143,41 @@ class TextHandlerMixin:
             db=self.db,
             is_dm=bool(channel_id and str(channel_id).startswith("D")),
             processor=self,  # F30: start_deep_research reaches openai_client/scheduling/thread_manager
+            # F34: the image tools' hard settings (image_model), the sandbox they may mount
+            # into, and the ids they may edit. container_id is the SAME container already in
+            # the tools array — an image mounted anywhere else is invisible to the model.
+            thread_config=cfg,
+            container_id=ci_container if isinstance(ci_container, str) else None,
+            image_catalog=cfg.get(image_tools.CATALOG_KEY) or [],
+            sandbox_image_assets=[],
+            # F35: what mount_file may pull into the sandbox, and what it actually did.
+            thread_files=cfg.get(file_mount.FILES_KEY) or [],
+            mounted_files=[],
         )
+
+    async def _prepare_sandbox_tools(self, request_config: dict, thread_key: str,
+                                     ci_container, client=None) -> None:
+        """Shape the sandbox-facing tools to THIS turn (F34 images, F35 mount_file).
+
+        Their schemas are factories, and a factory only ever sees thread_config — so the
+        turn-specific facts they need get stashed there: whether there is an addressable
+        sandbox container (no id → create_image_asset and mount_file are not offered, because
+        bytes pushed into an unknown container are invisible to the model), the catalog of
+        images edit_image may name, and the catalog of files mount_file may pull in. Both
+        catalogs become literal enums, so an invented id cannot even be emitted.
+        """
+        request_config[image_tools.CI_CONTAINER_KEY] = (
+            ci_container if isinstance(ci_container, str) else None)
+        request_config[image_tools.CATALOG_KEY] = await image_catalog.build_catalog(
+            self.db, thread_key)
+        request_config[file_mount.FILES_KEY] = await thread_files.build_catalog(
+            self.db, thread_key)
+        # F36: the channel's canvases, so the model knows they EXIST. Without this the only clue
+        # a canvas was there was the word "canvas" in a tool description — so "update our devops
+        # call agenda" had nothing to match, and the model would have had to guess. Cached per
+        # channel (this one is a Slack API call, not a DB read).
+        request_config[canvas_tools.CATALOG_KEY] = await canvas_tools.build_catalog(
+            client, (thread_key or "").split(":")[0])
 
     @staticmethod
     def _is_reaction_only(response_text: str, local_tool_calls: Optional[List[dict]]) -> bool:
@@ -303,6 +351,7 @@ class TextHandlerMixin:
         # carries the per-turn _unprompted_turn flag so no_response_needed is exposed only
         # where it should be; the timeout-retry path already nulled the registry there.
         ci_container = await self._resolve_ci_container(request_config, thread_key)
+        await self._prepare_sandbox_tools(request_config, thread_key, ci_container, client)
         tools = self._build_tools_array(request_config, model,
                                         exclude_mcp_server=failed_mcp_server, registry=registry,
                                         ci_container=ci_container)
@@ -324,7 +373,9 @@ class TextHandlerMixin:
         local_tool_calls = []     # [{"name","ok"}] record of local tool executions
         terminal_action = None    # F2: "no_reply" when the model called no_response_needed
         no_reply_reason = None
-        deep_research_started = False  # F30.1: start_deep_research fired — drop this reply
+        background_job_started = False  # F30.1: start_background_job fired — drop this reply
+        sandbox_assets = []       # F34: images mounted into the sandbox as ingredients
+        mounted_digests = []      # F35: files WE mounted — never publishable back
         usage_info = {}           # response.usage lands here (usage-driven budgeting)
         mcp_discovered = {}       # mcp_list_tools payloads land here (discovery cache)
         mcp_results = []          # F12: completed mcp_call outputs land here (result memory)
@@ -339,8 +390,9 @@ class TextHandlerMixin:
             if tools and registry is not None:
                 # Local tools present — run the function-call loop (composes with
                 # web_search/MCP in the same tools array). Hold the tool_context so we can
-                # read back F30.1's deep_research_started signal after the loop.
-                tool_context = self._build_tool_context(message, client)
+                # read back F30.1's background_job_started signal after the loop.
+                tool_context = self._build_tool_context(message, client, request_config,
+                                                        ci_container)
                 result = await self.openai_client.create_text_response_with_tool_loop(
                     messages=messages_for_api,
                     tools=tools,
@@ -366,7 +418,11 @@ class TextHandlerMixin:
                 local_tool_calls = result["local_tool_calls"]
                 terminal_action = result.get("terminal_action")
                 no_reply_reason = result.get("reason")
-                deep_research_started = bool(getattr(tool_context, "deep_research_started", False))
+                background_job_started = bool(getattr(tool_context, "background_job_started", False))
+                sandbox_assets = list(getattr(tool_context, "sandbox_image_assets", None) or [])
+                # F35: what we PUT INTO the container. The publisher must never post a mounted
+                # input back at the user — not even a byte-identical copy under a new name.
+                mounted_digests = file_mount.mounted_digests(tool_context)
             elif tools:
                 # Generate response with tools
                 if retry_timeout:
@@ -470,7 +526,7 @@ class TextHandlerMixin:
         # Unconditional: a stray sandbox link must never reach the user, even on a turn where
         # we captured no container (the strip is a cheap no-op when there's nothing to strip).
         # Same for a `[used tools: …]` line the model echoed back from its own context.
-        response_text = strip_provenance_echo(strip_sandbox_links(response_text))
+        response_text = strip_provenance_echo(strip_citation_markers(strip_sandbox_links(response_text)))
 
         # Record the API's authoritative context size on the thread
         thread_state.record_usage(usage_info.get("input_tokens", 0),
@@ -480,18 +536,18 @@ class TextHandlerMixin:
         for _label, _tools_payload in mcp_discovered.items():
             self.mcp_manager.cache_discovered_tools_payload(_label, _tools_payload)
 
-        # F30.1: a start_deep_research call succeeded this turn. The live status card the job
+        # F30.1: a start_background_job call succeeded this turn. The live status card the job
         # posts IS the acknowledgment, so DROP the model's ack reply — nothing posts, no footer,
         # no empty assistant turn, no quota burn. Non-streaming never commits text mid-flight,
         # so we suppress unless an EARLIER attempt this turn already exposed text (F8), which we
         # must never retract.
-        if deep_research_started and not visible_already_committed:
-            self.log_info("start_deep_research started — suppressing the turn's ack reply (card owns it)")
+        if background_job_started and not visible_already_committed:
+            self.log_info("start_background_job started — suppressing the turn's ack reply (card owns it)")
             return Response(
                 type="text",
                 content="",
                 metadata={"model": thread_config.get("model"),
-                          "deep_research_started": True, "posted": False},
+                          "background_job_started": True, "posted": False},
             )
 
         # F2: explicit no-reply outcome. Nothing posts, no footer, no empty assistant turn
@@ -534,7 +590,9 @@ class TextHandlerMixin:
                     type="text",
                     content="",
                     metadata={"model": thread_config.get("model"), "posted": False,
-                              "artifact_containers": artifact_containers}
+                              "artifact_containers": artifact_containers,
+                              "sandbox_image_assets": sandbox_assets,
+                          "mounted_digests": mounted_digests}
                 )
             self.log_warning("Empty non-streaming response without a terminal action — posting nothing")
             return Response(
@@ -611,7 +669,9 @@ class TextHandlerMixin:
             content=response_text,
             metadata={"model": thread_config.get("model"),
                       "tool_provenance": tool_provenance,
-                      "artifact_containers": artifact_containers}
+                      "artifact_containers": artifact_containers,
+                          "sandbox_image_assets": sandbox_assets,
+                          "mounted_digests": mounted_digests}
         )
 
     async def _cleanup_silent_stream(self, client, channel_id: str, native_coord,
@@ -824,10 +884,25 @@ class TextHandlerMixin:
         mcp_servers_used = set()
         loop_external_used = []  # web_search/MCP names surfaced by the tool loop (local tools are plumbing, never listed)
 
+        # F34: the 👀 "I'm on it" ack used to ride on the intent classifier's ack bit. With
+        # the classifier gone, the honest signal that this turn is real work is a tool
+        # actually firing — a couple of seconds later than the pre-flight guess, but true
+        # rather than predicted. Fires once, and BEFORE the native-stream guard below (which
+        # returns early once the stream owns the message).
+        ack_placed = False
+
         # Define tool event callback
         async def tool_callback(tool_type: str, status: str):
             """Handle tool events for status updates"""
-            nonlocal progress_task
+            nonlocal progress_task, ack_placed
+
+            if (status == "started" and not ack_placed
+                    and getattr(config, "enable_ack_reaction", True)):
+                ack_placed = True
+                try:
+                    await self._place_ack_reaction(client, message)
+                except Exception as e:  # noqa: BLE001 — an emoji must never break a turn
+                    self.log_debug(f"ack reaction failed: {e}")
 
             # Native mode: once the stream owns the visible message the placeholder is
             # gone — status edits would hit a deleted ts. Log tool activity instead.
@@ -1043,7 +1118,10 @@ class TextHandlerMixin:
                     buffer.add_chunk(text_chunk)
                     if buffer.should_update() and rate_limiter.can_make_request():
                         rate_limiter.record_request_attempt()
-                        cumulative = buffer.get_complete_text()
+                        # A native stream cannot unsend. Strip the dead sandbox links HERE,
+                        # at the append — stripping them at finalize (as we used to) is far
+                        # too late, because the link is already in Slack by then.
+                        cumulative = stream_safe_text(buffer.get_complete_text())
                         ok, overflow = await native_coord.update(cumulative)
                         if overflow is not None:
                             # Part rolled: the just-closed part's visible text was delivered
@@ -1414,6 +1492,7 @@ class TextHandlerMixin:
             # request_config were resolved once above (F2) so no_response_needed is exposed
             # on unprompted streamed turns.
             ci_container = await self._resolve_ci_container(request_config, thread_key)
+            await self._prepare_sandbox_tools(request_config, thread_key, ci_container, client)
             tools = self._build_tools_array(request_config, model,
                                             exclude_mcp_server=exclude_mcp_server, registry=registry,
                                             ci_container=ci_container)
@@ -1427,12 +1506,15 @@ class TextHandlerMixin:
             containers_gone: List[str] = []   # F32 (see _handle_text_response)
             terminal_action = None  # F2: "no_reply" when the loop honored no_response_needed
             no_reply_reason = None
-            deep_research_started = False  # F30.1: start_deep_research fired — drop this reply
+            background_job_started = False  # F30.1: start_background_job fired — drop this reply
+            sandbox_assets = []            # F34: images mounted into the sandbox as ingredients
+            mounted_digests = []       # F35: files WE mounted — never publishable back
             if tools and registry is not None:
                 # Local tools present — streaming function-call loop (intermediate tool
                 # rounds don't stream text; the final round streams normally). Hold the
-                # tool_context so we can read back F30.1's deep_research_started signal.
-                tool_context = self._build_tool_context(message, client)
+                # tool_context so we can read back F30.1's background_job_started signal.
+                tool_context = self._build_tool_context(message, client, request_config,
+                                                        ci_container)
                 loop_result = await self.openai_client.create_streaming_response_with_tool_loop(
                     messages=messages_for_api,
                     tools=tools,
@@ -1459,7 +1541,11 @@ class TextHandlerMixin:
                 local_tool_calls = loop_result["local_tool_calls"]
                 terminal_action = loop_result.get("terminal_action")
                 no_reply_reason = loop_result.get("reason")
-                deep_research_started = bool(getattr(tool_context, "deep_research_started", False))
+                background_job_started = bool(getattr(tool_context, "background_job_started", False))
+                sandbox_assets = list(getattr(tool_context, "sandbox_image_assets", None) or [])
+                # F35: what we PUT INTO the container. The publisher must never post a mounted
+                # input back at the user — not even a byte-identical copy under a new name.
+                mounted_digests = file_mount.mounted_digests(tool_context)
                 # Only EXTERNAL names (web_search/MCP) join the attribution list —
                 # local tool executions are recorded in local_tool_calls, not shown
                 local_names = {c.get("name") for c in local_tool_calls if c.get("name")}
@@ -1510,7 +1596,7 @@ class TextHandlerMixin:
             # not to emit them in the first place.
             await self._drop_dead_containers(containers_gone, thread_key)
             artifact_containers = collect_container_ids(artifacts)
-            response_text = strip_provenance_echo(strip_sandbox_links(response_text))
+            response_text = strip_provenance_echo(strip_citation_markers(strip_sandbox_links(response_text)))
 
             # Record the API's authoritative context size on the thread
             thread_state.record_usage(usage_info.get("input_tokens", 0),
@@ -1557,20 +1643,20 @@ class TextHandlerMixin:
                               "posted": False}
                 )
 
-            # F30.1: start_deep_research succeeded — the live status card the job posts IS the
+            # F30.1: start_background_job succeeded — the live status card the job posts IS the
             # acknowledgment, so DROP this turn's ack reply. Suppress ONLY when nothing visible
             # has streamed yet (a short ack stays buffered until finalize; committed text is
             # never retracted). Runs BEFORE native finalize so any started-but-empty stream is
             # torn down instead of flushed. If preamble already reached Slack, leave it alone.
-            if deep_research_started and not visible_content_delivered:
-                self.log_info("start_deep_research started — suppressing the turn's ack reply (card owns it)")
+            if background_job_started and not visible_content_delivered:
+                self.log_info("start_background_job started — suppressing the turn's ack reply (card owns it)")
                 await self._cleanup_silent_stream(
                     client, message.channel_id, native_coord, message_id, current_message_id,
                     "deep_research")
                 return Response(
                     type="text",
                     content="",
-                    metadata={"streamed": True, "deep_research_started": True,
+                    metadata={"streamed": True, "background_job_started": True,
                               "model": thread_config.get("model"), "posted": False}
                 )
 
@@ -1604,6 +1690,13 @@ class TextHandlerMixin:
             # code_interpreter is filtered out here (internal processing, not a source) but stays
             # in tools_used for the F7 provenance record.
             attribution_tools = visible_attribution_tools(tools_used)
+            # Seeded empty, and every consumer below keys off tools_note ITSELF rather than
+            # re-deriving "was there a footer?" from tools_used. They disagree: a turn whose
+            # only tool is code_interpreter has a non-empty tools_used but NO footer (internal
+            # processing is not a source), and reading tools_note under a tools_used guard
+            # then raised UnboundLocalError and ate the whole reply — which is exactly what a
+            # "compute this and build me a deck" turn does.
+            tools_note = ""
             if (attribution_tools or exclude_mcp_server) and show_attribution:
                 if attribution_tools:
                     # Show successful tools
@@ -1634,7 +1727,7 @@ class TextHandlerMixin:
             native_finalized = False
             footer_blocks = None
             if native_coord is not None and native_coord.started and not native_coord.failed:
-                suffix = tools_note if (tools_used or exclude_mcp_server) else ""
+                suffix = tools_note
                 # Settings chrome ("⚙️ <model>") rides the LAST part of the response
                 # itself (stopStream accepts blocks) instead of a separate trailing
                 # message — every surface: channels open channel settings, DMs open
@@ -1648,7 +1741,11 @@ class TextHandlerMixin:
                         message.channel_id, thread_config.get("model"))
                 # F32: the buffer holds what was streamed, which may still contain the dead
                 # sandbox link — clean the text the finalize actually commits.
-                final_streamed = strip_provenance_echo(strip_sandbox_links(buffer.get_complete_text()))
+                # Same transform as the appends above (see stream_safe_text): the sink tracks
+                # how much RAW text it has sent, so finalize must speak the same language or
+                # its delta lands in the wrong place. `final` releases anything held back
+                # mid-stream that turned out to be innocent.
+                final_streamed = stream_safe_text(buffer.get_complete_text(), final=True)
                 native_finalized = await native_coord.finalize(
                     final_streamed, suffix=suffix, blocks=footer_blocks)
                 current_message_id = native_coord.current_ts or current_message_id
@@ -1685,13 +1782,16 @@ class TextHandlerMixin:
                     # Get the current display text without loading indicator
                     final_part_text = buffer.get_complete_text()
                     if final_part_text:
-                        # Add tools attribution to the final overflow message if tools were used
-                        if (tools_used or exclude_mcp_server) and show_attribution:
-                            if tools_used:
+                        # Add tools attribution to the final overflow message if tools were used.
+                        # attribution_tools, NOT tools_used: this branch was missed when
+                        # code_interpreter became invisible, so an overflowing answer still
+                        # footed "Tools Used: code_interpreter".
+                        if (attribution_tools or exclude_mcp_server) and show_attribution:
+                            if attribution_tools:
                                 if exclude_mcp_server:
-                                    tools_note = f"\n\n_Tools Used: {', '.join(tools_used)} (failed: {exclude_mcp_display})_"
+                                    tools_note = f"\n\n_Tools Used: {', '.join(attribution_tools)} (failed: {exclude_mcp_display})_"
                                 else:
-                                    tools_note = f"\n\n_Tools Used: {', '.join(tools_used)}_"
+                                    tools_note = f"\n\n_Tools Used: {', '.join(attribution_tools)}_"
                             else:
                                 tools_note = f"\n\n_MCP server '{exclude_mcp_display}' could not be reached. Response generated without external tools._"
                             final_part_text = final_part_text + tools_note
@@ -1730,7 +1830,7 @@ class TextHandlerMixin:
                     if response_text != buffer.last_sent_text:
                         # Calculate if mismatch is just from tools attribution being added
                         char_difference = len(response_text) - len(buffer.last_sent_text)
-                        expected_attribution_length = len(tools_note) if (tools_used or exclude_mcp_server) else 0
+                        expected_attribution_length = len(tools_note)
 
                         # Allow ±5 char tolerance for minor formatting differences
                         is_attribution_only = abs(char_difference - expected_attribution_length) <= 5
@@ -1865,7 +1965,9 @@ class TextHandlerMixin:
                           "posted": bool(delivered_ts and (response_text or "").strip()),
                           "model": thread_config.get("model"),
                           # F32: main.py uploads these after the reply lands.
-                          "artifact_containers": artifact_containers}
+                          "artifact_containers": artifact_containers,
+                          "sandbox_image_assets": sandbox_assets,
+                          "mounted_digests": mounted_digests}
             )
 
         except Exception as e:

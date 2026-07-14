@@ -259,8 +259,12 @@ def test_registry_gating_on_enable_channel_memory():
                 registry = SlackBot._build_tool_registry(bot)
         return {s["name"] for s in registry.schemas()}
 
-    assert {"remember_fact", "update_fact", "forget_fact"} <= build(True)
-    assert build(False) == set()
+    # Assert about the memory tools themselves, not the whole registry: tools registered
+    # unconditionally by other features (F34's generate_image) are legitimately present in
+    # both builds and say nothing about this gate.
+    memory_tools = {"remember_fact", "update_fact", "forget_fact"}
+    assert memory_tools <= build(True)
+    assert memory_tools.isdisjoint(build(False))
 
 
 # --- ToolContext plumbing + guidance ---

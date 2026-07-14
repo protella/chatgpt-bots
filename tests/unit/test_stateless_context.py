@@ -17,13 +17,12 @@ from base_client import Message
 from config import config
 from message_processor.thread_management import ThreadManagementMixin
 from message_processor.utilities import MessageUtilitiesMixin
-from message_processor.handlers.vision import VisionHandlerMixin
 from thread_manager import AsyncThreadStateManager, ThreadState
 
 
 # --------------------------------------------------------------------------- harness
 
-class _Proc(ThreadManagementMixin, VisionHandlerMixin, MessageUtilitiesMixin):
+class _Proc(ThreadManagementMixin, MessageUtilitiesMixin):
     """Minimal processor binding the real mixins."""
 
     def __init__(self, db=None, openai_client=None):

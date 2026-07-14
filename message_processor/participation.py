@@ -252,6 +252,7 @@ class ParticipationEngine:
                        name_hit: bool = False,
                        sender_is_bot: bool = False,
                        channel_topic: Optional[str] = None,
+                       channel_canvases: Optional[List[str]] = None,
                        channel_people: Optional[str] = None,
                        capabilities: Optional[str] = None,
                        attachments: Optional[str] = None,
@@ -311,6 +312,10 @@ class ParticipationEngine:
             "name_hit": bool(name_hit),
             "sender_is_bot": bool(sender_is_bot),
             "channel_topic": channel_topic,
+            # F36: the gate never sees tool schemas, so without this a passive
+            # "we should update the devops agenda" reads as idle chatter and it
+            # stays silent — the main model never gets a turn to notice the canvas.
+            "channel_canvases": channel_canvases,
             "channel_people": channel_people,
             "capabilities": capabilities,
             "attachments": attachments,

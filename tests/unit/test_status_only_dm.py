@@ -278,37 +278,11 @@ async def test_unprompted_turn_streams_after_f2_revision(monkeypatch):
     host._handle_streaming_text_response.assert_awaited_once()
 
 
-# ---------------- vision gate parity ----------------
-
-def test_vision_gates_stay_in_sync():
-    """The vision streaming gate and its 'streamed' metadata gate must use the
-    same condition — source-level check to prevent double-posting drift."""
-    import inspect
-    from message_processor.handlers import vision
-    src = inspect.getsource(vision)
-    assert src.count("thinking_id is not None or native_capable") >= 2, (
-        "vision.py's streaming gate and streamed-metadata gate must both use "
-        "(thinking_id is not None or native_capable)"
-    )
-
-
-# ---------------- image handlers: never store a None status id ----------------
-
-def test_image_handlers_guard_status_message_id():
-    import inspect
-    from message_processor.handlers import image_gen, image_edit
-    for mod in (image_gen, image_edit):
-        src = inspect.getsource(mod)
-        for i, line in enumerate(src.splitlines()):
-            if 'response_metadata["status_message_id"]' in line and "=" in line.split("status_message_id")[1]:
-                window = "\n".join(src.splitlines()[max(0, i - 2):i])
-                assert (
-                    "if generating_id" in window
-                    or "if editing_id" in window
-                    or "if checklist.message_id" in window
-                ), (
-                    f"{mod.__name__}: status_message_id stored without a None guard"
-                )
+# The vision-gate-parity and image-handler status-id guards are gone with the handlers they
+# introspected. Both hazards are now structural rather than untested: the vision/image_edit
+# modules no longer exist, text.py derives its streaming decision from a SINGLE
+# `(thinking_id is not None or native_capable)` gate (so two gates cannot drift apart), and
+# no production code writes response_metadata["status_message_id"] at all.
 
 
 # --------------------------------------------------------------------------- status text sanitization

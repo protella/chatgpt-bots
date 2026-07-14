@@ -160,7 +160,7 @@ class TestLogSessionEnd:
 class TestLoggerIntegration:
     """Integration tests for logger functionality"""
     
-    def test_logger_output_format(self, caplog):
+    def test_logger_output_format(self):
         """Test actual logger output format"""
         # Our custom logger uses its own handlers, we need to check those
         # instead of relying on caplog which doesn't capture custom handlers
@@ -177,7 +177,7 @@ class TestLoggerIntegration:
         except Exception as e:
             pytest.fail(f"Logger failed to log: {e}")
     
-    def test_logger_levels(self, caplog):
+    def test_logger_levels(self):
         """Test different logging levels"""
         logger = setup_logger("level_test", level="DEBUG")
         
@@ -195,7 +195,7 @@ class TestLoggerIntegration:
         # Verify logger level is set correctly
         assert logger.level == logging.DEBUG
     
-    def test_session_lifecycle(self, caplog):
+    def test_session_lifecycle(self):
         """Test complete session lifecycle logging"""
         # Test that session lifecycle functions work without errors
         try:

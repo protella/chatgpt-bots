@@ -1,7 +1,6 @@
 """
 Unit tests for thread_manager.py module
 """
-import time
 from unittest.mock import MagicMock
 from thread_manager import ThreadState, AssetLedger
 
@@ -87,65 +86,9 @@ class TestAssetLedger:
         assert ledger.thread_ts == "123.456"
         assert ledger.images == []
     
-    def test_add_image_without_db(self):
-        """Test adding image without database"""
-        ledger = AssetLedger(thread_ts="123.456")
-        ledger.add_image(
-            image_data="base64data",
-            prompt="A beautiful sunset",
-            timestamp=time.time(),
-            slack_url="https://slack.com/image.png"
-        )
-        
-        assert len(ledger.images) == 1
-        assert ledger.images[0]["data"] == "base64data"
-        assert ledger.images[0]["prompt"] == "A beautiful sunset"[:100]
-        assert ledger.images[0]["slack_url"] == "https://slack.com/image.png"
-        assert ledger.images[0]["source"] == "generated"
-    
-    def test_add_image_with_db(self):
-        """Test adding image with database"""
-        mock_db = MagicMock()
-        ledger = AssetLedger(thread_ts="123.456")
-        
-        ledger.add_image(
-            image_data="base64data",
-            prompt="Test prompt",
-            timestamp=time.time(),
-            slack_url="https://slack.com/image.png",
-            db=mock_db,
-            thread_id="C123:123.456",
-            analysis="Image contains a cat"
-        )
-        
-        # With DB, base64 should not be stored in memory
-        assert ledger.images[0]["data"] is None
-        assert ledger.images[0]["prompt"] == "Test prompt"  # Full prompt with DB
-        
-        mock_db.save_image_metadata.assert_called_once()
-    
-    def test_add_url_image(self):
-        """Test adding URL image"""
-        ledger = AssetLedger(thread_ts="123.456")
-        ledger.add_url_image(
-            image_data="base64data",
-            url="https://example.com/image.jpg",
-            timestamp=time.time()
-        )
-        
-        assert len(ledger.images) == 1
-        assert ledger.images[0]["source"] == "url"
-        assert ledger.images[0]["original_url"] == "https://example.com/image.jpg"
-    
-    def test_get_recent_images(self):
-        """Test getting recent images"""
-        ledger = AssetLedger(thread_ts="123.456")
-        
-        for i in range(10):
-            ledger.add_image(f"data{i}", f"prompt{i}", time.time())
-        
-        recent = ledger.get_recent_images(count=3)
-        assert len(recent) == 3
-        assert recent[0]["prompt"] == "prompt7"[:100]
+    # The add_image/add_url_image/get_recent_images writers were removed with the vision and
+    # image-edit handlers. Rows are now appended by the delivery seam
+    # (message_processor/image_delivery.py::publish_image), which is covered — including the
+    # "no base64 in the row" invariant — in test_background_image_gen.py.
 
 

@@ -3,7 +3,30 @@ from __future__ import annotations
 import time
 from typing import Optional
 
+from config import config
 from message_processor.progress import ProgressChecklist
+
+# Longest enhanced prompt we'll put under an image. It is a caption, not an essay.
+_CAPTION_CHARS = 700
+
+
+def _enhanced_prompt_caption(image_data, prompt: str) -> str:
+    """The enhanced prompt, as the image's caption — only when SHOW_ENHANCED_PROMPT is on.
+
+    Enhancement always RUNS (it is most of what makes the picture good); this only controls
+    whether the user has to look at it. It used to be shown unconditionally, as its own noisy
+    block above every image, which is why the default here is off.
+    """
+    if not config.show_enhanced_prompt:
+        return ""
+    enhanced = (getattr(image_data, "prompt", "") or "").strip()
+    # Nothing to show if the enhancer was a no-op — repeating the user's own words back at
+    # them is not a feature.
+    if not enhanced or enhanced == (prompt or "").strip():
+        return ""
+    if len(enhanced) > _CAPTION_CHARS:
+        enhanced = enhanced[:_CAPTION_CHARS].rstrip() + "…"
+    return f"_Enhanced prompt: {enhanced}_"
 
 
 async def publish_image(
@@ -53,7 +76,7 @@ async def publish_image(
             thread_id,
             image_data.to_bytes(),
             f"generated_image.{image_data.format}",
-            "",
+            _enhanced_prompt_caption(image_data, prompt),
         )
     except Exception as e:  # noqa: BLE001
         processor.log_error(f"Image upload failed for {thread_key}: {e}", exc_info=True)

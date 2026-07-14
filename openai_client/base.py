@@ -76,7 +76,7 @@ class OpenAIClient(LoggerMixin):
             # All text operations - use streaming chunk timeout from config
             "text_with_tools": config.api_timeout_streaming_chunk,      # Use configured timeout
             "text_normal": config.api_timeout_streaming_chunk,          # Use configured timeout
-            "intent_classification": config.api_timeout_streaming_chunk, # Use configured timeout
+            "utility_call": config.api_timeout_streaming_chunk,          # Utility-model hops
             "prompt_enhancement": config.api_timeout_streaming_chunk,    # Use configured timeout
 
             # Streaming operations
@@ -455,23 +455,6 @@ class OpenAIClient(LoggerMixin):
             **params,
         )
 
-    async def classify_intent(
-        self,
-        messages: List[Dict[str, Any]],
-        last_user_message: str,
-        has_attached_images: bool = False,
-        max_retries: int = 2,
-        return_ack: bool = False,
-    ):
-        return await responses_api.classify_intent(
-            self,
-            messages=messages,
-            last_user_message=last_user_message,
-            has_attached_images=has_attached_images,
-            max_retries=max_retries,
-            return_ack=return_ack,
-        )
-
     async def classify_wake(
         self,
         text: str,
@@ -600,33 +583,24 @@ class OpenAIClient(LoggerMixin):
             stream_callback=stream_callback,
         )
 
-    async def _enhance_vision_prompt(
-        self,
-        user_question: str,
-        conversation_history: Optional[List[Dict[str, Any]]] = None,
-    ) -> str:
-        return await vision_api._enhance_vision_prompt(
-            self,
-            user_question=user_question,
-            conversation_history=conversation_history,
-        )
-
     async def analyze_images(
         self,
         images: List[str],
         question: str,
         detail: Optional[str] = None,
-        enhance_prompt: bool = True,
+        enhance_prompt: bool = False,
         conversation_history: Optional[List[Dict[str, Any]]] = None,
         system_prompt: Optional[str] = None,
         stream_callback: Optional[Callable[[str], None]] = None,
     ) -> str:
+        # enhance_prompt is vestigial: the utility-model rewrite hop it used to gate is gone
+        # (the only caller, image_catalog, always passed False). Kept solely so that explicit
+        # `enhance_prompt=False` keyword keeps binding; drop it there and here together.
         return await vision_api.analyze_images(
             self,
             images=images,
             question=question,
             detail=detail,
-            enhance_prompt=enhance_prompt,
             conversation_history=conversation_history,
             system_prompt=system_prompt,
             stream_callback=stream_callback,
@@ -663,19 +637,6 @@ class OpenAIClient(LoggerMixin):
             output_compression=output_compression,
             enhance_prompt=enhance_prompt,
             conversation_history=conversation_history,
-        )
-
-    async def analyze_image(
-        self,
-        image_data: str,
-        question: str,
-        detail: Optional[str] = None,
-    ) -> str:
-        return await vision_api.analyze_image(
-            self,
-            image_data=image_data,
-            question=question,
-            detail=detail,
         )
 
     async def _create_text_response_with_timeout(
