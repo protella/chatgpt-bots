@@ -570,9 +570,23 @@ class TestStreamingFunctionCallEvents:
 def _react_self():
     s = MagicMock()
     s.react = AsyncMock(return_value=True)
+
+    # F38: the guard now calls _react_add (which reports whether THIS call actually added
+    # the reaction, vs Slack's already_reacted). Delegate to the `react` stub these tests
+    # drive, treating a successful add as genuinely ours — the already_reacted case gets
+    # its own explicit coverage in test_ack_lifecycle.py.
+    async def _react_add(channel_id, ts, emoji):
+        ok = await s.react(channel_id, ts, emoji)
+        return ok, ok
+    s._react_add = _react_add
     s.get_react_tool_schema = SlackMessagingMixin.get_react_tool_schema.__get__(s)
     s.execute_react_tool = SlackMessagingMixin.execute_react_tool.__get__(s)
     s._reserve_and_react = SlackMessagingMixin._reserve_and_react.__get__(s)
+    s._reserve_and_react_owned = SlackMessagingMixin._reserve_and_react_owned.__get__(s)
+    s._reserve_once = SlackMessagingMixin._reserve_once.__get__(s)
+    s.settle_reaction_lease = SlackMessagingMixin.settle_reaction_lease.__get__(s)
+    s._is_committed = SlackMessagingMixin._is_committed
+    s._REMOVING = SlackMessagingMixin._REMOVING
     s._trim_reaction_guard = SlackMessagingMixin._trim_reaction_guard.__get__(s)
     s._REACTION_GUARD_MAX = SlackMessagingMixin._REACTION_GUARD_MAX
     s._REACTION_GUARD_RECENCY_S = SlackMessagingMixin._REACTION_GUARD_RECENCY_S

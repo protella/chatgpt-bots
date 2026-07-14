@@ -65,6 +65,15 @@ class ToolContext:
     # publisher can refuse to post a user's own file back at them, even byte-copied.
     thread_files: Optional[List[Dict[str, Any]]] = None
     mounted_files: Optional[List[Dict[str, Any]]] = None
+    # F38: the turn's presentation + work-claim state (message_processor.turn_runtime).
+    # A slow local tool calls `await ctx.turn.claim_work(ctx.client, ctx.message)` once its
+    # arguments and capacity checks have PASSED and immediately before the slow part starts —
+    # never on entry, or a rejected call would flash a 👀 it is about to retract. A tool that
+    # posts its own surface (a background job's card, a detached image) sets
+    # `ctx.turn.visible_action_committed = True` so the turn counts as having produced output
+    # even though its Response carries no text.
+    turn: Any = None
+    message: Any = None
 
 
 Executor = Callable[[ToolContext, Dict[str, Any]], Awaitable[Dict[str, Any]]]

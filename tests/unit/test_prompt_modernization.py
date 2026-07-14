@@ -7,9 +7,8 @@ made image work a set of TOOLS, so nothing pre-routes a turn any more.)
 """
 import asyncio
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
-from config import config
 from message_processor.utilities import MessageUtilitiesMixin
 from prompts import (
     PARTICIPATION_SYSTEM_PROMPT,
@@ -84,43 +83,11 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-# ------------------------------------------------- F19 ack reaction
-
-def _ack_msg():
-    from base_client import Message
-    return Message(text="analyze this deck", user_id="U1", channel_id="C1",
-                   thread_id="99.0", metadata={"ts": "99.0"})
-
-
-def test_place_ack_reaction_uses_reservation_guard(monkeypatch):
-    """The ack routes through the F6 reservation guard on the triggering ts."""
-    monkeypatch.setattr(config, "ack_reaction_emoji", "eyes", raising=False)
-    proc = _Proc()
-    client = MagicMock()
-    client._reserve_and_react = AsyncMock(return_value={"ok": True})
-    client.react = AsyncMock()
-    _run(proc._place_ack_reaction(client, _ack_msg()))
-    client._reserve_and_react.assert_awaited_once_with("C1", "99.0", "eyes")
-    client.react.assert_not_awaited()
-
-
-def test_place_ack_reaction_falls_back_to_react(monkeypatch):
-    """A client without the guard still gets the reaction via plain react()."""
-    monkeypatch.setattr(config, "ack_reaction_emoji", "hourglass", raising=False)
-    proc = _Proc()
-    client = MagicMock(spec=["react"])
-    client.react = AsyncMock()
-    _run(proc._place_ack_reaction(client, _ack_msg()))
-    client.react.assert_awaited_once_with("C1", "99.0", "hourglass")
-
-
-def test_place_ack_reaction_is_silent_on_failure(monkeypatch):
-    """A wedged/failing Slack call never propagates — the turn continues."""
-    monkeypatch.setattr(config, "ack_reaction_emoji", "eyes", raising=False)
-    proc = _Proc()
-    client = MagicMock()
-    client._reserve_and_react = AsyncMock(side_effect=RuntimeError("slack down"))
-    _run(proc._place_ack_reaction(client, _ack_msg()))  # does not raise
+# F38: `_place_ack_reaction` is gone, and with it the tests that pinned it. It fired on the
+# first tool EVENT — before a call's arguments were validated, and for fast lookups that were
+# over before the eye rendered. The work claim now lives on TurnRuntime (see
+# tests/unit/test_ack_lifecycle.py): staked only by work that is slow and really happening,
+# and taken back if that work produces nothing.
 
 
 # ------------------------------------------------- new guidance present

@@ -260,16 +260,22 @@ class ChannelPulse:
             channel_id, ts=ts, thread_ts=thread_ts, user_id=None,
             display_name=display_name, sender_type="self", text=text or "", is_bot=True)
 
-    def record_own_reaction(self, channel_id: str, *, message_ts: str, emoji: str) -> None:
+    def record_own_reaction(self, channel_id: str, *, message_ts: str,
+                            emoji: str) -> Optional[dict]:
         """F31: record a reaction the BOT ITSELF just placed as a synthetic self-entry, so
         both the channel envelope and the per-thread classifier tails show the bot's own
-        reactions ("did you react to that?" becomes answerable from context). Verdict-,
-        ack-, and tool-path reactions all commit through _reserve_and_react — the single
-        choke point that calls this on a successful add. DMs are excluded (record() already
-        excludes them). Idempotent by construction: a fresh wall-clock ts avoids collisions,
-        so a re-add that never actually commits never reaches here."""
+        reactions ("did you react to that?" becomes answerable from context). Verdict- and
+        tool-path reactions all commit through _reserve_and_react — the single choke point
+        that calls this on a successful add. DMs are excluded (record() already excludes
+        them). Idempotent by construction: a fresh wall-clock ts avoids collisions, so a
+        re-add that never actually commits never reaches here.
+
+        Returns a RECEIPT (or None when nothing was recorded) naming the exact synthetic
+        entry. F38: a work-claim 👀 that the turn later takes back must take its history
+        entry back too — leave it and the classifier reads a phantom reaction on the next
+        message and reasons from a thing that is no longer on screen."""
         if not channel_id or self._is_dm(channel_id) or not message_ts:
-            return
+            return None
         display_name = (config.bot_name_aliases or ["bot"])[0]
         shorthand = self._norm_reaction(emoji)
         # Look up the target message in the ring to build an attribution excerpt; if it's
@@ -306,6 +312,48 @@ class ChannelPulse:
         self.record(
             channel_id, ts=synth_ts, thread_ts=thread_ts, user_id=None,
             display_name=display_name, sender_type="self", text=text, is_bot=True)
+        # record() normalizes a root's thread_ts to None but files the tail under the root
+        # itself — mirror that here so the receipt names the ring the entry actually landed in.
+        return {"channel_id": channel_id, "synth_ts": synth_ts,
+                "root_ts": thread_ts or synth_ts}
+
+    def remove_own_reaction(self, receipt: Optional[dict]) -> bool:
+        """F38: the exact inverse of record_own_reaction — drop the synthetic entry named by
+        `receipt` from the channel ring, the thread tail, and the dedup window.
+
+        NOT the same thing as `remove_reaction()`, which only decrements the social-proof
+        COUNT for a reaction someone else's `reaction_removed` event took off. This removes
+        the bot's own synthetic *history* entry. Calling both here would double-count: Slack
+        still delivers `reaction_removed` for our own removal, and that event owns the count.
+        Best-effort and idempotent; never raises."""
+        if not receipt:
+            return False
+        channel_id = receipt.get("channel_id")
+        synth_ts = receipt.get("synth_ts")
+        root_ts = receipt.get("root_ts")
+        if not channel_id or not synth_ts:
+            return False
+        removed = False
+        buf = self._buffers.get(channel_id)
+        if buf is not None:
+            kept = [e for e in buf if e.get("ts") != synth_ts]
+            if len(kept) != len(buf):
+                buf.clear()
+                buf.extend(kept)
+                removed = True
+        chan_tails = self._thread_tails.get(channel_id)
+        dq = chan_tails.get(root_ts) if chan_tails is not None else None
+        if dq is not None:
+            kept_tail = [e for e in dq if e.get("ts") != synth_ts]
+            if len(kept_tail) != len(dq):
+                dq.clear()
+                dq.extend(kept_tail)
+                removed = True
+        # Free the dedup slot too, or a later entry reusing this ts would be silently dropped.
+        seen = self._seen_ts.get(channel_id)
+        if seen is not None:
+            seen.pop(synth_ts, None)
+        return removed
 
     async def ensure_backfill(self, channel_id: str, client, bot) -> None:
         """Seed the ring with ONE conversations.history call, once per channel

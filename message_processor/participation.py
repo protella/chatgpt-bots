@@ -123,11 +123,11 @@ class ParticipationVerdict:
     emoji: Optional[str] = None
     placement: str = "thread"
     reason: str = ""
-    # F19: "I'm looking at it" acknowledgment. Meaningful only with action="respond" —
-    # set when the reply is worth giving AND implies real work (attachments, data/MCP
-    # lookups, multi-step tools, long-form output). The gate drops ACK_REACTION_EMOJI on
-    # the triggering message before dispatching. Coerced safely (absent/malformed → False).
-    ack: bool = False
+    # F38: the `ack` bit is GONE. The classifier used to predict "this reply implies real
+    # work" and the gate dropped a 👀 on the strength of that guess — before the model had
+    # done anything, and often wrongly (it acked a passing comment). The 👀 is now staked by
+    # the work itself, when a slow tool actually starts, and retracted if the work produces
+    # nothing. A classifier cannot know that in advance, so it no longer tries.
     # F27: earlier messages from the SAME sender that this survivor carries forward, so its
     # single reply covers the whole same-author burst. Oldest-first, newest 3 at most.
     # Attached by evaluate() after validate_verdict returns (validate_verdict stays pure).
@@ -358,10 +358,9 @@ class ParticipationEngine:
         placement = str(raw.get("placement") or "thread").strip().lower()
         if placement not in VALID_PLACEMENTS:
             placement = "thread"
-        # F19: coerce ack to a plain bool (absent/malformed → False); only respond turns
-        # carry it — a react/ignore/backoff verdict never acks.
-        ack = action == "respond" and raw.get("ack") is True
+        # F38: an `ack` key from a stale prompt (or a model that remembers the old contract)
+        # is simply ignored — the field is gone from the verdict.
         return ParticipationVerdict(
             action=action, emoji=emoji, placement=placement,
-            reason=str(raw.get("reason") or "")[:300], ack=ack,
+            reason=str(raw.get("reason") or "")[:300],
         )
