@@ -313,6 +313,13 @@ async def execute_generate_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
 
     settings, rejected, effective_cfg = _effective_config(ctx.thread_config, args.get("overrides"))
 
+    # F38: arguments are valid and there is capacity — the image IS going to be made. Stake
+    # the 👀 now, after the rejections above, so a bad call or a full queue never flashes an
+    # eye it has to take back.
+    turn = getattr(ctx, "turn", None)
+    if turn is not None:
+        await turn.claim_work(client, getattr(ctx, "message", None))
+
     from message_processor.progress import ProgressChecklist
     # prefer_message=True is NOT the config default, and is forced here on purpose: this job is
     # DETACHED. Slack's assistant-status surface auto-clears the moment the turn's reply posts,
@@ -359,6 +366,11 @@ async def execute_generate_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
         logger.warning(f"Failed to mark upload started for {thread_key}: {e}")
 
     ctx.image_generation_started = True
+    # F38: the image posts itself into the thread — this turn HAS produced output, even
+    # though its Response carries no text. Without this the end-of-turn settle would read the
+    # empty reply as silence and retract the 👀 while the picture was still on its way.
+    if turn is not None:
+        turn.visible_action_committed = True
     logger.info(f"Detached image generation {generation_id} for {thread_key} "
                 f"(model={settings['model']} size={settings['size']})")
 
@@ -415,6 +427,11 @@ async def execute_create_image_asset(ctx, args: Dict[str, Any]) -> Dict[str, Any
 
     settings, rejected, _ = _effective_config(ctx.thread_config, args.get("overrides"))
     filename = _safe_filename(args.get("filename") or "image", settings["format"])
+
+    # F38: validated and under the per-turn cap — an image model is about to run. Claim.
+    turn = getattr(ctx, "turn", None)
+    if turn is not None:
+        await turn.claim_work(getattr(ctx, "client", None), getattr(ctx, "message", None))
 
     try:
         async with _semaphore():
@@ -525,6 +542,11 @@ async def execute_edit_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
     thread_key = _thread_key(ctx)
     settings, rejected, _ = _effective_config(ctx.thread_config, args.get("overrides"))
 
+    # F38: every source id resolved — downloads and an image-model edit are about to run.
+    turn = getattr(ctx, "turn", None)
+    if turn is not None:
+        await turn.claim_work(client, getattr(ctx, "message", None))
+
     # Download the sources from Slack. They are never held on disk — bytes in, bytes out.
     b64_images: List[str] = []
     for entry in resolved:
@@ -581,6 +603,12 @@ async def execute_edit_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
     )
     if not file_url:
         return _err("post_failed", "The edited image was created but could not be posted.")
+
+    # F38: the edited image is IN the thread now. If the model then returns empty text (or the
+    # turn ends abnormally) the settle would otherwise read that as silence and retract the 👀
+    # from a turn that visibly delivered a picture.
+    if turn is not None:
+        turn.visible_action_committed = True
 
     processor.thread_manager.mark_needs_refresh(thread_key)
     logger.info(f"Edited image posted for {thread_key} from {[e['image_id'] for e in resolved]}")

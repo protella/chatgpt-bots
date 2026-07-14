@@ -182,6 +182,13 @@ async def execute_mount_file(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str
                 "already_mounted": True,
                 "message": "Already in the sandbox from earlier — open it from this path."}
 
+    # F38: past every rejection AND past the cache hit above (which returns in microseconds) —
+    # a real Slack download plus a container upload is about to happen. This is the honest
+    # moment to stake the 👀.
+    turn = getattr(ctx, "turn", None)
+    if turn is not None:
+        await turn.claim_work(client, getattr(ctx, "message", None))
+
     data = await _download(client, entry)
     if not data:
         return _err("file_unavailable",

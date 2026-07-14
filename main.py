@@ -14,6 +14,7 @@ from message_processor.base import MessageProcessor
 from message_processor.participation import (ParticipationEngine,
                                              render_capabilities_line)
 from message_processor.people_tools import format_people_summary
+from message_processor.turn_runtime import TurnRuntime
 from message_processor import thread_files
 from base_client import BaseClient, Message
 
@@ -225,26 +226,13 @@ class ChatBotV2:
                 await self._apply_backoff(message, client)
                 return None
             if verdict.action == "respond":
-                # F19: on a respond+ack verdict, drop the "I'm looking at it" reaction on
-                # the triggering message BEFORE dispatching the turn — the classifier judged
-                # the reply implies real work. Purely additive (no accounting), through the
-                # F6 reservation guard, fails silent. Only respond verdicts ever ack.
-                if verdict.ack and getattr(config, "enable_ack_reaction", True):
-                    ack_ts = message.metadata.get("ts") or message.thread_id
-                    if ack_ts:
-                        try:
-                            if hasattr(client, "_reserve_and_react"):
-                                await asyncio.wait_for(
-                                    client._reserve_and_react(channel_id, ack_ts, config.ack_reaction_emoji),
-                                    timeout=config.tool_call_timeout)
-                            elif hasattr(client, "react"):
-                                await asyncio.wait_for(
-                                    client.react(channel_id, ack_ts, config.ack_reaction_emoji),
-                                    timeout=config.tool_call_timeout)
-                        except asyncio.TimeoutError:
-                            main_logger.debug("Ack reaction timed out")
-                        except Exception as e:
-                            main_logger.debug(f"Ack reaction failed: {e}")
+                # F38: the gate no longer acks. It used to drop a 👀 here on a respond+ack
+                # verdict, but that reaction was a PREDICTION that work was coming — made
+                # before the model had done anything, and demonstrably overeager (it acked
+                # "Never tried this. Not sure how it will turn out", a passing comment). A
+                # teammate who drops eyes and then does nothing is misleading. The 👀 is now
+                # a CLAIM ON WORK, staked by TurnRuntime.claim_work when a tool actually
+                # starts doing something slow, and taken back if that work produces nothing.
                 return verdict
             return None  # ignore
         except Exception as e:
@@ -319,8 +307,38 @@ class ChatBotV2:
             return "this conversation"
         return (cleaned[:80] + "…") if len(cleaned) > 80 else cleaned
 
+    @staticmethod
+    def _produced_visible_output(response, turn) -> bool:
+        """F38: did this turn actually do the thing the 👀 claimed?
+
+        The claim is honored by anything the user can SEE: text that went out, a deliberate
+        response reaction, or a tool that owns its own surface (a background job's status
+        card, a detached image). It is NOT honored by silence, by an error notice, or by a
+        turn that got queued behind another — in all three the bot claimed work and then
+        produced none of it, so the eye comes back off."""
+        if turn is not None and turn.visible_action_committed:
+            return True   # a detached producer (image gen / background job) owns a surface
+        if response is None or response.type in ("error", "queued"):
+            return False
+        meta = response.metadata or {}
+        if meta.get("interrupted"):
+            # The turn died partway through and all that reached the thread was an apology
+            # for dying. It claimed work and delivered none of it — `posted` is True only
+            # because a Slack surface exists to carry the notice.
+            return False
+        if meta.get("terminal_action") == "no_reply":
+            # The one sibling a no-reply turn may have: a reaction that IS the answer.
+            return bool(meta.get("response_reaction_committed"))
+        if meta.get("reaction_only") or meta.get("background_job_started"):
+            return True
+        posted = meta.get("posted")
+        if posted is None:  # non-streaming handlers can't know; derive from the outcome
+            posted = bool(response.type == "text"
+                          and (meta.get("streamed") or (response.content or "").strip()))
+        return bool(posted)
+
     async def _rescue_sandbox_images(self, response, client: BaseClient, message: Message,
-                                     post_thread_id: str) -> None:
+                                     post_thread_id: str) -> int:
         """Post images the model made as sandbox ingredients but never turned into anything.
 
         create_image_asset deliberately does not publish: its image is a component of some
@@ -328,15 +346,19 @@ class ChatBotV2:
         ingredient alongside the finished thing would be noise. But if the turn published
         NOTHING, the model generated images and then failed to use them — and the container
         they live in is gone within 20 minutes. Handing them over beats losing them silently.
+
+        Returns the number of images that actually reached the thread (F38: a rescued image
+        IS visible output, so a turn that delivered one has honored its 👀).
         """
         assets = (response.metadata or {}).get("sandbox_image_assets") or []
         if not assets:
-            return
+            return 0
         from message_processor.image_delivery import publish_image
         main_logger.warning(
             f"Turn published no artifacts but created {len(assets)} sandbox image(s) — "
             "posting them directly rather than letting them die with the container")
         thread_key = f"{message.channel_id}:{message.thread_id}"
+        posted = 0
         for asset in assets:
             image_data = asset.get("image_data")
             if image_data is None:
@@ -351,8 +373,10 @@ class ChatBotV2:
                     thread_manager=self.processor.thread_manager, unprompted=False,
                     message_ts=(message.metadata or {}).get("ts"),
                 )
+                posted += 1
             except Exception as e:
                 main_logger.error(f"Sandbox image rescue failed: {e}", exc_info=True)
+        return posted
 
     async def handle_message(self, message: Message, client: BaseClient):
         """Handle incoming message from any platform"""
@@ -412,10 +436,16 @@ class ChatBotV2:
             and thread_manager.is_thread_processing(message.thread_id, message.channel_id) is True
         )
 
+        # F38: what this turn is allowed to SHOW. A turn the model may end in silence gets no
+        # speculative chrome at all — no placeholder, no composer status (which would also
+        # auto-open the thread), no phase updates. The reply, if there is one, creates its own
+        # surface when the first words arrive; if there is none, nothing was ever posted.
+        turn = TurnRuntime.for_message(message, post_thread_id)
+
         # Send initial thinking indicator (streamed replies grow inside this message,
         # so placement is decided here).
         thinking_id = None
-        if not already_processing:
+        if not already_processing and turn.progress_enabled:
             thinking_id = await client.send_thinking_indicator(
                 message.channel_id,
                 post_thread_id
@@ -440,7 +470,8 @@ class ChatBotV2:
 
         response = None
         try:
-            response = await self.processor.process_message(message, client, thinking_id)
+            response = await self.processor.process_message(message, client, thinking_id,
+                                                            turn=turn)
 
             # Delete thinking indicator (but not if streaming was used — it's already the
             # response — and not when a ProgressChecklist owns the thinking message, F4).
@@ -562,6 +593,12 @@ class ChatBotV2:
                             if published:
                                 main_logger.info(
                                     f"Published {len(published)} artifact(s) to the thread")
+                                # F38: a chart or a deck visibly landed. On an empty-text turn
+                                # (code interpreter answering with the file itself) the Response
+                                # says posted=False, and without this the end-of-turn settle
+                                # would read that as silence and retract the 👀 from a turn that
+                                # plainly delivered.
+                                turn.visible_action_committed = True
                         except asyncio.TimeoutError:
                             main_logger.error("Artifact publishing timed out — reply already posted")
                         except Exception as e:
@@ -578,8 +615,10 @@ class ChatBotV2:
                     # with the container. A silent no-output turn is the worst failure mode
                     # here, so hand them over rather than lose them.
                     if not published:
-                        await self._rescue_sandbox_images(response, client, message,
-                                                          post_thread_id)
+                        rescued = await self._rescue_sandbox_images(response, client, message,
+                                                                    post_thread_id)
+                        if rescued:
+                            turn.visible_action_committed = True  # F38: an image did land
                 elif response.type == "error":
                     # Send error message
                     await client.handle_error(
@@ -644,6 +683,14 @@ class ChatBotV2:
             except Exception as notify_error:
                 main_logger.error(f"Failed to send error notice: {notify_error}")
         finally:
+            # F38: settle the work claim. Runs in `finally` so an exception, a cancellation,
+            # or an early return can't strand a 👀 on a message the bot then ignored.
+            try:
+                await turn.settle_ack(
+                    client, self._produced_visible_output(response, turn))
+            except Exception as ack_error:  # noqa: BLE001
+                main_logger.debug(f"Ack settle failed: {ack_error}")
+
             # Native-streamed replies don't trip Slack's "auto-clear status on reply"
             # (it keys on chat.postMessage, not chat.stopStream), so a status-only turn
             # left the working bubble spinning forever (user report 2026-07-10).
@@ -652,7 +699,10 @@ class ChatBotV2:
             # Also skipped for background image gen (background_owns_status): the job owns
             # the status-only progress surface and clears it on completion — clearing here
             # would blank it the instant the turn returns (Codex finding 8).
+            # F38: and skipped entirely when progress was deferred — there is no status to
+            # clear, and clearing one we never set would auto-open the thread to say so.
             if (thinking_id is None
+                    and turn.progress_enabled
                     and not (response is not None and response.type == "queued")
                     and not (response is not None and response.metadata.get("background_owns_status"))
                     and hasattr(client, "clear_assistant_status")):

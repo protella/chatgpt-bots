@@ -213,12 +213,21 @@ async def test_gate_none_ts_native_capable_streams(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_gate_none_ts_without_native_does_not_stream(monkeypatch):
-    """No placeholder + no native path → non-streaming (never a dead edit loop)."""
+async def test_gate_none_ts_without_native_still_streams(monkeypatch):
+    """F38 REVERSES the old rule here.
+
+    It used to be: no placeholder + no native streaming → fall back to non-streaming, on the
+    theory that the edit loop had nowhere to write. That was survivable while every turn got a
+    placeholder — but once a turn that might stay silent stops posting one, this branch would
+    have silently killed streaming on EVERY ambient turn wherever native streaming is off
+    (which is the shipped default). The legacy loop can seed its own message on the first
+    chunk, so it streams; a turn that never speaks simply never seeds one.
+    """
     from base_client import Message
     from message_processor.handlers.text import TextHandlerMixin
+    import types
+
     host = MagicMock()
-    host._handle_streaming_text_response = AsyncMock()
     real = TextHandlerMixin._handle_text_response
 
     client = MagicMock(spec=[])  # no supports_native_streaming attribute at all
@@ -228,31 +237,15 @@ async def test_gate_none_ts_without_native_does_not_stream(monkeypatch):
     async def fake_config(**kw):
         return {"enable_streaming": True}
 
-    called = {}
-
-    async def probe(self, *a, **kw):
-        # Reaching the non-streaming section means the gate rejected streaming;
-        # abort here — the rest of the method needs a full harness.
-        called["non_streaming"] = True
-        raise RuntimeError("stop-probe")
-
+    host._handle_streaming_text_response = AsyncMock(return_value="STREAMED")
     with patch.object(config, "get_thread_config_async", side_effect=fake_config):
-        src_gate_streams = False
-        try:
-            # Run the real method just far enough to see which branch it takes.
-            import types
-            bound = types.MethodType(real, host)
-            # Patch the streaming handler to detect wrong-branch routing
-            host._handle_streaming_text_response = AsyncMock(
-                side_effect=AssertionError("should not stream without native"))
-            thread_state = MagicMock()
-            thread_state.messages = []
-            await bound("hello", thread_state, client, msg, thinking_id=None)
-        except AssertionError:
-            src_gate_streams = True
-        except Exception:
-            pass  # non-streaming path hit real logic and failed on mocks — fine
-    assert not src_gate_streams
+        bound = types.MethodType(real, host)
+        thread_state = MagicMock()
+        thread_state.messages = []
+        result = await bound("hello", thread_state, client, msg, thinking_id=None)
+
+    assert result == "STREAMED"
+    host._handle_streaming_text_response.assert_awaited_once()
 
 
 @pytest.mark.asyncio

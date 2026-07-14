@@ -15,6 +15,7 @@ from . import image_catalog
 from .containers import ContainerManager
 from .message_timestamps import stamp_content
 from .thread_management import ThreadManagementMixin
+from .turn_runtime import TurnRuntime
 from .handlers.text import TextHandlerMixin
 from .handlers.image_gen import ImageJobMixin
 from .utilities import MessageUtilitiesMixin
@@ -79,18 +80,24 @@ class MessageProcessor(ThreadManagementMixin,
 
 
 
-    async def process_message(self, message: Message, client: BaseClient, thinking_id: Optional[str] = None) -> Optional[Response]:
+    async def process_message(self, message: Message, client: BaseClient,
+                              thinking_id: Optional[str] = None,
+                              turn: Optional["TurnRuntime"] = None) -> Optional[Response]:
         """
         Process a message and return a response
-        
+
         Args:
             message: Universal message object
             client: The client that received the message
             thinking_id: ID of the thinking indicator message to update
-        
+            turn: F38 per-turn presentation + work-claim state. Defaults (progress on,
+                  never silent) keep non-main.py callers and older tests working.
+
         Returns:
             Response object or None if unable to process
         """
+        if turn is None:
+            turn = TurnRuntime(progress_enabled=True, reply_thread_id=message.thread_id)
         thread_key = f"{message.channel_id}:{message.thread_id}"
         
         # Log request start with clear markers
@@ -158,19 +165,26 @@ class MessageProcessor(ThreadManagementMixin,
 
             # Check if this thread had a previous timeout
             if hasattr(thread_state, 'had_timeout') and thread_state.had_timeout:
-                # Send timeout notification to user
-                timeout_msg = "⚠️ Heads up — my last answer in this thread never finished. Picking up from here."
-                await client.send_message(
-                    channel_id=message.channel_id,
-                    text=timeout_msg,
-                    thread_id=message.thread_id
-                )
-                # Clear the timeout flag
+                # F38: this notice fires BEFORE the model has decided anything, so on a turn
+                # that may end in silence it would break that silence all by itself — the bot
+                # would announce a dead answer and then say nothing else. On an addressed turn
+                # (where a reply always follows) it still earns its place. Either way the flag
+                # is cleared: a stale one would make a LATER prompted turn describe an old
+                # failure as "my last answer".
+                if turn.progress_enabled:
+                    timeout_msg = "⚠️ Heads up — my last answer in this thread never finished. Picking up from here."
+                    await client.send_message(
+                        channel_id=message.channel_id,
+                        text=timeout_msg,
+                        thread_id=message.thread_id
+                    )
+                    self.log_info(f"Notified user about previous timeout in thread {thread_key}")
+                else:
+                    self.log_debug(
+                        f"Prior timeout in {thread_key} — clearing silently (turn may not reply)")
                 thread_state.had_timeout = False
-                self.log_info(f"Notified user about previous timeout in thread {thread_key}")
-            
-            # Note: 80% context warning moved to after response generation
-            
+
+
             # Get thread config to determine model (user prefs + shared channel
             # settings; DMs simply have no channel_settings row → no-op there)
             thread_config = await config.get_thread_config_async(
@@ -320,7 +334,7 @@ class MessageProcessor(ThreadManagementMixin,
                     message.channel_id,
                     thinking_id,
                     pipeline_status("optimizing_history", f"Optimizing conversation history ({projected_tokens:,}/{max_tokens:,} tokens)…"),
-                    emoji=config.circle_loader_emoji, thread_id=message.thread_id)
+                    emoji=config.circle_loader_emoji, thread_id=message.thread_id, turn=turn)
 
                 total_trimmed = 0
 
@@ -435,7 +449,7 @@ class MessageProcessor(ThreadManagementMixin,
 
             response = await self._handle_text_response(
                 user_content, thread_state, client, message, thinking_id, retry_count=0,
-                artifacts_acc=turn_artifacts)
+                artifacts_acc=turn_artifacts, turn=turn)
 
             # DEBUG: log conversation history after processing (with truncated content).
             # log_debug, not print — conversation content must not leak to stdout
@@ -456,46 +470,14 @@ class MessageProcessor(ThreadManagementMixin,
             
             # Calculate final token count
             final_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-            
-            # Check if we should show the 80% context warning AFTER the response
-            if not thread_state.has_shown_80_percent_warning and response and response.type not in ["error", "queued"]:
-                # Get current model's token limit and check usage
-                model = thread_state.current_model or config.gpt_model
-                max_tokens = config.get_model_token_limit(model)
-                eighty_percent_threshold = int(max_tokens * config.token_cleanup_threshold)  # Using same threshold from .env
-                
-                if final_tokens > eighty_percent_threshold:
-                    # Send one-time warning about context usage as a stylized message
-                    warning_msg = (
-                        f"```\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📊 CONTEXT USAGE NOTIFICATION\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"\n"
-                        f"Current Usage: {final_tokens:,} / {max_tokens:,} tokens\n"
-                        f"({final_tokens/max_tokens:.0%} of available context)\n"
-                        f"\n"
-                        f"💡 Tips for optimal performance:\n"
-                        f"   • Start new threads for unrelated topics\n"
-                        f"   • Older messages may be auto-summarized\n"
-                        f"   • Important context is always preserved\n"
-                        f"\n"
-                        f"✅ You can continue chatting normally\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"```"
-                    )
-                    
-                    # Send as regular message so everyone in channel threads can see it
-                    await client.send_message(
-                        channel_id=message.channel_id,
-                        text=warning_msg,
-                        thread_id=message.thread_id
-                    )
-                    
-                    # Mark that we've shown the warning
-                    thread_state.has_shown_80_percent_warning = True
-                    self.log_info(f"Sent 80% context warning for thread {thread_key}: {final_tokens}/{max_tokens} tokens")
-            
+
+            # F38: the "📊 CONTEXT USAGE NOTIFICATION" box is gone. Compaction is a
+            # behind-the-scenes function and the bot has no business narrating it — this
+            # posted a public ASCII box of token counts and "tips" into the thread, where
+            # everyone could see it, over a thing the user never asked about and cannot act
+            # on. The model is still TOLD its history was summarized (the has_trimmed_messages
+            # note in the system prompt); that is where the fact belongs.
+
             self.log_info("")
             self.log_info("="*100)
             self.log_info(f"REQUEST END | Thread: {thread_key} | Status: {response_type.upper()} | Time: {elapsed:.2f}s | Tokens: {final_tokens}")
@@ -543,7 +525,7 @@ class MessageProcessor(ThreadManagementMixin,
                         enhanced_text if 'enhanced_text' in locals() else user_content,
                         thread_state, client, message, thinking_id,
                         retry_count=1,
-                        artifacts_acc=turn_artifacts
+                        artifacts_acc=turn_artifacts, turn=turn
                     )
                     self.log_info(f"Retry successful for {operation_type}")
                     return response

@@ -1010,6 +1010,13 @@ async def execute_start_background_job(ctx: ToolContext, args: Dict[str, Any]) -
     # the build phase would fall back to defaults and quietly ignore the user's choices.
     thread_config = copy.deepcopy(dict(getattr(ctx, "thread_config", None) or {}))
 
+    # F38: everything that could reject this call has now passed, so the job really is going
+    # to run — stake the 👀 work claim. Deliberately AFTER the validation above: a job we were
+    # about to turn away must never flash an eye it then has to take back.
+    turn = getattr(ctx, "turn", None)
+    if turn is not None:
+        await turn.claim_work(client, getattr(ctx, "message", None))
+
     job_id = uuid4().hex[:12]
     if tm is not None and hasattr(tm, "register_research"):
         tm.register_research(thread_key, job_id, _gist(task))
@@ -1037,6 +1044,10 @@ async def execute_start_background_job(ctx: ToolContext, args: Dict[str, Any]) -
     # job posts is the acknowledgment. Set on the shared ToolContext the tool loop exposes.
     try:
         ctx.background_job_started = True
+        # F38: the card IS this turn's visible output, so the turn has produced something
+        # even though its Response is empty — the 👀 stays.
+        if turn is not None:
+            turn.visible_action_committed = True
     except Exception:  # noqa: BLE001 — a defensive guard; ctx is a mutable dataclass
         pass
     result: Dict[str, Any] = {"ok": True, "status": "started", "mode": mode,

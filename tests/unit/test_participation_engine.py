@@ -80,28 +80,16 @@ class TestVerdictValidation:
         v = ParticipationEngine.validate_verdict({"action": "ignore", "reason": "x" * 999})
         assert len(v.reason) == 300
 
-    # F19: acknowledgment flag
-    def test_ack_absent_defaults_false(self):
-        assert ParticipationEngine.validate_verdict({"action": "respond"}).ack is False
+    # F38: the classifier's `ack` bit is GONE — it predicted "real work ahead" before the
+    # model had done anything, and the gate dropped a 👀 on that guess. The verdict must
+    # carry no such field, and a stale `ack` key from an old prompt must be inert.
+    def test_verdict_has_no_ack_field(self):
+        assert not hasattr(ParticipationEngine.validate_verdict({"action": "respond"}), "ack")
 
-    def test_ack_true_on_respond(self):
-        assert ParticipationEngine.validate_verdict(
-            {"action": "respond", "ack": True}).ack is True
-
-    def test_ack_malformed_coerced_false(self):
-        # Only a literal True flips it; strings/ints/None never do.
-        for bad in ("true", 1, "yes", None, "ack"):
-            assert ParticipationEngine.validate_verdict(
-                {"action": "respond", "ack": bad}).ack is False
-
-    def test_ack_ignored_on_non_respond_actions(self):
-        # ack is meaningful only with respond — react/ignore/backoff never carry it.
-        assert ParticipationEngine.validate_verdict(
-            {"action": "ignore", "ack": True}).ack is False
-        assert ParticipationEngine.validate_verdict(
-            {"action": "react", "emoji": "eyes", "ack": True}).ack is False
-        assert ParticipationEngine.validate_verdict(
-            {"action": "backoff", "ack": True}).ack is False
+    def test_stale_ack_key_is_ignored(self):
+        v = ParticipationEngine.validate_verdict({"action": "respond", "ack": True})
+        assert v.action == "respond"
+        assert not hasattr(v, "ack")
 
 
 # ------------------------------------------------------------------- debounce + rails
@@ -466,48 +454,33 @@ class TestGateWiring:
         verdict = await app._run_participation_gate(_channel_msg(), client)
         assert verdict is not None and verdict.action == "respond"
 
-    # F19: acknowledgment reaction on respond+ack
+    # F38: the gate NEVER reacts on a respond verdict. The 👀 is a claim on work, staked by
+    # the work itself once a slow tool really starts — not a prediction the classifier makes
+    # before the model has looked at anything. A gate that acks a passing comment and then
+    # says nothing is exactly the misleading behavior this removed.
     @pytest.mark.asyncio
-    async def test_respond_ack_reacts_before_dispatch(self, monkeypatch):
+    async def test_respond_never_reacts(self, monkeypatch):
         monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
         monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
         monkeypatch.setattr(config, "enable_ack_reaction", True, raising=False)
         monkeypatch.setattr(config, "ack_reaction_emoji", "eyes", raising=False)
-        app, client, _ = _make_app({"action": "respond", "ack": True})
-        verdict = await app._run_participation_gate(_channel_msg(), client)
-        assert verdict is not None and verdict.action == "respond" and verdict.ack is True
-        # reaction placed on the triggering message through the F6 reservation guard
-        client._reserve_and_react.assert_awaited_once_with("C1", "10.0", "eyes")
-
-    @pytest.mark.asyncio
-    async def test_respond_without_ack_no_reaction(self, monkeypatch):
-        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        monkeypatch.setattr(config, "enable_ack_reaction", True, raising=False)
         app, client, _ = _make_app({"action": "respond"})
         verdict = await app._run_participation_gate(_channel_msg(), client)
         assert verdict is not None and verdict.action == "respond"
         client._reserve_and_react.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_ack_disabled_skips_reaction(self, monkeypatch):
+    async def test_respond_never_reacts_even_with_a_stale_ack_bit(self, monkeypatch):
+        # An old prompt (or a model reciting the old contract) can still emit "ack": true.
+        # It must be inert — no reaction, no crash.
         monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
         monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        monkeypatch.setattr(config, "enable_ack_reaction", False, raising=False)
+        monkeypatch.setattr(config, "enable_ack_reaction", True, raising=False)
+        monkeypatch.setattr(config, "ack_reaction_emoji", "eyes", raising=False)
         app, client, _ = _make_app({"action": "respond", "ack": True})
         verdict = await app._run_participation_gate(_channel_msg(), client)
         assert verdict is not None and verdict.action == "respond"
         client._reserve_and_react.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_ack_emoji_configurable(self, monkeypatch):
-        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        monkeypatch.setattr(config, "enable_ack_reaction", True, raising=False)
-        monkeypatch.setattr(config, "ack_reaction_emoji", "hourglass_flowing_sand", raising=False)
-        app, client, _ = _make_app({"action": "respond", "ack": True})
-        await app._run_participation_gate(_channel_msg(), client)
-        client._reserve_and_react.assert_awaited_once_with("C1", "10.0", "hourglass_flowing_sand")
 
     @pytest.mark.asyncio
     async def test_react_verdict_ignores_ack_field(self, monkeypatch):

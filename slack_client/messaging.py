@@ -5,6 +5,7 @@ import random
 import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_sdk.errors import SlackApiError
@@ -389,18 +390,22 @@ class SlackMessagingMixin:
         except Exception as e:
             self.log_debug(f"own-reply pulse record failed: {e}")
 
-    def _record_own_reaction_pulse(self, channel_id: str, ts: Optional[str], emoji: str) -> None:
+    def _record_own_reaction_pulse(self, channel_id: str, ts: Optional[str],
+                                   emoji: str) -> Optional[dict]:
         """F31: record a reaction the bot itself just placed into the channel pulse, so the
         envelope and thread tails surface the bot's own reactions. All real Slack reaction
-        paths (verdict, ack, react_to_message tool) commit through _reserve_and_react, so
-        hooking that single choke point covers them once. Best-effort; never breaks reacting."""
+        paths (verdict, work-claim, react_to_message tool) commit through _reserve_and_react,
+        so hooking that single choke point covers them once. Best-effort; never breaks
+        reacting. Returns the pulse receipt (F38) so an owned reaction that gets taken back
+        can take its synthetic history entry back with it."""
         pulse = getattr(self, "channel_pulse", None)
         if pulse is None or not ts:
-            return
+            return None
         try:
-            pulse.record_own_reaction(channel_id, message_ts=ts, emoji=emoji)
+            return pulse.record_own_reaction(channel_id, message_ts=ts, emoji=emoji)
         except Exception as e:
             self.log_debug(f"own-reaction pulse record failed: {e}")
+            return None
 
     # Slack section-block text hard limit is 3000 chars; keep a margin so the reply text
     # fits one section when we attach the footer as blocks.
@@ -1002,27 +1007,64 @@ class SlackMessagingMixin:
         native-streamed replies — Slack's auto-clear keys on chat.postMessage only."""
         return await self.set_assistant_status(channel_id, thread_id, status="")
 
+    async def _react_add(self, channel_id: str, message_ts: str, emoji: str) -> tuple:
+        """The raw add, returning (ok, added).
+
+        `added` is the bit `react()` throws away and F38 needs: True only when THIS call
+        actually put the reaction there. Slack's `already_reacted` is still ok=True — the
+        emoji is present, the caller's intent is satisfied — but added=False, because a
+        reaction we did not place is not a reaction we may take away. (Slack scopes
+        reactions per user, so `already_reacted` can only mean the BOT reacted before, never
+        that a human did.)"""
+        if not config.enable_reactions:
+            return False, False
+        name = (emoji or "").strip().strip(":")
+        if not name:
+            return False, False
+        try:
+            await self.app.client.reactions_add(channel=channel_id, name=name, timestamp=message_ts)
+            return True, True
+        except SlackApiError as e:
+            err = e.response.get("error") if getattr(e, "response", None) else str(e)
+            if err == "already_reacted":
+                return True, False  # present, but not ours to remove
+            self.log_warning(f"Could not add reaction :{name}: ({err})")
+            return False, False
+        except Exception as e:  # noqa: BLE001
+            self.log_error(f"Unexpected error adding reaction :{name}: {e}")
+            return False, False
+
     async def react(self, channel_id: str, message_ts: str, emoji: str) -> bool:
         """Add an emoji reaction to a message (Phase 4). ``emoji`` may include or omit colons.
 
         Best-effort: treats already_reacted as success, never raises.
         """
+        ok, _added = await self._react_add(channel_id, message_ts, emoji)
+        return ok
+
+    async def unreact(self, channel_id: str, message_ts: str, emoji: str) -> bool:
+        """Remove one of the BOT'S OWN reactions (F38). Slack scopes reactions.remove to the
+        authenticated user, so this can never strip a human's emoji off a message.
+
+        `no_reaction` counts as success — the goal state is "the emoji is not there", and
+        something else having removed it already satisfies that. Never raises."""
         if not config.enable_reactions:
             return False
         name = (emoji or "").strip().strip(":")
         if not name:
             return False
         try:
-            await self.app.client.reactions_add(channel=channel_id, name=name, timestamp=message_ts)
+            await self.app.client.reactions_remove(
+                channel=channel_id, name=name, timestamp=message_ts)
             return True
         except SlackApiError as e:
             err = e.response.get("error") if getattr(e, "response", None) else str(e)
-            if err == "already_reacted":
-                return True  # idempotent: the reaction is already present
-            self.log_warning(f"Could not add reaction :{name}: ({err})")
+            if err == "no_reaction":
+                return True  # already gone — the intended end state
+            self.log_warning(f"Could not remove reaction :{name}: ({err})")
             return False
         except Exception as e:  # noqa: BLE001
-            self.log_error(f"Unexpected error adding reaction :{name}: {e}")
+            self.log_error(f"Unexpected error removing reaction :{name}: {e}")
             return False
 
     # --- react_to_message local tool (redesign Phase D) ---
@@ -1087,7 +1129,11 @@ class SlackMessagingMixin:
 
     def _trim_reaction_guard(self, guard, ts_map, now, keep=None) -> None:
         """Evict oldest guard entries beyond the cap, pinning anything touched within the
-        recency window (and always ``keep``)."""
+        recency window (and always ``keep``).
+
+        F38: an entry holding a LIVE OWNED slot is pinned unconditionally. Ownership is what
+        lets a turn take its 👀 back, and a long turn (a research job runs for minutes) would
+        otherwise age out of the recency window and lose the right to clean up after itself."""
         if len(guard) <= self._REACTION_GUARD_MAX:
             return
         cutoff = now - self._REACTION_GUARD_RECENCY_S
@@ -1097,23 +1143,196 @@ class SlackMessagingMixin:
             entry = guard.get(k)
             if entry is keep:
                 continue
+            if any(isinstance(v, dict) for v in (entry or {}).values()):
+                continue  # a live claim lives here — evicting it would strand the 👀
             if ts_map.get(k, 0.0) >= cutoff:
                 continue  # recently touched → pinned (active-turn committed or fresh pending)
             del guard[k]
             ts_map.pop(k, None)
 
-    async def _reserve_and_react(self, channel_id: str, ts: str, emoji: str) -> dict:
-        """F6: atomic per-message reservation with rollback.
+    # --- F38: reaction leases (a 👀 the turn can take back) ---
+    #
+    # Ownership is part of the GUARD, not a map beside it. That matters, and it took a review
+    # round to see why: a parallel map cannot be kept honest, because Slack's `already_reacted`
+    # is silent about WHO reacted. Sequence that breaks the parallel design —
+    #
+    #   1. turn A adds 👀 and records itself as owner
+    #   2. A's guard entry is evicted (2000-entry LRU)
+    #   3. turn B reserves the same emoji: no slot, so it calls Slack
+    #   4. Slack: `already_reacted` (A's 👀 is still up there) → B gets no lease...
+    #   5. ...and B never overwrites A's ownership record, because it never had one to write
+    #   6. A ends silently, its token still "matches", and it rips the 👀 out from under B
+    #
+    # Holding ownership in the slot makes step 2 self-correcting: eviction destroys the claim,
+    # so A can no longer prove the emoji is its own and declines to touch it. Losing the right
+    # to clean up is the safe failure; removing someone else's reaction is not.
+    #
+    # A slot is therefore one of:
+    #   Future              an add is in flight (a concurrent sibling reserved it first)
+    #   True                committed, unowned — nobody may remove it
+    #   {"token": ...}      committed and OWNED by the turn holding the matching lease
+    #   {"token", "removing"}  that owner is mid-removal; no one else may touch it
+    _REMOVING = "removing"
 
-        Guard: bounded LRU map (channel, ts) -> {emoji: Future(pending) | True(committed)},
-        plus a parallel (channel, ts) -> monotonic touch time. Distinct emoji up to
-        REACTION_MAX_PER_MESSAGE land; a duplicate emoji is idempotent success WITHOUT
-        consuming a slot. Because dispatch_all runs sibling calls concurrently, the slot is
-        reserved SYNCHRONOUSLY (before the first await) so N+1 distinct reactions can't all
-        pass the cap; a failed/cancelled Slack call rolls the reservation back in `finally`.
-        A duplicate whose in-flight owner FAILS must not report success (round-2 fix a).
-        Eviction pins recently-touched entries (committed or pending) so consumed slots
-        can't resurrect mid-turn; a duplicate's wait on an in-flight owner is time-bounded."""
+    @staticmethod
+    def _is_committed(slot) -> bool:
+        """True/owned/removing all mean 'the emoji is on the message'. A Future does not."""
+        return slot is True or isinstance(slot, dict)
+
+    def settle_reaction_lease(self, lease: Optional[dict]) -> None:
+        """The turn produced something: the reaction has earned its place. Drop the claim —
+        the emoji, the guard slot and the pulse entry all stay exactly as they are.
+
+        Releasing matters even for reactions nobody intends to remove (a gate verdict, the
+        model's own react tool): an owned slot is pinned against eviction, so never settling
+        one would slowly fill the guard with unevictable entries."""
+        if not lease:
+            return
+        slots = (getattr(self, "_reaction_guard", None) or {}).get(
+            (lease.get("channel_id"), lease.get("ts")))
+        if slots is None:
+            return
+        slot = slots.get(lease.get("emoji"))
+        if isinstance(slot, dict) and slot.get("token") == lease.get("token"):
+            slots[lease["emoji"]] = True  # committed, unowned, evictable again
+
+    def _settle_removal_slot(self, channel_id: str, ts: str, emoji: str, token: str,
+                             ok: bool, lease: dict) -> None:
+        """Transition a `removing` slot to its final state. Runs from the removal TASK's
+        `finally`, so it happens even if the turn that asked for the removal is cancelled —
+        otherwise the slot would stay `removing` forever, and since owned slots are pinned
+        against eviction, a run of cancelled turns would grow the guard without bound."""
+        guard = getattr(self, "_reaction_guard", None)
+        slots = (guard or {}).get((channel_id, ts))
+        slot = slots.get(emoji) if slots is not None else None
+        if not (isinstance(slot, dict) and slot.get("token") == token
+                and slot.get(self._REMOVING) is not None):
+            return  # someone else already resolved it; don't stomp their state
+        if not ok:
+            # The emoji may well still be up there. Demote to committed-unowned rather than
+            # dropping the slot: a stale 👀 is survivable, a guard that thinks a live reaction
+            # is gone is not (it would let the cap be exceeded and re-add over the top).
+            slots[emoji] = True
+            self.log_debug(f"Could not take back :{emoji}: — leaving the bookkeeping intact")
+            return
+        slots.pop(emoji, None)
+        if not slots and guard is not None and guard.get((channel_id, ts)) is slots:
+            guard.pop((channel_id, ts), None)
+            ts_map = getattr(self, "_reaction_guard_ts", None)
+            if ts_map is not None:
+                ts_map.pop((channel_id, ts), None)
+        pulse = getattr(self, "channel_pulse", None)
+        if pulse is not None and lease.get("pulse_receipt"):
+            try:
+                pulse.remove_own_reaction(lease["pulse_receipt"])
+            except Exception as e:  # noqa: BLE001 — history cleanup must never break a turn
+                self.log_debug(f"own-reaction pulse removal failed: {e}")
+        self.log_debug(f"Took back :{emoji}: — the turn produced nothing")
+
+    async def _run_reaction_removal(self, channel_id: str, ts: str, emoji: str, token: str,
+                                    lease: dict) -> bool:
+        """The removal itself, as its own task. Bounded, and it ALWAYS settles the slot."""
+        ok = False
+        try:
+            ok = await asyncio.wait_for(
+                self.unreact(channel_id, ts, emoji),
+                timeout=max(1.0, float(getattr(config, "tool_call_timeout", 20))))
+        except asyncio.TimeoutError:
+            self.log_debug(f"Reaction removal timed out for :{emoji}:")
+        except Exception as e:  # noqa: BLE001
+            self.log_debug(f"Reaction removal failed for :{emoji}: {e}")
+        finally:
+            # `finally`, not `except Exception` — a CancelledError is a BaseException and
+            # would otherwise sail straight past, stranding the slot in `removing`.
+            self._settle_removal_slot(channel_id, ts, emoji, token, ok, lease)
+        return ok
+
+    async def remove_owned_reaction(self, lease: Optional[dict]) -> bool:
+        """The turn produced nothing: take the reaction back off.
+
+        Refuses unless the slot still carries OUR token — if the entry was evicted and
+        re-committed, or another turn claimed the emoji, it is no longer ours and we leave it.
+
+        The removal runs as its own task and settles the guard from a `finally`, so a
+        cancelled turn cannot strand the slot mid-removal. The caller merely waits for it."""
+        if not lease:
+            return False
+        channel_id, ts = lease.get("channel_id"), lease.get("ts")
+        emoji, token = lease.get("emoji"), lease.get("token")
+        guard = getattr(self, "_reaction_guard", None)
+        slots = (guard or {}).get((channel_id, ts))
+        slot = slots.get(emoji) if slots is not None else None
+        if not (isinstance(slot, dict) and slot.get("token") == token
+                and slot.get(self._REMOVING) is None):
+            self.log_debug(f"Reaction lease for :{emoji}: is stale — leaving it alone")
+            return False
+        # Publish the removal SYNCHRONOUSLY, before any await, so a concurrent remover bails
+        # and a concurrent reserver can WAIT on the outcome rather than being told the emoji
+        # is safely present when it is moments from disappearing.
+        task = asyncio.ensure_future(
+            self._run_reaction_removal(channel_id, ts, emoji, token, lease))
+        slots[emoji] = {"token": token, self._REMOVING: task}
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise      # the task lives on and settles the slot itself
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _reserve_and_react(self, channel_id: str, ts: str, emoji: str) -> dict:
+        """F6 reservation for a PERMANENT reaction — one the caller never takes back.
+
+        Settles the lease immediately: this reaction is staying, so it must not sit in the
+        guard as an unevictable owned slot."""
+        result, lease = await self._reserve_and_react_owned(channel_id, ts, emoji)
+        self.settle_reaction_lease(lease)
+        return result
+
+    async def _reserve_and_react_owned(self, channel_id: str, ts: str, emoji: str) -> tuple:
+        """F6 reservation + F38 lease. Returns (result, lease).
+
+        Retries until the slot reaches a STABLE state, under one absolute deadline. Every
+        await in `_reserve_once` — waiting on someone else's in-flight add, waiting on a
+        removal — can be overtaken while we sleep: the owner of the add we waited for may
+        start removing it, a removal we waited for may be followed by a fresh add and a second
+        removal. So a pass that had to wait never trusts what it learned; it re-reads the slot
+        and decides again.
+
+        A fixed number of passes cannot express that (I tried two, and codex pointed out that
+        two removal generations back-to-back fall straight through it and return nothing at
+        all). The deadline can: we either converge on a real answer or say so honestly."""
+        deadline = time.monotonic() + max(1.0, float(getattr(config, "tool_call_timeout", 20)))
+        while True:
+            result, lease, retry = await self._reserve_once(
+                channel_id, ts, emoji, deadline)
+            if not retry:
+                return result, lease
+            if time.monotonic() >= deadline:
+                # Never fall through with a None result — the react tool subscripts it.
+                return ({"ok": False, "error": "reaction_busy",
+                         "message": f"Could not settle :{emoji}: — it is being changed "
+                                    f"concurrently. Try again."}, None)
+
+    async def _reserve_once(self, channel_id: str, ts: str, emoji: str,
+                            deadline: Optional[float] = None) -> tuple:
+        """One reservation pass. Returns (result, lease, retry).
+
+        Guard: bounded LRU map (channel, ts) -> {emoji: Future(pending) | True(committed)
+        | {"token"}(owned) | {"token","removing"}(being taken back)}, plus a parallel
+        (channel, ts) -> monotonic touch time. Distinct emoji up to REACTION_MAX_PER_MESSAGE
+        land; a duplicate emoji is idempotent success WITHOUT consuming a slot. Because
+        dispatch_all runs sibling calls concurrently, the slot is reserved SYNCHRONOUSLY
+        (before the first await) so N+1 distinct reactions can't all pass the cap; a
+        failed/cancelled Slack call rolls the reservation back in `finally`. A duplicate whose
+        in-flight owner FAILS must not report success (round-2 fix a). Eviction pins
+        recently-touched entries and any entry holding a live claim; a duplicate's wait on an
+        in-flight owner is time-bounded.
+
+        F38 — the LEASE. Non-None only when THIS call genuinely added the reaction (not a
+        duplicate, not `already_reacted`, not a wait on someone else's in-flight add). It is
+        the receipt that lets `remove_owned_reaction` prove the emoji on screen is the one we
+        put there, so a work-claim 👀 we take back can never strip a reaction that a
+        concurrent turn — or the model's own react tool — has since made its own."""
         now = time.monotonic()
         cap = max(1, int(getattr(config, "reaction_max_per_message", 4)))
         guard = getattr(self, "_reaction_guard", None)
@@ -1130,45 +1349,93 @@ class SlackMessagingMixin:
         ts_map[key] = now
         self._trim_reaction_guard(guard, ts_map, now, keep=slots)
 
+        # How long we may wait on someone else's in-flight operation: whatever is left of the
+        # caller's overall deadline, so a slot that keeps churning can't outlast it.
+        wait_bound = max(1.0, float(getattr(config, "tool_call_timeout", 20)))
+        if deadline is not None:
+            wait_bound = min(wait_bound, max(0.0, deadline - now))
+
+        busy = ({"ok": False, "error": "reaction_busy",
+                 "message": f"Could not settle :{emoji}: — it is being changed concurrently. "
+                            f"Try again."}, None, False)
+
         existing = slots.get(emoji)
         if existing is not None:
-            # Duplicate emoji — idempotent, no new slot consumed.
-            if existing is True:  # already committed
-                return {"ok": True, "emoji": emoji, "ts": ts, "idempotent": True}
-            # In-flight: await the owner's real outcome (shield so our cancellation doesn't
-            # cancel theirs), but time-bounded so a never-resolving owner can't hang us.
-            wait_bound = max(1.0, float(getattr(config, "tool_call_timeout", 20)))
+            removal = existing.get(self._REMOVING) if isinstance(existing, dict) else None
+            if removal is not None:
+                # The emoji is being TAKEN BACK right now. Reporting "it's there" would be a
+                # lie the moment the removal lands — and for the model's react tool that lie
+                # becomes a reaction-only reply whose reaction does not exist. Wait for the
+                # real outcome instead.
+                try:
+                    await asyncio.wait_for(asyncio.shield(removal), timeout=wait_bound)
+                except asyncio.TimeoutError:
+                    # Still running. We do NOT know how it ends, and guessing "still present"
+                    # would be the same lie one step later. Say so honestly.
+                    return busy
+                except Exception:
+                    pass
+                # Resolved, one way or the other — and the task has already settled the slot
+                # (popped on success, demoted to True on failure). Anything we remember about
+                # it is stale, so decide again from what the guard says NOW.
+                return None, None, True
+            # Duplicate emoji — idempotent, no new slot consumed. No lease: we did not put
+            # this one there, so it is not ours to take back.
+            if self._is_committed(existing):
+                return {"ok": True, "emoji": emoji, "ts": ts, "idempotent": True}, None, False
+            # In-flight ADD: await the owner's real outcome (shield so our cancellation
+            # doesn't cancel theirs), time-bounded so a never-resolving owner can't hang us.
             try:
                 ok = await asyncio.wait_for(asyncio.shield(existing), timeout=wait_bound)
+            except asyncio.TimeoutError:
+                return busy
             except Exception:
                 ok = False
-            if ok:
-                return {"ok": True, "emoji": emoji, "ts": ts, "idempotent": True}
-            return {"ok": False, "error": "reaction_failed", "message": f"Could not add :{emoji}:."}
+            if not ok:
+                return ({"ok": False, "error": "reaction_failed",
+                         "message": f"Could not add :{emoji}:."}, None, False)
+            # The add succeeded — but that was then. While we slept, its owner may already
+            # have started taking it back (a work-claim turn that produced nothing). Reporting
+            # success on the strength of a stale future would promise a reaction that is on
+            # its way out. Re-read the slot and decide again.
+            return None, None, True
 
         # New emoji — enforce the cap over committed + pending distinct emoji.
         if len(slots) >= cap:
-            return {"ok": False, "error": "reaction_cap",
-                    "message": f"Already at the max of {cap} reactions on that message."}
+            return ({"ok": False, "error": "reaction_cap",
+                     "message": f"Already at the max of {cap} reactions on that message."},
+                    None, False)
 
         # Reserve synchronously (before any await) so concurrent siblings see the slot.
         fut = asyncio.get_event_loop().create_future()
         slots[emoji] = fut
         committed = False
         try:
-            ok = await self.react(channel_id, ts, emoji)
+            ok, added = await self._react_add(channel_id, ts, emoji)
             if ok:
-                slots[emoji] = True  # commit
                 committed = True
                 if not fut.done():
                     fut.set_result(True)
+                if not added:
+                    # Slack said already_reacted: the emoji is present, but WE did not put it
+                    # there this time — a previous turn did, and the guard entry proving it was
+                    # evicted. Commit the slot UNOWNED and mint no lease: removing it would
+                    # take back a reaction that is not ours.
+                    slots[emoji] = True
+                    return {"ok": True, "emoji": emoji, "ts": ts, "idempotent": True}, None, False
                 # F31: a genuine new commit — record it as the bot's own reaction so it's
                 # self-visible in the rings (idempotent duplicates below never reach here).
-                self._record_own_reaction_pulse(channel_id, ts, emoji)
-                return {"ok": True, "emoji": emoji, "ts": ts}
+                receipt = self._record_own_reaction_pulse(channel_id, ts, emoji)
+                token = uuid4().hex
+                slots[emoji] = {"token": token}   # committed AND owned by this caller
+                return ({"ok": True, "emoji": emoji, "ts": ts},
+                        {"token": token, "channel_id": channel_id, "ts": ts,
+                         "emoji": emoji, "pulse_receipt": receipt},
+                        False)
             if not fut.done():
                 fut.set_result(False)
-            return {"ok": False, "error": "reaction_failed", "message": f"Could not add :{emoji}:."}
+            return ({"ok": False, "error": "reaction_failed",
+                     "message": f"Could not add :{emoji}:."}, None, False)
         finally:
             if not committed:
                 # Roll back the reservation — covers failure, timeout, and cancellation.

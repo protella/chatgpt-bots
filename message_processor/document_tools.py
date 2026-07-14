@@ -189,6 +189,11 @@ async def execute_read_document(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
     cache_key = doc_file_id or url_private
     text = _extraction_cache.get(cache_key)
     if text is None:
+        # F38: a cache MISS means a real download plus extraction (OCR on a scanned PDF is
+        # genuinely slow) — stake the 👀. A cache hit returns instantly and claims nothing.
+        turn = getattr(ctx, "turn", None)
+        if turn is not None:
+            await turn.claim_work(ctx.client, getattr(ctx, "message", None))
         try:
             data = await ctx.client.download_file(url_private, doc_file_id)
         except Exception as e:

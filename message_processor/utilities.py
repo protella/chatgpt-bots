@@ -1415,14 +1415,24 @@ class MessageUtilitiesMixin:
             self.log_error(f"Error scheduling async message send: {e}")
             return None
 
-    def _update_status(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], message: str, emoji: Optional[str] = None, thread_id: Optional[str] = None):
+    def _update_status(self, client: BaseClient, channel_id: str, thinking_id: Optional[str],
+                       message: str, emoji: Optional[str] = None, thread_id: Optional[str] = None,
+                       turn: Optional[Any] = None):
         """Update the progress indicator with a status message.
 
         With a message indicator (thinking_id set): edit that message.
         Status-only DMs (thinking_id None on the assistant surface): route the
         phase text to assistant.threads.setStatus when the caller supplies
         thread_id — the composer status changes instead of a message edit.
+
+        F38: `thinking_id is None` used to be sufficient proof of "status-only surface". It
+        isn't any more — a deferred turn also has no indicator, and routing its phase updates
+        to setStatus would render a thinking status AND auto-open the thread, which is the
+        exact flash the deferral exists to remove. So a turn that may end in silence says
+        nothing at all until it commits.
         """
+        if turn is not None and not getattr(turn, "progress_enabled", True):
+            return
         if thinking_id and hasattr(client, 'update_message'):
             status_emoji = emoji or config.circle_loader_emoji
             # Schedule the async call as a task to avoid blocking
@@ -1446,32 +1456,10 @@ class MessageUtilitiesMixin:
         else:
             self.log_debug("Client doesn't support message updates")
 
-    async def _place_ack_reaction(self, client: BaseClient, message: Message):
-        """F19: drop the "I'm looking at it" acknowledgment reaction on the triggering
-        message (addressed-turn path — the intent classifier judged real work ahead).
-
-        Routed through the F6 reservation guard so a later model/gate reaction honestly
-        sees the slot consumed and never double-adds; bounded by the tool-call timeout so
-        a wedged Slack call can't stall the turn; purely additive and fails silent (a
-        missed ack reaction is never worth failing a turn over)."""
-        channel_id = message.channel_id
-        react_ts = (message.metadata.get("ts") if message.metadata else None) or message.thread_id
-        if not react_ts:
-            return
-        emoji = config.ack_reaction_emoji
-        try:
-            if hasattr(client, "_reserve_and_react"):
-                await asyncio.wait_for(
-                    client._reserve_and_react(channel_id, react_ts, emoji),
-                    timeout=config.tool_call_timeout)
-            elif hasattr(client, "react"):
-                await asyncio.wait_for(
-                    client.react(channel_id, react_ts, emoji),
-                    timeout=config.tool_call_timeout)
-        except asyncio.TimeoutError:
-            self.log_debug("Ack reaction timed out")
-        except Exception as e:
-            self.log_debug(f"Ack reaction failed: {e}")
+    # F38: `_place_ack_reaction` is gone. It placed the 👀 unconditionally on the first tool
+    # EVENT — which fires before a call's arguments are validated, and for fast lookups that
+    # are over before the eye renders. The claim now lives on TurnRuntime, is staked only by
+    # work that is genuinely slow and genuinely happening, and can be taken back.
 
     async def _start_progress_updater_async(self, client: BaseClient, channel_id: str, thinking_id: Optional[str], operation: str = "request", emoji: Optional[str] = None):
         """Start an async task that updates thinking message periodically
