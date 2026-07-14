@@ -32,6 +32,9 @@ class _WakeHost:
     def _build_generation_inflight_note(self, *a, **k):
         return None
 
+    def _build_research_inflight_note(self, *a, **k):
+        return None
+
     def log_debug(self, *a, **k):
         pass
 
