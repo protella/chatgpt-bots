@@ -1247,6 +1247,50 @@ class MessageUtilitiesMixin:
             self.log_debug(f"in-flight note build failed: {e}")
             return None
 
+    def _build_research_inflight_note(self, channel_id: Optional[str],
+                                      thread_ts: Optional[str]) -> Optional[str]:
+        """F38: volatile suffix line telling the model a BACKGROUND JOB is already running in
+        this thread.
+
+        Images have had this since F1. Background jobs never did — `research_in_flight_count`
+        was read in exactly one place, the tool's own cap check, so the model was blind to its
+        own running work. Live consequence: a job was building a deck, the user posted a
+        passing remark in the thread ("Never tried this. Not sure how it will turn out"), the
+        bot woke on it with no idea a deck was already in flight, and started a second one.
+        Two status cards, two decks, one request.
+
+        Carries the task gist AND the deliverable filenames, because "is the thing they're
+        talking about the thing I'm already building?" is the question the model has to answer,
+        and a filename answers it without guesswork."""
+        try:
+            if not channel_id or thread_ts is None or not hasattr(self, "thread_manager"):
+                return None
+            tm = self.thread_manager
+            if not hasattr(tm, "research_jobs_in_flight"):
+                return None
+            jobs = tm.research_jobs_in_flight(f"{channel_id}:{thread_ts}")
+            if not jobs:
+                return None
+            lines = []
+            for j in jobs:
+                gist = self._escape_suffix_text(j.get("task_summary") or "background work")
+                mode = self._escape_suffix_text(j.get("mode") or "research")
+                files = [self._escape_suffix_text(f) for f in (j.get("deliverables") or [])]
+                tail = f" → {', '.join(files)}" if files else ""
+                lines.append(f"- {mode}: \"{gist}\"{tail}")
+            body = "\n".join(lines)
+            return (
+                "[Background work already running in this thread:\n"
+                f"{body}\n"
+                "It posts its own status card and delivers its own files when it finishes. "
+                "Treat questions or comments about that work as follow-ups — do NOT call "
+                "start_background_job for it again. Start another job only if the user has "
+                "explicitly asked for separate, additional work.]"
+            )
+        except Exception as e:
+            self.log_debug(f"research in-flight note build failed: {e}")
+            return None
+
     def _wake_trigger_line(self, md: dict) -> str:
         """The 'trigger:' line for the wake envelope (F3), from message metadata."""
         source = md.get("wake_source")
@@ -1342,6 +1386,11 @@ class MessageUtilitiesMixin:
         inflight = self._build_generation_inflight_note(channel_id, thread_ts)
         if inflight:
             parts.append(inflight)
+        # F38: the same courtesy for background jobs, which never had it — the model could not
+        # see its own running work and would start it a second time.
+        research = self._build_research_inflight_note(channel_id, thread_ts)
+        if research:
+            parts.append(research)
         return "\n\n".join(parts)
 
     def _schedule_async_call(self, coro):

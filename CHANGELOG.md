@@ -262,6 +262,18 @@ Flags: `ENABLE_DEEP_RESEARCH` (default **on**), `DEEP_RESEARCH_REASONING_EFFORT`
 (on — the byline needs the `chat:write.customize` scope; without it the bot posts plainly rather
 than failing).
 
+### 🔁 Fixed - It no longer builds the same thing twice
+
+Ask for a deck, say something in the thread while it's working, and the bot could quietly
+start building the deck *again* — two status cards, two files, one request.
+
+The cause was a blind spot: the bot could see when it was already generating an *image*, but
+not when it was already running a *background job*. So a passing remark in the thread ("never
+tried this, not sure how it'll turn out") was enough to wake it, and with no idea a build was
+already under way, it started a second one. It now knows what it has running, and says so to
+itself before deciding anything. A second job needs you to actually ask for separate work, and
+two jobs can never write the same filename.
+
 ### 🤫 Fixed - It stops thinking out loud
 
 Three things the bot used to say that it had no business saying.
