@@ -28,7 +28,6 @@ class ThreadState:
     had_timeout: bool = False  # Track if this thread had a timeout for user notification
     has_trimmed_messages: bool = False  # Track if messages have been trimmed from this thread
     has_summary_head: bool = False  # Phase S: a compaction summary head message is present
-    has_shown_80_percent_warning: bool = False  # Track if we've shown the 80% context warning
     current_model: str = field(default_factory=lambda: config.gpt_model)  # Track current model for token limits
     participants: Dict[str, str] = field(default_factory=dict)  # user_id -> display name, for the @mention roster
     # F3 wake envelope: (user_id, sender_type) of the thread's ROOT message author, so the

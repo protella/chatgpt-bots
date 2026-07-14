@@ -262,6 +262,27 @@ Flags: `ENABLE_DEEP_RESEARCH` (default **on**), `DEEP_RESEARCH_REASONING_EFFORT`
 (on — the byline needs the `chat:write.customize` scope; without it the bot posts plainly rather
 than failing).
 
+### 🤫 Fixed - It stops thinking out loud
+
+Three things the bot used to say that it had no business saying.
+
+- **No more "Thinking…" flash on messages it doesn't answer.** Listening in a channel, the bot
+  decides twice whether to speak: a quick judgment call, and then the real one once it has
+  actually read the room. The "Thinking…" indicator went up between the two — so a message it
+  ultimately had nothing to add to still got a spinner that appeared and vanished. Now nothing
+  shows until it has committed to replying. If it decides to stay out of it, you never see it
+  consider the question at all.
+- **👀 means "I'm on this", and it means it.** The eye used to be a *guess*, dropped before the
+  bot had done anything, on a hunch that real work was coming — so it landed on passing
+  comments and then nothing followed. It's now a claim on work: it appears when the bot
+  genuinely starts doing something slow (a search, a build, reading your file), and if that
+  work comes to nothing, **it takes the eye back off**. A quick answer gets no eye at all — the
+  answer is the acknowledgment.
+- **The context-usage box is gone.** It printed a public banner of token counts and "tips for
+  optimal performance" into the thread, where the whole channel could see it, about
+  housekeeping you never asked about and can't act on. Conversation compaction is the bot's
+  own business and it now keeps it to itself.
+
 ### 🧾 Feature - Canvases, for work that outlives the thread
 
 Some things shouldn't be a chat message. A running spec, a launch checklist, a summary that keeps

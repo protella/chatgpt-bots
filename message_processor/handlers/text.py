@@ -69,6 +69,43 @@ def native_stream_place_in_channel(message: Message) -> bool:
     )
 
 
+# F38: hosted tools whose "started" event means real, slow work is now under way — the point
+# at which a 👀 is honest. Everything else the callback fires for is deliberately absent:
+# `mcp` discovery (`discovering_tools`) is plumbing that runs before the model has decided to
+# call anything, and `local:*` events fire the instant a call is DISPATCHED — before its
+# arguments are validated, before a duplicate background job is rejected — so claiming there
+# would flash an eye on a call that never happened. Slow local tools claim from inside their
+# own executors, once they know they are really going to do the work.
+#
+# KNOWN GAP, and it is structural rather than an oversight: these events only exist while
+# STREAMING. A non-streaming turn resolves its hosted tools server-side inside one response,
+# emitting nothing to react to, so a non-streaming web search claims no 👀. Local slow tools
+# still claim on both paths (their executors run in both loops). Streaming is the default, and
+# the alternative — polling, or claiming optimistically before the tools run — would put the
+# eye back on a guess, which is the thing we just removed.
+_WORK_CLAIM_HOSTED_TOOLS = frozenset({
+    "web_search", "file_search", "code_interpreter", "image_generation",
+})
+
+
+def _claims_work(tool_type: str, status: str) -> bool:
+    """Does this tool event mean the bot has committed to real work?"""
+    if status == "started" and tool_type in _WORK_CLAIM_HOSTED_TOOLS:
+        return True
+    # An MCP call signals "calling" (its "discovering_tools" phase is not a call at all).
+    return status == "calling" and (tool_type == "mcp" or tool_type.startswith("mcp:"))
+
+
+def _reaction_committed(local_tool_calls: Optional[List[dict]]) -> bool:
+    """Did the model deliberately react as its response? A no_reply turn is allowed exactly
+    one sibling: react_to_message. That reaction IS an answer, so a turn ending this way has
+    produced output — the F38 work-claim 👀 stays."""
+    return any(
+        c.get("name") == "react_to_message" and c.get("ok")
+        for c in (local_tool_calls or [])
+    )
+
+
 class TextHandlerMixin:
     def _get_tool_registry(self, client: BaseClient, thread_config: dict):
         """The client's local-tool registry, or None when the loop can't/shouldn't run."""
@@ -128,7 +165,7 @@ class TextHandlerMixin:
 
     def _build_tool_context(self, message: Message, client: BaseClient,
                             request_config: Optional[dict] = None,
-                            ci_container=None) -> ToolContext:
+                            ci_container=None, turn=None) -> ToolContext:
         """Per-request context handed to local tool executors."""
         meta = message.metadata or {}
         channel_id = message.channel_id
@@ -143,6 +180,11 @@ class TextHandlerMixin:
             db=self.db,
             is_dm=bool(channel_id and str(channel_id).startswith("D")),
             processor=self,  # F30: start_deep_research reaches openai_client/scheduling/thread_manager
+            # F38: so a slow local tool can stake the 👀 work claim once it knows it is
+            # really going to do the work, and a tool that owns its own surface can record
+            # that the turn produced output.
+            turn=turn,
+            message=message,
             # F34: the image tools' hard settings (image_model), the sandbox they may mount
             # into, and the ids they may edit. container_id is the SAME container already in
             # the tools array — an image mounted anywhere else is invisible to the model.
@@ -184,10 +226,7 @@ class TextHandlerMixin:
         """True when the model reacted (successfully) and deliberately returned no text."""
         if (response_text or "").strip():
             return False
-        return any(
-            c.get("name") == "react_to_message" and c.get("ok")
-            for c in (local_tool_calls or [])
-        )
+        return _reaction_committed(local_tool_calls)
 
     async def _handle_text_response(self, user_content: Any, thread_state, client: BaseClient,
                               message: Message, thinking_id: Optional[str] = None,
@@ -196,7 +235,9 @@ class TextHandlerMixin:
                               failed_mcp_server: Optional[str] = None,
                               _context_retry: bool = False,
                               visible_already_committed: bool = False,
-                              artifacts_acc: Optional[List[dict]] = None) -> Response:
+                              artifacts_acc: Optional[List[dict]] = None,
+                              turn: Optional[Any] = None,
+                              lazy_surface_ts: Optional[str] = None) -> Response:
         """Handle text-only response generation.
 
         ``artifacts_acc`` (F32): container ids seen by EARLIER attempts this turn. Each attempt
@@ -219,13 +260,14 @@ class TextHandlerMixin:
         # Check if streaming is enabled and supported (respecting user prefs)
         # Allow streaming on retry if the failure was just MCP-related (not a streaming failure)
         streaming_enabled = thread_config.get('enable_streaming', config.enable_streaming)
-        # thinking_id None = status-only DM indicator (setStatus, no placeholder).
-        # Streaming still works there when the native path can create its own
-        # message (chat.startStream); the legacy edit loop seeds one lazily.
-        native_capable = (hasattr(client, 'supports_native_streaming')
-                          and client.supports_native_streaming())
-        can_stream = (hasattr(client, 'supports_streaming') and client.supports_streaming() and
-                     streaming_enabled and (thinking_id is not None or native_capable))
+        # F38: streaming no longer needs a placeholder to write into. It used to demand one
+        # (or native streaming, which makes its own message) and otherwise fell back to
+        # non-streaming — which would have silently killed streaming on EVERY ambient turn
+        # wherever native streaming is off. Both paths can create their reply lazily: the
+        # native sink on chat.startStream, the legacy loop by seeding on the first chunk. A
+        # turn that never speaks simply never creates one.
+        can_stream = (hasattr(client, 'supports_streaming') and client.supports_streaming()
+                      and streaming_enabled)
         # F2 (revised 2026-07-10): unprompted turns stream just like prompted turns. The
         # no_response_needed contract is now enforced by a COMMITTED-TEXT rule in the
         # streaming tool loop (a no-reply call is honored only while no visible text has
@@ -238,7 +280,7 @@ class TextHandlerMixin:
                 user_content, thread_state, client, message, thinking_id, attachment_urls,
                 exclude_mcp_server=failed_mcp_server,
                 visible_already_committed=visible_already_committed,
-                artifacts_acc=artifacts_acc,
+                artifacts_acc=artifacts_acc, turn=turn, lazy_surface_ts=lazy_surface_ts,
             )
         
         # Fall back to non-streaming logic
@@ -334,13 +376,17 @@ class TextHandlerMixin:
 
         # Update status before generating
         failed_mcp_display = ", ".join(sorted(self._as_mcp_exclusion_set(failed_mcp_server)))
+        # F38: `turn=` is load-bearing on all three. Without it a DEFERRED turn (thinking_id
+        # None because we deliberately posted nothing) falls through _update_status into
+        # set_assistant_status — which renders a thinking status AND auto-opens the thread,
+        # recreating the exact flash this work removes. Reachable whenever streaming is off.
         if failed_mcp_server:
             self._update_status(client, message.channel_id, thinking_id,
-                               f"Retrying without '{failed_mcp_display}'...", emoji=config.circle_loader_emoji, thread_id=message.thread_id)
+                               f"Retrying without '{failed_mcp_display}'...", emoji=config.circle_loader_emoji, thread_id=message.thread_id, turn=turn)
         elif retry_count > 0:
-            self._update_status(client, message.channel_id, thinking_id, "Retrying response...", emoji=config.circle_loader_emoji, thread_id=message.thread_id)
+            self._update_status(client, message.channel_id, thinking_id, "Retrying response...", emoji=config.circle_loader_emoji, thread_id=message.thread_id, turn=turn)
         else:
-            self._update_status(client, message.channel_id, thinking_id, pipeline_status("generating_response", "Generating response…"), thread_id=message.thread_id)
+            self._update_status(client, message.channel_id, thinking_id, pipeline_status("generating_response", "Generating response…"), thread_id=message.thread_id, turn=turn)
         
         # Determine which model to use (web search model if web search enabled)
         web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
@@ -392,7 +438,7 @@ class TextHandlerMixin:
                 # web_search/MCP in the same tools array). Hold the tool_context so we can
                 # read back F30.1's background_job_started signal after the loop.
                 tool_context = self._build_tool_context(message, client, request_config,
-                                                        ci_container)
+                                                        ci_container, turn=turn)
                 result = await self.openai_client.create_text_response_with_tool_loop(
                     messages=messages_for_api,
                     tools=tools,
@@ -505,7 +551,7 @@ class TextHandlerMixin:
                     attachment_urls, retry_count=retry_count,
                     failed_mcp_server=failed_mcp_server, _context_retry=True,
                     visible_already_committed=visible_already_committed,
-                    artifacts_acc=artifacts
+                    artifacts_acc=artifacts, turn=turn, lazy_surface_ts=lazy_surface_ts
                 )
             raise
         finally:
@@ -561,7 +607,9 @@ class TextHandlerMixin:
                 content="",
                 metadata={"model": thread_config.get("model"),
                           "terminal_action": "no_reply",
-                          "reason": no_reply_reason, "posted": False},
+                          "reason": no_reply_reason, "posted": False,
+                          "response_reaction_committed":
+                              _reaction_committed(local_tool_calls)},
             )
 
         # Build unified tools attribution at the end of response
@@ -699,7 +747,9 @@ class TextHandlerMixin:
                                       attachment_urls: Optional[List[str]] = None,
                                       exclude_mcp_server=None,
                                       visible_already_committed: bool = False,
-                                      artifacts_acc: Optional[List[dict]] = None) -> Response:
+                                      artifacts_acc: Optional[List[dict]] = None,
+                                      turn: Optional[Any] = None,
+                                      lazy_surface_ts: Optional[str] = None) -> Response:
         """Handle text-only response generation with streaming support.
 
         exclude_mcp_server accepts a single label or a set of labels (exclusions
@@ -707,14 +757,19 @@ class TextHandlerMixin:
 
         ``visible_already_committed`` (F8): True when an earlier attempt this turn already
         exposed visible text; seeds the tool loop's committed-text signal so a
-        no_response_needed on this attempt is rejected instead of orphaning the partial."""
+        no_response_needed on this attempt is rejected instead of orphaning the partial.
+
+        ``lazy_surface_ts`` (F38): an earlier attempt this turn created the reply message
+        itself (no placeholder existed). It is OURS — an MCP retry must keep writing into it
+        rather than seeding a second one, which is how the same turn ends up posting twice."""
         exclude_mcp_display = ", ".join(sorted(self._as_mcp_exclusion_set(exclude_mcp_server)))
         # Check if client supports streaming
         if not hasattr(client, 'supports_streaming') or not client.supports_streaming():
             self.log_debug("Client doesn't support streaming, falling back to non-streaming")
             return await self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls, retry_count=0,
                                                     visible_already_committed=visible_already_committed,
-                                                    artifacts_acc=artifacts_acc)
+                                                    artifacts_acc=artifacts_acc, turn=turn,
+                                                    lazy_surface_ts=lazy_surface_ts)
         
         # Get streaming configuration from client
         streaming_config = client.get_streaming_config() if hasattr(client, 'get_streaming_config') else {}
@@ -832,30 +887,43 @@ class TextHandlerMixin:
             initial_message = f"{config.circle_loader_emoji} Retrying without '{exclude_mcp_display}'..."
         else:
             initial_message = f"{config.circle_loader_emoji} {config.random_loading_message()}"
+        # F38: no placeholder is a first-class state now, not a fallback. It means one of
+        # three things and all of them stream fine: a status-only DM (setStatus is the cue),
+        # a deferred turn (nothing may be shown until the model commits), or an MCP retry
+        # that already owns a lazily-created message. The old `else` here bailed out to
+        # non-streaming whenever native streaming was off — which would have cost every
+        # ambient turn its streaming the moment we stopped posting a placeholder.
         if thinking_id:
             # Update existing thinking message
             message_id = thinking_id
             await client.update_message(message.channel_id, message_id, initial_message)
-        elif hasattr(client, 'supports_native_streaming') and client.supports_native_streaming():
-            # Status-only DM indicator: no placeholder exists (setStatus is the
-            # visible cue). The native stream creates the reply message on the
-            # first chunk; if that fails, the legacy loop seeds one lazily.
-            message_id = None
+        elif lazy_surface_ts:
+            # An earlier attempt this turn already created the reply message; keep writing
+            # into it. Seeding another would leave the abandoned partial on screen next to
+            # the retry's answer.
+            message_id = lazy_surface_ts
+            try:
+                await client.update_message(message.channel_id, message_id, initial_message)
+            except Exception as e:  # noqa: BLE001
+                self.log_debug(f"Could not reset the lazy surface for retry: {e}")
         else:
-            # We need a way to post a message and get its ID - this would depend on client implementation
-            self.log_warning("No thinking_id provided for streaming - falling back to non-streaming")
-            return await self._handle_text_response(user_content, thread_state, client, message, thinking_id, attachment_urls, retry_count=0,
-                                                    visible_already_committed=visible_already_committed,
-                                                    artifacts_acc=artifacts_acc)
+            message_id = None  # created lazily: native on startStream, legacy on first chunk
         
         async def stream_status_update(status_msg: str) -> dict:
-            """Tool/phase status during streaming: edit the placeholder when one
-            exists; on status-only turns (no placeholder — setStatus is the visible
-            cue, DMs and agent-surface channel threads alike) route to the native
-            composer status instead of editing a message."""
-            if message_id:
+            """Tool/phase status during streaming: edit the reply message when one exists;
+            on status-only turns (no placeholder — setStatus is the visible cue, DMs and
+            agent-surface channel threads alike) route to the composer status instead.
+
+            F38: on a DEFERRED turn there is neither, and there must not be — a composer
+            status here would render a thinking line and auto-open the thread for a turn
+            that may be about to say nothing. Status is dropped until the reply exists;
+            once it does, `current_message_id` carries it and the edit path resumes."""
+            surface = current_message_id or message_id
+            if surface:
                 # Original pre-status-only path: rate-limited streaming edit.
-                return await client.update_message_streaming(message.channel_id, message_id, status_msg)
+                return await client.update_message_streaming(message.channel_id, surface, status_msg)
+            if turn is not None and not turn.progress_enabled:
+                return {"success": True}   # deferred: no surface may be conjured to say this
             if hasattr(client, "set_assistant_status"):
                 try:
                     await client.set_assistant_status(message.channel_id, message.thread_id, status=status_msg)
@@ -884,25 +952,20 @@ class TextHandlerMixin:
         mcp_servers_used = set()
         loop_external_used = []  # web_search/MCP names surfaced by the tool loop (local tools are plumbing, never listed)
 
-        # F34: the 👀 "I'm on it" ack used to ride on the intent classifier's ack bit. With
-        # the classifier gone, the honest signal that this turn is real work is a tool
-        # actually firing — a couple of seconds later than the pre-flight guess, but true
-        # rather than predicted. Fires once, and BEFORE the native-stream guard below (which
-        # returns early once the stream owns the message).
-        ack_placed = False
-
         # Define tool event callback
         async def tool_callback(tool_type: str, status: str):
             """Handle tool events for status updates"""
-            nonlocal progress_task, ack_placed
+            nonlocal progress_task
 
-            if (status == "started" and not ack_placed
-                    and getattr(config, "enable_ack_reaction", True)):
-                ack_placed = True
-                try:
-                    await self._place_ack_reaction(client, message)
-                except Exception as e:  # noqa: BLE001 — an emoji must never break a turn
-                    self.log_debug(f"ack reaction failed: {e}")
+            # F38: stake the 👀 work claim — but only for the hosted tools that genuinely take
+            # time. This hook fires for EVERY tool event, including fast lookups and calls the
+            # executor is about to reject, and an eye that appears and vanishes a second later
+            # is exactly the misleading thing we are removing. Slow LOCAL tools claim from
+            # inside their own executors instead, after their arguments and capacity checks
+            # pass. Fires BEFORE the native-stream guard below (which returns early once the
+            # stream owns the message).
+            if turn is not None and _claims_work(tool_type, status):
+                await turn.claim_work(client, message)
 
             # Native mode: once the stream owns the visible message the placeholder is
             # gone — status edits would hit a deleted ts. Log tool activity instead.
@@ -1045,6 +1108,17 @@ class TextHandlerMixin:
         # at the first confirmed content delivery (== part 1's message in either path).
         first_delivered_ts = None
         overflow_buffer = ""
+        # F38: the ONE authoritative answer to "where does a reply this turn creates go?".
+        # None = top-level in the channel. Every message the streaming paths mint — the lazy
+        # seed, overflow parts, the zero-chunk final post — must use this and never
+        # `message.thread_id`, which is merely the thread the TRIGGER lives in. They got away
+        # with the latter only because a placeholder already existed in the right place.
+        reply_target = (turn.reply_thread_id if turn is not None
+                        else (None if native_stream_place_in_channel(message)
+                              else message.thread_id))
+        # A reply message this attempt created itself (no placeholder). An MCP retry inherits
+        # it so the turn edits its existing answer instead of posting a second one.
+        lazy_surface_owned = lazy_surface_ts
         continuation_msg = continuation_trailer()  # shared marker (message_markers)
         # Reserve space for: continuation msg (~40), part prefix (~30), tools attribution (~100), markdown expansion (~400)
         # CRITICAL: The messaging layer (update_message_streaming) has a backup truncation at 3700 chars
@@ -1062,10 +1136,9 @@ class TextHandlerMixin:
         native_coord = None
         if (hasattr(client, "supports_native_streaming") and client.supports_native_streaming()
                 and hasattr(client, "begin_native_stream")):
-            place_in_channel = native_stream_place_in_channel(message)
             native_coord = NativeStreamCoordinator(
                 client, message.channel_id,
-                None if place_in_channel else message.thread_id,
+                reply_target,
                 char_limit=message_char_limit, logger=self.log_debug,
                 user_id=message.user_id,
             )
@@ -1077,7 +1150,7 @@ class TextHandlerMixin:
         # Define the streaming callback
         async def stream_callback(text_chunk: str):
             """Callback function called with each text chunk from OpenAI"""
-            nonlocal current_message_id, current_part, overflow_buffer, progress_task, first_chunk_received, streaming_aborted, visible_content_delivered, first_delivered_ts
+            nonlocal current_message_id, current_part, overflow_buffer, progress_task, first_chunk_received, streaming_aborted, visible_content_delivered, first_delivered_ts, lazy_surface_owned
 
             # If we've aborted, ignore further chunks
             if streaming_aborted:
@@ -1153,16 +1226,21 @@ class TextHandlerMixin:
                     return
                 # start failed: fall through to the legacy path (chunk not yet buffered)
 
-            # Status-only DM (no placeholder) reaching the legacy path: edits need
-            # a real message — seed it now, once. Retried on the next chunk if the
-            # seed post fails; the post-stream final correction is the backstop.
+            # No placeholder (status-only DM, or F38 deferred) reaching the legacy path:
+            # edits need a real message — seed it now, once. This IS the moment the turn
+            # commits: the first words exist, so a surface may finally appear. Retried on
+            # the next chunk if the seed post fails; the post-stream final correction is the
+            # backstop. The seed goes to `reply_target` (F38), NOT message.thread_id — a
+            # top-level channel reply must not land inside a thread just because no
+            # placeholder was there to hold its place.
             if current_message_id is None:
                 if text_chunk is None and not buffer.has_pending_update():
                     return
                 seed = await client.send_message_get_ts(
-                    message.channel_id, message.thread_id, initial_message)
+                    message.channel_id, reply_target, initial_message)
                 if seed and seed.get("success") and seed.get("ts"):
                     current_message_id = seed["ts"]
+                    lazy_surface_owned = seed["ts"]  # ours: an MCP retry must reuse it
                 else:
                     self.log_warning("Could not seed legacy streaming message (status-only DM) — chunk buffered")
                     if text_chunk:
@@ -1292,8 +1370,11 @@ class TextHandlerMixin:
                             
                             continuation_text = f"{part_prefix(current_part)}{continuation_display} {config.loading_ellipse_emoji}"
 
-                            # Send new message and get its ID
-                            new_msg_result = await client.send_message_get_ts(message.channel_id, thinking_id or message.thread_id, continuation_text)
+                            # Send new message and get its ID. F38: overflow parts go where the
+                            # REPLY goes. This used to pass `thinking_id` as the thread id,
+                            # which on a top-level channel reply nested part 2 in a thread
+                            # under part 1.
+                            new_msg_result = await client.send_message_get_ts(message.channel_id, reply_target, continuation_text)
                             if new_msg_result and new_msg_result.get("success") and "ts" in new_msg_result:
                                 current_message_id = new_msg_result["ts"]
                                 # Reset buffer with the properly fenced overflow content
@@ -1514,7 +1595,7 @@ class TextHandlerMixin:
                 # rounds don't stream text; the final round streams normally). Hold the
                 # tool_context so we can read back F30.1's background_job_started signal.
                 tool_context = self._build_tool_context(message, client, request_config,
-                                                        ci_container)
+                                                        ci_container, turn=turn)
                 loop_result = await self.openai_client.create_streaming_response_with_tool_loop(
                     messages=messages_for_api,
                     tools=tools,
@@ -1624,7 +1705,9 @@ class TextHandlerMixin:
                     content="",
                     metadata={"streamed": True, "terminal_action": "no_reply",
                               "reason": no_reply_reason,
-                              "model": thread_config.get("model"), "posted": False}
+                              "model": thread_config.get("model"), "posted": False,
+                              "response_reaction_committed":
+                                  _reaction_committed(local_tool_calls)}
                 )
 
             # Reaction-only turn: the model reacted via the react tool and deliberately
@@ -1760,16 +1843,17 @@ class TextHandlerMixin:
             if native_finalized:
                 visible_content_delivered = True  # native stopStream delivered the final text (+ attribution)
             elif current_message_id is None:
-                # Status-only DM where neither the native stream nor the lazy legacy
-                # seed ever produced a message (e.g. zero chunks before completion).
-                # Post the response fresh so nothing is lost (attribution is already
-                # appended to response_text above).
+                # No surface at all — status-only DM or an F38 deferred turn where neither
+                # the native stream nor the lazy legacy seed ever produced a message (e.g.
+                # zero chunks before completion). Post the response fresh so nothing is lost
+                # (attribution is already appended to response_text above). Goes to
+                # reply_target, not message.thread_id: nothing has established placement yet.
                 self.log_info("No streaming message exists — posting final response directly")
                 try:
                     # Capture the delivered ts so F5/F7 below key on the real message
                     # (send_message already records the own-reply pulse for this ts;
                     # record_own_reply is idempotent by (channel, ts) so a repeat is a no-op).
-                    posted_ts = await client.send_message(message.channel_id, message.thread_id, response_text)
+                    posted_ts = await client.send_message(message.channel_id, reply_target, response_text)
                     if posted_ts:
                         current_message_id = posted_ts
                         visible_content_delivered = True
@@ -1814,7 +1898,7 @@ class TextHandlerMixin:
                                 message.channel_id, current_message_id, truncated)
                             overflow_text = final_part_text[cut:].lstrip()
                             await client.send_message(
-                                message.channel_id, message.thread_id,
+                                message.channel_id, reply_target,
                                 f"{CONTINUATION_HEAD}\n\n{overflow_text}")
                         else:
                             final_result = await client.update_message_streaming(message.channel_id, current_message_id, final_part_text)
@@ -1867,7 +1951,7 @@ class TextHandlerMixin:
 
                             # Send the rest as new messages
                             overflow_text = response_text[cut:].lstrip()
-                            await client.send_message(message.channel_id, message.thread_id, f"{CONTINUATION_HEAD}\n\n{overflow_text}")
+                            await client.send_message(message.channel_id, reply_target, f"{CONTINUATION_HEAD}\n\n{overflow_text}")
 
                             if final_result["success"]:
                                 visible_content_delivered = True
@@ -2064,6 +2148,48 @@ class TextHandlerMixin:
                 except Exception as e:  # noqa: BLE001 — a lingering partial beats a lost answer
                     self.log_warning(f"Could not delete abandoned partial stream: {e}")
 
+            # F38: same reasoning for a message the LEGACY loop seeded itself (no placeholder
+            # existed — a deferred or status-only turn). The non-streaming fallback posts a
+            # fresh answer, so this partial has to go or the turn speaks twice. An MCP retry
+            # is the exception: it keeps streaming and inherits the surface below.
+            #
+            # This one FAILS CLOSED: the surface may hold PARTIAL ANSWER TEXT, so posting a
+            # fresh full answer beside it would show the user the same reply twice. If we
+            # cannot delete it, we keep exactly one surface, tell the truth in it, and stop.
+            #
+            # The native branch above does NOT fail closed, and that is a pre-existing gap
+            # rather than a considered asymmetry — a failed native stream can hold partial
+            # answer text too, so a failed delete there carries the same double-output risk.
+            # Left alone deliberately: it predates this change and is not newly reachable.
+            # Flagged for its own fix.
+            if lazy_surface_owned and not failed_mcp_server:
+                deleted = False
+                try:
+                    deleted = bool(await client.delete_message(
+                        message.channel_id, lazy_surface_owned))
+                except Exception as e:  # noqa: BLE001
+                    self.log_warning(f"Could not delete the lazily-seeded partial: {e}")
+                if not deleted:
+                    self.log_error(
+                        "Could not remove the partial reply before falling back — refusing to "
+                        "post a second answer; surfacing the interruption in place instead")
+                    try:
+                        await client.update_message(
+                            message.channel_id, lazy_surface_owned,
+                            "⚠️ I got cut off partway through that answer. Please ask again.")
+                    except Exception as e:  # noqa: BLE001
+                        self.log_error(f"Could not surface the interruption: {e}")
+                    return Response(
+                        type="text", content="",
+                        metadata={"streamed": True, "posted": True,
+                                  "model": thread_config.get("model"),
+                                  "interrupted": True},
+                    )
+                self.log_debug("Deleted the lazily-seeded partial before non-streaming fallback")
+                if lazy_surface_owned == cleanup_ts:
+                    cleanup_ts = None
+                lazy_surface_owned = None
+
             # Retry request - streaming preserved for MCP failures, non-streaming for other errors
             if failed_mcp_server:
                 self.log_info("Retrying with streaming (excluding failed MCP server)")
@@ -2088,7 +2214,11 @@ class TextHandlerMixin:
                 user_content, thread_state, client, message, thinking_id,
                 attachment_urls, retry_count=1, failed_mcp_server=failed_mcp_servers,
                 visible_already_committed=visible_content_delivered,
-                artifacts_acc=artifacts
+                artifacts_acc=artifacts, turn=turn,
+                # F38: an MCP retry keeps streaming, so hand it the message this attempt
+                # created. Without it the retry sees "no placeholder", seeds a SECOND
+                # message, and the turn posts its answer twice.
+                lazy_surface_ts=lazy_surface_owned,
             )
 
     @staticmethod
