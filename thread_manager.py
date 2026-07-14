@@ -25,7 +25,6 @@ class ThreadState:
     system_prompt: Optional[str] = None
     last_activity: float = field(default_factory=time.time)
     is_processing: bool = False
-    pending_clarification: Optional[Dict[str, Any]] = None
     had_timeout: bool = False  # Track if this thread had a timeout for user notification
     has_trimmed_messages: bool = False  # Track if messages have been trimmed from this thread
     has_summary_head: bool = False  # Phase S: a compaction summary head message is present
@@ -227,73 +226,9 @@ class AssetLedger:
     thread_ts: str
     images: List[Dict[str, Any]] = field(default_factory=list)
     
-    def add_image(self, image_data: str, prompt: str, timestamp: float, slack_url: Optional[str] = None, source: str = "generated", original_url: Optional[str] = None, db = None, thread_id: Optional[str] = None, analysis: Optional[str] = None):
-        """Add an image to the ledger
-        
-        Args:
-            image_data: Base64 encoded image data (NOT stored in DB)
-            prompt: Description or prompt for the image
-            timestamp: When the image was added
-            slack_url: URL if uploaded to Slack
-            source: Source of image - 'generated', 'attachment', 'url'
-            original_url: Original URL if image was downloaded from web
-            db: Optional database manager for persistence
-            thread_id: Optional thread ID for database storage
-            analysis: Optional vision analysis for database storage
-        """
-        # Store in memory (for backward compatibility, but without base64 if DB available)
-        if db:
-            # Don't store base64 in memory when DB is available
-            self.images.append({
-                "data": None,  # No base64 in memory when using DB
-                "prompt": prompt,  # Full prompt in memory when DB available
-                "timestamp": timestamp,
-                "slack_url": slack_url,
-                "source": source,
-                "original_url": original_url
-            })
-            
-            # Store metadata in database (no base64)
-            if thread_id and (slack_url or original_url):
-                db.save_image_metadata(
-                    thread_id=thread_id,
-                    url=slack_url or original_url,
-                    image_type=source,
-                    prompt=prompt,  # Full prompt to DB
-                    analysis=analysis,
-                    metadata={"timestamp": timestamp}
-                )
-        else:
-            # Legacy behavior when no DB
-            self.images.append({
-                "data": image_data,
-                "prompt": prompt[:100],  # Truncated without DB
-                "timestamp": timestamp,
-                "slack_url": slack_url,
-                "source": source,
-                "original_url": original_url
-            })
-    
-    def add_url_image(self, image_data: str, url: str, timestamp: float, slack_url: Optional[str] = None):
-        """Add an image downloaded from a URL"""
-        self.add_image(
-            image_data=image_data,
-            prompt=f"Image from URL: {url}",
-            timestamp=timestamp,
-            slack_url=slack_url,
-            source="url",
-            original_url=url
-        )
-    
-    def get_recent_images(self, count: int = 5) -> List[Dict[str, Any]]:
-        """Get the most recent images"""
-        return self.images[-count:] if self.images else []
-    
-    def clear_old_images(self, _keep_last: int = 10):
-        """Keep only the most recent images to manage memory"""
-        # With database, we don't need to limit images
-        # This method is kept for backward compatibility but does nothing
-        pass
+    # Rows are appended directly by the delivery seam (message_processor/image_delivery.py);
+    # the old add_image/add_url_image writers belonged to the deleted vision + image-edit
+    # handlers, which also owned the DB write that publish_image now does.
 
 
 class AsyncThreadLockManager(LoggerMixin):
@@ -482,8 +417,9 @@ class AsyncThreadStateManager(LoggerMixin):
 
     def mark_upload_started(self, thread_key: str, generation_id: Optional[str] = None):
         """Signal that an asset upload for this thread is in flight. F13: overlapping
-        generations each register their own token (generation_id, or "__sync__" for the
-        serial sync path which passes None); wait_for_uploads blocks until ALL land."""
+        generations each register their own token (generation_id, or "__sync__" when the
+        caller has none). The detached generate_image tool claims its token while the turn
+        still holds the thread lock; the event clears only once every token drains."""
         token = generation_id or "__sync__"
         self._upload_pending.setdefault(thread_key, set()).add(token)
         event = self._upload_events.get(thread_key)
@@ -506,18 +442,6 @@ class AsyncThreadStateManager(LoggerMixin):
             event = self._upload_events.get(thread_key)
             if event is not None:
                 event.set()
-
-    async def wait_for_uploads(self, thread_key: str, timeout: float = 10.0):
-        """Wait (bounded) for ALL in-flight asset uploads on this thread to land."""
-        if not self._upload_pending.get(thread_key):
-            return
-        event = self._upload_events.get(thread_key)
-        if event is None or event.is_set():
-            return
-        try:
-            await asyncio.wait_for(event.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            self.log_warning(f"Timed out waiting for in-flight upload on {thread_key}; proceeding")
 
     # --- F1: background image-generation registry ---
 

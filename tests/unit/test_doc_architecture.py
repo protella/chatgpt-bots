@@ -12,6 +12,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from config import config
+from message_processor.utilities import MessageUtilitiesMixin
 
 
 # ---------------------------------------------------------------------------
@@ -109,12 +110,10 @@ class TestPromptsAndGuidance:
 # Injection rendering
 # ---------------------------------------------------------------------------
 
-class _UtilHarness:
-    from message_processor.utilities import MessageUtilitiesMixin as _M
-    _build_message_with_documents = _M._build_message_with_documents
-    _build_user_content = _M._build_user_content
-    _native_file_eligible = _M._native_file_eligible
-    _build_spreadsheet_schema_block = _M._build_spreadsheet_schema_block
+class _UtilHarness(MessageUtilitiesMixin):
+    """Inherits the mixin rather than cherry-picking methods off it: the copied-attribute
+    form silently broke whenever a mixin method started calling a NEW private helper
+    (self._api_part), which the harness had no way to know about."""
 
     def log_warning(self, *a, **k): pass
     def log_info(self, *a, **k): pass

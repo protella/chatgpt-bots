@@ -69,17 +69,6 @@ class TestBotConfig:
         config = BotConfig()
         assert config.progress_checklist_prefer_message is False
 
-    def test_background_image_gen_default_enabled(self, mock_env):
-        """ENABLE_BACKGROUND_IMAGE_GEN defaults to True"""
-        config = BotConfig()
-        assert config.enable_background_image_gen is True
-
-    @patch.dict(os.environ, {"ENABLE_BACKGROUND_IMAGE_GEN": "false"})
-    def test_background_image_gen_disabled(self, mock_env):
-        """ENABLE_BACKGROUND_IMAGE_GEN=false disables background generation"""
-        config = BotConfig()
-        assert config.enable_background_image_gen is False
-
     def test_api_timeout_image_default(self, mock_env):
         """API_TIMEOUT_IMAGE defaults to 300 and exceeds the general read timeout"""
         config = BotConfig()

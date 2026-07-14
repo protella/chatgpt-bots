@@ -4,11 +4,7 @@ import pytest
 from prompts import (
     SLACK_SYSTEM_PROMPT,
     CLI_SYSTEM_PROMPT,
-    INTENT_CLASSIFIER_PROMPT,
-    IMAGE_INTENT_SYSTEM_PROMPT,
     IMAGE_ANALYSIS_PROMPT,
-    VISION_DEFAULT_QUESTION,
-    VISION_ENHANCEMENT_PROMPT,
     IMAGE_EDIT_SYSTEM_PROMPT,
     IMAGE_GEN_SYSTEM_PROMPT,
 )
@@ -53,59 +49,12 @@ class TestPrompts:
         assert len(CLI_SYSTEM_PROMPT) > 0
         assert "helpful assistant" in CLI_SYSTEM_PROMPT.lower()
 
-    def test_intent_classifier_prompt_defined(self):
-        """INTENT_CLASSIFIER_PROMPT keeps all five labels + the learned rules"""
-        assert INTENT_CLASSIFIER_PROMPT is not None
-        assert isinstance(INTENT_CLASSIFIER_PROMPT, str)
-        for label in ("new", "edit", "vision", "ambiguous", "none"):
-            assert label in INTENT_CLASSIFIER_PROMPT
-        # Learned production rules survive the trim
-        assert "PREVIOUS response type" in INTENT_CLASSIFIER_PROMPT  # continuation rule
-        assert "attachments" in INTENT_CLASSIFIER_PROMPT             # vision requires files
-        assert "URLs" in INTENT_CLASSIFIER_PROMPT                    # links are not images
-        assert "logo" in INTENT_CLASSIFIER_PROMPT.lower()            # logo/icon -> new
-        # Output instruction — F19 extended it to two tokens (intent + ack flag)
-        assert "Output exactly two tokens" in INTENT_CLASSIFIER_PROMPT
-        assert "<ack|noack>" in INTENT_CLASSIFIER_PROMPT
-
-    def test_intent_classifier_backcompat_alias(self):
-        """Old constant name still resolves (pre-modernization imports/tests)"""
-        assert IMAGE_INTENT_SYSTEM_PROMPT is INTENT_CLASSIFIER_PROMPT
-
-    def test_intent_classifier_is_trimmed(self):
-        """The classifier fires on every responded message and sits below OpenAI's
-        1024-token cache threshold — it must stay small. chars/4 proxy < 420 tokens.
-
-        Budget raised from 350 (see test_prompt_modernization for the full rationale): the
-        prompt was pinned at 1399/1400 chars and its `new` bullet treated "visualize" as an
-        image trigger, routing charts to the image model."""
-        assert len(INTENT_CLASSIFIER_PROMPT) / 4 < 420
-
-    def test_intent_classifier_never_routes_charts_to_the_image_model(self):
-        """The bug this guards: gpt-image-1 DRAWS a chart — inventing both the numbers and the
-        category names — instead of the sandbox COMPUTING one from the user's actual data."""
-        new_bullet = INTENT_CLASSIFIER_PROMPT.split("- edit")[0]
-        assert "visualize" not in new_bullet.lower()
-        assert "chart" in INTENT_CLASSIFIER_PROMPT.lower()
-        assert '"none", never "new"' in INTENT_CLASSIFIER_PROMPT
-
     def test_image_analysis_prompt_defined(self):
         assert IMAGE_ANALYSIS_PROMPT is not None
         assert "image" in IMAGE_ANALYSIS_PROMPT.lower()
         assert "concise" in IMAGE_ANALYSIS_PROMPT.lower()
         # Stored as hidden context in every rebuild with images — bounded length
         assert "Maximum 120 words" in IMAGE_ANALYSIS_PROMPT
-
-    def test_vision_default_question_defined(self):
-        """Standard question used when the user attaches an image with no real ask"""
-        assert isinstance(VISION_DEFAULT_QUESTION, str)
-        assert "conversationally" in VISION_DEFAULT_QUESTION
-
-    def test_vision_enhancement_prompt_defined(self):
-        assert VISION_ENHANCEMENT_PROMPT is not None
-        assert isinstance(VISION_ENHANCEMENT_PROMPT, str)
-        assert "conversational" in VISION_ENHANCEMENT_PROMPT.lower()
-        assert "troubleshooting" in VISION_ENHANCEMENT_PROMPT.lower()
 
     def test_image_edit_system_prompt_defined(self):
         """Edit prompt: literal instructions, bounded length, no unasked embellishment"""
@@ -131,10 +80,7 @@ class TestPrompts:
         prompts = [
             SLACK_SYSTEM_PROMPT,
             CLI_SYSTEM_PROMPT,
-            INTENT_CLASSIFIER_PROMPT,
             IMAGE_ANALYSIS_PROMPT,
-            VISION_DEFAULT_QUESTION,
-            VISION_ENHANCEMENT_PROMPT,
             IMAGE_EDIT_SYSTEM_PROMPT,
             IMAGE_GEN_SYSTEM_PROMPT,
         ]
@@ -146,10 +92,7 @@ class TestPrompts:
         prompts = [
             SLACK_SYSTEM_PROMPT,
             CLI_SYSTEM_PROMPT,
-            INTENT_CLASSIFIER_PROMPT,
             IMAGE_ANALYSIS_PROMPT,
-            VISION_DEFAULT_QUESTION,
-            VISION_ENHANCEMENT_PROMPT,
             IMAGE_EDIT_SYSTEM_PROMPT,
             IMAGE_GEN_SYSTEM_PROMPT,
         ]
@@ -166,9 +109,6 @@ class TestPrompts:
         # Username-prefix convention + never-echo rule
         assert 'prefixed "Username: "' in SLACK_SYSTEM_PROMPT
         assert "never copy the format" in SLACK_SYSTEM_PROMPT.lower()
-        # Intent classifier has all categories
-        for category in ("new", "edit", "vision", "ambiguous", "none"):
-            assert category in INTENT_CLASSIFIER_PROMPT
         # Edit prompt distinguishes both edit types
         assert "photo edit only" in IMAGE_EDIT_SYSTEM_PROMPT
         assert "Style transformation" in IMAGE_EDIT_SYSTEM_PROMPT

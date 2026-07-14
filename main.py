@@ -14,6 +14,7 @@ from message_processor.base import MessageProcessor
 from message_processor.participation import (ParticipationEngine,
                                              render_capabilities_line)
 from message_processor.people_tools import format_people_summary
+from message_processor import thread_files
 from base_client import BaseClient, Message
 
 
@@ -73,6 +74,32 @@ class ChatBotV2:
                 and md.get("participation_name_hit") is not True)
 
     async def _run_participation_gate(self, message: Message, client: BaseClient):
+        """The gate, plus the one thing that must happen whether or not we speak.
+
+        Deciding not to REPLY to a message is not the same as deciding to FORGET it. Everything
+        that records a shared file — the document row, the image row, and therefore the catalog
+        that `mount_file` and `read_document` resolve against — lived inside the turn, so a
+        message we stayed quiet about had its attachments dropped on the floor for good.
+
+        That is not a rare corner. It happened on the very first live run of this feature: four
+        files were dropped into a thread a couple of seconds apart, the CSV among them arrived
+        while the gate was still debouncing, its message was superseded by the next one, and the
+        CSV simply ceased to exist as far as the bot was concerned. The model then — correctly —
+        refused to build the report, because it could not read the numbers and would not invent
+        them. The file was sitting right there in the channel.
+
+        So: run the gate, and if the answer is anything other than "respond", catalog the files
+        anyway. When the answer IS respond, the turn does the richer job (extraction, summaries,
+        visual descriptions) and we leave it alone — `save_document` is a plain INSERT, so
+        cataloguing here as well would just duplicate the row.
+        """
+        verdict = await self._gate_verdict(message, client)
+        if verdict is None and (message.attachments or []):
+            self.processor._schedule_async_call(
+                thread_files.catalog_unattended(self.processor, client, message))
+        return verdict
+
+    async def _gate_verdict(self, message: Message, client: BaseClient):
         """Phase F gate for UNPROMPTED channel messages: hard rails → debounce →
         ONE engine call → act. Returns a verdict only for action='respond';
         every other outcome (ignore / react / backoff / superseded / any failure)
@@ -141,6 +168,15 @@ class ChatBotV2:
             # F11: inventory of the assistant's own tools/data sources so the classifier
             # can weigh whether it is well-suited to answer an open question to the room.
             capabilities = render_capabilities_line(getattr(self.processor, "mcp_manager", None))
+            # F36: canvases are channel furniture, like the topic. Cached per channel.
+            channel_canvases = []
+            try:
+                from message_processor import canvas_tools
+                channel_canvases = [c["title"] for c in
+                                    await canvas_tools.build_catalog(client, channel_id)]
+            except Exception:  # noqa: BLE001 — never cost the gate a verdict
+                channel_canvases = []
+
             verdict = await engine.evaluate(
                 channel_id=channel_id, ts=ts, text=message.text,
                 sender_id=message.user_id,
@@ -152,6 +188,7 @@ class ChatBotV2:
                 name_hit=name_hit,
                 sender_is_bot=message.metadata.get("participation_sender_bot") is True,
                 channel_topic=channel_topic,
+                channel_canvases=channel_canvases,
                 channel_people=channel_people,
                 capabilities=capabilities,
                 attachments=message.metadata.get("participation_attachments"),
@@ -282,6 +319,41 @@ class ChatBotV2:
             return "this conversation"
         return (cleaned[:80] + "…") if len(cleaned) > 80 else cleaned
 
+    async def _rescue_sandbox_images(self, response, client: BaseClient, message: Message,
+                                     post_thread_id: str) -> None:
+        """Post images the model made as sandbox ingredients but never turned into anything.
+
+        create_image_asset deliberately does not publish: its image is a component of some
+        larger artifact (a slide in a deck, a layer in a composite), and posting the raw
+        ingredient alongside the finished thing would be noise. But if the turn published
+        NOTHING, the model generated images and then failed to use them — and the container
+        they live in is gone within 20 minutes. Handing them over beats losing them silently.
+        """
+        assets = (response.metadata or {}).get("sandbox_image_assets") or []
+        if not assets:
+            return
+        from message_processor.image_delivery import publish_image
+        main_logger.warning(
+            f"Turn published no artifacts but created {len(assets)} sandbox image(s) — "
+            "posting them directly rather than letting them die with the container")
+        thread_key = f"{message.channel_id}:{message.thread_id}"
+        for asset in assets:
+            image_data = asset.get("image_data")
+            if image_data is None:
+                continue
+            try:
+                await publish_image(
+                    processor=self.processor, client=client, channel_id=message.channel_id,
+                    thread_id=post_thread_id, thread_key=thread_key, image_data=image_data,
+                    checklist=None, generation_id=None,
+                    prompt=asset.get("enhanced_prompt") or asset.get("prompt") or "",
+                    db=getattr(self.processor, "db", None),
+                    thread_manager=self.processor.thread_manager, unprompted=False,
+                    message_ts=(message.metadata or {}).get("ts"),
+                )
+            except Exception as e:
+                main_logger.error(f"Sandbox image rescue failed: {e}", exc_info=True)
+
     async def handle_message(self, message: Message, client: BaseClient):
         """Handle incoming message from any platform"""
         # Phase F participation gate: for UNPROMPTED channel messages (judicious/active
@@ -368,15 +440,12 @@ class ChatBotV2:
 
         response = None
         try:
-            # Process the message and get intent
             response = await self.processor.process_message(message, client, thinking_id)
-            
-            # Delete thinking indicator (but not if streaming was used - it's already the
-            # response, not for background image gen — the job owns that message/status —
-            # and not when a ProgressChecklist owns the thinking message, F4).
+
+            # Delete thinking indicator (but not if streaming was used — it's already the
+            # response — and not when a ProgressChecklist owns the thinking message, F4).
             if (thinking_id and response
                     and not response.metadata.get("streamed")
-                    and response.type != "background"
                     and response.metadata.get("checklist") is None):
                 await client.delete_message(message.channel_id, thinking_id)
             elif thinking_id and not response:
@@ -464,6 +533,7 @@ class ChatBotV2:
                     # no chart. (A files-only turn has empty content by design — still publish.)
                     reply_landed = (response.metadata or {}).get("posted") is not False
                     files_only = not (response.content or "").strip()
+                    published = []
                     if artifact_containers and (reply_landed or files_only):
                         try:
                             from message_processor.artifacts import publish_artifacts
@@ -482,6 +552,10 @@ class ChatBotV2:
                                     message_ts=(message.metadata or {}).get("ts"),
                                     container_manager=getattr(
                                         self.processor, "container_manager", None),
+                                    # F35: files the model MOUNTED are ingredients the user
+                                    # already owns — never publish them back, even byte-copied.
+                                    suppress_digests=(response.metadata or {}).get(
+                                        "mounted_digests") or [],
                                 ),
                                 timeout=config.artifact_publish_timeout,
                             )
@@ -496,80 +570,16 @@ class ChatBotV2:
                         main_logger.warning(
                             "Reply did not post — suppressing its artifacts (a file with no "
                             "answer above it reads as a bug)")
-                elif response.type == "image":
-                    # Latch: the upload + DB row land after the thread lock released, so a
-                    # fast follow-up "edit it" must wait for this to finish (or time out).
-                    upload_thread_key = f"{message.channel_id}:{message.thread_id}"
-                    upload_manager = getattr(self.processor, "thread_manager", None)
-                    if upload_manager and hasattr(upload_manager, "mark_upload_started"):
-                        upload_manager.mark_upload_started(upload_thread_key)
 
-                    from message_processor.image_delivery import publish_image
-                    unprompted = self._is_unprompted_turn(message)
-                    # F4: if the handler threaded a live ProgressChecklist, it owns the
-                    # status surface — publish_image does the "Uploading…" step + completes
-                    # it in place (keeping the accumulated steps + history marker). Only the
-                    # config-off (no-checklist) path gets the manual "Uploading…" message.
-                    checklist = response.metadata.get("checklist")
-                    upload_status_id = None
-                    if checklist is None:
-                        platform_name = client.name.replace("Bot", "") if hasattr(client, 'name') else "system"
-                        upload_status = f"{config.circle_loader_emoji} Uploading image to {platform_name}..."
-                        if response.metadata.get("streamed"):
-                            status_msg_id = response.metadata.get("status_message_id")
-                            if status_msg_id and hasattr(client, 'update_message'):
-                                await client.update_message(message.channel_id, status_msg_id, upload_status)
-                                upload_status_id = status_msg_id
-                            else:
-                                upload_status_id = await client.send_thinking_indicator(message.channel_id, message.thread_id)
-                                if upload_status_id and hasattr(client, 'update_message'):
-                                    await client.update_message(message.channel_id, upload_status_id, upload_status)
-                        else:
-                            upload_status_id = await client.send_thinking_indicator(message.channel_id, message.thread_id)
-                            if upload_status_id and hasattr(client, 'update_message'):
-                                await client.update_message(message.channel_id, upload_status_id, upload_status)
-
-                    try:
-                        # Delivery seam owns upload, falsey-URL = failure, breadcrumb-
-                        # independent DB persistence + warm state, ledger, checklist
-                        # completion, and unprompted accounting. generation_id is None (sync).
-                        file_url = await publish_image(
-                            processor=self.processor,
-                            client=client,
-                            channel_id=message.channel_id,
-                            thread_id=message.thread_id,
-                            thread_key=upload_thread_key,
-                            image_data=response.content,
-                            checklist=checklist,
-                            generation_id=None,
-                            prompt=(response.metadata.get("prompt") or ""),
-                            db=getattr(self.processor, "db", None),
-                            thread_manager=self.processor.thread_manager,
-                            unprompted=unprompted,
-                            message_ts=(message.metadata or {}).get("ts"),
-                            image_type=response.metadata.get("image_type", "generated"),
-                        )
-                        if file_url is None:
-                            await client.handle_error(
-                                message.channel_id, message.thread_id,
-                                "⚠️ I created the image but couldn't post it. Please try again.")
-                    finally:
-                        # Always release the latch — a wedged latch would stall the next
-                        # edit for the full wait timeout (publish_image no longer releases it).
-                        if upload_manager and hasattr(upload_manager, "mark_upload_finished"):
-                            upload_manager.mark_upload_finished(upload_thread_key)
-
-                    # Manual status cleanup (the checklist path deletes its own message via
-                    # complete(delete_after=4)).
-                    if upload_status_id:
-                        await asyncio.sleep(4)
-                        await client.delete_message(message.channel_id, upload_status_id)
-                elif response.type == "background":
-                    # F1: new-image generation detached to a background job. Like 'queued',
-                    # nothing to post here — the job posts the image and owns its progress
-                    # surface. The thinking indicator was already left in place above.
-                    main_logger.debug(
-                        f"Image generation running in background for {message.channel_id}:{message.thread_id}")
+                    # F34: create_image_asset mounts an image into the sandbox as an
+                    # INGREDIENT, so it is deliberately not published — the deck or composite
+                    # built from it is. But if the turn ended having published nothing at all,
+                    # the model made images and then failed to use them, and they would die
+                    # with the container. A silent no-output turn is the worst failure mode
+                    # here, so hand them over rather than lose them.
+                    if not published:
+                        await self._rescue_sandbox_images(response, client, message,
+                                                          post_thread_id)
                 elif response.type == "error":
                     # Send error message
                     await client.handle_error(

@@ -16,7 +16,7 @@ tools run, and only the final round's text reaches the user.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from config import config
 from tool_registry import ToolContext, ToolRegistry, serialize_tool_result
@@ -110,6 +110,45 @@ def _merge_used(tools_used_all: List[str], round_used: List[str]) -> None:
     for name in round_used:
         if name not in tools_used_all:
             tools_used_all.append(name)
+
+
+def _replay_committed_text(input_items: List[Dict[str, Any]], text: str) -> None:
+    """Replay a STREAMING round's pre-tool preamble as an assistant turn.
+
+    In the streaming loop a round's text is only suppressed once a function_call appears —
+    whatever the model said BEFORE calling the tool has already streamed to Slack. Without
+    replaying it, the next round sees no record of having spoken, so the model says the same
+    thing again, and the repeat lands in the SAME streamed message: the user reads
+    "Making that now. Making that now."
+
+    Deliberately NOT done in the non-streaming loop: there, an intermediate round's text is
+    discarded rather than shown, so the model repeating it in the final round is exactly
+    right — it is the only copy the user ever sees.
+
+    Appended BEFORE the round's items, so it never lands between a reasoning item and the
+    function_call it belongs to (reasoning models require that pair to stay adjacent).
+    """
+    if (text or "").strip():
+        input_items.append({"role": "assistant", "content": text})
+
+
+# F37: a "free" (bookkeeping) round costs no budget, but it is still a round — a model that
+# loops on update_todos and nothing else must terminate. Free rounds get their own ceiling at
+# this multiple of the productive cap.
+_FREE_ROUND_CEILING = 2
+# ...and a ceiling WITHIN a round, enforced BEFORE dispatch. A round's calls run in parallel, so
+# without this a single round can fire fifty update_todos at once: fifty concurrent executors and
+# fifty Slack updates. Capping only the totals stops the NEXT round — far too late, the storm has
+# already happened. A rewrite-the-whole-list tool never needs more than one call in a round; two
+# is slack. Excess calls are not dispatched, but they ARE answered (see _EXCESS_FREE_RESULT):
+# the Responses API 400s on a function_call with no matching function_call_output.
+_FREE_CALLS_PER_ROUND = 2
+_EXCESS_FREE_RESULT = {
+    "ok": False,
+    "error": "too_many_calls_this_round",
+    "message": ("Not run: you called this bookkeeping tool several times in one round. It "
+                "replaces the whole list in a single call — make one call with the final state."),
+}
 
 
 # --- F2: no_response_needed terminal action ---
@@ -223,9 +262,9 @@ async def create_text_response_with_tool_loop(
     input_items: List[Dict[str, Any]] = list(messages)
     tools_used_all: List[str] = []
     local_tool_calls: List[Dict[str, Any]] = []
+    tool_choice: Optional[str] = None
     rounds = 0
     total_calls = 0
-    tool_choice: Optional[str] = None
     # F30: expose this turn's live input (stable reference — appended in place across rounds)
     # plus the developer prompt/model, so a detached job can snapshot the full context by copy.
     if tool_context is not None:
@@ -302,12 +341,20 @@ async def create_streaming_response_with_tool_loop(
     prior_committed: bool = False,
     max_tool_rounds: Optional[int] = None,
     max_tool_calls: Optional[int] = None,
+    tool_choice: Optional[str] = None,
+    free_tools: Optional[Iterable[str]] = None,
     **params: Any,
 ) -> Dict[str, Any]:
     """Streaming response with local tool execution.
 
     Returns {"text", "tools_used", "local_tool_calls"}. Intermediate (tool) rounds don't
     stream text to the user; the final round streams normally and fires the completion flush.
+
+    ``tool_choice`` seeds the FIRST round only; the loop still forces ``"none"`` on the final
+    round as before. F37 passes ``"required"`` so the delivery-plan call cannot answer in prose
+    and deliver nothing. It must be a named parameter, not a ``**params`` passthrough — the
+    round call already sends ``tool_choice=`` explicitly, so a duplicate in ``params`` raises
+    TypeError.
 
     ``prior_committed`` (F8): seeds the committed-text signal True when an EARLIER attempt
     this turn already exposed visible text (e.g. an MCP-failure retry after a partial
@@ -317,16 +364,69 @@ async def create_streaming_response_with_tool_loop(
     ``max_tool_rounds`` / ``max_tool_calls`` override the config chat-turn caps for callers
     with a different round economy (F30.2: the research job spends a round per milestone
     report, so the 4-round chat default would strangle it).
+
+    ``free_tools`` (F37) names BOOKKEEPING tools that must not compete with productive work for
+    the budget. A round whose calls are ALL free costs neither a round nor a call. The caps
+    exist to stop a runaway loop from billing forever; a status-card update is not the thing
+    they are guarding against, and leaving it on the meter means a chatty todo list starves the
+    build phase of the `mount_file` / `create_image_asset` calls it actually needs. Free rounds
+    still have a ceiling of their own (``_FREE_ROUND_CEILING`` × the cap) so "free" can never
+    mean "unbounded": a model looping on update_todos alone is a runaway too, just a cheaper one.
+    A MIXED round (bookkeeping + real work) is fully productive — only the free calls in it ride
+    free, so the round is charged normally.
     """
     rounds_cap = int(max_tool_rounds) if max_tool_rounds is not None else config.max_tool_rounds
     calls_cap = (int(max_tool_calls) if max_tool_calls is not None
                  else config.max_tool_calls_per_turn)
+    free_names = {str(n) for n in (free_tools or ())}
+    free_rounds_cap = max(1, rounds_cap * _FREE_ROUND_CEILING)
+    free_calls_cap = max(1, calls_cap * _FREE_ROUND_CEILING)
+    budget = {"rounds": 0, "calls": 0, "free_rounds": 0, "free_calls": 0}
+
+    def _suppress_excess_free(calls: List[Dict[str, Any]]) -> Dict[int, Any]:
+        """Refuse the free calls in this round that exceed the burst cap or the remaining free
+        allowance — BEFORE they are dispatched. Returns result_overrides for _run_tool_round,
+        which answers them without running them (a function_call left without a
+        function_call_output earns a 400 on the next request)."""
+        if not free_names:
+            return {}
+        allowed = min(_FREE_CALLS_PER_ROUND, max(0, free_calls_cap - budget["free_calls"]))
+        overrides: Dict[int, Any] = {}
+        taken = 0
+        for c in calls:
+            if c.get("name") not in free_names:
+                continue
+            taken += 1
+            if taken > allowed:
+                overrides[id(c)] = _EXCESS_FREE_RESULT
+        return overrides
+
+    def _charge(calls: List[Dict[str, Any]], suppressed: Dict[int, Any]) -> None:
+        """Bill a round. A round of PURE bookkeeping costs no round and no productive call;
+        anything else is fully charged (the free calls riding in a mixed round are still free,
+        the round is not).
+
+        Free CALLS are counted too, not just free rounds — but only the ones that actually RAN.
+        A suppressed call did no work, so billing it would let a burst exhaust the allowance
+        without ever executing. It cannot loop on that forever: a round of nothing but free
+        calls is still a free ROUND, and those have their own ceiling."""
+        ran = [c for c in calls if id(c) not in suppressed]
+        free = [c for c in ran if c.get("name") in free_names]
+        productive = [c for c in ran if c.get("name") not in free_names]
+        budget["free_calls"] += len(free)
+        if not productive and calls:
+            budget["free_rounds"] += 1
+            return
+        budget["rounds"] += 1
+        budget["calls"] += len(productive)
+
+    def _capped() -> bool:
+        return (budget["rounds"] >= rounds_cap or budget["calls"] >= calls_cap
+                or budget["free_rounds"] >= free_rounds_cap
+                or budget["free_calls"] >= free_calls_cap)
     input_items: List[Dict[str, Any]] = list(messages)
     tools_used_all: List[str] = []
     local_tool_calls: List[Dict[str, Any]] = []
-    rounds = 0
-    total_calls = 0
-    tool_choice: Optional[str] = None
     # F30: expose this turn's live input (stable reference) + developer prompt/model so a
     # detached job can snapshot the full context by copy (see create_text_response_with_tool_loop).
     if tool_context is not None:
@@ -352,6 +452,12 @@ async def create_streaming_response_with_tool_loop(
             tool_choice=tool_choice,
             **params,
         )
+        # A seeded tool_choice (F37: "required") seeds the FIRST round ONLY. Left set, it would
+        # force the SAME tool again on the next round — the model would be made to re-answer a
+        # question it had already answered, and the second answer would overwrite the first.
+        # "none" is the loop's own terminal state and must survive.
+        if tool_choice not in (None, "none"):
+            tool_choice = None
         if (text or "").strip():
             visible_committed = True
 
@@ -370,35 +476,45 @@ async def create_streaming_response_with_tool_loop(
                 return await _handle_no_reply_terminal(
                     self, registry, tool_context, calls, terminal_call,
                     tools_used_all, local_tool_calls,
-                    remaining_budget=calls_cap - total_calls)
+                    remaining_budget=calls_cap - budget["calls"])
             # A visible reply already began: no_response_needed is INVALID. Reject it
             # (feed an error back), run any siblings, and CONTINUE so the model completes
             # the reply into the same streamed message. WARNING = contract friction.
             self.log_warning(
                 f"{_NO_REPLY_TOOL} called after visible text already streamed — rejecting; "
                 "model must complete the reply")
-            rounds += 1
-            total_calls += len(calls)
+            suppressed = _suppress_excess_free(calls)
+            _charge(calls, suppressed)
+            _replay_committed_text(input_items, text)
             await _run_tool_round(
                 self, registry, tool_context, sink, input_items, local_tool_calls, tool_callback,
-                result_overrides={id(terminal_call): _INVALID_NO_REPLY_RESULT})
+                result_overrides={**suppressed,
+                                  id(terminal_call): _INVALID_NO_REPLY_RESULT})
             _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")])
-            if rounds >= rounds_cap or total_calls >= calls_cap:
+            if _capped():
                 self.log_warning(
-                    f"Tool loop cap hit ({rounds} rounds / {total_calls} calls) — forcing final answer"
+                    f"Tool loop cap hit ({budget['rounds']} rounds / "
+                    f"{budget['calls']} calls) — forcing final answer"
                 )
                 tool_choice = "none"
             continue
 
-        rounds += 1
-        total_calls += len(calls)
+        suppressed = _suppress_excess_free(calls)
+        if suppressed:
+            self.log_warning(
+                f"Suppressed {len(suppressed)} excess bookkeeping call(s) in one round — "
+                "not dispatched; the model is told to make a single call")
+        _charge(calls, suppressed)
+        _replay_committed_text(input_items, text)
         await _run_tool_round(
-            self, registry, tool_context, sink, input_items, local_tool_calls, tool_callback
+            self, registry, tool_context, sink, input_items, local_tool_calls, tool_callback,
+            result_overrides=suppressed or None,
         )
         _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")])
 
-        if rounds >= rounds_cap or total_calls >= calls_cap:
+        if _capped():
             self.log_warning(
-                f"Tool loop cap hit ({rounds} rounds / {total_calls} calls) — forcing final answer"
+                f"Tool loop cap hit ({budget['rounds']} rounds / "
+                f"{budget['calls']} calls) — forcing final answer"
             )
             tool_choice = "none"

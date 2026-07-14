@@ -1,9 +1,8 @@
 """Advanced unit tests for thread_manager.py - watchdog, cleanup, and edge cases"""
 
 import pytest
-import time
 
-from thread_manager import ThreadState, AssetLedger
+from thread_manager import ThreadState
 
 # Default timeout for stuck threads (5 seconds for testing)
 THREAD_LOCK_TIMEOUT_SECONDS = 5
@@ -32,51 +31,8 @@ class TestThreadStateEdgeCases:
         assert thread_state.messages[0]["content"] == "Message 10"
         assert thread_state.messages[-1]["content"] == "Message 59"
     
-    def test_thread_state_with_large_images(self):
-        """Test thread state with large image data"""
-        # Add large images to asset ledger
-        for i in range(10):
-            large_data = "x" * (1024 * 1024)  # 1MB per image
-            # Asset ledger is now a separate entity, not part of thread state
-            # This test verifies AssetLedger can handle large data
-            asset_ledger = AssetLedger(thread_ts="test_thread")
-            asset_ledger.add_image(
-                image_data=large_data,
-                prompt=f"Image {i}",
-                timestamp=time.time(),
-                slack_url=f"https://example.com/{i}.png"
-            )
-        
-        # Should handle large data  
-        assert len(asset_ledger.images) == 1  # Only last image added to this ledger
-        
-        # Create a new ledger with multiple images for the recent test
-        test_ledger = AssetLedger(thread_ts="test_thread")
-        for i in range(10):
-            test_ledger.add_image(
-                image_data=f"data_{i}",
-                prompt=f"Image {i}",
-                timestamp=time.time() + i,
-                slack_url=f"https://example.com/{i}.png"
-            )
-        
-        # Get recent images should work
-        recent = test_ledger.get_recent_images()  # No limit parameter
-        assert len(recent) <= 5  # Returns up to 5 recent images
-    
-    def test_asset_ledger_url_tracking(self):
-        """Test AssetLedger URL image tracking"""
-        ledger = AssetLedger(thread_ts="test_thread")
-        
-        # Add URL-only image (add_url_image needs image_data, url, and timestamp)
-        ledger.add_url_image(
-            image_data="test_base64_data",
-            url="https://example.com/image.png",
-            timestamp=time.time()
-        )
-        
-        # Should track URL with base64 data
-        assert len(ledger.images) == 1
-        assert ledger.images[0]["original_url"] == "https://example.com/image.png"
-        assert ledger.images[0]["data"] == "test_base64_data"
-    
+    # The AssetLedger large-image and URL-tracking tests exercised add_image/add_url_image/
+    # get_recent_images, which were removed with the vision + image-edit handlers. Ledger rows
+    # are now appended by message_processor/image_delivery.py::publish_image and never carry
+    # base64 at all; see test_background_image_gen.py.
+

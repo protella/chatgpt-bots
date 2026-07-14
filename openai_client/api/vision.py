@@ -3,80 +3,11 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, List, Optional
 
 from config import config
-from prompts import VISION_ENHANCEMENT_PROMPT
 
-
-async def _enhance_vision_prompt(
-    client,
-    user_question: str,
-    conversation_history: Optional[List[Dict[str, Any]]] = None,
-) -> str:
-    """Enhance a vision analysis prompt based on conversation context."""
-
-    self = client
-    try:
-        # Build enhancement messages with full context
-        enhancement_messages = [{"role": "developer", "content": VISION_ENHANCEMENT_PROMPT}]
-
-        # Include conversation history if provided (text only, no images)
-        if conversation_history:
-            for msg in conversation_history:
-                # Only include text content, skip any image data
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    enhancement_messages.append({"role": msg["role"], "content": content})
-
-        # Add the current user message with image indicator
-        enhancement_messages.append(
-            {"role": "user", "content": f"[User has attached an image with this message]: {user_question}"}
-        )
-
-        # Ask for enhancement based on context
-        enhancement_messages.append(
-            {
-                "role": "user",
-                "content": "Based on the conversation above, create an appropriate prompt for analyzing the attached image.",
-            }
-        )
-
-        # Build request parameters
-        request_params = {
-            "model": config.utility_model,
-            "input": enhancement_messages,
-            "max_output_tokens": 200,
-            "store": False,
-        }
-
-        # Utility model is a GPT-5-series reasoning model (gpt-5-mini)
-        request_params["temperature"] = 1.0
-        request_params["reasoning"] = {"effort": config.utility_reasoning_effort}
-        request_params["text"] = {"verbosity": config.utility_verbosity}
-
-        response = await self._safe_api_call(
-            self.client.responses.create,
-            operation_type="prompt_enhancement",
-            **request_params,
-        )
-
-        enhanced = ""
-        if response.output:
-            for item in response.output:
-                if hasattr(item, "content") and item.content:
-                    for content in item.content:
-                        if hasattr(content, "text"):
-                            enhanced += content.text
-
-        enhanced = enhanced.strip()
-
-        if enhanced and len(enhanced) > 10:
-            self.log_debug(f"Enhanced vision prompt: {enhanced[:100]}...")
-            return enhanced
-        else:
-            return user_question  # Fallback to original
-
-    except Exception as e:
-        self.log_warning(f"Failed to enhance vision prompt: {e}")
-        return user_question
+# Hard ceiling on one image analysis. A real description is a few hundred characters; this is
+# orders of magnitude above any legitimate answer, so it can only be hit by a stream that is
+# not terminating — in which case truncating is the only outcome that leaves a machine standing.
+_MAX_ANALYSIS_CHARS = 200_000
 
 
 async def analyze_images(
@@ -84,7 +15,6 @@ async def analyze_images(
     images: List[str],
     question: str,
     detail: Optional[str] = None,
-    enhance_prompt: bool = True,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
     system_prompt: Optional[str] = None,
     stream_callback: Optional[Callable[[str], None]] = None,
@@ -99,14 +29,8 @@ async def analyze_images(
         self.log_warning(f"Limiting to 10 images (received {len(images)})")
         images = images[:10]
 
-    # Enhance the question if requested
-    enhanced_question = question
-    if enhance_prompt:
-        enhanced_question = await self._enhance_vision_prompt(question, conversation_history)
-        self.log_info(f"Vision analysis with enhanced prompt: {enhanced_question[:100]}...")
-
     # Build content array with text and images
-    content = [{"type": "input_text", "text": enhanced_question}]
+    content = [{"type": "input_text", "text": question}]
 
     for image_data in images:
         # Use data URL format for base64 images
@@ -184,6 +108,25 @@ async def analyze_images(
                                         break
 
                         if text_chunk:
+                            # Two guards, because this loop trusts the stream to be finite and
+                            # to yield strings, and a stream that is neither will take the whole
+                            # process down with it. `output_text += <non-str>` does not raise:
+                            # str.__add__ returns NotImplemented, Python falls back to the
+                            # right operand's __radd__, and output_text silently becomes that
+                            # object — each subsequent += building a new one that retains the
+                            # last. That is unbounded, and it is not hypothetical: it once ate
+                            # 30GB and OOM-killed a dev box.
+                            if not isinstance(text_chunk, str):
+                                self.log_warning(
+                                    f"Vision stream yielded a non-text delta "
+                                    f"({type(text_chunk).__name__}); ending the stream.")
+                                break
+                            if len(output_text) + len(text_chunk) > _MAX_ANALYSIS_CHARS:
+                                self.log_warning(
+                                    f"Vision analysis exceeded {_MAX_ANALYSIS_CHARS} chars; "
+                                    f"truncating. The stream may not be terminating.")
+                                output_text += text_chunk[:_MAX_ANALYSIS_CHARS - len(output_text)]
+                                break
                             output_text += text_chunk
                             if stream_callback:
                                 # Support both sync and async callbacks
@@ -270,15 +213,3 @@ async def analyze_images(
     except Exception as e:
         self.log_error(f"Error analyzing images: {e}", exc_info=True)
         raise
-
-
-async def analyze_image(
-    client,
-    image_data: str,
-    question: str,
-    detail: Optional[str] = None,
-) -> str:
-    """Analyze a single image (backward compatibility wrapper)."""
-
-    self = client
-    return await self.analyze_images([image_data], question, detail)

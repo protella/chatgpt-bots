@@ -3,6 +3,7 @@
 All stubbed I/O: no live Slack, no live OpenAI, no legacy suite.
 """
 import asyncio
+from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -37,6 +38,11 @@ def _registry_with(name="echo", executor=None, schema_extra=None):
 
 async def _ok(args):
     return {"ok": True, "echo": args}
+
+
+def _ok_exec():
+    """A second executor for registries that need more than one tool (F37 free-tool tests)."""
+    return lambda ctx, args: _ok(args)
 
 
 def _call(name="echo", call_id="c1", arguments='{"x": 1}'):
@@ -268,6 +274,183 @@ class TestToolLoop:
             tool_callback=lambda t, s: events.append((t, s)))
         assert out["text"] == "streamed final"
         assert ("local:echo", "started") in events and ("local:echo", "completed") in events
+
+    @pytest.mark.asyncio
+    async def test_a_seeded_tool_choice_seeds_only_the_first_round(self, monkeypatch):
+        """F37 forces the delivery-plan call with tool_choice="required". Left set, it would
+        force the SAME tool again on the next round: the model would be made to re-answer a
+        question it had already answered, and _plan_delivery's executor would OVERWRITE the first
+        plan with the second. Round 1 forced; never again."""
+        seen = []
+        state = {"n": 0}
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            seen.append(tool_choice)
+            # Only the forced round produces a call; afterwards the model would answer in text.
+            if tool_choice == "required" and function_call_sink is not None:
+                function_call_sink.extend([_call()])
+            state["n"] += 1
+            return "" if tool_choice == "required" else "done"
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            fake_streaming)
+        out = await tool_loop.create_streaming_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with(),
+            tool_context=ToolContext(), stream_callback=lambda c: None,
+            max_tool_rounds=1, max_tool_calls=1, tool_choice="required")
+
+        assert seen[0] == "required"          # round 1 is forced...
+        assert "required" not in seen[1:]     # ...and no round after it is
+        assert seen[1] == "none"              # the cap of 1 drives the wind-down round
+        assert out["text"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_bookkeeping_calls_do_not_spend_the_budget(self, monkeypatch):
+        """F37 — THE ship-blocker this feature was rejected for.
+
+        A live todo list fires on every transition. On the meter, those calls eat the round
+        budget that the build phase needs for mount_file / create_image_asset: the status card
+        would starve the deck it is reporting on, and the loop would force a final answer before
+        the file was ever built. A card update is not what a runaway guard is guarding against.
+
+        Here: a cap of 2 productive rounds, and the model interleaves bookkeeping throughout.
+        Both real tools must still get to run."""
+        registry = _registry_with(name="update_todos")
+        registry.register({"type": "function", "name": "mount_file",
+                           "parameters": {"type": "object", "properties": {}}}, _ok_exec())
+        rounds = [
+            [_call("update_todos", "a1")],                  # free
+            [_call("update_todos", "a2")],                  # free
+            [_call("mount_file", "b1")],                    # productive #1
+            [_call("update_todos", "a3")],                  # free
+            [_call("mount_file", "b2")],                    # productive #2 -> hits the cap
+            [],
+        ]
+        state = {"n": 0}
+        dispatched = []
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            i = state["n"]
+            state["n"] += 1
+            calls = rounds[i] if i < len(rounds) else []
+            if tool_choice != "none" and function_call_sink is not None:
+                function_call_sink.extend(calls)
+                dispatched.extend(c["name"] for c in calls)
+            return "final" if tool_choice == "none" or not calls else ""
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            fake_streaming)
+        out = await tool_loop.create_streaming_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=registry,
+            tool_context=ToolContext(), stream_callback=lambda c: None,
+            max_tool_rounds=2, max_tool_calls=2, free_tools=("update_todos",))
+
+        # Three bookkeeping calls rode free, and BOTH productive calls still got their turn.
+        assert dispatched.count("update_todos") == 3
+        assert dispatched.count("mount_file") == 2, (
+            "a chatty todo list starved the real work — the exact bug this exists to prevent")
+        assert out["text"] == "final"
+
+    @pytest.mark.asyncio
+    async def test_free_does_not_mean_unbounded(self, monkeypatch):
+        """"Free" is a budget exemption, not a licence to loop forever. A model that only ever
+        calls update_todos is still a runaway — just a cheap one — so free rounds have a ceiling
+        of their own and the loop is forced to answer."""
+        state = {"n": 0}
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            state["n"] += 1
+            if tool_choice != "none" and function_call_sink is not None:
+                function_call_sink.extend([_call("update_todos", f"c{state['n']}")])
+            return "gave up" if tool_choice == "none" else ""
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            fake_streaming)
+        out = await tool_loop.create_streaming_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with(name="update_todos"),
+            tool_context=ToolContext(), stream_callback=lambda c: None,
+            max_tool_rounds=2, max_tool_calls=2, free_tools=("update_todos",))
+
+        # It terminated instead of spinning: the free ceiling is a multiple of the real cap.
+        assert out["text"] == "gave up"
+        assert state["n"] <= 2 * tool_loop._FREE_ROUND_CEILING + 2
+
+    @pytest.mark.asyncio
+    async def test_a_burst_of_free_calls_is_refused_before_it_is_dispatched(self, monkeypatch):
+        """Codex review, round 2. Counting free calls only stops the NEXT round — by then the
+        storm has already happened: a round's tool calls dispatch in PARALLEL, so one "free"
+        round firing twenty update_todos means twenty concurrent executors and twenty Slack
+        updates. The excess must be refused BEFORE dispatch.
+
+        And refused, not dropped: a function_call left without a matching function_call_output
+        is a 400 on the very next request. Every suppressed call still gets an answer."""
+        executed = []
+
+        async def _spy(ctx, args):
+            executed.append(state["n"])          # which round dispatched it
+            return {"ok": True}
+
+        state = {"n": 0, "last_input": []}
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            state["n"] += 1
+            state["last_input"] = list(messages)     # what the NEXT request would send
+            if tool_choice != "none" and function_call_sink is not None:
+                function_call_sink.extend(
+                    _call("update_todos", f"c{state['n']}_{i}") for i in range(20))
+            return "stopped" if tool_choice == "none" else ""
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            fake_streaming)
+        out = await tool_loop.create_streaming_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with("update_todos", _spy),
+            tool_context=ToolContext(), stream_callback=lambda c: None,
+            max_tool_rounds=2, max_tool_calls=2, free_tools=("update_todos",))
+
+        assert out["text"] == "stopped"
+        # No ROUND dispatched more than the burst cap — 18 of each 20 were never run at all.
+        per_round = Counter(executed)
+        assert per_round and max(per_round.values()) <= tool_loop._FREE_CALLS_PER_ROUND, (
+            f"a round dispatched {max(per_round.values())} bookkeeping calls at once")
+        # ...and yet EVERY call was ANSWERED: a function_call with no matching
+        # function_call_output is a 400 on the very next request. Suppressed ≠ dropped.
+        replayed = state["last_input"]
+        made = [m for m in replayed if m.get("type") == "function_call"]
+        answered = [m for m in replayed if m.get("type") == "function_call_output"]
+        assert made and {m["call_id"] for m in made} == {m["call_id"] for m in answered}
+        refused = [m for m in answered if "too_many_calls_this_round" in str(m.get("output"))]
+        assert len(refused) == len(made) - len(executed)
+
+    @pytest.mark.asyncio
+    async def test_a_mixed_round_is_charged_normally(self, monkeypatch):
+        """Bookkeeping riding ALONGSIDE real work does not launder the round. Only the free
+        calls are free; the round itself did real work and is billed for it."""
+        registry = _registry_with(name="update_todos")
+        registry.register({"type": "function", "name": "mount_file",
+                           "parameters": {"type": "object", "properties": {}}}, _ok_exec())
+        state = {"n": 0}
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            state["n"] += 1
+            if tool_choice != "none" and function_call_sink is not None:
+                function_call_sink.extend([_call("update_todos", f"a{state['n']}"),
+                                           _call("mount_file", f"b{state['n']}")])
+            return "final" if tool_choice == "none" else ""
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            fake_streaming)
+        await tool_loop.create_streaming_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=registry,
+            tool_context=ToolContext(), stream_callback=lambda c: None,
+            max_tool_rounds=1, max_tool_calls=9, free_tools=("update_todos",))
+
+        # One mixed round exhausted the 1-round cap: round 2 is the forced wind-down.
+        assert state["n"] == 2
 
 
 # --------------------------------------------------------------------------- streaming event handling
@@ -658,6 +841,27 @@ def test_participation_prompt_routes_explicit_reaction_requests_to_respond():
 
 # --------------------------------------------------------------------------- processor glue
 
+def _slack_tool_mock(history=None):
+    """A stand-in SlackBot for _build_tool_registry.
+
+    Every schema-returning method must hand back a REAL dict. A bare MagicMock is callable,
+    and register() reads a callable schema as a per-request factory (F34's image tools shape
+    themselves to the user's image model), so a MagicMock schema is a registration error —
+    which would fail these tests for a reason that has nothing to do with what they assert.
+    """
+    s = MagicMock()
+    s.get_history_tools_for_openai.return_value = history or []
+    s.get_react_tool_schema.return_value = {
+        "type": "function", "name": "react_to_message", "parameters": {}}
+    s.get_search_tool_schema.return_value = {
+        "type": "function", "name": "search_slack", "parameters": {}}
+    s.get_post_to_thread_tool_schema.return_value = {
+        "type": "function", "name": "post_to_thread", "parameters": {}}
+    s.get_no_reply_tool_schema.return_value = {
+        "type": "function", "name": "no_response_needed", "parameters": {}}
+    return s
+
+
 class TestProcessorGlue:
     def test_reaction_only_detection(self):
         is_ro = TextHandlerMixin._is_reaction_only
@@ -700,35 +904,34 @@ class TestProcessorGlue:
         monkeypatch.setattr(config, "enable_search_tool", True)
         monkeypatch.setattr(config, "enable_channel_memory", True)
         monkeypatch.setattr(config, "enable_post_to_thread_tool", True)
-        s = MagicMock()
-        s.get_history_tools_for_openai.return_value = [
+        s = _slack_tool_mock(history=[
             {"type": "function", "name": "fetch_channel_history", "parameters": {}},
             {"type": "function", "name": "fetch_thread_messages", "parameters": {}},
-        ]
-        s.get_react_tool_schema.return_value = {
-            "type": "function", "name": "react_to_message", "parameters": {}}
-        s.get_search_tool_schema.return_value = {
-            "type": "function", "name": "search_slack", "parameters": {}}
-        s.get_post_to_thread_tool_schema.return_value = {
-            "type": "function", "name": "post_to_thread", "parameters": {}}
+        ])
         monkeypatch.setattr(config, "enable_read_document_tool", True)
         monkeypatch.setattr(config, "enable_people_tools", True)
         monkeypatch.setattr(config, "enable_deep_research", True)
         registry = SlackBot._build_tool_registry(s)
         names = {t["name"] for t in registry.schemas()}
-        assert names == {"fetch_channel_history", "fetch_thread_messages",
-                         "react_to_message", "search_slack", "post_to_thread",
-                         "remember_fact", "update_fact", "forget_fact",
-                         "read_document", "lookup_user", "list_channel_members",
-                         "start_deep_research"}
+        # Every gated-on tool is exposed. (Not an exact-set assertion: an always-on tool the
+        # builder gains later — F34's generate_image was the first — is not a bug in the
+        # wiring this test is about. The gates below are what it actually verifies.)
+        assert {"fetch_channel_history", "fetch_thread_messages",
+                "react_to_message", "search_slack", "post_to_thread",
+                "remember_fact", "update_fact", "forget_fact",
+                "read_document", "lookup_user", "list_channel_members",
+                "start_background_job"} <= names
+        # …and the per-request gates still hide what this request doesn't qualify for:
+        # no_response_needed needs an unprompted turn (F2), and the image tools that depend on
+        # turn state — a sandbox container / a non-empty image catalog — have neither here (F34).
+        assert names.isdisjoint({"no_response_needed", "create_image_asset", "edit_image"})
 
     def test_registry_builder_search_gated_off(self, monkeypatch):
         from slack_client.base import SlackBot
         monkeypatch.setattr(config, "enable_history_tools", False)
         monkeypatch.setattr(config, "enable_reactions", False)
         monkeypatch.setattr(config, "enable_search_tool", False)
-        s = MagicMock()
-        s.get_history_tools_for_openai.return_value = []
+        s = _slack_tool_mock()
         registry = SlackBot._build_tool_registry(s)
         assert "search_slack" not in {t["name"] for t in registry.schemas()}
 
@@ -736,11 +939,10 @@ class TestProcessorGlue:
     async def test_registry_history_executor_routes_by_name(self, monkeypatch):
         from slack_client.base import SlackBot
         monkeypatch.setattr(config, "enable_reactions", False)
-        s = MagicMock()
-        s.get_history_tools_for_openai.return_value = [
+        s = _slack_tool_mock(history=[
             {"type": "function", "name": "fetch_channel_history", "parameters": {}},
             {"type": "function", "name": "fetch_thread_messages", "parameters": {}},
-        ]
+        ])
         s.dispatch_history_tool_call = AsyncMock(return_value={"ok": True})
         registry = SlackBot._build_tool_registry(s)
         ctx = ToolContext()
