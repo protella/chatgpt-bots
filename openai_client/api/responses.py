@@ -2,36 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from typing import Any, Callable, Dict, List, Optional
 
 from config import config, clamp_effort
 from openai_client.container_errors import (demote_container_tools, is_container_gone,
                                             persistent_container_ids)
-from prompts import (INTENT_CLASSIFIER_PROMPT, MEMORY_EXTRACTION_SYSTEM_PROMPT,
-                     PARTICIPATION_SYSTEM_PROMPT, TOOL_RESULT_SUMMARIZE_PROMPT,
-                     WAKE_CLASSIFIER_SYSTEM_PROMPT)
-
-
-_INTENT_WORD_MAP = {
-    "new": "new_image", "edit": "edit_image", "vision": "vision",
-    "ambiguous": "ambiguous_image", "none": "text_only",
-}
-
-
-def _parse_intent_and_ack(result: str) -> tuple:
-    """F19: parse the classifier's '<intent> <ack|noack>' output defensively.
-
-    Two tokens → (intent, ack); one token → (intent, noack). A garbage second token
-    is simply not "ack" → noack, and never disturbs intent routing. A stray full
-    sentence (long/unmapped first token) falls back to text_only, exactly as the old
-    one-word contract did. Returns the mapped intent label, ack bool."""
-    tokens = (result or "").strip().lower().split()
-    word = tokens[0] if tokens else ""
-    ack = len(tokens) >= 2 and tokens[1] == "ack"
-    if not word or len(word) > 20:
-        word = "none"
-    return _INTENT_WORD_MAP.get(word, "text_only"), ack
+from prompts import (MEMORY_EXTRACTION_SYSTEM_PROMPT, PARTICIPATION_SYSTEM_PROMPT,
+                     TOOL_RESULT_SUMMARIZE_PROMPT, WAKE_CLASSIFIER_SYSTEM_PROMPT)
 
 
 def _capture_usage(usage_sink, response):
@@ -1084,7 +1061,7 @@ async def classify_wake(self, text: str, signals: Optional[Dict[str, Any]] = Non
     try:
         response = await self._safe_api_call(
             self.client.responses.create,
-            operation_type="intent_classification",
+            operation_type="utility_call",
             **request_params,
         )
         result = ""
@@ -1157,6 +1134,11 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
         lines.append("- This is a reply inside a thread the assistant can see.")
     if signals.get("channel_topic"):
         lines.append(f"- Channel topic: {signals['channel_topic']}")
+    if signals.get("channel_canvases"):
+        # Named so a request can match one WITHOUT the word "canvas": "update our devops call
+        # agenda" is actionable precisely because a canvas called "DevOps Agenda" exists here.
+        names = ", ".join(signals["channel_canvases"])
+        lines.append(f"- Channel canvases (living docs the assistant can edit): {names}")
     # F29: who's around — member count + recently active names. Helps resolve WHO a message
     # (and any "you") is aimed at; the system prompt explains these are real, distinct people.
     if signals.get("channel_people"):
@@ -1233,7 +1215,7 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
     try:
         response = await self._safe_api_call(
             self.client.responses.create,
-            operation_type="intent_classification",
+            operation_type="utility_call",
             **request_params,
         )
         result = ""
@@ -1284,7 +1266,7 @@ async def extract_memory(self, exchange_text: str, existing_memory: Optional[Lis
     try:
         response = await self._safe_api_call(
             self.client.responses.create,
-            operation_type="intent_classification",
+            operation_type="utility_call",
             **request_params,
         )
         result = ""
@@ -1339,7 +1321,7 @@ async def summarize_tool_result(self, text: str, max_chars: int) -> Optional[str
     try:
         response = await self._safe_api_call(
             self.client.responses.create,
-            operation_type="intent_classification",
+            operation_type="utility_call",
             **request_params,
         )
         result = ""
@@ -1355,187 +1337,6 @@ async def summarize_tool_result(self, text: str, max_chars: int) -> Optional[str
         self.log_warning(f"Tool-result summarization failed ({e}); falling back to truncation")
         return None
 
-
-async def classify_intent(
-    self,
-    messages: List[Dict[str, Any]],
-    last_user_message: str,
-    has_attached_images: bool = False,
-    max_retries: int = 2,
-    return_ack: bool = False,
-):
-    """
-    Classify user intent using a lightweight model with retry logic
-
-    Args:
-        messages: Recent conversation context (last 6-8 exchanges)
-        last_user_message: The latest user message to classify
-        has_attached_images: Whether the current message has images attached
-        max_retries: Number of retry attempts on timeout (default: 2)
-        return_ack: F19 — when True, return (intent, ack_bool) instead of a bare
-            intent string. ack reflects the classifier's '<intent> <ack|noack>'
-            second token (defaults noack; a garbage token never breaks routing).
-
-    Returns:
-        Intent classification: 'new_image', 'edit_image', 'vision',
-        'ambiguous_image', or 'text_only' (bare str, or (intent, ack) when
-        return_ack). Returns 'error' (or ('error', False)) if it fails after retries.
-    """
-    # Build properly structured conversation
-    conversation_messages = []
-    
-    # Add system prompt as developer message
-    conversation_messages.append({
-        "role": "developer",
-        "content": INTENT_CLASSIFIER_PROMPT
-    })
-    
-    # Track if we've seen recent images
-    has_recent_image = False
-    
-    # Add historical messages with proper roles
-    for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        
-        # Handle multi-part content
-        if isinstance(content, list):
-            text_parts = [c.get("text", "") for c in content if c.get("type") == "input_text"]
-            content = " ".join(text_parts)
-        
-        # Check if assistant recently generated an image
-        if role == "assistant" and "generated image" in content.lower():
-            has_recent_image = True
-        
-        # Pass full message content without truncation
-        # This ensures the intent classifier has complete context
-        
-        # Add message with proper role
-        conversation_messages.append({
-            "role": role,
-            "content": content
-        })
-    
-    # Add the current message to classify with metadata
-    current_msg_with_metadata = last_user_message
-    if has_attached_images:
-        current_msg_with_metadata += "\n[Note: User has attached images with this message]"
-    
-    conversation_messages.append({
-        "role": "user",
-        "content": current_msg_with_metadata
-    })
-    
-    # Add classification instruction as final user message
-    conversation_messages.append({
-        "role": "user",
-        "content": "Based on this conversation, classify the user's latest message. Respond with exactly two tokens: the intent (new, edit, vision, ambiguous, or none) then the ack flag (ack or noack)."
-    })
-    
-    # Debug logging
-    self.log_debug(f"Intent classification with {len(conversation_messages)} messages")
-    self.log_debug(f"Historical messages: {len(messages)}, has_recent_image: {has_recent_image}")
-    if hasattr(config, 'debug_intent_classification') and config.debug_intent_classification:
-        self.log_debug(f"Messages structure: {conversation_messages[-3:]}")  # Last 3 messages
-    
-    try:
-        # Build request parameters with properly structured conversation
-        request_params = {
-            "model": config.utility_model,
-            "input": conversation_messages,
-            "max_output_tokens": config.utility_max_tokens,  # Configurable for different reasoning efforts
-            "store": False,  # Never store classification calls
-        }
-        
-        # Utility model is a GPT-5-series reasoning model (gpt-5-mini)
-        request_params["temperature"] = 1.0  # Fixed for reasoning models
-        request_params["reasoning"] = {"effort": clamp_effort(config.utility_model, config.utility_reasoning_effort)}  # Use utility config
-        request_params["text"] = {"verbosity": config.utility_verbosity}  # Use utility config
-        
-        self.log_debug(f"About to call responses.create for intent classification at {time.strftime('%H:%M:%S')}")
-        self.log_debug(f"Using model: {config.utility_model}, timeout: {self.client.timeout}s")
-        
-        # Use safe API call wrapper with intent-specific timeout
-        response = await self._safe_api_call(
-            self.client.responses.create,
-            operation_type="intent_classification",  # Uses 30s timeout
-            **request_params
-        )
-
-        self.log_debug(f"Response received from API at {time.strftime('%H:%M:%S')}")
-        
-        # Extract True/False response
-        result = ""
-        if response.output:
-            for item in response.output:
-                if hasattr(item, "content") and item.content:
-                    for content in item.content:
-                        if hasattr(content, "text"):
-                            result += content.text
-        
-        result = result.strip().lower()
-
-        # F19: parse '<intent> <ack|noack>' defensively — two tokens carry the ack
-        # flag, one token falls back to noack, a stray sentence → text_only. The old
-        # single-word contract is a strict subset of this.
-        intent, ack = _parse_intent_and_ack(result)
-
-        # Debug logging
-        self.log_debug(f"Image check raw result: '{result}' for message: '{last_user_message[:50]}...'")
-        self.log_debug(f"Classified intent: {intent} (ack={ack})")
-        return (intent, ack) if return_ack else intent
-
-    except TimeoutError:
-        # On timeout, retry with exponential backoff
-        for retry in range(1, max_retries + 1):
-            wait_time = 2 ** (retry - 1)  # 1s, 2s, 4s...
-            self.log_warning(f"Intent classification timeout (attempt {retry}/{max_retries}), retrying in {wait_time}s...")
-            await asyncio.sleep(wait_time)
-
-            try:
-                # Retry the classification with shorter timeout
-                response = await self._safe_api_call(
-                    self.client.responses.create,
-                    operation_type="intent_classification",
-                    timeout_seconds=15,  # Shorter timeout for retries
-                    **request_params
-                )
-
-                # Process response (same as above)
-                result = ""
-                if response.output:
-                    for item in response.output:
-                        if hasattr(item, "content") and item.content:
-                            for content in item.content:
-                                if hasattr(content, "text"):
-                                    result += content.text
-
-                result = result.strip().lower()
-
-                # F19: same two-token parse as the main path.
-                intent, ack = _parse_intent_and_ack(result)
-
-                self.log_info(f"Intent classification succeeded on retry {retry}: {intent} (ack={ack})")
-                return (intent, ack) if return_ack else intent
-
-            except TimeoutError:
-                if retry == max_retries:
-                    self.log_error(f"Intent classification failed after {max_retries} retries")
-                    return ('error', False) if return_ack else 'error'  # Trigger proper error handling
-                continue
-            except Exception as retry_error:
-                self.log_error(f"Retry {retry} failed with error: {retry_error}")
-                if retry == max_retries:
-                    return ('error', False) if return_ack else 'error'
-                continue
-
-        # Should not reach here, but failsafe
-        return ('error', False) if return_ack else 'error'
-
-    except Exception as e:
-        self.log_error(f"Error classifying intent: {e}")
-        self.log_error(f"Exception type: {type(e).__name__}")
-        return ('error', False) if return_ack else 'error'  # Return error instead of defaulting to text
 
 async def _create_text_response_with_timeout(
     self,

@@ -38,10 +38,33 @@ class ToolContext:
     current_input: Optional[List[Any]] = None
     system_prompt: Optional[str] = None
     model: Optional[str] = None
-    # F30.1: set True by execute_start_deep_research on a successful start, so the turn's
+    # F30.1: set True by execute_start_background_job on a successful start, so the turn's
     # finalizer (handlers/text.py) can DROP the model's ack reply — the research status card
     # the job posts is the acknowledgment. Read back from the same context the loop shares.
-    deep_research_started: bool = False
+    background_job_started: bool = False
+    # F34: image tools. `thread_config` carries the resolved per-user settings (the image
+    # MODEL is read from here and is NOT model-selectable). `container_id` is the SAME
+    # persistent code-interpreter container already placed in the tools array — the image
+    # asset tool must never resolve its own, or it would mount bytes into a container the
+    # model cannot see. `image_catalog` is this turn's allowlist of editable images, so an
+    # invented image id is rejected rather than silently editing the wrong picture.
+    thread_config: Optional[Dict[str, Any]] = None
+    container_id: Optional[str] = None
+    image_catalog: Optional[List[Dict[str, Any]]] = None
+    # Set True by a detached image generation, so the finalizer can drop the model's ack
+    # reply the same way deep research does — the posted image IS the acknowledgment.
+    image_generation_started: bool = False
+    # Paths mounted into the container by create_image_asset this turn. If the turn ends
+    # having published nothing, these are rescued to the thread rather than vanishing with
+    # the container (see handlers/text.py) — a silent no-output turn is the worst failure.
+    sandbox_image_assets: Optional[List[Dict[str, Any]]] = None
+    # F35: mount_file. `thread_files` is this turn's allowlist of mountable files (images AND
+    # documents behind one opaque id space) — the same authorization rule as `image_catalog`:
+    # only ids we advertised resolve. `mounted_files` records what actually went into the
+    # sandbox, so (a) a second mount of the same file is a no-op, and (b) the artifact
+    # publisher can refuse to post a user's own file back at them, even byte-copied.
+    thread_files: Optional[List[Dict[str, Any]]] = None
+    mounted_files: Optional[List[Dict[str, Any]]] = None
 
 
 Executor = Callable[[ToolContext, Dict[str, Any]], Awaitable[Dict[str, Any]]]
@@ -55,14 +78,27 @@ class ToolRegistry:
 
     def register(
         self,
-        schema: Dict[str, Any],
+        schema: Any,
         executor: Executor,
         enabled: Optional[Callable[[dict], bool]] = None,
         timeout: Optional[float] = None,
+        name: Optional[str] = None,
     ) -> None:
-        name = schema.get("name")
-        if not name:
-            raise ValueError("Tool schema must have a 'name'")
+        """Register a tool.
+
+        ``schema`` is either a static dict or a FACTORY ``(thread_config) -> dict``, for a
+        tool whose shape depends on the request (F34: the image tools' legal option values
+        differ by the user's selected image model, and their description names the user's
+        saved defaults). A factory must be given an explicit ``name``, since there is no
+        dict to read it from.
+        """
+        if callable(schema):
+            if not name:
+                raise ValueError("A schema factory must be registered with an explicit name")
+        else:
+            name = schema.get("name")
+            if not name:
+                raise ValueError("Tool schema must have a 'name'")
         # timeout=None → the shared config.tool_call_timeout. A tool with a heavier
         # worst case (e.g. read_document, which may download + render + OCR a scan)
         # sets its own longer bound so the generic 20s cap can't abort it.
@@ -70,13 +106,24 @@ class ToolRegistry:
                              "enabled": enabled, "timeout": timeout}
 
     def schemas(self, thread_config: Optional[dict] = None) -> List[Dict[str, Any]]:
-        """Schemas of the tools enabled for this request (a failing gate hides the tool)."""
+        """Schemas of the tools enabled for this request (a failing gate hides the tool).
+
+        A schema factory that raises hides its tool rather than failing the turn — the same
+        fail-closed rule the enable-gate already follows.
+        """
         out = []
+        cfg = thread_config or {}
         for tool in self._tools.values():
             gate = tool["enabled"]
             try:
-                if gate is None or gate(thread_config or {}):
-                    out.append(tool["schema"])
+                if gate is not None and not gate(cfg):
+                    continue
+                schema = tool["schema"]
+                if callable(schema):
+                    schema = schema(cfg)
+                    if not schema:
+                        continue
+                out.append(schema)
             except Exception:
                 continue
         return out

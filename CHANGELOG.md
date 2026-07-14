@@ -240,11 +240,16 @@ recognize those and go do the work properly — in DMs and channels alike, in th
   ("what happened to egg prices this year, and what's the H2 outlook?") and the bot spins the
   research off into a background job, then posts a sourced report back into the thread minutes
   later. The conversation stays usable the whole time — you can ask other things, and it answers.
-- **You can watch it work.** A single live status card sits in the thread while the job runs,
-  showing the goals it has completed in its own words ("Cross-checked USDA and BLS price series
-  — wholesale fell first, retail followed with a lag") plus a running count of what it's been
-  doing: *todos as of 7:36 PM · 23 web searches · 2 datassential calls*. The card finishes with
-  a ✅ and "Reported findings below", or an honest ❌ and the reason.
+- **It comes back with the thing, not just the findings.** A job can build what it researched
+  into a real deliverable — a deck, a spreadsheet, a PDF — with any charts computed from the
+  actual data rather than drawn. It decides what's worth handing over, so you get the report, or
+  the file, or both, and never the pile of scratch files it made along the way.
+- **You can watch it work, and it's a real to-do list.** A single live card sits in the thread
+  while the job runs: the plan it wrote when it set off, each step ticking from ◦ to ✓, and the
+  one it's working on right now called out. It revises the list as it learns — the plan at minute
+  one often isn't the plan it finishes with — alongside a running count of what it's been doing:
+  *todos as of 7:36 PM · 23 web searches · 2 datassential calls*. The card closes with a ✅ and
+  what it delivered, or an honest ❌ and the reason.
 - **The findings arrive under their own byline** — "ChatGPT [research: 2026 US egg outlook]" —
   so a long report is clearly the research job talking, not the bot interrupting the chat. It
   closes with what it used: *deep research · 4m 56s · effort high · tools: web_search*.
@@ -256,6 +261,50 @@ Flags: `ENABLE_DEEP_RESEARCH` (default **on**), `DEEP_RESEARCH_REASONING_EFFORT`
 `DEEP_RESEARCH_TIMEOUT` (600s), `DEEP_RESEARCH_MAX_PER_THREAD` (2), and `ENABLE_RESEARCH_LABEL`
 (on — the byline needs the `chat:write.customize` scope; without it the bot posts plainly rather
 than failing).
+
+### 🧾 Feature - Canvases, for work that outlives the thread
+
+Some things shouldn't be a chat message. A running spec, a launch checklist, a summary that keeps
+getting amended — in a thread it's buried within the hour, and as a posted file it forks into
+`_final_v3` by Thursday. The bot can now put that kind of work in a Slack canvas and go back and
+edit it in place.
+
+- **It makes the canvas that gets a tab** at the top of the channel, so there's somewhere to find
+  it later rather than a link you have to dig for.
+- **It can read, edit and list canvases** — including ones you made. Ask it to add a section to
+  the spec and it amends the canvas instead of posting another copy of it.
+- **It names the canvas when it creates it**, because Slack has no rename — an untitled canvas
+  stays untitled forever.
+
+Flag: `ENABLE_CANVAS_TOOLS` (default **on**; needs the `canvases:read` / `canvases:write` scopes).
+
+### 🎨 Changed - Images and code are the same conversation now
+
+The bot used to decide, before it had really read your message, whether the turn was "an image
+request" or "a chat request" — one guess, no take-backs. That guess is gone. Making an image,
+editing one, and running code are now just things it can *do*, chosen while it's thinking, the
+same way it decides to search the web.
+
+- **It can make a picture and compute a chart in the same breath.** Ask for a deck with a cover
+  image and a chart of your real numbers, and you get a single `.pptx` with both in it — the
+  image generated, the chart computed from your actual data, the whole thing assembled and
+  handed back. Before, a turn could do one or the other, never both.
+- **"Chart this" stopped being an image request.** The old router treated "visualize" as a cue
+  to *draw*, so it would hand your spreadsheet to an image model, which produced a
+  handsome-looking chart with invented numbers and invented category names. Charts are computed
+  now, always.
+- **It edits the image you meant.** It picks from the actual images in the thread by name rather
+  than guessing "probably the last one" — and if your request is genuinely ambiguous it asks
+  instead of quietly editing the wrong picture.
+- **It respects your image settings, and knows when not to.** Your saved model, size, quality
+  and background still apply by default. The model can now deviate when the job calls for it
+  (a wide image for a title slide) — except the image *model* itself, which is yours and is not
+  up for negotiation.
+- **The "Enhanced Prompt" wall of text is gone.** It still rewrites your prompt into something
+  the image model can work with — that just isn't your business any more, the same way the code
+  it runs isn't. You get an image, not a lecture about how it got there.
+
+Flag: `ENABLE_IMAGE_TOOLS` (default **on**). Off restores the old classifier and its routing.
 
 ### 📊 Feature - It can write and run code, and hand you the file
 

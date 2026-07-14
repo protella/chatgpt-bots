@@ -178,6 +178,13 @@ def test_gate_registers_react_with_empty_default(monkeypatch):
     s.get_history_tools_for_openai.return_value = []
     s.get_react_tool_schema.return_value = {
         "type": "function", "name": "react_to_message", "parameters": {}}
+    # Every schema the builder registers unconditionally must be a real dict: a bare MagicMock
+    # is CALLABLE, and register() reads a callable as a schema factory (F34) — which is a
+    # registration error, not a react_to_message failure.
+    s.get_post_to_thread_tool_schema.return_value = {
+        "type": "function", "name": "post_to_thread", "parameters": {}}
+    s.get_no_reply_tool_schema.return_value = {
+        "type": "function", "name": "no_response_needed", "parameters": {}}
     registry = SlackBot._build_tool_registry(s)
     assert "react_to_message" in {t["name"] for t in registry.schemas()}
 

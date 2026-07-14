@@ -32,11 +32,12 @@ import re
 import zipfile
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from config import config
 from logger import setup_logger
 from message_processor.containers import publication_lock, release_publication_lock
+from message_processor.tool_provenance import strip_provenance_echo
 
 # Must go through setup_logger: handlers are attached to `slack_bot.*` loggers with
 # propagate=False, so a bare getLogger(__name__) writes to NOWHERE. Every rejection notice here
@@ -152,6 +153,91 @@ def strip_sandbox_links(text: str) -> str:
     out = _SANDBOX_BARE_RE.sub("", out)
     out = re.sub(r"\n{3,}", "\n\n", out)
     return out.strip()
+
+
+# Web-search citation markers. The Responses API wraps them in Private Use Area delimiters —
+# U+E200 cite U+E202 turn12search1 U+E201 — which are invisible to the model's own eye and
+# meaningless to Slack. They are NOT harmless: the PUA codepoints get rendered downstream as
+# arbitrary emoji, so a cited sentence reaches the user as
+#   "…one-million-token context. cite:ship:turn12search1:walking:"
+# The payload sits BETWEEN the delimiters, so stripping the PUA characters alone would be worse
+# than doing nothing — it would leave the literal text "citeturn12search1" behind. The whole
+# span has to go.
+_CITATION_RE = re.compile("\ue200.*?\ue201", re.DOTALL)
+_PUA_RE = re.compile("[\ue200-\ue20f]")
+
+
+def strip_citation_markers(text: str) -> str:
+    """Remove the Responses API's PUA-delimited web-search citations.
+
+    Verified against a live report. The raw text carries:
+        \\ue200 cite \\ue202 turn9search0 \\ue202 turn9search1 \\ue201
+    and by the time it reaches Slack the inner delimiters have already been mapped to emoji
+    shortcodes, so the user reads "...recurrent approaches. cite:ship:turn9search0:walking:".
+    Strip the whole span at the SOURCE, before any emoji conversion can get to it.
+    """
+    if not text:
+        return text
+    out = _CITATION_RE.sub("", text)
+    # Belt and braces: an unpaired delimiter would still render as a stray emoji.
+    return _PUA_RE.sub("", out)
+
+
+# A markdown link or a bare sandbox path that is still being written. We cannot yet tell what
+# it will become, and a native stream is APPEND-ONLY — once a character is sent it cannot be
+# unsent — so the tail is held back until it resolves.
+_OPEN_LINKISH_RE = re.compile(r"\[[^\]\n]*\]\([^)\n]*$|\[[^\]\n]*$|\[[^\]\n]*\]$")
+
+
+def stream_safe_text(text: str, final: bool = False) -> str:
+    """What is safe to APPEND to an append-only native stream right now.
+
+    ``strip_sandbox_links`` alone was not enough, and this is why: it ran only at finalize,
+    while the stream appends as it goes. By the time we stripped the link it was already in
+    Slack, the stripped text was SHORTER than what had been sent, so the delta was empty and
+    the dead link simply stayed — a clickable "Download the deck" that leads nowhere, sitting
+    right above the real file. Verified live.
+
+    So the strip has to happen at the APPEND, and it has to be PREFIX-STABLE: what we send for
+    a prefix of the text must remain a prefix of what we send for the whole text, or the sink's
+    sent-length bookkeeping desynchronizes and text duplicates or vanishes. Hence no ``.strip()``
+    and no whitespace collapsing here (``strip_sandbox_links`` does both, which is fine for a
+    one-shot non-streaming post and fatal mid-stream), and hence the hold-back: anything that
+    could still turn into a sandbox link waits until we can see what it actually is.
+
+    Whatever is held back is not lost — ``final=True`` releases it, and by then any real
+    sandbox link has been removed for good.
+    """
+    if not text:
+        return text
+    # Complete `[label](sandbox:/…)` links collapse to their label on both paths, so the two
+    # agree about them. Completed citation spans vanish on both paths, likewise.
+    out = _SANDBOX_LINK_RE.sub(lambda m: m.group(1) or "", text)
+    out = _CITATION_RE.sub("", out)
+
+    if final:
+        out = _SANDBOX_BARE_RE.sub("", out)
+        out = _PUA_RE.sub("", out)
+        return strip_provenance_echo(out)
+
+    # Mid-stream, a bare path CANNOT be told apart from a path still being typed — the regex
+    # happily matches `sandbox:/mnt/data/deck.` as if it were whole, and substituting it away
+    # left a dangling `[Download it].` that sailed straight through the hold-back and into
+    # Slack. So don't substitute at all here: cut at the FIRST unresolved mention and wait.
+    idx = out.find("sandbox:")
+    if idx != -1:
+        out = out[:idx]
+    # A citation span still arriving is the same problem: its opener has landed but its closer
+    # has not, so the span cannot be matched yet. Emit up to the opener and wait — appending
+    # `citeturn9` and only THEN learning it was a citation is unfixable, because
+    # the stream is append-only.
+    cut = out.find("")
+    if cut != -1:
+        out = out[:cut]
+    out = strip_provenance_echo(out)
+    # ...then cut back over any markdown-link syntax left dangling in front of it (or still
+    # being written), since it may yet turn out to wrap a sandbox path.
+    return _OPEN_LINKISH_RE.sub("", out)
 
 
 def sanitize_filename(name: str, fallback_index: int = 1) -> Optional[str]:
@@ -375,41 +461,99 @@ async def publish_artifacts(
     db: Any = None,
     message_ts: Optional[str] = None,
     container_manager: Any = None,
+    ledger_key: Optional[str] = None,
+    suppress_digests: Optional[Iterable[str]] = None,
+    expect_filenames: Optional[Iterable[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Publish everything the model wrote THIS turn. Returns the published descriptors.
 
-    Holds the thread's publication latch for its whole body. The thread lock is already gone by
-    the time this runs (the reply has posted, `process_message` has returned), so without the
-    latch the NEXT turn could be writing files into the same persistent container while we list
-    it — and we would post its half-finished work under the previous answer.
+    Holds the publication latch for its whole body. The thread lock is already gone by the time
+    this runs (the reply has posted, `process_message` has returned), so without the latch the
+    NEXT turn could be writing files into the same persistent container while we list it — and
+    we would post its half-finished work under the previous answer.
+
+    `ledger_key` scopes the *container* concerns — the latch and the already-published record —
+    while `thread_key` stays the *thread* concern: which conversation the DB rows belong to.
+    They are the same string for a normal turn. A background job separates them: it builds in
+    its OWN container (sharing the thread's would let a chat turn's baseline snapshot silently
+    mark the job's half-written deck as "already published", and it would never be posted), but
+    the deck it produces still belongs to the thread the user asked in, or tomorrow's "revise
+    that deck" would not be able to find it.
+
+    `suppress_digests` refuses to publish bytes we ourselves put INTO the container — a mounted
+    input is an ingredient. `containers.files.create` already marks uploads `source="user"` and
+    the listing only yields `"assistant"` files, so this is the second lock on the same door:
+    it also catches a model that copies the user's spreadsheet to a new name and thereby makes
+    an assistant-owned, byte-identical twin of a file they already have.
+
+    `expect_filenames` is the DECLARED deliverable manifest, and when it is present it is the
+    whole answer: the user asked for a PDF, so they get the PDF and nothing else. Everything
+    else in the container is working material by definition. Only a background build knows this
+    up front — a chat turn has no manifest and must fall back to the heuristics below.
     """
-    lock = publication_lock(thread_key)
+    ledger = ledger_key or thread_key
+    lock = publication_lock(ledger)
     try:
         async with lock:
             return await _publish_locked(
                 openai_client=openai_client, client=client, channel_id=channel_id,
                 thread_id=thread_id, thread_key=thread_key, container_ids=container_ids,
-                db=db, message_ts=message_ts, container_manager=container_manager)
+                db=db, message_ts=message_ts, container_manager=container_manager,
+                ledger_key=ledger, suppress_digests=set(suppress_digests or ()),
+                expect_filenames=[f.lower() for f in (expect_filenames or ())])
     finally:
-        release_publication_lock(thread_key)
+        release_publication_lock(ledger)
 
 
-async def _publish_locked(
+# Zip-backed document formats. An image placed into one of these is stored as a plain zip
+# entry, byte-for-byte, which is what makes ingredient detection exact rather than a guess.
+_COMPOSITE_EXTS = {"pptx", "docx", "xlsx"}
+
+# Documents that are NOT zips, so the exact byte-match above cannot see inside them. A PDF
+# re-encodes an image on the way in (DCTDecode/FlateDecode), so the chart embedded in the
+# document and the loose chart in the container share no bytes at all.
+_OPAQUE_COMPOSITE_EXTS = {"pdf"}
+
+# Every format whose whole point is to CONTAIN the other files.
+_DOCUMENT_EXTS = _COMPOSITE_EXTS | _OPAQUE_COMPOSITE_EXTS
+
+
+def _embedded_member_hashes(candidates: List[Dict[str, Any]]) -> set:
+    """sha256 of every file embedded inside the composite documents we're about to publish.
+
+    Used to tell a deliverable apart from an ingredient. python-pptx/docx store an added
+    picture as an unmodified zip entry, so the hash matches the loose file exactly. If the
+    model re-encodes an image on the way in, the hashes won't match and the loose copy still
+    goes out — this is a precise suppression, never a guess at what looks like a leftover.
+    """
+    hashes: set = set()
+    for candidate in candidates:
+        if candidate["ext"] not in _COMPOSITE_EXTS:
+            continue
+        try:
+            with zipfile.ZipFile(io.BytesIO(candidate["data"])) as zf:
+                for info in zf.infolist():
+                    if info.is_dir() or info.file_size == 0:
+                        continue
+                    hashes.add(hashlib.sha256(zf.read(info)).hexdigest())
+        except Exception as e:  # noqa: BLE001 — a corrupt zip must not stop publication
+            logger.debug(f"Could not inspect {candidate['filename']} for embedded files: {e}")
+    return hashes
+
+
+async def _gather_candidates(
     *,
     openai_client: Any,
-    client: Any,
-    channel_id: str,
-    thread_id: str,
-    thread_key: str,
     container_ids: Optional[List[str]],
-    db: Any,
-    message_ts: Optional[str],
     container_manager: Any,
-) -> List[Dict[str, Any]]:
-    """The publication body. Runs under the thread's publication latch.
+    ledger_key: str,
+) -> tuple:
+    """Phase 1 of publication: list the container(s), drop what already went out, and download
+    + validate everything that's left. Returns ``(candidates, skipped)``.
 
-    The cap counts ACCEPTED uploads, not candidates: an intermediate file the model happened to
-    write must not consume the budget the real deliverable needed.
+    Bytes land in memory and stay there — never on disk (CLAUDE.md). Downloading BEFORE any
+    decision is deliberate: whether a chart is a deliverable or an ingredient of the deck beside
+    it can only be answered by looking inside the deck.
     """
     refs = await resolve_container_artifacts(openai_client, container_ids or [])
 
@@ -421,23 +565,26 @@ async def _publish_locked(
     if container_manager is not None:
         for cid in {r.container_id for r in refs}:
             try:
-                already.update(await container_manager.get_published_files(thread_key, cid))
+                already.update(await container_manager.get_published_files(ledger_key, cid))
             except Exception as e:  # noqa: BLE001 — worst case we re-post; never fail the turn
-                logger.warning(f"Could not load published-file record for {thread_key}: {e}")
+                logger.warning(f"Could not load published-file record for {ledger_key}: {e}")
 
     refs = [r for r in refs if r.file_id not in already]
     if not refs:
-        return []
+        return [], 0
 
     max_bytes = config.artifact_max_mb * 1024 * 1024
     cap = config.artifact_max_files
-    published: List[Dict[str, Any]] = []
-    published_ids: Dict[str, List[str]] = {}
-    seen_hashes = set()
     skipped = 0
 
+    # Fetch and validate every candidate BEFORE deciding what to send, because that decision
+    # is not per-file: a chart that was embedded into a deck is an ingredient, not a
+    # deliverable, and we can only know that by looking at the deck. Bounded so a runaway loop
+    # writing hundreds of files can't turn into hundreds of downloads.
+    download_budget = max(cap * 4, cap)
+    candidates: List[Dict[str, Any]] = []
     for index, ref in enumerate(refs, start=1):
-        if len(published) >= cap:
+        if len(candidates) >= download_budget:
             skipped = len(refs) - index + 1
             break
 
@@ -460,12 +607,144 @@ async def _publish_locked(
             logger.warning(f"Artifact rejected (content does not match .{ext}): {filename}")
             continue
 
-        digest = hashlib.sha256(data).hexdigest()
+        candidates.append({"ref": ref, "filename": filename, "ext": ext, "data": data,
+                           "digest": hashlib.sha256(data).hexdigest()})
+
+    return candidates, skipped
+
+
+def _select_candidates(candidates: List[Dict[str, Any]], *, suppress_digests: set,
+                       expect_filenames: List[str]) -> List[Dict[str, Any]]:
+    """Phase 2: decide which downloaded candidates are DELIVERABLES rather than working
+    material. Pure selection, no I/O — which is what lets a background job run it, show the
+    result to the model, and upload only later (F37).
+
+    Every rule below answers one question: the model wrote this file, but did the user ask for
+    it?
+    """
+    # A .pptx/.docx/.xlsx is a zip, and an image embedded into one is stored as a verbatim zip
+    # entry — so the deck itself tells us which of the other files were merely its ingredients.
+    # Ask for a deck and you should get a deck, not a deck plus the loose charts that went into
+    # it. (The prompt also tells the model to embed from memory; this is the part that does not
+    # depend on the model complying.)
+    embedded = _embedded_member_hashes(candidates)
+
+    # A DECLARED manifest beats every heuristic below: the caller knows exactly which files were
+    # asked for, so anything else in the container is working material. Matched on name, and on
+    # extension too — the model does not always honour the filename it was given, and delivering
+    # the right document under a slightly wrong name beats delivering nothing.
+    if expect_filenames:
+        wanted_exts = {f.rpartition(".")[2] for f in expect_filenames if "." in f}
+        keep = [c for c in candidates
+                if c["filename"].lower() in expect_filenames or c["ext"] in wanted_exts]
+        if keep:
+            dropped = [c["filename"] for c in candidates if c not in keep]
+            if dropped:
+                # Never silently truncate — say what was held back and why.
+                logger.info(f"Artifacts held back (not a declared deliverable): {dropped}")
+            candidates = keep
+        else:
+            # Nothing matched. Publishing the intermediates would be worse than useless — it
+            # would look like the deliverable. Say so loudly and hand back the raw candidates,
+            # so a mis-named deck still reaches the user rather than vanishing.
+            logger.warning(
+                f"No candidate matched the declared deliverables {expect_filenames}; "
+                f"falling back to {[c['filename'] for c in candidates]}")
+
+    # A model that revises its work leaves the draft behind. It wrote Board_Ready.pdf, thought
+    # better of it, wrote Board_Brief.pdf — and the user got both, with no way to tell which was
+    # the real one. The listing is in creation order, so within one extension the LAST document
+    # is the finished one; the earlier ones are the drafts it moved on from.
+    #
+    # Scoped to DOCUMENT types on purpose. "Give me a chart and a cleaned CSV" is a normal ask
+    # and must keep working; "give me two different PDFs in one turn" is not, and the log says
+    # plainly what was held back if it ever happens.
+    by_ext: Dict[str, List[Dict[str, Any]]] = {}
+    for candidate in candidates:
+        if candidate["ext"] in _DOCUMENT_EXTS:
+            by_ext.setdefault(candidate["ext"], []).append(candidate)
+    superseded = {id(c) for group in by_ext.values() if len(group) > 1 for c in group[:-1]}
+    if superseded:
+        logger.info(
+            "Artifacts held back (superseded drafts of the same document type): "
+            f"{[c['filename'] for c in candidates if id(c) in superseded]}")
+        candidates = [c for c in candidates if id(c) not in superseded]
+
+    # Is a DOCUMENT going out this turn? Then the loose images beside it are the pictures that
+    # went into it, and the user asked for the document.
+    #
+    # The exact hash check above catches this for zip formats, but it cannot for a PDF (which
+    # re-encodes what it embeds) and it cannot for a chart the model merely DISPLAYED (a
+    # display render is a separate rasterisation, so its bytes never match the embedded copy).
+    # Both holes were live: a PDF shipped with its own two 1MB charts posted next to it.
+    #
+    # Note this stays scoped to turns that produce a document. A turn that just draws a chart
+    # publishes it, exactly as before — being asked for a picture and being asked for a report
+    # that contains pictures are different requests.
+    publishing_document = any(c["ext"] in _DOCUMENT_EXTS for c in candidates)
+
+    accepted: List[Dict[str, Any]] = []
+    seen_hashes: set = set()
+    for candidate in candidates:
+        filename = candidate["filename"]
+        ext, digest = candidate["ext"], candidate["digest"]
+
+        if digest in suppress_digests:
+            # Byte-identical to something WE mounted into the container. The user already has
+            # this file — they gave it to us. Posting it back is noise at best.
+            logger.info(f"Artifact suppressed (this is a mounted input, not output): {filename}")
+            continue
+
+        if digest in embedded:
+            logger.info(
+                f"Artifact suppressed (embedded in a document we're publishing): {filename}")
+            continue
+
+        if publishing_document and ext in _IMAGE_EXTS:
+            logger.info(
+                f"Artifact suppressed (an ingredient of the document being published): {filename}")
+            continue
+
         if digest in seen_hashes:
             # e.g. the model saved a chart AND displayed it — same bytes, one upload.
             logger.info(f"Artifact skipped (duplicate content): {filename}")
             continue
         seen_hashes.add(digest)
+
+        accepted.append(candidate)
+
+    return accepted
+
+
+async def _upload_candidates(
+    accepted: List[Dict[str, Any]],
+    *,
+    client: Any,
+    channel_id: str,
+    thread_id: str,
+    thread_key: str,
+    db: Any,
+    message_ts: Optional[str],
+    container_manager: Any,
+    ledger_key: str,
+    skipped: int = 0,
+) -> List[Dict[str, Any]]:
+    """Phase 3: upload the selected files to Slack and persist their refs.
+
+    The cap counts ACCEPTED uploads, not candidates: an intermediate file the model happened to
+    write must not consume the budget the real deliverable needed.
+    """
+    cap = config.artifact_max_files
+    published: List[Dict[str, Any]] = []
+    published_ids: Dict[str, List[str]] = {}
+
+    for candidate in accepted:
+        if len(published) >= cap:
+            skipped += 1
+            continue
+
+        ref, filename = candidate["ref"], candidate["filename"]
+        ext, data = candidate["ext"], candidate["data"]
 
         try:
             upload = await client.send_file(
@@ -497,9 +776,9 @@ async def _publish_locked(
     if published_ids and container_manager is not None:
         for cid, ids in published_ids.items():
             try:
-                await container_manager.remember_published(thread_key, cid, ids)
+                await container_manager.remember_published(ledger_key, cid, ids)
             except Exception as e:  # noqa: BLE001
-                logger.warning(f"Could not record published files for {thread_key}: {e}")
+                logger.warning(f"Could not record published files for {ledger_key}: {e}")
 
     if skipped > 0:
         # Never silently truncate — a dropped deliverable the user asked for should be visible
@@ -507,3 +786,157 @@ async def _publish_locked(
         logger.warning(f"Artifact cap ({cap}) reached — {skipped} further file(s) not published")
 
     return published
+
+
+async def _publish_locked(
+    *,
+    openai_client: Any,
+    client: Any,
+    channel_id: str,
+    thread_id: str,
+    thread_key: str,
+    container_ids: Optional[List[str]],
+    db: Any,
+    message_ts: Optional[str],
+    container_manager: Any,
+    ledger_key: str,
+    suppress_digests: set,
+    expect_filenames: List[str],
+) -> List[Dict[str, Any]]:
+    """The publication body — gather, select, upload. Runs under the publication latch."""
+    candidates, skipped = await _gather_candidates(
+        openai_client=openai_client, container_ids=container_ids,
+        container_manager=container_manager, ledger_key=ledger_key)
+    if not candidates:
+        return []
+    accepted = _select_candidates(candidates, suppress_digests=suppress_digests,
+                                  expect_filenames=expect_filenames)
+    return await _upload_candidates(
+        accepted, client=client, channel_id=channel_id, thread_id=thread_id,
+        thread_key=thread_key, db=db, message_ts=message_ts,
+        container_manager=container_manager, ledger_key=ledger_key, skipped=skipped)
+
+
+# --- F37: staged publication (background jobs) ----------------------------------------------
+
+
+@dataclass
+class StagedArtifact:
+    """A built file, downloaded and validated, waiting for someone to decide its fate.
+
+    Staging exists so a background job's container can DIE the moment it finishes building. The
+    API caps a container's idle life at 20 minutes; if the model that decides what to ship had
+    to reach back into the container, a slow finalize — or a queue, or a retry — would lose the
+    deliverable. So we pull the bytes out first and hold them in memory (never disk, CLAUDE.md),
+    and the container is free to expire.
+
+    ``artifact_id`` is opaque and application-issued on purpose. The model selects what to
+    publish BY ID, never by filename: filenames are model-authored and therefore hallucinable,
+    and a selection contract that silently matched the wrong file — or nothing — would ship the
+    wrong deliverable with total confidence.
+    """
+    artifact_id: str
+    filename: str
+    ext: str
+    size_bytes: int
+    candidate: Dict[str, Any]   # the internal candidate dict (carries the bytes + ref)
+
+    def manifest_entry(self) -> Dict[str, Any]:
+        """What the model is shown. The bytes never go anywhere near the prompt."""
+        return {"artifact_id": self.artifact_id, "filename": self.filename,
+                "kind": self.ext, "size_bytes": self.size_bytes}
+
+
+async def stage_artifacts(
+    *,
+    openai_client: Any,
+    container_ids: Optional[List[str]] = None,
+    container_manager: Any = None,
+    ledger_key: str,
+    suppress_digests: Optional[Iterable[str]] = None,
+    expect_filenames: Optional[Iterable[str]] = None,
+) -> List[StagedArtifact]:
+    """Gather + select + hold in memory. Publishes NOTHING. Never raises."""
+    lock = publication_lock(ledger_key)
+    try:
+        async with lock:
+            candidates, skipped = await _gather_candidates(
+                openai_client=openai_client, container_ids=container_ids,
+                container_manager=container_manager, ledger_key=ledger_key)
+            if skipped:
+                # Never silently truncate: the model is about to be shown a manifest, and a file
+                # missing from it is a file it cannot choose to publish.
+                logger.warning(f"Staging for {ledger_key} stopped at the download budget — "
+                               f"{skipped} container file(s) never examined")
+            if not candidates:
+                return []
+            accepted = _select_candidates(
+                candidates, suppress_digests=set(suppress_digests or ()),
+                expect_filenames=[f.lower() for f in (expect_filenames or ())])
+    except Exception as e:  # noqa: BLE001 — a staging failure costs the files, not the job
+        logger.error(f"Artifact staging failed for {ledger_key}: {e}", exc_info=True)
+        return []
+    finally:
+        release_publication_lock(ledger_key)
+
+    staged = [
+        StagedArtifact(artifact_id=f"art_{i}", filename=c["filename"], ext=c["ext"],
+                       size_bytes=len(c["data"]), candidate=c)
+        for i, c in enumerate(accepted, start=1)
+    ]
+    if staged:
+        logger.info(f"Staged {len(staged)} artifact(s) for {ledger_key}: "
+                    f"{[(s.artifact_id, s.filename) for s in staged]}")
+    return staged
+
+
+async def publish_staged(
+    staged: List[StagedArtifact],
+    artifact_ids: Iterable[str],
+    *,
+    client: Any,
+    channel_id: str,
+    thread_id: str,
+    thread_key: str,
+    db: Any = None,
+    message_ts: Optional[str] = None,
+    container_manager: Any = None,
+    ledger_key: str,
+) -> List[Dict[str, Any]]:
+    """Upload the staged artifacts the model asked for, in the order it asked for them.
+
+    An id that matches nothing is DROPPED and logged loudly — never resolved to a
+    "close enough" file. Publishing the wrong deliverable confidently is worse than publishing
+    none, and unlike a filename match there is no honest fallback available here.
+    """
+    by_id = {s.artifact_id: s for s in staged}
+    chosen: List[Dict[str, Any]] = []
+    seen: set = set()
+    for artifact_id in artifact_ids or ():
+        key = str(artifact_id).strip()
+        target = by_id.get(key)
+        if target is None:
+            logger.warning(f"Delivery plan named an unknown artifact id {artifact_id!r} "
+                           f"(have: {sorted(by_id)}) — dropped")
+            continue
+        if key in seen:
+            # ["art_1", "art_1"] would otherwise upload and persist the same file twice.
+            logger.info(f"Delivery plan named {key} more than once — publishing it once")
+            continue
+        seen.add(key)
+        chosen.append(target.candidate)
+    if not chosen:
+        return []
+
+    lock = publication_lock(ledger_key)
+    try:
+        async with lock:
+            return await _upload_candidates(
+                chosen, client=client, channel_id=channel_id, thread_id=thread_id,
+                thread_key=thread_key, db=db, message_ts=message_ts,
+                container_manager=container_manager, ledger_key=ledger_key)
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Staged publication failed for {ledger_key}: {e}", exc_info=True)
+        return []
+    finally:
+        release_publication_lock(ledger_key)

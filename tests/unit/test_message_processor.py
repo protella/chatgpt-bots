@@ -42,7 +42,6 @@ class TestMessageProcessor:
     def mock_openai_client(self):
         """Create a mock OpenAI client"""
         mock = MagicMock()
-        mock.classify_intent.return_value = "chat"
         mock.get_response.return_value = "Hello from AI"
         mock.create_text_response.return_value = "Hello from AI"
         mock.create_text_response_with_tools.return_value = "Hello from AI"
@@ -141,7 +140,6 @@ class TestMessageProcessor:
             channel_id="C456",
             messages=[],
             had_timeout=False,
-            pending_clarification=None,
             message_count=0,  # Add required field
             config_overrides={},
             system_prompt=None
@@ -181,7 +179,6 @@ class TestMessageProcessor:
         mock_client.send_message_async = AsyncMock()
         mock_client.get_thread_history = AsyncMock(return_value=[])
         mock_client.get_thread_history_async = AsyncMock(return_value=[])
-        processor.openai_client.classify_intent = AsyncMock(return_value="text_only")
         processor.openai_client.create_text_response = AsyncMock(return_value="Test response")
 
         # Mock thread state with previous timeout
@@ -189,7 +186,6 @@ class TestMessageProcessor:
             thread_ts="T789",
             channel_id="C456",
             messages=[],
-            pending_clarification=None,
             add_message=MagicMock()
         )
         # Set had_timeout as a property that can be changed
@@ -216,7 +212,6 @@ class TestMessageProcessor:
                 channel_id="C1",
                 messages=[],
                 had_timeout=False,
-                pending_clarification=None
             )
             processor.thread_manager.get_or_create_thread.return_value = thread_state
 
@@ -335,7 +330,6 @@ class TestMessageProcessorDiagnostics:
                     channel_id="C456",
                     messages=[],
                     had_timeout=False,
-                    pending_clarification=None
                 )
                 processor.thread_manager.get_or_create_thread.return_value = thread_state
                 processor.thread_manager.acquire_thread_lock.return_value = True
@@ -344,7 +338,6 @@ class TestMessageProcessorDiagnostics:
                     "thread_key": f"{thread_state.channel_id}:{thread_state.thread_ts}",
                     "message_count": len(thread_state.messages),
                     "has_timeout": thread_state.had_timeout,
-                    "pending_clarification": thread_state.pending_clarification is not None
                 }
                 
                 print(f"\\nDiagnostic Thread Info: {diagnostic_info}")
@@ -352,4 +345,3 @@ class TestMessageProcessorDiagnostics:
                 # Verify initial state
                 assert diagnostic_info["message_count"] == 0
                 assert diagnostic_info["has_timeout"] is False
-                assert diagnostic_info["pending_clarification"] is False

@@ -16,7 +16,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 
-from thread_manager import AsyncThreadStateManager
 from message_processor.utilities import MessageUtilitiesMixin
 
 REPO = Path(__file__).resolve().parents[2]
@@ -28,42 +27,6 @@ RUNTIME_FILES = [
 ] + [str(p.relative_to(REPO)) for p in (REPO / "message_processor").rglob("*.py")] \
   + [str(p.relative_to(REPO)) for p in (REPO / "slack_client").rglob("*.py")] \
   + [str(p.relative_to(REPO)) for p in (REPO / "openai_client").rglob("*.py")]
-
-
-# --------------------------------------------------------------------- upload latch
-
-class TestUploadLatch:
-    async def test_wait_returns_immediately_when_no_upload(self):
-        mgr = AsyncThreadStateManager()
-        await asyncio.wait_for(mgr.wait_for_uploads("C1:1"), timeout=1)
-
-    async def test_wait_blocks_until_finished(self):
-        mgr = AsyncThreadStateManager()
-        mgr.mark_upload_started("C1:1")
-        order = []
-
-        async def editor():
-            await mgr.wait_for_uploads("C1:1")
-            order.append("edit")
-
-        async def uploader():
-            await asyncio.sleep(0.05)
-            order.append("upload")
-            mgr.mark_upload_finished("C1:1")
-
-        await asyncio.gather(editor(), uploader())
-        assert order == ["upload", "edit"]  # edit resolved only after upload landed
-
-    async def test_wait_times_out_and_proceeds(self):
-        mgr = AsyncThreadStateManager()
-        mgr.mark_upload_started("C1:1")
-        # never finished — bounded wait must return, not hang
-        await asyncio.wait_for(mgr.wait_for_uploads("C1:1", timeout=0.1), timeout=1)
-
-    async def test_latch_is_per_thread(self):
-        mgr = AsyncThreadStateManager()
-        mgr.mark_upload_started("C1:1")
-        await asyncio.wait_for(mgr.wait_for_uploads("C2:2"), timeout=1)  # other thread unaffected
 
 
 # ------------------------------------------------- analysis persisted for live images
@@ -161,25 +124,20 @@ async def test_schedule_async_call_keeps_strong_reference():
 # ------------------------------------------------------------- retry condition (fix 3)
 
 def test_text_timeout_retry_condition_reachable():
-    """Mirror of the fixed should_retry expression: text_normal retries even though
-    `intent` is always assigned by routing; intent_classification keeps its guard."""
-    def should_retry(operation_type, already_retried, intent_in_locals):
-        return (
-            operation_type in ['text_normal', 'intent_classification']
-            and not already_retried
-            and (operation_type != 'intent_classification' or not intent_in_locals)
-        )
+    """A text_normal timeout must actually retry. The original bug guarded the retry on
+    `'intent' not in locals()`, which routing had always assigned — so the branch was dead.
+    With the classifier deleted there is no intent to guard on at all."""
+    def should_retry(operation_type, already_retried):
+        return operation_type == 'text_normal' and not already_retried
 
-    # The dead-code bug: text_normal + intent assigned -> must now retry
-    assert should_retry('text_normal', False, True) is True
-    assert should_retry('text_normal', True, True) is False       # no infinite loops
-    assert should_retry('intent_classification', False, False) is True
-    assert should_retry('intent_classification', False, True) is False  # guard kept
-    assert should_retry('vision', False, False) is False
+    assert should_retry('text_normal', False) is True
+    assert should_retry('text_normal', True) is False       # no infinite loops
+    assert should_retry('vision', False) is False
 
-    # And the source must actually carry the scoped guard
+    # And the source must carry no classifier retry path
     src = (REPO / "message_processor" / "base.py").read_text()
-    assert "operation_type != 'intent_classification' or 'intent' not in locals()" in src
+    assert "intent_classification" not in src
+    assert "classify_intent" not in src
 
 
 # ------------------------------------------------------------------ source-scan gates

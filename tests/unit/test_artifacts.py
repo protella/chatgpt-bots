@@ -1082,12 +1082,20 @@ class TestArtifactsSurviveRetries:
         assert forwards >= reentries - 2, "a retry path drops the artifact accumulator"
 
     def test_turn_level_accumulator_exists_in_process_message(self):
-        """base.py's timeout retry re-enters the handler too — it must share the same sink."""
+        """base.py's timeout retry re-enters the handler too — it must share the same sink.
+
+        Asserted against the number of dispatch sites rather than a fixed count: F34/F35
+        collapsed the old image/vision/text routing ladder into a single text handler, and a
+        hardcoded number would have failed for the right reason but the wrong cause.
+        """
         import inspect
         from message_processor.base import MessageProcessor
         src = inspect.getsource(MessageProcessor.process_message)
         assert "turn_artifacts" in src
-        assert src.count("artifacts_acc=turn_artifacts") >= 4
+        dispatches = src.count("self._handle_text_response(")
+        assert dispatches >= 2, "expected at least the main dispatch and the timeout retry"
+        assert src.count("artifacts_acc=turn_artifacts") == dispatches, (
+            "every re-entry into the handler must carry the turn's artifact sink")
 
 
 class TestMountingHonoursTheThreadSetting:
@@ -1226,8 +1234,14 @@ class TestProvenanceEchoIsStripped:
         import inspect
         from message_processor.handlers.text import TextHandlerMixin
         src = inspect.getsource(TextHandlerMixin)
-        # both the non-streaming and streaming commits, and the native finalize
-        assert src.count("strip_provenance_echo(strip_sandbox_links(") == 3
+        # The two one-shot commits (non-streaming, and the streaming path's stored text) strip
+        # the assembled text in one go...
+        assert src.count("strip_provenance_echo(strip_citation_markers(strip_sandbox_links(") == 2
+        # ...but the native stream is APPEND-ONLY, so it cannot strip after the fact: it must
+        # do it at the append AND at the finalize, through the prefix-stable transform. A
+        # strip that only ran at finalize is exactly how a dead sandbox link reached a user.
+        assert src.count("stream_safe_text(") == 2
+        assert "stream_safe_text(buffer.get_complete_text(), final=True)" in src
 
 
 class TestAbortedStreamDoesNotDuplicateTheAnswer:
@@ -1261,3 +1275,348 @@ class TestAbortedStreamDoesNotDuplicateTheAnswer:
         from message_processor.handlers.text import TextHandlerMixin
         src = inspect.getsource(TextHandlerMixin)
         assert "and native_coord.current_ts and not failed_mcp_server" in src
+
+
+class TestStreamSafeText:
+    """The dead-link bug, seen live.
+
+    The model wrote "[Download the 2-slide PowerPoint](sandbox:/mnt/data/deck.pptx)". We stripped
+    sandbox links only at finalize — but a native stream APPENDS as it goes, so the link was
+    already in Slack. The stripped final text was SHORTER than what had been sent, the delta came
+    out empty, and the dead link just stayed: a clickable "Download" leading nowhere, directly
+    above the real .pptx.
+    """
+
+    def test_complete_sandbox_link_never_appended(self):
+        from message_processor.artifacts import stream_safe_text
+        out = stream_safe_text("Here you go. [Download the deck](sandbox:/mnt/data/deck.pptx)")
+        assert "sandbox:" not in out
+        assert "Download the deck" not in out or "](" not in out
+
+    def test_partial_sandbox_link_is_held_back_not_sent(self):
+        from message_processor.artifacts import stream_safe_text
+        # Mid-stream: we cannot yet see that this is a sandbox link, and we can never unsend.
+        out = stream_safe_text("Here you go. [Download the deck](sandbox:/mnt/da")
+        assert "sandbox" not in out
+        assert "Download" not in out
+        assert out == "Here you go. "
+
+    def test_bare_sandbox_path_fragment_held_back(self):
+        from message_processor.artifacts import stream_safe_text
+        assert "sandbox" not in stream_safe_text("The file is at sandbox:/mnt/dat")
+
+    def test_final_releases_innocent_held_back_text(self):
+        from message_processor.artifacts import stream_safe_text
+        text = "See the chart [1] for detail."
+        assert stream_safe_text(text, final=True) == text
+
+    def test_ordinary_markdown_link_survives_when_complete(self):
+        from message_processor.artifacts import stream_safe_text
+        text = "Docs are [here](https://example.com/x)."
+        assert stream_safe_text(text, final=True) == text
+        assert "https://example.com/x" in stream_safe_text(text + " More.")
+
+    def test_prefix_stability_the_property_the_sink_depends_on(self):
+        """Every prefix we would have appended must remain a prefix of the final text.
+
+        The sink tracks how many RAW chars it has sent and appends only the tail beyond that.
+        If a later transform is not a superstring of an earlier one, the delta lands in the
+        wrong place and text duplicates or vanishes. This is why stream_safe_text must not
+        .strip() or collapse whitespace the way strip_sandbox_links does.
+        """
+        from message_processor.artifacts import stream_safe_text
+        full = ("Built the deck.\n\n[Download it](sandbox:/mnt/data/deck.pptx)\n"
+                "The chart is [here](https://x.test/c) and totals are below.")
+        final = stream_safe_text(full, final=True)
+        for i in range(len(full) + 1):
+            sent = stream_safe_text(full[:i])
+            assert final.startswith(sent), (
+                f"prefix {i} produced {sent!r}, which is not a prefix of {final!r}")
+
+    def test_provenance_echo_never_appended_midstream(self):
+        from message_processor.artifacts import stream_safe_text
+        out = stream_safe_text("56,088\n[used tools: code_interpreter]\n")
+        assert "used tools" not in out
+
+
+class TestIngredientsAreNotPublishedAlongsideTheDocument:
+    """Ask for a deck, get a deck — not a deck plus the loose charts that went into it.
+
+    python-pptx stores an embedded picture as a byte-identical zip entry, so the document
+    itself tells us which of the other files were merely its ingredients. That is an exact
+    signal, not a guess at what looks like a leftover.
+    """
+
+    @staticmethod
+    def _deck_with(*blobs):
+        import io
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("[Content_Types].xml", "<Types/>")
+            for i, blob in enumerate(blobs):
+                zf.writestr(f"ppt/media/image{i}.png", blob)
+        return buf.getvalue()
+
+    def _candidates(self, deck, **loose):
+        import hashlib
+        out = [{"ext": "pptx", "filename": "deck.pptx", "data": deck,
+                "digest": hashlib.sha256(deck).hexdigest()}]
+        for name, data in loose.items():
+            out.append({"ext": "png", "filename": f"{name}.png", "data": data,
+                        "digest": hashlib.sha256(data).hexdigest()})
+        return out
+
+    def test_embedded_chart_is_suppressed(self):
+        import hashlib
+        from message_processor.artifacts import _embedded_member_hashes
+        chart = b"\x89PNG\r\n\x1a\n-the-real-chart-bytes"
+        deck = self._deck_with(chart)
+        embedded = _embedded_member_hashes(self._candidates(deck, chart=chart))
+        assert hashlib.sha256(chart).hexdigest() in embedded
+
+    def test_a_chart_that_is_NOT_in_the_deck_still_publishes(self):
+        import hashlib
+        from message_processor.artifacts import _embedded_member_hashes
+        embedded_chart = b"\x89PNG\r\n\x1a\n-embedded"
+        standalone = b"\x89PNG\r\n\x1a\n-asked-for-separately"
+        deck = self._deck_with(embedded_chart)
+        embedded = _embedded_member_hashes(
+            self._candidates(deck, a=embedded_chart, b=standalone))
+        assert hashlib.sha256(embedded_chart).hexdigest() in embedded
+        assert hashlib.sha256(standalone).hexdigest() not in embedded
+
+    def test_the_document_never_suppresses_itself(self):
+        import hashlib
+        from message_processor.artifacts import _embedded_member_hashes
+        deck = self._deck_with(b"\x89PNG\r\n\x1a\n-x")
+        embedded = _embedded_member_hashes(self._candidates(deck))
+        assert hashlib.sha256(deck).hexdigest() not in embedded
+
+    def test_corrupt_document_does_not_break_publication(self):
+        from message_processor.artifacts import _embedded_member_hashes
+        assert _embedded_member_hashes(
+            [{"ext": "pptx", "filename": "broken.pptx", "data": b"not a zip",
+              "digest": "d"}]) == set()
+
+    def test_a_turn_with_no_document_suppresses_nothing(self):
+        from message_processor.artifacts import _embedded_member_hashes
+        assert _embedded_member_hashes(
+            [{"ext": "png", "filename": "c.png", "data": b"x", "digest": "d"}]) == set()
+
+
+class TestOnlyTheDocumentShipsNotItsIngredients:
+    """Ask for a PDF and you get a PDF — not a PDF plus the two charts that are already in it.
+
+    The zip-member hash check cannot cover this: a PDF re-encodes what it embeds, and a chart
+    the model merely DISPLAYED is a separate rasterisation whose bytes never match the embedded
+    copy. Both holes shipped live — a 8.6MB PDF arrived with its own 1MB charts posted beside it.
+    """
+
+    async def test_charts_beside_a_pdf_are_suppressed(self):
+        files = [_cfile("f1", "/mnt/data/report.pdf"),
+                 _cfile("f2", "/mnt/data/chart_a.png"),
+                 _cfile("f3", "/mnt/data/chart_b.png")]
+        oc = _openai_payloads(files, {"f1": b"%PDF-1.7 body", "f2": PNG, "f3": PNG + b"x"})
+        client = _client()
+
+        out = await publish_artifacts(
+            openai_client=oc, client=client, channel_id="C1", thread_id="1.0",
+            thread_key="C1:1.0", container_ids=["c1"], db=None)
+
+        assert [p["filename"] for p in out] == ["report.pdf"]
+
+    async def test_a_chart_on_its_own_still_ships(self):
+        # The rule is scoped to turns that produce a document. "Draw me a chart" is a different
+        # request from "write me a report that has charts in it", and must not regress.
+        files = [_cfile("f1", "/mnt/data/revenue.png")]
+        oc = _openai_payloads(files, {"f1": PNG})
+        client = _client()
+
+        out = await publish_artifacts(
+            openai_client=oc, client=client, channel_id="C1", thread_id="1.0",
+            thread_key="C1:1.0", container_ids=["c1"], db=None)
+
+        assert [p["filename"] for p in out] == ["revenue.png"]
+
+    async def test_a_declared_manifest_beats_every_heuristic(self):
+        # A background build KNOWS what was asked for. Everything else in the container is
+        # working material, whatever it happens to be named.
+        files = [_cfile("f1", "/mnt/data/deck.pdf"),
+                 _cfile("f2", "/mnt/data/notes.csv"),
+                 _cfile("f3", "/mnt/data/scratch.txt")]
+        oc = _openai_payloads(files, {"f1": b"%PDF-1.7 body", "f2": b"a,b\n1,2\n",
+                                      "f3": b"scratch"})
+        client = _client()
+
+        out = await publish_artifacts(
+            openai_client=oc, client=client, channel_id="C1", thread_id="1.0",
+            thread_key="C1:1.0", container_ids=["c1"], db=None,
+            expect_filenames=["deck.pdf"])
+
+        assert [p["filename"] for p in out] == ["deck.pdf"]
+
+    async def test_a_misnamed_deliverable_still_reaches_the_user(self):
+        # The model does not always honour the filename it was handed. Matching the EXTENSION
+        # too means the right document goes out under a slightly wrong name, instead of nothing.
+        files = [_cfile("f1", "/mnt/data/ai_report_final.pdf")]
+        oc = _openai_payloads(files, {"f1": b"%PDF-1.7 body"})
+        client = _client()
+
+        out = await publish_artifacts(
+            openai_client=oc, client=client, channel_id="C1", thread_id="1.0",
+            thread_key="C1:1.0", container_ids=["c1"], db=None,
+            expect_filenames=["rise_of_ai.pdf"])
+
+        assert [p["filename"] for p in out] == ["ai_report_final.pdf"]
+
+
+class TestCitationMarkersNeverReachTheUser:
+    """web_search wraps citations in Private Use Area delimiters. They reached a user as
+    "…one-million-token context. cite:ship:turn12search1:walking:" because the delimiters get
+    mapped to emoji shortcodes downstream. Strip the whole span at the source."""
+
+    def test_the_whole_span_goes_not_just_the_delimiters(self):
+        from message_processor.artifacts import strip_citation_markers
+        raw = "Transformers removed recurrence. citeturn9search0 Next."
+        out = strip_citation_markers(raw)
+        assert "cite" not in out
+        assert "turn9search0" not in out
+        assert "" not in out and "" not in out and "" not in out
+        assert out.startswith("Transformers removed recurrence.")
+        assert out.endswith("Next.")
+
+    def test_a_half_arrived_citation_is_held_back_mid_stream(self):
+        # The native stream is APPEND-ONLY. Emitting "citeturn9" and only THEN
+        # discovering it was a citation is unfixable.
+        from message_processor.artifacts import stream_safe_text
+        partial = "Context is big. citeturn9sea"
+        assert stream_safe_text(partial, final=False) == "Context is big. "
+
+    def test_plain_text_is_untouched(self):
+        from message_processor.artifacts import strip_citation_markers
+        assert strip_citation_markers("just a normal answer") == "just a normal answer"
+        assert strip_citation_markers("") == ""
+
+
+class TestOnlyTheFinalDocumentShips:
+    """A model that revises leaves the draft behind. It wrote Board_Ready.pdf, thought better of
+    it, wrote Board_Brief.pdf — and the user got BOTH, with no way to tell which was real."""
+
+    async def test_the_superseded_draft_is_held_back(self):
+        files = [_cfile("f1", "/mnt/data/Board_Ready.pdf"),
+                 _cfile("f2", "/mnt/data/Board_Brief.pdf")]
+        oc = _openai_payloads(files, {"f1": b"%PDF-1.7 draft", "f2": b"%PDF-1.7 final"})
+        client = _client()
+
+        out = await publish_artifacts(
+            openai_client=oc, client=client, channel_id="C1", thread_id="1.0",
+            thread_key="C1:1.0", container_ids=["c1"], db=None)
+
+        # The listing is in creation order: the last one written is the one it finished on.
+        assert [p["filename"] for p in out] == ["Board_Brief.pdf"]
+
+    async def test_different_document_types_both_ship(self):
+        # "A deck AND the workbook behind it" is a real ask; only same-type drafts are drafts.
+        files = [_cfile("f1", "/mnt/data/report.pdf"), _cfile("f2", "/mnt/data/data.xlsx")]
+        oc = _openai_payloads(files, {"f1": b"%PDF-1.7 x", "f2": XLSX})
+        client = _client()
+
+        out = await publish_artifacts(
+            openai_client=oc, client=client, channel_id="C1", thread_id="1.0",
+            thread_key="C1:1.0", container_ids=["c1"], db=None)
+
+        assert sorted(p["filename"] for p in out) == ["data.xlsx", "report.pdf"]
+
+
+# ------------------------------------------------------------------ F37: staged publication
+#
+# A background job's container dies on a 20-minute idle clock. If the model that decides what to
+# ship had to reach back INTO the container, a slow finalize would eventually lose a deliverable
+# to an expiry. So the bytes come out first and wait in memory; the decision happens after.
+
+class TestStaging:
+    @pytest.mark.asyncio
+    async def test_staging_pulls_the_bytes_out_and_publishes_nothing(self):
+        oc = _openai([MagicMock(id="f1", source="assistant", path="/mnt/data/report.pdf")],
+                     payload=PDF)
+        staged = await artifacts_mod.stage_artifacts(openai_client=oc, container_ids=["c1"],
+                                                     ledger_key="C1:1.1")
+        assert [s.filename for s in staged] == ["report.pdf"]
+        assert staged[0].artifact_id == "art_1"       # opaque, application-issued
+        assert staged[0].size_bytes == len(PDF)
+        assert staged[0].candidate["data"] == PDF     # held in memory, never on disk
+        # Nothing was posted: staging takes no Slack client at all.
+        assert staged[0].manifest_entry() == {
+            "artifact_id": "art_1", "filename": "report.pdf", "kind": "pdf",
+            "size_bytes": len(PDF)}
+
+    @pytest.mark.asyncio
+    async def test_staging_applies_the_declared_manifest(self):
+        """The chart that went INTO the PDF is working material — it must never be staged, or
+        the model would be offered its own ingredients to publish."""
+        oc = _openai_payloads(
+            [MagicMock(id="f1", source="assistant", path="/mnt/data/chart.png"),
+             MagicMock(id="f2", source="assistant", path="/mnt/data/report.pdf")],
+            {"f1": PNG, "f2": PDF})
+        staged = await artifacts_mod.stage_artifacts(
+            openai_client=oc, container_ids=["c1"], ledger_key="C1:1.2",
+            expect_filenames=["report.pdf"])
+        assert [s.filename for s in staged] == ["report.pdf"]
+
+    @pytest.mark.asyncio
+    async def test_publish_staged_ships_only_what_the_model_named(self):
+        oc = _openai_payloads(
+            [MagicMock(id="f1", source="assistant", path="/mnt/data/a.csv"),
+             MagicMock(id="f2", source="assistant", path="/mnt/data/b.csv")],
+            {"f1": CSV, "f2": CSV + b"x"})
+        staged = await artifacts_mod.stage_artifacts(openai_client=oc, container_ids=["c1"],
+                                                     ledger_key="C1:1.3")
+        assert len(staged) == 2
+        client = _client()
+        published = await artifacts_mod.publish_staged(
+            staged, ["art_2"], client=client, channel_id="C1", thread_id="1.3",
+            thread_key="C1:1.3", ledger_key="C1:1.3")
+        assert [p["filename"] for p in published] == ["b.csv"]
+        assert client.send_file.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_publish_staged_drops_an_unknown_id_instead_of_guessing(self):
+        """A hallucinated id must ship NOTHING. Publishing a 'close enough' file confidently is
+        worse than publishing none — and unlike a filename match there is no honest fallback."""
+        oc = _openai([MagicMock(id="f1", source="assistant", path="/mnt/data/report.pdf")],
+                     payload=PDF)
+        staged = await artifacts_mod.stage_artifacts(openai_client=oc, container_ids=["c1"],
+                                                     ledger_key="C1:1.4")
+        client = _client()
+        published = await artifacts_mod.publish_staged(
+            staged, ["art_99"], client=client, channel_id="C1", thread_id="1.4",
+            thread_key="C1:1.4", ledger_key="C1:1.4")
+        assert published == []
+        client.send_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_publish_staged_honours_the_requested_order(self):
+        oc = _openai_payloads(
+            [MagicMock(id="f1", source="assistant", path="/mnt/data/a.csv"),
+             MagicMock(id="f2", source="assistant", path="/mnt/data/b.csv")],
+            {"f1": CSV, "f2": CSV + b"x"})
+        staged = await artifacts_mod.stage_artifacts(openai_client=oc, container_ids=["c1"],
+                                                     ledger_key="C1:1.5")
+        client = _client()
+        published = await artifacts_mod.publish_staged(
+            staged, ["art_2", "art_1"], client=client, channel_id="C1", thread_id="1.5",
+            thread_key="C1:1.5", ledger_key="C1:1.5")
+        assert [p["filename"] for p in published] == ["b.csv", "a.csv"]
+
+    @pytest.mark.asyncio
+    async def test_publishing_nothing_is_a_legitimate_outcome(self):
+        oc = _openai([MagicMock(id="f1", source="assistant", path="/mnt/data/report.pdf")],
+                     payload=PDF)
+        staged = await artifacts_mod.stage_artifacts(openai_client=oc, container_ids=["c1"],
+                                                     ledger_key="C1:1.6")
+        client = _client()
+        assert await artifacts_mod.publish_staged(
+            staged, [], client=client, channel_id="C1", thread_id="1.6",
+            thread_key="C1:1.6", ledger_key="C1:1.6") == []
+        client.send_file.assert_not_awaited()

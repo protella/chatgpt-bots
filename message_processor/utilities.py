@@ -16,7 +16,7 @@ from config import config, pipeline_status
 from message_processor.message_timestamps import stamp_content
 from message_processor.people_tools import format_people_summary
 from prompts import (SLACK_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, LOCAL_TOOLS_GUIDANCE,
-                     CODE_INTERPRETER_GUIDANCE)
+                     CODE_INTERPRETER_GUIDANCE, CANVAS_GUIDANCE)
 
 
 def build_roster_text(participants, user_cache=None, bot_user_id=None):
@@ -63,6 +63,41 @@ CI_MOUNTABLE_MIMETYPES = {
 }
 
 
+# The ONLY keys the Responses API accepts on a content part. Everything else our attachment
+# pipeline hangs on these dicts (`source`, `filename`, `url`, `file_id`) is internal bookkeeping
+# for the DB write and the image catalog.
+#
+# `file_id` is deliberately NOT here. The API does accept a file_id — but it means an OPENAI
+# file id, and ours is Slack's (`F0BGSHE3JGJ`). Passing it through earns a second, more
+# confusing 400 than the one this whitelist was written to fix:
+#   Invalid 'input[5].content[1].file_id': expected an ID that begins with 'file'.
+# We send the bytes inline (image_url / file_data), so there is nothing for it to name.
+_API_PART_KEYS = {
+    "input_image": ("type", "image_url", "detail"),
+    "input_file": ("type", "filename", "file_data", "file_url"),
+    "input_text": ("type", "text"),
+}
+
+
+def api_part(part: Dict) -> Dict:
+    """Strip a content part down to what the API will actually accept.
+
+    These dicts do double duty: they carry the image/file for the API AND the metadata the DB
+    write needs afterwards. Passing them through whole is a hard 400 —
+    `Unknown parameter: 'input[3].content[1].source'` — which killed every turn that had an
+    image attached. It only surfaced when F34 stopped routing images to the vision handler and
+    started letting them ride the ordinary text turn: nothing had ever sent one of these dicts
+    to the API before.
+
+    Module-level rather than a method, because it is a pure function of the part and the code
+    that builds content should not need a `self` to sanitise one.
+    """
+    allowed = _API_PART_KEYS.get(part.get("type"))
+    if not allowed:
+        return part
+    return {k: v for k, v in part.items() if k in allowed and v is not None}
+
+
 class MessageUtilitiesMixin:
     def _format_user_content_with_username(self, content: str, message: Message) -> str:
         """Format user content with username prefix for multi-user context
@@ -103,8 +138,8 @@ class MessageUtilitiesMixin:
         """
         if image_inputs or file_inputs:
             content = [{"type": "input_text", "text": text}]
-            content.extend(image_inputs or [])
-            content.extend(file_inputs or [])
+            content.extend(api_part(p) for p in (image_inputs or []))
+            content.extend(api_part(p) for p in (file_inputs or []))
             return content
         else:
             # Simple text content
@@ -813,107 +848,66 @@ class MessageUtilitiesMixin:
         
         return image_inputs, document_inputs, unsupported_files
 
-    def _extract_image_registry(self, thread_state) -> List[Dict[str, str]]:
-        """Extract all image URLs and descriptions from thread state"""
-        image_registry = []
-        
-        for msg in thread_state.messages:
-            if msg.get("role") == "assistant":
-                metadata = msg.get("metadata", {})
-                content = msg.get("content", "")
-                
-                # First check metadata (new approach)
-                if metadata.get("type") in ["image_generation", "image_edit", "image_analysis"]:
-                    url = metadata.get("url")
-                    prompt = metadata.get("prompt", content)
-                    image_type = metadata.get("type", "").replace("_", " ")
-                    
-                    image_registry.append({
-                        "url": url if url else "[Pending upload]",
-                        "description": prompt,
-                        "type": image_type
-                    })
-                # Fallback to string matching for backward compatibility
-                elif isinstance(content, str):
-                    # Check for any image markers
-                    image_markers = ["Generated image:", "Edited image:", "Analyzed uploaded image:"]
-                    for marker in image_markers:
-                        if marker in content:
-                            # Extract URL if present
-                            url = None
-                            if "<" in content and ">" in content:
-                                url_start = content.rfind("<")
-                                url_end = content.rfind(">")
-                                if url_start < url_end:
-                                    url = content[url_start + 1:url_end]
-                            
-                            # Extract description based on marker type
-                            if marker == "Analyzed uploaded image:":
-                                # For analysis, we want to note this is the original uploaded image
-                                desc_start = content.find(marker) + len(marker)
-                                desc_end = content.find("<") if "<" in content else len(content)
-                                description = f"[Original] {content[desc_start:desc_end].strip()}"
-                            else:
-                                # For generated/edited images
-                                desc_start = content.find(marker) + len(marker)
-                                desc_end = content.find("<") if "<" in content else len(content)
-                                description = content[desc_start:desc_end].strip()
-                            
-                            if url or marker == "Image analysis:":
-                                image_registry.append({
-                                    "url": url if url else "[Uploaded image - URL pending]",
-                                    "description": description,
-                                    "type": marker.replace(":", "").lower().replace(" ", "_")
-                                })
-                            break  # Only process first marker found
-        
-        return image_registry
+    async def _inject_image_analyses(self, messages: List[Dict], thread_state) -> List[Dict]:
+        """Inject stored image analyses into conversation for context.
 
-    async def _has_recent_image(self, thread_state) -> bool:
-        """Check if there are recent images in the conversation"""
-        # First check the database for ALL images in this thread (no limit)
-        if self.db:
-            thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
-            thread_images = await self.db.find_thread_images_async(thread_key)
-            if thread_images:
-                self.log_debug(f"Found {len(thread_images)} images in DB for thread {thread_key}")
-                return True
-        
-        # Fallback: Check last few messages for image generation breadcrumbs or uploaded images
-        for msg in thread_state.messages[-5:]:  # Check last 5 messages
-            if msg.get("role") == "assistant":
-                content = msg.get("content", "")
-                # Check metadata for image generation
-                metadata = msg.get("metadata", {})
-                if metadata.get("type") == "image_generation":
-                    return True
-                # Fallback to text markers
-                if isinstance(content, str):
-                    # Look for image generation markers
-                    if any(marker in content.lower() for marker in [
-                        "generated image:",
-                        "here's the image",
-                        "created an image",
-                        "edited image:"
-                    ]):
-                        return True
-            elif msg.get("role") == "user":
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    # Look for uploaded image URLs (Slack format)
-                    if "files.slack.com" in content or "[Uploaded" in content:
-                        return True
-        
-        # Also check asset ledger if available
-        asset_ledger = self.thread_manager.get_asset_ledger(thread_state.thread_ts)
-        if asset_ledger and asset_ledger.images:
-            # Check if any images were created in last 5 minutes
-            current_time = time.time()
-            for img in asset_ledger.get_recent_images(3):
-                if current_time - img.get("timestamp", 0) < 300:  # 5 minutes
-                    return True
-        
-        return False
+        Keys on the Slack ts stamped into each message's metadata (Phase S — there is no
+        DB message mirror to pair against). Injection content and position are functions
+        of the message ts and the stored image rows only, so two rebuilds of the same
+        thread serialize identically — required for OpenAI prefix-cache stability.
+        """
+        if not self.db:
+            return messages
+
+        thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+
+        enhanced_messages = []
+
+        for i, msg in enumerate(messages):
+            # Add the original message
+            enhanced_messages.append(msg)
+
+            # Only inject after user messages
+            if msg.get("role") == "user":
+                msg_ts = (msg.get("metadata") or {}).get("ts")
+
+                if msg_ts:
+                    # Get images associated with this specific message
+                    images_for_message = await self.db.get_images_by_message_async(thread_key, msg_ts)
+
+                    for img_data in images_for_message:
+                        analysis = img_data.get("analysis")
+                        url = img_data.get("url")
+                        image_type = img_data.get("image_type", "image")
+
+                        # Inject image context - either analysis or just URL info
+                        if analysis:
+                            # Full analysis available
+                            enhanced_messages.append({
+                                "role": "developer",
+                                "content": f"[Visual context for {image_type}]:\n{analysis}\n[End of visual context]"
+                            })
+                            self.log_debug(f"Injected analysis for message at position {i}")
+                        elif url:
+                            # No analysis but we have the URL - inject basic info
+                            context_msg = f"[Image context: {image_type} at {url}]"
+                            if image_type == "generated":
+                                context_msg = f"[Bot generated an image and posted it at: {url}]"
+                            elif image_type == "uploaded":
+                                context_msg = f"[User uploaded an image at: {url}]"
+                            elif image_type == "edited":
+                                context_msg = f"[Bot edited an image and posted it at: {url}]"
+
+                            enhanced_messages.append({
+                                "role": "developer",
+                                "content": context_msg
+                            })
+                            self.log_debug(f"Injected URL context for {image_type} at position {i}")
+
+        if len(enhanced_messages) > len(messages):
+            self.log_info(f"Enhanced conversation with {len(enhanced_messages) - len(messages)} image context entries")
+
+        return enhanced_messages
 
     def _build_participant_roster(self, thread_state, client) -> str:
         """Build the @mention roster text from thread participants + the client's user cache."""
@@ -943,15 +937,40 @@ class MessageUtilitiesMixin:
         return "\n".join(f"- [#{r['id']}] {r['content']}" for r in sorted(rows, key=lambda r: r["id"]))
 
     async def _build_channel_info(self, client, channel_id: Optional[str]) -> Optional[dict]:
-        """Fetch this channel's name/topic/purpose via the client's cached lookup.
+        """Fetch this channel's name/topic/purpose (and its canvases) via cached lookups.
         Returns None for DMs, non-Slack clients, or on any failure — prompt unchanged."""
         fetch = getattr(client, "get_channel_context", None)
         if not fetch or not channel_id:
             return None
         try:
-            return await fetch(channel_id)
+            info = await fetch(channel_id)
         except Exception:
             return None
+        if not info:
+            return info
+
+        # F36: canvases are channel furniture, like the topic or the member list — so they
+        # belong in the channel context, not only in a tool schema. Slack posts no message when
+        # a canvas is shared, so a canvas is otherwise INVISIBLE: nothing in the rebuilt history
+        # mentions it. Without this, "update our devops call agenda" has nothing to attach to —
+        # the word "canvas" never appears, so the model has no reason to suspect one exists, and
+        # the participation gate (which never sees tool schemas at all) may not even wake.
+        try:
+            from message_processor import canvas_tools
+            canvases = await canvas_tools.build_catalog(client, channel_id)
+            if canvases:
+                info = dict(info)
+                # The channel canvas is named by its own top heading (Slack keeps it "Untitled"
+                # forever) and flagged, because its ROLE is what an ask will lean on: "put it on
+                # the canvas" means that one, and nothing else.
+                info["canvases"] = [
+                    (f"{c['title']} — the channel canvas, pinned as a tab"
+                     if c.get("is_channel_canvas") else c["title"])
+                    for c in canvases
+                ]
+        except Exception:  # noqa: BLE001 — a canvas lookup must never cost the prompt
+            pass
+        return info
 
     def _get_system_prompt(self, client: BaseClient, user_timezone: str = "UTC",
                           user_tz_label: Optional[str] = None, user_real_name: Optional[str] = None,
@@ -1056,7 +1075,8 @@ class MessageUtilitiesMixin:
         # Where the conversation lives: channel name + topic + purpose (cached lookup;
         # None in DMs). Topics often carry load-bearing facts (links, owners, norms).
         channel_info_context = ""
-        if channel_info and (channel_info.get("name") or channel_info.get("topic") or channel_info.get("purpose")):
+        if channel_info and (channel_info.get("name") or channel_info.get("topic")
+                             or channel_info.get("purpose") or channel_info.get("canvases")):
             info_lines = []
             if channel_info.get("name"):
                 info_lines.append(f"This conversation is in the #{channel_info['name']} channel.")
@@ -1064,6 +1084,12 @@ class MessageUtilitiesMixin:
                 info_lines.append(f"Channel topic: {channel_info['topic']}")
             if channel_info.get("purpose"):
                 info_lines.append(f"Channel description: {channel_info['purpose']}")
+            if channel_info.get("canvases"):
+                # Named, so an ask can match one WITHOUT the word "canvas" — "update our devops
+                # call agenda" should land on the canvas called "DevOps Agenda".
+                info_lines.append(
+                    "Channel canvases (living documents you can read and edit):\n"
+                    + "\n".join(f"- {t}" for t in channel_info["canvases"]))
             channel_info_context = "\n\n--- CHANNEL CONTEXT ---\n" + "\n".join(info_lines) + "\n--- END CHANNEL CONTEXT ---"
 
         # Phase 7: per-channel ground rules set by an operator (applied when present)
@@ -1092,6 +1118,15 @@ class MessageUtilitiesMixin:
             code_interpreter_enabled = config.enable_code_interpreter
         code_interpreter_context = CODE_INTERPRETER_GUIDANCE if code_interpreter_enabled else ""
 
+        # F36: canvases. Only in a CHANNEL — a DM has no canvas tab, and the tools are not
+        # registered there. Without this block the tools sit unused: the model answers "start a
+        # running agenda" with a chat message, because the choice between "reply" and "document"
+        # is made before it ever reads a tool description.
+        canvas_context = ""
+        if (channel_info is not None and config.enable_canvas_tools
+                and tool_registry is not None and tool_registry.has_tools()):
+            canvas_context = CANVAS_GUIDANCE
+
         # Prompt-cache hygiene: the system prompt is the START of every request payload,
         # so anything volatile here busts the OpenAI prefix cache for the whole thread.
         # Only the DATE lives here (one bust per day). The minute-precision time is
@@ -1099,7 +1134,7 @@ class MessageUtilitiesMixin:
         # channel_memory / roster / directives change rarely — acceptable in the prefix.
         time_context = f"\n\nToday's date: {current_time.strftime('%A, %B %d, %Y')} ({timezone_display})\nThe precise current time is provided at the end of the conversation."
 
-        return base_prompt + user_context + model_context + web_search_context + local_tools_context + code_interpreter_context + trimming_context + custom_instructions_context + channel_info_context + channel_directives_context + channel_memory_context + (participant_roster or "") + time_context
+        return base_prompt + user_context + model_context + web_search_context + local_tools_context + code_interpreter_context + canvas_context + trimming_context + custom_instructions_context + channel_info_context + channel_directives_context + channel_memory_context + (participant_roster or "") + time_context
 
     def _build_time_suffix_context(self, user_timezone: str = "UTC",
                                    user_tz_label: Optional[str] = None) -> str:
@@ -1357,26 +1392,6 @@ class MessageUtilitiesMixin:
                 db.save_tool_usage_async(channel_id, message_ts, thread_key or "", provenance))
         except Exception as e:  # noqa: BLE001 — provenance persistence is never load-bearing
             self.log_debug(f"tool-provenance persist skipped: {e}")
-
-    def _update_message_streaming_sync(self, client, channel_id: str, message_id: str, text: str):
-        """Wrapper for calling async update_message_streaming from sync contexts
-
-        Returns a fake success result since we can't wait for the actual result
-        in a synchronous callback context.
-        """
-        try:
-            result_coro = client.update_message_streaming(channel_id, message_id, text)
-            if hasattr(result_coro, '__await__'):
-                # This is a coroutine - schedule it to run
-                self._schedule_async_call(result_coro)
-                # Return a success result since we can't wait for the actual result
-                return {"success": True, "rate_limited": False, "retry_after": None}
-            else:
-                # It's already a result (shouldn't happen with async methods)
-                return result_coro
-        except Exception as e:
-            self.log_error(f"Error scheduling async message update: {e}")
-            return {"success": False, "rate_limited": False, "retry_after": None, "error": str(e)}
 
     def _send_message_get_ts_sync(self, client, channel_id: str, thread_id: str, text: str):
         """Wrapper for calling async send_message_get_ts from sync contexts

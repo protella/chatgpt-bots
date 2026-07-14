@@ -302,12 +302,22 @@ class SlackUtilitiesMixin:
         
         return None
 
-    async def download_file(self, file_url: str, file_id: Optional[str] = None) -> Optional[bytes]:
+    async def download_file(self, file_url: str, file_id: Optional[str] = None,
+                            allow_html: bool = False) -> Optional[bytes]:
         """Download a file from Slack
-        
+
         Args:
             file_url: The Slack file URL (can be url_private or permalink)
             file_id: Optional file ID (will be extracted from URL if not provided)
+            allow_html: Accept a text/html body instead of rejecting it.
+
+        An HTML body normally means the download FAILED — Slack serves a login page rather than
+        a 401 when auth is wrong, so HTML where an image should be is the signature of a bad
+        token, and returning it would hand the caller a web page dressed as a PNG.
+
+        A canvas is the exception: its content genuinely IS html (there is no canvases.read —
+        you fetch url_private and get markup). So canvases opt in, and check for themselves
+        that what came back is a canvas rather than a login screen.
         """
         try:
             # If file_id not provided, try to extract from URL
@@ -375,7 +385,7 @@ class SlackUtilitiesMixin:
                     if response.status == 200:
                         # Check if we got actual image data
                         content_type = response.headers.get('content-type', '').lower()
-                        if 'text/html' in content_type:
+                        if 'text/html' in content_type and not allow_html:
                             self.log_error("Got HTML instead of image data from private URL")
                             text_preview = await response.text()
                             self.log_debug(f"Response preview: {text_preview[:200]}")

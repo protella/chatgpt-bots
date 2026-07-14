@@ -204,7 +204,7 @@ class TestRequestParams:
         try:
             config.utility_model = "gpt-5.6-luna"
             config.utility_reasoning_effort = "minimal"  # stale .env value
-            await R.classify_intent(fake, messages=[], last_user_message="hello")
+            await R.extract_memory(fake, exchange_text="hello")
             assert fake.captured["reasoning"] == {"effort": "none"}
         finally:
             config.utility_model = orig_model

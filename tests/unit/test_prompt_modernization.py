@@ -1,32 +1,25 @@
 """Prompt modernization (frontier-model trim) — behavioral contracts.
 
-Covers: the multi-user prefix-cache fix in _get_system_prompt, the vision
-enhancement-hop retirement (flag default off + default question), the intent
-classifier's five-label contract on the trimmed prompt, and the presence of
-the new teammate/batch/brevity guidance.
+Covers: the multi-user prefix-cache fix in _get_system_prompt, the ack reaction, and the
+presence of the teammate/batch/brevity guidance. (The intent classifier and the vision
+enhancement hop this file also used to cover were deleted with the legacy image path — F34
+made image work a set of TOOLS, so nothing pre-routes a turn any more.)
 """
 import asyncio
-import types
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from config import config
-from openai_client.api.responses import (classify_intent as _classify_intent,
-                                          _parse_intent_and_ack)
 from message_processor.utilities import MessageUtilitiesMixin
-from message_processor.handlers.vision import VisionHandlerMixin, _VAGUE_VISION_ASKS
 from prompts import (
-    INTENT_CLASSIFIER_PROMPT,
     PARTICIPATION_SYSTEM_PROMPT,
     SLACK_SYSTEM_PROMPT,
-    VISION_DEFAULT_QUESTION,
 )
 
 
 # --------------------------------------------------------------------------- harness
 
-class _Proc(VisionHandlerMixin, MessageUtilitiesMixin):
+class _Proc(MessageUtilitiesMixin):
     def __init__(self, openai_client=None):
         self.db = None
         self.openai_client = openai_client
@@ -87,143 +80,11 @@ def test_single_user_thread_keeps_user_context():
     assert "You're speaking with Erin Evans" in p
 
 
-# ------------------------------------------------- vision enhancement retirement
-
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro) if False else asyncio.run(coro)
+    return asyncio.run(coro)
 
 
-def test_enhancement_skipped_when_flag_off():
-    openai_client = MagicMock()
-    openai_client._enhance_vision_prompt = AsyncMock(return_value="ENHANCED")
-    proc = _Proc(openai_client=openai_client)
-    with patch.object(config, "enable_vision_enhancement", False):
-        out = _run(proc._build_vision_question("what breed is the dog on the left?", []))
-    assert out == "what breed is the dog on the left?"
-    openai_client._enhance_vision_prompt.assert_not_awaited()
-
-
-def test_enhancement_runs_when_flag_on():
-    openai_client = MagicMock()
-    openai_client._enhance_vision_prompt = AsyncMock(return_value="ENHANCED")
-    proc = _Proc(openai_client=openai_client)
-    with patch.object(config, "enable_vision_enhancement", True):
-        out = _run(proc._build_vision_question("what breed is the dog?", [{"role": "user"}]))
-    assert out == "ENHANCED"
-    openai_client._enhance_vision_prompt.assert_awaited_once()
-
-
-@pytest.mark.parametrize("ask", ["", "   ", "describe this", "What is this?", "describe this image."])
-def test_default_question_for_empty_or_vague_asks(ask):
-    """Empty/vague asks get the standard default question — flag on OR off."""
-    openai_client = MagicMock()
-    openai_client._enhance_vision_prompt = AsyncMock(return_value="ENHANCED")
-    proc = _Proc(openai_client=openai_client)
-    for flag in (False, True):
-        with patch.object(config, "enable_vision_enhancement", flag):
-            out = _run(proc._build_vision_question(ask, []))
-        assert out == VISION_DEFAULT_QUESTION
-    openai_client._enhance_vision_prompt.assert_not_awaited()
-
-
-def test_vague_set_is_lowercase_normalized():
-    assert all(p == p.lower() for p in _VAGUE_VISION_ASKS)
-
-
-# ------------------------------------------------- intent classifier contract
-
-class _Classifier:
-    """Binds the real classify_intent with a mocked API."""
-    from openai_client.api.responses import classify_intent  # bound below
-
-    def __init__(self, word):
-        content = types.SimpleNamespace(text=word)
-        item = types.SimpleNamespace(content=[content])
-        self._response = types.SimpleNamespace(output=[item], usage=None)
-        self.client = MagicMock()
-        self.client.timeout = 30
-        self.captured_params = None
-
-    async def _safe_api_call(self, fn, operation_type=None, timeout_seconds=None, **params):
-        self.captured_params = params
-        return self._response
-
-    def log_debug(self, *a, **k): pass
-    def log_warning(self, *a, **k): pass
-    def log_error(self, *a, **k): pass
-
-
-_Classifier.classify_intent = _classify_intent
-
-
-@pytest.mark.parametrize("word,expected", [
-    ("new", "new_image"),
-    ("edit", "edit_image"),
-    ("vision", "vision"),
-    ("ambiguous", "ambiguous_image"),
-    ("none", "text_only"),
-    ("garbage sentence with spaces", "text_only"),  # invalid -> safe default
-])
-def test_classifier_five_label_contract(word, expected):
-    c = _Classifier(word)
-    intent = _run(c.classify_intent([], "some message"))
-    assert intent == expected
-    # The trimmed prompt is what actually gets sent
-    dev_msgs = [m for m in c.captured_params["input"] if m.get("role") == "developer"]
-    assert dev_msgs and dev_msgs[0]["content"] == INTENT_CLASSIFIER_PROMPT
-
-
-def test_classifier_prompt_token_budget():
-    """Fires on every responded message and sits below the 1024-token prompt-cache
-    threshold — must stay small. chars/4 proxy.
-
-    Raised 350 -> 420 to buy the rule-5 chart fix. The old prompt was 1399/1400 chars — pinned
-    to the character — and its `new` bullet listed "visualize" as an image trigger, so "chart
-    it" reached gpt-image-1, which drew a chart with invented numbers AND invented categories.
-    Fitting under 350 meant deleting production-hardened disambiguation rules; ~40 tokens per
-    classifier call is the cheaper side of that trade, and 420 is still far under 1024."""
-    assert len(INTENT_CLASSIFIER_PROMPT) / 4 < 420
-
-
-# ------------------------------------------------- F19 intent ack parse
-
-@pytest.mark.parametrize("raw,intent,ack", [
-    ("vision ack", "vision", True),          # two tokens: intent + ack
-    ("new ack", "new_image", True),
-    ("edit noack", "edit_image", False),     # explicit noack
-    ("none", "text_only", False),            # one-word fallback -> noack
-    ("vision", "vision", False),
-    ("new banana", "new_image", False),      # garbage 2nd token never breaks routing
-    ("none whatever extra", "text_only", False),
-    ("garbage sentence here", "text_only", False),  # unmapped 1st token -> safe default
-    ("", "text_only", False),                # empty -> safe default
-    ("  vision   ACK  ", "vision", True),    # whitespace + case tolerant
-])
-def test_parse_intent_and_ack(raw, intent, ack):
-    assert _parse_intent_and_ack(raw) == (intent, ack)
-
-
-def test_classifier_return_ack_two_token(monkeypatch):
-    """return_ack=True unpacks (intent, ack) from the two-token model output."""
-    c = _Classifier("vision ack")
-    intent, ack = _run(c.classify_intent([], "look at this", return_ack=True))
-    assert intent == "vision" and ack is True
-
-
-def test_classifier_return_ack_defaults_noack_on_one_word():
-    """A one-word (legacy-shaped) output still parses; ack defaults False."""
-    c = _Classifier("none")
-    intent, ack = _run(c.classify_intent([], "hi", return_ack=True))
-    assert intent == "text_only" and ack is False
-
-
-def test_classifier_bare_return_unchanged_without_return_ack():
-    """Without return_ack the call still returns a bare intent string (back-compat)."""
-    c = _Classifier("new ack")
-    assert _run(c.classify_intent([], "draw a cat")) == "new_image"
-
-
-# ------------------------------------------------- F19 intent-path ack reaction
+# ------------------------------------------------- F19 ack reaction
 
 def _ack_msg():
     from base_client import Message
@@ -232,7 +93,7 @@ def _ack_msg():
 
 
 def test_place_ack_reaction_uses_reservation_guard(monkeypatch):
-    """The intent-path ack routes through the F6 reservation guard on the triggering ts."""
+    """The ack routes through the F6 reservation guard on the triggering ts."""
     monkeypatch.setattr(config, "ack_reaction_emoji", "eyes", raising=False)
     proc = _Proc()
     client = MagicMock()
@@ -284,7 +145,7 @@ def test_f17_voice_banter_clause_present():
     assert "one good line beats three" in SLACK_SYSTEM_PROMPT
 
 
-def test_f17_classifier_banter_clause_present():
+def test_f17_participation_banter_clause_present():
     # F17: playful banter/teasing genuinely AT the assistant is a respond (a short quip)
     # or react case — not "marginal value" to ignore — but addressee rules still dominate.
     assert "Playful banter or teasing aimed genuinely AT the assistant is a respond case" \

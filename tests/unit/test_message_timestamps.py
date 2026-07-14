@@ -23,7 +23,6 @@ from message_processor.message_timestamps import (
 )
 from message_processor.thread_management import ThreadManagementMixin
 from message_processor.utilities import MessageUtilitiesMixin
-from message_processor.handlers.vision import VisionHandlerMixin
 from prompts import PARTICIPATION_SYSTEM_PROMPT
 from slack_client.channel_pulse import ChannelPulse
 from thread_manager import AsyncThreadStateManager
@@ -35,7 +34,7 @@ _STAMP_RE = re.compile(r"^\[(Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d{2}-\d{2} "
 
 # --------------------------------------------------------------------------- harness
 
-class _Proc(ThreadManagementMixin, VisionHandlerMixin, MessageUtilitiesMixin):
+class _Proc(ThreadManagementMixin, MessageUtilitiesMixin):
     def __init__(self, db=None):
         self.db = db
         self.thread_manager = AsyncThreadStateManager(db=db)

@@ -332,17 +332,23 @@ class BotConfig:
     # WHY it woke (trigger reason, sender role, bot-vs-human). Text-handler turns only;
     # never in the system prompt or history. Off → suffix unchanged.
     enable_wake_envelope: bool = field(default_factory=lambda: os.getenv("ENABLE_WAKE_ENVELOPE", "true").lower() == "true")
-    # --- Background image generation (F1) ---
-    # New-image generation runs in a background job so the thread lock releases and
-    # conversation keeps flowing during the (multi-minute) generation. Off → today's
-    # inline behavior (generation holds the lock), minus the shared-delivery bug fixes
-    # which apply to both paths. Image EDIT stays synchronous either way this phase.
-    enable_background_image_gen: bool = field(default_factory=lambda: os.getenv("ENABLE_BACKGROUND_IMAGE_GEN", "true").lower() == "true")
     # F13 — how many background image generations may run concurrently in ONE thread.
-    # A new_image request past this cap gets a friendly "already N cooking" rejection;
-    # edits still wait for the in-flight image regardless. Per-thread; there is deliberately
+    # Enforced by the generate_image tool (message_processor/image_tools.py), which returns an
+    # "at_capacity" error the model relays in its own words. Per-thread; there is deliberately
     # NO global cap (F14).
     max_concurrent_image_generations: int = field(default_factory=lambda: int(os.getenv("MAX_CONCURRENT_IMAGE_GENERATIONS", "5")))
+    # Show the model-rewritten ("enhanced") image prompt as a caption under the image. The
+    # enhancement ALWAYS runs — this only decides whether the user has to read it. Off by
+    # default: it used to be posted as its own block above every image, which was noise.
+    show_enhanced_prompt: bool = field(default_factory=lambda: os.getenv("SHOW_ENHANCED_PROMPT", "false").lower() == "true")
+    # F36: Slack canvases (create/read/edit/list). A canvas is the right home for something the
+    # thread keeps returning to — a spec, a checklist — where a message gets buried and a file
+    # forks into _final_v3. Needs canvases:read + canvases:write.
+    enable_canvas_tools: bool = field(default_factory=lambda: os.getenv("ENABLE_CANVAS_TOOLS", "true").lower() == "true")
+    # Canvas DELETION is irreversible and public. It is withheld on unprompted turns regardless
+    # (the model must never tidy up a channel it was only listening in) — this flag turns it off
+    # entirely, even when asked directly.
+    enable_canvas_delete: bool = field(default_factory=lambda: os.getenv("ENABLE_CANVAS_DELETE", "true").lower() == "true")
     # Rotating loading messages shown in the assistant thread's transient bubble.
     # Sourced from a message file (one per line, # comments ok) — see
     # status_messages/loading_messages.generic.txt. Brand them by pointing
@@ -583,13 +589,6 @@ class BotConfig:
     search_channel_types: list = field(default_factory=lambda: _env_list(
         "SEARCH_CHANNEL_TYPES", ["public_channel", "private_channel"]))
 
-    # --- Vision question enhancement hop (legacy) ---
-    # When true, a utility-model call rewrites the user's question about an image (with full
-    # conversation history) before the vision call. Frontier vision models don't need the
-    # question pre-chewed — default OFF saves one utility call + 1-2s latency per vision
-    # request. Empty/vague questions get VISION_DEFAULT_QUESTION either way.
-    enable_vision_enhancement: bool = field(default_factory=lambda: os.getenv("ENABLE_VISION_ENHANCEMENT", "false").lower() == "true")
-
     # --- Document architecture (Phase D2) ---
     # Native file input: PDFs within the API limits ride the attach turn as an input_file
     # content part (base64 per-request — never the OpenAI Files API), so the model sees
@@ -643,11 +642,21 @@ class BotConfig:
     # Per-thread cap on concurrent research jobs (friendly structured rejection at the cap, which
     # the model relays). Deliberately per-thread, no global cap — mirrors image gen's choice.
     deep_research_max_per_thread: int = field(default_factory=lambda: max(1, int(os.getenv("DEEP_RESEARCH_MAX_PER_THREAD", "2"))))
-    # F30.2: the job's tool-loop round budget. Each report_progress milestone costs one round,
-    # the job instruction asks for 2-5 milestones, so 10 = that ceiling with 2x headroom — the
-    # chat-turn MAX_TOOL_ROUNDS (4) would strangle milestone reporting. On cap the loop forces
-    # a final answer (tool_choice="none"), never an error.
+    # The job's tool-loop budget for PRODUCTIVE work. It is a runaway guard, not a ration: the
+    # thing that actually bounds a detached job's cost is DEEP_RESEARCH_TIMEOUT (wall clock).
+    # F37: card bookkeeping (update_todos) is exempt — it is passed as a `free_tool`, so a
+    # chatty todo list cannot eat the calls the build phase needs for mount_file /
+    # create_image_asset. Research spends almost nothing here (web_search is server-side and
+    # costs no round); the budget is for local tools. On cap the loop forces a final answer
+    # (tool_choice="none"), never an error.
     deep_research_max_tool_rounds: int = field(default_factory=lambda: max(1, int(os.getenv("DEEP_RESEARCH_MAX_TOOL_ROUNDS", "10"))))
+    # F35: the BUILD phase — a second loop that runs only when the job declared `deliverables`,
+    # with a code sandbox + image/mount tools, to turn the findings into an actual file.
+    # It needs a bigger round budget than the research phase: mount, write code, read the
+    # traceback, fix, re-run, verify. Running out of rounds mid-build is the difference between
+    # a deck and an apology.
+    deep_research_build_timeout: float = field(default_factory=lambda: float(os.getenv("DEEP_RESEARCH_BUILD_TIMEOUT", "600")))
+    deep_research_max_build_rounds: int = field(default_factory=lambda: max(1, int(os.getenv("DEEP_RESEARCH_MAX_BUILD_ROUNDS", "16"))))
     # Label the findings post with a chat.postMessage username override ("<bot> [research: …]").
     # Needs the chat:write.customize scope, which the app may not have — on the first failure the
     # process falls back to plain posts for the rest of its life. Never breaks delivery.
@@ -681,6 +690,7 @@ class BotConfig:
     # when the container was last active (an API call that failed never touched it).
     code_interpreter_container_reuse_minutes: int = field(
         default_factory=lambda: max(1, int(os.getenv("CODE_INTERPRETER_CONTAINER_REUSE_MINUTES", "15"))))
+    # --- F32: outbound artifacts ---
     # Max artifacts published per turn. The model can write many intermediate files; only the
     # ones it cites get published, and this bounds a runaway loop from flooding the thread.
     artifact_max_files: int = field(default_factory=lambda: max(1, int(os.getenv("ARTIFACT_MAX_FILES", "4"))))

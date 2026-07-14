@@ -16,13 +16,12 @@ from config import config
 from message_processor import tool_provenance as tp
 from message_processor.thread_management import ThreadManagementMixin
 from message_processor.utilities import MessageUtilitiesMixin
-from message_processor.handlers.vision import VisionHandlerMixin
 from thread_manager import AsyncThreadStateManager
 
 
 # --------------------------------------------------------------------------- harness
 
-class _Proc(ThreadManagementMixin, VisionHandlerMixin, MessageUtilitiesMixin):
+class _Proc(ThreadManagementMixin, MessageUtilitiesMixin):
     def __init__(self, db=None):
         self.db = db
         self.thread_manager = AsyncThreadStateManager(db=db)
