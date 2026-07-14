@@ -6,6 +6,7 @@ notes, the research-label fallback + process-lifetime memory, the thread_manager
 registry / shutdown cancellation, and config defaults.
 """
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -164,6 +165,8 @@ async def test_executor_missing_task(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_per_thread_cap_rejection(monkeypatch):
+    """The cap is now the ceiling for EXPLICITLY parallel work — so reaching it requires
+    run_in_parallel, otherwise the second-job guard below rejects first."""
     monkeypatch.setattr(config, "enable_deep_research", True)
     monkeypatch.setattr(config, "deep_research_max_per_thread", 2)
     tm = AsyncThreadStateManager()
@@ -172,10 +175,63 @@ async def test_per_thread_cap_rejection(monkeypatch):
     # Pre-fill the thread to the cap.
     tm.register_research("C1:100.0", "j1", "a")
     tm.register_research("C1:100.0", "j2", "b")
-    res = await rt.execute_start_background_job(ctx, {"task": "dig into X", "plan": ["Do the work"]})
+    res = await rt.execute_start_background_job(
+        ctx, {"task": "dig into X", "plan": ["Do the work"], "run_in_parallel": True})
     assert res["ok"] is False and res["error"] == "too_many_research_jobs"
     assert "max 2" in res["message"]
     assert proc.scheduled == []  # nothing detached
+
+
+@pytest.mark.asyncio
+async def test_a_second_job_needs_an_explicit_parallel_request(monkeypatch):
+    """F38, the double-status-card bug. A job is building a deck; the user posts a passing
+    remark in the thread; the model wakes and tries to start the same build again. Under the
+    old cap of 2 that was simply legal. Now it is refused unless someone actually asked for
+    separate work — and the refusal tells the model what is already running so it can just
+    reply instead."""
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    monkeypatch.setattr(config, "deep_research_max_per_thread", 2)
+    tm = AsyncThreadStateManager()
+    proc = _FakeProcessor(openai_client=SimpleNamespace(), tm=tm)
+    tm.register_research("C1:100.0", "j1", "DevOps report deck", mode="research_and_build",
+                         deliverables=["devops_report.pptx"])
+
+    res = await rt.execute_start_background_job(
+        _ctx(proc, _FakeClient()),
+        {"task": "make the devops deck", "plan": ["Do the work"],
+         "deliverables": [{"type": "powerpoint", "description": "deck", "filename": "again.pptx"}]})
+    assert res["ok"] is False and res["error"] == "research_already_running"
+    assert res["active_jobs"][0]["deliverables"] == ["devops_report.pptx"]
+    assert proc.scheduled == []          # no second job, no second status card
+
+    # Explicitly asked for parallel work → allowed (still under the cap).
+    res = await rt.execute_start_background_job(
+        _ctx(proc, _FakeClient()),
+        {"task": "separately, research pricing", "plan": ["Do the work"],
+         "run_in_parallel": True})
+    assert res["ok"] is True
+    for coro in proc.scheduled:
+        coro.close()
+
+
+@pytest.mark.asyncio
+async def test_a_clashing_deliverable_is_refused_even_in_parallel(monkeypatch):
+    """Two jobs writing the same filename deliver two files with one name. There is no reading
+    of that which is what anyone wanted — so this one is refused even with the opt-in."""
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    monkeypatch.setattr(config, "deep_research_max_per_thread", 2)
+    tm = AsyncThreadStateManager()
+    proc = _FakeProcessor(openai_client=SimpleNamespace(), tm=tm)
+    tm.register_research("C1:100.0", "j1", "deck", mode="research_and_build",
+                         deliverables=["q3.pptx"])
+
+    res = await rt.execute_start_background_job(
+        _ctx(proc, _FakeClient()),
+        {"task": "another deck", "plan": ["Do the work"], "run_in_parallel": True,
+         "deliverables": [{"type": "powerpoint", "description": "d", "filename": "q3.pptx"}]})
+    assert res["ok"] is False and res["error"] == "deliverable_already_building"
+    assert res["clashing"] == ["q3.pptx"]
+    assert proc.scheduled == []
 
 
 @pytest.mark.asyncio
@@ -1314,18 +1370,24 @@ async def test_build_mode_without_a_deliverable_is_rejected_at_dispatch(monkeypa
 
 @pytest.mark.asyncio
 async def test_mode_defaults_from_what_was_declared(monkeypatch):
-    """No mode + deliverables => research_and_build. No mode, no deliverables => research."""
+    """No mode + deliverables => research_and_build. No mode, no deliverables => research.
+
+    A processor each: the first call REGISTERS a job, and F38 refuses a second one in the same
+    thread without an explicit parallel request — so sharing one would test that guard instead
+    of the mode defaulting."""
     monkeypatch.setattr(config, "enable_deep_research", True)
     proc = _FakeProcessor(openai_client=SimpleNamespace(), tm=AsyncThreadStateManager())
     res = await rt.execute_start_background_job(
         _ctx(proc, _FakeClient()), {"task": "dig in", "plan": ["Do the work"]})
     assert res["mode"] == "research"
+
+    proc2 = _FakeProcessor(openai_client=SimpleNamespace(), tm=AsyncThreadStateManager())
     res = await rt.execute_start_background_job(
-        _ctx(proc, _FakeClient()),
+        _ctx(proc2, _FakeClient()),
         {"task": "dig in", "deliverables": [{"type": "pdf", "description": "d"}],
          "plan": ["Do the work"]})
     assert res["mode"] == "research_and_build"
-    for coro in proc.scheduled:
+    for coro in (*proc.scheduled, *proc2.scheduled):
         coro.close()
 
 
@@ -1677,3 +1739,159 @@ def test_a_todo_fits_on_one_line():
     assert "80 CHARACTERS" in rt._RESEARCH_JOB_INSTRUCTION.upper()
     assert "80 CHARACTERS" in rt.get_start_background_job_schema()[
         "parameters"]["properties"]["plan"]["description"].upper()
+
+
+# ------------------------------------------------------ F38: the model can SEE its own job
+
+class _ResearchSuffixHost:
+    def __init__(self, tm):
+        from message_processor.utilities import MessageUtilitiesMixin
+        self._build_research_inflight_note = (
+            MessageUtilitiesMixin._build_research_inflight_note.__get__(self))
+        self._escape_suffix_text = MessageUtilitiesMixin._escape_suffix_text
+        self.thread_manager = tm
+
+    def log_debug(self, *a, **k):
+        pass
+
+
+def test_the_model_is_told_what_is_already_running():
+    """The root cause of the double status card: in-flight IMAGES were surfaced to the model,
+    in-flight BACKGROUND JOBS were not. `research_in_flight_count` was read in exactly one
+    place — the tool's own cap check — so the model was blind to its own running work, and a
+    passing remark in the thread was enough to make it start the same deck a second time."""
+    tm = AsyncThreadStateManager(db=None)
+    host = _ResearchSuffixHost(tm)
+    assert host._build_research_inflight_note("C1", "T1") is None
+
+    tm.register_research("C1:T1", "j1", "DevOps [report] deck\nwith newline",
+                         mode="research_and_build", deliverables=["devops.pptx"])
+    note = host._build_research_inflight_note("C1", "T1")
+    assert note is not None
+    assert "Background work already running" in note
+    assert "devops.pptx" in note                       # the filename is what disambiguates
+    assert "do NOT call start_background_job for it again" in note
+    # Free text is escaped — no raw brackets/newlines leak into the block.
+    assert "[report]" not in note
+
+    tm.finish_research("C1:T1", "j1")
+    assert host._build_research_inflight_note("C1", "T1") is None
+
+
+def test_the_inflight_note_rides_the_suffix():
+    """It must reach the model on EVERY wake — ambient, continuation and mention alike — so it
+    lives in the volatile suffix beside the image note, not in the wake envelope."""
+    import inspect
+    from message_processor.utilities import MessageUtilitiesMixin
+    src = inspect.getsource(MessageUtilitiesMixin._build_suffix_context)
+    assert "_build_research_inflight_note" in src
+
+
+@pytest.mark.asyncio
+async def test_two_sibling_calls_in_one_round_cannot_both_start(monkeypatch):
+    """A round's tool calls are dispatched CONCURRENTLY (dispatch_all → asyncio.gather), so two
+    sibling start_background_job calls interleave at every await inside the executor.
+
+    The 👀 claim used to sit between the guard and the registration. That one await was enough:
+    both siblings read an empty registry, both passed the guards, both registered — the
+    duplicate guard, the filename check and the cap bypassed in a single round, and the user
+    gets the two status cards this whole commit exists to prevent. Everything from the
+    active-jobs read to the registration is now await-free.
+    """
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    monkeypatch.setattr(config, "deep_research_max_per_thread", 2)
+    tm = AsyncThreadStateManager()
+    proc = _FakeProcessor(openai_client=SimpleNamespace(), tm=tm)
+
+    # A turn whose claim_work YIELDS — the interleaving point the old ordering exposed.
+    class _YieldingTurn:
+        visible_action_committed = False
+
+        async def claim_work(self, *a, **k):
+            await asyncio.sleep(0)
+
+    ctx1 = _ctx(proc, _FakeClient())
+    ctx2 = _ctx(proc, _FakeClient())
+    ctx1.turn = _YieldingTurn()
+    ctx2.turn = _YieldingTurn()
+
+    results = await asyncio.gather(
+        rt.execute_start_background_job(
+            ctx1, {"task": "build the deck", "plan": ["Do the work"]}),
+        rt.execute_start_background_job(
+            ctx2, {"task": "build the deck", "plan": ["Do the work"]}),
+    )
+    started = [r for r in results if r.get("ok")]
+    refused = [r for r in results if not r.get("ok")]
+    assert len(started) == 1, "both siblings started — the guard was bypassed"
+    assert refused[0]["error"] == "research_already_running"
+    assert len(proc.scheduled) == 1     # one job, one status card
+    for coro in proc.scheduled:
+        coro.close()
+
+
+@pytest.mark.asyncio
+async def test_a_task_that_dies_before_it_runs_does_not_wedge_the_thread():
+    """The job's own `finally` clears the registry — but it cannot run if the task is cancelled
+    before its body ever starts. The entry would then claim "a job is running here" forever,
+    and because the model now READS that and the executor ENFORCES it, one orphan would
+    silently block every future job in the thread. Worse than the duplicate it prevents."""
+    tm = AsyncThreadStateManager()
+
+    async def never_runs():
+        await asyncio.sleep(10)
+
+    task = asyncio.ensure_future(never_runs())
+    tm.register_research("C1:T1", "j1", "deck", mode="research_and_build",
+                         deliverables=["x.pptx"])
+    tm.attach_research_task("C1:T1", "j1", task)
+    assert tm.research_in_flight_count("C1:T1") == 1
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    await asyncio.sleep(0)     # let the done-callback fire
+
+    assert tm.research_in_flight_count("C1:T1") == 0, "orphan entry — the thread is wedged"
+    assert tm.research_jobs_in_flight("C1:T1") == []
+
+
+@pytest.mark.asyncio
+async def test_a_timeout_during_the_ack_cannot_orphan_a_live_job(monkeypatch):
+    """The executor runs under the round's tool_call_timeout, so it can be CANCELLED after the
+    job is already detached and live. If that lands before the commitment flags are set, the
+    job posts its card and delivers its files while the turn believes nothing happened: the
+    model's ack reply stops being suppressed (a reply duplicating the card) and the finalizer
+    retracts the 👀 from work that is visibly under way.
+
+    So the flags are committed before the 👀 is claimed — the last await in the executor."""
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    monkeypatch.setattr(config, "tool_call_timeout", 0.05)
+    tm = AsyncThreadStateManager()
+    proc = _FakeProcessor(openai_client=SimpleNamespace(), tm=tm)
+
+    class _HangingTurn:
+        visible_action_committed = False
+
+        async def claim_work(self, *a, **k):
+            await asyncio.sleep(10)          # wedged Slack — outlives the outer timeout
+
+    ctx = _ctx(proc, _FakeClient())
+    ctx.turn = _HangingTurn()
+
+    reg = ToolRegistry()
+    reg.register(rt.get_start_background_job_schema(), rt.execute_start_background_job)
+    out = await reg.dispatch(
+        ctx, "start_background_job",
+        json.dumps({"task": "build the deck", "plan": ["Do the work"]}))
+
+    # The round gives up on us...
+    assert out["ok"] is False and out["error"] == "timeout"
+    # ...but the job is real, and the turn knows it.
+    assert len(proc.scheduled) == 1
+    assert ctx.background_job_started is True
+    assert ctx.turn.visible_action_committed is True
+    for coro in proc.scheduled:
+        coro.close()

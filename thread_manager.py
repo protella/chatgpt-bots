@@ -513,22 +513,42 @@ class AsyncThreadStateManager(LoggerMixin):
     # --- F30: background deep-research registry (parallel to image generations) ---
 
     def register_research(self, thread_key: str, job_id: str, task_summary: str,
-                          task: Optional[asyncio.Task] = None):
+                          task: Optional[asyncio.Task] = None,
+                          mode: Optional[str] = None,
+                          deliverables: Optional[List[str]] = None):
         """Register an in-flight background research job for this thread. Additive — a thread
-        can hold several concurrent jobs (bounded by DEEP_RESEARCH_MAX_PER_THREAD at the tool)."""
+        can hold several concurrent jobs (bounded by DEEP_RESEARCH_MAX_PER_THREAD at the tool).
+
+        F38: `mode` and `deliverables` are recorded because the count alone was never enough.
+        The model has to be able to tell "the deck already being built" from "a genuinely
+        different request", and a filename is the least ambiguous way to say which is which."""
         self._active_research.setdefault(thread_key, {})[job_id] = {
             "job_id": job_id,
             "task": task,
             "started_at": time.monotonic(),
             "task_summary": task_summary,
+            "mode": mode,
+            "deliverables": list(deliverables or []),
         }
 
     def attach_research_task(self, thread_key: str, job_id: str, task: asyncio.Task):
         """Store the scheduled task handle (minted after the id, needed for shutdown).
-        ID-conditional so a stale job can't overwrite a newer registration."""
+        ID-conditional so a stale job can't overwrite a newer registration.
+
+        F38: also attach a done-callback that clears the registry entry. The job's own
+        `finally` normally does this, but it cannot run if the task dies BEFORE its coroutine
+        body starts — cancelled at shutdown, or killed on its first tick. The entry would then
+        say "a job is running here" forever, and since the model now reads that (and the
+        executor now enforces it), a single such orphan would silently block every future job
+        in the thread. That is a worse failure than the duplicate it prevents, so the cleanup
+        is belt AND braces. `finish_research` is idempotent, so the double call is free."""
         entry = self._active_research.get(thread_key, {}).get(job_id)
-        if entry is not None:
-            entry["task"] = task
+        if entry is None:
+            return
+        entry["task"] = task
+        if hasattr(task, "add_done_callback"):
+            task.add_done_callback(
+                lambda _t, k=thread_key, j=job_id: self.finish_research(k, j))
 
     def finish_research(self, thread_key: str, job_id: str) -> bool:
         """Clear ONE in-flight research job by id (never touches a sibling); returns True iff
@@ -540,6 +560,23 @@ class AsyncThreadStateManager(LoggerMixin):
                 self._active_research.pop(thread_key, None)
             return True
         return False
+
+    def research_jobs_in_flight(self, thread_key: str) -> List[dict]:
+        """WHAT is running in this thread, oldest first — not just how many.
+
+        F38: the count was the only thing ever exposed, and it was exposed only to the tool's
+        own cap check. The model itself had no idea a job was running, so a chatty follow-up
+        in the thread ("Never tried this. Not sure how it will turn out") could wake it, and it
+        would cheerfully start a SECOND build of the same deck. Two status cards, two jobs, one
+        request. The fix is simply to tell it (see _build_research_inflight_note)."""
+        bucket = self._active_research.get(thread_key) or {}
+        return sorted(
+            ({"job_id": e["job_id"], "task_summary": e.get("task_summary"),
+              "mode": e.get("mode"), "deliverables": list(e.get("deliverables") or []),
+              "started_at": e.get("started_at")}
+             for e in bucket.values()),
+            key=lambda e: e.get("started_at") or 0.0,
+        )
 
     def research_in_flight_count(self, thread_key: str) -> int:
         """How many research jobs are currently in flight for this thread (for the cap)."""

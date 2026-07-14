@@ -349,6 +349,18 @@ def get_start_background_job_schema() -> dict:
                     "minItems": 1,
                     "maxItems": _MAX_PLAN,
                 },
+                "run_in_parallel": {
+                    "type": "boolean",
+                    "description": (
+                        "Only set this true when a job is ALREADY RUNNING in this thread and "
+                        "the user has explicitly asked for a SEPARATE, ADDITIONAL piece of "
+                        "work to run alongside it. A comment, a question, or a refinement "
+                        "about the job that is already running is a follow-up, not a new job — "
+                        "leave this false and simply reply. When in doubt, leave it false: a "
+                        "second job posts a second status card and delivers a second file, "
+                        "which is almost never what someone asking about the first one wants."
+                    ),
+                },
             },
             "required": ["task", "plan"],
         },
@@ -991,10 +1003,44 @@ async def execute_start_background_job(ctx: ToolContext, args: Dict[str, Any]) -
     thread_key = f"{channel_id}:{thread_root}"
     tm = getattr(processor, "thread_manager", None)
 
-    # Per-thread cap — friendly, structured rejection the model can relay (no global cap).
+    # F38: a second concurrent job is now OPT-IN.
+    #
+    # The cap alone was never a policy. It was 2, so a second job was simply legal — and the
+    # model, which could not see the first one at all, would start it on a passing remark in the
+    # thread. The user got two status cards and two decks from one request. Awareness (the
+    # in-flight suffix note) is the primary fix; this is the backstop for when the model wakes
+    # anyway. Deliberately NOT gist similarity: comparing task text produces false matches and
+    # false misses in equal measure. "One job unless someone explicitly asked for two" is a rule
+    # that can actually be reasoned about.
+    active = (tm.research_jobs_in_flight(thread_key)
+              if tm is not None and hasattr(tm, "research_jobs_in_flight") else [])
+    parallel_requested = args.get("run_in_parallel") is True
+    if active and not parallel_requested:
+        return {"ok": False, "error": "research_already_running",
+                "active_jobs": [{"task": j.get("task_summary"), "mode": j.get("mode"),
+                                 "deliverables": j.get("deliverables")} for j in active],
+                "message": (
+                    "A background job is ALREADY running in this thread (see active_jobs). It "
+                    "posts its own status card and delivers its own files. If the user is "
+                    "asking about or refining THAT work, just reply — don't start it again. If "
+                    "they have genuinely asked for separate additional work to run alongside "
+                    "it, call this again with run_in_parallel=true.")}
+
+    # Even with an explicit parallel request, two jobs writing the same filename would deliver
+    # two files with one name — there is no reading of that which is what anyone wanted.
+    if active and deliverables:
+        wanted = {d["filename"] for d in deliverables}
+        clashing = sorted(wanted.intersection(
+            {f for j in active for f in (j.get("deliverables") or [])}))
+        if clashing:
+            return {"ok": False, "error": "deliverable_already_building",
+                    "clashing": clashing,
+                    "message": (f"A job in this thread is already building {', '.join(clashing)}. "
+                                "Wait for it, or build something with a different name.")}
+
+    # Per-thread cap — the ceiling for genuinely parallel work (no global cap).
     cap = max(1, int(getattr(config, "deep_research_max_per_thread", 2)))
-    in_flight = (tm.research_in_flight_count(thread_key)
-                 if tm is not None and hasattr(tm, "research_in_flight_count") else 0)
+    in_flight = len(active)
     if in_flight >= cap:
         return {"ok": False, "error": "too_many_research_jobs",
                 "message": (f"There {'is' if in_flight == 1 else 'are'} already {in_flight} "
@@ -1010,16 +1056,20 @@ async def execute_start_background_job(ctx: ToolContext, args: Dict[str, Any]) -
     # the build phase would fall back to defaults and quietly ignore the user's choices.
     thread_config = copy.deepcopy(dict(getattr(ctx, "thread_config", None) or {}))
 
-    # F38: everything that could reject this call has now passed, so the job really is going
-    # to run — stake the 👀 work claim. Deliberately AFTER the validation above: a job we were
-    # about to turn away must never flash an eye it then has to take back.
-    turn = getattr(ctx, "turn", None)
-    if turn is not None:
-        await turn.claim_work(client, getattr(ctx, "message", None))
-
+    # RESERVE THE SLOT. Everything from the `active` read above to this registration runs with
+    # NO await in it, and that is not an accident — a round's tool calls are dispatched
+    # concurrently (`dispatch_all` → `asyncio.gather`), so two sibling start_background_job
+    # calls interleave at every await point. Yield anywhere in here and both siblings read an
+    # empty registry, both pass the guards, and both register: the duplicate-job guard, the
+    # filename check and the cap are all bypassed at once, and the user gets exactly the two
+    # status cards this commit exists to prevent. The 👀 claim used to sit right here and was
+    # precisely such a yield; it now happens AFTER the slot is ours.
     job_id = uuid4().hex[:12]
     if tm is not None and hasattr(tm, "register_research"):
-        tm.register_research(thread_key, job_id, _gist(task))
+        # F38: mode + deliverable filenames ride along, so the in-flight note can tell the model
+        # WHAT is running, not merely that something is.
+        tm.register_research(thread_key, job_id, _gist(task), mode=mode,
+                             deliverables=[d["filename"] for d in deliverables])
     coro = _run_background_job(
         processor=processor, client=client, channel_id=channel_id,
         thread_root=thread_root, thread_key=thread_key, job_id=job_id,
@@ -1040,8 +1090,18 @@ async def execute_start_background_job(ctx: ToolContext, args: Dict[str, Any]) -
         tm.attach_research_task(thread_key, job_id, task_handle)
     processor.log_info(f"Background job {job_id} ({mode}) started for {thread_key}: "
                        f"{_gist(task)!r}")
+
+    # COMMIT THE FACTS FIRST, BEFORE ANY FURTHER AWAIT. The job is detached and live now — it
+    # will post its card and deliver its files whatever happens to us. But this executor is
+    # itself dispatched under `tool_call_timeout`, so the round can cancel us from here on. If
+    # that lands before these flags are set, the job runs and posts while the turn believes
+    # nothing happened: the model's ack reply is no longer suppressed (a reply duplicating the
+    # card), and the finalizer reads the turn as having produced nothing and retracts the 👀
+    # from work that is visibly under way.
+    #
     # F30.1: signal the turn's finalizer to DROP the model's ack reply — the status card the
     # job posts is the acknowledgment. Set on the shared ToolContext the tool loop exposes.
+    turn = getattr(ctx, "turn", None)
     try:
         ctx.background_job_started = True
         # F38: the card IS this turn's visible output, so the turn has produced something
@@ -1050,6 +1110,13 @@ async def execute_start_background_job(ctx: ToolContext, args: Dict[str, Any]) -
             turn.visible_action_committed = True
     except Exception:  # noqa: BLE001 — a defensive guard; ctx is a mutable dataclass
         pass
+
+    # NOW stake the 👀. After the reservation (an await between the guard and the registration
+    # lets a sibling call slip through), after the commitment flags (see above), and after
+    # every rejection above — a job we were about to turn away must never flash an eye it then
+    # has to take back. Best-effort: losing the emoji here costs nothing.
+    if turn is not None:
+        await turn.claim_work(client, getattr(ctx, "message", None))
     result: Dict[str, Any] = {"ok": True, "status": "started", "mode": mode,
                              "task": _gist(task)}
     if deliverables:
