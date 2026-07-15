@@ -182,6 +182,23 @@ async def test_human_sender_still_reaches_onboarding():
     assert bot.message_handler.await_count == 1
 
 
+async def test_userless_event_never_onboards():
+    """A message_deleted / tombstone echo carries no `user` and no `bot_id`. It must be dropped
+    before onboarding — a None user id read as a brand-new user, creating "default preferences
+    for new user None" and firing the Configure-Settings welcome card at an established user in
+    their own DM. It also must not dispatch to the model."""
+    bot = _make_bot()
+    bot.db.get_user_preferences_async = AsyncMock(return_value=None)  # no prefs -> new-user branch
+    bot.db.get_or_create_user_async = AsyncMock(return_value={"email": None})
+    bot.db.create_default_user_preferences_async = AsyncMock(return_value={"settings_completed": False})
+    evt = {"channel": "D123", "ts": "1784134707.0055", "subtype": "message_deleted",
+           "channel_type": "im"}  # no `user`, no `bot_id`
+    await bot._handle_slack_message(evt, bot.app.client)
+    bot.db.get_user_preferences_async.assert_not_awaited()  # never reached the onboarding gate
+    bot.db.create_default_user_preferences_async.assert_not_awaited()  # no "new user None"
+    assert bot.message_handler.await_count == 0  # not a human turn -> not dispatched
+
+
 # --------------------------------------------------------------------------- off gates @mentions
 
 async def test_off_level_drops_app_mention():
