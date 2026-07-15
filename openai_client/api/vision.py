@@ -33,8 +33,39 @@ async def analyze_images(
     content = [{"type": "input_text", "text": question}]
 
     for image_data in images:
-        # Use data URL format for base64 images
-        content.append({"type": "input_image", "image_url": f"data:image/png;base64,{image_data}"})
+        # Accept every shape a caller might hand us, because one of them was silently 400ing.
+        #
+        # Callers hold images as the pipeline's attachment PARTS — dicts of
+        # {type, image_url, source, filename, url, file_id} — not as bare base64 (see
+        # _process_attachments). Interpolating one of those straight into an f-string produced
+        # `data:image/png;base64,{'type': 'input_image', ...}`, which the API rejects with
+        # "invalid base64-encoded value". Image cataloguing never once succeeded for an uploaded
+        # image: every analysis died in the except below and the thread lost that context.
+        #
+        # A dict also carries its REAL mimetype in image_url, so honouring it fixes a second,
+        # quieter bug — a JPEG was being announced to the API as image/png.
+        part_detail = detail
+        if isinstance(image_data, dict):
+            url = image_data.get("image_url")
+            part_detail = image_data.get("detail") or detail
+        elif isinstance(image_data, str) and image_data.startswith("data:"):
+            url = image_data
+        else:
+            url = f"data:image/png;base64,{image_data}"
+        if not url or not isinstance(url, str):
+            self.log_warning("Skipping an image with no usable data")
+            continue
+        part = {"type": "input_image", "image_url": url}
+        if part_detail:
+            part["detail"] = part_detail
+        content.append(part)
+
+    # If NOTHING usable survived, do not ask anyway. The model would happily answer the question
+    # ("describe this image") from thin air, and the caller persists whatever comes back as a
+    # real analysis — a hallucinated description of a picture nobody ever sent.
+    if not any(p.get("type") == "input_image" for p in content):
+        self.log_warning("No usable images to analyze — refusing to ask the model to imagine one")
+        return ""
 
     try:
         # Build request parameters with conversation history

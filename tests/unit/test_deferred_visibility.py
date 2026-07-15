@@ -306,16 +306,70 @@ def test_the_model_is_still_told_about_compaction():
 # --------------------------------------------------------------- the prior-timeout notice
 
 @pytest.mark.asyncio
+async def _timeout_notice_shown_for(turn, monkeypatch):
+    """Drive the real process_message with a thread that previously timed out; report whether
+    the recovery notice was posted."""
+    from base_client import Response
+    from message_processor.base import MessageProcessor
+
+    with patch("message_processor.base.AsyncThreadStateManager"), \
+         patch("message_processor.base.OpenAIClient"):
+        p = MessageProcessor()
+
+    state = SimpleNamespace(had_timeout=True, messages=[], thread_ts="10.0", channel_id="C1",
+                            root_author=("U1", "human"), config_overrides={})
+    p.thread_manager.acquire_thread_lock = AsyncMock(return_value=True)
+    p.thread_manager.release_thread_lock = AsyncMock()
+
+    async def _state(*a, **k):
+        return state
+
+    p._get_or_rebuild_thread_state = _state
+    # Stop the turn the moment the notice decision is behind us.
+    p._handle_text_response = AsyncMock(return_value=Response(type="text", content="ok"))
+    p._build_channel_memory_text = AsyncMock(return_value="")
+    p._build_channel_info = AsyncMock(return_value="")
+    p._process_attachments = AsyncMock(return_value=([], [], []))
+
+    client = MagicMock()
+    client.send_message = AsyncMock()
+
+    try:
+        await p.process_message(_message(participation_check=True), client, None, turn=turn)
+    except Exception:
+        pass   # anything downstream of the notice is not this test's business
+
+    posted = [c for c in client.send_message.await_args_list
+              if "never finished" in str(c)]
+    return bool(posted), state.had_timeout
+
+
+@pytest.mark.asyncio
 async def test_prior_timeout_notice_is_held_back_on_a_silent_turn(monkeypatch):
     """It posts BEFORE the model decides, so on a turn that may say nothing it would announce
     a dead answer and then fall silent. The flag still clears — a stale one would make a later
     prompted turn describe an old failure as "my last answer"."""
-    import inspect
-    from message_processor.base import MessageProcessor
-    src = inspect.getsource(MessageProcessor.process_message)
-    # The notice is gated on progress_enabled, and the flag is cleared either way.
-    assert "if turn.progress_enabled:" in src
-    idx = src.index("never finished")
-    gate = src.rindex("if turn.progress_enabled:", 0, idx)
-    clear = src.index("thread_state.had_timeout = False", idx)
-    assert gate < idx < clear
+    monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
+    turn = TurnRuntime(silence_capable=True, progress_enabled=False, reply_thread_id="10.0")
+
+    shown, still_flagged = await _timeout_notice_shown_for(turn, monkeypatch)
+
+    assert not shown, "a turn that may say nothing must not announce a dead answer first"
+    assert not still_flagged, "the flag must clear either way, or a later turn re-announces it"
+
+
+@pytest.mark.asyncio
+async def test_prior_timeout_notice_still_shows_on_a_top_level_reply(monkeypatch):
+    """F39: a top-level channel reply sets progress_enabled False — it may write NOTHING before
+    its finished answer, or Slack brands the answer "(edited)". Keying this notice on that flag
+    swallowed it on turns that were always going to answer. It is not speculative chrome: it is
+    a standalone post, never edited into anything. Key it on SILENCE, not on progress."""
+    monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
+    turn = TurnRuntime(silence_capable=False, progress_enabled=False,
+                       reply_thread_id=None, final_post_only=True)
+
+    shown, still_flagged = await _timeout_notice_shown_for(turn, monkeypatch)
+
+    assert shown, ("an addressed top-level turn always answers — it must still tell the user "
+                   "its last answer died")
+    assert not still_flagged

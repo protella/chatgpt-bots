@@ -171,7 +171,15 @@ class MessageProcessor(ThreadManagementMixin,
                 # (where a reply always follows) it still earns its place. Either way the flag
                 # is cleared: a stale one would make a LATER prompted turn describe an old
                 # failure as "my last answer".
-                if turn.progress_enabled:
+                #
+                # F39: keyed on SILENCE, not on `progress_enabled`. A top-level channel reply
+                # now sets progress_enabled False (it may not write anything before its finished
+                # answer — see TurnRuntime.final_post_only), and reusing that flag here silently
+                # swallowed a durable recovery notice on turns that were always going to answer.
+                # This notice is not speculative chrome: it is a standalone post, never edited
+                # into anything, so it carries no "(edited)" risk. The only reason to hold it
+                # back is a turn that might say nothing at all.
+                if not getattr(turn, "silence_capable", False):
                     timeout_msg = "⚠️ Heads up — my last answer in this thread never finished. Picking up from here."
                     await client.send_message(
                         channel_id=message.channel_id,
@@ -181,7 +189,7 @@ class MessageProcessor(ThreadManagementMixin,
                     self.log_info(f"Notified user about previous timeout in thread {thread_key}")
                 else:
                     self.log_debug(
-                        f"Prior timeout in {thread_key} — clearing silently (turn may not reply)")
+                        f"Prior timeout in {thread_key} — clearing silently (turn may say nothing)")
                 thread_state.had_timeout = False
 
 

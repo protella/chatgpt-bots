@@ -28,6 +28,38 @@ def is_checklist_status_text(text: str) -> bool:
     return bool(text) and CHECKLIST_STATUS_MARKER in text
 
 
+def segment_separator(prev: str, nxt: str) -> str:
+    """The boundary between two consecutive streamed round-segments — a pre-tool preamble and
+    the post-tool text of the next round.
+
+    Each local-tool round is its own API call, and the streaming buffer simply concatenates
+    the rounds, so without a separator the seam jams: "…under Super Heavy." + "Fixed." renders
+    as "Super Heavy.Fixed." Insert a paragraph break, but ONLY when the model didn't already
+    leave whitespace on either side (so we never double-space a seam it wrote itself). The
+    separator is APPENDED between segments — never inserted retroactively before already-sent
+    text — so an append-only sink stays append-only. Used in two places that must agree: the
+    handler injects it into the live buffer (Slack display) and the tool loop joins its
+    round-segments with it (the returned/persisted canonical text), so what the user sees and
+    what the thread remembers are the same string."""
+    if not prev or not nxt:
+        return ""
+    if prev[-1].isspace() or nxt[0].isspace():
+        return ""
+    return "\n\n"
+
+
+def join_segments(segments: List[str]) -> str:
+    """Join round-segments into the one canonical response, applying ``segment_separator`` at
+    every seam. Empty segments (tool-only rounds) contribute nothing and never leave a dangling
+    separator behind."""
+    out = ""
+    for seg in segments:
+        if not seg:
+            continue
+        out += segment_separator(out, seg) + seg
+    return out
+
+
 # Canonical marker set ("Continued..." style — user preference).
 _TRAILER_BODY = "Continued in next message..."
 _HEAD_BODY = "...continued"

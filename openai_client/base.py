@@ -467,9 +467,14 @@ class OpenAIClient(LoggerMixin):
         self,
         text: str,
         signals: Optional[Dict[str, Any]] = None,
+        images: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """Phase F participation judgment: raw JSON verdict dict (fail-safe {'action':'ignore'})."""
-        return await responses_api.classify_participation(self, text=text, signals=signals)
+        """Phase F participation judgment: raw JSON verdict dict (fail-safe {'action':'ignore'}).
+
+        F40: `images` are sanitized `input_image` parts (gate_vision) so the gate can judge a
+        picture on its content instead of its filename."""
+        return await responses_api.classify_participation(
+            self, text=text, signals=signals, images=images)
 
     async def extract_memory(
         self,

@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from config import config, valid_emoji_name
+from message_processor import gate_vision
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +257,8 @@ class ParticipationEngine:
                        channel_people: Optional[str] = None,
                        capabilities: Optional[str] = None,
                        attachments: Optional[str] = None,
+                       images: Optional[List[Dict]] = None,
+                       client: Any = None,
                        pulse: Any = None,
                        thread_root_ts: Optional[str] = None) -> Optional[ParticipationVerdict]:
         """Debounced judgment. Returns None when superseded — a newer message in the SAME
@@ -300,7 +303,22 @@ class ParticipationEngine:
             except Exception:
                 thread_tail = None
 
+        # F40: the pixels, not the filename. Loaded HERE — after the supersession check — so a
+        # superseded burst never downloads images for a verdict that is about to be discarded.
+        # `image_status` tells the prompt the truth: seen, or attached-but-unavailable. Any
+        # failure degrades to a text-only judgment; it must never turn into silence.
+        image_parts, image_status = [], gate_vision.NONE
+        if images and client is not None:
+            try:
+                image_parts, image_status = await gate_vision.load_for_gate(client, images)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Gate vision failed, judging on text alone: {e}")
+                image_parts, image_status = [], gate_vision.UNAVAILABLE
+        elif images:
+            image_status = gate_vision.UNAVAILABLE
+
         signals = {
+            "image_status": image_status,
             "sender_name": sender_name,
             "is_thread_reply": is_thread_reply,
             "strictness": level,
@@ -322,7 +340,12 @@ class ParticipationEngine:
             "burst_earlier": burst_earlier,
         }
         try:
-            raw = await self.openai_client.classify_participation(text=text, signals=signals)
+            # `images` only rides when there ARE images: the text-only call keeps its exact old
+            # shape, so nothing that never sees a picture changes behaviour by one token.
+            call_kwargs = {"text": text, "signals": signals}
+            if image_parts:
+                call_kwargs["images"] = image_parts
+            raw = await self.openai_client.classify_participation(**call_kwargs)
         except Exception:
             raw = None  # fail-safe: silence, never spam
         verdict = self.validate_verdict(raw)

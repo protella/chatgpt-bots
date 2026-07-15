@@ -276,7 +276,13 @@ class TestF14bClassifyPayload:
             signals={"sender_name": "Peter", "attachments": "1 image (food.png)"})
         prompt = llm.captured_input[1]["content"]
         assert "Attached to the message: 1 image (food.png)." in prompt
-        assert "The assistant can view and analyze attachments." in prompt
+        # F40: the old line here said "The assistant can view and analyze attachments" — a claim
+        # about the ANSWERING model, fed unconditionally to a classifier that could see nothing.
+        # The model took it as licence to opine on a picture it had never seen (the :dogkek:
+        # reaction). With no image_status signal, the honest line is: you see the name, not the
+        # contents — but the assistant can open it if it decides to respond.
+        assert "Only the filename and type" in prompt
+        assert "can view and analyze attachments" not in prompt
 
     @pytest.mark.asyncio
     async def test_attachment_line_omitted_when_absent(self):

@@ -81,7 +81,11 @@ class SlackMessageEventsMixin:
                 "url": file.get("url_private"),
                 "id": file.get("id"),
                 "name": file.get("name"),
-                "mimetype": mimetype
+                "mimetype": mimetype,
+                # F40: the wake gate checks the DECLARED size before it downloads anything, so
+                # an oversized image is skipped rather than pulled into memory and then thrown
+                # away. Slack always sends this on file_share.
+                "size": file.get("size"),
             })
 
         # Get username and timezone for logging
@@ -385,6 +389,13 @@ class SlackMessageEventsMixin:
             attach_summary = _summarize_attachments(event.get("files"))
             if attach_summary:
                 message.metadata["participation_attachments"] = attach_summary
+            # F40: and hand it the IMAGES themselves — descriptors only here. Nothing is
+            # downloaded until the message survives the debounce, so a superseded burst never
+            # spends bandwidth on pictures whose verdict is thrown away.
+            gate_images = [a for a in (message.attachments or [])
+                           if (a or {}).get("type") == "image" and (a or {}).get("url")]
+            if gate_images:
+                message.metadata["participation_images"] = gate_images
         # Phase 7: carry per-channel ground rules + placement into the response pipeline.
         if cs:
             if cs.get("directives"):

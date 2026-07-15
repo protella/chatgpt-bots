@@ -49,6 +49,7 @@ class TurnRuntime:
     silence_capable: bool = False
     progress_enabled: bool = True
     reply_thread_id: Optional[str] = None
+    final_post_only: bool = False
     ack_lease: Optional[dict] = field(default=None, repr=False)
     ack_target_ts: Optional[str] = None
     visible_action_committed: bool = False
@@ -66,10 +67,29 @@ class TurnRuntime:
                         and meta.get("wake_source") == "thread_continuation")
         silence_capable = ((unprompted or continuation)
                            and bool(getattr(config, "enable_no_reply_tool", True)))
+
+        # F39 — the "(edited)" rule. Slack can only STREAM into a thread: chat.startStream
+        # REQUIRES thread_ts. So a reply we're about to post at the top level of a channel has
+        # no native path, and the legacy fallback fakes streaming by posting a stub and
+        # chat.update-ing it — which stamps the message "(edited)" forever. A human teammate
+        # doesn't post a stub and revise it in public; they post once, finished. Neither does
+        # Claude, which is why its top-level replies carry no edit marker and ours did.
+        #
+        # So these turns write NOTHING until the answer is whole: no placeholder, no composer
+        # status (it would auto-open a thread anyway), no edit loop. Just the finished message.
+        # DMs are excluded — they also can't stream natively, but a DM is a conversation, not a
+        # public channel, and losing the live reveal there is a real cost with no edit-marker
+        # complaint attached. Threads keep streaming exactly as before.
+        channel_id = str(getattr(message, "channel_id", "") or "")
+        final_post_only = (reply_thread_id is None and bool(channel_id)
+                           and not channel_id.startswith("D"))
         return cls(
             silence_capable=silence_capable,
-            progress_enabled=not silence_capable,
+            # A turn that may say nothing shows no chrome; neither does one that can't show
+            # chrome without editing it into the answer afterwards.
+            progress_enabled=not (silence_capable or final_post_only),
             reply_thread_id=reply_thread_id,
+            final_post_only=final_post_only,
         )
 
     async def claim_work(self, client: Any, message: Any) -> None:

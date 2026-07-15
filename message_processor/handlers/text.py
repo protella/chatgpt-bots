@@ -12,6 +12,7 @@ from message_markers import (
     continuation_trailer,
     entity_safe_cut,
     part_prefix,
+    segment_separator,
 )
 from streaming import FenceHandler, NativeStreamCoordinator, RateLimitManager, StreamingBuffer
 from tool_registry import ToolContext
@@ -85,6 +86,15 @@ def native_stream_place_in_channel(message: Message) -> bool:
 # eye back on a guess, which is the thing we just removed.
 _WORK_CLAIM_HOSTED_TOOLS = frozenset({
     "web_search", "file_search", "code_interpreter", "image_generation",
+})
+
+# Local tools that BLOCK the loop synchronously for a long time (gpt-image-2 is ~a minute).
+# Native appends are token-driven, so a round's pre-tool preamble ("Making that…") freezes
+# on screen for the tool's whole duration unless we push it to Slack before dispatch. Scoped
+# deliberately: `generate_image` is detached (its turn returns at once) and `start_background_job`
+# withholds its ack for the status card (F30.1) — flushing before either would strand content.
+_PRE_TOOL_FLUSH_TOOLS = frozenset({
+    "local:edit_image", "local:create_image_asset",
 })
 
 
@@ -893,11 +903,12 @@ class TextHandlerMixin:
         # that already owns a lazily-created message. The old `else` here bailed out to
         # non-streaming whenever native streaming was off — which would have cost every
         # ambient turn its streaming the moment we stopped posting a placeholder.
-        if thinking_id:
-            # Update existing thinking message
-            message_id = thinking_id
-            await client.update_message(message.channel_id, message_id, initial_message)
-        elif lazy_surface_ts:
+        #
+        # F39: the INHERITED surface wins over a placeholder, never the other way round. A
+        # retry only ever inherits a surface that the previous attempt confirmed was live, and
+        # native streaming deletes the placeholder as it takes over — so when both are set, the
+        # placeholder is the dead one. Choosing it wrote the answer to a corpse.
+        if lazy_surface_ts:
             # An earlier attempt this turn already created the reply message; keep writing
             # into it. Seeding another would leave the abandoned partial on screen next to
             # the retry's answer.
@@ -906,6 +917,10 @@ class TextHandlerMixin:
                 await client.update_message(message.channel_id, message_id, initial_message)
             except Exception as e:  # noqa: BLE001
                 self.log_debug(f"Could not reset the lazy surface for retry: {e}")
+        elif thinking_id:
+            # Update existing thinking message
+            message_id = thinking_id
+            await client.update_message(message.channel_id, message_id, initial_message)
         else:
             message_id = None  # created lazily: native on startStream, legacy on first chunk
         
@@ -955,7 +970,7 @@ class TextHandlerMixin:
         # Define tool event callback
         async def tool_callback(tool_type: str, status: str):
             """Handle tool events for status updates"""
-            nonlocal progress_task
+            nonlocal progress_task, pending_segment_break
 
             # F38: stake the 👀 work claim — but only for the hosted tools that genuinely take
             # time. This hook fires for EVERY tool event, including fast lookups and calls the
@@ -967,9 +982,32 @@ class TextHandlerMixin:
             if turn is not None and _claims_work(tool_type, status):
                 await turn.claim_work(client, message)
 
+            # A local-tool round ends the current text segment: the model's next words are a new
+            # round (its own API call), and the buffer would otherwise concatenate them with no
+            # gap. Arm the seam break so the next visible chunk gets a paragraph boundary. Keyed
+            # on buffered text (NOT visible_content_delivered) so it also fires on final-post-only
+            # turns, where nothing is delivered until the very end. Hosted tools (web_search/MCP)
+            # resolve inside one round and never split the text, so they don't arm it.
+            if (status == "started" and tool_type.startswith("local:")
+                    and buffer.get_complete_text().strip()):
+                pending_segment_break = True
+
             # Native mode: once the stream owns the visible message the placeholder is
             # gone — status edits would hit a deleted ts. Log tool activity instead.
             if native_coord is not None and native_coord.started and not native_coord.failed:
+                # A blocking synchronous tool is about to hold the loop for ~a minute with no
+                # tokens flowing. Push the round's buffered preamble to Slack NOW, or the
+                # half-written "Making that…" line stays frozen until the tool returns and the
+                # next round streams (finalize is far too late). The wrapper skips the None
+                # completion signal on a function-call round (responses.py), so this is the
+                # only boundary at which the preamble can be committed before the wait.
+                if status == "started" and tool_type in _PRE_TOOL_FLUSH_TOOLS:
+                    had_preamble = buffer.has_pending_update()
+                    await _flush_native_pending(force=True)
+                    if had_preamble:
+                        self.log_info(
+                            f"Pre-tool native flush: pushed the round's preamble to Slack "
+                            f"before {tool_type} blocks")
                 self.log_debug(f"Tool event during native stream (status suppressed): {tool_type} {status}")
                 return
 
@@ -1107,6 +1145,12 @@ class TextHandlerMixin:
         # part's ts, so F7 must persist there (last-part keying vanishes on rebuild). Captured
         # at the first confirmed content delivery (== part 1's message in either path).
         first_delivered_ts = None
+        # A local-tool round just ran and the NEXT visible chunk opens a new segment — inject a
+        # paragraph seam before it so a preamble and the post-tool text don't jam ("Heavy.Fixed").
+        # Set on a local tool's `started` (only when text is already buffered), consumed by the
+        # first non-empty chunk of the next round. Mirrors the tool loop's join_segments so the
+        # buffer (Slack) and the returned canonical text agree.
+        pending_segment_break = False
         overflow_buffer = ""
         # F38: the ONE authoritative answer to "where does a reply this turn creates go?".
         # None = top-level in the channel. Every message the streaming paths mint — the lazy
@@ -1116,6 +1160,14 @@ class TextHandlerMixin:
         reply_target = (turn.reply_thread_id if turn is not None
                         else (None if native_stream_place_in_channel(message)
                               else message.thread_id))
+        # F39: a top-level channel reply cannot stream (chat.startStream REQUIRES thread_ts) and
+        # must not be faked with an edit loop, which brands the message "(edited)". Write
+        # nothing until the answer is whole, then post it once. See TurnRuntime.final_post_only.
+        final_post_only = bool(
+            turn.final_post_only if turn is not None
+            else (reply_target is None and bool(message.channel_id)
+                  and not str(message.channel_id).startswith("D")))
+        final_post_failed = False
         # A reply message this attempt created itself (no placeholder). An MCP retry inherits
         # it so the turn edits its existing answer instead of posting a second one.
         lazy_surface_owned = lazy_surface_ts
@@ -1134,7 +1186,8 @@ class TextHandlerMixin:
         # Any start/append failure flips the coordinator inert and the legacy
         # update_message_streaming edit loop below takes over seamlessly.
         native_coord = None
-        if (hasattr(client, "supports_native_streaming") and client.supports_native_streaming()
+        if (not final_post_only
+                and hasattr(client, "supports_native_streaming") and client.supports_native_streaming()
                 and hasattr(client, "begin_native_stream")):
             native_coord = NativeStreamCoordinator(
                 client, message.channel_id,
@@ -1147,10 +1200,68 @@ class TextHandlerMixin:
         progress_task = None
         first_chunk_received = False
 
+        async def _flush_native_pending(force: bool) -> None:
+            """Append the buffer's cumulative text to the native stream now.
+
+            Appends are otherwise token-driven, so a finished round's preamble would sit
+            invisible while a blocking synchronous tool holds the loop — the frozen
+            "Making that…" line. ``force=True`` fires at that boundary: it skips the cadence
+            timer (a real commit point) but still honours the rate limiter's
+            circuit/Retry-After state and records the outcome, so a forced append can't
+            drive the stream inert on its own. ``force=False`` is the per-chunk tick and is
+            byte-for-byte the old inline gate (``should_update() and can_make_request()``).
+            """
+            nonlocal visible_content_delivered, first_delivered_ts, current_message_id, current_part
+            if native_coord is None or native_coord.failed or not native_coord.started:
+                return
+            if force:
+                if not buffer.has_pending_update():
+                    return
+                if not rate_limiter.can_make_request():
+                    # Correct fail-safe (the circuit is open or Retry-After is live), but it
+                    # means the preamble stays frozen until the next append — log it so a live
+                    # report can tell "the checkpoint never fired" from "it was held back".
+                    self.log_debug("Pre-tool native flush held by the rate limiter "
+                                   "(circuit/Retry-After) — preamble stays buffered for now")
+                    return
+            elif not (buffer.should_update() and rate_limiter.can_make_request()):
+                return
+            rate_limiter.record_request_attempt()
+            # A native stream cannot unsend. Strip the dead sandbox links HERE, at the
+            # append — stripping them at finalize (as we used to) is far too late, because
+            # the link is already in Slack by then.
+            cumulative = stream_safe_text(buffer.get_complete_text())
+            ok, overflow = await native_coord.update(cumulative)
+            if overflow is not None:
+                # Part rolled: the just-closed part's visible text was delivered (M4 — the
+                # buffer is about to be reset to the newline-stripped remainder, so record
+                # delivery NOW before it's lost).
+                visible_content_delivered = True
+                buffer.reset()
+                buffer.add_chunk(overflow)
+                buffer.mark_updated()
+                current_part = native_coord.part
+            if ok:
+                rate_limiter.record_success()
+                if cumulative.strip():
+                    visible_content_delivered = True
+                    if first_delivered_ts is None:
+                        first_delivered_ts = native_coord.current_ts or current_message_id
+                if overflow is None:
+                    buffer.mark_updated()
+                buffer.update_interval_setting(rate_limiter.get_current_interval())
+                current_message_id = native_coord.current_ts or current_message_id
+            else:
+                # Went inert mid-stream: legacy edits continue on the native message so
+                # nothing visible is lost.
+                rate_limiter.record_failure(is_rate_limit=False)
+                current_message_id = native_coord.current_ts or current_message_id
+                self.log_warning("Native stream went inert — continuing with legacy updates")
+
         # Define the streaming callback
         async def stream_callback(text_chunk: str):
             """Callback function called with each text chunk from OpenAI"""
-            nonlocal current_message_id, current_part, overflow_buffer, progress_task, first_chunk_received, streaming_aborted, visible_content_delivered, first_delivered_ts, lazy_surface_owned
+            nonlocal current_message_id, current_part, overflow_buffer, progress_task, first_chunk_received, streaming_aborted, visible_content_delivered, first_delivered_ts, lazy_surface_owned, message_id, pending_segment_break
 
             # If we've aborted, ignore further chunks
             if streaming_aborted:
@@ -1170,59 +1281,69 @@ class TextHandlerMixin:
                         pass
                     self.log_debug("Cancelled progress updater - streaming started")
 
+            # ---- Segment seam: a local tool ran, and this is the first visible text of the new
+            # round. Append a paragraph break (if neither side already has whitespace) so the
+            # preamble and the post-tool text don't jam into "Heavy.Fixed". Added to the buffer
+            # BEFORE the chunk, so an append-only native stream never rewrites what it already
+            # sent. Same rule the tool loop uses to join its segments — the two agree.
+            if pending_segment_break and text_chunk and text_chunk.strip():
+                pending_segment_break = False
+                sep = segment_separator(buffer.get_complete_text(), text_chunk)
+                if sep:
+                    buffer.add_chunk(sep)
+
+            # ---- F39: final-post-only (top-level channel reply) ----
+            # Slack has no way to stream here, and the edit loop below would brand the answer
+            # "(edited)". So this turn touches Slack exactly once, at the end. Accumulate and
+            # return BEFORE any surface is minted, seeded, rolled or edited — the terminal
+            # `current_message_id is None` branch posts the finished text (splitting it if it
+            # overflows). Nothing is lost: `response_text` is the API's complete answer, not
+            # this buffer.
+            if final_post_only:
+                if text_chunk:
+                    buffer.add_chunk(text_chunk)
+                return
+
             # ---- Native sink (Phase G): append-only streaming replaces the edit loop ----
             if native_coord is not None and not native_coord.failed:
                 if text_chunk is None:
                     return  # tail + attribution are appended by finalize() after the API call
                 if not native_coord.started:
-                    if await native_coord.start():
-                        current_message_id = native_coord.current_ts or current_message_id
-                        # Placeholder is skipped in native mode — startStream created
-                        # the reply message. Best-effort removal of the old indicator
-                        # (status-only DMs never had one).
-                        if message_id:
-                            try:
-                                await client.delete_message(message.channel_id, message_id)
-                            except Exception as e:
-                                self.log_debug(f"Could not remove placeholder for native stream: {e}")
-                    else:
-                        self.log_info("Native streaming unavailable — using legacy streaming updates")
-                if not native_coord.failed:
-                    buffer.add_chunk(text_chunk)
-                    if buffer.should_update() and rate_limiter.can_make_request():
-                        rate_limiter.record_request_attempt()
-                        # A native stream cannot unsend. Strip the dead sandbox links HERE,
-                        # at the append — stripping them at finalize (as we used to) is far
-                        # too late, because the link is already in Slack by then.
-                        cumulative = stream_safe_text(buffer.get_complete_text())
-                        ok, overflow = await native_coord.update(cumulative)
-                        if overflow is not None:
-                            # Part rolled: the just-closed part's visible text was delivered
-                            # (M4 — the buffer is about to be reset to the newline-stripped
-                            # remainder, so record delivery NOW before it's lost).
-                            visible_content_delivered = True
-                            # markers were appended by the coordinator (message_markers
-                            # shapes); buffer restarts from the overflow.
-                            buffer.reset()
-                            buffer.add_chunk(overflow)
-                            buffer.mark_updated()
-                            current_part = native_coord.part
-                        if ok:
-                            rate_limiter.record_success()
-                            if cumulative.strip():
-                                visible_content_delivered = True
-                                if first_delivered_ts is None:
-                                    first_delivered_ts = native_coord.current_ts or current_message_id
-                            if overflow is None:
-                                buffer.mark_updated()
-                            buffer.update_interval_setting(rate_limiter.get_current_interval())
+                    # ONE LIVE SURFACE, ALWAYS. chat.startStream MINTS a message, so the old
+                    # surface has to be gone BEFORE it runs, not after. Deleting afterwards was
+                    # best-effort and its result was ignored, so a failed delete left the turn
+                    # owning two live messages — the abandoned indicator/partial AND the stream.
+                    # If the old surface cannot be removed, native does not start at all: keep
+                    # streaming into the surface we already have (legacy edits, below).
+                    stand_down = False
+                    if message_id:
+                        removed = False
+                        try:
+                            removed = bool(await client.delete_message(message.channel_id, message_id))
+                        except Exception as e:  # noqa: BLE001
+                            self.log_debug(f"Could not remove the old surface for native streaming: {e}")
+                        if removed:
+                            if lazy_surface_owned == message_id:
+                                lazy_surface_owned = None
+                            message_id = None
+                            current_message_id = None
+                        else:
+                            stand_down = True
+                            native_coord.failed = True
+                            self.log_info(
+                                "Could not clear the existing surface — native streaming stood "
+                                "down rather than leave a second message behind")
+                    if not stand_down:
+                        if await native_coord.start():
+                            # `native_coord.part_ts` is now this attempt's ledger of owned
+                            # messages (one per part) — the error path reconciles it, so an MCP
+                            # retry inherits the stream instead of minting a second one.
                             current_message_id = native_coord.current_ts or current_message_id
                         else:
-                            # Went inert mid-stream: legacy edits continue on the
-                            # native message so nothing visible is lost.
-                            rate_limiter.record_failure(is_rate_limit=False)
-                            current_message_id = native_coord.current_ts or current_message_id
-                            self.log_warning("Native stream went inert — continuing with legacy updates")
+                            self.log_info("Native streaming unavailable — using legacy streaming updates")
+                if not native_coord.failed:
+                    buffer.add_chunk(text_chunk)
+                    await _flush_native_pending(force=False)
                     return
                 # start failed: fall through to the legacy path (chunk not yet buffered)
 
@@ -1603,6 +1724,10 @@ class TextHandlerMixin:
                     tool_context=tool_context,
                     stream_callback=stream_callback,
                     tool_callback=tool_callback,
+                    # Chat wants the canonical whole-turn text (preamble + post-tool), seam-joined
+                    # to match what streamed to Slack. Deep research et al. keep the default
+                    # (final-round-only) so intermediate preambles never leak into their output.
+                    aggregate_segments=True,
                     prior_committed=visible_already_committed,
                     model=model,
                     temperature=thread_config["temperature"],
@@ -1843,11 +1968,13 @@ class TextHandlerMixin:
             if native_finalized:
                 visible_content_delivered = True  # native stopStream delivered the final text (+ attribution)
             elif current_message_id is None:
-                # No surface at all — status-only DM or an F38 deferred turn where neither
-                # the native stream nor the lazy legacy seed ever produced a message (e.g.
-                # zero chunks before completion). Post the response fresh so nothing is lost
-                # (attribution is already appended to response_text above). Goes to
-                # reply_target, not message.thread_id: nothing has established placement yet.
+                # No surface at all — an F39 final-post-only turn (a top-level channel reply,
+                # which deliberately wrote nothing until now), a status-only DM, or an F38
+                # deferred turn where neither the native stream nor the lazy legacy seed ever
+                # produced a message (e.g. zero chunks before completion). Post the response
+                # fresh so nothing is lost (attribution is already appended to response_text
+                # above). Goes to reply_target, not message.thread_id: nothing has established
+                # placement yet. send_message splits it if it overflows.
                 self.log_info("No streaming message exists — posting final response directly")
                 try:
                     # Capture the delivered ts so F5/F7 below key on the real message
@@ -1857,7 +1984,16 @@ class TextHandlerMixin:
                     if posted_ts:
                         current_message_id = posted_ts
                         visible_content_delivered = True
+                    else:
+                        # send_message swallows SlackApiError and returns None. This post is the
+                        # turn's ONLY delivery, so a swallowed failure here is a silently lost
+                        # answer — the response would still claim `streamed`, and main.py never
+                        # re-posts a streamed reply. Hand the text back instead (below).
+                        final_post_failed = True
+                        self.log_error("Final response post failed — handing the answer back to "
+                                       "the caller to deliver")
                 except Exception as e:
+                    final_post_failed = True
                     self.log_error(f"Error posting final response directly: {e}")
             elif current_part > 1:
                 # We're on an overflow message - just remove the loading indicator
@@ -2033,26 +2169,34 @@ class TextHandlerMixin:
             self.log_info(f"Streaming completed: {stats['successful_requests']}/{stats['total_requests']} updates, "
                          f"final length: {buffer_stats['text_length']} chars")
             
-            return Response(
-                type="text",
-                content=response_text,
-                metadata={"streamed": True, "message_id": message_id,
-                          "native_stream": bool(native_coord is not None and native_coord.started
-                                                and not native_coord.failed),
-                          # Chrome rode the final stopStream — tells main.py's separate
-                          # footer post to stand down (falls back when finalize failed).
-                          "footer_attached": bool(native_finalized and footer_blocks),
-                          # Honest accounting from ACTUAL delivery: a visible message ts plus
-                          # non-empty text means content went out. A failed stream that left
-                          # no delivered ts must not burn the unprompted quota (main.py's
-                          # streamed=True fallback would otherwise read as posted).
-                          "posted": bool(delivered_ts and (response_text or "").strip()),
-                          "model": thread_config.get("model"),
-                          # F32: main.py uploads these after the reply lands.
-                          "artifact_containers": artifact_containers,
-                          "sandbox_image_assets": sandbox_assets,
-                          "mounted_digests": mounted_digests}
-            )
+            stream_meta = {"streamed": True, "message_id": message_id,
+                           "native_stream": bool(native_coord is not None and native_coord.started
+                                                 and not native_coord.failed),
+                           # Chrome rode the final stopStream — tells main.py's separate
+                           # footer post to stand down (falls back when finalize failed).
+                           "footer_attached": bool(native_finalized and footer_blocks),
+                           # Honest accounting from ACTUAL delivery: a visible message ts plus
+                           # non-empty text means content went out. A failed stream that left
+                           # no delivered ts must not burn the unprompted quota (main.py's
+                           # streamed=True fallback would otherwise read as posted).
+                           "posted": bool(delivered_ts and (response_text or "").strip()),
+                           "model": thread_config.get("model"),
+                           # F32: main.py uploads these after the reply lands.
+                           "artifact_containers": artifact_containers,
+                           "sandbox_image_assets": sandbox_assets,
+                           "mounted_digests": mounted_digests}
+            if final_post_failed:
+                # Nothing reached Slack. `streamed` False is what makes main.py post the text
+                # itself; leave `posted` UNSET rather than False so it derives the outcome from
+                # the send it is about to do — an explicit False would also retract the 👀 from
+                # a turn that does end up answering.
+                stream_meta["streamed"] = False
+                stream_meta.pop("posted", None)
+                # main.py persists provenance from the metadata after ITS send (we never got a
+                # ts to persist against). Without this the rescued answer lands with no F7
+                # record at all — the tool attribution silently vanishes on rebuild.
+                stream_meta["tool_provenance"] = tool_provenance
+            return Response(type="text", content=response_text, metadata=stream_meta)
 
         except Exception as e:
             # Usage-estimator backstop: on a context-window rejection, compact the
@@ -2124,71 +2268,122 @@ class TextHandlerMixin:
             if cleanup_ts and hasattr(client, 'update_message_streaming'):
                 try:
                     # Send whatever text we have without the loading indicator, or a formatted error message
-                    if buffer.has_content():
+                    holds_answer = buffer.has_content()
+                    if holds_answer:
                         error_text = buffer.get_complete_text()
                     else:
                         if failed_mcp_server:
                             error_text = f"{config.error_emoji} *MCP Connection Failed*\n\nCouldn't connect to MCP server '{failed_mcp_server}'. Retrying with other tools..."
                         else:
                             error_text = f"{config.error_emoji} *OpenAI Stream Interrupted*\n\nOpenAI's streaming response was interrupted. I'll try again without streaming..."
-                    await client.update_message_streaming(message.channel_id, cleanup_ts, error_text)
+                    cleaned = await client.update_message_streaming(
+                        message.channel_id, cleanup_ts, error_text)
+                    # THIS EDIT CAN BE THE FIRST SUCCESSFUL DELIVERY. If every mid-stream write
+                    # failed transiently, `visible_content_delivered` is still False while this
+                    # write has just put the partial ANSWER on screen. Reconciliation below asks
+                    # that flag whether a surviving surface could be duplicated — so if the
+                    # answer landed here, say so, or a failed delete leads to the answer being
+                    # posted twice.
+                    if holds_answer and (cleaned or {}).get("success") and error_text.strip():
+                        visible_content_delivered = True
                 except Exception as cleanup_error:
                     self.log_debug(f"Could not remove loading indicator: {cleanup_error}")
 
-            # The partial the abandoned stream left behind is a dead artifact of a failed attempt:
-            # the retry below re-answers from scratch and posts its own message. Delete it, or the
-            # user reads the same answer twice.
-            if (native_coord is not None and native_coord.started
-                    and native_coord.current_ts and not failed_mcp_server):
-                try:
-                    if await client.delete_message(message.channel_id, native_coord.current_ts):
-                        self.log_debug("Deleted abandoned partial stream before non-streaming fallback")
-                        if native_coord.current_ts == cleanup_ts:
-                            cleanup_ts = None
-                except Exception as e:  # noqa: BLE001 — a lingering partial beats a lost answer
-                    self.log_warning(f"Could not delete abandoned partial stream: {e}")
+            # ---- Reconcile every surface THIS attempt minted (F39) ----------------------
+            # The attempt owns whatever it created itself: each native part (chat.startStream
+            # mints a message per part) or the legacy seed. It does NOT own the caller's
+            # placeholder — the non-streaming fallback writes its answer into that one.
+            #
+            # Both retries re-answer from scratch, so every owned surface is a dead artifact of
+            # a failed attempt. Leave one alive holding partial answer text and the user reads
+            # the same answer twice — the "42 / 42" duplicate.
+            #
+            #   MCP retry  — keeps streaming, so it INHERITS the first surface. Reset it to the
+            #                retry notice HERE: that neutralizes the partial answer by OVERWRITE
+            #                (a write we can verify) rather than by a delete that might fail.
+            #                Every other part is deleted.
+            #   Otherwise  — falls back to non-streaming, which posts its own message, so every
+            #                owned surface goes.
+            #
+            # FAIL CLOSED: a surface we can neither neutralize nor delete, once visible answer
+            # text has been delivered, would be duplicated by the retry's answer. One honest
+            # message beats two conflicting ones.
+            #
+            # The ledger is a UNION, never a choice. `NativeStreamCoordinator.started` is
+            # `session is not None`, and the session is assigned BEFORE start() is awaited — so
+            # a FAILED chat.startStream still reports started=True with an EMPTY part_ts, and
+            # the legacy loop goes on to seed its own message. Read this as "native parts, ELSE
+            # the seed" and that seed is never reconciled: it survives the fallback, and the
+            # answer lands on screen twice.
+            owned: List[str] = []
+            if native_coord is not None:
+                owned.extend(ts for ts in native_coord.part_ts if ts)
+            if lazy_surface_owned and lazy_surface_owned not in owned:
+                owned.append(lazy_surface_owned)
 
-            # F38: same reasoning for a message the LEGACY loop seeded itself (no placeholder
-            # existed — a deferred or status-only turn). The non-streaming fallback posts a
-            # fresh answer, so this partial has to go or the turn speaks twice. An MCP retry
-            # is the exception: it keeps streaming and inherits the surface below.
-            #
-            # This one FAILS CLOSED: the surface may hold PARTIAL ANSWER TEXT, so posting a
-            # fresh full answer beside it would show the user the same reply twice. If we
-            # cannot delete it, we keep exactly one surface, tell the truth in it, and stop.
-            #
-            # The native branch above does NOT fail closed, and that is a pre-existing gap
-            # rather than a considered asymmetry — a failed native stream can hold partial
-            # answer text too, so a failed delete there carries the same double-output risk.
-            # Left alone deliberately: it predates this change and is not newly reachable.
-            # Flagged for its own fix.
-            if lazy_surface_owned and not failed_mcp_server:
-                deleted = False
+            keeper = owned[0] if (owned and failed_mcp_server) else None
+            doomed = owned[1:] if keeper else owned
+            survivors: List[str] = []
+
+            async def _drop_surface(ts: str) -> bool:
                 try:
-                    deleted = bool(await client.delete_message(
-                        message.channel_id, lazy_surface_owned))
+                    return bool(await client.delete_message(message.channel_id, ts))
                 except Exception as e:  # noqa: BLE001
-                    self.log_warning(f"Could not delete the lazily-seeded partial: {e}")
-                if not deleted:
-                    self.log_error(
-                        "Could not remove the partial reply before falling back — refusing to "
-                        "post a second answer; surfacing the interruption in place instead")
+                    self.log_warning(f"Could not delete the abandoned partial {ts}: {e}")
+                    return False
+
+            for dead_ts in doomed:
+                if await _drop_surface(dead_ts):
+                    self.log_debug(f"Deleted abandoned partial {dead_ts} before retrying")
+                else:
+                    survivors.append(dead_ts)
+
+            if keeper:
+                retry_display = ", ".join(sorted(self._as_mcp_exclusion_set(failed_mcp_servers)))
+                reset_ok = False
+                try:
+                    reset_ok = bool(await client.update_message(
+                        message.channel_id, keeper,
+                        f"{config.circle_loader_emoji} Retrying without '{retry_display}'..."))
+                except Exception as e:  # noqa: BLE001
+                    self.log_warning(f"Could not reset the inherited surface: {e}")
+                if not reset_ok:
+                    # It still holds answer text and we could not blank it. Delete it and let
+                    # the retry mint its own surface; if that fails too it is a survivor and we
+                    # fail closed below.
+                    if not await _drop_surface(keeper):
+                        survivors.append(keeper)
+                    keeper = None
+
+            if survivors and visible_content_delivered:
+                self.log_error(
+                    "Could not clear a partial reply before retrying — refusing to post a "
+                    "second answer; surfacing the interruption in place instead")
+                # EVERY surface still standing has to be neutralized, not just the first.
+                # Rewriting survivors[0] alone left the others holding partial ANSWER TEXT (and
+                # a reset keeper still promising a retry that is no longer coming) — so the
+                # turn ended with several live messages, one of them a half-answer. The first
+                # gets the explanation; the rest are stamped as discarded. Deleting them is
+                # what already failed, so overwriting is all we have left.
+                voice, *rest = ([keeper] if keeper else []) + survivors
+                try:
+                    await client.update_message(
+                        message.channel_id, voice,
+                        "⚠️ I got cut off partway through that answer. Please ask again.")
+                except Exception as e:  # noqa: BLE001
+                    self.log_error(f"Could not surface the interruption: {e}")
+                for stray in rest:
                     try:
                         await client.update_message(
-                            message.channel_id, lazy_surface_owned,
-                            "⚠️ I got cut off partway through that answer. Please ask again.")
+                            message.channel_id, stray, "⚠️ _(discarded — that reply was cut off)_")
                     except Exception as e:  # noqa: BLE001
-                        self.log_error(f"Could not surface the interruption: {e}")
-                    return Response(
-                        type="text", content="",
-                        metadata={"streamed": True, "posted": True,
-                                  "model": thread_config.get("model"),
-                                  "interrupted": True},
-                    )
-                self.log_debug("Deleted the lazily-seeded partial before non-streaming fallback")
-                if lazy_surface_owned == cleanup_ts:
-                    cleanup_ts = None
-                lazy_surface_owned = None
+                        self.log_error(f"Could not neutralize a stray partial: {e}")
+                return Response(
+                    type="text", content="",
+                    metadata={"streamed": True, "posted": True,
+                              "model": thread_config.get("model"),
+                              "interrupted": True},
+                )
 
             # Retry request - streaming preserved for MCP failures, non-streaming for other errors
             if failed_mcp_server:
@@ -2210,15 +2405,21 @@ class TextHandlerMixin:
             # buffer.has_content() would falsely read empty even after a part was delivered).
             # Once any visible text landed this turn, a no_response_needed on the retry is
             # rejected rather than orphaning that partial as fake silence.
+            # F39: native streaming DELETES the placeholder before it mints its stream (and
+            # stands down if that delete fails), so once it started, `thinking_id` names a dead
+            # message. Handing it to the retry pointed it at a corpse — and the surface
+            # selection preferred it over the live inherited one. Pass None instead.
+            retry_thinking_id = (None if (native_coord is not None and native_coord.started)
+                                 else thinking_id)
             return await self._handle_text_response(
-                user_content, thread_state, client, message, thinking_id,
+                user_content, thread_state, client, message, retry_thinking_id,
                 attachment_urls, retry_count=1, failed_mcp_server=failed_mcp_servers,
                 visible_already_committed=visible_content_delivered,
                 artifacts_acc=artifacts, turn=turn,
-                # F38: an MCP retry keeps streaming, so hand it the message this attempt
-                # created. Without it the retry sees "no placeholder", seeds a SECOND
-                # message, and the turn posts its answer twice.
-                lazy_surface_ts=lazy_surface_owned,
+                # F38: an MCP retry keeps streaming, so hand it the one surface this attempt
+                # created (reconciled above). Without it the retry sees "no placeholder", mints
+                # a SECOND message, and the turn posts its answer twice.
+                lazy_surface_ts=keeper,
             )
 
     @staticmethod

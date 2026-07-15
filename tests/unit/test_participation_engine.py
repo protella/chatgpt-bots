@@ -605,11 +605,18 @@ class TestPlacement:
 
     @pytest.mark.asyncio
     async def test_reply_in_channel_setting_posts_top_level_and_skips_footer(self):
+        """F39: a top-level channel reply gets NO placeholder — it is posted once, finished.
+
+        It used to get one, and that was the "(edited)" bug: Slack can only stream into a
+        thread (chat.startStream REQUIRES thread_ts), so a top-level placeholder could only
+        become the answer by being chat.update-d — which brands the message "(edited)" forever.
+        A human teammate posts once; so do we.
+        """
         app, client = self._app_with_processor(self._resp())
         msg = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
                       metadata={"ts": "10.0", "reply_in_channel": True})
         await app.handle_message(msg, client)
-        client.send_thinking_indicator.assert_awaited_once_with("C1", None)
+        client.send_thinking_indicator.assert_not_awaited()
         assert client.send_message.await_args.args[1] is None  # top-level post
         client.maybe_post_response_footer.assert_not_awaited()
 
