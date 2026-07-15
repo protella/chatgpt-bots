@@ -262,6 +262,41 @@ Flags: `ENABLE_DEEP_RESEARCH` (default **on**), `DEEP_RESEARCH_REASONING_EFFORT`
 (on — the byline needs the `chat:write.customize` scope; without it the bot posts plainly rather
 than failing).
 
+### 🖼️ Fixed - It looks at your image before reacting to it
+
+Drop a picture in a channel with no caption and the bot used to react to it *blind* — the quick
+"should I chime in here?" check only ever saw the filename, never the image. So a meme or a
+screenshot got an emoji chosen from thin air, sometimes plainly the wrong one. That check now
+actually sees the picture, so when it reacts — or decides the image is worth a real answer — it's
+responding to what's in it, not guessing from the words around it.
+
+And when it *does* study an uploaded image, that finally works at all: image analysis had been
+silently failing on every upload, so the bot quietly lost track of what a picture showed later in
+the conversation. It reads them correctly now.
+
+Kept deliberately cheap: a couple of images at most, small, at low resolution, on a short
+deadline — and if it can't see one, it's told so plainly instead of inventing what's in it.
+Flag: `ENABLE_MULTIMODAL_GATE` (default **on**).
+
+### ✂️ Fixed - Replies come out once, and clean
+
+- **No more "(edited)" on channel replies.** When the bot answered at the top of a channel
+  rather than in a thread, it posted a stub and rewrote it as the words arrived — and Slack
+  stamped the result "(edited)" every time, as if it had gone back and changed its answer. Those
+  replies now appear once, whole, with no marker. (Inside a thread it still types the answer out
+  live, which Slack never marks edited.)
+- **No more double answers.** If a tool the bot was using hiccuped and it had to retry, it could
+  post the entire answer a second time and leave the half-finished first copy sitting above it.
+  A retry now continues the reply you're already reading instead of starting a new one.
+
+### ⏳ Fixed - You can watch it work while it edits an image
+
+Ask the bot to edit an image and it would say something like "On it, fixing that now —" and then
+freeze mid-sentence for the whole minute the edit took, snapping to the full reply only once the
+new picture was ready. Now whatever it says *before* it starts editing reaches you right away, so
+you're not staring at half a sentence wondering if it hung. And when it picks the reply back up
+afterward, the two halves no longer collide into one jammed-together word.
+
 ### 🔁 Fixed - It no longer builds the same thing twice
 
 Ask for a deck, say something in the thread while it's working, and the bot could quietly

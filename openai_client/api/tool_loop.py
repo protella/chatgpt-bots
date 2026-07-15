@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from config import config
+from message_markers import join_segments
 from tool_registry import ToolContext, ToolRegistry, serialize_tool_result
 
 from . import responses as responses_api
@@ -343,6 +344,7 @@ async def create_streaming_response_with_tool_loop(
     max_tool_calls: Optional[int] = None,
     tool_choice: Optional[str] = None,
     free_tools: Optional[Iterable[str]] = None,
+    aggregate_segments: bool = False,
     **params: Any,
 ) -> Dict[str, Any]:
     """Streaming response with local tool execution.
@@ -439,6 +441,13 @@ async def create_streaming_response_with_tool_loop(
     # signal that decides whether a no_response_needed call is valid. Seeded by
     # prior_committed so a cross-attempt partial (F8) also counts as committed.
     visible_committed = bool(prior_committed)
+    # Every round's visible text, in order — a pre-tool preamble and the post-tool text are
+    # SEPARATE rounds. ``aggregate_segments`` (the chat handler) returns the seam-joined whole so
+    # the thread remembers exactly what Slack showed instead of just the last round's "Fixed."
+    # It is OPT-IN: internal consumers that treat this as a final-round-only stream — deep
+    # research reads result["text"] as the report and never shows the intermediate "I'll search…"
+    # preambles — must keep getting only the last round, or those preambles leak into the report.
+    segments: List[str] = []
 
     while True:
         sink: List[Dict[str, Any]] = []
@@ -458,13 +467,18 @@ async def create_streaming_response_with_tool_loop(
         # "none" is the loop's own terminal state and must survive.
         if tool_choice not in (None, "none"):
             tool_choice = None
+        if text:
+            # Keep even a whitespace-only round: join_segments drops only truly empty ("")
+            # segments, but a "\n" is real committed text the handler's buffer also keeps —
+            # dropping it here would desync the returned aggregate from the Slack display.
+            segments.append(text)
         if (text or "").strip():
             visible_committed = True
 
         calls = _function_calls(sink)
         if not calls or tool_choice == "none":
             return {
-                "text": text,
+                "text": join_segments(segments) if aggregate_segments else text,
                 "tools_used": tools_used_all,
                 "local_tool_calls": local_tool_calls,
             }

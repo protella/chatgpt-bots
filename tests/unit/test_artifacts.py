@@ -1262,19 +1262,16 @@ class TestAbortedStreamDoesNotDuplicateTheAnswer:
         src = inspect.getsource(TextHandlerMixin)
         assert "Native stream abandon failed before non-streaming fallback" in src
 
-    def test_abandoned_partial_is_deleted_so_the_retry_does_not_duplicate_it(self):
-        import inspect
-        from message_processor.handlers.text import TextHandlerMixin
-        src = inspect.getsource(TextHandlerMixin)
-        assert "Deleted abandoned partial stream before non-streaming fallback" in src
-
-    def test_mcp_streaming_retry_keeps_its_partial(self):
-        """An MCP failure retries WITH streaming and continues the same message — deleting the
-        partial there would throw away text we are about to keep building on."""
-        import inspect
-        from message_processor.handlers.text import TextHandlerMixin
-        src = inspect.getsource(TextHandlerMixin)
-        assert "and native_coord.current_ts and not failed_mcp_server" in src
+    # RETIRED (F39). Two grep-tests used to live here, and both were wrong:
+    #
+    #   test_abandoned_partial_is_deleted_...  asserted a log STRING, not a deletion.
+    #   test_mcp_streaming_retry_keeps_its_partial  asserted the guard `not failed_mcp_server`,
+    #       i.e. "an MCP retry keeps its partial on screen" — which WAS the duplicate-reply bug.
+    #       It passed happily while the native path posted every MCP-retried answer twice.
+    #
+    # A source grep cannot count the messages left on screen. Their replacements drive the real
+    # handler against a fake Slack and assert exactly one survives:
+    # tests/unit/test_reply_surface.py.
 
 
 class TestStreamSafeText:

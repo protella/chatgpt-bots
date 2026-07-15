@@ -193,6 +193,10 @@ class ChatBotV2:
                 channel_people=channel_people,
                 capabilities=capabilities,
                 attachments=message.metadata.get("participation_attachments"),
+                # F40: descriptors only — the engine downloads the pixels itself, and only once
+                # the message has survived the debounce.
+                images=message.metadata.get("participation_images"),
+                client=client,
                 pulse=pulse, thread_root_ts=message.thread_id,
             )
             if verdict is None:  # superseded by a newer message during debounce

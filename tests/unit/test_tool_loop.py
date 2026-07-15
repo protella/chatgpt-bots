@@ -276,6 +276,80 @@ class TestToolLoop:
         assert ("local:echo", "started") in events and ("local:echo", "completed") in events
 
     @pytest.mark.asyncio
+    async def test_streaming_loop_returns_the_seam_joined_aggregate_not_just_the_last_round(
+            self, monkeypatch):
+        """A pre-tool preamble and the post-tool text are SEPARATE rounds. The old return handed
+        back only the last round ("Fixed."), so the thread state remembered a different string
+        than Slack displayed (which shows every round). Now the loop returns the canonical join,
+        seam-separated exactly like the buffer the handler streams."""
+        rounds = [("Fixing the chopsticks under Super Heavy.", [_call()]), ("Fixed.", [])]
+        state = {"n": 0}
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            text, calls = rounds[min(state["n"], len(rounds) - 1)]
+            state["n"] += 1
+            if tool_choice != "none" and function_call_sink is not None:
+                function_call_sink.extend(calls)
+            return text
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            fake_streaming)
+        out = await tool_loop.create_streaming_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with(),
+            tool_context=ToolContext(), stream_callback=lambda c: None,
+            tool_callback=lambda t, s: None, aggregate_segments=True)
+        assert out["text"] == "Fixing the chopsticks under Super Heavy.\n\nFixed.", out["text"]
+
+    @pytest.mark.asyncio
+    async def test_aggregation_is_opt_in_default_returns_final_round_only(self, monkeypatch):
+        """Deep research reads result["text"] as the report and never streams the intermediate
+        "I'll search…" preambles to Slack — so the DEFAULT must stay final-round-only, or those
+        preambles leak into the report. Only the chat handler passes aggregate_segments=True."""
+        rounds = [("I'll look into that.", [_call()]), ("The final report.", [])]
+        state = {"n": 0}
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            text, calls = rounds[min(state["n"], len(rounds) - 1)]
+            state["n"] += 1
+            if tool_choice != "none" and function_call_sink is not None:
+                function_call_sink.extend(calls)
+            return text
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            fake_streaming)
+        out = await tool_loop.create_streaming_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with(),
+            tool_context=ToolContext(), stream_callback=lambda c: None,
+            tool_callback=lambda t, s: None)                      # no aggregate_segments
+        assert out["text"] == "The final report.", out["text"]
+
+    @pytest.mark.asyncio
+    async def test_aggregate_keeps_whitespace_only_rounds_to_match_the_buffer(self, monkeypatch):
+        """A wholly whitespace round is real committed text the handler's buffer keeps, so the
+        aggregate must keep it too — dropping it would desync persisted text from the display
+        ("A\\nB" on screen vs "A\\n\\nB" persisted)."""
+        rounds = [("A", [_call()]), ("\n", [_call()]), ("B", [])]
+        state = {"n": 0}
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            text, calls = rounds[min(state["n"], len(rounds) - 1)]
+            state["n"] += 1
+            if tool_choice != "none" and function_call_sink is not None:
+                function_call_sink.extend(calls)
+            return text
+
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            fake_streaming)
+        out = await tool_loop.create_streaming_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with(),
+            tool_context=ToolContext(), stream_callback=lambda c: None,
+            tool_callback=lambda t, s: None, aggregate_segments=True)
+        assert out["text"] == "A\nB", out["text"]      # the "\n" round is kept; no doubled seam
+
+    @pytest.mark.asyncio
     async def test_a_seeded_tool_choice_seeds_only_the_first_round(self, monkeypatch):
         """F37 forces the delivery-plan call with tool_choice="required". Left set, it would
         force the SAME tool again on the next round: the model would be made to re-answer a
@@ -964,3 +1038,26 @@ class TestProcessorGlue:
         # ctx rides along so omitted channel_id/thread_ts default to the current conversation
         s.dispatch_history_tool_call.assert_awaited_once_with(
             "fetch_thread_messages", {"channel_id": "C1"}, ctx)
+
+
+class TestSegmentJoin:
+    """The seam rule shared by the tool loop (returned aggregate) and the handler (Slack buffer):
+    a paragraph break between round-segments, but only where the model didn't already leave one."""
+
+    def test_jams_get_a_paragraph_break(self):
+        from message_markers import segment_separator, join_segments
+        assert segment_separator("under Super Heavy.", "Fixed.") == "\n\n"
+        assert join_segments(["under Super Heavy.", "Fixed."]) == "under Super Heavy.\n\nFixed."
+
+    def test_existing_whitespace_is_not_doubled(self):
+        from message_markers import segment_separator
+        assert segment_separator("done.\n", "next") == ""          # prior segment ends in space
+        assert segment_separator("done.", "\nnext") == ""          # next begins with space
+        assert segment_separator("done. ", "next") == ""
+
+    def test_empty_segments_contribute_nothing(self):
+        from message_markers import segment_separator, join_segments
+        assert segment_separator("", "x") == "" and segment_separator("x", "") == ""
+        assert join_segments(["only"]) == "only"
+        assert join_segments(["a", "", "b"]) == "a\n\nb"           # the empty middle round vanishes
+        assert join_segments([]) == ""
