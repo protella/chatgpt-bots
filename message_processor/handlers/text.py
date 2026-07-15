@@ -88,13 +88,17 @@ _WORK_CLAIM_HOSTED_TOOLS = frozenset({
     "web_search", "file_search", "code_interpreter", "image_generation",
 })
 
-# Local tools that BLOCK the loop synchronously for a long time (gpt-image-2 is ~a minute).
-# Native appends are token-driven, so a round's pre-tool preamble ("Making that…") freezes
-# on screen for the tool's whole duration unless we push it to Slack before dispatch. Scoped
-# deliberately: `generate_image` is detached (its turn returns at once) and `start_background_job`
-# withholds its ack for the status card (F30.1) — flushing before either would strand content.
+# Local tools whose round emits a real pre-tool preamble ("Making that…") that must not freeze.
+# Native appends are token-driven and the wrapper skips the None completion signal on a tool
+# round, so a buffered preamble sits frozen — at whatever the cadence last flushed — until the
+# NEXT round streams. edit_image/create_image_asset block the loop ~a minute; generate_image is
+# detached, but its dispatch still does synchronous Slack work (stakes 👀, posts the status card)
+# and the round boundary strands the preamble's tail across it either way. All three push the
+# preamble before dispatch. `start_background_job` is deliberately EXCLUDED: it withholds its
+# short ack so the job's live status card owns the acknowledgment (F30.1, keyed on
+# visible_content_delivered staying False) — flushing there would strand both the ack and the card.
 _PRE_TOOL_FLUSH_TOOLS = frozenset({
-    "local:edit_image", "local:create_image_asset",
+    "local:edit_image", "local:create_image_asset", "local:generate_image",
 })
 
 

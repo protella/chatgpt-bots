@@ -289,13 +289,13 @@ Flag: `ENABLE_MULTIMODAL_GATE` (default **on**).
   post the entire answer a second time and leave the half-finished first copy sitting above it.
   A retry now continues the reply you're already reading instead of starting a new one.
 
-### ⏳ Fixed - You can watch it work while it edits an image
+### ⏳ Fixed - You can watch it work while it makes an image
 
-Ask the bot to edit an image and it would say something like "On it, fixing that now —" and then
-freeze mid-sentence for the whole minute the edit took, snapping to the full reply only once the
-new picture was ready. Now whatever it says *before* it starts editing reaches you right away, so
-you're not staring at half a sentence wondering if it hung. And when it picks the reply back up
-afterward, the two halves no longer collide into one jammed-together word.
+Ask the bot for a picture — a new one or an edit — and it would start a line like "Making that
+now —" and then freeze mid-sentence, snapping to the full reply only once the image was ready.
+Now whatever it says *before* the image work begins reaches you right away, so you're not staring
+at half a sentence wondering if it hung. And when it picks the reply back up afterward, the two
+halves no longer collide into one jammed-together word.
 
 ### 🔁 Fixed - It no longer builds the same thing twice
 
@@ -345,6 +345,15 @@ edit it in place.
   stays untitled forever.
 
 Flag: `ENABLE_CANVAS_TOOLS` (default **on**; needs the `canvases:read` / `canvases:write` scopes).
+
+### 🙋 Fixed - No surprise "set up your settings" card
+
+If a message got deleted in your DM with the bot — including the bot quietly clearing its own
+in-progress status line — Slack echoes that deletion back as an event with nobody attached to it.
+The bot mistook "nobody" for "somebody brand new" and popped its first-run *Welcome — configure
+your settings* card at you, mid-conversation, as if you'd never met. Your actual settings were
+never touched. It now ignores those unattributed events, so that card only ever appears for
+someone genuinely new.
 
 ### 🎨 Changed - Images and code are the same conversation now
 

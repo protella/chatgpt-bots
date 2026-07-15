@@ -604,13 +604,16 @@ def _held_streaming_config():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tool", ["local:edit_image", "local:create_image_asset"])
-async def test_a_blocking_tools_preamble_reaches_slack_before_it_runs(monkeypatch, tool):
+@pytest.mark.parametrize(
+    "tool", ["local:edit_image", "local:create_image_asset", "local:generate_image"])
+async def test_a_pre_tool_preamble_reaches_slack_before_the_tool_runs(monkeypatch, tool):
     """THE BUG. Native appends are token-driven, and the wrapper skips the None signal on a tool
     round — so a round's preamble sat frozen at whatever the cadence last flushed (one word:
-    "Yep") for the entire ~minute the tool ran, and only appeared once the NEXT round streamed.
-    Every blocking synchronous tool must find the preamble already on screen when it dispatches —
-    parametrized so dropping either member of _PRE_TOOL_FLUSH_TOOLS fails here."""
+    "Yep") until the NEXT round streamed. For edit_image/create_image_asset that is the tool's
+    whole ~minute; for detached generate_image it is the ~2s its dispatch spends staking the eye
+    and posting the status card, then the empty final round. Every flush tool must find the
+    preamble already on screen when it dispatches — parametrized so dropping any member of
+    _PRE_TOOL_FLUSH_TOOLS fails here."""
     monkeypatch.setattr(config, "enable_no_reply_tool", False, raising=False)
     from message_processor import file_mount
     monkeypatch.setattr(file_mount, "mounted_digests", lambda tc: [], raising=False)
@@ -631,12 +634,13 @@ async def test_a_blocking_tools_preamble_reaches_slack_before_it_runs(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_a_detached_or_background_tools_ack_is_not_flushed_early(monkeypatch):
-    """Scoping guard. The flush is ONLY for tools that block the loop. `start_background_job`
-    returns fast and DELIBERATELY withholds its short ack so the job's live status card owns the
+async def test_start_background_jobs_ack_is_not_flushed_early(monkeypatch):
+    """Scoping guard. `start_background_job` is the one tool held OUT of the flush set: it returns
+    fast and DELIBERATELY withholds its short ack so the job's live status card owns the
     acknowledgment (F30.1) — that suppression keys on `visible_content_delivered` still being
     False. Force-flushing its preamble at dispatch would set the flag and strand both the ack and
-    the card, so a non-blocking tool must NOT trigger the early flush."""
+    the card. (Detached generate_image, by contrast, DOES flush — its preamble is real visible
+    text with nothing to suppress; see the parametrized flush test above.)"""
     monkeypatch.setattr(config, "enable_no_reply_tool", False, raising=False)
     from message_processor import file_mount
     monkeypatch.setattr(file_mount, "mounted_digests", lambda tc: [], raising=False)
