@@ -425,6 +425,20 @@ class SlackMessageEventsMixin:
         if event.get("subtype") == "message_changed":
             return
 
+        # A message event carrying neither a `user` nor a bot identity is a Slack subtype we do
+        # not act on — a deletion (message_deleted / tombstone) or an unattributed system post,
+        # NOT a human turn. It must never fall through to onboarding below: with user_id=None the
+        # new-user branch has no saved prefs, so it creates "default preferences for new user
+        # None" and fires the Configure-Settings welcome card into whoever's DM the event landed
+        # in (observed live: a deletion echo in an active DM greeted an established user).
+        # classify_sender can't catch it — with no bot_id/app_id it reads as 'human'. Bot senders
+        # keep their path (they carry bot_id, so classify_sender still routes them to other_bot).
+        if not event.get("user") and not (event.get("bot_id") or event.get("app_id")):
+            self.log_debug(
+                f"Dropping unattributed message event (subtype={event.get('subtype')}, "
+                f"ts={event.get('ts')}) — not a human turn")
+            return
+
         message = await self._event_to_message(event, client)
         if wake_source:
             message.metadata["wake_source"] = wake_source
