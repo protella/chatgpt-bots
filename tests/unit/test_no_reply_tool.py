@@ -333,6 +333,8 @@ async def test_streaming_no_reply_rejected_after_committed_text(monkeypatch):
         host, messages=[], tools=[], registry=_FakeRegistry([]),
         tool_context=None, stream_callback=lambda c: None)
     assert out.get("terminal_action") is None          # NOT silenced
+    # Default (non-aggregate) loop returns the completing round only; the chat handler, which
+    # opts into aggregate_segments, is where the committed preamble is preserved on screen.
     assert out["text"] == " — all done."               # completing round's reply
     assert {"name": "no_response_needed", "ok": False, "gist": "reason=<str>"} in out["local_tool_calls"]
     assert any("after visible text" in w for w in host.warnings)
@@ -353,7 +355,7 @@ async def test_streaming_no_reply_with_committed_text_runs_react_sibling(monkeyp
     out = await tool_loop.create_streaming_response_with_tool_loop(
         _RecordingSelf(), messages=[], tools=[], registry=_FakeRegistry(dispatched),
         tool_context=None, stream_callback=lambda c: None)
-    assert out["text"] == "done"
+    assert out["text"] == "done"                       # default loop: completing round only
     assert "react_to_message" in dispatched            # sibling ran
     assert "no_response_needed" not in dispatched       # rejected via override, not dispatched
 

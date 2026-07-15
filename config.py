@@ -197,6 +197,20 @@ class BotConfig:
     # mid-exchange follow-up case.
     participation_reasoning_effort: str = field(default_factory=lambda: os.getenv("PARTICIPATION_REASONING_EFFORT", "low"))
 
+    # F40 — the wake gate SEES attached images (user report 2026-07-13: a meme captioned only
+    # ":dogkek:" earned a :joy: reaction the gate had inferred from the emoji in the caption,
+    # never having looked at the picture). All the context can live in the image, so the gate
+    # gets the pixels, not a filename. Deliberately NOT gated on "thin text": a long caption
+    # ("this is exactly what prod does every Friday") is just as meaningless without the image,
+    # and a text-only first pass would keep the reported bug — that pass answered confidently.
+    #
+    # Cost control is by CAPS, not by guessing: low detail, few images, hard byte ceiling.
+    # Raising reasoning effort would NOT buy visual resolution — that's what `detail` is for.
+    enable_multimodal_gate: bool = field(default_factory=lambda: os.getenv("ENABLE_MULTIMODAL_GATE", "true").lower() == "true")
+    gate_vision_max_images: int = field(default_factory=lambda: int(os.getenv("GATE_VISION_MAX_IMAGES", "2")))
+    gate_vision_max_bytes: int = field(default_factory=lambda: int(os.getenv("GATE_VISION_MAX_BYTES", str(5 * 1024 * 1024))))
+    gate_vision_detail: str = field(default_factory=lambda: os.getenv("GATE_VISION_DETAIL", "low"))
+
     # Analysis function parameters (for vision analysis, complex tasks)
     analysis_reasoning_effort: str = field(default_factory=lambda: os.getenv("ANALYSIS_REASONING_EFFORT", "medium"))
     analysis_verbosity: str = field(default_factory=lambda: os.getenv("ANALYSIS_VERBOSITY", "medium"))
