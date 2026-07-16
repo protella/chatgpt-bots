@@ -54,7 +54,7 @@ DISCORD_TOKEN / DISCORD_ALLOWED_CHANNEL_IDS / DISCORD_LOG_LEVEL
 GPT4_MAX_TOKENS
 THREAD_MAX_TOKEN_COUNT
 MAX_UNPROMPTED_REPLIES_PER_HOUR   # the hourly cap is gone — pacing is the model's judgment
-PARTICIPATION_SNOOZE_HOURS        # "butt out" now mutes the thread durably, no timer
+PARTICIPATION_SNOOZE_HOURS        # retired — easing off is remembered as a channel preference, not a timer or a mute
 ```
 
 New keys worth a decision (see `.env.example` for the full annotated list — every knob is
@@ -164,15 +164,17 @@ DMs behave as before.
   overrides; anything left on "each person's own setting" keeps using the asker's
   personal preferences. A "My personal settings" button inside the modal opens your
   own settings without a second button in chat.
-- **"Quiet down" works like you'd hope**: telling the bot to pipe down gets a 🤐 and
-  permanently mutes unprompted participation *in that thread* — no timer to wait out,
-  and mentions and name-summons still answer. It also writes a dated note to channel
-  memory, so the bar goes up channel-wide. Standing feedback ("stay out of here unless
-  tagged", "keep answers short in this channel") is remembered durably as a channel
-  preference.
-- **Per-channel memory, model-managed**: the bot decides what's durable
-  (decisions, conventions, preferences) and remembers/updates/forgets it via its own
-  tools; facts are recalled in future conversations in that channel
+- **"Ease off" is heard as a preference, not a shutdown**: casual feedback — "you're a
+  bit chatty in here", "react less" — no longer slams the brakes or benches the bot in a
+  thread. It records a gentle, per-channel preference (e.g. "react sparingly here") and
+  adjusts; mentions and name-summons always still answer. Only an explicit, unambiguous
+  instruction the bot is asked directly — "only reply when I tag you", "you can be more
+  active in here" — actually changes the channel's participation setting.
+- **Per-channel memory, model-managed — and now yours to edit**: the bot decides what's
+  durable (decisions, conventions, preferences) and remembers/updates/forgets it via its
+  own tools; facts are recalled in future conversations in that channel. You can review and
+  edit that memory by hand in the ⚙️ Channel settings modal — it's a plain text box, one
+  note per line: add, reword, or delete notes and save.
 - **On-demand context tools**: the bot can fetch older thread/channel history and
   search the workspace (`assistant.search.context`) when a conversation references
   something it can't see — instead of guessing. It can also link directly to an
@@ -230,6 +232,11 @@ DMs behave as before.
 - **Questions in other threads stop vanishing.** Rapid-fire chatter in one thread could
   silently cancel the pending evaluation of an unrelated message elsewhere in the channel,
   so it was never judged and never answered. Each conversation is now debounced on its own.
+- **Settings and canvas deletion take a real ask.** Changing how the bot participates in a
+  channel — or deleting a channel canvas — now takes a person asking the bot directly (an
+  @mention, or a DM for canvases). A passing name-drop, quoted text, or another bot can't
+  trigger either, so "being talked about" can never flip a channel's settings or remove its
+  canvas.
 
 ### 🔬 Feature - Deep research, in the background
 

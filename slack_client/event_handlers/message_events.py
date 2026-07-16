@@ -312,21 +312,6 @@ class SlackMessageEventsMixin:
         ts = event.get("ts")
         thread_ts = event.get("thread_ts")
 
-        # F15 muted-thread pre-gate: a thread told to "butt out" is permanently opted out of
-        # UNPROMPTED participation (replaces the old channel-wide snooze timer). Cheap check
-        # before any model call or replies fetch. A name-hit summons still reaches the engine
-        # (told to be quiet ≠ deaf); direct @-mentions arrive via app_mention and never hit
-        # this path. Unlike the old snooze this logs when it drops (silent drops were a
-        # live-debugging pain).
-        thread_root = thread_ts or ts
-        muted_threads = (cs or {}).get("muted_threads") or []
-        if thread_root in muted_threads and not name_hit:
-            self.log_debug(
-                f"Muted-thread pre-gate: dropping unprompted message in {channel_id} "
-                f"thread {thread_root} (ts={ts})"
-            )
-            return
-
         sender_is_bot = self.classify_sender(event) != "human"
         direct_continuation = False
         if not sender_is_bot and thread_ts and thread_ts != ts:
@@ -397,14 +382,17 @@ class SlackMessageEventsMixin:
             if gate_images:
                 message.metadata["participation_images"] = gate_images
         # Phase 7: carry per-channel ground rules + placement into the response pipeline.
-        if cs:
-            if cs.get("directives"):
-                message.metadata["channel_directives"] = cs["directives"]
-            if cs.get("reply_in_channel"):
-                message.metadata["reply_in_channel"] = True
-        elif config.reply_in_channel_default:
-            # No saved channel settings: the global default decides whether top-level
-            # replies are allowed (the engine still judges placement per message).
+        if cs and cs.get("directives"):
+            message.metadata["channel_directives"] = cs["directives"]
+        # reply_in_channel resolution (redesign Layer 1): a row's EXPLICIT True/False wins;
+        # None (inherit) OR no row at all falls back to the global default. The old `elif` hung
+        # off `if cs:`, so a channel WITH a row but a NULL reply_in_channel never reached the
+        # default and was silently forced to threads-only. The engine still judges placement
+        # per message when top-level replies are allowed.
+        reply_in_channel = (cs or {}).get("reply_in_channel")
+        if reply_in_channel is None:
+            reply_in_channel = config.reply_in_channel_default
+        if reply_in_channel:
             message.metadata["reply_in_channel"] = True
 
         self.log_debug(

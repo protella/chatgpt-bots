@@ -7,8 +7,8 @@ operator directives, and the bot's own recent participation rate.
 
 Authority order (cheap → expensive), enforced in code not prompt:
   prefilters (message_events: own message / subtype / level=off / muted-thread /
-  addressed-short-circuit / mentions_only) → hard hourly throttle → debounce →
-  ONE utility-model call → verdict.
+  addressed-short-circuit / mentions_only) → debounce → ONE utility-model call → verdict.
+  (The old hourly hard cap was retired in F17 — pacing is the model's judgment, not a ceiling.)
 
 @mentions, name-wakes, 1:1 threads, and DMs NEVER reach this engine — they are
 answered directly (told to be quiet ≠ deaf).
@@ -61,9 +61,42 @@ VALID_ACTIONS = ("respond", "react", "ignore", "backoff")
 VALID_PLACEMENTS = ("thread", "channel")
 VALID_LEVELS = ("off", "mentions_only", "judicious", "active")
 
+# Participation-backoff redesign (Layer 2): the taxonomy a `backoff` verdict carries so the
+# engine can tell a passing "not now" from a durable "stop doing X here" — and never confuse
+# a soft preference with an explicit settings change.
+VALID_DIMENSIONS = ("reactions", "replies", "verbosity", "thread_participation")
+VALID_DURABILITIES = ("momentary", "standing")
+VALID_SCOPES = ("thread", "channel")
+VALID_STRUCTURAL = ("none", "participation", "placement", "both")
+
 MODE_TO_LEVEL = {"off": "off", "tag_only": "mentions_only", "auto_respond": "judicious"}
 LEVEL_TO_MODE = {"off": "off", "mentions_only": "tag_only",
                  "judicious": "auto_respond", "active": "auto_respond"}
+
+
+def _coerce_enum(value: Any, allowed: tuple) -> Optional[str]:
+    """Lowercased value if it is one of `allowed`, else None (a malformed field never leaks)."""
+    v = str(value or "").strip().lower()
+    return v if v in allowed else None
+
+
+def _coerce_memory_op(value: Any) -> str:
+    """Normalize the `memory_op` field to none | add | delete | update:<id> | delete:<id>.
+
+    `update:<id>`/`delete:<id>` target a specific channel-memory row. Bare `add`/`delete`
+    (which carry no row id) are still accepted for backward-compatible parsing, but no longer
+    drive a thread mute — thread-scoped feedback is guidance-only and persists nothing.
+    Anything malformed degrades to "none" (no durable action)."""
+    s = str(value or "none").strip().lower()
+    if s in ("none", "add", "delete"):
+        return s
+    for op in ("update", "delete"):
+        prefix = op + ":"
+        if s.startswith(prefix):
+            ident = s[len(prefix):].strip()
+            if ident.isdigit():
+                return f"{op}:{ident}"
+    return "none"
 
 
 def resolve_participation_level(channel_settings: Optional[Dict[str, Any]]) -> str:
@@ -124,6 +157,22 @@ class ParticipationVerdict:
     emoji: Optional[str] = None
     placement: str = "thread"
     reason: str = ""
+    # Participation-backoff redesign (Layer 2): the taxonomy a `backoff` verdict carries.
+    # All defaulted so a pre-redesign verdict ({action, emoji, placement, reason}) still parses
+    # unchanged. `dimension` is which behavior the feedback is about; `durability` momentary vs
+    # standing; `scope` "channel" (a channel-wide preference) vs "thread" (guidance for the
+    # current message only — a thread-scoped aside persists nothing now that the per-thread mute
+    # mechanism is gone); `guidance` the normalized preference text; `memory_op` the durable
+    # record to make on CHANNEL memory (add / update:<id> / delete:<id> / none) — it is no
+    # longer a thread-mute add/unmute verb; `structural_request` an explicit channel-settings
+    # change that the main model, not the engine, applies via the gated
+    # set_channel_participation tool.
+    dimension: Optional[str] = None
+    durability: Optional[str] = None
+    scope: Optional[str] = None
+    guidance: str = ""
+    memory_op: str = "none"
+    structural_request: str = "none"
     # F38: the `ack` bit is GONE. The classifier used to predict "this reply implies real
     # work" and the gate dropped a 👀 on the strength of that guess — before the model had
     # done anything, and often wrongly (it acked a passing comment). The 👀 is now staked by
@@ -358,12 +407,33 @@ class ParticipationEngine:
     # ------------------------------------------------------------- validate
 
     @staticmethod
+    def _coerce_emoji(raw: dict, force_allowlist: bool) -> Optional[str]:
+        """Resolve the verdict's emoji. F20: by default any syntactically valid standard emoji
+        name is accepted; a REACTION_EMOJIS allowlist, when set, constrains the choice. For a
+        REACT verdict (force_allowlist=True) an off-list/garbage name falls back to the first
+        allowlisted emoji (the old wake gate's choice), and None means "downgrade to ignore".
+        For a backoff ACK (force_allowlist=False) an off-list/garbage/empty name means simply
+        no ack — a reaction is never forced onto the sender who just asked for restraint."""
+        allow = [e.strip().strip(":") for e in (getattr(config, "reaction_emojis", None) or [])
+                 if e and e.strip().strip(":")]
+        emoji = str(raw.get("emoji") or "").strip().strip(":")
+        if allow:
+            if emoji in allow:
+                return emoji
+            return allow[0] if force_allowlist else None
+        return emoji if valid_emoji_name(emoji) else None
+
+    @staticmethod
     def validate_verdict(raw: Any) -> ParticipationVerdict:
         """Coerce a raw model dict into a safe verdict. Anything malformed →
         ignore. F20: by default any syntactically valid standard emoji name is
         accepted (a garbage name downgrades the react to ignore); when a
         REACTION_EMOJIS allowlist is set, an off-list emoji falls back to the
-        first allowlisted emoji (the choice the old wake gate made)."""
+        first allowlisted emoji (the choice the old wake gate made).
+
+        A `backoff` verdict additionally carries the participation-feedback taxonomy
+        (dimension/durability/scope/guidance/memory_op/structural_request); each field is
+        parsed defensively and defaults so the caller never has to guard for absence."""
         if not isinstance(raw, dict):
             return ParticipationVerdict(action="ignore", reason="malformed-verdict")
         action = str(raw.get("action") or "").strip().lower()
@@ -371,19 +441,27 @@ class ParticipationEngine:
             return ParticipationVerdict(action="ignore", reason="invalid-action")
         emoji = None
         if action == "react":
-            allow = [e.strip().strip(":") for e in (getattr(config, "reaction_emojis", None) or []) if e and e.strip().strip(":")]
-            emoji = str(raw.get("emoji") or "").strip().strip(":")
-            if allow:
-                if emoji not in allow:
-                    emoji = allow[0]
-            elif not valid_emoji_name(emoji):
+            emoji = ParticipationEngine._coerce_emoji(raw, force_allowlist=True)
+            if emoji is None:
                 return ParticipationVerdict(action="ignore", reason="react-no-valid-emoji")
+        elif action == "backoff":
+            # An OPTIONAL ack emoji; absent/garbage simply means no ack.
+            emoji = ParticipationEngine._coerce_emoji(raw, force_allowlist=False)
         placement = str(raw.get("placement") or "thread").strip().lower()
         if placement not in VALID_PLACEMENTS:
             placement = "thread"
         # F38: an `ack` key from a stale prompt (or a model that remembers the old contract)
         # is simply ignored — the field is gone from the verdict.
-        return ParticipationVerdict(
+        verdict = ParticipationVerdict(
             action=action, emoji=emoji, placement=placement,
             reason=str(raw.get("reason") or "")[:300],
         )
+        if action == "backoff":
+            verdict.dimension = _coerce_enum(raw.get("dimension"), VALID_DIMENSIONS)
+            verdict.durability = _coerce_enum(raw.get("durability"), VALID_DURABILITIES)
+            verdict.scope = _coerce_enum(raw.get("scope"), VALID_SCOPES)
+            verdict.guidance = str(raw.get("guidance") or "").strip()[:300]
+            verdict.memory_op = _coerce_memory_op(raw.get("memory_op"))
+            structural = str(raw.get("structural_request") or "none").strip().lower()
+            verdict.structural_request = structural if structural in VALID_STRUCTURAL else "none"
+        return verdict

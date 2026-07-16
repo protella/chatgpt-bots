@@ -1042,10 +1042,12 @@ feedback becomes a standing channel-memory rule, and nothing quietly expires.
 
 **Design:**
 1. **Backoff verdict → thread mute + memory fact (replaces the timer).** On backoff:
-   (a) permanently mute THAT thread for unprompted participation — persisted (e.g.
-   `muted_threads` list on channel_settings JSON), enforced as a cheap pre-gate check;
-   direct @-mentions/name-summons in the muted thread still answer (user can always
-   re-invite). (b) Write/update a channel-memory fact via the existing memory system
+   (a) ~~permanently mute THAT thread for unprompted participation~~ **SUPERSEDED (memories→textarea
+   redesign): the per-thread mute mechanism was removed entirely — no `muted_threads` write, no
+   `channel_thread_mutes` row, no pre-gate drop.** A thread-scoped "stop replying here" is now
+   guidance honored for the CURRENT message only and persists nothing; only a standing,
+   CHANNEL-scoped preference is durable (a per-channel channel-memory marker). Direct
+   @-mentions/name-summons always answer regardless. (b) Write/update a channel-memory fact via the existing memory system
    recording the feedback with an absolute date ("2026-07-11: <user> told the assistant
    to butt out of <topic/thread> — raise the bar for unprompted replies here"). The
    classifier already receives memory facts; PARTICIPATION_SYSTEM_PROMPT gains one line:
@@ -1054,19 +1056,25 @@ feedback becomes a standing channel-memory rule, and nothing quietly expires.
 2. **Remove the snooze timer rail:** `snoozed_until` no longer set by backoff; the
    is_snoozed hard-drop in the dispatch path is deleted (existing rows just expire
    inert; leave the column). The snooze ack reaction stays (acknowledge the feedback).
-3. **De-escalation is explicit:** "you can speak up again" etc. is ordinary memory-tool
-   territory — the model updates/forgets the fact (LOCAL_TOOLS_GUIDANCE already covers
-   standing-feedback updates); unmuting a thread happens by addressing the bot there.
+3. **De-escalation is explicit (participation-backoff redesign; per-thread mute later removed).**
+   The participation classifier emits a taxonomy on a `backoff` verdict. For CHANNEL-scoped
+   feedback a re-invitation ("you can react again" / "you can chime in more") is a
+   `memory_op: delete:<id>` — `main._apply_backoff` deletes the matching per-channel preference
+   marker. Thread-scoped feedback no longer persists anything, so there is nothing to reverse:
+   a later "you can jump back in here" simply reads as guidance for the current message. (The
+   original per-thread mute — and its `remove_thread_mute_async` unmute path and settings-modal
+   clear button — were removed in the memories→textarea redesign; a name-hit/@-mention was never
+   gated by it anyway.)
 4. Config: `ENABLE_PARTICIPATION_ENGINE` still governs everything; no new flag — this
    replaces behavior behind the same feature. `PARTICIPATION_SNOOZE_HOURS` and the
    modal/settings surface that exposes snooze (settings_modal.py, event_handlers/
    settings.py — check) are removed/marked deprecated in .env.example.
 
-**Tests:** backoff mutes the thread (unprompted drop pre-gate) but @-mention/name-hit
-in that thread still answers; mute persists across restart (DB-backed); memory fact
-written with absolute date, updated not duplicated on repeat; classifier prompt line
-present; snoozed_until no longer written and no longer dropped on; ack emoji still
-fires; de-escalation: forgetting the fact restores normal judgment.
+**Tests:** a thread-scoped backoff persists nothing (no mute, no pre-gate drop) and the next
+message is still judged normally; a standing CHANNEL-scope preference is recorded as a
+channel-memory marker, updated not duplicated on repeat; classifier prompt line present;
+snoozed_until no longer written and no longer dropped on; ack emoji still fires;
+de-escalation: forgetting the channel preference restores normal judgment.
 
 ## F16. MCP digest summarization instead of blind truncation (user directive 2026-07-11)
 
@@ -1390,11 +1398,11 @@ the other one ("answers incoming in their threads").
    `channel_pulse.record_own_reply` so the rings stay truthful. No unprompted
    accounting (it runs inside an addressed/judged turn). Never raises — refusals
    return {"ok": False, ...}.
-3. Rails (cheap, semantic): target thread muted by the user (F15 muted_threads) →
-   refuse with "thread_muted_by_user" (the mute means "stop contributing there"; the
-   model relays that instead of violating it). Empty text / missing thread_ts →
-   refuse. Posting to the CURRENT thread → refuse with a hint to just reply normally
-   (prevents double-posting).
+3. Rails (cheap, semantic): ~~target thread muted by the user → refuse with
+   "thread_muted_by_user"~~ **REMOVED (memories→textarea redesign): the per-thread mute is
+   gone, so `post_to_thread` no longer does a mute lookup and never refuses on that ground.**
+   Empty text / missing thread_ts → refuse. Posting to the CURRENT thread → refuse with a hint
+   to just reply normally (prevents double-posting).
 4. Tool description teaches the Claude-Tag pattern: use when a reply belongs in a
    DIFFERENT conversation (user asked you to answer a message elsewhere, or you're
    closing a loop you were part of); acknowledge briefly in the current thread rather
@@ -1402,7 +1410,7 @@ the other one ("answers incoming in their threads").
 5. LOCAL_TOOLS_GUIDANCE: one short bullet on the same judgment.
 
 **Tests:** schema registered + required params; executor posts markdown-converted
-text to the target thread; muted-thread refusal; current-thread refusal; empty-text
+text to the target thread (no mute lookup); current-thread refusal; empty-text
 refusal; record_own_reply called with the target thread; used-tools provenance line
 includes post_to_thread; never-raises contract on Slack API failure.
 

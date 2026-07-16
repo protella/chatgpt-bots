@@ -7,7 +7,7 @@ import sys
 import signal
 import asyncio
 import argparse
-from typing import Optional
+from typing import Any, Dict, Optional
 from config import config
 from logger import log_session_start, log_session_end, main_logger
 from message_processor.base import MessageProcessor
@@ -227,7 +227,13 @@ class ChatBotV2:
                     main_logger.debug(f"Participation react failed: {e}")
                 return None
             if verdict.action == "backoff":
-                await self._apply_backoff(message, client)
+                # The taxonomy decides what "backoff" means: a durable per-channel preference,
+                # a real thread mute/unmute, a momentary aside (nothing persisted), or an
+                # explicit channel-settings change — the last one falls through to the response
+                # loop so the MAIN model applies it (with judgment) via set_channel_participation.
+                fall_through = await self._apply_backoff(message, client, verdict)
+                if fall_through:
+                    return verdict
                 return None
             if verdict.action == "respond":
                 # F38: the gate no longer acks. It used to drop a 👀 here on a respond+ack
@@ -244,72 +250,192 @@ class ChatBotV2:
             main_logger.warning(f"Participation gate error: {e}; staying silent")
             return None
 
-    async def _apply_backoff(self, message: Message, client: BaseClient):
-        """'Butt out' loop (F15): ack with an emoji (no more words), permanently MUTE
-        THIS THREAD for unprompted participation, and write/update a durable channel-memory
-        fact so the classifier raises the bar channel-wide. No timer — nothing expires; the
-        model forgets/updates the fact (and the mute lifts) when re-invited. @-mentions and
-        name-hit summons in the muted thread still answer."""
+    # ---- participation-feedback backoff taxonomy (redesign Layer 2) ----
+    # Default guidance text per dimension, used to write a readable preference memory when the
+    # classifier gives no `guidance` of its own.
+    _PREF_DEFAULT_GUIDANCE = {
+        "reactions": "react less often in this channel",
+        "replies": "reply more sparingly in this channel",
+        "verbosity": "keep replies short in this channel",
+        "thread_participation": "participate more sparingly in this channel",
+    }
+
+    async def _apply_backoff(self, message: Message, client: BaseClient, verdict) -> bool:
+        """Route a participation-feedback ('backoff') verdict through the redesign taxonomy.
+
+        Returns True when the message should fall through to the MAIN response loop — an
+        explicit channel-settings change the model applies with judgment via the gated
+        set_channel_participation tool. Returns False when the feedback was fully handled
+        here: a durable per-channel preference (memory), or a momentary/thread-scoped aside
+        that persists nothing.
+
+        Structural settings (participation level / placement) are NEVER written here. This
+        routine only ever touches per-channel preference MEMORY, so a "react less" can no
+        longer clobber a channel's response mode — the incident this redesign fixes. A
+        thread-scoped "stop replying here" is guidance for the current message only; it writes
+        nothing durable (there is no per-thread mute — that mechanism was removed)."""
         channel_id = message.channel_id
         react_ts = message.metadata.get("ts") or message.thread_id
-        thread_root = message.thread_id or react_ts
-        if hasattr(client, "react"):
-            try:
-                await client.react(channel_id, react_ts, config.snooze_ack_emoji)
-            except Exception as e:
-                main_logger.debug(f"Backoff ack react failed: {e}")
-        try:
-            newly = await self.processor.db.add_muted_thread_async(
-                channel_id, thread_root, updated_by="participation_engine")
+
+        # 1. Explicit structural request → the model owns it. Nothing durable is written here;
+        #    the taxonomy deliberately keeps settings changes in the response loop.
+        if verdict.structural_request and verdict.structural_request != "none":
             main_logger.info(
-                f"Participation backoff: muted thread {channel_id}:{thread_root} "
-                f"(newly={newly})")
-        except Exception as e:
-            main_logger.warning(f"Backoff thread-mute write failed: {e}")
-        try:
-            if getattr(config, "enable_channel_memory", True) and self.processor.db:
-                await self._record_backoff_memory(message, react_ts)
-        except Exception as e:
-            main_logger.debug(f"Backoff memory write failed: {e}")
+                f"Participation backoff: explicit structural request "
+                f"({verdict.structural_request}) in {channel_id} — routing to the response loop")
+            # BLOCKER #3: this is the classifier's SEMANTIC judgment that the current human
+            # message is an explicit structural request (it distinguishes addressed-to from
+            # talked-about, which the raw name regex cannot). Stamp the turn so the gated
+            # set_channel_participation tool is authorized in the response loop even without a
+            # literal <@bot> mention ("only reply when I tag you" carries no mention). The flag
+            # is one half of the authorization; the other half (human sender) is enforced in
+            # handlers.text where the tool context is built.
+            if isinstance(message.metadata, dict):
+                message.metadata["gate_authorized_structural"] = True
+            return True
 
-    async def _record_backoff_memory(self, message: Message, react_ts: str):
-        """Write or UPDATE (never duplicate) the channel-memory fact recording a butt-out.
+        standing = verdict.durability == "standing"
+        db = getattr(self.processor, "db", None)
 
-        One fact per thread — keyed by author=`participation_engine:<thread_root>` so a repeat
-        backoff on the same thread refreshes that row's date/text instead of piling up
-        duplicates, while butt-outs in DIFFERENT threads accrue as distinct facts (the
-        classifier reads REPEATED facts as observe-only)."""
-        import datetime
-        channel_id = message.channel_id
-        thread_root = message.thread_id or react_ts
-        try:
-            day = datetime.datetime.fromtimestamp(
-                float(react_ts), tz=datetime.timezone.utc).date().isoformat()
-        except (ValueError, TypeError, OSError):
-            day = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
-        who = (message.metadata.get("user_real_name")
-               or message.metadata.get("username") or "a teammate")
-        topic = self._backoff_topic(message.text)
-        content = (f"{day}: {who} told the assistant to butt out of {topic} — "
-                   f"raise the bar for unprompted replies in this channel.")
-        marker = f"participation_engine:{thread_root}"
-        existing = await self.processor.db.get_channel_memory_async(channel_id)
-        prior = next((f for f in (existing or []) if f.get("author") == marker), None)
-        if prior:
-            await self.processor.db.update_channel_memory_async(prior["id"], content)
+        # 2. The ONLY durable effect is a per-channel preference marker, and only for a
+        #    standing, CHANNEL-scoped verdict. A momentary "not now" persists nothing; a
+        #    thread-scoped "stop replying here" is guidance for this message alone — there is
+        #    no per-thread mute to write (the mute mechanism was removed, so a thread aside can
+        #    neither clobber channel settings nor leave a durable record). Any other/missing
+        #    scope also writes nothing.
+        if (standing and db is not None and verdict.scope == "channel"
+                and getattr(config, "enable_channel_memory", True)):
+            try:
+                await self._apply_pref_memory(channel_id, verdict)
+            except Exception as e:
+                main_logger.warning(f"Backoff durable write failed: {e}")
+
+        # 4. Conditional ack. Routed through the reservation/timeout path (like the gate's own
+        #    react) so a later main-model turn honestly sees the slot consumed. NEVER react when
+        #    the feedback is ABOUT reactions — acking "stop reacting" with a reaction is absurd.
+        if verdict.emoji and verdict.dimension != "reactions":
+            await self._backoff_ack(client, channel_id, react_ts, verdict.emoji)
+
+        return False
+
+    # Reserved author prefix for the engine's own per-dimension preference markers. The backoff
+    # memory CRUD may ONLY ever touch rows under this prefix — never a human's fact and never a
+    # workspace fact (both of which get_channel_memory_async also returns).
+    _PREF_MARKER_PREFIX = "participation_engine:pref:"
+
+    def _own_pref_row(self, fact: Dict[str, Any]) -> bool:
+        """True only for one of the engine's OWN channel-scope preference markers. Guards the
+        backoff CRUD so an `update:<id>`/`delete:<id>` verdict can never rewrite or delete a
+        workspace or human memory fact (redesign BLOCKER #4)."""
+        return (((fact.get("scope") or "channel") == "channel")
+                and str(fact.get("author") or "").startswith(self._PREF_MARKER_PREFIX))
+
+    def _is_own_dimension_pref(self, fact: Dict[str, Any], marker: str) -> bool:
+        """Stronger than `_own_pref_row`: True only for THIS dimension's own channel-scope marker
+        row (`author == marker`). SHOULD-FIX 1: an `update:<id>`/`delete:<id>` verdict names a
+        raw fact id, and `_own_pref_row` alone would accept ANY of the engine's markers — so a
+        `reactions` verdict could rewrite or delete the `verbosity` marker. Requiring the author
+        to equal the current dimension's marker refuses a cross-dimension id (it then falls back
+        to this dimension's own marker row)."""
+        return self._own_pref_row(fact) and str(fact.get("author") or "") == marker
+
+    async def _apply_pref_memory(self, channel_id: str, verdict) -> None:
+        """Record / refine / remove ONE per-channel, per-dimension participation preference.
+
+        Keyed by a stable marker author `participation_engine:pref:<dimension>` so a repeat
+        "react less" UPDATES the single marker row instead of accumulating duplicate facts —
+        the false "REPEATED = observe-only" escalation the redesign removes.
+
+        Scope discipline (BLOCKER #4): every write here is confined to the engine's OWN marker
+        rows. An `update:<id>`/`delete:<id>` that names a workspace or human fact is REFUSED and
+        falls back to the per-dimension marker path; it never rewrites or deletes someone else's
+        memory. The add/refresh path goes through the atomic upsert_channel_pref_memory helper
+        (SHOULD-FIX #8), which enforces one marker row per dimension, the MEMORY_MAX_ROWS cap,
+        and the marker author — with no read-all-then-insert race."""
+        db = self.processor.db
+        dimension = verdict.dimension or "replies"
+        marker = f"{self._PREF_MARKER_PREFIX}{dimension}"
+        op = verdict.memory_op
+        existing = await db.get_channel_memory_async(channel_id) or []
+
+        # Reversal: delete the recorded preference. An explicit [#id] is honored ONLY when it
+        # names one of our OWN markers; otherwise fall back to this dimension's marker row. A
+        # workspace/human id is never deleted.
+        if op.startswith("delete"):
+            target = None
+            if op.startswith("delete:"):
+                wanted = int(op.split(":", 1)[1])
+                cand = next((f for f in existing if f.get("id") == wanted), None)
+                # SHOULD-FIX 1: only THIS dimension's own marker — a cross-dimension id is refused.
+                if cand is not None and self._is_own_dimension_pref(cand, marker):
+                    target = cand
+            if target is None:
+                target = next(
+                    (f for f in existing if self._is_own_dimension_pref(f, marker)), None)
+            if target is not None:
+                await db.delete_channel_memory_async(target["id"])
+                main_logger.info(
+                    f"Participation reversal: removed preference [#{target['id']}] in {channel_id}")
+            return
+
+        content = self._pref_memory_content(verdict, dimension)
+
+        # Explicit update of a specific numbered fact — honored ONLY for our own marker rows.
+        # Updating in place keeps that row's marker author. A non-owned or stale id is refused and
+        # falls through to the atomic marker upsert (which (re)writes the per-dimension marker).
+        if op.startswith("update:"):
+            wanted = int(op.split(":", 1)[1])
+            row = next((f for f in existing if f.get("id") == wanted), None)
+            # SHOULD-FIX 1: only THIS dimension's own marker may be updated in place. A row owned
+            # by a DIFFERENT dimension (or a workspace/human fact) is refused and falls through to
+            # the marker upsert, so a verdict never corrupts another dimension's preference.
+            if row is not None and self._is_own_dimension_pref(row, marker):
+                await db.update_channel_memory_async(row["id"], content)
+                main_logger.info(f"Participation preference updated [#{row['id']}] in {channel_id}")
+                return
+            # non-owned / cross-dimension / stale id — fall through to the marker upsert
+
+        # add / refresh: exactly one preference row per dimension, written atomically with the
+        # marker author and the MEMORY_MAX_ROWS cap enforced inside the helper.
+        cap = max(1, getattr(config, "memory_max_rows", 25))
+        new_id = await db.upsert_channel_pref_memory(channel_id, marker, content, max_rows=cap)
+        if new_id is None:
+            main_logger.debug(
+                f"Participation preference at memory cap and no marker row in {channel_id} — "
+                "not adding (won't evict a human's memory)")
         else:
-            await self.processor.db.add_channel_memory_async(
-                channel_id, content, author=marker)
+            main_logger.info(
+                f"Participation preference recorded/refreshed [#{new_id}] ({dimension}) in {channel_id}")
 
-    @staticmethod
-    def _backoff_topic(text: Optional[str]) -> str:
-        """A short, single-line topic phrase for the butt-out memory fact, derived from the
-        triggering message. Collapses whitespace and truncates so the stored fact stays a
-        readable one-liner."""
-        cleaned = " ".join((text or "").split())
-        if not cleaned:
-            return "this conversation"
-        return (cleaned[:80] + "…") if len(cleaned) > 80 else cleaned
+    def _pref_memory_content(self, verdict, dimension: str) -> str:
+        """The stored preference sentence: the classifier's normalized guidance when present,
+        else a sensible per-dimension default, tagged with the dimension for readability."""
+        guidance = " ".join((verdict.guidance or "").split())
+        if not guidance:
+            guidance = self._PREF_DEFAULT_GUIDANCE.get(
+                dimension, "participate more sparingly in this channel")
+        elif len(guidance) > 200:
+            guidance = guidance[:200] + "…"
+        return f"Channel participation preference ({dimension}): {guidance}"
+
+    async def _backoff_ack(self, client: BaseClient, channel_id: str,
+                           react_ts: str, emoji: str) -> None:
+        """Drop the optional acknowledgment reaction, bounded and routed through the same
+        reservation guard the gate's own react uses (main.py gate react) so a later turn sees
+        the slot consumed and never double-adds."""
+        try:
+            if hasattr(client, "_reserve_and_react"):
+                await asyncio.wait_for(
+                    client._reserve_and_react(channel_id, react_ts, emoji),
+                    timeout=config.tool_call_timeout)
+            elif hasattr(client, "react"):
+                await asyncio.wait_for(
+                    client.react(channel_id, react_ts, emoji),
+                    timeout=config.tool_call_timeout)
+        except asyncio.TimeoutError:
+            main_logger.debug("Backoff ack react timed out")
+        except Exception as e:
+            main_logger.debug(f"Backoff ack react failed: {e}")
 
     @staticmethod
     def _produced_visible_output(response, turn) -> bool:
