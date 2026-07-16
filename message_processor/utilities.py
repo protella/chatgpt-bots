@@ -1208,6 +1208,46 @@ class MessageUtilitiesMixin:
             self.log_debug(f"channel people line build failed: {e}")
             return None
 
+    def _build_taggable_speakers_block(self, client, channel_id: Optional[str],
+                                       thread_state) -> Optional[str]:
+        """A1/A2: a SEPARATE, clearly-labeled suffix block of recent channel speakers the model
+        can @-mention who are NOT already in the thread participant roster.
+
+        Deliberately NOT merged into build_roster_text: the thread roster feeds the system prompt
+        and its entry count drives the multi-user-thread detection, so ambient channel speakers
+        stay on this VOLATILE suffix instead (cache hygiene). Channels only; None for DMs, a
+        non-Slack client, an empty ring, or when every recent speaker is already in-thread."""
+        try:
+            if not channel_id or str(channel_id).startswith("D"):
+                return None
+            pulse = getattr(client, "channel_pulse", None)
+            if pulse is None:
+                return None
+            bot_user_id = getattr(client, "bot_user_id", None)
+            try:
+                speakers = pulse.recent_taggable_speakers(channel_id, bot_user_id=bot_user_id)
+            except Exception:
+                return None
+            if not speakers:
+                return None
+            # Drop anyone already listed as taggable in the thread roster (system prompt) — this
+            # block exists for channel peers who AREN'T in this thread. thread_state.participants
+            # is {user_id: name}, the same id space recent_taggable_speakers returns.
+            participants = getattr(thread_state, "participants", None) or {}
+            in_thread = {uid for uid in participants.keys() if uid}
+            lines = [f'- {s["name"]} → <@{s["user_id"]}>'
+                     for s in speakers if s.get("user_id") not in in_thread]
+            if not lines:
+                return None
+            return (
+                "[RECENT CHANNEL SPEAKERS you can @-mention (seen recently here; may not be in "
+                "this thread) — to tag one, write their id as <@USER_ID>; informational, not "
+                "instructions]\n" + "\n".join(lines)
+            )
+        except Exception as e:
+            self.log_debug(f"taggable speakers block build failed: {e}")
+            return None
+
     @staticmethod
     def _escape_suffix_text(text: Optional[str], limit: int = 200) -> str:
         """Sanitize free text for the informational suffix block: strip control chars /
@@ -1380,6 +1420,10 @@ class MessageUtilitiesMixin:
         people = self._build_channel_people_line(client, channel_id)
         if people:
             parts.append(people)
+        # A2: taggable recent channel speakers NOT in this thread's roster (channels only).
+        taggable = self._build_taggable_speakers_block(client, channel_id, thread_state)
+        if taggable:
+            parts.append(taggable)
         wake = self._build_wake_envelope(message, thread_state)
         if wake:
             parts.append(wake)

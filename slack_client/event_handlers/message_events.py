@@ -464,6 +464,16 @@ class SlackMessageEventsMixin:
                     return
             if cs and cs.get("directives"):
                 message.metadata["channel_directives"] = cs["directives"]
+            # B1: the mention path must resolve placement too, or main.py place_in_channel
+            # is always False and every @mention reply threads. Mirror the channel-dispatch
+            # path (~392): a row's EXPLICIT True/False wins; None/absent falls back to the
+            # global default. A mention carries no engine verdict, so a truthy setting on a
+            # top-level trigger yields a top-level reply (the user summoned us at channel level).
+            reply_in_channel = (cs or {}).get("reply_in_channel")
+            if reply_in_channel is None:
+                reply_in_channel = config.reply_in_channel_default
+            if reply_in_channel:
+                message.metadata["reply_in_channel"] = True
         if sender_type == "other_bot":
             if self.message_handler:
                 await self.message_handler(message, self)

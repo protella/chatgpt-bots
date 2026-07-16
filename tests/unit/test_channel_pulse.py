@@ -5,6 +5,8 @@ rendering with current-thread exclusion, suffix (not system prompt) placement,
 participation stats, feed-before-gates wiring, and flag gating.
 """
 
+import time
+
 import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -409,3 +411,85 @@ def test_record_without_files_leaves_text_untouched():
     p = ChannelPulse(size=10)
     p.record("C1", **_entry("100.0", text="just talking"))
     assert "[+" not in p.render_envelope("C1")
+
+
+# ------------------------------------------- recent_taggable_speakers (A1)
+# Unlike _entry (user_id pinned to "U1"), these tests need distinct ids AND fresh ts:
+# recent_taggable_speakers returns {user_id, name} and applies a 24h age horizon
+# (now - float(ts)), so ancient ts like "1.0" would all age out.
+
+def _trec(p, ts, uid, *, name=None, sender="human", is_bot=False, channel="C1"):
+    p.record(channel, ts=ts, thread_ts=None, user_id=uid, display_name=name,
+             sender_type=sender, text="hi", is_bot=is_bot)
+
+
+def _fresh(delta=10.0):
+    """A ts `delta` seconds in the past — inside the default 24h horizon."""
+    return f"{time.time() - delta:.6f}"
+
+
+def test_taggable_newest_first_dedup_id_and_name():
+    p = ChannelPulse(size=20)
+    _trec(p, _fresh(50), "UA", name="Alice")
+    _trec(p, _fresh(40), "UB", name="Bob")
+    _trec(p, _fresh(10), "UA", name="Alice New")   # newest instance per uid wins
+    out = p.recent_taggable_speakers("C1", bot_user_id="UBOT")
+    assert out == [{"user_id": "UA", "name": "Alice New"},
+                   {"user_id": "UB", "name": "Bob"}]
+
+
+def test_taggable_excludes_bot_self_sentinels_keeps_other_bots():
+    p = ChannelPulse(size=20)
+    _trec(p, _fresh(60), "UBOT", name="ChatGPT")             # the bot itself (by id) — excluded
+    _trec(p, _fresh(55), "UME", name="Me", sender="self")    # bot's own turn (self) — excluded
+    _trec(p, _fresh(50), None, name=None)                    # no real user_id — excluded
+    _trec(p, _fresh(45), "bot", name="Botish")               # sentinel id — excluded
+    _trec(p, _fresh(40), "unknown", name="Ghost")            # sentinel id — excluded
+    _trec(p, _fresh(35), "UCLAUDE", name="Claude", sender="other_bot", is_bot=True)  # peer KEPT
+    _trec(p, _fresh(30), "UH", name="Human")                 # ordinary human KEPT
+    out = p.recent_taggable_speakers("C1", bot_user_id="UBOT")
+    assert out == [{"user_id": "UH", "name": "Human"},          # newest-first
+                   {"user_id": "UCLAUDE", "name": "Claude"}]
+
+
+def test_taggable_dm_and_unknown_channel_empty():
+    p = ChannelPulse(size=20)
+    assert p.recent_taggable_speakers("D123") == []    # DM rejected
+    assert p.recent_taggable_speakers("C-none") == []  # unknown channel → empty ring
+    _trec(p, _fresh(10), "UA", name="Alice", channel="D123")  # DMs are never recorded anyway
+    assert p.recent_taggable_speakers("D123") == []
+
+
+def test_taggable_age_horizon_drops_stale_and_unparseable():
+    p = ChannelPulse(size=20)
+    _trec(p, _fresh(10), "UFRESH", name="Fresh")
+    _trec(p, f"{time.time() - 200000:.6f}", "USTALE", name="Stale")  # > 24h old
+    _trec(p, "not-a-ts", "UBAD", name="Bad")                          # unparseable → skipped
+    assert p.recent_taggable_speakers("C1") == [{"user_id": "UFRESH", "name": "Fresh"}]
+    # A wider horizon lets the aged one back in; the unparseable ts still can't prove freshness.
+    wide = p.recent_taggable_speakers("C1", max_age_seconds=300000)
+    assert {d["user_id"] for d in wide} == {"UFRESH", "USTALE"}
+
+
+def test_taggable_respects_limit():
+    p = ChannelPulse(size=30)
+    for i in range(6):
+        _trec(p, _fresh(60 - i), f"U{i}", name=f"User{i}")   # U0 oldest … U5 newest
+    out = p.recent_taggable_speakers("C1", limit=2)
+    assert [d["user_id"] for d in out] == ["U5", "U4"]
+
+
+def test_taggable_name_sanitized_and_capped():
+    p = ChannelPulse(size=20)
+    _trec(p, _fresh(20), "UA", name="Claude [bot]")   # brackets folded (no frame spoofing)
+    _trec(p, _fresh(10), "UB", name="Z" * 200)        # length-capped
+    by_id = {d["user_id"]: d["name"] for d in p.recent_taggable_speakers("C1")}
+    assert by_id["UA"] == "Claude (bot)"
+    assert len(by_id["UB"]) == 80
+
+
+def test_taggable_never_raises_on_bad_state():
+    # A malformed buffer must degrade to [] rather than propagate (never raises contract).
+    p = ChannelPulse(size=5)
+    p._buffers["C1"] = "not-a-deque"
+    assert p.recent_taggable_speakers("C1") == []

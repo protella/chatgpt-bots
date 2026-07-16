@@ -196,6 +196,88 @@ class NativeStreamSession:
             return False
 
 
+class WorkspaceEmojiCache:
+    """Process-lifetime cache of the workspace's CUSTOM emoji shorthand names (emoji.list).
+
+    Reachable from BOTH the react_to_message tool-schema factory and the participation gate
+    via ``client.workspace_emojis``. Holds a sorted/deduped tuple of names plus a monotonic
+    expiry; ``refresh()`` is the only thing that hits Slack, and ``get_custom_emoji_names()``
+    is a sync, stale-tolerant getter that schedules a background refresh when expired but
+    never blocks a request.
+
+    Fail-soft everywhere: any error (including the emoji:read scope being absent — which is
+    also the de-facto off switch) RETAINS the last good tuple; an empty tuple only ever means
+    we have never had a successful fetch. The model then simply sees no customs, and no turn
+    fails on account of emoji.list.
+    """
+
+    def __init__(self, client):
+        self._client = client
+        self._names: tuple = ()
+        self._expiry: float = 0.0        # monotonic deadline; 0 = never fetched
+        self._lock = asyncio.Lock()
+        self._refreshing: bool = False   # guards against scheduling overlapping refreshes
+        self._refresh_task = None        # ref to the scheduled task (GC + lifecycle guard)
+
+    def _log_debug(self, msg: str) -> None:
+        log = getattr(self._client, "log_debug", None)
+        if log:
+            log(msg)
+
+    async def refresh(self) -> tuple:
+        """Fetch emoji.list and rebuild the name tuple.
+
+        Parses resp["emoji"] KEYS (both real customs and ``alias:*`` entries — the KEY is the
+        alias NAME reactions.add accepts, so aliases are kept), filters each through
+        ``valid_emoji_name``, then sorts + dedupes. On ANY error the last good tuple is kept
+        (empty only if never fetched). The TTL is reset either way, so a persistent failure
+        (e.g. missing emoji:read) backs off instead of hammering the API on every getter call.
+        """
+        async with self._lock:
+            try:
+                resp = await self._client.app.client.emoji_list()
+                emoji = (resp or {}).get("emoji") or {}
+                names = {
+                    name for name in ((k or "").strip().strip(":") for k in emoji.keys())
+                    if valid_emoji_name(name)
+                }
+                self._names = tuple(sorted(names))
+            except Exception as e:  # noqa: BLE001 — never fatal; keep the last good tuple
+                self._log_debug(f"workspace emoji refresh failed, keeping last good: {e}")
+            finally:
+                self._expiry = time.monotonic() + max(
+                    1.0, float(getattr(config, "workspace_emoji_ttl_seconds", 3600)))
+            return self._names
+
+    def get_custom_emoji_names(self) -> tuple:
+        """Sync, stale-ok. Returns the current tuple immediately; if it has expired AND no
+        refresh is already running, schedules a background refresh (fire-and-forget). Never
+        awaits, never raises — a request path can call this freely."""
+        if time.monotonic() >= self._expiry and not self._refreshing:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return self._names  # no running loop — just return what we have
+            self._refreshing = True  # set synchronously so a burst schedules exactly one refresh
+            try:
+                task = loop.create_task(self.refresh())
+                self._refresh_task = task  # keep a ref so the task isn't GC'd mid-flight
+                # Own the guard's lifecycle HERE, not in refresh()'s finally: the callback fires on
+                # completion, error, AND cancellation, so a task cancelled before refresh() runs can't
+                # wedge _refreshing=True and block every future refresh. And since only this getter
+                # sets the flag True (once, under the guard), there is no premature-clear race.
+                task.add_done_callback(self._on_refresh_done)
+            except Exception as e:  # noqa: BLE001
+                self._refreshing = False
+                self._log_debug(f"workspace emoji background refresh not scheduled: {e}")
+        return self._names
+
+    def _on_refresh_done(self, task) -> None:
+        """Clear the refresh guard once the scheduled task settles (success, error, or cancel)."""
+        self._refreshing = False
+        self._refresh_task = None
+
+
 class SlackMessagingMixin:
     async def start(self):
         """Start the Slack bot"""
@@ -223,6 +305,16 @@ class SlackMessagingMixin:
 
         # Resolve our own identity up front so we can tell our messages apart from other bots'
         await self._ensure_self_identity()
+
+        # C1: warm the workspace custom-emoji cache once, now that identity is set. Fail-soft —
+        # a missing emoji:read scope (or any API error) just leaves the cache empty and the
+        # model sees no customs; the getter refreshes it lazily thereafter.
+        cache = getattr(self, "workspace_emojis", None)
+        if cache is not None:
+            try:
+                await cache.refresh()
+            except Exception as e:  # noqa: BLE001 — startup must never break on emoji.list
+                self.log_debug(f"initial workspace emoji refresh failed: {e}")
 
         # Create a task for start_async that can be cancelled
         self._start_task = asyncio.create_task(self.handler.start_async())
@@ -1069,16 +1161,52 @@ class SlackMessagingMixin:
 
     # --- react_to_message local tool (redesign Phase D) ---
 
-    def get_react_tool_schema(self) -> dict:
-        """Function-tool schema for model-invoked reactions. By default the model may pick
-        ANY standard Slack emoji shorthand name — choosing the right one IS the judgment.
-        If REACTION_EMOJIS is configured, it constrains the choice to that allowlist via an
-        enum (brand control)."""
+    # ~600-char budget for the custom-emoji list injected into a schema/classifier description,
+    # so surfacing customs never bloats every main-model request.
+    _CUSTOM_EMOJI_CHAR_BUDGET = 600
+
+    def _budgeted_custom_emoji_names(self, count_cap: int) -> list:
+        """A deterministic, budgeted slice of the workspace custom-emoji names for a schema
+        description: at most ``count_cap`` names AND within the ~600-char budget. Reads the
+        sync, stale-ok cache getter; returns [] when there are no customs (or no cache)."""
+        cache = getattr(self, "workspace_emojis", None)
+        if cache is None:
+            return []
+        try:
+            names = cache.get_custom_emoji_names()
+        except Exception:  # noqa: BLE001 — a schema build must never fail the turn
+            return []
+        cap = max(0, int(count_cap or 0))
+        capped = names[:cap]  # hard max: 0 → none, never "unlimited"
+        out, used = [], 0
+        for name in capped:
+            cost = len(name) + 2  # +2 approximates the ", " separator between names
+            if out and used + cost > self._CUSTOM_EMOJI_CHAR_BUDGET:
+                break
+            out.append(name)
+            used += cost
+        return out
+
+    def get_react_tool_schema(self, cfg: Optional[dict] = None) -> dict:
+        """Registry FACTORY (called per request as ``schema(cfg)``) for the react_to_message
+        tool. By default the model may pick ANY standard Slack emoji shorthand name — choosing
+        the right one IS the judgment. If REACTION_EMOJIS is configured, it constrains the
+        choice to that allowlist via an enum (brand control), and customs are NOT injected. When
+        no allowlist is set, the workspace's custom emoji are surfaced as EXTRA named choices in
+        the field DESCRIPTION (never an enum — an enum would forbid every standard emoji)."""
         allowed = [e.strip().strip(":") for e in (config.reaction_emojis or []) if e and e.strip().strip(":")]
         emoji_schema = {"type": "string",
                         "description": "Any standard Slack emoji shorthand name (no colons), e.g. joy, tada, fire."}
         if allowed:
             emoji_schema["enum"] = allowed
+        else:
+            customs = self._budgeted_custom_emoji_names(
+                getattr(config, "react_tool_custom_emoji_cap", 64))
+            if customs:
+                emoji_schema["description"] += (
+                    " This workspace also has custom emoji you may use when one fits, e.g.: "
+                    + ", ".join(customs) + "."
+                )
         return {
             "type": "function",
             "name": "react_to_message",

@@ -566,6 +566,77 @@ class ChannelPulse:
         except Exception:
             return []
 
+    def recent_taggable_speakers(self, channel_id: str, *, bot_user_id: Optional[str] = None,
+                                 limit: int = 12,
+                                 max_age_seconds: float = 86400) -> List[Dict[str, Any]]:
+        """A1: recent channel speakers WITH a real user_id — newest-first, deduped — that the
+        model can turn into an <@id> mention. This is the taggable handle for a channel peer who
+        ISN'T in the current thread's participant roster.
+
+        Distinct from recent_speakers() (names only, for the 'Channel people' line) and from
+        build_roster_text (thread participants, system prompt): merging ambient speakers into the
+        thread roster would corrupt its multi-user-thread detection and bust the prefix cache, so
+        this stays a separate, suffix-only surface. Excludes entries with no real id, the
+        sentinels 'bot'/'unknown', the bot itself (bot_user_id or sender_type 'self'); KEEPS other
+        bots that have a real id — peer agents must be taggable. Skips entries older than
+        max_age_seconds (entry 'ts' as an epoch float; unparseable → skipped).
+
+        Returns [{"user_id":..., "name":...}], most-recent-first, capped to `limit`. Pure
+        in-memory, zero-await, never raises; [] for a DM or unknown channel."""
+        try:
+            if self._is_dm(channel_id):
+                return []
+            buf = self._buffers.get(channel_id)
+            if not buf:
+                return []
+            try:
+                horizon = float(max_age_seconds)
+            except (TypeError, ValueError):
+                horizon = 86400.0
+            now = time.time()
+            cap = max(0, int(limit))  # 0 → none (honored below), never silently bumped to 1
+            # Order by message ts, NOT buffer insertion order: a late-delivered older event can be
+            # appended after a newer one, so reversed(buf) is not reliably newest-first. Parse each
+            # entry's ts, drop what we can't place or that falls outside the horizon, then sort
+            # newest-first so dedup keeps the MOST-RECENT entry per user.
+            candidates: List[tuple] = []
+            for e in buf:
+                uid = e.get("user_id")
+                if not uid or uid in ("bot", "unknown"):
+                    continue
+                if bot_user_id and uid == bot_user_id:
+                    continue
+                if e.get("sender_type") == "self":
+                    continue
+                # A Slack ts ('SSSSSSSSSS.MMMMMM') and a synthetic wall-clock ts are both epoch
+                # seconds, so float(ts) covers both. Can't parse → can't prove freshness or order.
+                try:
+                    ets = float(e.get("ts"))
+                    if ets != ets or ets in (float("inf"), float("-inf")):
+                        raise ValueError  # nan/inf are not real timestamps: they dodge the horizon
+                except (TypeError, ValueError):                       # and poison the sort — reject them
+                    if horizon > 0:
+                        continue
+                    ets = float("-inf")  # unorderable, but allowed (sorts last) when there is no horizon
+                if horizon > 0 and now - ets > horizon:
+                    continue
+                candidates.append((ets, e))
+            candidates.sort(key=lambda c: c[0], reverse=True)  # newest-first
+            seen: set = set()
+            out: List[Dict[str, Any]] = []
+            for _ets, e in candidates:
+                if len(out) >= cap:  # checked BEFORE append so cap=0 → [] (not one)
+                    break
+                uid = e.get("user_id")
+                if uid in seen:
+                    continue
+                seen.add(uid)
+                out.append({"user_id": uid,
+                            "name": _sanitize_name(e.get("display_name") or uid)[:80]})
+            return out
+        except Exception:
+            return []
+
     # -------------------------------------------------------------- envelope
 
     def render_envelope(self, channel_id: str, exclude_thread_ts: Optional[str] = None,

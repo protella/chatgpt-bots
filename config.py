@@ -427,6 +427,17 @@ class BotConfig:
     # F6: max distinct emoji the bot may place on a single message. Guards against
     # over-reaction while still letting a user who asks for several get several.
     reaction_max_per_message: int = field(default_factory=lambda: int(os.getenv("REACTION_MAX_PER_MESSAGE", "4")))
+    # C1/C6: workspace CUSTOM-emoji surfacing. The bot fetches emoji.list once at startup and
+    # refreshes lazily; the names become extra choices for the classifier and the react tool
+    # (only when REACTION_EMOJIS is empty — a set allowlist is the exact hard constraint and
+    # customs are never injected over it). No explicit off-switch: absent the emoji:read scope
+    # the fetch fails soft and the name set simply stays empty.
+    workspace_emoji_ttl_seconds: int = field(default_factory=lambda: int(os.getenv("WORKSPACE_EMOJI_TTL_SECONDS", "3600")))
+    # Deterministic sorted cap of custom names fed to the participation classifier as signals.
+    participation_custom_emoji_cap: int = field(default_factory=lambda: int(os.getenv("PARTICIPATION_CUSTOM_EMOJI_CAP", "32")))
+    # Cap of custom names listed in the react_to_message tool-schema description (also budgeted
+    # by a per-request char budget so surfacing customs never bloats every main-model request).
+    react_tool_custom_emoji_cap: int = field(default_factory=lambda: int(os.getenv("REACT_TOOL_CUSTOM_EMOJI_CAP", "64")))
 
     # --- Outbound self-prefix hygiene (Phase 3.4) ---
     # Leading "Name:" prefixes to strip from the model's reply so it never answers as "ChatGPT: …"
