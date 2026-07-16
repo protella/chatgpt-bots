@@ -47,14 +47,11 @@ class TestChannelSettingsModal:
         assert json.loads(view["private_metadata"])["channel_id"] == "C1"
         assert self._block(view, "participation_block")["element"]["initial_option"]["value"] == "inherit"
         assert self._block(view, "directives_block")["element"]["initial_value"] == ""
-        # No saved row → checkbox mirrors the global default (REPLY_IN_CHANNEL_DEFAULT,
-        # default true: top-level replies allowed, engine judges placement per message)
+        # No saved row → reply placement is the tri-state "inherit" option (NOT resolved to the
+        # global default), so opening + saving untouched can never freeze that default into a row.
         element = self._block(view, "reply_in_channel_block")["element"]
-        from config import config as _cfg
-        if _cfg.reply_in_channel_default:
-            assert element.get("initial_options")
-        else:
-            assert "initial_options" not in element
+        assert element["type"] == "static_select"
+        assert element["initial_option"]["value"] == "inherit"
 
     def test_prefill_from_row(self, modal):
         # Legacy row (response_mode only) maps to its participation-level equivalent.
@@ -62,7 +59,8 @@ class TestChannelSettingsModal:
         view = modal.build_channel_settings_modal("C2", cs, "tag_only")
         assert self._block(view, "participation_block")["element"]["initial_option"]["value"] == "judicious"
         assert self._block(view, "directives_block")["element"]["initial_value"] == "only deploys"
-        assert self._block(view, "reply_in_channel_block")["element"].get("initial_options")
+        # reply_in_channel True → "channel"; False → "threads"; None → "inherit".
+        assert self._block(view, "reply_in_channel_block")["element"]["initial_option"]["value"] == "channel"
 
     def test_null_mode_treated_as_inherit(self, modal):
         view = modal.build_channel_settings_modal("C3", {"response_mode": None}, "off")

@@ -495,10 +495,14 @@ class BotConfig:
     # F17: the hourly-cap hard rail is gone. Unprompted replies are still counted and fed to
     # the classifier as a signal, but pacing is the model's judgment, not a numeric ceiling —
     # MAX_UNPROMPTED_REPLIES_PER_HOUR is retired (frontier models don't run away unless asked).
-    # F15: "butt out" backoff no longer snoozes on a timer — it permanently mutes THAT
-    # thread (channel_settings.muted_threads) and writes a durable channel-memory fact.
-    # PARTICIPATION_SNOOZE_HOURS is retired. The ack emoji stays — a backoff still gets a
-    # wordless acknowledgement reaction.
+    # Participation-backoff redesign: a "backoff" verdict is no longer one blunt action. The
+    # taxonomy routes each case — a standing per-CHANNEL preference is a channel-memory marker;
+    # a thread-scoped "stop replying here" is guidance for the current message only and persists
+    # NOTHING (the per-thread mute table was removed); a momentary "not now" likewise persists
+    # nothing; and an explicit channel-settings change goes through the gated
+    # set_channel_participation tool. The acknowledgement reaction is CONDITIONAL now (driven by
+    # the classifier, and never emitted when the feedback is about reactions), not an always-on
+    # emoji. SNOOZE_ACK_EMOJI is a retained legacy default; the engine picks the ack per verdict.
     snooze_ack_emoji: str = field(default_factory=lambda: os.getenv("SNOOZE_ACK_EMOJI", "zipper_mouth_face").strip().strip(":"))
 
     # F19: "I'm looking at it" acknowledgment reaction. When a reply will take real work

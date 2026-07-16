@@ -22,6 +22,7 @@ from .search_tool import SlackSearchToolMixin
 from .channel_pulse import ChannelPulse
 from tool_registry import ToolRegistry
 from message_processor.memory_tools import register_memory_tools
+from message_processor.participation_tools import register_participation_tools
 from message_processor.document_tools import register_document_tools
 from message_processor.image_tools import register_image_tools
 from message_processor.file_mount import register_file_mount_tools
@@ -106,6 +107,11 @@ class SlackBot(SlackMessageEventsMixin,
             registry.register(self.get_search_tool_schema(), self.execute_search_tool)
         if config.enable_channel_memory:
             register_memory_tools(registry)  # channel-only; executors refuse DMs
+        # Decision #4: the gated set_channel_participation tool — the ONLY path that writes
+        # structural participation/placement settings, and only on an explicit instruction.
+        # Channel-only (executor refuses DMs), same as the memory tools.
+        if config.enable_participation_engine:
+            register_participation_tools(registry)
         if config.enable_read_document_tool:
             register_document_tools(registry)  # summary+ref rows; content re-derived in memory
         if config.enable_people_tools:

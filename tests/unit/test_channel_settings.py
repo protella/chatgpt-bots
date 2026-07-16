@@ -65,7 +65,9 @@ class TestChannelSettingsDB:
         row = await temp_db.get_channel_settings_async("C3")
         assert row["response_mode"] == "off"
         assert row["directives"] == "stay quiet"
-        assert row["reply_in_channel"] is False
+        # reply_in_channel was never set → NULL → None (inherit from the global default), no longer
+        # collapsed to False. See the participation redesign (Layer 0) NULL-inheritance fix.
+        assert row["reply_in_channel"] is None
 
     async def test_async_get_unset_none(self, temp_db):
         assert await temp_db.get_channel_settings_async("C_MISSING") is None

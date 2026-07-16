@@ -1,7 +1,7 @@
 """Phase F — ParticipationEngine: verdict validation, level/mode mapping, debounce,
-uncapped participation (F17: no hourly-cap rail), backoff thread-mute + memory writes
-(F15), placement wiring, modal dual-write, DB columns/migration, and the busy-rejection
-needs_refresh fix.
+uncapped participation (F17: no hourly-cap rail), backoff pref-memory writes (thread-scope
+now persists nothing; the mute mechanism was removed), placement wiring, modal dual-write,
+DB columns/migration, and the busy-rejection needs_refresh fix.
 
 All stubbed I/O — no live bot, no legacy suite.
 """
@@ -399,7 +399,9 @@ def _make_app(verdict, pulse=None, engine_enabled=True, monkeypatch=None):
     app.processor.db.set_channel_settings_async = AsyncMock()
     app.processor.db.add_channel_memory_async = AsyncMock()
     app.processor.db.update_channel_memory_async = AsyncMock()
-    app.processor.db.add_muted_thread_async = AsyncMock(return_value=True)
+    app.processor.db.delete_channel_memory_async = AsyncMock()
+    # Redesign SHOULD-FIX #8: the pref add/refresh path routes through the atomic marker upsert.
+    app.processor.db.upsert_channel_pref_memory = AsyncMock(return_value=7)
     client = MagicMock()
     client.channel_pulse = pulse
     client.react = AsyncMock()
@@ -518,42 +520,44 @@ class TestGateWiring:
         client._reserve_and_react.assert_awaited_once_with("C1", "10.0", "eyes")
 
     @pytest.mark.asyncio
-    async def test_backoff_mutes_thread_reacts_and_writes_memory(self, monkeypatch):
-        # F15: backoff acks with the emoji, MUTES THE THREAD (not a channel-wide timer),
-        # and writes a dated butt-out memory fact. snoozed_until is never written.
+    async def test_backoff_thread_exit_persists_nothing_via_gate(self, monkeypatch):
+        # Redesign: an explicit "stay out of THIS thread" (standing, thread-scoped) backoff routes
+        # through the gate into _apply_backoff. The per-thread mute mechanism was removed, so it is
+        # guidance for the current message only — it writes NOTHING durable (no structural
+        # channel_settings — the clobber this redesign fixes — no channel memory, no marker upsert).
+        # The gate stays silent (returns None).
         monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
         monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        monkeypatch.setattr(config, "snooze_ack_emoji", "zipper_mouth_face", raising=False)
         monkeypatch.setattr(config, "enable_channel_memory", True, raising=False)
-        app, client, _ = _make_app({"action": "backoff"})
+        app, client, _ = _make_app({
+            "action": "backoff", "durability": "standing", "scope": "thread",
+            "dimension": "thread_participation", "guidance": "stay out of this thread",
+            "memory_op": "add"})
         assert await app._run_participation_gate(_channel_msg(), client) is None
-        client.react.assert_awaited_once_with("C1", "10.0", "zipper_mouth_face")
-        # thread muted (DB-backed), keyed by the thread root ts
-        mute_call = app.processor.db.add_muted_thread_async.await_args
-        assert mute_call.args[0] == "C1" and mute_call.args[1] == "10.0"
-        # no snooze timer written
         app.processor.db.set_channel_settings_async.assert_not_awaited()
-        # dated butt-out fact, authored with the thread marker (for dedup on repeat)
-        mem_call = app.processor.db.add_channel_memory_async.await_args
-        assert "butt out" in mem_call.args[1]
-        assert "raise the bar for unprompted replies" in mem_call.args[1]
-        assert mem_call.kwargs["author"] == "participation_engine:10.0"
+        app.processor.db.add_channel_memory_async.assert_not_awaited()
+        app.processor.db.upsert_channel_pref_memory.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_backoff_updates_existing_memory_fact_not_duplicate(self, monkeypatch):
-        # F15: a repeat butt-out on the SAME thread UPDATES the prior fact (matched by its
-        # participation_engine:<thread> author) instead of adding a duplicate row.
+    async def test_backoff_standing_channel_pref_updates_marker_via_gate(self, monkeypatch):
+        # Redesign: a standing, channel-scoped soft preference records ONE per-channel/
+        # per-dimension memory keyed by the stable marker author `participation_engine:pref:
+        # <dimension>`, written through the atomic upsert so a repeat converges on that single
+        # row instead of piling up duplicates (the false "REPEATED = observe-only" escalation is
+        # gone). No mute, no structural write, and never the raw add.
         monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
         monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
         monkeypatch.setattr(config, "enable_channel_memory", True, raising=False)
-        app, client, _ = _make_app({"action": "backoff"})
-        app.processor.db.get_channel_memory_async = AsyncMock(return_value=[
-            {"id": 7, "author": "participation_engine:10.0", "content": "old fact"},
-        ])
+        app, client, _ = _make_app({
+            "action": "backoff", "durability": "standing", "scope": "channel",
+            "dimension": "reactions", "guidance": "react less here", "memory_op": "add"})
         assert await app._run_participation_gate(_channel_msg(), client) is None
-        app.processor.db.update_channel_memory_async.assert_awaited_once()
-        assert app.processor.db.update_channel_memory_async.await_args.args[0] == 7
+        app.processor.db.upsert_channel_pref_memory.assert_awaited_once()
+        args = app.processor.db.upsert_channel_pref_memory.await_args
+        assert args.args[1] == "participation_engine:pref:reactions"   # stable marker author
+        assert "react less" in args.args[2]                           # normalized content
         app.processor.db.add_channel_memory_async.assert_not_awaited()
+        app.processor.db.set_channel_settings_async.assert_not_awaited()
 
     def test_participation_prompt_has_butt_out_memory_line(self):
         # F15: the classifier learns about butt-out feedback through channel memory —
@@ -738,15 +742,6 @@ class TestDBAndModal:
         assert temp_db.get_channel_settings("C1")["muted_threads"] == []
         # no row → empty list, never a crash
         assert temp_db.get_channel_settings("C2") is None
-
-    def test_add_muted_thread_persists_and_dedupes(self, temp_db):
-        # F15: mute is DB-backed (survives restart — a fresh get sees it) and idempotent.
-        assert asyncio.run(temp_db.add_muted_thread_async("C1", "10.0")) is True
-        assert asyncio.run(temp_db.add_muted_thread_async("C1", "10.0")) is False  # dedup
-        assert asyncio.run(temp_db.add_muted_thread_async("C1", "30.0")) is True
-        # read back through a fresh async connection (simulates restart — state is durable)
-        row = asyncio.run(temp_db.get_channel_settings_async("C1"))
-        assert row["muted_threads"] == ["10.0", "30.0"]
 
     def test_migration_adds_columns_to_legacy_table(self):
         with tempfile.TemporaryDirectory() as tmpdir:
