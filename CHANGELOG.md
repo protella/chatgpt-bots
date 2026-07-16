@@ -237,6 +237,14 @@ DMs behave as before.
   @mention, or a DM for canvases). A passing name-drop, quoted text, or another bot can't
   trigger either, so "being talked about" can never flip a channel's settings or remove its
   canvas.
+- **@mentions answer at channel level.** @-mention the bot on a top-level message and it now replies
+  in the channel instead of burying the answer in a thread — a direct summon expects a visible
+  reply. Threads-only channels, and mentions made *inside* a thread, still thread as before.
+- **It can tag a teammate it's actually seen.** The bot could only @-mention people already in the
+  current thread, so asking it to hand something to another person or agent in the channel — one
+  that hadn't spoken in *this* thread — could make it fumble the mention, occasionally even tagging
+  itself. It now recognizes whoever's spoken in the channel recently and can address them correctly,
+  and will look a member up rather than guess.
 
 ### 🔬 Feature - Deep research, in the background
 
@@ -433,6 +441,10 @@ maximum), `CODE_INTERPRETER_CONTAINER_REUSE_MINUTES` (15).
 - **The emoji palette is now open by default.** The bot picks whatever emoji actually fits, from
   the full standard set. `REACTION_EMOJIS` is still there if you want to hold it to a
   brand-approved list — set it and the restriction is enforced everywhere.
+- **Your workspace's custom emoji are on the menu now, too.** The bot reads your custom/branded
+  emoji and can react with them, not just the standard set — so it can reach for your team's own
+  `:shipit:` or `:this:` when one fits. Refreshed in the background, so new emoji show up on their
+  own. (`REACTION_EMOJIS` still overrides everything when you set it.)
 - **Ask for several reactions and you get several.** The bot was hard-limited to one emoji per
   message on several layers, so a request for three would get one — and it would sometimes follow
   up by claiming it was "showing restraint". Up to `REACTION_MAX_PER_MESSAGE` (default 4) now.

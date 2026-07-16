@@ -305,6 +305,7 @@ class ParticipationEngine:
                        channel_canvases: Optional[List[str]] = None,
                        channel_people: Optional[str] = None,
                        capabilities: Optional[str] = None,
+                       workspace_custom_emojis: Optional[List[str]] = None,
                        attachments: Optional[str] = None,
                        images: Optional[List[Dict]] = None,
                        client: Any = None,
@@ -385,6 +386,9 @@ class ParticipationEngine:
             "channel_canvases": channel_canvases,
             "channel_people": channel_people,
             "capabilities": capabilities,
+            # C3: extra reaction choices for the classifier (empty when a REACTION_EMOJIS
+            # allowlist is set — customs are never injected over the hard constraint).
+            "workspace_custom_emojis": workspace_custom_emojis or [],
             "attachments": attachments,
             "burst_earlier": burst_earlier,
         }
@@ -421,6 +425,9 @@ class ParticipationEngine:
             if emoji in allow:
                 return emoji
             return allow[0] if force_allowlist else None
+        # C3: stay PERMISSIVE with no allowlist — any syntactically valid shorthand is accepted,
+        # which covers BOTH standard emoji AND a workspace custom name (same charset). Never gate
+        # on the custom set: a valid standard emoji must never be rejected for not being a custom.
         return emoji if valid_emoji_name(emoji) else None
 
     @staticmethod

@@ -178,6 +178,21 @@ class ChatBotV2:
             except Exception:  # noqa: BLE001 — never cost the gate a verdict
                 channel_canvases = []
 
+            # C3: workspace custom emoji as EXTRA classifier choices — ONLY when there is no
+            # REACTION_EMOJIS allowlist (a set allowlist is the exact hard constraint; customs
+            # are never injected over it). Deterministic sorted cap; stale-ok cache getter.
+            workspace_custom_emojis = []
+            if not (config.reaction_emojis or []):
+                emoji_cache = getattr(client, "workspace_emojis", None)
+                if emoji_cache is not None:
+                    try:
+                        names = emoji_cache.get_custom_emoji_names()
+                        cap = max(0, int(getattr(config, "participation_custom_emoji_cap", 32)))
+                        # cap is a hard maximum: 0 → none (never "unlimited"); names[:0] == [].
+                        workspace_custom_emojis = list(names[:cap])
+                    except Exception:  # noqa: BLE001 — never cost the gate a verdict
+                        workspace_custom_emojis = []
+
             verdict = await engine.evaluate(
                 channel_id=channel_id, ts=ts, text=message.text,
                 sender_id=message.user_id,
@@ -192,6 +207,7 @@ class ChatBotV2:
                 channel_canvases=channel_canvases,
                 channel_people=channel_people,
                 capabilities=capabilities,
+                workspace_custom_emojis=workspace_custom_emojis,
                 attachments=message.metadata.get("participation_attachments"),
                 # F40: descriptors only — the engine downloads the pixels itself, and only once
                 # the message has survived the debounce.
@@ -706,7 +722,10 @@ class ChatBotV2:
                                     openai_client=self.processor.openai_client,
                                     client=client,
                                     channel_id=message.channel_id,
-                                    thread_id=post_thread_id,
+                                    # B2: artifacts always thread. post_thread_id is None on a
+                                    # top-level channel reply, so thread off message.thread_id
+                                    # instead — the chart hangs under the answer, never top-level.
+                                    thread_id=message.thread_id,
                                     thread_key=f"{message.channel_id}:{message.thread_id}",
                                     container_ids=artifact_containers,
                                     db=getattr(self.processor, "db", None),
@@ -745,8 +764,10 @@ class ChatBotV2:
                     # with the container. A silent no-output turn is the worst failure mode
                     # here, so hand them over rather than lose them.
                     if not published:
+                        # B2: rescued sandbox images always thread — pass message.thread_id, not
+                        # post_thread_id (None on a top-level channel reply).
                         rescued = await self._rescue_sandbox_images(response, client, message,
-                                                                    post_thread_id)
+                                                                    message.thread_id)
                         if rescued:
                             turn.visible_action_committed = True  # F38: an image did land
                 elif response.type == "error":

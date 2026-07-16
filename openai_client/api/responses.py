@@ -1183,6 +1183,17 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
         lines.append(f"- Allowed reaction emoji (choose one): {', '.join(allow)}")
     else:
         lines.append("- Reaction emoji: any standard Slack emoji name (shorthand, no colons)")
+        # C3: workspace custom emoji as EXTRA choices — only surfaced when there is no
+        # allowlist (the branch above), and only when the gate actually passed some. Standard
+        # emoji stay allowed; this only ADDS names the model wouldn't otherwise know exist.
+        customs = [str(e).strip().strip(":") for e in (signals.get("workspace_custom_emojis") or [])
+                   if str(e).strip().strip(":")]
+        if customs:
+            lines.append(
+                "- Workspace custom emoji you may also choose when one fits: "
+                + ", ".join(customs)
+                + "; standard Slack emoji remain allowed."
+            )
     if signals.get("directives"):
         lines.append(f"- Channel ground rules (honor them): {signals['directives']}")
     facts = signals.get("memory_facts") or []
