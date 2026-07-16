@@ -109,12 +109,24 @@ class SettingsModal(LoggerMixin):
         }
     
     def build_channel_settings_modal(self, channel_id: str, current_settings: Optional[Dict],
-                                     global_default_mode: str) -> Dict:
+                                     global_default_mode: str,
+                                     channel_memories: Optional[List[Dict]] = None,
+                                     memory_textarea_value: Optional[str] = None,
+                                     mem_seed: Optional[List] = None) -> Dict:
         """Build the per-channel settings modal (Phase 7).
 
         `current_settings` is the DB row (or None). A NULL/absent response_mode means the channel
         inherits the global default; that is represented by the "inherit" option here, and the
         submission handler stores None (NULL) for it so the global default keeps applying.
+
+        `channel_memories` (from ``get_channel_memory_async``) drives the memory sections at the
+        bottom: channel-scope facts become ONE editable multiline textarea; workspace-scope facts
+        render read-only below it. On a FRESH open (`memory_textarea_value`/`mem_seed` both None)
+        the textarea value and the open-time seed ``[[id, hash], ...]`` are computed from the rows.
+        On a RE-RENDER (model change / views_update) the caller passes both verbatim so an in-flight
+        edit survives and the seed stays anchored to the rows the user first saw. `mem_seed` rides in
+        `private_metadata` so the submit handler can reconcile exactly those rows. All optional so
+        pure builder tests can render without a DB.
         """
         from message_processor.participation import MODE_TO_LEVEL, VALID_LEVELS
 
@@ -122,9 +134,6 @@ class SettingsModal(LoggerMixin):
 
         cs = current_settings or {}
         directives_value = cs.get("directives") or ""
-        # No saved row → the global default decides (checkbox pre-checked when the
-        # default allows top-level replies)
-        reply_in_channel = bool(cs.get("reply_in_channel", config.reply_in_channel_default))
 
         def _select(action_id, label_map, current, inherit_label):
             """Static select with an 'inherit' first option; initial = current or inherit."""
@@ -183,17 +192,33 @@ class SettingsModal(LoggerMixin):
         selected_value = current_level if current_level in VALID_LEVELS else "inherit"
         initial_mode_option = next(o for o in mode_options if o["value"] == selected_value)
 
-        reply_option = {
-            "text": {"type": "plain_text", "text": "Reply at top level instead of in a thread"},
-            "value": "reply_in_channel",
-        }
+        # Reply placement is a TRI-STATE control (SHOULD-FIX #5): a stored None means "inherit the
+        # workspace default", True means "reply at channel level", False means "threads only". The
+        # old binary checkbox resolved NULL to today's global default, so merely opening + saving an
+        # inheriting channel FROZE that default into an explicit row. These three options map
+        # straight back to None / True / False on submit, so an untouched inheriting channel stays
+        # NULL (still inheriting) and future global-config changes keep flowing through.
+        ric_value = cs.get("reply_in_channel")  # None (inherit) | True | False
+        default_placement_text = ("reply at channel level" if config.reply_in_channel_default
+                                  else "threads only")
+        placement_options = [
+            {"text": {"type": "plain_text",
+                      "text": f"Inherit workspace default (currently: {default_placement_text})"},
+             "value": "inherit"},
+            {"text": {"type": "plain_text", "text": "Reply at channel level"}, "value": "channel"},
+            {"text": {"type": "plain_text", "text": "Threads only"}, "value": "threads"},
+        ]
+        if ric_value is None:
+            placement_selected = "inherit"
+        elif ric_value:
+            placement_selected = "channel"
+        else:
+            placement_selected = "threads"
         reply_element = {
-            "type": "checkboxes",
-            "action_id": "reply_in_channel",
-            "options": [reply_option],
+            "type": "static_select", "action_id": "reply_in_channel",
+            "options": placement_options,
+            "initial_option": next(o for o in placement_options if o["value"] == placement_selected),
         }
-        if reply_in_channel:
-            reply_element["initial_options"] = [reply_option]
 
         blocks = [
             {"type": "section", "text": {"type": "mrkdwn",
@@ -218,7 +243,7 @@ class SettingsModal(LoggerMixin):
              "element": reply_element,
              "label": {"type": "plain_text", "text": "Reply placement"},
              "hint": {"type": "plain_text",
-                      "text": "When checked, I MAY answer a top-level message at channel level — I judge per message whether a quick channel reply or a thread fits better. Unchecked, everything gets a thread."}},
+                      "text": "'Inherit' follows the workspace default. 'Reply at channel level' lets me answer a top-level message in the channel — I still judge per message whether a thread fits better. 'Threads only' always routes replies into a thread."}},
             {"type": "divider"},
             {"type": "section", "text": {"type": "mrkdwn",
              "text": "*Shared response settings* — apply to everyone in this channel. "
@@ -237,9 +262,27 @@ class SettingsModal(LoggerMixin):
              "label": {"type": "plain_text", "text": "Verbosity"}},
         ]
 
-        # F15: the channel-wide snooze timer (and its early-resume control) is retired.
-        # "Butt out" now mutes the specific thread; unmuting happens by addressing the bot
-        # there, and the model forgets/updates the standing memory fact — no modal surface.
+        # Channel-memory editor + read-only workspace-shared list. On a fresh open we derive the
+        # textarea value and the open-time seed from the DB rows; on a re-render the caller hands both
+        # back verbatim so an in-flight edit survives. The seed lists EXACTLY the rows shown in the box
+        # and rides in private_metadata so submit reconciles only what the user could actually see.
+        memories = channel_memories or []
+        channel_rows = [m for m in memories if m.get("scope") == "channel"]
+        workspace_rows = [m for m in memories if m.get("scope") != "channel"]
+
+        if memory_textarea_value is None and mem_seed is None:
+            memory_textarea_value, mem_seed, hidden_count = self._compute_channel_memory_seed(channel_rows)
+        else:
+            mem_seed = mem_seed or []
+            memory_textarea_value = memory_textarea_value or ""
+            # Seed is carried verbatim on re-render; derive "+N more" from what it omits (normalize
+            # returns "" for whitespace-only, so a bare strip test matches the fresh-open blank drop).
+            non_blank = sum(1 for m in channel_rows if (m.get("content") or "").strip())
+            hidden_count = max(0, non_blank - len(mem_seed))
+
+        blocks.append({"type": "divider"})
+        blocks.extend(self._build_channel_memory_blocks(
+            memory_textarea_value, hidden_count, workspace_rows))
 
         return {
             "type": "modal",
@@ -247,9 +290,100 @@ class SettingsModal(LoggerMixin):
             "title": {"type": "plain_text", "text": "Channel Settings"},
             "submit": {"type": "plain_text", "text": "Save"},
             "close": {"type": "plain_text", "text": "Cancel"},
-            "private_metadata": json.dumps({"channel_id": channel_id}),
+            "private_metadata": json.dumps({"channel_id": channel_id, "mem_seed": mem_seed}),
             "blocks": blocks,
         }
+
+    # Read-only workspace-shared memories are one block per item; cap the list so a workspace with a
+    # lot of shared facts can't blow Slack's 100-block modal limit. Channel-scope memory is a single
+    # textarea now, so it needs no per-item cap — only the 2900-char textarea budget below.
+    _MODAL_LIST_CAP = 10
+
+    # Slack plain_text_input's max we build the channel-memory textarea against (value + budget guard).
+    _MEMORY_TEXTAREA_MAX = 2900
+
+    @staticmethod
+    def _truncate(text: str, limit: int) -> str:
+        """Trim to `limit` chars with an ellipsis so long facts/reasons stay on one line."""
+        text = (text or "").strip()
+        return text if len(text) <= limit else text[: max(0, limit - 1)].rstrip() + "…"
+
+    def _compute_channel_memory_seed(self, channel_rows: List[Dict]):
+        """From channel-scope rows (oldest-first, as ``get_channel_memory_async`` returns them),
+        build the textarea `initial_value` and the open-time seed ``[[id, hash], ...]``.
+
+        Each row is normalized and blank rows are dropped. Rows are included oldest-first only while
+        the joined value stays within the textarea budget; on the first row that would overflow we
+        stop and the rest become the "+N more not shown" remainder. The seed lists EXACTLY the
+        included rows — never seed a row that isn't in the box, or submit could "delete" a row the
+        user never saw. Returns ``(initial_value, mem_seed, hidden_count)``.
+        """
+        from database import normalize_memory_line, memory_content_hash
+
+        normed = [(m.get("id"), normalize_memory_line(m.get("content") or "")) for m in channel_rows]
+        normed = [(mid, content) for mid, content in normed if content]  # drop blanks
+
+        included: List[str] = []
+        seed: List = []
+        used = 0
+        for mid, content in normed:
+            addition = len(content) + (1 if included else 0)  # +1 for the joining newline
+            if used + addition > self._MEMORY_TEXTAREA_MAX:
+                break
+            included.append(content)
+            seed.append([mid, memory_content_hash(content)])
+            used += addition
+
+        return "\n".join(included), seed, len(normed) - len(included)
+
+    def _build_channel_memory_blocks(self, textarea_value: str, hidden_count: int,
+                                     workspace_rows: List[Dict]) -> List[Dict]:
+        """Blocks for the channel-memory editor plus the read-only workspace-shared list.
+
+        Channel-scope memory is ONE multiline textarea (`block_id="channel_memory_block"`,
+        `action_id="channel_memory"`): edit or delete lines and Save to reconcile, blank it out to
+        forget everything. Workspace-scope facts are visible context but READ-ONLY from a channel
+        (see `message_processor/memory_tools.py` `_visible_row`), so they render without any control.
+        """
+        memory_input: Dict = {
+            "type": "plain_text_input", "action_id": "channel_memory",
+            "multiline": True, "max_length": self._MEMORY_TEXTAREA_MAX,
+            "placeholder": {"type": "plain_text",
+                            "text": "e.g. Deploys go out Thursdays — ping @oncall before merging."},
+        }
+        # Slack rejects an empty initial_value, so only set it when there's something to seed.
+        if textarea_value:
+            memory_input["initial_value"] = textarea_value
+
+        blocks: List[Dict] = [
+            {"type": "section",
+             "text": {"type": "mrkdwn", "text": "*What I remember about this channel*"}},
+            {"type": "input", "block_id": "channel_memory_block", "optional": True,
+             "element": memory_input,
+             "label": {"type": "plain_text", "text": "Channel memory"},
+             "hint": {"type": "plain_text",
+                      "text": "One note per line. Edit or delete lines and Save; "
+                              "blank it out to forget everything here."}},
+        ]
+        if hidden_count > 0:
+            blocks.append({"type": "context", "elements": [
+                {"type": "mrkdwn", "text": f"_+{hidden_count} more not shown_"}]})
+
+        # Workspace-scope memories: shown for context, but managed elsewhere — no edit control.
+        if workspace_rows:
+            cap = self._MODAL_LIST_CAP
+            shown = workspace_rows[:cap]
+            lines = "\n".join(f"• {self._truncate(m.get('content') or '', 200) or '(empty)'}"
+                              for m in shown)
+            if len(workspace_rows) > cap:
+                lines += f"\n_+{len(workspace_rows) - cap} more_"
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn",
+                         "text": f"*Workspace-shared memories* (read-only here)\n{lines}"},
+            })
+
+        return blocks
 
     def _build_modal_blocks(self, settings: Dict, selected_model: str,
                            is_new_user: bool = False, in_thread: bool = False,

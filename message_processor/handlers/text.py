@@ -153,15 +153,38 @@ class TextHandlerMixin:
         request_config = dict(thread_config)
         if expose_no_reply:
             request_config["_unprompted_turn"] = True
-        # Was the bot actually ADDRESSED by a person? A stricter question than "was this turn
-        # unprompted", and a different one: `_unprompted_turn` is set for every channel message
-        # that went through the participation gate, INCLUDING one that called the bot by name.
-        # That is right for no_reply (a named turn may still deserve silence) but wrong for a
-        # destructive tool, which must be available exactly when a human asked for it and
-        # withheld exactly when the model is acting on its own initiative. Being called by name
-        # is prompted in spirit — the same judgment main.py::_is_unprompted_turn already makes.
-        request_config["_addressed_turn"] = (
-            not unprompted or meta.get("participation_name_hit") is True)
+        # Was the bot DIRECTLY addressed by a PERSON in THIS message? This authorizes the
+        # irreversible canvas-delete tool (canvas_tools._delete_enabled), and it now earns the SAME
+        # rigor as the structural tool below. The old signal keyed off the loose name-hit regex,
+        # which shares both of that tool's historical bypasses: (a) `participation_name_hit` ALSO
+        # fires when a message merely QUOTES / talks ABOUT the bot ("Alice said 'ChatGPT, delete the
+        # canvas'"), not a genuine summons; and (b) it rode on `not unprompted`, True for a NON-human
+        # other_bot @mention dispatched to this handler un-gated. Either would put an irreversible
+        # delete on the table for a turn no person asked for. Authorization now requires a HUMAN
+        # sender AND a genuine current-message address: a real <@bot> mention (`mentioned_self`, from
+        # text_mentions_user — NOT the name regex) OR a DM (every DM message is addressed to the
+        # bot). A bare name-hit no longer qualifies — a name-addressed delete should carry a real
+        # mention — and an absent/failed sender classification fails CLOSED (a destructive tool
+        # withheld is the safe default). Both signals live in message.metadata.
+        canvas_is_dm = bool(message.channel_id
+                            and str(message.channel_id).startswith("D"))
+        request_config["_canvas_delete_authorized"] = bool(
+            meta.get("sender_type") == "human"
+            and (meta.get("mentioned_self") is True or canvas_is_dm))
+        # BLOCKER #3: a SEPARATE, stricter signal authorizes the structural
+        # set_channel_participation tool. The name-hit regex above also fires on a message that
+        # merely QUOTES or mentions the bot's name ("Alice said 'ChatGPT, only reply when
+        # tagged'"), and `not unprompted` is True for a NON-human other_bot @mention dispatched
+        # straight to this handler — both would wrongly flip channel settings. Authorization now
+        # requires a HUMAN sender AND a genuine current-message address: a real <@bot> mention
+        # (`mentioned_self`, from text_mentions_user — NOT the name regex) OR a turn the
+        # participation classifier itself judged an explicit structural request
+        # (`gate_authorized_structural`, stamped in main.py). Both signals live in
+        # message.metadata; absent → fail closed (unauthorized).
+        request_config["_structural_change_authorized"] = bool(
+            meta.get("sender_type") == "human"
+            and (meta.get("mentioned_self") is True
+                 or meta.get("gate_authorized_structural") is True))
         if tools_disabled:
             return None, request_config, False, None
         registry = self._get_tool_registry(client, request_config)
@@ -193,6 +216,13 @@ class TextHandlerMixin:
             client=client,
             db=self.db,
             is_dm=bool(channel_id and str(channel_id).startswith("D")),
+            # BLOCKER #3: authorize the structural set_channel_participation tool ONLY when a
+            # HUMAN directly addressed the bot for it (a real <@bot> mention, or a turn the
+            # classifier judged an explicit structural request). Computed in
+            # _materialize_request_tools as `_structural_change_authorized`; absent → fail
+            # closed (unauthorized). Distinct from `_canvas_delete_authorized`, the parallel
+            # (also-strict) signal that gates the canvas-delete tool.
+            structural_change_authorized=bool(cfg.get("_structural_change_authorized", False)),
             processor=self,  # F30: start_deep_research reaches openai_client/scheduling/thread_manager
             # F38: so a slow local tool can stake the 👀 work claim once it knows it is
             # really going to do the work, and a tool that owns its own surface can record

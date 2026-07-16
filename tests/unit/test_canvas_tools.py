@@ -288,7 +288,8 @@ class TestRegistration:
     def test_addressed_turns_get_the_full_set_including_delete(self):
         registry = ToolRegistry()
         ct.register_canvas_tools(registry)
-        cfg = {ct.CATALOG_KEY: [{"canvas_id": "F1", "title": "Agenda"}]}
+        cfg = {ct.CATALOG_KEY: [{"canvas_id": "F1", "title": "Agenda"}],
+               "_canvas_delete_authorized": True}
         names = {s["name"] for s in registry.schemas(cfg)}
 
         assert names == {"create_channel_canvas", "list_canvases", "read_canvas", "edit_canvas",
@@ -296,14 +297,18 @@ class TestRegistration:
 
     def test_an_unaddressed_turn_gets_everything_except_delete(self):
         # It can still create, read and edit while listening — it just cannot destroy anything
-        # on its own initiative.
+        # on its own initiative. A config with no authorization flag (or an explicit False) fails
+        # CLOSED: delete is a destructive op and must not default to available.
         registry = ToolRegistry()
         ct.register_canvas_tools(registry)
         cfg = {ct.CATALOG_KEY: [{"canvas_id": "F1", "title": "Agenda"}],
-               "_addressed_turn": False}
+               "_canvas_delete_authorized": False}
         names = {s["name"] for s in registry.schemas(cfg)}
 
         assert names == {"create_channel_canvas", "list_canvases", "read_canvas", "edit_canvas"}
+        # And the same holds when the flag is simply absent — fail closed, not open.
+        assert "delete_canvas" not in {
+            s["name"] for s in registry.schemas({ct.CATALOG_KEY: cfg[ct.CATALOG_KEY]})}
 
     def test_with_no_canvases_only_create_and_list_are_offered(self):
         # read/edit are factories over the channel's canvases: with none, there is nothing to
@@ -342,7 +347,8 @@ class TestRegistration:
         ct.register_canvas_tools(registry)
         cfg = {ct.CATALOG_KEY: [{"canvas_id": "F1", "title": "Agenda",
                                  "is_channel_canvas": True},
-                                {"canvas_id": "F2", "title": "Old notes"}]}
+                                {"canvas_id": "F2", "title": "Old notes"}],
+               "_canvas_delete_authorized": True}
         delete = [s for s in registry.schemas(cfg) if s["name"] == "delete_canvas"][0]
 
         assert delete["parameters"]["properties"]["canvas_id"]["enum"] == ["F2"]
@@ -664,34 +670,52 @@ class TestDelete:
 
     def test_offered_when_a_person_addressed_the_bot(self):
         cfg = {ct.CATALOG_KEY: [{"canvas_id": "F1", "title": "Old Agenda"}],
-               "_addressed_turn": True}
+               "_canvas_delete_authorized": True}
         assert ct._delete_enabled(cfg) is True
         schema = ct.get_delete_canvas_schema(cfg)
         assert schema["parameters"]["properties"]["canvas_id"]["enum"] == ["F1"]
 
     def test_withheld_when_nobody_addressed_it(self):
         cfg = {ct.CATALOG_KEY: [{"canvas_id": "F1", "title": "Old Agenda"}],
-               "_addressed_turn": False}
+               "_canvas_delete_authorized": False}
         assert ct._delete_enabled(cfg) is False
 
         registry = ToolRegistry()
         ct.register_canvas_tools(registry)
         assert "delete_canvas" not in {s["name"] for s in registry.schemas(cfg)}
 
-    def test_being_called_by_name_counts_as_addressed(self):
-        """The bug this replaced: `_unprompted_turn` is set for EVERY channel message that went
-        through the participation gate, name-hits included. Gating on it withheld delete from
-        "ChatGPT, delete that canvas" — exactly the request the tool exists to serve."""
-        import inspect
+    def test_withheld_when_the_signal_is_absent(self):
+        """Fail CLOSED: a config that never ran the authorization derivation must not get delete.
+        The earlier signal defaulted to available (`cfg.get("_addressed_turn", True)`); a
+        destructive tool does the opposite."""
+        cfg = {ct.CATALOG_KEY: [{"canvas_id": "F1", "title": "Old Agenda"}]}
+        assert ct._delete_enabled(cfg) is False
+
+    def test_bare_name_hit_no_longer_authorizes_delete(self):
+        """The tightening: a name-hit that carries NO real <@bot> mention (the vector where a
+        message merely QUOTES the bot's name) must not put an irreversible delete on the table.
+        Run the REAL signal derivation from a Message's metadata and confirm the gate stays shut."""
+        from base_client import Message
         from message_processor.handlers.text import TextHandlerMixin
-        src = inspect.getsource(TextHandlerMixin._materialize_request_tools)
-        assert '_addressed_turn' in src
-        assert 'participation_name_hit' in src
+
+        class _H(TextHandlerMixin):
+            def __init__(self):
+                self.db = None
+
+        msg = Message(text="Alice said 'ChatGPT, delete the canvas'", user_id="U1",
+                      channel_id="C04QDHE8W8M", thread_id="1.0",
+                      metadata={"sender_type": "human", "mentioned_self": False,
+                                "participation_check": True, "participation_name_hit": True})
+        _reg, request_config, _n, _s = _H()._materialize_request_tools(
+            MagicMock(), {}, msg, tools_disabled=True)
+        assert request_config["_canvas_delete_authorized"] is False
+        cfg = {ct.CATALOG_KEY: [{"canvas_id": "F1", "title": "Old Agenda"}], **request_config}
+        assert ct._delete_enabled(cfg) is False
 
     def test_the_kill_switch_wins(self, monkeypatch):
         monkeypatch.setattr(ct.config, "enable_canvas_delete", False)
         assert ct._delete_enabled({ct.CATALOG_KEY: [{"canvas_id": "F1", "title": "x"}],
-                                   "_addressed_turn": True}) is False
+                                   "_canvas_delete_authorized": True}) is False
 
     async def test_deletes_and_invalidates_the_catalog(self):
         ctx, web = _ctx()
@@ -712,6 +736,35 @@ class TestDelete:
 
         assert out["error"] == "not_in_this_channel"
         web.canvases_delete.assert_not_awaited()
+
+    async def test_a_bot_authored_delete_is_refused_by_the_executor(self):
+        # Defense-in-depth (mirrors participation_tools): `_delete_enabled` already withholds the
+        # tool from a non-human sender, but the executor re-reads the raw sender classification off
+        # ctx.message and refuses a NON-human author BEFORE any Slack call — belt and suspenders for
+        # the one irreversible canvas op.
+        from base_client import Message
+        ctx, web = _ctx()
+        ctx.message = Message(text="delete it", user_id="B1", channel_id="C1",
+                              thread_id="1.0", metadata={"sender_type": "other_bot"})
+        out = await ct.execute_delete_canvas(ctx, {"canvas_id": "F123"})
+
+        assert out["ok"] is False and out["error"] == "not_human_sender"
+        web.canvases_delete.assert_not_awaited()
+
+    async def test_a_human_authored_delete_passes_the_executor_check(self):
+        # The mirror: a human author on ctx.message clears the defense-in-depth check and the
+        # delete proceeds. (Absent sender classification also proceeds — the check never fails
+        # closed on paths that omit it; the schema gate is the primary authorization.)
+        from base_client import Message
+        ctx, web = _ctx()
+        web.canvases_delete = AsyncMock(return_value={"ok": True})
+        ct._catalog_cache["C1"] = {"at": 0.0, "entries": [{"canvas_id": "F123", "title": "x"}]}
+        ctx.message = Message(text="delete it", user_id="U07PETER", channel_id="C1",
+                              thread_id="1.0", metadata={"sender_type": "human"})
+        out = await ct.execute_delete_canvas(ctx, {"canvas_id": "F123"})
+
+        assert out["ok"] is True and out["deleted"] is True
+        web.canvases_delete.assert_awaited_once_with(canvas_id="F123")
 
 
 @pytest.mark.unit

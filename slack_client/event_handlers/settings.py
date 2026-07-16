@@ -53,6 +53,63 @@ class SlackSettingsHandlersMixin:
             self.log_error(f"Failed to update session data: {e}")
         return False
 
+    async def _load_channel_modal_extras(self, channel_id: str):
+        """Fetch the channel memory list surfaced in the channel settings modal.
+
+        Best-effort: a DB hiccup must not stop the modal from opening, so a failure degrades to an
+        empty list rather than raising.
+        """
+        try:
+            return await self.db.get_channel_memory_async(channel_id) or []
+        except Exception as e:
+            self.log_warning(f"Could not load channel memory for modal ({channel_id}): {e}")
+            return []
+
+    @staticmethod
+    def _overlay_channel_form_state(row, state):
+        """Overlay the modal's in-flight form values onto the stored channel row for a re-render
+        (model change).
+
+        SHOULD-FIX #7: in-flight values are AUTHORITATIVE — a field the user has edited but not yet
+        saved is never overwritten by the stored row. Concretely:
+          - a CLEARED directives box stays cleared (we don't restore the stored text);
+          - an 'inherit' participation choice stays inherit — we clear response_mode in lockstep so
+            the builder's legacy fallback can't resurrect the stored explicit mode; and
+          - reply placement round-trips the tri-state (inherit → None, channel → True, threads →
+            False) instead of collapsing to a binary that drops the inherit state.
+        The result feeds straight into ``build_channel_settings_modal`` so the rebuilt view shows
+        exactly what the user had on screen.
+        """
+        from message_processor.participation import LEVEL_TO_MODE
+
+        def _sel(block, action):
+            opt = state.get(block, {}).get(action, {}).get('selected_option') or {}
+            val = opt.get('value', 'inherit')
+            return None if val == 'inherit' else val
+
+        cs = dict(row or {})
+        cs['model'] = _sel('channel_model_block', 'channel_model')
+        cs['reasoning_effort'] = _sel('channel_effort_block', 'channel_reasoning_effort')
+        cs['verbosity'] = _sel('channel_verbosity_block', 'channel_verbosity')
+
+        level = _sel('participation_block', 'participation_level')
+        cs['participation_level'] = level
+        # Keep response_mode in lockstep with the in-flight level. Without this, moving the control
+        # back to 'inherit' (level=None) leaves the stale stored response_mode in cs, and the builder
+        # falls back to it and reselects the old explicit level — silently undoing the user's edit.
+        cs['response_mode'] = LEVEL_TO_MODE.get(level) if level else None
+
+        # Directives: the form value is authoritative. An empty box means the user cleared it — keep
+        # it empty, never fall back to the stored text (matches the submit handler's empty→None rule).
+        dir_raw = state.get('directives_block', {}).get('directives', {}).get('value')
+        cs['directives'] = dir_raw.strip() if dir_raw and dir_raw.strip() else None
+
+        # Reply placement tri-state: inherit → None, channel → True, threads → False.
+        ric_opt = state.get('reply_in_channel_block', {}).get('reply_in_channel', {}).get('selected_option') or {}
+        ric_val = ric_opt.get('value', 'inherit')
+        cs['reply_in_channel'] = None if ric_val == 'inherit' else (ric_val == 'channel')
+        return cs
+
     def _register_settings_handlers(self):
         # Register slash command handler
         @self.app.command(config.settings_slash_command)
@@ -176,7 +233,10 @@ class SlackSettingsHandlersMixin:
             try:
                 current = await self.db.get_channel_settings_async(channel_id)
                 global_default = getattr(config, 'channel_response_mode', 'tag_only')
-                modal = self.settings_modal.build_channel_settings_modal(channel_id, current, global_default)
+                memories = await self._load_channel_modal_extras(channel_id)
+                modal = self.settings_modal.build_channel_settings_modal(
+                    channel_id, current, global_default,
+                    channel_memories=memories)
                 await client.views_open(trigger_id=trigger_id, view=modal)
                 self.log_info(f"Channel settings modal opened for {channel_id} by {user_id} (footer button)")
             except Exception as e:
@@ -243,10 +303,16 @@ class SlackSettingsHandlersMixin:
             dir_raw = state.get('directives_block', {}).get('directives', {}).get('value')
             directives = dir_raw.strip() if dir_raw and dir_raw.strip() else None
 
-            ric_selected = state.get('reply_in_channel_block', {}).get('reply_in_channel', {}).get('selected_options') or []
-            reply_in_channel = len(ric_selected) > 0
+            # Tri-state placement (SHOULD-FIX #5): 'inherit' → None (stays NULL, keeps inheriting the
+            # global default), 'channel' → True, 'threads' → False. Never freeze today's default
+            # into an explicit row: opening + saving an inheriting channel untouched leaves it NULL.
+            ric_opt = state.get('reply_in_channel_block', {}).get('reply_in_channel', {}).get('selected_option') or {}
+            ric_val = ric_opt.get('value', 'inherit')
+            reply_in_channel = None if ric_val == 'inherit' else (ric_val == 'channel')
 
-            # F15: the snooze early-resume control is retired (thread mutes replace the timer).
+            # F15/F38: the snooze timer and the per-thread mute control are both retired. A
+            # thread-scoped "stop" is guidance-only now (no durable store); channel memory is the
+            # only persisted per-channel state, edited via the textarea reconciled below.
 
             # Shared response settings (model/effort/verbosity): 'inherit' clears to NULL
             # so the asker's personal preferences apply again.
@@ -274,10 +340,43 @@ class SlackSettingsHandlersMixin:
                 default_level = MODE_TO_LEVEL.get(getattr(config, 'channel_response_mode', 'tag_only'), 'mentions_only')
                 effective = level_sel if level_sel != 'inherit' else f"inherit ({default_level})"
                 self.log_info(f"Channel settings saved for {channel_id} by {user_id}: participation={level_sel}")
+
+                # Reconcile the channel-memory textarea against the open-time seed. Isolated in its
+                # own try/except so a memory failure never sinks the settings save — we still confirm,
+                # just with a warning. `mem_seed` is the seed we stashed in private_metadata at open.
+                mem_warning = ""
+                try:
+                    from database import normalize_memory_line
+                    seed = metadata.get('mem_seed', [])
+                    raw = state.get('channel_memory_block', {}).get('channel_memory', {}).get('value') or ""
+                    lines, seen = [], set()
+                    for ln in raw.split("\n"):
+                        norm = normalize_memory_line(ln)
+                        if norm and norm not in seen:
+                            seen.add(norm)
+                            lines.append(norm)
+                    result = await self.db.reconcile_channel_memory_from_textarea_async(
+                        channel_id, seed, lines, author=user_id, max_rows=config.memory_max_rows)
+                    over_cap = result.get('over_cap', 0)
+                    conflicts = result.get('conflicts', 0)
+                    if over_cap:
+                        mem_warning += (f"\n⚠️ {over_cap} note(s) not saved — this channel's memory is full "
+                                        f"({config.memory_max_rows} max).")
+                    if conflicts:
+                        mem_warning += (f"\n⚠️ {conflicts} note(s) were changed elsewhere while this was open "
+                                        "and left unchanged.")
+                    self.log_info(
+                        f"Channel memory reconciled for {channel_id} by {user_id}: "
+                        f"+{len(result.get('added', []))} -{len(result.get('deleted', []))} "
+                        f"conflicts={conflicts} over_cap={over_cap}")
+                except Exception as me:
+                    self.log_error(f"Error reconciling channel memory for {channel_id}: {me}")
+                    mem_warning += "\n⚠️ Couldn't fully update channel memory — please try again."
+
                 try:
                     await client.chat_postEphemeral(
                         channel=channel_id, user=user_id,
-                        text=f"✅ Channel settings saved. Response mode: *{effective}*."
+                        text=f"✅ Channel settings saved. Response mode: *{effective}*.{mem_warning}"
                     )
                 except Exception:
                     pass
@@ -297,25 +396,18 @@ class SlackSettingsHandlersMixin:
                 return
             try:
                 state = view.get('state', {}).get('values', {})
-
-                def _sel(block, action):
-                    opt = state.get(block, {}).get(action, {}).get('selected_option') or {}
-                    val = opt.get('value', 'inherit')
-                    return None if val == 'inherit' else val
-
                 row = await self.db.get_channel_settings_async(channel_id) or {}
-                cs = dict(row)
-                cs['model'] = _sel('channel_model_block', 'channel_model')
-                cs['reasoning_effort'] = _sel('channel_effort_block', 'channel_reasoning_effort')
-                cs['verbosity'] = _sel('channel_verbosity_block', 'channel_verbosity')
-                cs['participation_level'] = _sel('participation_block', 'participation_level')
-                dir_raw = state.get('directives_block', {}).get('directives', {}).get('value')
-                cs['directives'] = dir_raw if dir_raw else cs.get('directives')
-                ric = state.get('reply_in_channel_block', {}).get('reply_in_channel', {}).get('selected_options') or []
-                cs['reply_in_channel'] = len(ric) > 0
+                cs = self._overlay_channel_form_state(row, state)
 
+                # Carry the in-flight textarea + ORIGINAL open-time seed forward (never recompute the
+                # seed from the DB on re-render, or an unsaved deletion would silently re-anchor).
+                mem_text = state.get('channel_memory_block', {}).get('channel_memory', {}).get('value') or ""
+                mem_seed = metadata.get('mem_seed', [])
+                memories = await self._load_channel_modal_extras(channel_id)
                 global_default = getattr(config, 'channel_response_mode', 'tag_only')
-                modal = self.settings_modal.build_channel_settings_modal(channel_id, cs, global_default)
+                modal = self.settings_modal.build_channel_settings_modal(
+                    channel_id, cs, global_default, channel_memories=memories,
+                    memory_textarea_value=mem_text, mem_seed=mem_seed)
                 await client.views_update(view_id=view.get('id'), view=modal)
                 self.log_debug(f"Channel modal rebuilt for model change in {channel_id}")
             except Exception as e:

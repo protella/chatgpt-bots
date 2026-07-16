@@ -1510,16 +1510,6 @@ class SlackMessagingMixin:
         if target == current or target == trigger:
             return {"ok": False, "error": "same_thread",
                     "message": "That's the current thread — just reply normally instead."}
-        # F15 rail: a thread the user muted is opted out of the bot contributing there. Relay
-        # that instead of violating it.
-        try:
-            cs = await ctx.db.get_channel_settings_async(channel_id)
-            muted = (cs or {}).get("muted_threads") or []
-        except Exception:
-            muted = []
-        if target in muted:
-            return {"ok": False, "error": "thread_muted_by_user",
-                    "message": "That thread was muted — the user asked the bot to stay out of it."}
         try:
             posted_ts = await self.send_message(channel_id, target, text)
         except Exception as e:

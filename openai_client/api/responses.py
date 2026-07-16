@@ -1093,10 +1093,13 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
                                  images: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Phase F participation judgment — ONE utility-model call, strict JSON out.
 
-    Returns the raw verdict dict {"action", "emoji", "placement", "ack", "reason"}; the
-    caller (ParticipationEngine.validate_verdict) coerces/validates it (F19 "ack" is the
-    optional respond-turn acknowledgment flag). Best-effort and CONSERVATIVE: any failure
-    or unparseable output returns {"action": "ignore"}.
+    Returns the raw verdict dict the model emitted; the caller
+    (ParticipationEngine.validate_verdict) coerces/validates it. The verdict carries
+    {"action", "emoji", "placement", "reason"} plus, on a `backoff` (participation-feedback)
+    action, the redesign taxonomy — {"dimension", "durability", "scope", "guidance",
+    "memory_op", "structural_request"}. (The old F19 "ack" flag is gone: the 👀 is now staked
+    by the work itself, not predicted here.) Best-effort and CONSERVATIVE: any failure or
+    unparseable output returns {"action": "ignore"}.
 
     Prompt construction is deterministic: signal lines render in a fixed order so
     identical inputs produce identical payloads."""

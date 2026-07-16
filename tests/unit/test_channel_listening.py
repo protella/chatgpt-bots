@@ -282,37 +282,29 @@ async def test_engine_disabled_makes_auto_respond_mentions_only(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_muted_thread_skips_unprompted_but_not_addressed(monkeypatch):
-    # F15: a "butt out" muted thread drops UNPROMPTED messages in that thread pre-gate,
-    # but a name-hit summons in the same thread still reaches the engine (told to be quiet
-    # ≠ deaf; @-mentions arrive via app_mention and never touch this path).
+async def test_one_to_one_continuation_responds_with_no_mute_lookup(monkeypatch):
+    # The per-thread mute mechanism was removed: a "stay out of this thread" is now a no-op, so an
+    # untagged HUMAN reply in a genuinely 1:1 thread still continues deterministically. Crucially
+    # the routing consults NO mute state — the pre-gate mute lookup is gone.
     monkeypatch.setattr(config, "channel_response_mode", "auto_respond", raising=False)
     monkeypatch.setattr(config, "bot_name_aliases", ["ChatGPT"], raising=False)
     monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
     bot = _make_bot()
-    bot._thread_participation = AsyncMock(return_value=(False, 1, 0))  # no 1:1 continuation
-    muted = {"response_mode": "auto_respond", "muted_threads": ["50.0"]}
+    bot._thread_participation = AsyncMock(return_value=(True, 1, 0))  # bot present, one human, 1:1
+    bot.db = MagicMock()
+    bot.db.is_thread_muted_async = AsyncMock(return_value=True)  # even a "would-be muted" thread
 
     async def _cs(channel_id):
-        return muted
+        return {"response_mode": "auto_respond"}
 
     bot._get_channel_settings = _cs
-    # unprompted reply in the muted thread → silent, no dispatch
     await bot._handle_channel_message(
-        _evt(text="anyone know the q3 numbers?", thread_ts="50.0", ts="60.0"), bot.app.client)
-    bot.message_handler.assert_not_called()
-    # name-bearing in the muted thread → still reaches the engine
-    await bot._handle_channel_message(
-        _evt(text="ChatGPT you there?", thread_ts="50.0", ts="61.0"), bot.app.client)
+        _evt(text="and what about q4?", thread_ts="50.0", ts="60.0"), bot.app.client)
     bot.message_handler.assert_called_once()
     msg = bot.message_handler.call_args[0][0]
-    assert msg.metadata.get("participation_check") is True
-    assert msg.metadata.get("participation_name_hit") is True
-    # a message in a DIFFERENT (unmuted) thread participates normally
-    bot.message_handler.reset_mock()
-    await bot._handle_channel_message(
-        _evt(text="anyone free to review?", thread_ts="99.0", ts="99.5"), bot.app.client)
-    bot.message_handler.assert_called_once()
+    assert msg.metadata.get("wake_source") == "thread_continuation"
+    # no mute lookup happened anywhere on the path
+    bot.db.is_thread_muted_async.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ Provides persistent storage for threads, messages, images, documents, and user p
 
 import sqlite3
 import aiosqlite
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,30 @@ logger = logging.getLogger(__name__)
 # None (→ clear the column to NULL). Used by the channel_settings setters so the settings
 # modal's "inherit from global default" selection stores NULL rather than a literal string.
 _UNSET = object()
+
+
+# Shared hash/normalize contract for channel-memory reconciliation. The settings modal builder,
+# the submit handler, and reconcile_channel_memory_from_textarea_async ALL route content through
+# these two functions so a content hash computed at modal-open matches one recomputed at submit —
+# that identity is how a seeded row is matched (keep), missed (delete), or changed (conflict).
+def normalize_memory_line(text: str) -> str:
+    """Collapse every whitespace run (spaces, tabs, newlines) to a single space and strip ends.
+
+    Blank or whitespace-only input (and None) returns "". This is the single normalization all
+    three call sites share, so a legacy multi-line fact and its single-line textarea rendering
+    hash to the same value.
+    """
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def memory_content_hash(text: str) -> str:
+    """Stable short identity for a memory line: sha256 hexdigest of the normalized text, [:16].
+
+    Paired with normalize_memory_line so text that is equal after normalization hashes equal.
+    """
+    return hashlib.sha256(normalize_memory_line(text).encode()).hexdigest()[:16]
 
 
 def _decode_muted_threads(raw) -> List[str]:
@@ -43,6 +68,121 @@ def _encode_muted_threads(val) -> Optional[str]:
         return json.dumps([str(t) for t in val])
     except (ValueError, TypeError):
         return None
+
+
+# channel_settings columns whose write is a real, attributed structural edit. Touching any of
+# them bumps updated_ts/updated_by; a write that touches only the non-structural columns
+# (snoozed_until, the deprecated muted_threads) leaves authorship untouched — so a background
+# housekeeping write never looks like the last human to edit the channel's response settings.
+_CHANNEL_SETTINGS_STRUCTURAL = (
+    "response_mode", "directives", "reply_in_channel",
+    "participation_level", "model", "reasoning_effort", "verbosity",
+)
+
+
+def _build_channel_settings_write(channel_id, response_mode=_UNSET, directives=_UNSET,
+                                  reply_in_channel=_UNSET, participation_level=_UNSET,
+                                  snoozed_until=_UNSET, muted_threads=_UNSET,
+                                  model=_UNSET, reasoning_effort=_UNSET, verbosity=_UNSET,
+                                  updated_by=None):
+    """Build the atomic upsert for a partial channel_settings write.
+
+    Returns ``(sql, params)`` or ``None`` when no field was provided (caller no-ops).
+    Pure — no I/O — so both the sync and async setters share one implementation and one behavior.
+
+    Design (fixes the mute-clobber incident):
+    - Only explicitly-provided columns are written. Untouched columns are NEVER rewritten, so a
+      partial write cannot clobber another field (no read-modify-write of the whole row → no race
+      with a concurrent modal save).
+    - Inheritance-capable columns that carry a non-NULL table default (response_mode → 'tag_only',
+      reply_in_channel → 0) are pinned to NULL on a FRESH insert unless explicitly provided, so a
+      partial write never materializes a downgraded default over the live global config. Cleared
+      inheritance fields store NULL (never a copied runtime default), so global-config changes keep
+      being inherited.
+    - updated_ts/updated_by bump ONLY when a structural field changed
+      (see ``_CHANNEL_SETTINGS_STRUCTURAL``).
+    - reply_in_channel: explicit None → NULL (inherit); True/False → 1/0.
+    """
+    provided: Dict[str, Any] = {}
+    if response_mode is not _UNSET:
+        provided["response_mode"] = response_mode
+    if directives is not _UNSET:
+        provided["directives"] = directives
+    if reply_in_channel is not _UNSET:
+        provided["reply_in_channel"] = (
+            None if reply_in_channel is None else (1 if reply_in_channel else 0))
+    if participation_level is not _UNSET:
+        provided["participation_level"] = participation_level
+    if snoozed_until is not _UNSET:
+        provided["snoozed_until"] = snoozed_until
+    if muted_threads is not _UNSET:
+        # Deprecated inert JSON column — nothing reads it anymore (the per-thread mute mechanism
+        # was removed). Kept only so an explicit write can still clear it to NULL.
+        provided["muted_threads"] = _encode_muted_threads(muted_threads)
+    if model is not _UNSET:
+        provided["model"] = model
+    if reasoning_effort is not _UNSET:
+        provided["reasoning_effort"] = reasoning_effort
+    if verbosity is not _UNSET:
+        provided["verbosity"] = verbosity
+
+    if not provided:
+        return None
+
+    structural_provided = [c for c in provided if c in _CHANNEL_SETTINGS_STRUCTURAL]
+    changed_structural = bool(structural_provided)
+    # On the UPDATE (conflict) branch, "structural change" means a real VALUE change, not merely
+    # "a structural field was supplied": writing the SAME value must preserve updated_ts/updated_by
+    # so an idempotent structural write (a re-save of unchanged settings, a mute-path no-op) never
+    # rewrites who last edited the channel. `IS NOT` is SQLite's null-safe inequality, so an
+    # inherit(NULL)→NULL write also reads as unchanged.
+    change_cond = " OR ".join(
+        f"channel_settings.{c} IS NOT excluded.{c}" for c in structural_provided)
+
+    insert_cols = ["channel_id"]
+    params: List[Any] = [channel_id]
+    update_assignments: List[str] = []
+
+    # Pin the non-NULL-default inheritance columns to NULL on a fresh insert unless provided,
+    # so a partial insert inherits from global config instead of freezing a downgraded default.
+    for col in ("response_mode", "reply_in_channel"):
+        insert_cols.append(col)
+        params.append(provided.get(col))
+        if col in provided:
+            update_assignments.append(f"{col}=excluded.{col}")
+
+    for col, val in provided.items():
+        if col in ("response_mode", "reply_in_channel"):
+            continue
+        insert_cols.append(col)
+        params.append(val)
+        update_assignments.append(f"{col}=excluded.{col}")
+
+    # Attribute authorship only on a structural change. On a fresh insert updated_ts still gets
+    # its column default (a row must have a created stamp); the "don't bump" rule guards UPDATEs.
+    # An anonymous structural write (updated_by=None) still stamps the change time but preserves
+    # the prior author rather than erasing it.
+    insert_cols.append("updated_by")
+    params.append(updated_by if changed_structural else None)
+    if changed_structural:
+        # Bump the stamp/author ONLY when a provided structural column's value actually differs
+        # from the stored row (see change_cond) — a same-value write leaves attribution intact.
+        update_assignments.append(
+            f"updated_ts=CASE WHEN ({change_cond}) THEN CURRENT_TIMESTAMP ELSE updated_ts END")
+        if updated_by is not None:
+            update_assignments.append(
+                f"updated_by=CASE WHEN ({change_cond}) THEN excluded.updated_by ELSE updated_by END")
+
+    placeholders = ", ".join(["?"] * len(insert_cols))
+    cols_sql = ", ".join(insert_cols)
+    if update_assignments:
+        conflict = f"ON CONFLICT(channel_id) DO UPDATE SET {', '.join(update_assignments)}"
+    else:
+        # Only non-structural columns AND the row already exists → nothing changes there;
+        # but a fresh insert still needs to land, so keep the INSERT and no-op the conflict.
+        conflict = "ON CONFLICT(channel_id) DO NOTHING"
+    sql = f"INSERT INTO channel_settings ({cols_sql}) VALUES ({placeholders}) {conflict}"
+    return sql, params
 
 
 class DatabaseManager(LoggerMixin):
@@ -928,6 +1068,102 @@ class DatabaseManager(LoggerMixin):
                 )
             self.conn.commit()
 
+        with self._migration_step("participation redesign: memory cleanup"):
+            self._migrate_participation_redesign()
+
+        with self._migration_step("drop channel_thread_mutes table"):
+            # The per-thread mute mechanism was removed entirely. Drop the normalized table Layer
+            # 0 created. Separately keyed from the participation-redesign step above (not folded
+            # into it) so it is isolated by its own try/except and runs on every boot — including
+            # the already-migrated live DB, which still has the table. DROP TABLE IF EXISTS is
+            # idempotent: a no-op on a fresh DB that never created it and on every re-run.
+            self.conn.execute("DROP TABLE IF EXISTS channel_thread_mutes")
+            self.conn.commit()
+
+    def _migrate_participation_redesign(self):
+        """Layer 0 of the participation-backoff redesign. Idempotent and re-runnable.
+
+        Runs on EVERY init (``_migration_step`` is only a try/except, not a one-time guard), so
+        every step below MUST converge to the same state on a re-run and MUST NOT clobber rows
+        the running system now owns.
+
+        1. Clear the legacy JSON channel_settings.muted_threads column. The per-thread mute
+           mechanism was removed, so there is no longer any table to migrate the entries into —
+           the column is dead weight. Nothing reads it anymore, so nulling it is inert for the
+           running system, and clearing converges on the same state on every re-run. (The table
+           itself is dropped by a separate, later migration step.)
+        2. Delete the old auto-written "butt out / raise the bar" channel-memory facts
+           (author LIKE 'participation_engine:%') — BUT NOT the new per-dimension preference
+           markers (author LIKE 'participation_engine:pref:%'), which are live state the
+           redesign writes and must survive every restart. The old generic facts kept the
+           classifier suppressed channel-wide after the fix; the pref markers replace them.
+        3. Collapse any duplicate preference markers to one row per (channel, dimension) and
+           enforce that with a partial UNIQUE index — the invariant upsert_channel_pref_memory
+           relies on. Done here (not in init_schema) so the dedup runs BEFORE the UNIQUE index
+           is created and a re-run never trips over pre-existing duplicates.
+
+        Structural channel_settings columns are deliberately NOT rewritten: the mute clobber
+        overwrote updated_by, so we cannot prove the stored values were implicit, and the one
+        affected channel was already reset by hand.
+        """
+        # 1. CLEAR the legacy JSON muted_threads column. The per-thread mute mechanism was
+        #    removed, so there is nothing to copy anywhere — just null out the inert column so no
+        #    stale blob lingers. This is the only writer of the column and it converges on the
+        #    same state every re-run.
+        cleared = self.conn.execute(
+            "UPDATE channel_settings SET muted_threads = NULL "
+            "WHERE muted_threads IS NOT NULL AND muted_threads != ''"
+        )
+        if cleared.rowcount:
+            self.log_info(
+                f"DB: Cleared legacy muted_threads JSON on {cleared.rowcount} channel(s)")
+
+        # 2. Remove the stale severe participation-engine memory facts — but PRESERVE the
+        #    per-dimension preference markers (participation_engine:pref:*), which are live
+        #    redesign state, not stale suppression facts.
+        deleted = self.conn.execute(
+            "DELETE FROM channel_memory "
+            "WHERE author LIKE 'participation_engine:%' "
+            "AND author NOT LIKE 'participation_engine:pref:%'"
+        )
+        if deleted.rowcount:
+            self.log_info(
+                f"DB: Removed {deleted.rowcount} stale participation-engine memory fact(s)")
+
+        # 3. One preference marker per (channel, dimension). Collapse any duplicates BEFORE
+        #    creating the partial UNIQUE index the upsert relies on.
+        #    SHOULD-FIX 2: the marker is a CHANNEL-scope row (the upsert only ever writes/reads
+        #    scope='channel'), so both the dedupe and the index predicate must be scoped to
+        #    'channel' — otherwise a same-named WORKSPACE row could be swept by the dedupe or
+        #    collide with a valid channel marker in the (channel_id, author) unique index. And
+        #    keep the FRESHEST row (greatest updated_ts, id as the tie-breaker), not merely the
+        #    highest id: the upsert refreshes a marker in place with a new updated_ts, so a
+        #    later-refreshed but lower-id row must win over a stale higher-id duplicate.
+        #    COALESCE guards any legacy NULL updated_ts (falls back to created_ts, then '').
+        self.conn.execute(
+            "DELETE FROM channel_memory "
+            "WHERE author LIKE 'participation_engine:pref:%' AND scope = 'channel' "
+            "AND id NOT IN ("
+            "  SELECT m.id FROM channel_memory m "
+            "  WHERE m.author LIKE 'participation_engine:pref:%' AND m.scope = 'channel' "
+            "  AND NOT EXISTS ("
+            "    SELECT 1 FROM channel_memory m2 "
+            "    WHERE m2.author LIKE 'participation_engine:pref:%' AND m2.scope = 'channel' "
+            "    AND m2.channel_id = m.channel_id AND m2.author = m.author "
+            "    AND (COALESCE(m2.updated_ts, m2.created_ts, '') > COALESCE(m.updated_ts, m.created_ts, '') "
+            "      OR (COALESCE(m2.updated_ts, m2.created_ts, '') = COALESCE(m.updated_ts, m.created_ts, '') "
+            "          AND m2.id > m.id))))"
+        )
+        # Drop first so a re-run REPLACES an index created under the old (scope-agnostic)
+        # predicate; CREATE ... IF NOT EXISTS alone would silently keep the stale predicate.
+        self.conn.execute("DROP INDEX IF EXISTS idx_channel_memory_pref_marker")
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_memory_pref_marker "
+            "ON channel_memory (channel_id, author) "
+            "WHERE author LIKE 'participation_engine:pref:%' AND scope = 'channel'"
+        )
+        self.conn.commit()
+
     # Thread operations
     def get_or_create_thread(self, thread_id: str, channel_id: str, user_id: Optional[str] = None) -> Dict:
         """
@@ -1031,7 +1267,10 @@ class DatabaseManager(LoggerMixin):
         return {
             "response_mode": row["response_mode"],
             "directives": row["directives"],
-            "reply_in_channel": bool(row["reply_in_channel"]),
+            # NULL reply_in_channel stays None (inherit → resolves to config.reply_in_channel_default
+            # at read time). Collapsing NULL to False here erased the inherit distinction.
+            "reply_in_channel": (None if row["reply_in_channel"] is None
+                                 else bool(row["reply_in_channel"])),
             "participation_level": row["participation_level"],
             "snoozed_until": row["snoozed_until"],
             "muted_threads": _decode_muted_threads(row["muted_threads"]),
@@ -1048,45 +1287,27 @@ class DatabaseManager(LoggerMixin):
                              muted_threads=_UNSET,
                              model=_UNSET, reasoning_effort=_UNSET, verbosity=_UNSET,
                              updated_by: Optional[str] = None):
-        """Upsert per-channel settings (Phase 7; Phase F adds participation_level/snoozed_until;
-        F15 adds muted_threads).
+        """Upsert per-channel settings (Phase 7; Phase F adds participation_level/snoozed_until).
 
-        Omitted fields are preserved. An explicit value sets it; an explicit None CLEARS it
-        (→ NULL) so the modal's "inherit from global default" stores NULL rather than a literal
-        string (NULL then resolves to the global default at read time). muted_threads takes a
-        Python list (stored as JSON); None/[] clears it.
+        Atomic partial write: ONLY the explicitly-provided fields are written — omitted fields are
+        preserved untouched (never rewritten, so no clobber and no race with a concurrent save).
+        An explicit value sets a field; an explicit None CLEARS it (→ NULL) so the modal's "inherit
+        from global default" stores NULL rather than a copied default (NULL then resolves to the
+        global default at read time). updated_ts/updated_by bump only when a STRUCTURAL field
+        changed. muted_threads is a deprecated inert JSON column (nothing reads it — the
+        per-thread mute mechanism was removed); it takes a Python list, None/[] clears it.
         """
-        existing = self.get_channel_settings(channel_id) or {}
-        new_mode = existing.get("response_mode", "tag_only") if response_mode is _UNSET else response_mode
-        new_dir = existing.get("directives") if directives is _UNSET else directives
-        new_ric = existing.get("reply_in_channel", False) if reply_in_channel is _UNSET else reply_in_channel
-        new_level = existing.get("participation_level") if participation_level is _UNSET else participation_level
-        new_snooze = existing.get("snoozed_until") if snoozed_until is _UNSET else snoozed_until
-        new_muted = existing.get("muted_threads") if muted_threads is _UNSET else muted_threads
-        new_model = existing.get("model") if model is _UNSET else model
-        new_effort = existing.get("reasoning_effort") if reasoning_effort is _UNSET else reasoning_effort
-        new_verb = existing.get("verbosity") if verbosity is _UNSET else verbosity
-        self.conn.execute("""
-            INSERT INTO channel_settings (channel_id, response_mode, directives, reply_in_channel,
-                                          participation_level, snoozed_until, muted_threads, model,
-                                          reasoning_effort, verbosity, updated_ts, updated_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
-            ON CONFLICT(channel_id) DO UPDATE SET
-                response_mode=excluded.response_mode,
-                directives=excluded.directives,
-                reply_in_channel=excluded.reply_in_channel,
-                participation_level=excluded.participation_level,
-                snoozed_until=excluded.snoozed_until,
-                muted_threads=excluded.muted_threads,
-                model=excluded.model,
-                reasoning_effort=excluded.reasoning_effort,
-                verbosity=excluded.verbosity,
-                updated_ts=CURRENT_TIMESTAMP,
-                updated_by=excluded.updated_by
-        """, (channel_id, new_mode, new_dir, 1 if new_ric else 0, new_level, new_snooze,
-              _encode_muted_threads(new_muted), new_model, new_effort, new_verb, updated_by))
+        built = _build_channel_settings_write(
+            channel_id, response_mode=response_mode, directives=directives,
+            reply_in_channel=reply_in_channel, participation_level=participation_level,
+            snoozed_until=snoozed_until, muted_threads=muted_threads, model=model,
+            reasoning_effort=reasoning_effort, verbosity=verbosity, updated_by=updated_by)
+        if built is None:
+            return
+        sql, params = built
+        self.conn.execute(sql, params)
         self.conn.commit()
-        logger.debug(f"Saved channel_settings for {channel_id}: mode={new_mode}, level={new_level}")
+        logger.debug(f"Saved channel_settings for {channel_id}")
 
     # --- Per-channel memory (Phase 9) ---
     def get_channel_memory(self, channel_id: str) -> List[Dict]:
@@ -2602,7 +2823,9 @@ class DatabaseManager(LoggerMixin):
                 return {
                     "response_mode": row["response_mode"],
                     "directives": row["directives"],
-                    "reply_in_channel": bool(row["reply_in_channel"]),
+                    # NULL stays None (inherit → config.reply_in_channel_default at read time).
+                    "reply_in_channel": (None if row["reply_in_channel"] is None
+                                         else bool(row["reply_in_channel"])),
                     "participation_level": row["participation_level"],
                     "snoozed_until": row["snoozed_until"],
                     "muted_threads": _decode_muted_threads(row["muted_threads"]),
@@ -2619,61 +2842,27 @@ class DatabaseManager(LoggerMixin):
                                          muted_threads=_UNSET,
                                          model=_UNSET, reasoning_effort=_UNSET, verbosity=_UNSET,
                                          updated_by: Optional[str] = None):
-        """Async version of set_channel_settings (Phase F adds participation_level/snoozed_until;
-        F15 adds muted_threads).
+        """Async version of set_channel_settings (Phase F adds participation_level/snoozed_until).
 
-        Omitted fields are preserved; an explicit None CLEARS the column to NULL (so the modal's
-        "inherit" selection resolves to the global default at read time). muted_threads takes a
-        Python list (stored as JSON); None/[] clears it.
+        Atomic partial write — ONLY provided fields are written, omitted fields preserved (no
+        read-modify-write of the whole row, so no race with a concurrent modal save). Explicit None
+        CLEARS to NULL (inherit); updated_ts/updated_by bump only on a STRUCTURAL change.
+        muted_threads is a deprecated inert JSON column (nothing reads it — the per-thread mute
+        mechanism was removed).
         """
-        existing = await self.get_channel_settings_async(channel_id) or {}
-        new_mode = existing.get("response_mode", "tag_only") if response_mode is _UNSET else response_mode
-        new_dir = existing.get("directives") if directives is _UNSET else directives
-        new_ric = existing.get("reply_in_channel", False) if reply_in_channel is _UNSET else reply_in_channel
-        new_level = existing.get("participation_level") if participation_level is _UNSET else participation_level
-        new_snooze = existing.get("snoozed_until") if snoozed_until is _UNSET else snoozed_until
-        new_muted = existing.get("muted_threads") if muted_threads is _UNSET else muted_threads
-        new_model = existing.get("model") if model is _UNSET else model
-        new_effort = existing.get("reasoning_effort") if reasoning_effort is _UNSET else reasoning_effort
-        new_verb = existing.get("verbosity") if verbosity is _UNSET else verbosity
+        built = _build_channel_settings_write(
+            channel_id, response_mode=response_mode, directives=directives,
+            reply_in_channel=reply_in_channel, participation_level=participation_level,
+            snoozed_until=snoozed_until, muted_threads=muted_threads, model=model,
+            reasoning_effort=reasoning_effort, verbosity=verbosity, updated_by=updated_by)
+        if built is None:
+            return
+        sql, params = built
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("PRAGMA journal_mode=WAL")
-            await db.execute("""
-                INSERT INTO channel_settings (channel_id, response_mode, directives, reply_in_channel,
-                                              participation_level, snoozed_until, muted_threads, model,
-                                              reasoning_effort, verbosity, updated_ts, updated_by)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
-                ON CONFLICT(channel_id) DO UPDATE SET
-                    response_mode=excluded.response_mode,
-                    directives=excluded.directives,
-                    reply_in_channel=excluded.reply_in_channel,
-                    participation_level=excluded.participation_level,
-                    snoozed_until=excluded.snoozed_until,
-                    muted_threads=excluded.muted_threads,
-                    model=excluded.model,
-                    reasoning_effort=excluded.reasoning_effort,
-                    verbosity=excluded.verbosity,
-                    updated_ts=CURRENT_TIMESTAMP,
-                    updated_by=excluded.updated_by
-            """, (channel_id, new_mode, new_dir, 1 if new_ric else 0, new_level, new_snooze,
-                  _encode_muted_threads(new_muted), new_model, new_effort, new_verb, updated_by))
+            await db.execute(sql, params)
             await db.commit()
-            logger.debug(f"Saved channel_settings for {channel_id} (async): mode={new_mode}, level={new_level}")
-
-    async def add_muted_thread_async(self, channel_id: str, thread_ts: str,
-                                     updated_by: Optional[str] = None) -> bool:
-        """F15: permanently mute a thread for unprompted participation (a "butt out"
-        backoff). Read-modify-write of the channel's muted_threads list; idempotent —
-        re-muting an already-muted thread is a no-op. Returns True when newly added."""
-        if not channel_id or not thread_ts:
-            return False
-        existing = await self.get_channel_settings_async(channel_id) or {}
-        muted = list(existing.get("muted_threads") or [])
-        if str(thread_ts) in muted:
-            return False
-        muted.append(str(thread_ts))
-        await self.set_channel_settings_async(channel_id, muted_threads=muted, updated_by=updated_by)
-        return True
+            logger.debug(f"Saved channel_settings for {channel_id} (async)")
 
     # --- Per-channel memory (Phase 9), async variants ---
     async def get_channel_memory_async(self, channel_id: str) -> List[Dict]:
@@ -2718,6 +2907,189 @@ class DatabaseManager(LoggerMixin):
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("DELETE FROM channel_memory WHERE id = ?", (memory_id,))
             await db.commit()
+
+    async def upsert_channel_pref_memory(self, channel_id: str, marker_author: str,
+                                         content: str, max_rows: Optional[int] = None
+                                         ) -> Optional[int]:
+        """Atomically write-or-refresh the SINGLE per-channel participation preference marker
+        (author == ``marker_author``, e.g. ``participation_engine:pref:reactions``), returning
+        its row id — or ``None`` when a new marker is declined because the channel is at the
+        memory-row cap.
+
+        Why a bespoke helper (participation redesign, SHOULD-FIX #8): the old
+        read-all-then-insert in _apply_pref_memory raced (two concurrent "react less" verdicts
+        both saw "no marker" and both INSERTed a duplicate) and an ``update:<id>`` path could
+        leave the row authored by something other than the marker. This does the existence
+        check, the cap check, and the write inside ONE ``BEGIN IMMEDIATE`` transaction (the
+        connection is opened in autocommit so the explicit transaction is ours to control), so
+        concurrent callers serialize and converge on exactly one marker row per (channel,
+        dimension) — an invariant also pinned by the partial UNIQUE index
+        idx_channel_memory_pref_marker. The stored/updated row's author is ALWAYS the marker.
+
+        The cap mirrors remember_fact: at MEMORY_MAX_ROWS with no marker yet, decline rather
+        than evict a human's memory. An existing marker is always refreshed (a refresh frees no
+        slot and adds no row, so the cap never blocks it).
+        """
+        if not channel_id or not marker_author:
+            return None
+        async with aiosqlite.connect(self.db_path, isolation_level=None) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT id FROM channel_memory "
+                    "WHERE channel_id = ? AND author = ? AND scope = 'channel' LIMIT 1",
+                    (channel_id, marker_author),
+                ) as cur:
+                    existing = await cur.fetchone()
+                if existing is not None:
+                    row_id = existing[0]
+                    await db.execute(
+                        "UPDATE channel_memory SET content = ?, updated_ts = CURRENT_TIMESTAMP "
+                        "WHERE id = ?",
+                        (content, row_id),
+                    )
+                    await db.execute("COMMIT")
+                    return row_id
+                if max_rows is not None:
+                    async with db.execute(
+                        "SELECT COUNT(*) FROM channel_memory "
+                        "WHERE scope = 'channel' AND channel_id = ?",
+                        (channel_id,),
+                    ) as cur:
+                        (count,) = await cur.fetchone()
+                    if count >= max(1, int(max_rows)):
+                        await db.execute("ROLLBACK")
+                        return None
+                cur = await db.execute(
+                    "INSERT INTO channel_memory (channel_id, scope, content, author) "
+                    "VALUES (?, 'channel', ?, ?)",
+                    (channel_id, content, marker_author),
+                )
+                await db.execute("COMMIT")
+                return cur.lastrowid
+            except Exception:
+                await db.execute("ROLLBACK")
+                raise
+
+    async def reconcile_channel_memory_from_textarea_async(
+        self, channel_id: str, seed: list, lines: list, author: str, max_rows: int
+    ) -> dict:
+        """Reconcile channel-scope memory against an edited textarea in ONE atomic transaction.
+
+        The settings modal renders channel memory as a multiline textarea (one note per line). On
+        submit the handler passes:
+          - ``seed``: the ``[memory_id, content_hash]`` pairs captured at modal-OPEN (channel
+            scope, non-blank rows only) — the exact snapshot the user edited.
+          - ``lines``: the submitted textarea lines, already ``normalize_memory_line``-d with
+            blanks dropped, deduped, order preserved (re-normalized defensively here).
+
+        Keep / delete / add, all inside one ``BEGIN IMMEDIATE`` transaction (mirrors
+        ``upsert_channel_pref_memory``'s autocommit-plus-explicit-txn style) so a concurrent modal
+        save serializes and a partial failure rolls back — never a half-applied edit:
+          - KEEP a seed whose hash still appears in the textarea → untouched (author preserved).
+          - DELETE a seed whose hash left the textarea, but ONLY if the row still exists AND its
+            current content still hashes to the seed hash (unchanged since open). If it changed
+            since open, count a ``conflict`` and leave it (never clobber a concurrent edit). If it
+            is already gone, silently skip (never resurrect a row deleted elsewhere).
+          - ADD each textarea line matching NO seed hash AND no surviving channel row's content
+            (dedup vs unseeded rows). ``max_rows`` counts ALL remaining channel rows (current −
+            deletes + adds-so-far); overflow lines are skipped and counted in ``over_cap``.
+
+        Returns ``{'deleted': [ids], 'added': [contents], 'conflicts': int, 'over_cap': int}``.
+        Never raises on empty seed/lines: a fully-blanked box (``lines=[]``) deletes every
+        still-unchanged seeded row and adds nothing.
+        """
+        result: Dict[str, Any] = {"deleted": [], "added": [], "conflicts": 0, "over_cap": 0}
+        if not channel_id:
+            return result
+
+        # Defensive re-normalize + dedup by hash, order preserved (the handler already did this;
+        # a second pass keeps the method correct when called directly, e.g. from tests).
+        norm_lines: List[str] = []
+        line_hashes: set = set()
+        for raw in (lines or []):
+            n = normalize_memory_line(raw)
+            if not n:
+                continue
+            h = memory_content_hash(n)
+            if h in line_hashes:
+                continue
+            line_hashes.add(h)
+            norm_lines.append(n)
+
+        cap = max(1, int(max_rows)) if max_rows is not None else None
+
+        async with aiosqlite.connect(self.db_path, isolation_level=None) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                # 1. Snapshot all current channel-scope rows → {id: content}.
+                async with db.execute(
+                    "SELECT id, content FROM channel_memory "
+                    "WHERE scope = 'channel' AND channel_id = ?",
+                    (channel_id,),
+                ) as cur:
+                    current: Dict[Any, str] = {
+                        row["id"]: row["content"] for row in await cur.fetchall()
+                    }
+
+                # 2-4. Walk the seed once: keep, delete-if-unchanged, or record a conflict.
+                deleted_ids: List[Any] = []
+                seed_hashes: set = set()
+                for entry in (seed or []):
+                    try:
+                        mem_id, seed_hash = entry[0], entry[1]
+                    except (TypeError, IndexError, KeyError):
+                        continue
+                    seed_hashes.add(seed_hash)
+                    if seed_hash in line_hashes:
+                        continue  # KEEP — still present in the textarea, leave untouched.
+                    cur_content = current.get(mem_id)
+                    if cur_content is None:
+                        continue  # Already deleted elsewhere — nothing to do, no conflict.
+                    if memory_content_hash(cur_content) == seed_hash:
+                        await db.execute(
+                            "DELETE FROM channel_memory WHERE id = ?", (mem_id,))
+                        deleted_ids.append(mem_id)
+                        current.pop(mem_id, None)
+                    else:
+                        # Changed elsewhere since open — never clobber the concurrent edit.
+                        result["conflicts"] += 1
+
+                # 5. ADD. Dedup a new line against every seed hash (its KEEP row already covers it)
+                #    and against the content of every channel row that survived deletion.
+                surviving_hashes: set = {
+                    memory_content_hash(c) for c in current.values()
+                }
+                remaining = len(current)
+                added: List[str] = []
+                for n in norm_lines:
+                    h = memory_content_hash(n)
+                    if h in seed_hashes or h in surviving_hashes:
+                        continue
+                    if cap is not None and remaining >= cap:
+                        result["over_cap"] += 1
+                        continue
+                    await db.execute(
+                        "INSERT INTO channel_memory (channel_id, scope, content, author) "
+                        "VALUES (?, 'channel', ?, ?)",
+                        (channel_id, n, author),
+                    )
+                    added.append(n)
+                    surviving_hashes.add(h)
+                    remaining += 1
+
+                await db.execute("COMMIT")
+                result["deleted"] = deleted_ids
+                result["added"] = added
+                return result
+            except Exception:
+                await db.execute("ROLLBACK")
+                raise
 
     # --- Response feedback (Phase H) ---
     async def record_response_feedback_async(self, channel_id: str, thread_ts: Optional[str],

@@ -2,8 +2,9 @@
 
 Covers the design points: schema + required params, markdown-converted post into the
 TARGET thread via the standard messaging layer, own-reply pulse recording keyed on the
-target thread, the three refusal rails (muted target, current-thread double-post, empty
-text), provenance listing, and the never-raises contract on a Slack API failure.
+target thread, the refusal rails (current-thread double-post, empty text, missing
+thread_ts, disabled), provenance listing, and the never-raises contract on a Slack API
+failure. The per-thread mute mechanism was removed, so the tool posts with NO mute lookup.
 """
 from unittest.mock import AsyncMock, MagicMock
 
@@ -17,9 +18,11 @@ from slack_client.formatting.text import SlackFormattingMixin
 import prompts
 
 
-def _ctx(channel="C1", thread="root.1", trigger="msg.1", muted=None):
+def _ctx(channel="C1", thread="root.1", trigger="msg.1"):
+    # The per-thread mute mechanism was removed: post_to_thread no longer consults any mute
+    # state. The db still exposes is_thread_muted_async so a test can prove it is NEVER called.
     db = MagicMock()
-    db.get_channel_settings_async = AsyncMock(return_value={"muted_threads": muted or []})
+    db.is_thread_muted_async = AsyncMock(return_value=True)
     return ToolContext(channel_id=channel, thread_ts=thread, trigger_ts=trigger,
                        client=MagicMock(), db=db)
 
@@ -119,14 +122,18 @@ async def test_routes_through_send_message(monkeypatch):
 # ------------------------------------------------------------------- refusals
 
 @pytest.mark.asyncio
-async def test_muted_thread_refused(monkeypatch):
+async def test_posts_with_no_mute_lookup(monkeypatch):
+    # Even against a target the old code would have refused as "muted", the tool now posts and
+    # NEVER consults is_thread_muted_async — the mute mechanism is gone.
     monkeypatch.setattr(config, "enable_post_to_thread_tool", True)
     host = _light_host()
+    ctx = _ctx()
     out = await host.execute_post_to_thread(
-        _ctx(muted=["OTHER.9"]), {"thread_ts": "OTHER.9", "text": "hello"}
+        ctx, {"thread_ts": "OTHER.9", "text": "hello"}
     )
-    assert out["ok"] is False and out["error"] == "thread_muted_by_user"
-    host.send_message.assert_not_awaited()
+    assert out["ok"] is True and out["posted_ts"] == "900.0"
+    ctx.db.is_thread_muted_async.assert_not_awaited()
+    host.send_message.assert_awaited_once_with("C1", "OTHER.9", "hello")
 
 
 @pytest.mark.asyncio

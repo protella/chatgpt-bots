@@ -1239,6 +1239,16 @@ async def execute_delete_canvas(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
     canvas_id = (args.get("canvas_id") or "").strip()
     if not canvas_id:
         return _err("missing_canvas_id", "A canvas_id is required.")
+    # Defense-in-depth (mirrors participation_tools): `_delete_enabled` already withholds the tool
+    # unless a HUMAN directly addressed the bot, but this is the one irreversible canvas op, so
+    # re-check the raw sender classification off ctx.message and refuse a NON-human author outright.
+    # A bot-authored @mention (dispatched to the main handler un-gated) must never reach an
+    # irreversible delete even if the tool were somehow offered. Absent classification → rely on the
+    # schema gate (never fail closed on paths that omit it).
+    msg = getattr(ctx, "message", None)
+    sender_type = (getattr(msg, "metadata", None) or {}).get("sender_type") if msg is not None else None
+    if sender_type is not None and sender_type != "human":
+        return _err("not_human_sender", "A canvas can only be deleted at a person's request.")
     if not await _shared_into_channel(ctx, canvas_id):
         return _err("not_in_this_channel", f"{canvas_id} is not a canvas in this channel.")
 
@@ -1283,23 +1293,24 @@ def _enabled(_cfg: dict) -> bool:
 
 
 def _delete_enabled(cfg: dict) -> bool:
-    """Deletion is offered ONLY when a person actually ADDRESSED the bot.
+    """Deletion is offered ONLY when a PERSON directly addressed the bot in this message.
 
     The danger was never the user asking — "delete that canvas" is an ordinary request and they
     own their channel. The danger is the bot deciding to tidy up: on a turn nobody addressed it
     in, it is reading along and inferring what would be helpful, and a tool that irreversibly
     destroys a shared document has no business being on the table for that.
 
-    Keyed off `_addressed_turn`, NOT `_unprompted_turn`. The latter is set for every channel
-    message that went through the participation gate — including one that called the bot by name
-    — so gating on it withheld delete from "ChatGPT, delete that canvas", which is precisely the
-    case this tool exists to serve. Being called by name is prompted in spirit.
+    Keyed off `_canvas_delete_authorized` (handlers.text `_materialize_request_tools`): a HUMAN
+    sender AND a genuine current-message address — a real <@bot> mention or a DM. A bare name-hit
+    does NOT qualify (the `participation_name_hit` regex also fires on a message that merely QUOTES
+    the bot's name), and a NON-human other_bot @mention does not either. Absent → fail CLOSED: a
+    destructive tool must never default to available on a config that skipped the derivation.
     """
     if not getattr(config, "enable_canvas_tools", True):
         return False
     if not getattr(config, "enable_canvas_delete", True):
         return False
-    return bool(cfg.get("_addressed_turn", True))
+    return bool(cfg.get("_canvas_delete_authorized", False))
 
 
 def register_canvas_tools(registry: ToolRegistry) -> None:
@@ -1314,8 +1325,9 @@ def register_canvas_tools(registry: ToolRegistry) -> None:
                          canvas (and a second tab, forever) is not a mistake that can be made
 
     Delete is the odd one out twice over: it excludes the channel canvas from its enum, and it is
-    withheld on UNPROMPTED turns (see `_delete_enabled`), so the model can honour "delete that
-    canvas" but can never decide to tidy up a channel it was only listening in.
+    withheld unless a PERSON directly addressed the bot in this message (see `_delete_enabled`), so
+    the model can honour a genuine "delete that canvas" but can never decide to tidy up a channel it
+    was only listening in.
     """
     registry.register(get_create_channel_canvas_schema, execute_create_channel_canvas,
                       enabled=_enabled, name="create_channel_canvas")
