@@ -29,6 +29,9 @@ class _WakeHost:
     def _build_channel_people_line(self, *a, **k):
         return None
 
+    def _build_taggable_speakers_block(self, *a, **k):
+        return None
+
     def _build_generation_inflight_note(self, *a, **k):
         return None
 

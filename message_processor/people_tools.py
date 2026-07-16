@@ -82,10 +82,11 @@ def get_list_channel_members_schema() -> Dict[str, Any]:
         "type": "function",
         "name": "list_channel_members",
         "description": (
-            "List the members of the CURRENT channel — their names and the total count. Use it "
-            "when asked who is in this channel, who's here, or how many people are in the "
-            "channel. Names resolve to real/display names; a large channel is truncated with an "
-            "explicit note (never a silent cap)."
+            "List the members of the CURRENT channel — each as {id, name} plus the total count. "
+            "Use it when asked who is in this channel, who's here, or how many people are in the "
+            "channel, OR to get the Slack id needed to @-mention someone who hasn't spoken "
+            "recently (mention them by writing their id as <@id>). Names resolve to real/display "
+            "names; a large channel is truncated with an explicit note (never a silent cap)."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     }
@@ -228,29 +229,32 @@ async def execute_list_channel_members(ctx: ToolContext, args: Dict[str, Any]) -
 
     total = len(ids)
     shown_ids = ids[:MEMBERS_NAME_CAP]
-    names: List[str] = []
+    # A3: pair each resolved name with its Slack id so the model gets a MENTIONABLE handle
+    # (write <@id>), not just a name it would have to guess an id for.
+    members: List[Dict[str, str]] = []
     for uid in shown_ids:
         try:
-            names.append(await ctx.client.get_username(uid, api))
+            name = await ctx.client.get_username(uid, api)
         except Exception:
-            names.append(uid)
+            name = uid
+        members.append({"id": uid, "name": name})
 
     result: Dict[str, Any] = {
         "ok": True,
         "channel": channel_id,
         "total_members": total,
-        "shown": len(names),
-        "members": names,
+        "shown": len(members),
+        "members": members,
     }
     if count_is_partial:
         result["count_is_partial"] = True
         result["total_members_note"] = (
             f"At least {total} members — the channel is large enough that the full roster "
             "wasn't paginated; treat the count as a floor.")
-    if total > len(names):
+    if total > len(members):
         result["truncated"] = True
         result["note"] = (
-            f"Only the first {len(names)} of {total} members are named here — this is a "
+            f"Only the first {len(members)} of {total} members are named here — this is a "
             "PARTIAL roster, not the full list; say so if you relay it.")
     return result
 

@@ -192,9 +192,27 @@ async def test_list_members_paginates_and_resolves_names():
     client, api = _client(members_pages=pages)
     res = await execute_list_channel_members(_ctx(client), {})
     assert res["ok"] and res["total_members"] == 3
-    assert res["members"] == ["name-of-U1", "name-of-U2", "name-of-U3"]
+    # A3: each member is now {id, name} so the model gets a MENTIONABLE handle (write <@id>),
+    # not just a name it would have to guess an id for.
+    assert res["members"] == [
+        {"id": "U1", "name": "name-of-U1"},
+        {"id": "U2", "name": "name-of-U2"},
+        {"id": "U3", "name": "name-of-U3"},
+    ]
+    assert res["shown"] == 3
     assert "truncated" not in res
     assert api.conversations_members.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_list_members_surfaces_ids_for_mentioning():
+    # A3: the id half of every {id, name} pair is the Slack id, so the model can @-mention a
+    # member who hasn't spoken by writing <@id> — the whole point of the tool's amendment.
+    pages = [_members_page(["U07ALICE", "W02BOB"])]
+    client, _ = _client(members_pages=pages)
+    res = await execute_list_channel_members(_ctx(client), {})
+    assert {m["id"] for m in res["members"]} == {"U07ALICE", "W02BOB"}
+    assert all(set(m.keys()) == {"id", "name"} for m in res["members"])
 
 
 @pytest.mark.asyncio
@@ -204,6 +222,10 @@ async def test_list_members_caps_names_with_loud_note():
     res = await execute_list_channel_members(_ctx(client), {})
     assert res["ok"] and res["total_members"] == MEMBERS_NAME_CAP + 5
     assert len(res["members"]) == MEMBERS_NAME_CAP           # names capped
+    assert res["shown"] == MEMBERS_NAME_CAP
+    # capped members retain the {id, name} shape (truncation counts the dicts, never a lie)
+    assert all(set(m.keys()) == {"id", "name"} for m in res["members"])
+    assert res["members"][0] == {"id": "U0", "name": "name-of-U0"}
     assert res["truncated"] is True
     assert "PARTIAL" in res["note"] and str(MEMBERS_NAME_CAP) in res["note"]
 

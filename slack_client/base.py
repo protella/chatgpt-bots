@@ -16,7 +16,7 @@ from .event_handlers import (
 )
 from .utilities import SlackUtilitiesMixin
 from .formatting.text import SlackFormattingMixin
-from .messaging import SlackMessagingMixin
+from .messaging import SlackMessagingMixin, WorkspaceEmojiCache
 from .history_tool import SlackHistoryToolMixin
 from .search_tool import SlackSearchToolMixin
 from .channel_pulse import ChannelPulse
@@ -69,6 +69,11 @@ class SlackBot(SlackMessageEventsMixin,
         # Initialize settings modal handler
         self.settings_modal = SettingsModal(self.db)
 
+        # C1: workspace custom-emoji cache (emoji.list), reachable from the react_to_message
+        # schema factory and the participation gate via client.workspace_emojis. Warmed once at
+        # start(); refreshes lazily. Present before the registry build so the factory can read it.
+        self.workspace_emojis = WorkspaceEmojiCache(self)
+
         # Local tools the model can call through the function-call loop (Phase A).
         # Flags are read at construction — flipping them requires a restart, like all env config.
         self.tool_registry = self._build_tool_registry()
@@ -92,7 +97,10 @@ class SlackBot(SlackMessageEventsMixin,
         # F20: no longer gated on a non-empty REACTION_EMOJIS — the default is unrestricted
         # judgment (any standard emoji); an allowlist, when set, only constrains the choice.
         if config.enable_reactions and config.enable_react_tool:
-            registry.register(self.get_react_tool_schema(), self.execute_react_tool)
+            # C4: registered as a FACTORY (bound method, called per request as schema(cfg)) so
+            # the emoji-field description reflects the live custom-emoji cache without a restart.
+            registry.register(self.get_react_tool_schema, self.execute_react_tool,
+                              name="react_to_message")
         # F23: cross-thread reply into a DIFFERENT thread of the current channel (write-scoped
         # to this channel; muted target threads refused by the executor).
         if config.enable_post_to_thread_tool:
