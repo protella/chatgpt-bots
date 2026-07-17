@@ -1061,3 +1061,73 @@ class TestSegmentJoin:
         assert join_segments(["only"]) == "only"
         assert join_segments(["a", "", "b"]) == "a\n\nb"           # the empty middle round vanishes
         assert join_segments([]) == ""
+
+
+class TestCommittedTextReplay:
+    """A streaming round's pre-tool preamble has ALREADY streamed to Slack — text is only
+    suppressed once a function_call appears. Without replaying it into the next round's input
+    the model has no record of having spoken, says the same thing again, and the repeat lands
+    in the SAME streamed message: "Making that now. Making that now."
+    """
+
+    @staticmethod
+    def _streaming(rounds, seen):
+        """Scripted streaming rounds: one (text, sink) per round; `seen` collects the input
+        each round was handed, which is what the replay is asserted against."""
+        state = {"n": 0}
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            seen.append(list(messages))
+            text, sink = rounds[min(state["n"], len(rounds) - 1)]
+            state["n"] += 1
+            if tool_choice != "none" and function_call_sink is not None:
+                function_call_sink.extend(sink)
+            return text
+
+        return fake_streaming
+
+    async def _run_streaming(self, monkeypatch, rounds, seen):
+        monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                            self._streaming(rounds, seen))
+        return await tool_loop.create_streaming_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with(),
+            tool_context=ToolContext(), stream_callback=lambda c: None,
+            tool_callback=lambda t, s: None)
+
+    @pytest.mark.asyncio
+    async def test_preamble_replays_ahead_of_the_rounds_own_items(self, monkeypatch):
+        """And it lands BEFORE them: a reasoning item and the function_call it belongs to must
+        stay adjacent, which the Responses API requires for stateless replay."""
+        seen = []
+        reasoning = {"type": "reasoning", "item": {"type": "reasoning", "id": "rs_1"}}
+        rounds = [("Making that now.", [reasoning, _call()]), ("Done.", [])]
+        await self._run_streaming(monkeypatch, rounds, seen)
+
+        second = seen[1]
+        assert second[0] == {"role": "assistant", "content": "Making that now."}
+        assert [i.get("type") for i in second[1:]] == [
+            "reasoning", "function_call", "function_call_output"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("preamble", ["", "   \n  "])
+    async def test_a_silent_round_injects_no_assistant_turn(self, monkeypatch, preamble):
+        """Nothing reached Slack, so there is nothing to remember having said."""
+        seen = []
+        await self._run_streaming(monkeypatch, [(preamble, [_call()]), ("Done.", [])], seen)
+        assert not any(i.get("role") == "assistant" for i in seen[1])
+
+    @pytest.mark.asyncio
+    async def test_the_non_streaming_loop_deliberately_does_not_replay(self, monkeypatch):
+        """Its intermediate text is DISCARDED rather than shown, so the model repeating it in
+        the final round is exactly right — that repeat is the only copy the user ever sees.
+        Replaying here would teach the model it had already spoken when it hadn't."""
+        fake = _FakeRounds([("Making that now.", [_call()]), ("Making that now. Done.", [])])
+        monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake)
+
+        out = await tool_loop.create_text_response_with_tool_loop(
+            _Client(), messages=[], tools=[], registry=_registry_with(),
+            tool_context=ToolContext())
+        assert out["text"] == "Making that now. Done."
+        assert not any(i.get("role") == "assistant"
+                       for i in fake.invocations[1]["messages"])

@@ -25,7 +25,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-import pytest
 
 from base_client import Message
 from message_processor import canvas_tools as ct
