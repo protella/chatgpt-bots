@@ -621,7 +621,7 @@ async def execute_edit_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
         thread_id=ctx.thread_ts, thread_key=thread_key, image_data=image_data,
         checklist=checklist, generation_id=None, prompt=image_data.prompt,
         db=ctx.db, thread_manager=processor.thread_manager, unprompted=False,
-        message_ts=ctx.trigger_ts, image_type="edited",
+        message_ts=ctx.trigger_ts, image_type="edited", provenance_tool="edit_image",
     )
     if not file_url:
         return _err("post_failed", "The edited image was created but could not be posted.")

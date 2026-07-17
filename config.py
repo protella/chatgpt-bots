@@ -663,6 +663,27 @@ class BotConfig:
     tool_provenance_gist_chars: int = field(default_factory=lambda: int(os.getenv("TOOL_PROVENANCE_GIST_CHARS", "80")))
     # "[used tools: …]" annotation line budget; over it the line degrades to names only.
     tool_provenance_line_budget: int = field(default_factory=lambda: int(os.getenv("TOOL_PROVENANCE_LINE_BUDGET", "300")))
+    # F7 on a bot-posted IMAGE: files_upload_v2 returns no share ts, so the image message's ts
+    # has to be polled out of files.info, which Slack populates asynchronously. Wall-clock
+    # bound on that poll. Measured live 2026-07-16: the share appeared ~1.8s after upload in a
+    # private channel and ~3.8s in a DM (the slow case), so 15s is ~4x headroom over the worst
+    # observation. Provenance is invisible, so it can afford to keep polling: the image is
+    # already posted, and on timeout it simply keeps today's (missing) provenance. Only read
+    # when enable_tool_provenance is on.
+    image_share_ts_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("IMAGE_SHARE_TS_TIMEOUT_SECONDS", "15.0")))
+    # How long the "Uploading…" indicator may keep waiting for that SAME share record before
+    # giving up and completing anyway. The share is what makes the image actually VISIBLE, so
+    # this decides whether the user watches a spinner or an empty gap. It is deliberately NOT
+    # image_share_ts_timeout_seconds: this bound is visible and that one guards an invisible
+    # DB row, so they fail in different directions and want different numbers.
+    # Measured live 2026-07-17, upload-return → visible: 2.9-3.4s for a 3MB image, 4.1-4.7s
+    # for 7MB, 5.4s for a real generation. It tracks image SIZE, so it will drift with whatever
+    # the image model emits — hence the per-image log in image_delivery rather than trust in
+    # this constant. 12s is ~2.2x the worst of those.
+    # Erring long is the cheaper mistake: the wait ends when the share lands, so this only
+    # bites when Slack is genuinely misbehaving, whereas erring short quietly re-opens the very
+    # gap it exists to close. Expiring is not a failure — it just restores the old behavior.
+    image_indicator_hold_seconds: float = field(default_factory=lambda: float(os.getenv("IMAGE_INDICATOR_HOLD_SECONDS", "12.0")))
     # Age (days) after which tool-use provenance rows are swept by the cleanup worker (F7/F14).
     tool_usage_retention_days: int = field(default_factory=lambda: int(os.getenv("TOOL_USAGE_RETENTION_DAYS", "90")))
     # Age (days) after which stored document-extraction rows (metadata + summary) are swept.

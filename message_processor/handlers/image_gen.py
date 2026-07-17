@@ -37,7 +37,7 @@ class ImageJobMixin:
                 thread_key=thread_key, image_data=image_data, checklist=checklist,
                 generation_id=generation_id, prompt=image_data.prompt, db=self.db,
                 thread_manager=self.thread_manager, unprompted=unprompted,
-                message_ts=message_ts,
+                message_ts=message_ts, provenance_tool="generate_image",
             )
             if file_url is None:
                 # publish_image already failed the checklist; surface a friendly notice
