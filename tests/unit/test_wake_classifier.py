@@ -192,6 +192,21 @@ def test_prompt_carries_second_person_continuity_rule():
     assert "helpful third voice" in PARTICIPATION_SYSTEM_PROMPT
 
 
+def test_prompt_capability_is_not_address():
+    # Regression guard for the "do you stream messages?" bug (2026-07-16): a bare top-level
+    # "you" that continued Peter's exchange with another assistant (Claude) got claimed
+    # because the classifier read "ChatGPT can explain this" as "ChatGPT is addressed". The
+    # rule must span TOP-LEVEL flow (not just threads) and say capability != being addressed.
+    # F47: softened from an absolute ("never, by itself, a reason to claim it") to a
+    # non-overriding form — capability doesn't OVERRIDE a continuing addressee, but may still
+    # justify responding when there is no continuing addressee (a new ask / open-room question).
+    from prompts import PARTICIPATION_SYSTEM_PROMPT
+    assert "TOP-LEVEL messages" in PARTICIPATION_SYSTEM_PROMPT
+    assert "could answer never OVERRIDES" in PARTICIPATION_SYSTEM_PROMPT
+    # the softened clause still leaves room to answer a genuinely new / open-room ask
+    assert "open to the room" in PARTICIPATION_SYSTEM_PROMPT
+
+
 def test_prompt_carries_channel_people_rule():
     # F29: the people signal is teaching material for addressee resolution — names there
     # are real, distinct participants; an unknown name is never assumed to be the assistant.

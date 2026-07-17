@@ -110,6 +110,19 @@ def _claims_work(tool_type: str, status: str) -> bool:
     return status == "calling" and (tool_type == "mcp" or tool_type.startswith("mcp:"))
 
 
+def _hosted_or_mcp_used(tools_used) -> bool:
+    """F46: did this turn use a HOSTED, MCP, or code-interpreter tool — the thread-worthy ones?
+
+    The streaming path stakes substantive-work live via _claims_work on tool events; the
+    NON-streaming path resolves hosted/MCP/code tools server-side inside one response and emits
+    none, so it needs this end-of-turn check. Reuses the external-source filter (hosted + MCP;
+    it hides code_interpreter as plumbing) and adds an explicit code_interpreter check. Fast
+    LOCAL tools (memory/history/reactions) never count — the caller has already stripped them
+    from `tools_used` before this runs, so an empty list here means no thread-worthy work."""
+    tools = list(tools_used or [])
+    return bool(visible_attribution_tools(tools)) or "code_interpreter" in tools
+
+
 def _reaction_committed(local_tool_calls: Optional[List[dict]]) -> bool:
     """Did the model deliberately react as its response? A no_reply turn is allowed exactly
     one sibling: react_to_message. That reaction IS an answer, so a turn ending this way has
@@ -413,6 +426,14 @@ class TextHandlerMixin:
                                             message=message, thread_state=thread_state)
         if no_reply_suffix:
             suffix = f"{suffix}\n\n{no_reply_suffix}"
+        # F51 role authority: the channel-activity envelope is ambient, attacker-influenceable
+        # content (peripheral message text + derived artifact summaries), so it rides as an
+        # untrusted USER message — never in the developer suffix — and sits BEFORE the developer
+        # instructions so those keep recency. No-op for DMs / when the pulse has nothing.
+        pulse_envelope = self._build_pulse_envelope(
+            client, message.channel_id, thread_state.thread_ts)
+        if pulse_envelope:
+            messages_for_api = messages_for_api + [{"role": "user", "content": pulse_envelope}]
         messages_for_api = messages_for_api + [{
             "role": "developer",
             "content": suffix,
@@ -703,6 +724,19 @@ class TextHandlerMixin:
         tools_actually_used = [t for t in tools_actually_used if t not in local_names]
         attribution_tools = visible_attribution_tools(tools_actually_used)
 
+        # F46: on the NON-streaming path a hosted web_search / MCP / code_interpreter call resolves
+        # server-side inside one response and emits no streaming tool events, so _claims_work never
+        # fires and the turn would wrongly stay top-level. Mark substantive work here from the
+        # already-local-filtered tool list (so fast local tools never count) BEFORE placement
+        # resolves. The streaming path still marks via _claims_work. Idempotent; fail-open.
+        if turn is not None and _hosted_or_mcp_used(tools_actually_used):
+            turn.mark_substantive_work()
+        # F46: resolve placement BEFORE reading place_in_channel. A top-level channel reply
+        # that did substantive work (e.g. a slow local tool on the non-streaming path) is
+        # threaded under the trigger; resolve_reply_target flips place_in_channel so attribution
+        # renders and main.py rebinds its send target. Idempotent; no-op otherwise; fail-open.
+        if turn is not None:
+            turn.resolve_reply_target(message)
         # Top-level channel replies stay chrome-free; attribution rides only in
         # threads and DMs.
         show_attribution = not bool((message.metadata or {}).get("place_in_channel"))
@@ -919,6 +953,12 @@ class TextHandlerMixin:
                                             message=message, thread_state=thread_state)
         if no_reply_suffix:
             suffix = f"{suffix}\n\n{no_reply_suffix}"
+        # F51 role authority: envelope rides as an untrusted USER message before the developer
+        # suffix (see the non-streaming path for the rationale).
+        pulse_envelope = self._build_pulse_envelope(
+            client, message.channel_id, thread_state.thread_ts)
+        if pulse_envelope:
+            messages_for_api = messages_for_api + [{"role": "user", "content": pulse_envelope}]
         messages_for_api = messages_for_api + [{
             "role": "developer",
             "content": suffix,
@@ -1014,6 +1054,10 @@ class TextHandlerMixin:
             # pass. Fires BEFORE the native-stream guard below (which returns early once the
             # stream owns the message).
             if turn is not None and _claims_work(tool_type, status):
+                # F46: the same hosted/MCP work signal also forces a top-level channel reply
+                # into a thread at final-post time (resolve_reply_target). Recorded here rather
+                # than inside claim_work(), which early-returns when enable_ack_reaction is off.
+                turn.mark_substantive_work()
                 await turn.claim_work(client, message)
 
             # A local-tool round ends the current text segment: the model's next words are a new
@@ -1923,6 +1967,13 @@ class TextHandlerMixin:
                 if name not in tools_used:
                     tools_used.append(name)
 
+            # F46: resolve placement BEFORE show_attribution reads place_in_channel. A
+            # top-level channel reply that did substantive work is threaded under the trigger,
+            # and resolve_reply_target flips message.metadata["place_in_channel"] to False — so
+            # a flipped reply's attribution/footer render as the threaded reply it now is.
+            # Idempotent and a no-op for in-thread/no-work turns; fail-open.
+            if turn is not None:
+                turn.resolve_reply_target(message)
             # Top-level channel replies stay chrome-free; attribution rides only in
             # threads and DMs.
             show_attribution = not bool((message.metadata or {}).get("place_in_channel"))
@@ -1968,6 +2019,9 @@ class TextHandlerMixin:
             # legacy final-correction edit against the native message's ts.
             native_finalized = False
             footer_blocks = None
+            # F52/F8: True once the settings footer has ridden a delivered message on the
+            # direct final-post path (which has no native stream to attach to).
+            direct_footer_attached = False
             if native_coord is not None and native_coord.started and not native_coord.failed:
                 suffix = tools_note
                 # Settings chrome ("⚙️ <model>") rides the LAST part of the response
@@ -2011,13 +2065,40 @@ class TextHandlerMixin:
                 # placement yet. send_message splits it if it overflows.
                 self.log_info("No streaming message exists — posting final response directly")
                 try:
+                    # F46: the resolved target — a top-level channel reply that did substantive
+                    # work threads under the trigger (resolve_reply_target already flipped
+                    # place_in_channel above; this call is idempotent). No-op for in-thread/
+                    # no-work turns, where it returns reply_target unchanged.
+                    effective_target = (turn.resolve_reply_target(message)
+                                        if turn is not None else reply_target)
+                    # F52/F8: the settings footer must ride THIS message — the direct final-post
+                    # path is the reply's only surface (an F39 top-level-then-threaded reply, a
+                    # synthetic edit dispatch), so without attaching it here the "⚙️ <model>" row
+                    # arrives as a SEPARATE standalone message (seen live 2026-07-16 as a bare
+                    # "gpt-5.6-sol" post). Same placement rule as the native stopStream finalize
+                    # above: threaded replies only, never a top-level place-in-channel reply.
+                    direct_footer_blocks = None
+                    if (not bool((message.metadata or {}).get("place_in_channel"))
+                            and hasattr(client, "attachable_footer_blocks")):
+                        try:
+                            direct_footer_blocks = client.attachable_footer_blocks(
+                                message.channel_id, thread_config.get("model"))
+                        except Exception as footer_err:
+                            self.log_debug(f"Direct-post footer build failed: {footer_err}")
+                            direct_footer_blocks = None
                     # Capture the delivered ts so F5/F7 below key on the real message
                     # (send_message already records the own-reply pulse for this ts;
                     # record_own_reply is idempotent by (channel, ts) so a repeat is a no-op).
-                    posted_ts = await client.send_message(message.channel_id, reply_target, response_text)
+                    direct_send_meta: dict = {}
+                    posted_ts = await client.send_message(
+                        message.channel_id, effective_target, response_text,
+                        blocks=direct_footer_blocks, meta_out=direct_send_meta)
                     if posted_ts:
                         current_message_id = posted_ts
                         visible_content_delivered = True
+                        # Only stand the separate footer down when the chrome ACTUALLY rode the
+                        # message (a too-long reply posts plain and still needs the fallback).
+                        direct_footer_attached = bool(direct_send_meta.get("footer_attached"))
                     else:
                         # send_message swallows SlackApiError and returns None. This post is the
                         # turn's ONLY delivery, so a swallowed failure here is a silently lost
@@ -2206,9 +2287,11 @@ class TextHandlerMixin:
             stream_meta = {"streamed": True, "message_id": message_id,
                            "native_stream": bool(native_coord is not None and native_coord.started
                                                  and not native_coord.failed),
-                           # Chrome rode the final stopStream — tells main.py's separate
-                           # footer post to stand down (falls back when finalize failed).
-                           "footer_attached": bool(native_finalized and footer_blocks),
+                           # Chrome rode the final stopStream OR the direct final-post — tells
+                           # main.py's separate footer post to stand down (falls back when neither
+                           # attached: finalize failed, split reply, or top-level placement).
+                           "footer_attached": bool((native_finalized and footer_blocks)
+                                                   or direct_footer_attached),
                            # Honest accounting from ACTUAL delivery: a visible message ts plus
                            # non-empty text means content went out. A failed stream that left
                            # no delivered ts must not burn the unprompted quota (main.py's

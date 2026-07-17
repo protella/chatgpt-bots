@@ -543,12 +543,80 @@ class ThreadManagementMixin:
             self.log_error(f"Failed to persist thread summary for {thread_key}: {e}")
             return
 
-        self._upsert_summary_head_in_state(thread_state, summary_text, refs_list)
+        # F51c: an ambient artifact already READY on a message we just folded away would
+        # otherwise be lost — its derived note lives only in the transient per-call injection,
+        # never in thread_state.messages, so the summary never captured it and the compacted
+        # message won't return in the tail. Persist those notes as addenda now.
+        await self._capture_late_artifacts_for_span(thread_state, thread_key, ordered)
+
+        addenda_notes = await self._load_summary_addenda(thread_key)
+        self._upsert_summary_head_in_state(thread_state, summary_text, refs_list, addenda_notes)
+
+    async def _load_summary_addenda(self, thread_key: str) -> List[str]:
+        """Late-artifact addenda notes for a thread, deterministically ordered, or []."""
+        if not self.db or not hasattr(self.db, "get_thread_summary_addenda_async"):
+            return []
+        try:
+            rows = await self.db.get_thread_summary_addenda_async(thread_key)
+        except Exception as e:  # noqa: BLE001 — the head still renders without addenda
+            self.log_debug(f"summary addenda load failed for {thread_key}: {e}")
+            return []
+        return [r["note"] for r in rows if r.get("note")]
+
+    async def _capture_late_artifacts_for_span(self, thread_state, thread_key: str,
+                                               ordered: List[Dict]) -> None:
+        """When a span is folded into the summary, record a late addendum for every ambient
+        artifact ALREADY ready on those messages, so its derived context survives compaction.
+        Idempotent with the completion-time path (DB dedupes on thread+source+kind+ref)."""
+        if not self.db or not hasattr(self.db, "get_ambient_artifacts_for_messages"):
+            return
+        if not hasattr(self.db, "add_thread_summary_addendum_async"):
+            return
+        channel_id = getattr(thread_state, "channel_id", None)
+        if not channel_id:
+            return
+        ts_list = [(m.get("metadata") or {}).get("ts") for m in ordered
+                   if m.get("role") == "user"]
+        ts_list = [t for t in ts_list if t]
+        if not ts_list:
+            return
+        try:
+            by_ts = await self.db.get_ambient_artifacts_for_messages(
+                channel_id, ts_list, statuses=["ready"])
+        except Exception as e:  # noqa: BLE001
+            self.log_debug(f"late-artifact capture query failed: {e}")
+            return
+        if not by_ts:
+            return
+        from message_processor.ambient_memory import render_artifact_note
+        for source_ts, arts in by_ts.items():
+            for art in arts:
+                # Parity with the batch-load / pulse dedupe: unfurl notes are F48's preview.
+                if art.get("derivation_source") == "unfurl" or not art.get("summary"):
+                    continue
+                try:
+                    note = render_artifact_note(art)
+                except Exception:  # noqa: BLE001
+                    continue
+                if not note:
+                    continue
+                try:
+                    await self.db.add_thread_summary_addendum_async(
+                        thread_id=thread_key, channel_id=channel_id, source_ts=source_ts,
+                        kind=art.get("kind"), ref=art.get("ref"), note=note)
+                except Exception as e:  # noqa: BLE001
+                    self.log_debug(f"late-artifact addendum failed: {e}")
 
     @classmethod
-    def _build_summary_head_content(cls, summary_text: str, refs: Optional[List[Dict]]) -> str:
+    def _build_summary_head_content(cls, summary_text: str, refs: Optional[List[Dict]],
+                                    addenda: Optional[List[str]] = None) -> str:
         """Render the summary head message. MUST be deterministic for a given DB row —
-        no timestamps or counts — so rebuilds serialize identically (prompt-cache hygiene)."""
+        no timestamps or counts — so rebuilds serialize identically (prompt-cache hygiene).
+
+        `addenda` are F51c late-artifact notes (derived context that arrived AFTER, or was
+        folded in DURING, compaction). They ride in a clearly-framed section so the model reads
+        them as informational context, not instructions; the DB returns them in a deterministic
+        order so this stays cache-stable."""
         parts = [
             "--- SUMMARY OF EARLIER CONVERSATION ---",
             summary_text,
@@ -560,12 +628,18 @@ class ThreadManagementMixin:
                 value = r.get("value") or ""
                 name = r.get("name")
                 parts.append(f"- [{kind}] {name + ': ' if name else ''}{value}")
+        if addenda:
+            parts.append("Context that arrived after this summary was written:")
+            for note in addenda:
+                parts.append(f"- {note}")
         parts.append("--- END SUMMARY ---")
         return "\n".join(parts)
 
-    def _upsert_summary_head_in_state(self, thread_state, summary_text: str, refs: Optional[List[Dict]]):
+    def _upsert_summary_head_in_state(self, thread_state, summary_text: str,
+                                      refs: Optional[List[Dict]],
+                                      addenda: Optional[List[str]] = None):
         """Create or update the summary head message at position 0 of the live state."""
-        content = self._build_summary_head_content(summary_text, refs)
+        content = self._build_summary_head_content(summary_text, refs, addenda)
         for msg in thread_state.messages:
             if (msg.get("metadata") or {}).get("type") == self.SUMMARY_HEAD_MARKER:
                 msg["content"] = content
@@ -879,8 +953,13 @@ class ThreadManagementMixin:
                     summary_boundary = float(summary_row["boundary_ts"])
                 except (TypeError, ValueError):
                     summary_boundary = None
+                # F51c: fold any late-artifact addenda onto the head. These are for messages
+                # BEHIND the boundary (source_ts <= boundary), so they never collide with the
+                # tail's normal ambient batch-load.
+                addenda_notes = await self._load_summary_addenda(thread_key)
                 self._upsert_summary_head_in_state(
-                    thread_state, summary_row["summary_text"], summary_row.get("refs")
+                    thread_state, summary_row["summary_text"], summary_row.get("refs"),
+                    addenda_notes
                 )
 
             # Get history from platform first to see if there's anything to rebuild.
@@ -1160,8 +1239,10 @@ class ThreadManagementMixin:
                                         )
                                         self.log_info(f"Injected stored summary during rebuild: {filename}")
                                     else:
-                                        # Legacy thread (no row): derive once, store
-                                        # summary + ref, inject the summary block
+                                        # No usable summary: either a legacy thread with NO row,
+                                        # or a row that retention SLIMMED (summary nulled). Both
+                                        # re-derive here; they differ only in how the result is
+                                        # persisted (update the slimmed row vs. insert a new one).
                                         document_data = await client.download_file(att_url, attachment.get("id"))
                                         if document_data and self.document_handler:
                                             extracted_content = await self.document_handler.safe_extract_content_async(
@@ -1182,23 +1263,40 @@ class ThreadManagementMixin:
                                                         "file_id": attachment.get("id"),
                                                     }]
                                                 )
-                                                document_ledger = self.thread_manager.get_or_create_document_ledger(thread_state.thread_ts)
-                                                document_ledger.add_document(
-                                                    content=extracted_content["content"],  # transient
-                                                    filename=filename,
-                                                    mime_type=mimetype,
-                                                    summary=doc_summary,
-                                                    total_pages=extracted_content.get("total_pages"),
-                                                    page_structure=extracted_content.get("page_structure"),
-                                                    metadata=None,
-                                                    db=self.db,
-                                                    thread_id=thread_key,
-                                                    message_ts=message_metadata.get("ts"),
-                                                    file_id=attachment.get("id"),
-                                                    url_private=att_url,
-                                                    size_bytes=len(document_data),
-                                                )
-                                                self.log_info(f"Derived + stored summary during rebuild: {filename}")
+                                                if doc_row:
+                                                    # Row EXISTS but was slimmed (summary nulled by
+                                                    # retention): re-hydrate it in place. A fresh
+                                                    # add_document would INSERT a duplicate ref row
+                                                    # every rebuild — the table has no
+                                                    # UNIQUE(thread_id, filename) constraint.
+                                                    self.db.restore_document_derived(
+                                                        thread_key, filename,
+                                                        summary=doc_summary,
+                                                        page_structure=extracted_content.get("page_structure"),
+                                                        total_pages=extracted_content.get("total_pages"),
+                                                        size_bytes=len(document_data),
+                                                        message_ts=message_metadata.get("ts"),
+                                                    )
+                                                    self.log_info(f"Re-hydrated slimmed document row during rebuild: {filename}")
+                                                else:
+                                                    # Genuinely legacy (no row at all): insert once.
+                                                    document_ledger = self.thread_manager.get_or_create_document_ledger(thread_state.thread_ts)
+                                                    document_ledger.add_document(
+                                                        content=extracted_content["content"],  # transient
+                                                        filename=filename,
+                                                        mime_type=mimetype,
+                                                        summary=doc_summary,
+                                                        total_pages=extracted_content.get("total_pages"),
+                                                        page_structure=extracted_content.get("page_structure"),
+                                                        metadata=None,
+                                                        db=self.db,
+                                                        thread_id=thread_key,
+                                                        message_ts=message_metadata.get("ts"),
+                                                        file_id=attachment.get("id"),
+                                                        url_private=att_url,
+                                                        size_bytes=len(document_data),
+                                                    )
+                                                    self.log_info(f"Derived + stored summary during rebuild: {filename}")
                                             else:
                                                 self.log_warning(f"Failed to extract content from document during rebuild: {filename}")
                                         else:

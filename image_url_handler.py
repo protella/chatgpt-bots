@@ -12,20 +12,15 @@ from typing import List, Tuple, Optional, Dict
 from urllib.parse import urlparse, unquote
 import logging
 
-# Supported image MIME types (matching OpenAI vision API requirements)
-SUPPORTED_IMAGE_MIMETYPES = {
-    "image/jpeg",
-    "image/jpg", 
-    "image/png",
-    "image/gif",
-    "image/webp"
-}
-
-# Common image file extensions
-IMAGE_EXTENSIONS = {
-    '.jpg', '.jpeg', '.png', '.gif', '.webp',
-    '.JPG', '.JPEG', '.PNG', '.GIF', '.WEBP'
-}
+# F50: these used to be defined here, and this module was the ONLY one that consulted them —
+# the attachment path validated nothing at all and the gate kept a third, narrower list. One
+# definition now, in image_validation. (Extensions are matched lower-cased at every call site
+# below, so the old upper-case duplicates were never load-bearing.)
+from image_validation import (
+    ensure_api_compatible,
+    API_IMAGE_EXTENSIONS as IMAGE_EXTENSIONS,
+    API_IMAGE_MIMETYPES as SUPPORTED_IMAGE_MIMETYPES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -238,43 +233,29 @@ class ImageURLHandler:
                         logger.error(f"Image from {url} too large: {len(content) / 1024 / 1024:.1f}MB")
                         return None
 
-                    # Verify it's actually image data by checking magic bytes
-                    if len(content) > 4:
-                        # Check for common image format signatures
-                        header = content[:4]
-                        is_png = header[:4] == b'\x89PNG'
-                        is_jpeg = header[:2] == b'\xff\xd8'
-                        is_gif = header[:3] == b'GIF'
-                        is_webp = header[:4] == b'RIFF' and len(content) > 12 and content[8:12] == b'WEBP'
+                    # The bytes decide. Not the content-type header, not the URL's extension,
+                    # and not the `mimetype` our caller passed — that came from a HEAD
+                    # response, which is a claim, not proof. The old code here trusted a
+                    # passed mimetype outright and accepted `GIF` magic unconditionally, so a
+                    # URL to an ANIMATED gif sailed through and 400'd the turn.
+                    api_bytes, verdict = ensure_api_compatible(content)
+                    if api_bytes is None:
+                        logger.error(f"Rejecting image from {url}: {verdict}")
+                        logger.debug(f"First 20 bytes: {content[:20]}")
+                        return None
+                    content = api_bytes  # transcoded PNG when the source format needed it
+                    mimetype = verdict
 
-                        if not any([is_png, is_jpeg, is_gif, is_webp]):
-                            logger.error(f"Downloaded content from {url} does not appear to be a valid image")
-                            logger.debug(f"First 20 bytes: {content[:20]}")
-                            return None
-
-                    # Determine MIME type if not provided
-                    if not mimetype:
-                        if ';' in content_type:
-                            content_type = content_type.split(';')[0].strip()
-
-                        if content_type in SUPPORTED_IMAGE_MIMETYPES:
-                            mimetype = content_type
-                        else:
-                            # Guess from URL extension or magic bytes
-                            parsed = urlparse(url)
-                            path = unquote(parsed.path.lower())
-
-                            if path.endswith(('.jpg', '.jpeg')) or header[:2] == b'\xff\xd8':
-                                mimetype = 'image/jpeg'
-                            elif path.endswith('.png') or header[:4] == b'\x89PNG':
-                                mimetype = 'image/png'
-                            elif path.endswith('.gif') or header[:3] == b'GIF':
-                                mimetype = 'image/gif'
-                            elif path.endswith('.webp') or (header[:4] == b'RIFF' and content[8:12] == b'WEBP'):
-                                mimetype = 'image/webp'
-                            else:
-                                logger.error(f"Could not determine MIME type for {url}")
-                                return None
+                    # The pre-transcode check above bounded the DOWNLOAD (and guards memory); it
+                    # does not bound the RESULT. A compressed source under the limit can decode
+                    # and re-encode to a much larger PNG, which would then be base64'd and sent
+                    # unchecked. Enforce the ceiling again on the bytes we actually send.
+                    if len(content) > self.max_image_size:
+                        logger.error(
+                            f"Rejecting image from {url}: transcoded to "
+                            f"{len(content) / 1024 / 1024:.1f}MB "
+                            f"(max {self.max_image_size / 1024 / 1024:.1f}MB)")
+                        return None
 
                     # Convert to base64
                     base64_data = base64.b64encode(content).decode('utf-8')

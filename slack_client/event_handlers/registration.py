@@ -11,10 +11,26 @@ class SlackRegistrationMixin:
         @self.app.event("app_mention")
         async def handle_app_mention(event, say, client):
             self.log_debug(f"App mention event: channel={event.get('channel')}, ts={event.get('ts')}")
+            # F52: record this genuine Slack app_mention so the edit-reply path can tell that a
+            # mention-added edit is already covered by Slack's own event (editing to add a mention
+            # makes Slack deliver app_mention for the same ts) and skip a duplicate synthetic turn.
+            if hasattr(self, "_note_app_mention_seen"):
+                self._note_app_mention_seen(event.get("channel"), event.get("ts"))
+            # F51: an @mention carries ambient content (images/links/files) too. Capture BEFORE
+            # dispatch so it is kept even if the reply path drops it. Best-effort infra: guarded so
+            # a registration host without the message-events mixin (test harnesses) still works.
+            if hasattr(self, "_ambient_ingest"):
+                await self._ambient_ingest(event, client)
             await self._handle_slack_message(event, client, wake_source="app_mention")
 
         @self.app.event("message")
         async def handle_message(event, say, client):
+            # F51: ambient capture + lifecycle (edits/deletions) runs FIRST, independent of
+            # channel_type and ENABLE_CHANNEL_LISTENING — memory is a distinct setting from
+            # whether the bot replies. Never blocks the wake path (offer_event only enqueues).
+            # Guarded for registration hosts without the message-events mixin (test harnesses).
+            if hasattr(self, "_ambient_ingest"):
+                await self._ambient_ingest(event, client)
             channel_type = event.get("channel_type")
             if channel_type == "im":
                 # DMs from anyone except ourselves (other bots allowed so bot<->bot works).
@@ -27,6 +43,11 @@ class SlackRegistrationMixin:
                 # the app_mention event above).
                 if config.enable_channel_listening:
                     await self._handle_channel_message(event, client)
+
+        @self.app.event("file_deleted")
+        async def handle_file_deleted(event):
+            # F51: a Slack file removed → purge summaries derived from it (best-effort).
+            await self._ambient_file_deleted(event)
 
         # --- agent_view lifecycle (June 2026 surface, Phase G) ---
         @self.app.event("app_home_opened")

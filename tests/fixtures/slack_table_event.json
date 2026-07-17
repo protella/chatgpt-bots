@@ -1,0 +1,588 @@
+{
+  "user": "U01AF99F3JR",
+  "type": "message",
+  "ts": "1784222395.492299",
+  "client_msg_id": "dc916e9d-fdd9-4788-bac0-bfc653ff54a5",
+  "text": "what about this?",
+  "team": "T0320A41P",
+  "attachments": [
+    {
+      "id": 1,
+      "blocks": [
+        {
+          "type": "table",
+          "block_id": "9ec94a1e-2a5f-4274-b984-d01e7bc235d9",
+          "rows": [
+            [
+              {
+                "type": "rich_text",
+                "elements": [
+                  {
+                    "type": "rich_text_section",
+                    "elements": [
+                      {
+                        "type": "text",
+                        "text": "Name",
+                        "style": {
+                          "bold": true
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "block_id": "0EG8w"
+              },
+              {
+                "type": "rich_text",
+                "elements": [
+                  {
+                    "type": "rich_text_section",
+                    "elements": [
+                      {
+                        "type": "text",
+                        "text": "Email",
+                        "style": {
+                          "bold": true
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "block_id": "N4qpY"
+              },
+              {
+                "type": "rich_text",
+                "elements": [
+                  {
+                    "type": "rich_text_section",
+                    "elements": [
+                      {
+                        "type": "text",
+                        "text": "User type",
+                        "style": {
+                          "bold": true
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "block_id": "GUPJB"
+              },
+              {
+                "type": "rich_text",
+                "elements": [
+                  {
+                    "type": "rich_text_section",
+                    "elements": [
+                      {
+                        "type": "text",
+                        "text": "Groups",
+                        "style": {
+                          "bold": true
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "block_id": "T0oy5"
+              },
+              {
+                "type": "rich_text",
+                "elements": [
+                  {
+                    "type": "rich_text_section",
+                    "elements": [
+                      {
+                        "type": "text",
+                        "text": "Last Active",
+                        "style": {
+                          "bold": true
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "block_id": "cQ2Ai"
+              },
+              {
+                "type": "rich_text",
+                "elements": [
+                  {
+                    "type": "rich_text_section",
+                    "elements": [
+                      {
+                        "type": "text",
+                        "text": "ID",
+                        "style": {
+                          "bold": true
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "block_id": "7l8ZI"
+              }
+            ],
+            [
+              {
+                "type": "raw_text",
+                "text": "Alice Anderson"
+              },
+              {
+                "type": "raw_text",
+                "text": "alice.anderson@example.com"
+              },
+              {
+                "type": "raw_text",
+                "text": "full_user_tier"
+              },
+              {
+                "type": "raw_text",
+                "text": "User,Admin"
+              },
+              {
+                "type": "raw_text",
+                "text": "Oct 31, 2025"
+              },
+              {
+                "type": "raw_text",
+                "text": "1000000001"
+              }
+            ],
+            [
+              {
+                "type": "raw_text",
+                "text": "Bob Baker"
+              },
+              {
+                "type": "raw_text",
+                "text": "bob.baker@example.com"
+              },
+              {
+                "type": "raw_text",
+                "text": "basic_user_tier"
+              },
+              {
+                "type": "raw_text",
+                "text": "User"
+              },
+              {
+                "type": "raw_text",
+                "text": "Apr 11, 2022"
+              },
+              {
+                "type": "raw_text",
+                "text": "1000000002"
+              }
+            ],
+            [
+              {
+                "type": "raw_text",
+                "text": "Carol Chen"
+              },
+              {
+                "type": "raw_text",
+                "text": "carol.chen@example.com"
+              },
+              {
+                "type": "raw_text",
+                "text": "full_user_tier"
+              },
+              {
+                "type": "raw_text",
+                "text": "User,Sea-Sharks"
+              },
+              {
+                "type": "raw_text",
+                "text": "Jul 6, 2026"
+              },
+              {
+                "type": "raw_text",
+                "text": "1000000003"
+              }
+            ],
+            [
+              {
+                "type": "raw_text",
+                "text": "David Diaz"
+              },
+              {
+                "type": "raw_text",
+                "text": "david.diaz@example.com"
+              },
+              {
+                "type": "raw_text",
+                "text": "full_user_tier"
+              },
+              {
+                "type": "raw_text",
+                "text": "Apollo-11,User"
+              },
+              {
+                "type": "raw_text",
+                "text": "May 13, 2026"
+              },
+              {
+                "type": "raw_text",
+                "text": "1000000004"
+              }
+            ],
+            [
+              {
+                "type": "raw_text",
+                "text": "Erin Evans"
+              },
+              {
+                "type": "raw_text",
+                "text": "erin.evans@example.com"
+              },
+              {
+                "type": "raw_text",
+                "text": "full_user_tier"
+              },
+              {
+                "type": "raw_text",
+                "text": "User,Admin"
+              },
+              {
+                "type": "raw_text",
+                "text": "May 30, 2026"
+              },
+              {
+                "type": "raw_text",
+                "text": "1000000005"
+              }
+            ],
+            [
+              {
+                "type": "raw_text",
+                "text": "Frank Foster"
+              },
+              {
+                "type": "raw_text",
+                "text": "frank.foster@example.com"
+              },
+              {
+                "type": "raw_text",
+                "text": "full_user_tier"
+              },
+              {
+                "type": "raw_text",
+                "text": "User,Admin"
+              },
+              {
+                "type": "raw_text",
+                "text": "Jun 23, 2026"
+              },
+              {
+                "type": "raw_text",
+                "text": "1000000006"
+              }
+            ],
+            [
+              {
+                "type": "raw_text",
+                "text": "Grace Green"
+              },
+              {
+                "type": "raw_text",
+                "text": "grace.green@example.com"
+              },
+              {
+                "type": "raw_text",
+                "text": "full_user_tier"
+              },
+              {
+                "type": "raw_text",
+                "text": "Expresso,User"
+              },
+              {
+                "type": "raw_text",
+                "text": "Jul 14, 2026"
+              },
+              {
+                "type": "raw_text",
+                "text": "1000000007"
+              }
+            ],
+            [
+              {
+                "type": "raw_text",
+                "text": "Henry Hall"
+              },
+              {
+                "type": "raw_text",
+                "text": "henry.hall@example.com"
+              },
+              {
+                "type": "raw_text",
+                "text": "basic_user_tier"
+              },
+              {
+                "type": "raw_text",
+                "text": "User"
+              },
+              {
+                "type": "raw_text",
+                "text": "Aug 7, 2025"
+              },
+              {
+                "type": "raw_text",
+                "text": "1000000008"
+              }
+            ],
+            [
+              {
+                "type": "raw_text",
+                "text": "Iris Ito"
+              },
+              {
+                "type": "raw_text",
+                "text": "iris.ito@example.com"
+              },
+              {
+                "type": "raw_text",
+                "text": "full_user_tier"
+              },
+              {
+                "type": "raw_text",
+                "text": "User,Sea-Sharks"
+              },
+              {
+                "type": "raw_text",
+                "text": "Jun 22, 2026"
+              },
+              {
+                "type": "raw_text",
+                "text": "1000000009"
+              }
+            ],
+            [
+              {
+                "type": "raw_text",
+                "text": "Jack Jones"
+              },
+              {
+                "type": "raw_text",
+                "text": "jack.jones@example.com"
+              },
+              {
+                "type": "raw_text",
+                "text": "full_user_tier"
+              },
+              {
+                "type": "raw_text",
+                "text": "Expresso,User"
+              },
+              null,
+              {
+                "type": "raw_text",
+                "text": "1000000010"
+              }
+            ],
+            [
+              {
+                "type": "raw_text",
+                "text": "Karen Kim"
+              },
+              {
+                "type": "raw_text",
+                "text": "karen.kim@example.com"
+              },
+              {
+                "type": "raw_text",
+                "text": "core_user_tier"
+              },
+              {
+                "type": "raw_text",
+                "text": "User"
+              },
+              {
+                "type": "raw_text",
+                "text": "Apr 3, 2026"
+              },
+              {
+                "type": "raw_text",
+                "text": "1000000011"
+              }
+            ],
+            [
+              {
+                "type": "raw_text",
+                "text": "Liam Lopez"
+              },
+              {
+                "type": "raw_text",
+                "text": "liam.lopez@example.com"
+              },
+              {
+                "type": "raw_text",
+                "text": "full_user_tier"
+              },
+              {
+                "type": "raw_text",
+                "text": "User,Slice-n-Dice"
+              },
+              {
+                "type": "raw_text",
+                "text": "Aug 14, 2025"
+              },
+              {
+                "type": "raw_text",
+                "text": "1000000012"
+              }
+            ],
+            [
+              {
+                "type": "raw_text",
+                "text": "Maya Mehta"
+              },
+              {
+                "type": "raw_text",
+                "text": "maya.mehta@example.com"
+              },
+              {
+                "type": "raw_text",
+                "text": "full_user_tier"
+              },
+              {
+                "type": "raw_text",
+                "text": "Apollo-11,User"
+              },
+              {
+                "type": "raw_text",
+                "text": "May 27, 2026"
+              },
+              {
+                "type": "raw_text",
+                "text": "1000000013"
+              }
+            ],
+            [
+              {
+                "type": "raw_text",
+                "text": "Noah Novak"
+              },
+              {
+                "type": "raw_text",
+                "text": "noah.novak@example.com"
+              },
+              {
+                "type": "raw_text",
+                "text": "full_user_tier"
+              },
+              {
+                "type": "raw_text",
+                "text": "User,Admin"
+              },
+              {
+                "type": "raw_text",
+                "text": "Apr 8, 2026"
+              },
+              {
+                "type": "raw_text",
+                "text": "1000000014"
+              }
+            ],
+            [
+              {
+                "type": "raw_text",
+                "text": "Olivia Ortiz"
+              },
+              {
+                "type": "raw_text",
+                "text": "olivia.ortiz@example.com"
+              },
+              {
+                "type": "raw_text",
+                "text": "full_user_tier"
+              },
+              {
+                "type": "raw_text",
+                "text": "User"
+              },
+              {
+                "type": "raw_text",
+                "text": "Jul 16, 2026"
+              },
+              {
+                "type": "raw_text",
+                "text": "1000000015"
+              }
+            ],
+            [
+              {
+                "type": "raw_text",
+                "text": "Priya Prasad"
+              },
+              {
+                "type": "raw_text",
+                "text": "priya.prasad@example.com"
+              },
+              {
+                "type": "raw_text",
+                "text": "full_user_tier"
+              },
+              {
+                "type": "raw_text",
+                "text": "Expresso,User,Sea-Sharks"
+              },
+              {
+                "type": "raw_text",
+                "text": "Jun 3, 2026"
+              },
+              {
+                "type": "raw_text",
+                "text": "1000000016"
+              }
+            ],
+            [
+              {
+                "type": "raw_text",
+                "text": "Quinn Quill"
+              },
+              {
+                "type": "raw_text",
+                "text": "quinn.quill@example.com"
+              },
+              {
+                "type": "raw_text",
+                "text": "basic_user_tier"
+              },
+              {
+                "type": "raw_text",
+                "text": "Expresso,Apollo-11,User,Slice-n-Dice,Sea-Sharks"
+              },
+              {
+                "type": "raw_text",
+                "text": "Jul 8, 2026"
+              },
+              {
+                "type": "raw_text",
+                "text": "1000000017"
+              }
+            ]
+          ]
+        }
+      ],
+      "fallback": "[no preview available]"
+    }
+  ],
+  "blocks": [
+    {
+      "type": "rich_text",
+      "block_id": "p+KIj",
+      "elements": [
+        {
+          "type": "rich_text_section",
+          "elements": [
+            {
+              "type": "text",
+              "text": "what about this?"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

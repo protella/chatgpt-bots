@@ -201,6 +201,12 @@ class ParticipationEngine:
         # a same-author fast-follow rather than answering only the latest fragment. Bounded
         # by _MAX_PENDING_KEYS; each bucket self-drains when its survivor runs.
         self._pending: "OrderedDict[str, OrderedDict[str, str]]" = OrderedDict()
+        # F52: messages whose in-flight evaluation an EDIT has explicitly cancelled. An edit
+        # keeps the SAME ts, so a newer arrival can never supersede the original the ordinary
+        # way (note_arrival is monotonic on ts); supersede() marks it here and evaluate() drops
+        # the stale original — the edit's OWN re-evaluation, which carries edit context, is
+        # exempt. conv key -> set of superseded ts. Bounded by _MAX_PENDING_KEYS.
+        self._edit_superseded: "OrderedDict[str, set]" = OrderedDict()
 
     @staticmethod
     def _conv_key(channel_id: str, ts: str, thread_root: Optional[str],
@@ -229,6 +235,38 @@ class ParticipationEngine:
         current = self._latest.get(key)
         if current is None or _ts_key(ts) > _ts_key(current):
             self._latest[key] = ts
+
+    def supersede(self, channel_id: str, ts: Optional[str],
+                  thread_root: Optional[str] = None,
+                  sender_id: Optional[str] = None) -> None:
+        """F52: cancel a message's in-flight participation evaluation because it was EDITED and
+        the edit will be handled elsewhere — Slack's app_mention for a mention-added edit, or a
+        fresh edit-context evaluation for a meaning edit. The original evaluation keyed on the
+        SAME ts and so can never be superseded by a newer arrival; mark it here and evaluate()
+        drops it, exactly as a newer burst message would. The edit's OWN re-evaluation carries
+        edit context and is exempt. Idempotent; bounded by _MAX_PENDING_KEYS."""
+        if not channel_id or not ts:
+            return
+        key = self._conv_key(channel_id, ts, thread_root, sender_id)
+        bucket = self._edit_superseded.get(key)
+        if bucket is None:
+            bucket = set()
+            self._edit_superseded[key] = bucket
+        bucket.add(str(ts))
+        self._edit_superseded.move_to_end(key)
+        while len(self._edit_superseded) > _MAX_PENDING_KEYS:
+            self._edit_superseded.popitem(last=False)
+
+    def _consume_edit_supersession(self, key: str, ts: str) -> bool:
+        """True (and clears the mark) iff `ts` was explicitly superseded by an edit for `key`.
+        Consumed so a leaked mark can never affect a future message (ts is unique per message)."""
+        bucket = self._edit_superseded.get(key)
+        if bucket and str(ts) in bucket:
+            bucket.discard(str(ts))
+            if not bucket:
+                self._edit_superseded.pop(key, None)
+            return True
+        return False
 
     def _register_pending(self, key: str, ts: str, text: Optional[str]) -> None:
         """F27: record (ts, text) in its conversation's pending bucket so a later survivor
@@ -329,13 +367,47 @@ class ParticipationEngine:
         works pre-F27 because the reply lands in-thread with full history."""
         key = self._conv_key(channel_id, ts, thread_root_ts, sender_id)
         is_top_level = not (thread_root_ts and thread_root_ts != ts)
+        # F51b: the ambient service (reached via the same facade the gate downloads through) holds
+        # this message's ambient IMAGE jobs while the gate runs, so ONE vision look serves both the
+        # verdict and the stored observations. Only relevant when this message actually carries
+        # images; a text-only judgment is byte-for-byte unchanged.
+        svc = self._ambient_service(client) if images else None
         self.note_arrival(channel_id, ts, thread_root_ts, sender_id)  # monotonic; a stale caller can't clobber a newer marker
         self._register_pending(key, ts, text)  # F27: enroll before the await so the survivor can find us
         wait = max(0.0, float(getattr(config, "participation_debounce_seconds", 3.0)))
         if wait:
             await asyncio.sleep(wait)
         if self._latest.get(key) != ts:
-            return None  # superseded — our pending entry stays for the burst's survivor
+            # Superseded — our pending entry stays for the burst's survivor. Release any held
+            # image jobs promptly to the vision worker (this message's own images still get
+            # analyzed; the gate just never looked at them). Never let it affect the return.
+            if svc is not None:
+                try:
+                    svc.resolve_gate(channel_id, ts, {})
+                except Exception:  # noqa: BLE001
+                    pass
+            return None
+
+        # F52: an edit-triggered evaluation carries edit context (old text + already-replied),
+        # stashed on the Slack facade by the message-events edit path and keyed by (channel, ts).
+        # Popped HERE — after supersession — so a superseded burst never consumes it. It is folded
+        # into the classifier's view of the message (below); the Message.text the responder later
+        # sees stays the clean edited text. None for every ordinary (non-edit) message.
+        edit_context = self._take_edit_context(client, channel_id, ts)
+
+        # F52 double-answer fix (deterministic half): an EDIT explicitly cancelled THIS message's
+        # original evaluation. The edit is handled elsewhere — Slack's app_mention for a
+        # mention-added edit, or a fresh edit-context evaluation for a meaning edit — so the stale
+        # original must stay silent. The edit's OWN re-evaluation carries edit_context and is
+        # exempt (only the context-free original consumes the mark). This is the primary fix; the
+        # queue-drop backstop covers a respond dispatch that already slipped into the busy queue.
+        if edit_context is None and self._consume_edit_supersession(key, ts):
+            if svc is not None:
+                try:
+                    svc.resolve_gate(channel_id, ts, {})
+                except Exception:  # noqa: BLE001
+                    pass
+            return None
 
         # F27: we survived the debounce — always drain this stream's pending siblings (bucket
         # hygiene), but only CARRY them as a burst at top level, where the per-sender key
@@ -353,17 +425,32 @@ class ParticipationEngine:
             except Exception:
                 thread_tail = None
 
+        # F47: a TOP-LEVEL trigger has an EMPTY thread tail (it sits ON the root, which
+        # render_thread_tail excludes), so it carries no authoritative record of who the sender
+        # has been addressing — the gap that let a bare "you" continuing another assistant's
+        # exchange get wrongly claimed. Give the classifier that evidence from the channel ring.
+        # Threaded turns already have the authoritative thread_tail, so they skip this. Fail-open:
+        # a rendering error degrades to no signal, never to silence.
+        channel_addressee_tail = None
+        if pulse is not None and is_top_level:
+            try:
+                channel_addressee_tail = pulse.render_channel_addressee_tail(
+                    channel_id, before_ts=ts) or None
+            except Exception:
+                channel_addressee_tail = None
+
         # F40: the pixels, not the filename. Loaded HERE — after the supersession check — so a
         # superseded burst never downloads images for a verdict that is about to be discarded.
         # `image_status` tells the prompt the truth: seen, or attached-but-unavailable. Any
         # failure degrades to a text-only judgment; it must never turn into silence.
-        image_parts, image_status = [], gate_vision.NONE
+        image_parts, image_status, shown_descriptors = [], gate_vision.NONE, []
         if images and client is not None:
             try:
-                image_parts, image_status = await gate_vision.load_for_gate(client, images)
+                image_parts, image_status, shown_descriptors = await gate_vision.load_for_gate(
+                    client, images)
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Gate vision failed, judging on text alone: {e}")
-                image_parts, image_status = [], gate_vision.UNAVAILABLE
+                image_parts, image_status, shown_descriptors = [], gate_vision.UNAVAILABLE, []
         elif images:
             image_status = gate_vision.UNAVAILABLE
 
@@ -376,6 +463,9 @@ class ParticipationEngine:
             "memory_facts": memory_facts or [],
             "channel_activity": channel_activity,
             "thread_tail": thread_tail,
+            # F47: authoritative addressee evidence for a top-level trigger (None for threaded
+            # turns, which already carry thread_tail). Rendered above the peripheral envelope.
+            "channel_addressee_tail": channel_addressee_tail,
             "unprompted_last_hour": int(unprompted_last_hour),
             "name_hit": bool(name_hit),
             "sender_is_bot": bool(sender_is_bot),
@@ -391,11 +481,17 @@ class ParticipationEngine:
             "workspace_custom_emojis": workspace_custom_emojis or [],
             "attachments": attachments,
             "burst_earlier": burst_earlier,
+            # F52: present for inspection/tests only — classify_participation renders no line for
+            # it (the delivery is the [EDIT] block folded into the message text below).
+            "edit_context": edit_context,
         }
+        # F52: fold the edit context into the message the CLASSIFIER sees, not the Message.text
+        # the responder later uses. The system prompt's edited-message rule reads the [EDIT] block.
+        classifier_text = self._augment_text_with_edit(text, edit_context) if edit_context else text
         try:
             # `images` only rides when there ARE images: the text-only call keeps its exact old
             # shape, so nothing that never sees a picture changes behaviour by one token.
-            call_kwargs = {"text": text, "signals": signals}
+            call_kwargs = {"text": classifier_text, "signals": signals}
             if image_parts:
                 call_kwargs["images"] = image_parts
             raw = await self.openai_client.classify_participation(**call_kwargs)
@@ -406,7 +502,94 @@ class ParticipationEngine:
         # be told about the earlier same-author messages it must also address.
         if burst_earlier:
             verdict.burst_earlier = burst_earlier
+        # F51b: the gate has classified — hand the outcome to ambient memory. This is the ONLY
+        # coupling to the verdict, and it is one-way and total: the verdict is already built and is
+        # returned no matter what happens here. Per-image observations that parsed cleanly are
+        # stored as gate-sourced artifacts (no second vision call); any image without a usable
+        # observation (blind gate, malformed/wrong-count array, storage disabled) is released to
+        # the vision worker so it is still analyzed exactly once.
+        if svc is not None:
+            try:
+                observations = self._harvest_image_observations(raw, shown_descriptors)
+                svc.resolve_gate(channel_id, ts, observations)
+            except Exception as e:  # noqa: BLE001 — piggyback never alters/delays the verdict
+                logger.debug(f"gate/ambient piggyback failed (worker path covers): {e}")
         return verdict
+
+    @staticmethod
+    def _take_edit_context(client: Any, channel_id: str, ts: str) -> Optional[Dict[str, Any]]:
+        """F52: pop this message's edit context from the Slack facade, where the message-events
+        edit path stashed it, keyed by (channel, ts) — the SAME ts an edit keeps. Returns None
+        for every ordinary message (the store is absent) or in tests without a facade. Popping
+        (not peeking) means a re-evaluation of the same ts falls back to a plain judgment."""
+        if client is None or not channel_id or not ts:
+            return None
+        store = getattr(client, "_edit_reply_ctx_map", None)
+        if not store:
+            return None
+        try:
+            return store.pop(f"{channel_id}|{ts}", None)
+        except Exception:  # noqa: BLE001 — the piggyback must never break the verdict
+            return None
+
+    @staticmethod
+    def _augment_text_with_edit(text: str, ec: Dict[str, Any]) -> str:
+        """F52: build the classifier-only view of an edited message — the clean edited text plus a
+        labeled [EDIT] block giving what it said before and whether the assistant already replied.
+        The system prompt's edited-message rule reads this block to make the typo-vs-meaning call."""
+        old = str((ec or {}).get("old_text") or "").strip()
+        replied = bool((ec or {}).get("already_replied"))
+        note = ["[EDIT] The author edited this message after posting it."]
+        note.append(f'Before the edit it read: "{old}".' if old
+                    else "It had no text before the edit.")
+        note.append(
+            "The assistant already replied to it earlier — respond only if the edit changes the "
+            "meaning enough to need a correction or a real answer."
+            if replied else "The assistant has not replied to it yet.")
+        return f"{text}\n\n" + " ".join(note)
+
+    @staticmethod
+    def _ambient_service(client: Any) -> Any:
+        """The AmbientArtifactService, reached through the Slack facade the gate is handed.
+
+        The engine is constructed with only the OpenAI client (main.py), so the piggyback finds
+        the service via the same `self`-facade the gate already uses to download images. Returns
+        None in tests / when it isn't wired — the piggyback then simply no-ops and the ordinary
+        ambient vision worker covers the image."""
+        if client is None:
+            return None
+        getter = getattr(client, "_ambient_service", None)
+        if callable(getter):
+            try:
+                return getter()
+            except Exception:  # noqa: BLE001
+                return None
+        return getattr(getattr(client, "processor", None), "ambient_service", None)
+
+    @staticmethod
+    def _harvest_image_observations(raw: Any, shown: List[Dict]) -> Dict[str, str]:
+        """Map the classifier's `image_observations` back to Slack file ids — defensively.
+
+        Verdict safety is absolute: this runs only AFTER validate_verdict and touches nothing on
+        it. A missing/malformed array, or one whose length does not match the images actually
+        shown (so per-image order can't be trusted), yields {} — those images fall to the normal
+        ambient vision worker. Within a correctly-sized array, a blank/non-string entry is skipped
+        (its file id is left to the worker) and the rest are kept."""
+        if not shown or not isinstance(raw, dict):
+            return {}
+        obs = raw.get("image_observations")
+        if not isinstance(obs, list) or len(obs) != len(shown):
+            if obs is not None:
+                logger.debug(
+                    "gate observations dropped: %s entries for %d shown image(s)",
+                    len(obs) if isinstance(obs, list) else "non-list", len(shown))
+            return {}
+        out: Dict[str, str] = {}
+        for d, text in zip(shown, obs):
+            fid = (d or {}).get("id")
+            if fid and isinstance(text, str) and text.strip():
+                out[str(fid)] = text.strip()
+        return out
 
     # ------------------------------------------------------------- validate
 

@@ -68,6 +68,13 @@ class MessageProcessor(ThreadManagementMixin,
         self.mcp_manager = MCPManager(db=db)
         self.mcp_manager.initialize()
 
+        # F51: ambient-memory ingestion service. Owned here so its lifecycle is drained in
+        # cleanup() BEFORE the OpenAI client closes. channel_pulse is captured lazily from the
+        # Slack client at first offer_event (the client isn't wired to the processor yet).
+        from message_processor.ambient_memory import AmbientArtifactService
+        self.ambient_service = AmbientArtifactService(
+            db=db, openai_client=self.openai_client, channel_pulse=None)
+
         if not DOCUMENT_HANDLER_AVAILABLE:
             self.log_warning("DocumentHandler not available - document processing will be disabled")
         self.log_info(f"MessageProcessor initialized {'with' if db else 'without'} database")
@@ -710,11 +717,18 @@ class MessageProcessor(ThreadManagementMixin,
     def _build_failed_files_notice(unsupported_files: list) -> str:
         """User notice for files that were accepted but not processed.
 
-        Download failures get their own actionable line (re-upload); genuinely
-        unsupported types keep the supported-formats explainer.
+        Three different failures, three different things worth saying. Download failures get
+        their own actionable line (re-upload). Images we FETCHED and then turned away (F50)
+        carry a `reason` and get told exactly what was wrong with them — routing those through
+        the generic explainer below would print "GIF is supported" underneath a rejected
+        animated GIF, which is worse than saying nothing. Everything else keeps the
+        supported-formats explainer.
         """
         download_failures = [f for f in unsupported_files if f.get('error') == 'download_failed']
-        truly_unsupported = [f for f in unsupported_files if f.get('error') != 'download_failed']
+        rejected_images = [f for f in unsupported_files
+                           if f.get('error') != 'download_failed' and f.get('reason')]
+        truly_unsupported = [f for f in unsupported_files
+                             if f.get('error') != 'download_failed' and not f.get('reason')]
 
         sections = []
         if download_failures:
@@ -723,6 +737,11 @@ class MessageProcessor(ThreadManagementMixin,
                 "⚠️ *Couldn't Download File*\n\n"
                 f"I couldn't download {failed_str} — try re-uploading."
             )
+        if rejected_images:
+            from image_validation import rejection_text
+            lines = "\n".join(f"*{f['name']}* {rejection_text(f.get('reason'))}"
+                              for f in rejected_images)
+            sections.append("⚠️ *Couldn't Read Image*\n\n" + lines)
         if truly_unsupported:
             types_str = ", ".join(sorted({f['mimetype'] for f in truly_unsupported}))
             unsup_str = ", ".join(f"*{f['name']}*" for f in truly_unsupported)
@@ -732,9 +751,16 @@ class MessageProcessor(ThreadManagementMixin,
             section += "───────────────\n"
             section += "*Currently supported:*\n"
             section += "• Images (JPEG, PNG, GIF, WebP)\n"
-            # Generated from the handler's own table so this list can't lie
+            # Generated from the handler's own table so this list can't lie. The set is
+            # now large (dozens of code/config/text extensions), so we surface the common
+            # ones and honestly summarize the tail as "and N more" rather than dumping all.
             from document_handler import DOCUMENT_EXTENSIONS
-            doc_types = ", ".join(sorted(ext.lstrip('.').upper() for ext in DOCUMENT_EXTENSIONS))
+            common = ["PDF", "DOCX", "XLSX", "CSV", "TSV", "PPTX", "TXT", "MD", "JSON", "RTF"]
+            shown = [t for t in common if f".{t.lower()}" in DOCUMENT_EXTENSIONS]
+            remaining = len(DOCUMENT_EXTENSIONS) - len(shown)
+            doc_types = ", ".join(shown)
+            if remaining > 0:
+                doc_types += f", and {remaining} more"
             section += f"• Documents ({doc_types})\n\n"
             section += "_Support for additional file types may be added in the future._"
             sections.append(section)
@@ -774,6 +800,35 @@ class MessageProcessor(ThreadManagementMixin,
         if not batch:
             return
 
+        # F52 double-answer fix (queue-drop backstop): drop a queued PRE-EDIT participation
+        # dispatch whose message was since edited and handled by the edit path. Such a dispatch
+        # slipped into the busy queue before the engine supersession landed; carried forward it
+        # RE-RUNS the gate on stale text and posts a duplicate (live 2026-07-16). It is identified
+        # by carrying participation_check for a ts the edit path registered, WITHOUT the surviving
+        # edit's marker (the edit's own engine re-dispatch carries it and is kept). Addressed
+        # (app_mention/DM) turns and ordinary different messages carry no participation_check and
+        # are never touched; a genuinely different queued message has a different ts.
+        marker_getter = getattr(client, "edit_dispatch_marker", None)
+        if callable(marker_getter):
+            kept = []
+            for queued_msg in batch:
+                try:
+                    meta = queued_msg.metadata or {}
+                    ts = meta.get("ts")
+                    if meta.get("participation_check") and ts is not None:
+                        surviving = marker_getter(queued_msg.channel_id, ts)
+                        if surviving is not None and meta.get("edit_reply_marker") != surviving:
+                            self.log_info(
+                                f"Dropping stale pre-edit participation dispatch (ts={ts}) "
+                                f"superseded by an edit on {thread_key}")
+                            continue
+                except Exception as drop_err:  # noqa: BLE001 — never let the check lose a message
+                    self.log_warning(f"Edit-stale drop check failed: {drop_err}")
+                kept.append(queued_msg)
+            batch = kept
+            if not batch:
+                return
+
         handler = getattr(client, "message_handler", None)
         if handler is None:
             # No re-dispatch path (exotic client) — the messages exist in Slack;
@@ -812,6 +867,13 @@ class MessageProcessor(ThreadManagementMixin,
     async def cleanup(self):
         """Clean up resources and close clients."""
         self.log_info("Cleaning up MessageProcessor resources...")
+        # F51: drain the ambient service FIRST — its workers call the OpenAI client + DB, so it
+        # must finish (or be cancelled) before the client is closed under it.
+        if getattr(self, "ambient_service", None):
+            try:
+                await self.ambient_service.shutdown()
+            except Exception as e:  # noqa: BLE001
+                self.log_debug(f"Ambient service shutdown error: {e}")
         if hasattr(self, 'openai_client') and self.openai_client:
             await self.openai_client.close()
         # Close thread manager resources if needed

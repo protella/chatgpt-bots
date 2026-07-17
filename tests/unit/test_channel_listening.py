@@ -132,6 +132,101 @@ async def test_file_share_reaches_gate_and_plumbs_files(tag_only):
     assert msg.attachments[0]["id"] == "F123"
 
 
+def test_bot_message_has_content_distinguishes_webhook_from_chrome():
+    # F48: a webhook bot post carries its payload in attachment fields with EMPTY text — that is
+    # real content. Bare chrome (empty text, no files, no supplementary) is not.
+    from slack_client.event_handlers.message_events import SlackMessageEventsMixin as M
+    webhook = {"subtype": "bot_message", "text": "",
+               "attachments": [{"fields": [{"title": "Branch", "value": "main"}],
+                                "fallback": "Build #123 failed"}]}
+    assert M._bot_message_has_content(webhook) is True
+    assert M._bot_message_has_content({"subtype": "bot_message", "text": ""}) is False
+    assert M._bot_message_has_content({"subtype": "bot_message", "text": "hi"}) is True
+
+
+@pytest.mark.asyncio
+async def test_supplementary_bot_message_reaches_gate(monkeypatch):
+    # F48 acceptance case (MUST-FIX 10): a Jira/GitHub webhook bot_message with empty text but
+    # meaningful attachment fields must NOT be dropped at the subtype gate — it reaches the
+    # participation engine like any other content message.
+    monkeypatch.setattr(config, "channel_response_mode", "auto_respond", raising=False)
+    monkeypatch.setattr(config, "bot_name_aliases", ["ChatGPT"], raising=False)
+    monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
+    bot = _make_bot()
+    await bot._handle_channel_message(
+        _evt(subtype="bot_message", user=None, bot_id="OTHERBOT", text="",
+             attachments=[{"fields": [{"title": "Branch", "value": "main"}],
+                           "fallback": "Build #123 failed"}]),
+        bot.app.client)
+    bot.message_handler.assert_called_once()
+    msg = bot.message_handler.call_args[0][0]
+    assert msg.metadata.get("participation_check") is True
+    assert msg.metadata.get("participation_sender_bot") is True
+
+
+@pytest.mark.asyncio
+async def test_bare_chrome_bot_message_still_dropped(monkeypatch):
+    # The other half: a content-free bot post (no text, no files, no supplementary) still drops
+    # at the subtype gate — the widening is for real content only.
+    monkeypatch.setattr(config, "channel_response_mode", "auto_respond", raising=False)
+    monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
+    bot = _make_bot()
+    await bot._handle_channel_message(
+        _evt(subtype="bot_message", user=None, bot_id="OTHERBOT", text=""), bot.app.client)
+    bot.message_handler.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_edit_and_delete_mark_thread_needs_refresh():
+    # Blocker 1: a message edit/delete must flag the affected thread's warm ThreadState for
+    # rebuild, or it can retain the deleted/pre-edit content even after the pulse is corrected.
+    from types import SimpleNamespace
+
+    from slack_client.event_handlers.message_events import SlackMessageEventsMixin
+
+    refreshed = []
+    tm = SimpleNamespace(mark_needs_refresh=lambda k: refreshed.append(k))
+
+    class _DB:
+        async def delete_ambient_artifacts_by_source(self, c, t):
+            return 0
+
+    class _Pulse:
+        def remove_message(self, c, t):
+            return True
+
+    class _Svc:
+        def offer_event(self, ev, cl):
+            pass
+
+    class _Host(SlackMessageEventsMixin):
+        def __init__(self):
+            self.processor = SimpleNamespace(ambient_service=_Svc(), thread_manager=tm)
+            self.db = _DB()
+            self.channel_pulse = _Pulse()
+
+        def is_own_message(self, e):
+            return False
+
+        def log_debug(self, *a, **k):
+            pass
+
+        async def _feed_channel_pulse(self, e):
+            pass
+
+    host = _Host()
+    # delete: refresh keyed on the deleted message's thread root
+    await host._ambient_ingest(
+        {"subtype": "message_deleted", "channel": "C1", "deleted_ts": "5.0",
+         "previous_message": {"ts": "5.0", "thread_ts": "1.0"}}, object())
+    assert "C1:1.0" in refreshed
+    # edit: refresh keyed on the edited message's thread root
+    await host._ambient_ingest(
+        {"subtype": "message_changed", "channel": "C1",
+         "message": {"ts": "6.0", "thread_ts": "2.0", "text": "edited text"}}, object())
+    assert "C1:2.0" in refreshed
+
+
 def test_summarize_attachments_kind_breakdown():
     # F14b: count + kind breakdown + filenames only (no content).
     assert _summarize_attachments(None) is None

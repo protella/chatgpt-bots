@@ -90,6 +90,22 @@ def test_non_dict_defaults_human():
     assert b.is_own_message(None) is False
 
 
+def test_dev_allowlisted_bot_id_classifies_human(monkeypatch):
+    # User-token (xoxp) harness posts carry the app's bot_id even though a human wrote them;
+    # the DEV_TREAT_BOT_IDS_AS_HUMAN allowlist restores the truth. Empty in prod.
+    from config import config as cfg
+    b = _Ident(bot_id=SELF_BOT_ID, bot_user_id=SELF_USER_ID)
+    msg = {"bot_id": "B07HARNESS", "app_id": "A07HARNESS", "user": "U07PETER", "text": "hi"}
+    assert b.classify_sender(msg) == "other_bot"
+    monkeypatch.setattr(cfg, "dev_treat_bot_ids_as_human", ["B07HARNESS"])
+    assert b.classify_sender(msg) == "human"
+    # Self-detection wins over the allowlist, and other bots stay bots.
+    assert b.classify_sender({"bot_id": SELF_BOT_ID}) == "self"
+    assert b.classify_sender({"bot_id": "B07OTHER"}) == "other_bot"
+    # app_id-only messages (no bot_id) never match the bot_id allowlist.
+    assert b.classify_sender({"app_id": "A07OTHER"}) == "other_bot"
+
+
 # --- get_thread_history: metadata that feeds the role mapping ---
 
 @pytest.mark.asyncio

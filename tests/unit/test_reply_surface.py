@@ -527,6 +527,63 @@ async def test_a_failed_final_post_hands_the_answer_back_instead_of_dropping_it(
         "loses every tool attribution")
 
 
+# =============================================== 2b. the footer rides the direct final-post
+
+class _FooterSlack(FakeSlack):
+    """FakeSlack that also exposes the settings-footer helper and reports footer_attached via
+    meta_out (mirroring the real client's send seam)."""
+
+    def attachable_footer_blocks(self, channel_id, model=None):
+        return [{"type": "actions", "elements": [
+            {"type": "button", "action_id": "open_channel_settings",
+             "text": {"type": "plain_text", "text": f"⚙️ {model}"}}]}]
+
+    async def send_message(self, channel, thread, text, blocks=None, meta_out=None,
+                           username=None):
+        if meta_out is not None:
+            meta_out["footer_attached"] = bool(blocks)
+        return await FakeSlack.send_message(self, channel, thread, text, blocks=blocks)
+
+
+@pytest.mark.asyncio
+async def test_direct_final_post_attaches_footer_to_the_reply(monkeypatch):
+    """Bug B: a top-level channel turn that did substantive work threads its answer via the
+    direct final-post path. The settings footer must ride THAT message, not arrive as a separate
+    standalone post (the bare "gpt-5.6-sol" message seen live 2026-07-16)."""
+    monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
+    slack = _FooterSlack(native=True)
+    processor = _processor(FakeOpenAI(["Postgres defaults to READ COMMITTED."]))
+    msg = _message(thread=None, place_in_channel=True)   # top-level channel trigger
+    ts = _thread_state()
+    turn = TurnRuntime.for_message(msg, None)             # → final_post_only, direct-post path
+    turn.mark_substantive_work()                          # a tool ran → threads under the trigger
+
+    resp = await _run(processor, slack, msg, ts, turn)
+
+    # place_in_channel flipped to a threaded reply, so the footer rode the message…
+    assert msg.metadata.get("place_in_channel") is False
+    assert resp.metadata.get("footer_attached") is True
+    # …and there is exactly ONE message (no separate standalone footer post).
+    assert len([c for c in slack.calls if c[0] == "postMessage"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_final_post_top_level_suppresses_footer(monkeypatch):
+    """A genuine top-level channel reply (no substantive work → stays place_in_channel) carries
+    NO footer — chrome is suppressed there exactly as on the streamed path."""
+    monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
+    slack = _FooterSlack(native=True)
+    processor = _processor(FakeOpenAI(["quick answer"]))
+    msg = _message(thread=None, place_in_channel=True)
+    ts = _thread_state()
+    turn = TurnRuntime.for_message(msg, None)             # no mark_substantive_work → stays top-level
+
+    resp = await _run(processor, slack, msg, ts, turn)
+
+    assert msg.metadata.get("place_in_channel") is True
+    assert resp.metadata.get("footer_attached") is not True
+
+
 # ============================================================ 3. the placement rule
 
 def test_final_post_only_is_exactly_top_level_in_a_channel(monkeypatch):

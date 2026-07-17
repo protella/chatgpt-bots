@@ -292,7 +292,9 @@ async def test_image_injection_uses_message_ts_metadata(temp_db):
     ]
     enhanced = await _inject(proc, messages, state)
     assert len(enhanced) == 3
-    assert enhanced[1]["role"] == "developer"
+    # An addressed-upload analysis rides as USER context (F51 role authority): it is a model-
+    # written description of untrusted user-supplied image bytes, not a developer instruction.
+    assert enhanced[1]["role"] == "user"
     assert "A tabby cat on a desk." in enhanced[1]["content"]
 
 

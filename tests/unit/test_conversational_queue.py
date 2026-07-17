@@ -232,6 +232,82 @@ class TestDrainDispatch:
         assert trigger.text == "solo" and trigger.metadata["queued_batch_size"] == 1
 
 
+def _edit_msg(text, ts, *, participation_check=False, edit_marker=None, channel="C123",
+              thread="111.0"):
+    md = {"ts": ts, "username": "u"}
+    if participation_check:
+        md["participation_check"] = True
+    if edit_marker is not None:
+        md["edit_reply_marker"] = edit_marker
+    return Message(text=text, user_id="U1", channel_id=channel, thread_id=thread,
+                   attachments=[], metadata=md)
+
+
+class TestEditStaleDrop:
+    """F52: a stale PRE-EDIT participation dispatch that slipped into the busy queue is dropped
+    at drain (it would otherwise re-run the gate on stale text and post a duplicate), while the
+    edit's own dispatch and genuinely different messages survive."""
+
+    def _client(self, registry):
+        client = Mock()
+        client.message_handler = Mock()
+        client.edit_dispatch_marker = lambda ch, ts: registry.get(f"{ch}|{ts}")
+        return client
+
+    @pytest.mark.asyncio
+    async def test_stale_pre_edit_dispatch_dropped_survivor_kept(self, manager):
+        key = "C123:111.0"
+        # ts 200 was edited and handled; the edit's own dispatch carries marker "M".
+        registry = {"C123|200.0": "M"}
+        # Stale pre-edit engine respond (participation_check, no marker) for the SAME ts.
+        manager.enqueue_pending(key, _edit_msg("does anyone remember?", "200.0",
+                                               participation_check=True))
+        # A genuinely different queued message (different ts) — must survive.
+        manager.enqueue_pending(key, _edit_msg("unrelated question", "201.0",
+                                               participation_check=True))
+        manager.get_thread_async = AsyncMock(return_value=Mock())
+        proc = _drain_proc(manager)
+        client = self._client(registry)
+        with patch("message_processor.base.asyncio.sleep", new=AsyncMock()):
+            await proc._dispatch_pending_batch(_msg("done"), client, key)
+        proc._schedule_async_call.assert_called_once()
+        trigger = client.message_handler.call_args.args[0]
+        assert trigger.text == "unrelated question"   # the stale one was dropped
+        # The different message survived as the sole trigger (batch size 1 after the drop).
+        assert trigger.metadata["queued_batch_size"] == 1
+
+    @pytest.mark.asyncio
+    async def test_edits_own_marked_dispatch_survives(self, manager):
+        key = "C123:111.0"
+        registry = {"C123|200.0": "M"}
+        # The edit's OWN engine re-dispatch: same ts, carries the matching marker → kept.
+        manager.enqueue_pending(key, _edit_msg("review the Q3 numbers", "200.0",
+                                               participation_check=True, edit_marker="M"))
+        manager.get_thread_async = AsyncMock(return_value=Mock())
+        proc = _drain_proc(manager)
+        client = self._client(registry)
+        with patch("message_processor.base.asyncio.sleep", new=AsyncMock()):
+            await proc._dispatch_pending_batch(_msg("done"), client, key)
+        proc._schedule_async_call.assert_called_once()
+        assert client.message_handler.call_args.args[0].text == "review the Q3 numbers"
+
+    @pytest.mark.asyncio
+    async def test_addressed_turn_never_dropped(self, manager):
+        """An addressed (app_mention/DM) queued turn carries no participation_check — even for a
+        registered edit ts it is never dropped."""
+        key = "C123:111.0"
+        registry = {"C123|200.0": "M"}
+        manager.enqueue_pending(key, _edit_msg("<@UBOT> what's up", "200.0",
+                                               participation_check=False))
+        manager.get_thread_async = AsyncMock(return_value=Mock())
+        proc = _drain_proc(manager)
+        client = self._client(registry)
+        with patch("message_processor.base.asyncio.sleep", new=AsyncMock()):
+            await proc._dispatch_pending_batch(_msg("done"), client, key)
+        proc._schedule_async_call.assert_called_once()
+        assert client.message_handler.call_args.args[0].text == "<@UBOT> what's up"
+
+
 # --- Gate order: participation-ignored messages never reach the queue ---
 
 class TestGateOrder:

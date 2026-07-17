@@ -64,7 +64,10 @@ def test_last_400_tail_vs_300_head_envelope(monkeypatch):
     _rec(p, "C1", "101.0", "short reply", thread_ts="100.0")
     env = p.render_envelope("C1")
     tail_out = p.render_thread_tail("C1", "100.0", before_ts="200.0")
-    assert ("H" * 100) in env and "T" not in env           # envelope keeps the HEAD (300)
+    # De-brittled (F47): the assertion scans the whole envelope incl. its prose header, so a
+    # lone "T" is a false trip; the head-truncation keeps ZERO tail T's, and a 100-run can't
+    # appear in header prose — a robust proxy for "the tail didn't leak into the envelope".
+    assert ("H" * 100) in env and ("T" * 100) not in env    # envelope keeps the HEAD (300)
     assert ("T" * 200) in tail_out                          # tail keeps the last 400
 
 

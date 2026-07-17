@@ -92,10 +92,13 @@ settings:
       - message.mpim
       - reaction_added
       - reaction_removed
+      - file_deleted          # F51 ambient memory: purge summaries when a file is removed
       - app_home_opened       # agent_view lifecycle (current)
       - app_context_changed   # agent_view lifecycle (current)
-      - assistant_thread_started           # legacy agent surface — remove after code migrates
-      - assistant_thread_context_changed   # legacy agent surface — remove after code migrates
+      # assistant_thread_started / assistant_thread_context_changed were removed 2026-07-16:
+      # Slack's manifest validator rejects them alongside agent_view ("Agent View should not
+      # use assistant_thread_started"). The code's legacy handlers stay registered one release
+      # as a no-op safety net (see assistant_events.py) — Slack simply stops sending the events.
   interactivity:
     is_enabled: true
   org_deploy_enabled: false

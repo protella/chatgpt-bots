@@ -221,5 +221,8 @@ def test_unsupported_message_generated_from_extensions():
 def test_generated_doc_list_matches_sets():
     doc_types = ", ".join(sorted(ext.lstrip(".").upper() for ext in DOCUMENT_EXTENSIONS))
     assert "PPTX" in doc_types and "PDF" in doc_types
-    assert "PPT," not in doc_types and not doc_types.endswith("PPT")
-    assert "DOC," not in doc_types  # only DOCX remains
+    # Legacy binary formats stay unsupported — check the invariant directly rather
+    # than via a substring of the rendered list (F49 added .adoc, whose uppercase
+    # "ADOC" contains the substring "DOC" but is an unrelated AsciiDoc text format).
+    assert ".ppt" not in DOCUMENT_EXTENSIONS  # only .pptx remains
+    assert ".doc" not in DOCUMENT_EXTENSIONS  # only .docx remains

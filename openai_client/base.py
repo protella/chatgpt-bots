@@ -476,6 +476,16 @@ class OpenAIClient(LoggerMixin):
         return await responses_api.classify_participation(
             self, text=text, signals=signals, images=images)
 
+    async def classify_placement(
+        self,
+        text: str,
+        *,
+        signals: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """F46 placement judgment for an ADDRESSED turn: "thread" | "channel". Fail-open —
+        any error/timeout/parse failure returns "channel" (today's top-level mention behavior)."""
+        return await responses_api.classify_placement(self, text=text, signals=signals)
+
     async def extract_memory(
         self,
         exchange_text: str,
@@ -597,10 +607,18 @@ class OpenAIClient(LoggerMixin):
         conversation_history: Optional[List[Dict[str, Any]]] = None,
         system_prompt: Optional[str] = None,
         stream_callback: Optional[Callable[[str], None]] = None,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        verbosity: Optional[str] = None,
     ) -> str:
         # enhance_prompt is vestigial: the utility-model rewrite hop it used to gate is gone
         # (the only caller, image_catalog, always passed False). Kept solely so that explicit
         # `enhance_prompt=False` keyword keeps binding; drop it there and here together.
+        #
+        # model/reasoning_effort/verbosity override the analysis defaults (gpt_model +
+        # analysis_*). The ambient vision worker passes the utility model + clamped utility
+        # effort so a message the bot never answered doesn't cost primary-model spend, and the
+        # recorded model matches the one that actually ran. Omitted → the original behavior.
         return await vision_api.analyze_images(
             self,
             images=images,
@@ -609,6 +627,9 @@ class OpenAIClient(LoggerMixin):
             conversation_history=conversation_history,
             system_prompt=system_prompt,
             stream_callback=stream_callback,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            verbosity=verbosity,
         )
 
     async def edit_image(

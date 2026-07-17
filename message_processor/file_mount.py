@@ -187,6 +187,7 @@ async def execute_mount_file(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str
     # moment to stake the 👀.
     turn = getattr(ctx, "turn", None)
     if turn is not None:
+        turn.mark_substantive_work()  # F46: real download + mount ⇒ thread a top-level reply
         await turn.claim_work(client, getattr(ctx, "message", None))
 
     data = await _download(client, entry)

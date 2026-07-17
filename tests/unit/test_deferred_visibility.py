@@ -244,13 +244,26 @@ def test_every_streaming_message_creation_uses_the_reply_target():
     got away with it only because a placeholder already existed in the right place. Take the
     placeholder away and a top-level channel reply lands inside a thread instead. Every one of
     them must now use the turn's chosen destination.
+
+    F46: the zero-chunk final post now targets the RESOLVED destination — `effective_target =
+    turn.resolve_reply_target(message)`, i.e. `reply_target` refined by the substantive-work
+    thread override (a top-level channel reply that did real work threads under the trigger).
+    The seed / overflow parts still use `reply_target` directly. What must NEVER come back is
+    `message.thread_id` (the thread the trigger merely lives in).
     """
+    import inspect
     from message_processor.handlers.text import TextHandlerMixin
 
     targets = _creation_calls(TextHandlerMixin._handle_streaming_text_response)
     assert targets, "expected the streaming handler to create messages"
-    assert all(t == "reply_target" for t in targets), (
-        f"a streaming message-creation site is not using reply_target: {targets}")
+    assert all(t in ("reply_target", "effective_target") for t in targets), (
+        f"a streaming message-creation site targets neither reply_target nor the resolved "
+        f"effective_target (a regression to message.thread_id?): {targets}")
+    assert "effective_target" in targets, (
+        "the final-post site must use the resolved effective_target (F46 late thread override)")
+    src = inspect.getsource(TextHandlerMixin._handle_streaming_text_response)
+    assert "effective_target = " in src and "resolve_reply_target(message)" in src, (
+        "effective_target must be bound to the turn's resolved reply destination")
 
 
 def test_the_reply_target_is_the_turns_chosen_destination(monkeypatch):
