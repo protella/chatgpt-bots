@@ -50,6 +50,11 @@ class TurnRuntime:
     progress_enabled: bool = True
     reply_thread_id: Optional[str] = None
     final_post_only: bool = False
+    # F46: did this turn do real, thread-worthy work? Set by mark_substantive_work() at every
+    # site that stakes a work claim (a hosted tool ran, an MCP call was made, or a slow local
+    # deliverable tool ran). Drives resolve_reply_target's top-level→thread override. Tracked
+    # SEPARATELY from the 👀/claim_work, which early-returns when enable_ack_reaction is off.
+    did_substantive_work: bool = False
     ack_lease: Optional[dict] = field(default=None, repr=False)
     ack_target_ts: Optional[str] = None
     visible_action_committed: bool = False
@@ -91,6 +96,28 @@ class TurnRuntime:
             reply_thread_id=reply_thread_id,
             final_post_only=final_post_only,
         )
+
+    def mark_substantive_work(self) -> None:
+        """F46: record that this turn did real, thread-worthy work (a hosted tool ran, an MCP
+        call was made, or a deliverable local tool ran). Drives the top-level→thread override at
+        final-post time. Separate from claim_work()/the 👀, which is gated on enable_ack_reaction."""
+        self.did_substantive_work = True
+
+    def resolve_reply_target(self, message: Any) -> Optional[str]:
+        """F46: the thread_ts a final reply should go to. A top-level channel reply (reply_thread_id
+        is None, final_post_only) that did substantive work is threaded under the trigger; otherwise
+        the original target stands. Mutates message.metadata['place_in_channel']=False when it flips,
+        so attribution/footer render as a threaded reply. Idempotent; fail-open."""
+        try:
+            if (self.final_post_only and self.reply_thread_id is None
+                    and self.did_substantive_work):
+                meta = getattr(message, "metadata", None)
+                if isinstance(meta, dict):
+                    meta["place_in_channel"] = False
+                return getattr(message, "thread_id", None)
+        except Exception:
+            pass
+        return self.reply_thread_id
 
     async def claim_work(self, client: Any, message: Any) -> None:
         """Real work is starting: stake the 👀 claim on the triggering message.

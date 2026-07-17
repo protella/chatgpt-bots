@@ -6,6 +6,7 @@ import time
 from slack_sdk.errors import SlackApiError
 
 from config import config
+from slack_client.formatting.blocks import extract_supplementary_text
 
 
 class SlackSettingsHandlersMixin:
@@ -108,7 +109,62 @@ class SlackSettingsHandlersMixin:
         ric_opt = state.get('reply_in_channel_block', {}).get('reply_in_channel', {}).get('selected_option') or {}
         ric_val = ric_opt.get('value', 'inherit')
         cs['reply_in_channel'] = None if ric_val == 'inherit' else (ric_val == 'channel')
+
+        # Ambient-memory checkbox (F51): a present selected option means "capturing" (on). We keep
+        # the stored tri-state's on-state as None (inherit) and only an OFF box as explicit False,
+        # matching the enforcement rule that only `ambient_memory is False` is an opt-out. If the
+        # block is absent (master switch off → toggle hidden) leave the stored value untouched.
+        if 'ambient_memory_block' in state:
+            amb_sel = (state.get('ambient_memory_block', {})
+                       .get('ambient_memory', {}).get('selected_options'))
+            cs['ambient_memory'] = None if amb_sel else False
         return cs
+
+    @staticmethod
+    def _ambient_memory_block(ambient_value):
+        """Checkbox input for the per-channel ambient-memory opt-out (F51).
+
+        Checked = capturing (the default); unchecked = opted out. `ambient_value` is the stored
+        tri-state (None inherit / True / False); only an explicit False renders unchecked, so an
+        inheriting or explicitly-on channel shows the box ticked.
+        """
+        option = {
+            "text": {"type": "plain_text", "text": "Capture ambient context"},
+            "description": {"type": "plain_text",
+                            "text": ("Quietly keep notes on links, images, and files shared here "
+                                     "so I have context later. Off = stop capturing new items; "
+                                     "existing notes age out automatically.")},
+            "value": "on",
+        }
+        element = {"type": "checkboxes", "action_id": "ambient_memory", "options": [option]}
+        if ambient_value is not False:  # None (inherit → on) or True → capturing
+            element["initial_options"] = [option]
+        return {"type": "input", "block_id": "ambient_memory_block", "optional": True,
+                "element": element,
+                "label": {"type": "plain_text", "text": "Ambient memory"}}
+
+    def _inject_ambient_memory_toggle(self, modal, ambient_value):
+        """Insert the ambient-memory checkbox into a freshly built channel modal, right after the
+        reply-placement block (falls back to appending). Respects the global master switch: when
+        ENABLE_AMBIENT_MEMORY is off the toggle is hidden entirely — nothing is being captured, so
+        there is nothing to configure. Best-effort: a failure never stops the modal from opening.
+        """
+        if not getattr(config, "enable_ambient_memory", True):
+            return modal
+        try:
+            blocks = modal.get("blocks")
+            if not isinstance(blocks, list):
+                return modal
+            block = self._ambient_memory_block(ambient_value)
+            idx = next((i for i, b in enumerate(blocks)
+                        if b.get("block_id") == "reply_in_channel_block"), None)
+            if idx is None:
+                blocks.append(block)
+            else:
+                blocks.insert(idx + 1, block)
+        except Exception as e:  # noqa: BLE001 — a UI extra must not block the modal
+            self.log_warning(f"Could not inject ambient-memory toggle: {e}")
+        return modal
 
     def _register_settings_handlers(self):
         # Register slash command handler
@@ -237,6 +293,7 @@ class SlackSettingsHandlersMixin:
                 modal = self.settings_modal.build_channel_settings_modal(
                     channel_id, current, global_default,
                     channel_memories=memories)
+                self._inject_ambient_memory_toggle(modal, (current or {}).get("ambient_memory"))
                 await client.views_open(trigger_id=trigger_id, view=modal)
                 self.log_info(f"Channel settings modal opened for {channel_id} by {user_id} (footer button)")
             except Exception as e:
@@ -325,6 +382,18 @@ class SlackSettingsHandlersMixin:
             channel_effort = _sel('channel_effort_block', 'channel_reasoning_effort')
             channel_verbosity = _sel('channel_verbosity_block', 'channel_verbosity')
 
+            # Ambient-memory opt-out (F51): the checkbox is only rendered when the global master
+            # switch is on, so its block is present only then. Checked → capturing (store None so
+            # the channel keeps inheriting the global default); unchecked → opted out (False).
+            # When the toggle was hidden (master off) omit the field entirely so a save never
+            # clobbers a stored value. Turning it OFF never deletes existing notes — retention
+            # ages them out; capture/backfill enforcement lives elsewhere.
+            ambient_kwargs = {}
+            if config.enable_ambient_memory and 'ambient_memory_block' in state:
+                amb_sel = (state.get('ambient_memory_block', {})
+                           .get('ambient_memory', {}).get('selected_options'))
+                ambient_kwargs['ambient_memory'] = None if amb_sel else False
+
             try:
                 await self.db.set_channel_settings_async(
                     channel_id,
@@ -336,6 +405,7 @@ class SlackSettingsHandlersMixin:
                     reasoning_effort=channel_effort,
                     verbosity=channel_verbosity,
                     updated_by=user_id,
+                    **ambient_kwargs,
                 )
                 default_level = MODE_TO_LEVEL.get(getattr(config, 'channel_response_mode', 'tag_only'), 'mentions_only')
                 effective = level_sel if level_sel != 'inherit' else f"inherit ({default_level})"
@@ -408,6 +478,7 @@ class SlackSettingsHandlersMixin:
                 modal = self.settings_modal.build_channel_settings_modal(
                     channel_id, cs, global_default, channel_memories=memories,
                     memory_textarea_value=mem_text, mem_seed=mem_seed)
+                self._inject_ambient_memory_toggle(modal, cs.get("ambient_memory"))
                 await client.views_update(view_id=view.get('id'), view=modal)
                 self.log_debug(f"Channel modal rebuilt for model change in {channel_id}")
             except Exception as e:
@@ -1212,9 +1283,18 @@ class SlackSettingsHandlersMixin:
                     
                     if result.get('ok') and result.get('messages'):
                         msg = result['messages'][0]
+                        # F48: the refetched original may carry its content OUTSIDE `text`
+                        # (a table block, an unfurl, webhook fields). Refetching only `text`
+                        # would rebuild the context minus the very thing being asked about.
+                        refetched_text = msg.get('text', '') or ''
+                        supplementary = extract_supplementary_text(
+                            msg, primary_text=refetched_text)
+                        if supplementary:
+                            refetched_text = (f"{refetched_text}\n\n{supplementary}"
+                                              if refetched_text.strip() else supplementary)
                         # Reconstruct the full context from the fetched message
                         original_context = {
-                            "original_message": msg.get('text', ''),
+                            "original_message": refetched_text,
                             "channel_id": channel_id,
                             "thread_id": original_context.get('thread_id'),
                             "attachments": []  # We'll process files if they exist

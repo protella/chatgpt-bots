@@ -41,7 +41,108 @@ MAX_OFFICE_DECOMPRESSED_BYTES = 200 * 1024 * 1024
 # read_document timeout, so concurrent scans need parallel workers.
 _EXTRACTION_EXECUTOR = ThreadPoolExecutor(max_workers=config.doc_extraction_workers,
                                           thread_name_prefix="doc-extract")
-# Supported document MIME types
+# ---------------------------------------------------------------------------
+# File-type routing — ONE central extension→handler map (F49).
+#
+# This map is the single source of truth for BOTH admission (is_document_file)
+# AND dispatch (safe_extract_content). Deriving both from the same table is what
+# closes the old hole where an extension was ADMITTED but then latin-1 decoded
+# into mojibake because dispatch only knew a handful of filenames.
+#
+# Every text-extractable type Slack can send belongs here. Anything that would
+# only yield confident mojibake (binaries) or leak secrets is in DENIED_* below,
+# which is consulted BEFORE any mimetype-positive admission.
+# ---------------------------------------------------------------------------
+
+# Text-family extensions — code, config, web, markup, IDL, diffs, subtitles, logs.
+# parse_text CANNOT fail (utf-8 → latin-1 → cp1252 → iso-8859-1), so every correctly
+# text-shaped file here degrades to readable prose.
+_TEXT_EXTENSIONS = (
+    # plain / docs / logs
+    '.txt', '.md', '.mdx', '.log', '.out', '.err', '.trace',
+    # code
+    '.py', '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs',
+    '.go', '.rs', '.java', '.c', '.cpp', '.cc', '.h', '.hpp',
+    '.cs', '.rb', '.php', '.sh', '.bash', '.zsh', '.ps1', '.bat',
+    '.swift', '.kt', '.scala', '.pl', '.lua', '.r', '.m', '.dart',
+    '.ex', '.erl', '.hs', '.clj', '.jl', '.zig', '.asm',
+    '.sql',
+    # data / config
+    '.json', '.jsonl', '.ndjson',
+    '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf', '.properties',
+    '.hcl', '.tf', '.tfvars', '.editorconfig',
+    '.xml', '.html', '.htm',
+    # web
+    '.css', '.scss', '.sass', '.less', '.vue', '.svelte', '.astro', '.j2',
+    # markup
+    '.rst', '.adoc', '.org', '.tex', '.bib',
+    # IDL / schema
+    '.graphql', '.gql', '.proto', '.thrift', '.avsc', '.xsd',
+    # diffs / subtitles
+    '.diff', '.patch', '.srt', '.vtt', '.ass',
+)
+
+# The central extension→handler map.
+EXTENSION_HANDLERS = {ext: 'parse_text' for ext in _TEXT_EXTENSIONS}
+EXTENSION_HANDLERS.update({
+    '.pdf': 'parse_pdf_structured',
+    '.docx': 'parse_docx_structured',
+    '.pptx': 'parse_pptx_structured',
+    '.xlsx': 'parse_excel_adaptive',
+    '.xls': 'parse_excel_adaptive',
+    '.csv': 'parse_excel_adaptive',
+    # tab/pipe-separated: pandas already sniffs the delimiter in _parse_csv_with_pandas
+    '.tsv': 'parse_excel_adaptive',
+    '.tab': 'parse_excel_adaptive',
+    '.psv': 'parse_excel_adaptive',
+    '.rtf': 'parse_rtf',
+    '.eml': 'parse_email',
+    '.ipynb': 'parse_notebook',
+})
+
+# Extensionless files with a well-known identity that Slack delivers as text.
+# NOT a blanket "no extension → text" rule (that would admit binary blobs); only
+# these exact basenames route to parse_text.
+KNOWN_FILENAMES = {
+    'dockerfile', 'makefile', 'readme', 'license', 'changelog',
+    'gemfile', 'procfile', 'jenkinsfile', '.gitignore', '.bashrc',
+}
+
+# Denylist — consulted BEFORE any mimetype-positive admission. A .zip / .env
+# mislabeled text/plain must still be refused: latin-1 decodes ANY bytes into
+# confident mojibake (a regression, not coverage), and ingesting secrets into a
+# Slack thread + document ledger is not something we want to do quietly.
+DENIED_EXTENSIONS = (
+    # secrets
+    '.env', '.pem', '.key',
+    # archives
+    '.zip', '.rar', '.7z', '.tar', '.gz',
+    # legacy binary Office (no no-disk extractor; must WIN over a lying text/* mimetype so
+    # they aren't latin-1'd into mojibake). Only the OOXML variants (.docx/.pptx/.xlsx) parse.
+    '.doc', '.ppt', '.xlsb',
+    # deliberately-dropped container/ebook/message/columnar formats (licensing/memory —
+    # see SPEC_ADDENDUM). Denied outright so a mislabeled text/* can't smuggle them in.
+    '.odt', '.ods', '.odp', '.epub', '.msg', '.parquet',
+    # raster / vector images: these belong to the vision path, never the document parser —
+    # a .jpg claiming text/plain would otherwise be latin-1'd into garbage.
+    '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tif', '.tiff',
+    '.heic', '.heif', '.svg', '.ico',
+    # binary design / media assets
+    '.psd', '.ai', '.sketch', '.fig',
+    '.mp4', '.mov', '.avi', '.mkv',
+    '.mp3', '.wav', '.m4a', '.flac',
+    # executables / disk images / fonts with no text to extract
+    '.exe', '.dll', '.so', '.bin', '.iso',
+    '.ttf', '.otf', '.woff', '.woff2',
+)
+
+# Document file extensions — derived from the central map so admission and
+# dispatch can never disagree. Kept as a plain `set` (public: tests import it).
+DOCUMENT_EXTENSIONS = set(EXTENSION_HANDLERS)
+
+# Supported document MIME types. A mimetype here is admitted directly (the
+# text/* family is additionally admitted via a catch-all in is_document_file).
+# Kept a strict subset of MIME_TYPE_HANDLERS — enforced by a parity test.
 SUPPORTED_DOCUMENT_MIMETYPES = {
     # PDF documents
     "application/pdf",
@@ -52,6 +153,8 @@ SUPPORTED_DOCUMENT_MIMETYPES = {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # .xlsx
     "application/vnd.ms-excel",  # .xls
     "text/csv",  # .csv
+    "text/tab-separated-values",  # .tsv
+    "text/tsv",  # .tsv (alt label)
     # PowerPoint documents (.ppt legacy binary is not parseable by python-pptx
     # and is deliberately unsupported so users get the proper warning)
     "application/vnd.openxmlformats-officedocument.presentationml.presentation",  # .pptx
@@ -59,6 +162,10 @@ SUPPORTED_DOCUMENT_MIMETYPES = {
     "text/plain",  # .txt
     "text/markdown",  # .md
     "application/rtf",  # .rtf
+    "text/rtf",  # .rtf (alt label)
+    # Rich messages / notebooks
+    "message/rfc822",  # .eml
+    "application/x-ipynb+json",  # .ipynb
     # Code files
     "text/x-python",  # .py
     "application/javascript",  # .js
@@ -70,13 +177,8 @@ SUPPORTED_DOCUMENT_MIMETYPES = {
     # Log files
     "text/x-log",  # .log
 }
-# Document file extensions
-DOCUMENT_EXTENSIONS = {
-    '.pdf', '.docx', '.xlsx', '.xls', '.csv', '.pptx',
-    '.txt', '.md', '.rtf', '.py', '.js', '.json', '.sql', '.yaml', '.yml',
-    '.xml', '.html', '.htm', '.log', '.out'
-}
-# MIME type routing handlers
+# MIME type routing handlers — declared-mimetype fallback for extensionless files.
+# (Dispatch is extension-first; see safe_extract_content.)
 MIME_TYPE_HANDLERS = {
     'application/pdf': 'parse_pdf_structured',
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'parse_docx_structured',
@@ -84,9 +186,14 @@ MIME_TYPE_HANDLERS = {
     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'parse_excel_adaptive',
     'application/vnd.ms-excel': 'parse_excel_adaptive',
     'text/csv': 'parse_excel_adaptive',
+    'text/tab-separated-values': 'parse_excel_adaptive',
+    'text/tsv': 'parse_excel_adaptive',
     'text/plain': 'parse_text',
     'text/markdown': 'parse_text',
-    'application/rtf': 'parse_text',
+    'application/rtf': 'parse_rtf',
+    'text/rtf': 'parse_rtf',
+    'message/rfc822': 'parse_email',
+    'application/x-ipynb+json': 'parse_notebook',
     'text/x-python': 'parse_text',
     'application/javascript': 'parse_text',
     'application/json': 'parse_text',
@@ -149,18 +256,54 @@ class DocumentHandler(LoggerMixin):
             }
     def is_document_file(self, filename: str, mimetype: Optional[str] = None) -> bool:
         """
-        Check if a file is a supported document type
+        Check if a file is a supported document type.
+
+        Gate order is load-bearing (F49):
+          1. Denylist wins over EVERYTHING — a .zip/.env mislabeled text/plain is
+             still refused, because latin-1 would decode any bytes into confident
+             mojibake and secrets should not be ingested silently.
+          2. Mimetype-positive: the explicit supported set OR the text/* family
+             catch-all (fixes every correctly-labeled text/x-* code type).
+          3. Extension / known-filename. This is where TypeScript survives: Slack
+             sends `video/mp2t` for a .ts file, so it fails step 2 and is admitted
+             ONLY by its extension. Never refactor step 2 to short-circuit False.
+
         Args:
-            filename: The filename to check
+            filename: The filename to check (Slack documents this as nullable)
             mimetype: Optional MIME type
         Returns:
             True if the file is a supported document type
         """
-        if mimetype and mimetype in SUPPORTED_DOCUMENT_MIMETYPES:
+        filename_lower = (filename or "").lower()
+        if self._is_denied_file(filename_lower):
+            return False
+        if mimetype and (mimetype in SUPPORTED_DOCUMENT_MIMETYPES
+                         or mimetype.startswith("text/")):
             return True
-        # Check file extension
-        filename_lower = filename.lower()
-        return any(filename_lower.endswith(ext) for ext in DOCUMENT_EXTENSIONS)
+        return self._handler_for_filename(filename_lower) is not None
+
+    @staticmethod
+    def _is_denied_file(filename_lower: str) -> bool:
+        """True for secrets and binary formats we refuse regardless of mimetype."""
+        return any(filename_lower.endswith(ext) for ext in DENIED_EXTENSIONS)
+
+    @staticmethod
+    def _handler_for_filename(filename: Optional[str]) -> Optional[str]:
+        """Resolve a parser method name from the central extension map.
+
+        Returns the handler for the LONGEST matching extension (so compound names
+        like ``report.pdf.txt`` route by their real trailing extension), then falls
+        back to a known extensionless basename, then None (caller consults the
+        declared mimetype). Kept static + pure so admission and dispatch share it.
+        """
+        name = (filename or "").lower().rsplit('/', 1)[-1]
+        if name in KNOWN_FILENAMES:
+            return 'parse_text'
+        best_ext: Optional[str] = None
+        for ext in EXTENSION_HANDLERS:
+            if name.endswith(ext) and (best_ext is None or len(ext) > len(best_ext)):
+                best_ext = ext
+        return EXTENSION_HANDLERS[best_ext] if best_ext else None
     def safe_extract_content(self, file_data: bytes, mime_type: str, filename: str,
                              ocr_images: bool = True, ocr_text: bool = False) -> Dict[str, Any]:
         """
@@ -180,21 +323,16 @@ class DocumentHandler(LoggerMixin):
                 'format': 'error'
             }
         try:
-            # Route to appropriate parser
-            handler_name = MIME_TYPE_HANDLERS.get(mime_type)
-            if not handler_name:
-                # Try to determine handler from filename
-                filename_lower = filename.lower()
-                if filename_lower.endswith('.pdf'):
-                    handler_name = 'parse_pdf_structured'
-                elif filename_lower.endswith('.docx'):
-                    handler_name = 'parse_docx_structured'
-                elif filename_lower.endswith('.pptx'):
-                    handler_name = 'parse_pptx_structured'
-                elif filename_lower.endswith(('.xlsx', '.xls', '.csv')):
-                    handler_name = 'parse_excel_adaptive'
-                else:
-                    handler_name = 'parse_text'
+            # Route to appropriate parser. Extension-first, then the declared
+            # mimetype for extensionless files, then plain text. Extension-first is
+            # deliberate: Slack routinely sends application/octet-stream or a generic
+            # text/plain, and (for example) an .ipynb mislabeled application/json must
+            # route to parse_notebook — NOT dump raw JSON (a context bomb) at the model.
+            # The central EXTENSION_HANDLERS map is the same one admission uses, so an
+            # admitted extension can never resolve to a different handler here.
+            handler_name = self._handler_for_filename(filename)
+            if handler_name is None:
+                handler_name = MIME_TYPE_HANDLERS.get(mime_type, 'parse_text')
             # Zip-bomb guard for office-XML formats (they are ZIP archives)
             if handler_name in ('parse_docx_structured', 'parse_pptx_structured', 'parse_excel_adaptive') \
                     and file_data[:2] == b'PK' and not self._office_zip_within_limits(file_data):
@@ -745,8 +883,11 @@ class DocumentHandler(LoggerMixin):
             Dict with sheets, content, and structure info
         """
         try:
-            # Determine if this is CSV or Excel
-            if filename.lower().endswith('.csv'):
+            # Determine if this is a delimited-text table or a binary spreadsheet.
+            # .tsv/.tab (tab) and .psv (pipe) go through the CSV path — pandas sniffs
+            # the delimiter across [',', ';', '\t', '|'] in _parse_csv_with_pandas, so
+            # routing them here is deliberate rather than relying on the except fallback.
+            if filename.lower().endswith(('.csv', '.tsv', '.tab', '.psv')):
                 return self._parse_csv_with_pandas(file_data, filename, pd)
             else:
                 return self._parse_excel_with_pandas(file_data, filename, pd)
@@ -870,6 +1011,85 @@ class DocumentHandler(LoggerMixin):
             'encoding': 'utf-8_with_errors',
             'lines': len(text.splitlines()),
             'warning': 'Some characters may not have been decoded correctly'
+        }
+    def parse_rtf(self, file_data: bytes, filename: str) -> Dict[str, Any]:
+        """Extract prose from an RTF document, stripping control words.
+
+        Without this, .rtf fell through to parse_text and handed the model the raw
+        ``{\\rtf1\\ansi ...`` control-code soup. striprtf (BSD-3) consumes a decoded
+        string, so the bytes are decoded first (utf-8, then latin-1 as a fallback).
+        """
+        from striprtf.striprtf import rtf_to_text
+        try:
+            raw = file_data.decode('utf-8')
+        except UnicodeDecodeError:
+            raw = file_data.decode('latin-1', errors='replace')
+        text = rtf_to_text(raw)
+        return {
+            'content': text or '[No text content found in RTF document]',
+            'format': 'rtf',
+            'lines': len((text or '').splitlines()),
+        }
+    def parse_email(self, file_data: bytes, filename: str) -> Dict[str, Any]:
+        """Extract an .eml message: key headers plus the text/plain body.
+
+        Stdlib ``email`` only — no dependency. Attachments are intentionally
+        skipped: only the human-readable headers (From/To/Cc/Subject/Date) and the
+        plain-text body part reach the model.
+        """
+        from email import policy
+        from email.parser import BytesParser
+        msg = BytesParser(policy=policy.default).parsebytes(file_data)
+        header_lines = []
+        for header in ('From', 'To', 'Cc', 'Subject', 'Date'):
+            value = msg.get(header)
+            if value:
+                header_lines.append(f"{header}: {value}")
+        body = ''
+        try:
+            body_part = msg.get_body(preferencelist=('plain',))
+            if body_part is not None:
+                body = body_part.get_content()
+        except Exception as e:
+            self.log_warning(f"Failed to extract .eml body from {filename}: {e}")
+        content = '\n'.join(header_lines)
+        if body:
+            content += ('\n\n' if content else '') + body.strip()
+        return {
+            'content': content or '[No readable headers or text body in email]',
+            'format': 'eml',
+        }
+    def parse_notebook(self, file_data: bytes, filename: str) -> Dict[str, Any]:
+        """Extract a Jupyter .ipynb: markdown and code cells only.
+
+        Cell OUTPUTS, execution counts, and base64-embedded image payloads are
+        deliberately dropped — a notebook's outputs can be megabytes of base64 that
+        would blow the context window. This is why .ipynb has a dedicated handler and
+        never falls through to raw parse_text.
+        """
+        import json
+        nb = json.loads(file_data.decode('utf-8', errors='replace'))
+        cells = nb.get('cells', [])
+        blocks = []
+        for cell in cells:
+            if not isinstance(cell, dict):
+                continue
+            cell_type = cell.get('cell_type')
+            source = cell.get('source', '')
+            if isinstance(source, list):
+                source = ''.join(source)
+            source = (source or '').strip()
+            if not source:
+                continue
+            if cell_type == 'markdown':
+                blocks.append(source)
+            elif cell_type == 'code':
+                blocks.append(f"```\n{source}\n```")
+        content = '\n\n'.join(blocks)
+        return {
+            'content': content or '[Notebook contains no markdown or code cells]',
+            'format': 'ipynb',
+            'total_cells': len(cells),
         }
     def flexible_table_to_markdown(self, table_data: List[List[str]]) -> str:
         """

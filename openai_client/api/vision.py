@@ -18,11 +18,21 @@ async def analyze_images(
     conversation_history: Optional[List[Dict[str, Any]]] = None,
     system_prompt: Optional[str] = None,
     stream_callback: Optional[Callable[[str], None]] = None,
+    model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    verbosity: Optional[str] = None,
 ) -> str:
-    """Analyze one or more images with a question."""
+    """Analyze one or more images with a question.
+
+    `model`/`reasoning_effort`/`verbosity` override the analysis defaults (config.gpt_model +
+    config.analysis_*) — the ambient vision worker routes through the utility model so a message
+    the bot never answered doesn't spend primary-model reasoning. Omitted → original behavior."""
 
     self = client
     detail = detail or config.default_detail_level
+    vision_model = model or config.gpt_model
+    vision_effort = reasoning_effort or config.analysis_reasoning_effort
+    vision_verbosity = verbosity or config.analysis_verbosity
 
     # Limit to 10 images
     if len(images) > 10:
@@ -92,7 +102,7 @@ async def analyze_images(
             self.log_debug(f"Streaming vision analysis with {config.api_timeout_read}s timeout")
 
             request_params = {
-                "model": config.gpt_model,
+                "model": vision_model,
                 "input": input_messages,
                 "max_output_tokens": config.vision_max_tokens,
                 "store": False,
@@ -101,9 +111,9 @@ async def analyze_images(
 
             # Primary model is a GPT-5-series reasoning model (gpt-5.5)
             request_params["temperature"] = 1.0
-            request_params["reasoning"] = {"effort": config.analysis_reasoning_effort}
-            request_params["text"] = {"verbosity": config.analysis_verbosity}
-            if config.gpt_model.startswith("gpt-5.5"):
+            request_params["reasoning"] = {"effort": vision_effort}
+            request_params["text"] = {"verbosity": vision_verbosity}
+            if vision_model.startswith("gpt-5.5"):
                 request_params["prompt_cache_retention"] = "24h"
 
             # Stream the response
@@ -190,7 +200,7 @@ async def analyze_images(
         else:
             # Non-streaming version
             request_params = {
-                "model": config.gpt_model,
+                "model": vision_model,
                 "input": input_messages,
                 "max_output_tokens": config.vision_max_tokens,  # Use higher limit for vision with reasoning
                 "store": False,
@@ -198,9 +208,9 @@ async def analyze_images(
 
             # Primary model is a GPT-5-series reasoning model (gpt-5.5)
             request_params["temperature"] = 1.0
-            request_params["reasoning"] = {"effort": config.analysis_reasoning_effort}
-            request_params["text"] = {"verbosity": config.analysis_verbosity}
-            if config.gpt_model.startswith("gpt-5.5"):
+            request_params["reasoning"] = {"effort": vision_effort}
+            request_params["text"] = {"verbosity": vision_verbosity}
+            if vision_model.startswith("gpt-5.5"):
                 request_params["prompt_cache_retention"] = "24h"
 
             # API call with enforced timeout wrapper

@@ -211,6 +211,42 @@ class BotConfig:
     gate_vision_max_bytes: int = field(default_factory=lambda: int(os.getenv("GATE_VISION_MAX_BYTES", str(5 * 1024 * 1024))))
     gate_vision_detail: str = field(default_factory=lambda: os.getenv("GATE_VISION_DETAIL", "low"))
 
+    # F51 — Ambient memory. Images/links/files posted in a channel or thread are looked at,
+    # summarized, and kept as derived artifacts in the running context even when the bot does
+    # NOT respond ("nothing seen is forgotten"). Master kill switch below; participation `off`
+    # does NOT mean memory-off (they are distinct settings — see per-channel opt-out).
+    enable_ambient_memory: bool = field(default_factory=lambda: os.getenv("ENABLE_AMBIENT_MEMORY", "true").lower() == "true")
+    # Sub-switches: image capture rides the gate-vision call (near-zero cost) or a detached
+    # worker; link fetch opens URLs (SSRF-hardened); file summaries run bounded extraction.
+    enable_ambient_image_memory: bool = field(default_factory=lambda: os.getenv("ENABLE_AMBIENT_IMAGE_MEMORY", "true").lower() == "true")
+    enable_link_fetch: bool = field(default_factory=lambda: os.getenv("ENABLE_LINK_FETCH", "true").lower() == "true")
+    enable_ambient_file_memory: bool = field(default_factory=lambda: os.getenv("ENABLE_AMBIENT_FILE_MEMORY", "true").lower() == "true")
+    # fetch_url is the model-callable half of the SAME hardened fetcher (a directly-asked
+    # "read this link" opens it instead of relying on web_search luck). Not a free tool.
+    enable_fetch_url_tool: bool = field(default_factory=lambda: os.getenv("ENABLE_FETCH_URL_TOOL", "true").lower() == "true")
+
+    # Bounds — every cap that fires persists an honest `omitted`/`failed` status, never a silent drop.
+    ambient_queue_capacity: int = field(default_factory=lambda: int(os.getenv("AMBIENT_QUEUE_CAPACITY", "256")))
+    ambient_fetch_workers: int = field(default_factory=lambda: int(os.getenv("AMBIENT_FETCH_WORKERS", "2")))
+    ambient_vision_workers: int = field(default_factory=lambda: int(os.getenv("AMBIENT_VISION_WORKERS", "1")))
+    ambient_document_workers: int = field(default_factory=lambda: int(os.getenv("AMBIENT_DOCUMENT_WORKERS", "1")))
+    ambient_max_links_per_message: int = field(default_factory=lambda: int(os.getenv("AMBIENT_MAX_LINKS_PER_MESSAGE", "2")))
+    ambient_max_images_per_message: int = field(default_factory=lambda: int(os.getenv("AMBIENT_MAX_IMAGES_PER_MESSAGE", "4")))
+    ambient_max_files_per_message: int = field(default_factory=lambda: int(os.getenv("AMBIENT_MAX_FILES_PER_MESSAGE", "3")))
+    ambient_summary_max_chars: int = field(default_factory=lambda: int(os.getenv("AMBIENT_SUMMARY_MAX_CHARS", "600")))
+    ambient_extract_max_chars: int = field(default_factory=lambda: int(os.getenv("AMBIENT_EXTRACT_MAX_CHARS", "16000")))
+    # Link fetch caps. Bytes ceiling is SMALLER than the addressed-document 50MB ceiling.
+    link_fetch_max_bytes: int = field(default_factory=lambda: int(os.getenv("LINK_FETCH_MAX_BYTES", str(2 * 1024 * 1024))))
+    link_fetch_connect_timeout_s: float = field(default_factory=lambda: float(os.getenv("LINK_FETCH_CONNECT_TIMEOUT_S", "5")))
+    link_fetch_read_timeout_s: float = field(default_factory=lambda: float(os.getenv("LINK_FETCH_READ_TIMEOUT_S", "8")))
+    link_fetch_total_timeout_s: float = field(default_factory=lambda: float(os.getenv("LINK_FETCH_TOTAL_TIMEOUT_S", "12")))
+    link_fetch_max_redirects: int = field(default_factory=lambda: int(os.getenv("LINK_FETCH_MAX_REDIRECTS", "5")))
+    # Ambient file byte ceiling (streamed pre-download gate) — much smaller than addressed docs.
+    ambient_file_max_bytes: int = field(default_factory=lambda: int(os.getenv("AMBIENT_FILE_MAX_BYTES", str(8 * 1024 * 1024))))
+    ambient_artifact_retention_days: int = field(default_factory=lambda: int(os.getenv("AMBIENT_ARTIFACT_RETENTION_DAYS", "30")))
+    # Link summaries older than this re-fetch on next sighting (staleness window).
+    ambient_link_stale_days: int = field(default_factory=lambda: int(os.getenv("AMBIENT_LINK_STALE_DAYS", "7")))
+
     # Analysis function parameters (for vision analysis, complex tasks)
     analysis_reasoning_effort: str = field(default_factory=lambda: os.getenv("ANALYSIS_REASONING_EFFORT", "medium"))
     analysis_verbosity: str = field(default_factory=lambda: os.getenv("ANALYSIS_VERBOSITY", "medium"))
@@ -445,6 +481,14 @@ class BotConfig:
     # Env: SELF_PREFIX_NAMES (comma-separated).
     self_prefix_names: list = field(default_factory=lambda: _env_list("SELF_PREFIX_NAMES", ["ChatGPT", "ChatGPT-Dev", "Assistant", "Bot"]))
 
+    # --- Dev/test harness only ---
+    # bot_ids whose messages classify as HUMAN. Posts made via a user token (xoxp) carry the
+    # app's bot_id/app_id, so the live-test harness — which posts as a real user — reads as
+    # a bot everywhere sender type matters (participation judgment, edit-triggered replies).
+    # Listing that bot_id here restores the truth: those posts ARE a human's. NEVER set in prod.
+    # Env: DEV_TREAT_BOT_IDS_AS_HUMAN (comma-separated).
+    dev_treat_bot_ids_as_human: list = field(default_factory=lambda: _env_list("DEV_TREAT_BOT_IDS_AS_HUMAN", []))
+
     # --- Channel listening + wake classifier (Phase 5) ---
     # MASTER SWITCH (default OFF): when False the bot only acts on @mentions (app_mention) and
     # DMs, exactly as before — restarting the bot changes nothing. Flip on to let the bot see
@@ -459,6 +503,13 @@ class BotConfig:
     # message at channel level? (The engine still judges per message; a channel's
     # saved setting overrides this.)
     reply_in_channel_default: bool = field(default_factory=lambda: os.getenv("REPLY_IN_CHANNEL_DEFAULT", "true").lower() == "true")
+    # F46: judgment-call placement for MENTIONS/name-wakes (which run no participation gate and
+    # so carry no placement verdict). When on, a top-level public-channel mention that allows
+    # top-level replies gets one lean utility-model call deciding thread vs channel — so a
+    # deliberately-requested long-form deliverable ("write me a 3-paragraph story") threads even
+    # when no tool runs, like the Claude bot. DEFAULT OFF: inert until validated live on the dev
+    # bot; off ⇒ this block is skipped entirely (zero added latency/cost, zero behavior change).
+    enable_mention_placement_model: bool = field(default_factory=lambda: os.getenv("ENABLE_MENTION_PLACEMENT_MODEL", "false").lower() == "true")
     # Names the bot answers to without an @mention (case-insensitive whole-word match), so
     # "ChatGPT, can you…" wakes it. Keep in sync with the bot's display name(s).
     # Env: BOT_NAME_ALIASES (comma-separated) — SET THIS per environment (e.g. "ChatGPT-Dev" in dev).
@@ -484,6 +535,11 @@ class BotConfig:
     # judge can resolve who "you" addresses. 0 disables recording + the signal. F17: 15
     # (busy threads out-chatter 6 lines — match the envelope).
     participation_thread_tail: int = field(default_factory=lambda: int(os.getenv("PARTICIPATION_THREAD_TAIL", "15")))
+    # F47: a classifier-only "channel addressee tail" for TOP-LEVEL triggers, which have an
+    # empty thread tail and so no authoritative record of who was being addressed. Renders the
+    # last N channel-ring messages (top-level AND threaded), sender-typed, so the wake judge can
+    # resolve who a bare "you" continues an exchange with. 0 disables the signal.
+    participation_addressee_tail: int = field(default_factory=lambda: int(os.getenv("PARTICIPATION_ADDRESSEE_TAIL", "8")))
     # Max distinct threads whose tails are retained per channel (whole-thread LRU eviction).
     pulse_thread_tails_max: int = field(default_factory=lambda: int(os.getenv("PULSE_THREAD_TAILS_MAX", "50")))
     # Global bound on how many channels retain thread-tail rings (outer-map LRU).
@@ -503,6 +559,16 @@ class BotConfig:
     # Rapid-fire messages in the same channel within this window collapse into ONE engine
     # evaluation of the latest state (someone typing four short lines ≠ four verdicts).
     participation_debounce_seconds: float = field(default_factory=lambda: float(os.getenv("PARTICIPATION_DEBOUNCE_SECONDS", "3")))
+    # F52: an EDIT to a recent human message can also drive a reply. A forgotten @mention ADDED
+    # by an edit routes as an addressed wake (Slack fires no app_mention for edits); every other
+    # channel edit goes through the participation engine's full typo-vs-meaning judgment, so a
+    # spelling/format fix stays silent while a real content change (a question added, facts
+    # changed, an ask reversed) can respond — with a correction when the bot already answered.
+    # DEFAULT OFF (feature-flag convention): the operator env turns it on.
+    enable_edit_triggered_replies: bool = field(default_factory=lambda: os.getenv("ENABLE_EDIT_TRIGGERED_REPLIES", "false").lower() == "true")
+    # Only edits of messages younger than this (age from the ORIGINAL post time, not the edit
+    # time) are ever considered — an edit to last week's message never re-triggers.
+    edit_reply_window_minutes: int = field(default_factory=lambda: int(os.getenv("EDIT_REPLY_WINDOW_MINUTES", "60")))
     # F17: the hourly-cap hard rail is gone. Unprompted replies are still counted and fed to
     # the classifier as a signal, but pacing is the model's judgment, not a numeric ceiling —
     # MAX_UNPROMPTED_REPLIES_PER_HOUR is retired (frontier models don't run away unless asked).
@@ -599,6 +665,8 @@ class BotConfig:
     tool_provenance_line_budget: int = field(default_factory=lambda: int(os.getenv("TOOL_PROVENANCE_LINE_BUDGET", "300")))
     # Age (days) after which tool-use provenance rows are swept by the cleanup worker (F7/F14).
     tool_usage_retention_days: int = field(default_factory=lambda: int(os.getenv("TOOL_USAGE_RETENTION_DAYS", "90")))
+    # Age (days) after which stored document-extraction rows (metadata + summary) are swept.
+    document_retention_days: int = field(default_factory=lambda: int(os.getenv("DOCUMENT_RETENTION_DAYS", "90")))
 
     # --- Per-message timestamps (F10) ---
     # Prefix every message in model-visible thread context with a deterministic local

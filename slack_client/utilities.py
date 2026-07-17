@@ -123,6 +123,10 @@ class SlackUtilitiesMixin:
         if self.is_own_message(msg):
             return "self"
         if msg.get("bot_id") or msg.get("app_id") or msg.get("api_app_id"):
+            # Dev harness carve-out: user-token (xoxp) posts carry the app's bot_id even
+            # though a human authored them; the allowlist (empty in prod) restores that.
+            if str(msg.get("bot_id") or "") in (config.dev_treat_bot_ids_as_human or []):
+                return "human"
             return "other_bot"
         return "human"
 
@@ -302,14 +306,36 @@ class SlackUtilitiesMixin:
         
         return None
 
+    async def _read_response_capped(self, response, max_bytes: Optional[int]) -> Optional[bytes]:
+        """Read a response body. When `max_bytes` is set, STREAM and stop at max_bytes+1,
+        returning None if the cap is exceeded — so an ambient download can't buffer an unbounded
+        (missing/dishonest Content-Length) body into memory. `max_bytes=None` → the original
+        unbounded read (addressed-path behavior, unchanged)."""
+        if max_bytes is None:
+            return await response.read()
+        limit = int(max_bytes)
+        buf = bytearray()
+        async for chunk in response.content.iter_chunked(64 * 1024):
+            if not chunk:
+                continue
+            buf.extend(chunk)
+            if len(buf) > limit:
+                self.log_warning(f"Download exceeded byte cap ({limit}); aborting stream")
+                return None
+        return bytes(buf)
+
     async def download_file(self, file_url: str, file_id: Optional[str] = None,
-                            allow_html: bool = False) -> Optional[bytes]:
+                            allow_html: bool = False,
+                            max_bytes: Optional[int] = None) -> Optional[bytes]:
         """Download a file from Slack
 
         Args:
             file_url: The Slack file URL (can be url_private or permalink)
             file_id: Optional file ID (will be extracted from URL if not provided)
             allow_html: Accept a text/html body instead of rejecting it.
+            max_bytes: When set, stream and abort at max_bytes+1 (returns None) instead of
+                buffering the whole body. The ambient workers pass their smaller ceiling here;
+                the addressed path leaves it None (unbounded read, unchanged).
 
         An HTML body normally means the download FAILED — Slack serves a login page rather than
         a 401 when auth is wrong, so HTML where an image should be is the signature of a bad
@@ -348,7 +374,7 @@ class SlackUtilitiesMixin:
                     try:
                         async with session.get(file_url, headers=headers) as response:
                             if response.status == 200:
-                                return await response.read()
+                                return await self._read_response_capped(response, max_bytes)
                             else:
                                 self.log_error(f"Failed to download file directly: HTTP {response.status}")
                                 return None
@@ -390,7 +416,7 @@ class SlackUtilitiesMixin:
                             text_preview = await response.text()
                             self.log_debug(f"Response preview: {text_preview[:200]}")
                             return None
-                        return await response.read()
+                        return await self._read_response_capped(response, max_bytes)
                     else:
                         self.log_error(f"Failed to download file: HTTP {response.status}")
                         return None

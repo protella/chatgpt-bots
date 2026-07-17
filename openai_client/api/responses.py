@@ -8,7 +8,8 @@ from config import config, clamp_effort
 from openai_client.container_errors import (demote_container_tools, is_container_gone,
                                             persistent_container_ids)
 from prompts import (MEMORY_EXTRACTION_SYSTEM_PROMPT, PARTICIPATION_SYSTEM_PROMPT,
-                     TOOL_RESULT_SUMMARIZE_PROMPT, WAKE_CLASSIFIER_SYSTEM_PROMPT)
+                     PLACEMENT_SYSTEM_PROMPT, TOOL_RESULT_SUMMARIZE_PROMPT,
+                     WAKE_CLASSIFIER_SYSTEM_PROMPT)
 
 
 def _capture_usage(usage_sink, response):
@@ -1250,10 +1251,14 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
     def _render(status: str) -> str:
         rendered = [_attachment_line(status) if ln is _ATTACH_SLOT else ln for ln in lines]
         note = "\n\nSignals:\n" + "\n".join(rendered)
-        # F5: the current thread's recent exchange is the AUTHORITATIVE evidence for
-        # addressee resolution — render it above the peripheral channel envelope.
+        # F5/F47: addressee evidence is AUTHORITATIVE, rendered above the peripheral channel
+        # envelope. thread_tail wins when present (a threaded turn). For a TOP-LEVEL trigger it
+        # is empty and the F47 channel addressee tail is the authoritative block; the general
+        # channel-activity envelope always stays last + peripheral.
         if signals.get("thread_tail"):
             note += f"\n\n{signals['thread_tail']}"
+        if signals.get("channel_addressee_tail"):
+            note += f"\n\n{signals['channel_addressee_tail']}"
         if signals.get("channel_activity"):
             note += f"\n\n{signals['channel_activity']}"
         return note
@@ -1341,6 +1346,71 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
     except Exception as e:
         self.log_warning(f"Participation classification failed ({e}); defaulting to ignore")
         return {"action": "ignore"}
+
+
+async def classify_placement(self, text: str, *, signals: Optional[Dict[str, Any]] = None) -> str:
+    """F46 — placement judgment for an ADDRESSED turn: ONE lean utility-model call, strict JSON.
+
+    The assistant WAS addressed (a mention/name-wake) and IS going to answer; this decides only
+    WHERE the top-level reply belongs — "thread" (long-form/deliverable, back-and-forth likely,
+    multi-party) or "channel" (a short answer or quick beat the whole room benefits from). It is
+    the "like Claude" judgment for mentions, which run no participation gate and so carry no
+    placement verdict, and it handles no-tool long-form (the story) that the did_substantive_work
+    override cannot reach because no tool fires.
+
+    Best-effort, side-effect free, and FAIL-OPEN: any error/timeout/parse failure returns
+    "channel" (today's top-level behavior for a mention). Input is kept minimal — the latest
+    message text plus, only if cheaply provided, a recent-activity envelope."""
+    signals = signals or {}
+    context = ""
+    # Optional, cheap-only: a recent-activity envelope helps judge "back-and-forth likely" /
+    # "multiple parties", but is never fetched here — rendered only if the caller already had it.
+    activity = signals.get("channel_activity") or signals.get("recent_activity")
+    if activity:
+        context = f"\n\nRecent channel activity:\n{activity}"
+    conversation_messages = [
+        {"role": "developer", "content": PLACEMENT_SYSTEM_PROMPT},
+        {"role": "user",
+         "content": f"Latest message:\n{text}{context}\n\nRespond with ONLY the JSON verdict object."},
+    ]
+
+    request_params = {
+        "model": config.utility_model,
+        "input": conversation_messages,
+        # JSON verdict + reasoning-model preamble needs headroom past a one-word answer.
+        "max_output_tokens": max(1024, config.utility_max_tokens),
+        "store": False,
+    }
+    # Utility model is a GPT-5-series reasoning model; effort/verbosity match the other
+    # utility calls (NOT the higher participation effort — this is a lean two-way choice).
+    request_params["temperature"] = 1.0
+    request_params["reasoning"] = {"effort": clamp_effort(config.utility_model, config.utility_reasoning_effort)}
+    request_params["text"] = {"verbosity": config.utility_verbosity}
+
+    try:
+        response = await self._safe_api_call(
+            self.client.responses.create,
+            operation_type="utility_call",
+            **request_params,
+        )
+        result = ""
+        if response.output:
+            for item in response.output:
+                if hasattr(item, "content") and item.content:
+                    for content in item.content:
+                        if hasattr(content, "text"):
+                            result += content.text
+        result = result.strip()
+        self.log_debug(f"Placement verdict raw: '{result[:120]}' for: '{text[:60]}...'")
+        # Tolerate code fences / stray prose around the JSON object.
+        start, end = result.find("{"), result.rfind("}")
+        if start == -1 or end <= start:
+            return "channel"
+        placement = str(json.loads(result[start:end + 1]).get("placement", "channel")).strip().lower()
+        return "thread" if placement == "thread" else "channel"
+    except Exception as e:
+        self.log_debug(f"Placement classification failed ({e}); defaulting to channel (top-level)")
+        return "channel"
 
 
 async def extract_memory(self, exchange_text: str, existing_memory: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:

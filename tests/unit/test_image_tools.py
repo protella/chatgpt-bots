@@ -20,10 +20,12 @@ The properties worth defending, in rough order of how much they'd hurt to get wr
 """
 import base64
 import json
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from PIL import Image
 
 from config import config
 from message_processor import image_delivery, image_tools as it
@@ -65,6 +67,40 @@ def _tools_on(monkeypatch):
 
 
 # ----------------------------------------------------------------------------------- helpers
+
+def _img_bytes(fmt: str, mode: str = "RGB", color="red") -> bytes:
+    buf = BytesIO()
+    Image.new(mode, (4, 4), color).save(buf, format=fmt)
+    return buf.getvalue()
+
+
+def _png_bytes() -> bytes:
+    return _img_bytes("PNG")
+
+
+def _jpeg_bytes() -> bytes:
+    return _img_bytes("JPEG")
+
+
+def _webp_bytes() -> bytes:
+    return _img_bytes("WEBP")
+
+
+def _bmp_bytes() -> bytes:
+    return _img_bytes("BMP")
+
+
+def _animated_gif_bytes() -> bytes:
+    buf = BytesIO()
+    frames = [Image.new("RGB", (4, 4), "red").convert("P"),
+              Image.new("RGB", (4, 4), "blue").convert("P")]
+    frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:], duration=100)
+    return buf.getvalue()
+
+
+# A real, Pillow-decodable PNG so the edit path's byte validation/transcode accepts it.
+_SOURCE_PNG = _png_bytes()
+
 
 CATALOG = [
     {"image_id": "img_7", "url": "https://files.slack.com/red-cat.png", "kind": "generated",
@@ -132,7 +168,7 @@ class _FakeProcessor:
 class _FakeClient:
     """Slack. The point of most of these assertions is what it is NOT asked to do."""
 
-    def __init__(self, download=b"sourcebytes"):
+    def __init__(self, download=_SOURCE_PNG):
         self._download = download
         self.send_image = AsyncMock()
         self.send_message = AsyncMock()
@@ -326,8 +362,10 @@ async def test_edit_happy_path_posts_the_result(monkeypatch):
     assert kwargs["input_fidelity"] == "high"
     # The stored analysis rides along, so the edit-prompt enhancer needs no vision round-trip.
     assert kwargs["image_description"] == "A bar chart of quarterly revenue"
-    # The source came from Slack, in memory, as base64.
-    assert kwargs["input_images"] == [base64.b64encode(b"sourcebytes").decode()]
+    # The source came from Slack, in memory, as base64 — a PNG, so it rides through unchanged
+    # and is labeled with its ACTUAL mimetype (never a blanket .png guess).
+    assert kwargs["input_images"] == [base64.b64encode(_SOURCE_PNG).decode()]
+    assert kwargs["input_mimetypes"] == ["image/png"]
     publish.assert_awaited_once()
     # A fresh image landed in the thread → the next turn must rebuild from Slack.
     assert proc.thread_manager.consume_needs_refresh("C1:100.0") is True
@@ -377,6 +415,95 @@ async def test_edit_reports_a_source_it_cannot_fetch():
 
     assert res["error"] == "source_unavailable"
     oc.edit_image.assert_not_awaited()
+
+
+# --- edit-source byte validation / transcoding (Finding 4) --------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw,expected_mime", [
+    (_png_bytes(), "image/png"),
+    (_jpeg_bytes(), "image/jpeg"),
+    (_webp_bytes(), "image/webp"),
+])
+async def test_edit_passes_supported_sources_through_with_their_real_mimetype(
+        monkeypatch, raw, expected_mime):
+    # The edit endpoint accepts png/jpeg/webp: these ride through unchanged and are labeled with
+    # their ACTUAL mimetype, so edit_image names the upload part correctly instead of guessing .png.
+    monkeypatch.setattr(image_delivery, "publish_image",
+                        AsyncMock(return_value="https://files.slack.com/edited.png"))
+    oc = _openai()
+    client = _FakeClient(download=raw)
+
+    res = await it.execute_edit_image(
+        _ctx(_FakeProcessor(openai_client=oc), client, catalog=CATALOG),
+        {"source_image_ids": ["img_7"], "prompt": "make it blue"})
+
+    assert res["ok"] is True
+    kwargs = oc.edit_image.await_args.kwargs
+    assert kwargs["input_images"] == [base64.b64encode(raw).decode()]   # byte-identical
+    assert kwargs["input_mimetypes"] == [expected_mime]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [_bmp_bytes(), _animated_gif_bytes()])
+async def test_edit_transcodes_unsupported_sources_to_png(monkeypatch, raw):
+    # BMP is unsupported by the edit endpoint; GIF is supported by VISION but NOT by the edit
+    # endpoint. Both are transcoded to PNG in memory (first frame for the animated gif) and
+    # relabeled image/png — never handed to the Images API as unsupported bytes wearing a .png name.
+    monkeypatch.setattr(image_delivery, "publish_image",
+                        AsyncMock(return_value="https://files.slack.com/edited.png"))
+    oc = _openai()
+    client = _FakeClient(download=raw)
+
+    res = await it.execute_edit_image(
+        _ctx(_FakeProcessor(openai_client=oc), client, catalog=CATALOG),
+        {"source_image_ids": ["img_7"], "prompt": "make it blue"})
+
+    assert res["ok"] is True
+    kwargs = oc.edit_image.await_args.kwargs
+    assert kwargs["input_mimetypes"] == ["image/png"]
+    sent = base64.b64decode(kwargs["input_images"][0])
+    assert sent != raw                                   # a real re-encode, not passthrough
+    result = Image.open(BytesIO(sent))
+    result.load()
+    assert result.format == "PNG"
+    assert getattr(result, "n_frames", 1) == 1           # first frame only for the animated gif
+
+
+@pytest.mark.asyncio
+async def test_edit_reports_an_undecodable_source_gracefully():
+    # Fetched fine, but the bytes are not a decodable image. This is a graceful tool result with
+    # an honest message — never unsupported bytes handed to the Images API for a raw 400.
+    oc = _openai()
+    client = _FakeClient(download=b"this is not an image")
+
+    res = await it.execute_edit_image(
+        _ctx(_FakeProcessor(openai_client=oc), client, catalog=CATALOG),
+        {"source_image_ids": ["img_7"], "prompt": "make it blue"})
+
+    assert res["ok"] is False and res["error"] == "unreadable_source"
+    assert "img_7" in res["message"]
+    oc.edit_image.assert_not_awaited()      # no spend on a source we can't send
+
+
+@pytest.mark.asyncio
+async def test_edit_rejects_a_source_that_balloons_past_the_byte_ceiling(monkeypatch):
+    # New defect: transcoding has no output-byte ceiling — a small compressed source can expand
+    # into a huge PNG and exhaust memory / exceed the API request limit. With the ceiling in place,
+    # a converted source over the cap fails the same graceful three-state way as an undecodable one
+    # (distinct reason), and NO API call is made. Shrink the cap so any real source trips it.
+    monkeypatch.setattr(it, "_EDIT_SOURCE_MAX_BYTES", 8)
+    oc = _openai()
+    client = _FakeClient(download=_SOURCE_PNG)   # a valid PNG, comfortably over 8 bytes
+
+    res = await it.execute_edit_image(
+        _ctx(_FakeProcessor(openai_client=oc), client, catalog=CATALOG),
+        {"source_image_ids": ["img_7"], "prompt": "make it blue"})
+
+    assert res["ok"] is False and res["error"] == "unreadable_source"
+    assert "img_7" in res["message"]
+    assert "too large" in res["message"].lower()   # the distinct too_large_after_conversion reason
+    oc.edit_image.assert_not_awaited()             # never handed oversized bytes to the API
 
 
 @pytest.mark.asyncio

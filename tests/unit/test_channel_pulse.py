@@ -124,6 +124,62 @@ async def test_backfill_skips_dms():
     client.conversations_history.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_backfill_keeps_peers_and_clean_self_but_drops_own_chrome():
+    # F47: cold-start backfill must record other assistants + our clean final replies, but NOT our
+    # own UI chrome (status/checklist/"Settings available"/UI-helper block) — recorded as [self]
+    # addressee evidence, chrome would push a real Claude exchange out of the ring and masquerade
+    # as a continuation with US (the exact attribution bug). And it must retain the content-bearing
+    # subtypes the live feed keeps (thread_broadcast, file_share), dropping only churn.
+    from message_markers import CHECKLIST_STATUS_MARKER
+    from slack_client.event_handlers.message_events import SlackMessageEventsMixin
+
+    def _classify(m):
+        if m.get("bot_id") == "BSELF":
+            return "self"
+        if m.get("bot_id"):
+            return "other_bot"
+        return "human"
+
+    bot = MagicMock()
+    bot.classify_sender = _classify
+    bot.user_cache = {}
+    bot._PULSE_FEED_SKIP_SUBTYPES = SlackMessageEventsMixin._PULSE_FEED_SKIP_SUBTYPES
+
+    messages = [
+        {"ts": "1.0", "bot_id": "BCLAUDE", "username": "Claude", "text": "Once upon a time a fox"},
+        {"ts": "2.0", "bot_id": "BSELF", "username": "ChatGPT",
+         "text": ":hourglass_flowing_sand: Thinking..."},                  # our status chrome
+        {"ts": "3.0", "bot_id": "BSELF", "username": "ChatGPT",
+         "text": "✓ mounted the file" + CHECKLIST_STATUS_MARKER},          # our checklist chrome
+        {"ts": "4.0", "bot_id": "BSELF", "username": "ChatGPT", "text": "Settings available"},  # chrome
+        {"ts": "5.0", "bot_id": "BSELF", "username": "ChatGPT", "text": "Rate this response",
+         "blocks": [{"type": "actions", "elements": [{"action_id": "open_channel_settings"}]}]},  # UI-helper
+        {"ts": "6.0", "bot_id": "BSELF", "username": "ChatGPT", "text": "Sure, here is the answer."},  # clean self
+        {"ts": "7.0", "subtype": "thread_broadcast", "bot_id": "BCLAUDE", "username": "Claude",
+         "text": "broadcasting my reply", "thread_ts": "1.0"},             # content subtype: kept
+        {"ts": "8.0", "subtype": "file_share", "user": "U1", "text": "here is the file",
+         "files": [{"name": "a.pdf", "mimetype": "application/pdf"}]},     # content subtype: kept
+        {"ts": "9.0", "subtype": "channel_join", "user": "U2", "text": "has joined"},  # churn: dropped
+    ]
+    client = MagicMock()
+    client.conversations_history = AsyncMock(return_value={"messages": list(reversed(messages))})
+    p = ChannelPulse(size=30)
+    await p.ensure_backfill("C1", client, bot)
+    env = p.render_envelope("C1")
+    # Kept: the other assistant, our clean reply, and the content-bearing subtypes.
+    assert "Once upon a time a fox" in env
+    assert "Sure, here is the answer." in env
+    assert "broadcasting my reply" in env
+    assert "here is the file" in env
+    # Dropped: every flavor of our own chrome, and churn.
+    assert "Thinking" not in env
+    assert "mounted the file" not in env
+    assert "Settings available" not in env
+    assert "Rate this response" not in env
+    assert "has joined" not in env
+
+
 # ------------------------------------------------------------------- envelope
 
 def _seeded_pulse():
@@ -166,6 +222,19 @@ def test_envelope_deterministic_given_same_state():
     a, b = _seeded_pulse(), _seeded_pulse()
     assert a.render_envelope("C1") == b.render_envelope("C1")
     assert a.render_envelope("C1") == a.render_envelope("C1")
+
+
+def test_envelope_header_is_modest_peripheral():
+    # F47: the general channel-activity envelope is peripheral again. The authoritative
+    # "who addresses whom" record is the SEPARATE addressee tail (see
+    # test_addressee_tail.py); overstating this capped, process-local ring as that record
+    # both duplicated its job and read as an invite to continue other conversations. So the
+    # header must read as peripheral and must NOT claim to be the addressee record.
+    env = _seeded_pulse().render_envelope("C1")
+    header = env.splitlines()[0]
+    assert "peripheral" in header.lower()                 # framed as reference context, not the record
+    assert "other conversations" in header.lower()        # explicitly someone else's exchanges
+    assert "who has been talking to whom" not in header.lower()  # NOT the addressee record
 
 
 # --------------------------------------------------------- participation stats
@@ -282,12 +351,17 @@ def test_envelope_rides_suffix_not_system_prompt():
     proc = _bind_utils()
     client = MagicMock()
     client.channel_pulse = _seeded_pulse()
+    # F51 role authority: the envelope no longer rides INSIDE the developer suffix (it carries
+    # ambient, attacker-influenceable content). It is built separately and injected as a USER
+    # message by the text handler. The developer suffix keeps the trusted time context only.
     suffix = proc._build_suffix_context(client, "C1", None)
-    assert "[Recent channel activity" in suffix
+    assert "[Recent channel activity" not in suffix
     assert "[Current date and time:" in suffix
-    # DM: envelope absent, time still present
-    dm_suffix = proc._build_suffix_context(client, "D1", None)
-    assert "[Recent channel activity" not in dm_suffix
+    # The envelope IS produced for a channel (still volatile suffix content, just user-scoped)…
+    envelope = proc._build_pulse_envelope(client, "C1", None)
+    assert envelope and "[Recent channel activity" in envelope
+    # …and absent for a DM.
+    assert proc._build_pulse_envelope(client, "D1", None) is None
 
 
 # ----------------------------------------------- F29 channel-people suffix line

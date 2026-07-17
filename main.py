@@ -53,6 +53,10 @@ class ChatBotV2:
             self.client.processor = self.processor
             # Phase F: judgment layer for unprompted channel participation.
             self.participation_engine = ParticipationEngine(self.processor.openai_client)
+            # F52: expose the engine to the Slack facade's edit-reply path (message_events) so a
+            # mention-added / meaning edit can SUPERSEDE the original message's in-flight
+            # participation evaluation — the double-answer fix.
+            self.processor.participation_engine = self.participation_engine
         else:
             main_logger.error(f"Unknown platform: {self.platform}")
             sys.exit(1)
@@ -543,6 +547,31 @@ class ChatBotV2:
             if isinstance(message.metadata, dict) and getattr(verdict, "burst_earlier", None):
                 message.metadata["participation_burst_earlier"] = verdict.burst_earlier
 
+        # F46: judgment-call placement for MENTIONS/name-wakes. These run NO participation gate
+        # (so placement_verdict is still None) and default to a top-level reply — but a
+        # deliberately-requested long-form deliverable ("write me a 3-paragraph story") reads
+        # better in a thread, and no tool fires for it so the did_substantive_work override can't
+        # catch it. One lean utility-model call decides thread vs channel, feeding the UNCHANGED
+        # place_in_channel logic below. Gated behind enable_mention_placement_model (DEFAULT OFF):
+        # flag off ⇒ skipped entirely, zero added latency/cost, zero behavior change. Only for a
+        # top-level PUBLIC-channel trigger where top-level replies are allowed and no gate verdict
+        # exists (never override the engine's verdict). Fail-open: classify_placement returns
+        # "channel" on any error, and a raised call must not break the reply.
+        if (getattr(config, "enable_mention_placement_model", False)
+                and placement_verdict is None
+                and message.metadata.get("ts") == message.thread_id
+                and bool(message.metadata.get("reply_in_channel"))
+                and message.channel_id and not message.channel_id.startswith("D")):
+            try:
+                placement_verdict = await self.processor.openai_client.classify_placement(
+                    message.text)
+                main_logger.debug(
+                    f"Mention placement: verdict={placement_verdict} for a top-level "
+                    f"public-channel mention")
+            except Exception as e:
+                main_logger.debug(f"Mention placement call failed ({e}); staying top-level")
+                placement_verdict = None
+
         # Phase F placement (plan §4a, revised 2026-07-10): the channel's
         # reply_in_channel setting is an ALLOWANCE, not a mandate — when it's ON and
         # the trigger was top-level, the engine's per-message placement verdict
@@ -618,6 +647,15 @@ class ChatBotV2:
         try:
             response = await self.processor.process_message(message, client, thinking_id,
                                                             turn=turn)
+
+            # F46: the handler may have flipped a top-level channel reply into a thread (a turn
+            # that did substantive work — resolve_reply_target mutates message.metadata but NOT
+            # these locals). Rebind from the metadata so the fallback send, the footer guard, and
+            # channel_pulse below all agree with the placement text.py actually used. Fail-open:
+            # only rebind when metadata is a dict; a missing key leaves the original value.
+            if isinstance(message.metadata, dict):
+                place_in_channel = bool(message.metadata.get("place_in_channel", place_in_channel))
+                post_thread_id = None if place_in_channel else message.thread_id
 
             # Delete thinking indicator (but not if streaming was used — it's already the
             # response — and not when a ProgressChecklist owns the thinking message, F4).
@@ -955,6 +993,35 @@ class ChatBotV2:
                             except Exception as e:
                                 main_logger.debug(f"Tool-usage sweep skipped: {e}")
 
+                            # Sweep aged document-extraction rows: SLIM (not delete) — the derived
+                            # bulk (summary/page_structure/metadata) is nulled while the Slack ref
+                            # row is kept, so read_document and rebuilds re-extract on demand and a
+                            # file behind a compaction boundary stays resolvable indefinitely.
+                            try:
+                                self.processor.db.delete_old_documents(
+                                    days=config.document_retention_days)
+                            except Exception as e:
+                                main_logger.debug(f"Document sweep skipped: {e}")
+
+                            # F51: sweep expired ambient artifacts (retention). The sweep also
+                            # deletes their late-artifact addenda and returns the affected thread
+                            # keys; an ACTIVE warm thread still holds an in-memory summary head
+                            # carrying the expired note, so mark each for refresh (fail-soft per
+                            # thread — a marking failure must not break the sweep loop).
+                            try:
+                                swept_keys = self.processor.db.delete_expired_ambient_artifacts(
+                                    days=config.ambient_artifact_retention_days)
+                                tm = getattr(self.processor, "thread_manager", None)
+                                if tm is not None and hasattr(tm, "mark_needs_refresh"):
+                                    for thread_key in (swept_keys or []):
+                                        try:
+                                            tm.mark_needs_refresh(thread_key)
+                                        except Exception as mark_err:
+                                            main_logger.debug(
+                                                f"mark_needs_refresh failed for {thread_key}: {mark_err}")
+                            except Exception as e:
+                                main_logger.debug(f"Ambient-artifact sweep skipped: {e}")
+
                             # F32: reap code-interpreter containers for threads that have gone
                             # quiet. The containers themselves idle-expired long ago (20-minute
                             # API ceiling), so this is mostly dropping their rows — a revived
@@ -1003,6 +1070,20 @@ class ChatBotV2:
 
             # Start cleanup task
             await self.start_cleanup_task()
+
+            # F51: start the ambient-memory service on the running loop and resume any
+            # interrupted work (durable pending rows). Best-effort — a failure here must not
+            # stop the bot from serving.
+            svc = getattr(self.processor, "ambient_service", None)
+            if svc is not None:
+                try:
+                    svc.start()
+                    self._ambient_recover_task = asyncio.create_task(svc.recover_pending())
+                    self._ambient_recover_task.add_done_callback(
+                        lambda t: t.exception() and main_logger.warning(
+                            f"Ambient recover error: {t.exception()}"))
+                except Exception as e:
+                    main_logger.warning(f"Ambient service start skipped: {e}")
 
             # MCP startup health probe (informational; runs in the background so
             # a slow server can't delay boot). Strong ref so it can't be GC'd.
@@ -1057,6 +1138,17 @@ class ChatBotV2:
                 await tm.cancel_research_jobs(timeout=5.0)
             except Exception as e:
                 main_logger.warning(f"Error cancelling background research jobs: {e}")
+
+        # F51: drain the ambient artifact workers BEFORE the Slack client stops — they use the
+        # client's reusable download session for image/file capture, so tearing the client down
+        # first would fail in-flight ambient downloads. Idempotent: processor.cleanup() calls
+        # shutdown() again below (a no-op once drained).
+        svc = getattr(self.processor, "ambient_service", None) if self.processor else None
+        if svc is not None and hasattr(svc, "shutdown"):
+            try:
+                await svc.shutdown()
+            except Exception as e:
+                main_logger.warning(f"Error draining ambient workers: {e}")
 
         # Stop the client (this should interrupt any stuck operations)
         if self.client:

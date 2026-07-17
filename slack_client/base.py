@@ -122,6 +122,11 @@ class SlackBot(SlackMessageEventsMixin,
             register_participation_tools(registry)
         if config.enable_read_document_tool:
             register_document_tools(registry)  # summary+ref rows; content re-derived in memory
+        # F51: fetch_url — the SAME hardened fetcher as ambient link capture, so a directly-asked
+        # "read this link" opens the URL instead of relying on web_search luck.
+        if config.enable_fetch_url_tool and config.enable_link_fetch:
+            from message_processor.fetch_url_tool import register_fetch_url_tool
+            register_fetch_url_tool(registry)
         if config.enable_people_tools:
             register_people_tools(registry)  # F29: profile lookup + channel roster (Slack-visible only)
         if config.enable_deep_research:

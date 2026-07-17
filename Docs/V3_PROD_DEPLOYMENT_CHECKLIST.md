@@ -78,8 +78,8 @@ Without it, `ENABLE_PDF_OCR=true` degrades **silently** — scanned PDFs just co
 ```bash
 ./bin/pip install --require-hashes -r requirements.txt    # as blackhawk; installs into the in-place venv
 ```
-New since v2.5.1: `pytesseract`, `pdf2image`, `aiofiles`, and an `openai >= 2.45` bump.
-`python-magic` is gone (so libmagic is no longer needed).
+New since v2.5.1: `pytesseract`, `pdf2image`, `aiofiles`, `striprtf` (F49 .rtf extraction), and an
+`openai >= 2.45` bump. `python-magic` is gone (so libmagic is no longer needed).
 
 ## 6. `.env` — edit in place, never overwrite
 
@@ -91,7 +91,7 @@ Edit the keys below and leave every secret line untouched. Prod uses `KEY = "val
 ```
 GPT_MODEL = "gpt-5.6-sol"          # was gpt-5.5
 UTILITY_MODEL = "gpt-5.6-luna"     # was gpt-5-mini  ← MUST change; gpt-5-mini is gone from v3
-UTILITY_REASONING_EFFORT = "none"  # was low
+UTILITY_REASONING_EFFORT = "low"   # adaptive on Luna: 0 reasoning tokens on trivial verdicts, thinks only when needed (benchmarked 2026-07-16)
 UTILITY_VERBOSITY = "low"
 DEFAULT_REASONING_EFFORT = "low"
 DEFAULT_VERBOSITY = "low"
@@ -118,11 +118,15 @@ STATUS_LOADING_MESSAGES_FILE = "status_messages/loading_messages.datassential.tx
 ENABLE_CHANNEL_LISTENING = "true"                                     # all features on in prod
 ENABLE_DEEP_RESEARCH = "true"
 ENABLE_FEEDBACK_BUTTONS = "false"                                     # the one feature we leave off
-SLACK_NATIVE_STREAMING = "false"                                      # validate live before enabling
+SLACK_NATIVE_STREAMING = "true"                                       # validated live in dev since 2026-07-09; kills the "(edited)" markers on streamed replies
+ENABLE_MENTION_PLACEMENT_MODEL = "true"                               # F46 thread-vs-channel judgment for plain-text mentions; code default is false
+ENABLE_EDIT_TRIGGERED_REPLIES = "true"                                # meaningful message edits go through the participation judgment; code default is false
 ```
 The other ~84 new keys can be omitted — each has a working default (and every remaining feature
 defaults **on**, which is the posture we want), and `.env.example` documents each one inline if you
-prefer to pin them explicitly.
+prefer to pin them explicitly. Ambient memory (F51: quiet notes on links/images/files for later
+recall) is among the defaults-on set — its ~24 `AMBIENT_*`/`LINK_FETCH_*` knobs and the new
+`DOCUMENT_RETENTION_DAYS`/`EDIT_REPLY_WINDOW_MINUTES` all have working defaults.
 
 ### 6d. Consider — log levels
 Prod runs `DEBUG` across the board. v3 is considerably chattier (channel pulse, participation
@@ -195,9 +199,13 @@ Add to event subscriptions:
 ```
 reaction_added · reaction_removed · app_home_opened · app_context_changed
 message.channels · message.groups · message.mpim     ← REQUIRED: channel listening is on in prod
+file_deleted                                          ← F51 ambient-memory purge on file deletion
 ```
 Also add the `agent_view` block (agent description + suggested prompts) from
-`slack_app_manifest.example.yml`. **Reinstall the app to the workspace** so the new scopes take effect.
+`slack_app_manifest.example.yml` — and **REMOVE the legacy `assistant_thread_started` /
+`assistant_thread_context_changed` events if present**: Slack's manifest validator rejects them
+alongside `agent_view` (2026-07-16; the code handlers remain as a no-op safety net).
+**Reinstall the app to the workspace** so the new scopes take effect.
 
 The two that fail quietly if forgotten: **`chat:write.customize`** (the "[research: …]" byline on
 findings posts) and **`users:read.email`** (people lookups).
@@ -222,6 +230,9 @@ DB: Doc-content-drop migration complete — synthesized N summary(ies)
 ```
 Any `DB: Migration step '<name>' FAILED` line means that step did not complete — the bot will still
 start, but stop and investigate.
+
+New tables (`ambient_artifacts`, `thread_summary_addenda`) create themselves silently on first
+boot — no migration line, nothing to do.
 
 **Expect the DB to shrink a lot** (the message mirror and all document content are dropped).
 Everyone's model/effort resets to `gpt-5.6-sol` / `medium` — that's intended, and users can re-pick.
