@@ -833,8 +833,17 @@ class SlackMessagingMixin:
             self.log_error(f"Error sending message: {e}")
             return {"success": False, "error": str(e)}
 
-    async def send_image(self, channel_id: str, thread_id: str, image_data: bytes, filename: str, caption: str = "") -> Optional[str]:
-        """Send an image to Slack and return the file URL"""
+    async def send_image(self, channel_id: str, thread_id: str, image_data: bytes, filename: str,
+                         caption: str = "", meta_out: Optional[dict] = None) -> Optional[str]:
+        """Send an image to Slack and return the file URL.
+
+        `meta_out` (F7): optional dict the caller reads back — `meta_out["file_id"]` is the
+        uploaded file's id, set only once Slack accepts the upload. The RETURN stays the bare
+        URL (base_client / slack_client.base declare that contract), so the file id rides a
+        side channel rather than breaking every existing caller. It exists because
+        files_upload_v2 hands back no share ts: the file id is the only handle from which the
+        image message's ts can later be resolved (see resolve_file_share_ts).
+        """
         try:
             # Use files_upload_v2 for image upload
             result = await self.app.client.files_upload_v2(
@@ -844,20 +853,131 @@ class SlackMessagingMixin:
                 filename=filename,
                 initial_comment=caption
             )
-            
+
             # Extract the file URL from the response
             if result and "files" in result and len(result["files"]) > 0:
                 file_info = result["files"][0]
                 file_url = file_info.get("url_private", file_info.get("permalink"))
+                if meta_out is not None:
+                    meta_out["file_id"] = file_info.get("id")
                 self.log_info(f"Image uploaded: {filename} - URL: {file_url}")
                 return file_url
             else:
                 self.log_warning("Image uploaded but no URL found in response")
                 return None
-                
+
         except SlackApiError as e:
             self.log_error(f"Error uploading image: {e}")
             return None
+
+    # Poll schedule for resolve_file_share_ts, in seconds. Mild backoff rather than a fixed
+    # tight interval: the share lands ~1.8s (channel) to ~3.8s (DM) after upload, so a 0.4s
+    # loop would burn ~10 calls on a DM to learn nothing the 5th poll wouldn't have.
+    _SHARE_TS_BACKOFF = (0.5, 0.5, 1.0, 1.0, 2.0, 2.0, 4.0)
+
+    # Slack errors that will not come right inside the budget, so polling on until the
+    # deadline is pure waste. Everything ELSE is worth another poll while budget remains —
+    # including `file_not_found`, which here is the upload's own eventual consistency (the
+    # very race this poll exists to paper over), not a verdict that the file isn't real.
+    _SHARE_TS_PERMANENT_ERRORS = frozenset({
+        "invalid_auth", "not_authed", "missing_scope", "access_denied"})
+
+    @staticmethod
+    def _share_ts_error_code(error: SlackApiError) -> str:
+        """Slack's machine-readable `error` string, or "" when the shape isn't what we expect
+        (an unrecognized code is treated as transient, which is the safe default here)."""
+        response = getattr(error, "response", None)
+        if response is None:
+            return ""
+        try:
+            return str(response.get("error") or "")
+        except (AttributeError, TypeError):
+            return ""
+
+    @staticmethod
+    def _share_ts_retry_after(error: SlackApiError) -> Optional[float]:
+        """Seconds Slack asked us to wait on a 429, if it said. Header lookup is
+        case-insensitive because the casing varies with the transport underneath the SDK."""
+        headers = getattr(getattr(error, "response", None), "headers", None)
+        if not headers:
+            return None
+        try:
+            for key, value in headers.items():
+                if str(key).lower() == "retry-after":
+                    return max(0.0, float(value))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return None
+
+    async def resolve_file_share_ts(self, channel_id: str, file_id: str) -> Optional[str]:
+        """The ts of the message that shares an uploaded file, or None.
+
+        Why this exists: files_upload_v2's response DOES carry a `shares` key, and it is
+        always `{}` at upload time — Slack populates it asynchronously, so the share ts is
+        only readable from a later files.info call. Measured live 2026-07-16: the entry
+        appeared ~1.76s after upload in a private channel and ~3.81s in a DM (DMs are
+        markedly slower).
+
+        The entry sits at `shares["private"][channel_id][0]` for private channels AND DMs;
+        public channels use `shares["public"][channel_id][0]`. Both scopes are checked — the
+        caller has no way to know which applies. That entry's `ts` IS the file-share
+        message's ts (cross-checked against conversations.replies / conversations.history).
+
+        A transient failure is RETRIED within the budget rather than surrendering the row: a
+        429 or a blip is not an answer, and giving up on the first one throws away provenance
+        that a second poll would have had. Only clearly permanent errors bail early.
+
+        Best-effort chrome: a timeout, a SlackApiError, or any other failure returns None and
+        is logged, never raised. The image is already posted by the time anyone calls this,
+        and provenance must never be able to touch it.
+        """
+        if not channel_id or not file_id:
+            return None
+        deadline = time.monotonic() + max(0.0, float(config.image_share_ts_timeout_seconds))
+        attempt = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            # Budget is checked BEFORE the request, not after: waking exactly AT the deadline
+            # and polling once more is how a "15s bound" quietly becomes 15s plus a request.
+            # Attempt 0 is the deliberate exception — the share is often already there, so the
+            # first poll is always worth making even on an exhausted budget.
+            if attempt and remaining <= 0:
+                self.log_debug(f"share ts for {file_id} did not appear before the timeout")
+                return None
+
+            retry_after: Optional[float] = None
+            try:
+                # The budget bounds the CALL too, not just the gaps between calls, or one hung
+                # request sails past the deadline on its own (the SDK's default timeout being
+                # the only other ceiling). The guaranteed first poll has no budget left to be
+                # bounded by, so it keeps that SDK default.
+                result = await asyncio.wait_for(
+                    self.app.client.files_info(file=file_id),
+                    timeout=remaining if remaining > 0 else None)
+                shares = ((result or {}).get("file") or {}).get("shares") or {}
+                for scope in ("public", "private"):
+                    entries = (shares.get(scope) or {}).get(channel_id) or []
+                    if entries and entries[0].get("ts"):
+                        return entries[0]["ts"]
+            except SlackApiError as e:
+                if self._share_ts_error_code(e) in self._SHARE_TS_PERMANENT_ERRORS:
+                    self.log_debug(f"files.info share-ts lookup gave up for {file_id}: {e}")
+                    return None
+                retry_after = self._share_ts_retry_after(e)
+                self.log_debug(f"files.info share-ts lookup will retry for {file_id}: {e}")
+            except Exception as e:  # noqa: BLE001 — never load-bearing; see docstring
+                # Transport blips and our own call timeout above: transient like a 429, so
+                # they buy another poll rather than costing the row.
+                self.log_debug(f"share-ts resolve error for {file_id}: {e}")
+
+            delay = self._SHARE_TS_BACKOFF[min(attempt, len(self._SHARE_TS_BACKOFF) - 1)]
+            if retry_after is not None:
+                # Slack said when to come back; polling sooner just earns another 429.
+                delay = max(delay, retry_after)
+            attempt += 1
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                await asyncio.sleep(min(delay, remaining))
 
     async def send_file(self, channel_id: str, thread_id: str, file_data,
                         filename: str, title: Optional[str] = None,

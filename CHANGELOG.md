@@ -408,6 +408,14 @@ Now whatever it says *before* the image work begins reaches you right away, so y
 at half a sentence wondering if it hung. And when it picks the reply back up afterward, the two
 halves no longer collide into one jammed-together word.
 
+The other end of the same job had the opposite problem. Handing a finished picture to Slack takes
+well under a second, but Slack needs several more to actually put it on screen — around three
+seconds for a small image, over five for a large one. The "Uploading…" indicator disappeared at
+the handoff, so the last stretch of every image was dead air: no progress, no picture, nothing to
+suggest the bot hadn't simply stopped. It now waits for the image to really land before it clears,
+so something is always on screen, and it takes as long as that actually takes instead of guessing
+at a fixed delay.
+
 ### 🔁 Fixed - It no longer builds the same thing twice
 
 Ask for a deck, say something in the thread while it's working, and the bot could quietly
@@ -812,6 +820,10 @@ maximum), `CODE_INTERPRETER_CONTAINER_REUSE_MINUTES` (15).
   behavior and then contradict itself when corrected. Only tool names and a short hint of
   their arguments are kept — never their results or your content — and old records age out
   on their own. Turn it off with `ENABLE_TOOL_PROVENANCE=false`.
+- **Pictures it posts count too.** That record only ever attached to things the bot *said*, so
+  an image posted without a word alongside it left no trace of having been made — and asked
+  about it later, the bot would deny drawing its own picture. Images now carry the same record
+  as replies do.
 
 ### ⚙️ Fixed - The settings button is back on the message
 

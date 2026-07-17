@@ -522,6 +522,7 @@ class ChatBotV2:
                     db=getattr(self.processor, "db", None),
                     thread_manager=self.processor.thread_manager, unprompted=False,
                     message_ts=(message.metadata or {}).get("ts"),
+                    provenance_tool="create_image_asset",
                 )
                 posted += 1
             except Exception as e:
