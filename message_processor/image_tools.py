@@ -27,10 +27,16 @@ import asyncio
 import base64
 import binascii
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from config import config, pipeline_status
+from image_validation import (
+    IMAGE_EDIT_MIMETYPES,
+    TOO_LARGE_AFTER_CONVERSION,
+    ensure_compatible,
+    rejection_text,
+)
 from logger import setup_logger
 from message_processor import image_catalog
 from message_processor.image_service import (
@@ -55,6 +61,11 @@ CATALOG_KEY = "_image_catalog"
 # A filename the model picks lands in a shell-adjacent sandbox path. Keep it boring.
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _MAX_ASSETS_PER_TURN = 4
+# Ceiling on the transcoded edit-source bytes we base64 into the Images request. A highly
+# compressed TIFF/GIF under 50M pixels can expand into a very large PNG; without this a single
+# source could exhaust process memory or blow the API request limit. Matches ImageURLHandler's
+# 20MB download default.
+_EDIT_SOURCE_MAX_BYTES = 20 * 1024 * 1024
 
 # Image calls are expensive and slow, and `dispatch_all` runs a round's calls CONCURRENTLY —
 # a model that emits several create_image_asset/edit_image calls in one round would otherwise
@@ -318,6 +329,7 @@ async def execute_generate_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
     # eye it has to take back.
     turn = getattr(ctx, "turn", None)
     if turn is not None:
+        turn.mark_substantive_work()  # F46: real image generation ⇒ thread a top-level reply
         await turn.claim_work(client, getattr(ctx, "message", None))
 
     from message_processor.progress import ProgressChecklist
@@ -548,13 +560,22 @@ async def execute_edit_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
         await turn.claim_work(client, getattr(ctx, "message", None))
 
     # Download the sources from Slack. They are never held on disk — bytes in, bytes out.
+    # Each source is validated/transcoded to a format the edit endpoint accepts, and its ACTUAL
+    # mimetype is propagated so the upload part is labeled correctly (never a blanket .png).
     b64_images: List[str] = []
+    input_mimetypes: List[str] = []
     for entry in resolved:
-        data = await _download_b64(client, entry["url"])
-        if data is None:
-            return _err("source_unavailable",
-                        f"Could not fetch {entry['image_id']} from Slack.")
-        b64_images.append(data)
+        b64, meta = await _download_edit_source(client, entry["url"])
+        if b64 is None:
+            if meta is None:
+                return _err("source_unavailable",
+                            f"Could not fetch {entry['image_id']} from Slack.")
+            # Fetched, but the bytes aren't a decodable image — report it honestly rather than
+            # handing unsupported bytes to the Images API and taking a raw 400.
+            return _err("unreadable_source",
+                        f"The source image ({entry['image_id']}) {rejection_text(meta)}")
+        b64_images.append(b64)
+        input_mimetypes.append(meta)
 
     # The edit-prompt enhancer wants a description of what it is editing. The catalog
     # already carries the stored analysis, so the old flow's extra vision round-trip
@@ -575,6 +596,7 @@ async def execute_edit_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
         async with _semaphore():
             image_data = await processor.openai_client.edit_image(
                 input_images=b64_images,
+                input_mimetypes=input_mimetypes,
                 prompt=prompt,
                 model=settings["model"],
                 image_description=description,
@@ -625,22 +647,46 @@ async def execute_edit_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-async def _download_b64(client, url: str) -> Optional[str]:
-    """Slack URL → base64, in memory only (files never touch disk)."""
+async def _download_edit_source(client, url: str) -> Tuple[Optional[str], Optional[str]]:
+    """Slack URL → (base64, mimetype) for the Images *edit* endpoint, in memory only.
+
+    The edit endpoint accepts png/jpeg/webp — NOT gif — so a source outside that set (GIF, BMP,
+    TIFF, ...) is transcoded to PNG in memory (first frame) and the ACTUAL mimetype is returned
+    for the caller to label the upload part with. The old path base64'd the original bytes and
+    let ``edit_image`` blanket-label them ``image/png``, so a viewable BMP or GIF became
+    unsupported bytes wearing a ``.png`` name and 400'd the edit.
+
+    Returns:
+      ``(b64, mimetype)`` on success — bytes the edit endpoint accepts.
+      ``(None, None)``     the source could not be fetched from Slack.
+      ``(None, reason)``   the bytes were fetched but are not a decodable image (``reason`` is an
+                           image_validation rejection key for ``rejection_text``).
+    Files never touch disk.
+    """
     try:
         raw = await client.download_file(url)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"Image download failed ({url}): {e}")
-        return None
+        return None, None
     if not raw:
-        return None
+        return None, None
     if isinstance(raw, str):
         try:
-            base64.b64decode(raw, validate=True)
-            return raw
+            raw = base64.b64decode(raw, validate=True)
         except (binascii.Error, ValueError):
-            return None
-    return base64.b64encode(raw).decode("utf-8")
+            return None, None
+    api_bytes, verdict = ensure_compatible(raw, allowed=IMAGE_EDIT_MIMETYPES)
+    if api_bytes is None:
+        logger.warning(f"Edit source not usable ({url}): {verdict}")
+        return None, verdict
+    # Transcoding is unbounded on output size; a small compressed source can balloon into a huge
+    # PNG. Enforce the byte ceiling here so execute_edit_image reports honestly (graceful
+    # three-state failure, same as undecodable) and never hands oversized bytes to the API.
+    if len(api_bytes) > _EDIT_SOURCE_MAX_BYTES:
+        logger.warning(
+            f"Edit source too large after conversion ({url}): {len(api_bytes)} bytes")
+        return None, TOO_LARGE_AFTER_CONVERSION
+    return base64.b64encode(api_bytes).decode("utf-8"), verdict
 
 
 # --- registration ------------------------------------------------------------------------

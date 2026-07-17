@@ -45,7 +45,9 @@ Changed values (update if you set them explicitly):
 ```
 GPT_MODEL=gpt-5.6-sol            # was gpt-5.5
 UTILITY_MODEL=gpt-5.6-luna       # was gpt-5-mini
-UTILITY_REASONING_EFFORT=none    # was minimal ("minimal" is rejected by 5.6 models)
+UTILITY_REASONING_EFFORT=low     # was minimal ("minimal" is rejected by 5.6 models); "low" on
+                                 # Luna is adaptive — zero reasoning tokens on trivial verdicts,
+                                 # a few dozen only when a judgment needs them
 ```
 
 Delete (no longer used):
@@ -66,8 +68,15 @@ documented inline there):
   prod bot's name.
 - `ENABLE_DEEP_RESEARCH=true` — **on by default, and it works in DMs too.** Each job is
   minutes of model time at `high` effort; turn it off if that's not a bill you want.
-- `SLACK_NATIVE_STREAMING=false` — native streaming is built and tested but ships off;
-  validate live in your workspace before enabling
+- `SLACK_NATIVE_STREAMING=false` — Slack's native streaming API (no "(edited)" marks on
+  streamed replies). Ships off; recommended on once you've seen it work in your workspace
+- `ENABLE_AMBIENT_MEMORY=true` — the bot quietly keeps notes on links, images, and files
+  shared in channels it's in (see the Ambient memory section below); per-channel opt-out
+  in the ⚙️ Configure modal
+- `ENABLE_MENTION_PLACEMENT_MODEL=false` — thread-vs-channel judgment for plain-text
+  top-level mentions (long-form asks thread; quick answers stay top-level)
+- `ENABLE_EDIT_TRIGGERED_REPLIES=false` — meaningful edits to recent messages get the same
+  respond/ignore judgment as new messages (typo fixes stay silent)
 - `ENABLE_LINK_PREVIEWS=false` — links in the bot's posts stay inline; set true for Slack's
   preview cards (this is a change from v2 behavior, where Slack unfurled them)
 - `STATUS_LOADING_MESSAGES_FILE` — optional branded "working…" messages for the
@@ -91,8 +100,10 @@ reinstall the app — the new scopes need re-consent, and a missing one degrades
 silently. New since v2.5: the `agent_view` block; bot scopes
 `search:read.public/private/im/mpim/files/users`, `reactions:read`, `reactions:write`,
 `pins:read`, `users:read.email`, `chat:write.customize`, `assistant:write`, `emoji:read`; and
-events `reaction_added`, `reaction_removed`, `app_home_opened`, `app_context_changed` (the
-legacy `assistant_thread_*` events stay subscribed during the transition).
+events `reaction_added`, `reaction_removed`, `app_home_opened`, `app_context_changed`, and
+`file_deleted` (ambient-memory cleanup). **Remove the legacy `assistant_thread_started` /
+`assistant_thread_context_changed` events** — Slack's manifest validator now rejects them
+alongside `agent_view` (the code keeps no-op handlers, so nothing breaks either way).
 
 Two of those are easy to skip and annoying to debug: **`chat:write.customize`** is what puts
 the "[research: …]" byline on findings posts (without it the bot silently falls back to plain
@@ -117,6 +128,80 @@ destructive step. Watch for these lines, in order:
 From then on the database backs itself up nightly (7-day retention) as part of the scheduled
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
+
+### 🧠 Feature - Ambient memory: it remembers what the channel shares
+
+#### Added
+- **Links, images, and files posted in channels get quietly summarized in the background** —
+  even when the bot chooses not to reply — so a later "what did that chart say?" or "what was
+  that article about?" has real context, in the same thread or a different one. Only the
+  summary and a pointer to the original message are kept; the files themselves never persist.
+- **Links are actually opened** by a hardened fetcher (private/internal addresses refused,
+  size- and time-capped, redirects re-checked hop by hop). When a site blocks bots, Slack's
+  own link preview fills in instead.
+- **`fetch_url` tool** — ask the bot to open a link and it can, on demand.
+- **Per-channel "Ambient memory" toggle** in the ⚙️ Configure modal. Master switch
+  `ENABLE_AMBIENT_MEMORY` (on by default), per-kind switches and per-message caps in
+  `.env.example`. Notes age out automatically (30-day default).
+- Deleting a message or file deletes its notes; edits refresh them.
+- Images the wake-gate already looked at reuse that same look for the stored note — one
+  vision call, not two.
+- In long threads, a note that finishes *after* the thread's history was compacted re-attaches
+  to the summary instead of vanishing.
+
+### 📎 Feature - Tables, forwarded posts, and webhook attachments aren't invisible anymore
+
+#### Fixed
+- **Slack-native tables** (the kind the incident started with), **forwarded/quoted messages**,
+  **link unfurl cards**, and **legacy webhook attachments** (titles, fields, text) now render
+  into the bot's context on every path — live messages, thread history, channel activity.
+  Previously all of it was silently dropped: "what's in the table above?" got a shrug.
+
+### 📂 Feature - It reads far more file types
+
+#### Added
+- **~100 file extensions** now extract inline: code and config files (`.py`, `.ts`, `.yaml`,
+  `.toml`, …), `.rtf`, `.eml` email files, Jupyter notebooks (code + markdown, outputs
+  stripped), tab/pipe-separated data, and more. The unsupported-file card lists common types
+  and says "and N more".
+- Secrets are deliberately refused: `.env`, `.pem`, `.key` and friends are never ingested,
+  even mislabeled as plain text.
+
+### 🖼️ Changed - Images it can't send get converted, not rejected
+
+- **BMP, TIFF, ICO, and anything else Pillow can decode** now converts to PNG in memory and
+  just works — for viewing, for ambient notes, and as edit sources (GIF edit sources use the
+  first frame). Truly corrupt files get an honest "couldn't read this image" note instead of
+  an API error; oversized conversions are capped, not sent.
+
+### ✏️ Feature - Edits get a judgment call (off by default)
+
+#### Added
+- With `ENABLE_EDIT_TRIGGERED_REPLIES=true`, meaningfully editing a recent message (window:
+  `EDIT_REPLY_WINDOW_MINUTES`, default 60) gets the same judgment as a new message: a typo fix
+  stays silent; adding a question, changing the facts, or reversing the ask can draw a reply;
+  if the bot already answered and the edit invalidates that answer, it corrects itself.
+- **Editing an @mention into a message wakes the bot** — previously edits could never trigger
+  it at all.
+
+### 🧭 Feature - Mentions get thread-vs-channel placement judgment (off by default)
+
+#### Added
+- With `ENABLE_MENTION_PLACEMENT_MODEL=true`, a plain-text top-level mention gets one lean
+  utility-model call deciding where the reply belongs: "write me a story" threads, "what year
+  did Slack launch?" answers in channel. (Turns that did real work — searches, files, images —
+  already threaded.)
+
+### 🚚 Fixed - Delivery, retention, and context hardening
+
+- **The same answer can no longer post twice** after a Slack transport hiccup at exactly the
+  wrong moment: delivery now reconciles against the channel before retrying.
+- **Old document summaries slim down after retention** (`DOCUMENT_RETENTION_DAYS`, default 90)
+  instead of the row vanishing — the bot can always re-read the file from Slack, even in
+  compacted threads.
+- **Image descriptions no longer carry instruction-grade authority** in the model's context —
+  visual analysis of user-shared images rides as user content, closing a prompt-injection
+  lane.
 
 ### 🚀 Feature - GPT-5.6 model family (Sol / Terra / Luna)
 

@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from slack_sdk.errors import SlackApiError
 
 from config import config
+from slack_client.formatting.blocks import extract_supplementary_text
 
 
 class SlackHistoryToolMixin:
@@ -155,6 +156,23 @@ class SlackHistoryToolMixin:
         except (TypeError, ValueError):
             return cap
 
+    def _text_with_supplementary(self, msg: Dict[str, Any]) -> str:
+        """F48: a fetched message's text PLUS whatever Slack delivered outside it —
+        table blocks, unfurls, quoted messages, webhook attachment fields. Without this,
+        a message the model fetches by tool reads as empty when its content was never in
+        `text`. Mentions are left as Slack sent them (this surface never cleaned them).
+        Skipped for our own messages — our cards live in these fields (F47)."""
+        text = msg.get("text", "") or ""
+        try:
+            if self.classify_sender(msg) == "self":
+                return text
+        except Exception:
+            pass  # identity not wired -> fall through; extraction is still fail-open
+        supplementary = extract_supplementary_text(msg, primary_text=text)
+        if not supplementary:
+            return text
+        return f"{text}\n\n{supplementary}" if text.strip() else supplementary
+
     async def fetch_history_tool(
         self, channel_id: str, limit: Optional[int] = None, thread_ts: Optional[str] = None
     ) -> Dict[str, Any]:
@@ -183,7 +201,7 @@ class SlackHistoryToolMixin:
                 entry = {
                     "user": m.get("user") or m.get("username") or ("bot" if m.get("bot_id") else "unknown"),
                     "ts": m.get("ts"),
-                    "text": m.get("text", ""),
+                    "text": self._text_with_supplementary(m),
                 }
                 # F25: surface attached-file names so the model can reach a document
                 # seen in fetched history via read_document (names, never content).
@@ -288,7 +306,7 @@ class SlackHistoryToolMixin:
                 pins.append({
                     "user": msg.get("user") or msg.get("username") or ("bot" if msg.get("bot_id") else "unknown"),
                     "ts": msg.get("ts"),
-                    "text": msg.get("text", ""),
+                    "text": self._text_with_supplementary(msg),
                     "permalink": msg.get("permalink"),
                 })
             return {"ok": True, "channel": channel_id, "count": len(pins), "pins": pins}

@@ -193,6 +193,7 @@ async def execute_read_document(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
         # genuinely slow) — stake the 👀. A cache hit returns instantly and claims nothing.
         turn = getattr(ctx, "turn", None)
         if turn is not None:
+            turn.mark_substantive_work()  # F46: real extraction ⇒ thread a top-level reply
             await turn.claim_work(ctx.client, getattr(ctx, "message", None))
         try:
             data = await ctx.client.download_file(url_private, doc_file_id)

@@ -137,8 +137,14 @@ class TestImageURLHandler:
     @pytest.mark.asyncio
     async def test_download_image_success(self, handler):
         """Test successful image download"""
-        # Create fake image data (PNG header)
-        image_data = b'\x89PNG\r\n\x1a\n' + b'fake image data'
+        # A genuinely-decodable PNG: download_image validates the BYTES (Pillow parse), so a
+        # signature-plus-junk stub is now correctly rejected rather than downloaded.
+        from io import BytesIO
+
+        from PIL import Image
+        _b = BytesIO()
+        Image.new("RGB", (2, 2), "red").save(_b, format="PNG")
+        image_data = _b.getvalue()
 
         mock_session = MagicMock()
         mock_response = MagicMock()
@@ -157,6 +163,60 @@ class TestImageURLHandler:
             assert result['size'] == len(image_data)
             assert result['data'] == image_data
             assert result['base64_data'] == base64.b64encode(image_data).decode('utf-8')
+
+    @pytest.mark.asyncio
+    async def test_download_rejects_when_transcode_exceeds_max_size(self, handler, monkeypatch):
+        """Finding 3: the pre-transcode check bounds the DOWNLOAD, not the RESULT. A small source
+        that re-encodes to a PNG over the limit must be rejected on the POST-transcode bytes,
+        never base64'd and sent unchecked."""
+        import image_url_handler
+
+        handler.max_image_size = 100
+        small_source = b"\x00" * 50                       # under the cap: clears the pre-check
+        big_png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 500     # what the transcode "produced": over it
+        monkeypatch.setattr(image_url_handler, "ensure_api_compatible",
+                            lambda raw: (big_png, "image/png"))
+
+        mock_session = MagicMock()
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.headers = {'content-type': 'image/bmp'}
+        mock_response.read = AsyncMock(return_value=small_source)
+        mock_session.get.return_value.__aenter__.return_value = mock_response
+        mock_session.get.return_value.__aexit__.return_value = None
+
+        with patch.object(handler, '_get_session', return_value=mock_session):
+            result = await handler.download_image("https://example.com/x.bmp", mimetype='image/bmp')
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_download_accepts_transcode_within_max_size(self, handler, monkeypatch):
+        """The companion: a transcoded result UNDER the ceiling passes, carrying the post-transcode
+        bytes and their new mimetype."""
+        import image_url_handler
+
+        handler.max_image_size = 1000
+        small_source = b"\x00" * 50
+        small_png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
+        monkeypatch.setattr(image_url_handler, "ensure_api_compatible",
+                            lambda raw: (small_png, "image/png"))
+
+        mock_session = MagicMock()
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.headers = {'content-type': 'image/bmp'}
+        mock_response.read = AsyncMock(return_value=small_source)
+        mock_session.get.return_value.__aenter__.return_value = mock_response
+        mock_session.get.return_value.__aexit__.return_value = None
+
+        with patch.object(handler, '_get_session', return_value=mock_session):
+            result = await handler.download_image("https://example.com/x.bmp", mimetype='image/bmp')
+
+        assert result is not None
+        assert result['mimetype'] == 'image/png'
+        assert result['data'] == small_png
+        assert result['size'] == len(small_png)
 
     @pytest.mark.asyncio
     async def test_process_urls_from_text_success(self, handler):

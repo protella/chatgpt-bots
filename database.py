@@ -23,6 +23,12 @@ logger = logging.getLogger(__name__)
 # modal's "inherit from global default" selection stores NULL rather than a literal string.
 _UNSET = object()
 
+# F51c — cap on late-artifact addenda folded onto ONE thread's compaction summary head, so a
+# pathological channel can't bloat the head unboundedly. Each note is already length-capped at
+# render time; this caps the COUNT. Single source of truth for both the completion-time
+# (ambient service) and compaction-time (thread management) capture paths.
+_MAX_SUMMARY_ADDENDA_PER_THREAD = 20
+
 
 # Shared hash/normalize contract for channel-memory reconciliation. The settings modal builder,
 # the submit handler, and reconcile_channel_memory_from_textarea_async ALL route content through
@@ -77,6 +83,7 @@ def _encode_muted_threads(val) -> Optional[str]:
 _CHANNEL_SETTINGS_STRUCTURAL = (
     "response_mode", "directives", "reply_in_channel",
     "participation_level", "model", "reasoning_effort", "verbosity",
+    "ambient_memory",
 )
 
 
@@ -84,7 +91,7 @@ def _build_channel_settings_write(channel_id, response_mode=_UNSET, directives=_
                                   reply_in_channel=_UNSET, participation_level=_UNSET,
                                   snoozed_until=_UNSET, muted_threads=_UNSET,
                                   model=_UNSET, reasoning_effort=_UNSET, verbosity=_UNSET,
-                                  updated_by=None):
+                                  ambient_memory=_UNSET, updated_by=None):
     """Build the atomic upsert for a partial channel_settings write.
 
     Returns ``(sql, params)`` or ``None`` when no field was provided (caller no-ops).
@@ -125,6 +132,10 @@ def _build_channel_settings_write(channel_id, response_mode=_UNSET, directives=_
         provided["reasoning_effort"] = reasoning_effort
     if verbosity is not _UNSET:
         provided["verbosity"] = verbosity
+    if ambient_memory is not _UNSET:
+        # F51 opt-out: explicit None → NULL (inherit config.enable_ambient_memory); True/False → 1/0.
+        provided["ambient_memory"] = (
+            None if ambient_memory is None else (1 if ambient_memory else 0))
 
     if not provided:
         return None
@@ -275,6 +286,34 @@ class DatabaseManager(LoggerMixin):
             )
         """)
 
+        # F51c — late-artifact addenda to the compaction summary. An ambient artifact (a slow
+        # link fetch, a deferred vision job) can complete AFTER its source message has already
+        # been folded into a thread's compaction summary — or a message with a long-ready
+        # artifact can be compacted later. Either way the derived note would vanish: it never
+        # lived in thread_state.messages (injection is transient per API call), the summary was
+        # written without it, and the compacted message no longer returns in the rebuilt tail.
+        # These rows carry that late/folded derivation forward — the rebuild concatenates them
+        # onto the summary head. Bounded per thread (_MAX_SUMMARY_ADDENDA_PER_THREAD); UNIQUE
+        # per (thread, source, kind, ref) so the completion path and the compaction path can't
+        # double-record the same note. Deterministic order (source_ts, id) for cache stability.
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS thread_summary_addenda (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                source_ts TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                ref TEXT NOT NULL,
+                note TEXT NOT NULL,
+                created_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(thread_id, source_ts, kind, ref)
+            )
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_summary_addenda_thread
+            ON thread_summary_addenda(thread_id, source_ts, id)
+        """)
+
         # F32: thread-scoped code-interpreter containers. One OpenAI container per thread, so
         # the model's sandbox state (files in /mnt/data, loaded dataframes) survives the turn
         # boundary within a conversation.
@@ -363,6 +402,50 @@ class DatabaseManager(LoggerMixin):
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_document_message
             ON documents(message_ts)
+        """)
+
+        # F51 — Ambient artifacts. Derived summaries for images/links/files posted ambiently
+        # (or addressed) in a channel/thread, kept in the running context even when the bot
+        # doesn't respond. CHANNEL + source-ts keyed (NOT the colon thread key that locked out
+        # the incident lookup). conversation_ts is the thread root (= source_ts for a top-level
+        # message, NOT nullable) so thread retrieval + compaction stay deterministic without
+        # ever splitting a colon-composed key. summary/model are NULL for pending/failed rows.
+        # Slack stays the only transcript — this holds ONLY derivations + refs, never message
+        # text mirrors, never image bytes (CLAUDE.md pitfall 4). Reuse is SAME-CHANNEL only.
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS ambient_artifacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL,
+                source_ts TEXT NOT NULL,
+                conversation_ts TEXT NOT NULL,
+                kind TEXT NOT NULL,               -- 'image' | 'link' | 'file'
+                ref TEXT NOT NULL,                -- Slack file id, or normalized URL
+                title TEXT,
+                summary TEXT,                     -- NULL until ready
+                model TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',  -- pending|ready|failed|blocked|omitted
+                derivation_source TEXT,           -- gate_vision|vision_worker|fetch|unfurl|document
+                content_type TEXT,
+                error_code TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                fetched_at TIMESTAMP,
+                expires_at TIMESTAMP,
+                UNIQUE(channel_id, source_ts, kind, ref)
+            )
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ambient_source
+            ON ambient_artifacts(channel_id, source_ts)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ambient_conversation
+            ON ambient_artifacts(channel_id, conversation_ts, source_ts)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ambient_ref
+            ON ambient_artifacts(channel_id, kind, ref, status, fetched_at)
         """)
 
         # Tool-use provenance (F7): compact per-reply record of the tools the bot invoked
@@ -504,6 +587,7 @@ class DatabaseManager(LoggerMixin):
                 model TEXT,
                 reasoning_effort TEXT,
                 verbosity TEXT,
+                ambient_memory INTEGER,
                 updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_by TEXT
             )
@@ -646,6 +730,12 @@ class DatabaseManager(LoggerMixin):
                     self.log_info(f"DB: Adding {col} column to channel_settings")
                     self.conn.execute(f"ALTER TABLE channel_settings ADD COLUMN {col} TEXT")
                     self.conn.commit()
+            # F51: per-channel ambient-memory opt-out (NULL = inherit ENABLE_AMBIENT_MEMORY;
+            # 0 = memory off for this channel, distinct from participation `off`).
+            if cs_columns and 'ambient_memory' not in cs_columns:
+                self.log_info("DB: Adding ambient_memory column to channel_settings")
+                self.conn.execute("ALTER TABLE channel_settings ADD COLUMN ambient_memory INTEGER")
+                self.conn.commit()
 
         with self._migration_step("images.message_ts"):
             # Check if message_ts column exists in images table
@@ -1286,7 +1376,7 @@ class DatabaseManager(LoggerMixin):
                              participation_level=_UNSET, snoozed_until=_UNSET,
                              muted_threads=_UNSET,
                              model=_UNSET, reasoning_effort=_UNSET, verbosity=_UNSET,
-                             updated_by: Optional[str] = None):
+                             ambient_memory=_UNSET, updated_by: Optional[str] = None):
         """Upsert per-channel settings (Phase 7; Phase F adds participation_level/snoozed_until).
 
         Atomic partial write: ONLY the explicitly-provided fields are written — omitted fields are
@@ -1301,7 +1391,8 @@ class DatabaseManager(LoggerMixin):
             channel_id, response_mode=response_mode, directives=directives,
             reply_in_channel=reply_in_channel, participation_level=participation_level,
             snoozed_until=snoozed_until, muted_threads=muted_threads, model=model,
-            reasoning_effort=reasoning_effort, verbosity=verbosity, updated_by=updated_by)
+            reasoning_effort=reasoning_effort, verbosity=verbosity,
+            ambient_memory=ambient_memory, updated_by=updated_by)
         if built is None:
             return
         sql, params = built
@@ -1446,8 +1537,54 @@ class DatabaseManager(LoggerMixin):
         self.log_info(f"DB: Saved thread summary for {thread_id} (boundary_ts={boundary_ts})")
 
     def delete_thread_summary(self, thread_id: str):
-        """Delete the compaction summary for a thread."""
+        """Delete the compaction summary for a thread (and its late-artifact addenda —
+        PRAGMA foreign_keys is never enabled, so the cascade is explicit)."""
         self.conn.execute("DELETE FROM thread_summaries WHERE thread_id = ?", (thread_id,))
+        self.conn.execute("DELETE FROM thread_summary_addenda WHERE thread_id = ?", (thread_id,))
+
+    # Thread summary addenda (F51c — late-artifact context folded onto the summary head)
+    async def add_thread_summary_addendum_async(
+        self, thread_id: str, channel_id: str, source_ts: str, kind: str, ref: str, note: str,
+        *, cap: int = _MAX_SUMMARY_ADDENDA_PER_THREAD,
+    ) -> bool:
+        """Record a late/folded ambient-artifact note against a thread's compaction summary.
+
+        Idempotent on (thread_id, source_ts, kind, ref) so the completion-time path and the
+        compaction-time path can't double-record the same note. Bounded: at most `cap` addenda
+        per thread (a pathological channel can't bloat the summary head). Returns True when a
+        row was actually inserted."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(
+                "SELECT 1 FROM thread_summary_addenda "
+                "WHERE thread_id = ? AND source_ts = ? AND kind = ? AND ref = ?",
+                (thread_id, source_ts, kind, ref)) as cur:
+                if await cur.fetchone():
+                    return False  # already recorded (idempotent) — doesn't re-count against cap
+            async with db.execute(
+                "SELECT COUNT(*) FROM thread_summary_addenda WHERE thread_id = ?",
+                (thread_id,)) as cur:
+                row = await cur.fetchone()
+                if row and int(row[0]) >= int(cap):
+                    return False  # cap reached — drop silently rather than bloat the head
+            await db.execute(
+                "INSERT OR IGNORE INTO thread_summary_addenda "
+                "(thread_id, channel_id, source_ts, kind, ref, note) VALUES (?, ?, ?, ?, ?, ?)",
+                (thread_id, channel_id, source_ts, kind, ref, note))
+            await db.commit()
+        return True
+
+    async def get_thread_summary_addenda_async(self, thread_id: str) -> List[Dict]:
+        """Late-artifact addenda for a thread, deterministically ordered (source_ts, id) so
+        every rebuild serializes the summary head identically (prompt-cache hygiene). source_ts
+        is a numeric Slack ts stored as TEXT, so order by its REAL value, not string collation."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(
+                "SELECT * FROM thread_summary_addenda WHERE thread_id = ? "
+                "ORDER BY CAST(source_ts AS REAL) ASC, id ASC", (thread_id,)) as cursor:
+                return [dict(row) async for row in cursor]
 
     # Image operations
     def save_image_metadata(self, thread_id: str, url: str, image_type: str,
@@ -1800,7 +1937,39 @@ class DatabaseManager(LoggerMixin):
         except Exception as e:
             self.log_error(f"DB: Failed to save document {filename} - {e}", exc_info=True)
             raise
-    
+
+    def restore_document_derived(self, thread_id: str, filename: str, *,
+                                 summary: Optional[str] = None,
+                                 page_structure: Optional[Dict] = None,
+                                 total_pages: Optional[int] = None,
+                                 size_bytes: Optional[int] = None,
+                                 message_ts: Optional[str] = None) -> int:
+        """Re-hydrate a SLIMMED document row IN PLACE and return the rows updated.
+
+        Retention (delete_old_documents) nulls a row's derived bulk (summary/page_structure/
+        metadata) but keeps the Slack ref. When a rebuild re-derives that content it must UPDATE
+        the preserved row, not INSERT a second one: the `documents` table has no
+        UNIQUE(thread_id, filename) constraint, so a fresh save_document each retention/rebuild
+        cycle accumulates duplicate reference rows. Returns 0 when no matching row exists — the
+        caller then falls back to inserting (a genuinely legacy, never-stored document)."""
+        try:
+            cursor = self.conn.execute("""
+                UPDATE documents
+                SET summary = ?, page_structure = ?, total_pages = ?,
+                    size_bytes = COALESCE(?, size_bytes),
+                    message_ts = COALESCE(?, message_ts)
+                WHERE thread_id = ? AND filename = ?
+            """, (summary,
+                  json.dumps(page_structure) if page_structure else None,
+                  total_pages, size_bytes, message_ts, thread_id, filename))
+            if cursor.rowcount:
+                self.update_thread_activity(thread_id)
+                self.log_info(f"DB: Re-hydrated slimmed document {filename} for thread {thread_id}")
+            return cursor.rowcount or 0
+        except Exception as e:
+            self.log_error(f"DB: Failed to restore document {filename} - {e}", exc_info=True)
+            raise
+
     def get_thread_documents(self, thread_id: str, limit: Optional[int] = None) -> List[Dict]:
         """
         Get all documents for a thread.
@@ -1866,21 +2035,28 @@ class DatabaseManager(LoggerMixin):
         return None
     
     def delete_old_documents(self, days: int = 90):
-        """
-        Delete documents older than specified days.
-        
-        Args:
-            days: Number of days to retain documents (default 90)
-        """
-        cutoff = datetime.now() - timedelta(days=days)
-        
+        """SLIM document-extraction rows older than `days` (retention sweep) — do NOT delete them.
+
+        The reference row (filename, thread/channel key, Slack file_id/url_private, mime_type,
+        size, timestamps) is PRESERVED so read_document and thread rebuilds can always re-resolve
+        and re-extract the file from Slack on demand. Only the bulky DERIVED fields (summary,
+        page_structure, metadata) are nulled. This is the fix for the compaction-boundary gap:
+        a document behind a compaction boundary is never recreated by a rebuild, so DELETING its
+        row made a 100-day-old-but-still-in-Slack file unresolvable (`document_not_found`) even
+        though the summary head still referenced it. Slimming ages out the bulk while keeping the
+        row reachable indefinitely. created_at defaults to CURRENT_TIMESTAMP (UTC), so the cutoff
+        is computed IN SQL with datetime('now', …) — a Python datetime.now() cutoff would be LOCAL
+        time and skew the retention window on non-UTC hosts. Same trap as delete_old_tool_usage."""
         cursor = self.conn.execute("""
-            DELETE FROM documents 
-            WHERE created_at < ?
-        """, (cutoff,))
-        
+            UPDATE documents
+            SET summary = NULL, page_structure = NULL, metadata_json = NULL
+            WHERE created_at < datetime('now', ?)
+              AND (summary IS NOT NULL OR page_structure IS NOT NULL OR metadata_json IS NOT NULL)
+        """, (f"-{int(days)} days",))
+
         if cursor.rowcount > 0:
-            self.log_info(f"DB: Cleaned up {cursor.rowcount} documents older than {days} days")
+            self.log_info(f"DB: Slimmed {cursor.rowcount} documents older than {days} days "
+                          "(refs kept for on-demand re-extraction, derived bulk cleared)")
 
     def delete_old_tool_usage(self, days: int = 90):
         """Delete tool-use provenance rows older than `days` (F7 retention sweep).
@@ -2813,7 +2989,8 @@ class DatabaseManager(LoggerMixin):
             await db.execute("PRAGMA journal_mode=WAL")
             async with db.execute(
                 "SELECT response_mode, directives, reply_in_channel, participation_level, "
-                "snoozed_until, muted_threads, model, reasoning_effort, verbosity, updated_ts, updated_by "
+                "snoozed_until, muted_threads, model, reasoning_effort, verbosity, "
+                "ambient_memory, updated_ts, updated_by "
                 "FROM channel_settings WHERE channel_id = ?",
                 (channel_id,)
             ) as cursor:
@@ -2823,6 +3000,9 @@ class DatabaseManager(LoggerMixin):
                 return {
                     "response_mode": row["response_mode"],
                     "directives": row["directives"],
+                    # F51 opt-out: NULL → None (inherit config.enable_ambient_memory at read time).
+                    "ambient_memory": (None if row["ambient_memory"] is None
+                                       else bool(row["ambient_memory"])),
                     # NULL stays None (inherit → config.reply_in_channel_default at read time).
                     "reply_in_channel": (None if row["reply_in_channel"] is None
                                          else bool(row["reply_in_channel"])),
@@ -2841,7 +3021,7 @@ class DatabaseManager(LoggerMixin):
                                          participation_level=_UNSET, snoozed_until=_UNSET,
                                          muted_threads=_UNSET,
                                          model=_UNSET, reasoning_effort=_UNSET, verbosity=_UNSET,
-                                         updated_by: Optional[str] = None):
+                                         ambient_memory=_UNSET, updated_by: Optional[str] = None):
         """Async version of set_channel_settings (Phase F adds participation_level/snoozed_until).
 
         Atomic partial write — ONLY provided fields are written, omitted fields preserved (no
@@ -2854,7 +3034,8 @@ class DatabaseManager(LoggerMixin):
             channel_id, response_mode=response_mode, directives=directives,
             reply_in_channel=reply_in_channel, participation_level=participation_level,
             snoozed_until=snoozed_until, muted_threads=muted_threads, model=model,
-            reasoning_effort=reasoning_effort, verbosity=verbosity, updated_by=updated_by)
+            reasoning_effort=reasoning_effort, verbosity=verbosity,
+            ambient_memory=ambient_memory, updated_by=updated_by)
         if built is None:
             return
         sql, params = built
@@ -3350,6 +3531,263 @@ class DatabaseManager(LoggerMixin):
                         del img["metadata_json"]
                     images.append(img)
                 return images
+
+    # ---------------------------------------------------------------- F51 ambient artifacts
+    #
+    # Channel + source-ts keyed derivations for ambiently-seen images/links/files. Slack stays
+    # the only transcript: these hold summaries + refs ONLY. Reuse is same-channel by design —
+    # cross-channel reuse could leak private-channel/DM-derived content elsewhere.
+
+    async def insert_pending_ambient_artifact(
+        self, *, channel_id: str, source_ts: str, conversation_ts: str, kind: str, ref: str,
+        content_type: Optional[str] = None, derivation_source: Optional[str] = None,
+        expires_at: Optional[str] = None,
+    ) -> Optional[Dict]:
+        """Claim (or observe) an ambient artifact occurrence. Idempotent by
+        (channel_id, source_ts, kind, ref): a re-offer of the same occurrence does NOT clobber an
+        existing row (singleflight — a ready summary survives). Returns the row as it stands AFTER
+        the call (dict), so the caller can see whether it is already `ready`/`pending`/etc."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("""
+                INSERT INTO ambient_artifacts
+                    (channel_id, source_ts, conversation_ts, kind, ref, status,
+                     content_type, derivation_source, expires_at)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                ON CONFLICT(channel_id, source_ts, kind, ref) DO NOTHING
+            """, (channel_id, source_ts, conversation_ts, kind, ref,
+                  content_type, derivation_source, expires_at))
+            await db.commit()
+            async with db.execute("""
+                SELECT * FROM ambient_artifacts
+                WHERE channel_id = ? AND source_ts = ? AND kind = ? AND ref = ?
+            """, (channel_id, source_ts, kind, ref)) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def set_ambient_artifact_ready(
+        self, *, channel_id: str, source_ts: str, kind: str, ref: str,
+        title: Optional[str], summary: str, model: Optional[str],
+        derivation_source: str, content_type: Optional[str] = None,
+        expires_at: Optional[str] = None,
+    ) -> None:
+        """Mark an artifact ready with its derived summary. Only writes a row that exists (the
+        pending occurrence was claimed first) — status flips to `ready`, fetched_at stamped."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("""
+                UPDATE ambient_artifacts
+                SET status = 'ready', title = ?, summary = ?, model = ?,
+                    derivation_source = ?, content_type = COALESCE(?, content_type),
+                    error_code = NULL, updated_at = CURRENT_TIMESTAMP,
+                    fetched_at = CURRENT_TIMESTAMP, expires_at = COALESCE(?, expires_at)
+                WHERE channel_id = ? AND source_ts = ? AND kind = ? AND ref = ?
+            """, (title, summary, model, derivation_source, content_type, expires_at,
+                  channel_id, source_ts, kind, ref))
+            await db.commit()
+
+    async def set_ambient_artifact_status(
+        self, *, channel_id: str, source_ts: str, kind: str, ref: str,
+        status: str, error_code: Optional[str] = None, increment_attempt: bool = False,
+        derivation_source: Optional[str] = None,
+    ) -> None:
+        """Persist a terminal/interim status (failed/blocked/omitted/pending) with an honest
+        error_code — the house rule is no silent drops."""
+        attempt_sql = "attempt_count = attempt_count + 1," if increment_attempt else ""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute(f"""
+                UPDATE ambient_artifacts
+                SET status = ?, error_code = ?, {attempt_sql}
+                    derivation_source = COALESCE(?, derivation_source),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE channel_id = ? AND source_ts = ? AND kind = ? AND ref = ?
+            """, (status, error_code, derivation_source,
+                  channel_id, source_ts, kind, ref))
+            await db.commit()
+
+    async def get_ambient_artifacts_for_messages(
+        self, channel_id: str, source_ts_list: List[str],
+        statuses: Optional[List[str]] = None,
+    ) -> Dict[str, List[Dict]]:
+        """ONE batched query (never N+1) mapping source_ts -> [artifact rows], for rendering a
+        whole thread/page of history at once. Same-channel scoped. Deterministic order (id ASC)."""
+        if not channel_id or not source_ts_list:
+            return {}
+        # De-dup and cap placeholders defensively.
+        uniq = list(dict.fromkeys(str(t) for t in source_ts_list if t))
+        if not uniq:
+            return {}
+        placeholders = ",".join("?" for _ in uniq)
+        status_filter = ""
+        params: List[Any] = [channel_id, *uniq]
+        if statuses:
+            status_filter = f" AND status IN ({','.join('?' for _ in statuses)})"
+            params.extend(statuses)
+        out: Dict[str, List[Dict]] = {}
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(f"""
+                SELECT * FROM ambient_artifacts
+                WHERE channel_id = ? AND source_ts IN ({placeholders}){status_filter}
+                ORDER BY source_ts ASC, id ASC
+            """, params) as cursor:
+                async for row in cursor:
+                    r = dict(row)
+                    out.setdefault(r["source_ts"], []).append(r)
+        return out
+
+    async def find_reusable_ambient_summary(
+        self, channel_id: str, kind: str, ref: str, *, fresh_after: Optional[str] = None,
+    ) -> Optional[Dict]:
+        """A ready summary for the same ref IN THE SAME CHANNEL, optionally requiring
+        fetched_at >= fresh_after (ISO/SQL datetime) so a stale link re-fetches. Newest first."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            query = ("SELECT * FROM ambient_artifacts WHERE channel_id = ? AND kind = ? "
+                     "AND ref = ? AND status = 'ready' AND summary IS NOT NULL")
+            params: List[Any] = [channel_id, kind, ref]
+            if fresh_after:
+                query += " AND (fetched_at IS NULL OR fetched_at >= ?)"
+                params.append(fresh_after)
+            query += " ORDER BY fetched_at DESC, id DESC LIMIT 1"
+            async with db.execute(query, params) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def delete_ambient_artifacts_by_source(self, channel_id: str, source_ts: str) -> int:
+        """Purge all artifacts for a (channel, source message) — message_deleted/edit lifecycle.
+
+        ALSO purges the ambient image analyses the vision worker dual-wrote into `images`
+        (marked metadata `{"ambient": true}`, message_ts == source_ts, thread_id under this
+        channel). Without this the deleted/edited image's description survives in the ledger and
+        keeps being injected — the exact leak the retention/deletion path is meant to close."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            cursor = await db.execute(
+                "DELETE FROM ambient_artifacts WHERE channel_id = ? AND source_ts = ?",
+                (channel_id, source_ts))
+            # Exact structured match: the dual-written ambient row carries metadata
+            # {"ambient":true,"channel_id":...}. json_extract avoids matching {"ambient":false}
+            # or {"description":"ambient"}; json_valid guards any legacy non-JSON metadata.
+            await db.execute(
+                "DELETE FROM images WHERE message_ts = ? AND metadata_json IS NOT NULL "
+                "AND json_valid(metadata_json) "
+                "AND json_extract(metadata_json, '$.ambient') = 1 "
+                "AND json_extract(metadata_json, '$.channel_id') = ?",
+                (source_ts, channel_id))
+            # F51c: a late-artifact addendum for this source message must die with it, or a
+            # deleted/edited message's derived note keeps riding the summary head.
+            await db.execute(
+                "DELETE FROM thread_summary_addenda WHERE channel_id = ? AND source_ts = ?",
+                (channel_id, source_ts))
+            await db.commit()
+            return cursor.rowcount or 0
+
+    async def delete_ambient_artifacts_by_ref(self, channel_id: str, kind: str, ref: str) -> int:
+        """Purge artifacts for a specific ref (file_deleted lifecycle — a Slack file removed)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            cursor = await db.execute(
+                "DELETE FROM ambient_artifacts WHERE channel_id = ? AND kind = ? AND ref = ?",
+                (channel_id, kind, ref))
+            await db.execute(
+                "DELETE FROM thread_summary_addenda WHERE channel_id = ? AND kind = ? AND ref = ?",
+                (channel_id, kind, ref))
+            await db.commit()
+            return cursor.rowcount or 0
+
+    async def delete_ambient_artifacts_by_file_id(self, file_id: str) -> int:
+        """Purge image/file artifacts derived from a Slack file id, workspace-wide (file_deleted).
+        A file id is globally unique, so no channel scope is needed."""
+        if not file_id:
+            return 0
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            cursor = await db.execute(
+                "DELETE FROM ambient_artifacts WHERE ref = ? AND kind IN ('image','file')",
+                (file_id,))
+            # Exact structured match on the file id stored in metadata — NOT a url substring LIKE
+            # (an id that is a substring of another url would cross-delete the wrong image).
+            await db.execute(
+                "DELETE FROM images WHERE metadata_json IS NOT NULL AND json_valid(metadata_json) "
+                "AND json_extract(metadata_json, '$.ambient') = 1 "
+                "AND json_extract(metadata_json, '$.file_id') = ?",
+                (file_id,))
+            # F51c: file id is the addendum ref for image/file kinds — purge those too.
+            await db.execute(
+                "DELETE FROM thread_summary_addenda WHERE ref = ? AND kind IN ('image','file')",
+                (file_id,))
+            await db.commit()
+            return cursor.rowcount or 0
+
+    async def get_pending_ambient_artifacts(self, limit: int = 200) -> List[Dict]:
+        """Rows still `pending` — interrupted work to resume on restart. Oldest first."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(
+                "SELECT * FROM ambient_artifacts WHERE status = 'pending' "
+                "ORDER BY created_at ASC LIMIT ?", (int(limit),)) as cursor:
+                return [dict(row) async for row in cursor]
+
+    def delete_expired_ambient_artifacts(self, days: int = 30) -> List[str]:
+        """Retention sweep (sync, mirrors delete_old_tool_usage) — wired into the scheduled
+        cleanup worker. Uses expires_at when set, else falls back to a created_at age cutoff.
+        Cutoffs computed IN SQL (UTC) like the other sweeps, never a local Python datetime.
+
+        Returns the DISTINCT thread keys (`channel_id:thread_ts`) whose late-artifact addenda were
+        deleted. F51d: the sweep clears the addenda from the DB, but an ACTIVE warm thread still
+        holds an in-memory summary head carrying the expired note and would keep sending it
+        indefinitely; the cleanup worker marks each returned thread for refresh so its next turn
+        rebuilds without the note."""
+        # F51c: retire the aged artifacts' late-artifact addenda in the SAME operation. A row's
+        # derived note otherwise lingers indefinitely in the summary head after its artifact ages
+        # out — and keeps occupying one of the per-thread addenda cap slots. Match on the artifact
+        # identity (channel_id + source_ts + kind + ref); the row-value IN subquery uses the SAME
+        # cutoff predicate and MUST run BEFORE the artifacts are deleted (afterwards the subquery
+        # would find nothing to match).
+        # Capture the affected thread keys BEFORE the delete — the same identity subquery finds
+        # nothing once the artifacts are gone. thread_summary_addenda.thread_id is already stored
+        # as the full `channel_id:thread_ts` key, so it is the mark_needs_refresh key verbatim.
+        affected = self.conn.execute("""
+            SELECT DISTINCT thread_id FROM thread_summary_addenda
+            WHERE (channel_id, source_ts, kind, ref) IN (
+                SELECT channel_id, source_ts, kind, ref FROM ambient_artifacts
+                WHERE (expires_at IS NOT NULL AND expires_at < datetime('now'))
+                   OR (expires_at IS NULL AND created_at < datetime('now', ?))
+            )
+        """, (f"-{int(days)} days",)).fetchall()
+        affected_thread_keys = [row[0] for row in affected]
+        self.conn.execute("""
+            DELETE FROM thread_summary_addenda
+            WHERE (channel_id, source_ts, kind, ref) IN (
+                SELECT channel_id, source_ts, kind, ref FROM ambient_artifacts
+                WHERE (expires_at IS NOT NULL AND expires_at < datetime('now'))
+                   OR (expires_at IS NULL AND created_at < datetime('now', ?))
+            )
+        """, (f"-{int(days)} days",))
+        cursor = self.conn.execute("""
+            DELETE FROM ambient_artifacts
+            WHERE (expires_at IS NOT NULL AND expires_at < datetime('now'))
+               OR (expires_at IS NULL AND created_at < datetime('now', ?))
+        """, (f"-{int(days)} days",))
+        # Retention must also reach the dual-written ambient image analyses (metadata
+        # `{"ambient": true}`) — they have no expires_at column, so age them by created_at with
+        # the same window. Addressed uploads (no ambient marker) are untouched.
+        img_cursor = self.conn.execute("""
+            DELETE FROM images
+            WHERE metadata_json IS NOT NULL AND json_valid(metadata_json)
+              AND json_extract(metadata_json, '$.ambient') = 1
+              AND created_at < datetime('now', ?)
+        """, (f"-{int(days)} days",))
+        if cursor.rowcount > 0 or img_cursor.rowcount > 0:
+            self.log_info(f"DB: Cleaned up {cursor.rowcount} ambient artifacts + "
+                          f"{img_cursor.rowcount} ambient image analyses (retention {days}d)")
+        return affected_thread_keys
 
     async def get_thread_documents_async(self, thread_id: str, limit: Optional[int] = None) -> List[Dict]:
         """Async version of get_thread_documents."""

@@ -26,6 +26,7 @@ import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import config
+from image_validation import API_IMAGE_MIMETYPES, sniff_image_mimetype
 from logger import setup_logger
 
 logger = setup_logger(name="slack_bot.GateVision")
@@ -41,19 +42,16 @@ _DOWNLOAD_TIMEOUT_S = 8.0
 _MAX_CONCURRENT_GATE_FETCHES = 2
 _fetch_slots = asyncio.Semaphore(_MAX_CONCURRENT_GATE_FETCHES)
 
-# What we are willing to put in front of the model. The documented, universally-accepted raster
-# set — deliberately narrow. SVG is markup (an injection surface, not a picture), HEIC is not
-# accepted, and an ANIMATED gif can be rejected outright; rather than gamble on the hot path we
-# skip them and tell the classifier the image was unavailable, which is at least honest.
-_SAFE_MIMETYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
-
-# Magic bytes — Slack serves a LOGIN PAGE (HTML, HTTP 200) when auth is wrong, so "it downloaded
-# fine" proves nothing. Sniff what actually arrived instead of trusting the declared mimetype.
-_MAGIC = (
-    (b"\x89PNG\r\n\x1a\n", "image/png"),
-    (b"\xff\xd8\xff", "image/jpeg"),
-    (b"RIFF", "image/webp"),        # RIFF....WEBP
-)
+# What we are willing to put in front of the model: what the API accepts, MINUS gif.
+#
+# F50 unified the API-supported list into image_validation, but deliberately did NOT unify this
+# one away. The gate's narrowness is a choice, not an oversight: the API takes a static gif
+# happily, but telling static from animated means parsing the file, and this runs on the DEBOUNCE
+# HOT PATH in front of every ambient message that carries a picture. A wake verdict is not worth
+# that, and a gif skipped here is not a dropped wake — it degrades to `unavailable`, and the
+# classifier is TOLD it couldn't see the image rather than left to invent it from the filename.
+# (SVG and HEIC need no exclusion here; the API doesn't take them either.)
+_SAFE_MIMETYPES = API_IMAGE_MIMETYPES - {"image/gif"}
 
 VISIBLE = "visible"
 UNAVAILABLE = "unavailable"
@@ -71,12 +69,15 @@ def _detail() -> str:
 
 
 def _sniff(raw: bytes) -> Optional[str]:
-    for magic, mime in _MAGIC:
-        if raw.startswith(magic):
-            if mime == "image/webp" and raw[8:12] != b"WEBP":
-                return None
-            return mime
-    return None
+    """What arrived, or None if it isn't something this gate will show.
+
+    Slack serves a LOGIN PAGE (HTML, HTTP 200) when auth is wrong, so "it downloaded fine"
+    proves nothing — the shared sniffer answers what the bytes ACTUALLY are. Re-checking the
+    answer against _SAFE_MIMETYPES is what keeps the gif exclusion honest: `eligible()` screened
+    on the DECLARED mimetype, so a gif labelled image/png reaches this point.
+    """
+    mime = sniff_image_mimetype(raw)
+    return mime if mime in _SAFE_MIMETYPES else None
 
 
 def eligible(descriptors: Any) -> List[Dict]:
@@ -96,26 +97,31 @@ def eligible(descriptors: Any) -> List[Dict]:
     return out
 
 
-async def load_for_gate(client: Any, descriptors: Any) -> Tuple[List[Dict], str]:
-    """Fetch up to N images and return (input_image parts, status).
+async def load_for_gate(client: Any, descriptors: Any) -> Tuple[List[Dict], str, List[Dict]]:
+    """Fetch up to N images and return (input_image parts, status, shown descriptors).
 
     status is one of: `visible` (the model can see them), `unavailable` (images are attached but
     we could not show them — the prompt must say so, so the model doesn't invent their content),
     `none` (no images at all). Never raises: a gate that throws is a gate that goes silent.
+
+    `shown` is the ORIGINAL descriptor for each image that actually reached the model, in the same
+    order as `parts` — the API parts are anonymized to {type, image_url, detail}, so this parallel
+    list is how a caller maps a per-image observation back to its Slack file id (F51b piggyback).
     """
     if not getattr(config, "enable_multimodal_gate", True):
-        return [], NONE
+        return [], NONE, []
     candidates = eligible(descriptors)
     if not candidates:
         # Attached-but-unshowable (a PDF, an SVG, an oversized photo) still has to be declared:
         # the model must not fill the gap from the filename, which is exactly what it did.
-        return [], (UNAVAILABLE if descriptors else NONE)
+        return [], (UNAVAILABLE if descriptors else NONE), []
 
     import base64
 
     cap = max(1, int(config.gate_vision_max_images or 1))
     budget = int(config.gate_vision_max_bytes)     # a TOTAL ceiling, not just a per-image one
     parts: List[Dict] = []
+    shown: List[Dict] = []                          # descriptor per part, same order (F51b)
 
     async with _fetch_slots:
         for d in candidates[:cap]:
@@ -145,8 +151,9 @@ async def load_for_gate(client: Any, descriptors: Any) -> Tuple[List[Dict], str]
                 "image_url": f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}",
                 "detail": _detail(),
             })
+            shown.append(d)
 
     if not parts:
-        return [], UNAVAILABLE
+        return [], UNAVAILABLE, []
     logger.debug(f"Gate vision: showing the classifier {len(parts)} image(s)")
-    return parts, VISIBLE
+    return parts, VISIBLE, shown

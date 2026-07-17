@@ -25,6 +25,7 @@ from slack_client.event_handlers.feedback import (
     feedback_enabled,
     should_offer_feedback,
 )
+from slack_client.formatting.blocks import extract_supplementary_text
 from slack_client.utilities import strip_citations
 
 import re as _re
@@ -40,8 +41,13 @@ import re as _re
 _UI_HELPER_ACTION_IDS = frozenset({
     "open_channel_settings", FEEDBACK_ACTION_ID, USER_SETTINGS_ACTION_ID,
 })
+# Notification/accessibility fallback text for a standalone Configure-footer post. NOT a bare
+# model name (that reads as a spurious message when Slack surfaces the fallback — the live
+# "gpt-5.6-sol" post 2026-07-16); still recognized here so the history rebuild skips it as chrome.
+RESPONSE_FOOTER_FALLBACK_TEXT = "Channel settings"
 _UI_HELPER_FALLBACK_TEXTS = frozenset(
-    {"Rate this response", "Settings available"} | set(SUPPORTED_CHAT_MODELS)
+    {"Rate this response", "Settings available", RESPONSE_FOOTER_FALLBACK_TEXT}
+    | set(SUPPORTED_CHAT_MODELS)
 )
 
 
@@ -88,6 +94,42 @@ _SELF_STATUS_MARKERS = (
     "Rebuilding thread history",
     "Catching up on",
 )
+
+
+def is_self_chrome_message(text: str, msg: dict) -> bool:
+    """True when a message is our OWN transient UI chrome — a status/placeholder line
+    (":emoji: Thinking…"), a progress checklist ("✓ …"), the legacy processing notice, the
+    "Settings available" button, or a pure UI-helper block (Configure button / feedback strip)
+    with no real text. Such messages must never be replayed as an assistant turn (history
+    rebuild) NOR recorded as authoritative `[self]` addressee evidence (F47 cold-start backfill).
+
+    Content-bearing replies — even ones carrying the Configure chrome attached on stopStream —
+    are NOT chrome and return False. The caller decides ownership (only pass our own messages for
+    the self-status checks to be meaningful); this only classifies the shape. Fail-open: any
+    error classifies as NOT chrome, so a real reply is never silently dropped."""
+    try:
+        text = text or ""
+        # F1 progress-checklist ("✓ …") — carries an invisible marker, not the ":emoji:" shape.
+        if is_checklist_status_text(text):
+            return True
+        # Transient placeholders/status lines: ":emoji: Thinking..." and same-shaped updates.
+        if _SELF_STATUS_RE.match(text) and (
+            any(marker in text for marker in _SELF_STATUS_MARKERS)
+            or any(marker in text for marker in pipeline_status_markers())
+        ):
+            return True
+        # Legacy busy/processing notice.
+        if ":warning:" in text and "currently processing" in text:
+            return True
+        # Settings button message.
+        if text == "Settings available":
+            return True
+        # Pure UI-helper block (Configure button / Phase H feedback strip) with no real text.
+        if _is_ui_helper_message(msg):
+            return True
+    except Exception:
+        return False
+    return False
 
 
 class NativeStreamSession:
@@ -560,7 +602,36 @@ class SlackMessagingMixin:
                 # whole send returns None, so the caller retries the plain path.
                 if username:
                     post_kwargs["username"] = username
-                result = await self.app.client.chat_postMessage(**post_kwargs)
+                # Wall-clock instant just before the post. Reconcile anchors its lower bound
+                # here: a message that landed can only carry a Slack ts at or after we tried,
+                # so an older own-message (an identical earlier reply) can never be mistaken
+                # for this post. Captured on the happy path too — one cheap time.time() — but
+                # only ever READ in the ambiguous branch below.
+                attempt_start = time.time()
+                try:
+                    result = await self.app.client.chat_postMessage(**post_kwargs)
+                except SlackApiError:
+                    # Definitive API rejection — nothing landed. Let the outer handler return
+                    # None so the caller's single retry is correct; no reconcile (there is no
+                    # ambiguity to resolve, and this path must add zero extra work).
+                    raise
+                except Exception as transport_error:
+                    # AMBIGUOUS transport failure (timeout / connection reset raised AFTER the
+                    # request may have already reached Slack). chat.postMessage has no server-side
+                    # idempotency key, so before letting the caller re-post — which would double
+                    # the reply — reconcile against recent history: if our own message with this
+                    # text is already there, the post landed and we return its ts as success. If
+                    # it is NOT found (or the reconcile query itself fails) we re-raise unchanged
+                    # so the caller's existing single retry still runs (a missing answer is worse
+                    # than a rare duplicate).
+                    reconciled_ts = await self._reconcile_uncertain_post(
+                        channel_id, thread_id, formatted_text, attempt_start)
+                    if not reconciled_ts:
+                        raise
+                    self.log_warning(
+                        f"Final post response timed out but the message landed "
+                        f"(reconciled ts={reconciled_ts}); not re-posting: {transport_error}")
+                    result = {"ts": reconciled_ts}
                 posted_ts = result.get("ts")
                 # Report footer attachment only AFTER Slack returns a ts — a post that never
                 # landed hasn't attached anything, and the separate footer must still fire.
@@ -633,6 +704,100 @@ class SlackMessagingMixin:
         except SlackApiError as e:
             self.log_error(f"Error sending message: {e}")
             return None
+
+    # Ambiguous-commit reconcile window: an own message this recent that matches what we tried
+    # to send is treated as the post that just landed. Slack timestamps are epoch seconds. The
+    # primary lower bound is the attempt-start instant (below); this 120s value is a secondary
+    # ceiling only.
+    _RECONCILE_WINDOW_SECS = 120
+    # Slack `ts` is server-stamped while attempt_start is local; allow a little drift so a post
+    # that truly landed isn't rejected for a ts a hair before our local clock read.
+    _RECONCILE_CLOCK_SKEW_SECS = 5
+    # Prefix matching (Slack may append/trim chrome around the fallback text) is only safe for
+    # long messages: below this length a short reply can be a prefix of an unrelated longer one.
+    _RECONCILE_PREFIX_MIN_LEN = 200
+    # conversations.replies returns the EARLIEST in-window messages first, so the freshly-posted
+    # tail can sit past the first page. Follow the cursor up to this many pages before giving up.
+    _RECONCILE_MAX_PAGES = 3
+
+    @staticmethod
+    def _normalize_for_match(text: str) -> str:
+        """Whitespace/entity-normalized text for comparing what we SENT against what Slack
+        STORED. Slack collapses runs of whitespace and HTML-escapes &/</>, so undo both before
+        comparing so a benign normalization can't defeat the match."""
+        text = (text or "").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        return " ".join(text.split())
+
+    async def _reconcile_uncertain_post(self, channel_id: str, thread_id: Optional[str],
+                                        formatted_text: str, attempt_start: float) -> Optional[str]:
+        """After an AMBIGUOUS transport failure on a single-message post, look for the message we
+        just tried to send in recent history. Returns its ts when our OWN bot posted matching
+        text at or after `attempt_start` (the instant just before this post), else None (the
+        caller then reports failure so its single retry runs).
+
+        `formatted_text` is the exact post-conversion payload text handed to chat.postMessage.
+        `attempt_start` is a local wall-clock timestamp captured immediately before the post; a
+        message that actually landed can only carry a Slack ts at/after it (minus a small skew
+        for clock drift), so an identical EARLIER reply can never be mistaken for this one.
+
+        Best-effort: any error querying history returns None — a missing answer is worse than a
+        rare duplicate. Only the ambiguous branch calls this, so the happy path pays nothing."""
+        target = self._normalize_for_match(formatted_text)
+        if not target:
+            return None
+        # Lower bound anchored to the attempt (minus drift skew). The 120s window is a secondary
+        # ceiling: whichever bound is more recent wins, and the attempt-anchored floor normally
+        # does, so a stale identical reply is excluded outright.
+        floor_ts = attempt_start - self._RECONCILE_CLOCK_SKEW_SECS
+        cutoff = max(floor_ts, time.time() - self._RECONCILE_WINDOW_SECS)
+        oldest = f"{floor_ts:.6f}"
+        min_len = self._RECONCILE_PREFIX_MIN_LEN
+        # `oldest` + `inclusive` scope the query to the attempt window. conversations.replies
+        # returns the EARLIEST in-window messages first, so the freshly-posted tail can sit past
+        # the first page when >100 replies fall in-window — page the cursor (bounded to
+        # _RECONCILE_MAX_PAGES) and scan EVERY page. conversations.history returns newest-first so
+        # it matches on page 1 in practice, but the loop shape is shared. Any query error anywhere
+        # returns None — a missing answer is worse than a rare duplicate.
+        cursor: Optional[str] = None
+        for _page in range(self._RECONCILE_MAX_PAGES):
+            try:
+                if thread_id:
+                    resp = await self.app.client.conversations_replies(
+                        channel=channel_id, ts=thread_id, oldest=oldest, inclusive=True,
+                        limit=100, cursor=cursor)
+                else:
+                    resp = await self.app.client.conversations_history(
+                        channel=channel_id, oldest=oldest, inclusive=True,
+                        limit=100, cursor=cursor)
+                messages = resp.get("messages", []) if resp else []
+            except Exception as e:
+                self.log_warning(f"Reconcile query failed after uncertain post: {e}")
+                return None
+            for msg in messages:
+                if not self.is_own_message(msg):
+                    continue
+                try:
+                    if float(msg.get("ts", 0)) < cutoff:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                candidate = self._normalize_for_match(msg.get("text", ""))
+                if not candidate:
+                    continue
+                if candidate == target:
+                    return msg.get("ts")
+                # Full-prefix match (Slack may append/trim chrome around the fallback text) only
+                # when BOTH normalized strings are long — otherwise a short reply is a prefix of an
+                # unrelated longer one ("OK" vs "OK, done") and a genuinely lost new post gets
+                # swallowed. Compare the WHOLE shorter string, never a 200-char head: two long
+                # replies sharing a 200-char boilerplate prefix then diverging must NOT match.
+                if (len(candidate) >= min_len and len(target) >= min_len
+                        and (candidate.startswith(target) or target.startswith(candidate))):
+                    return msg.get("ts")
+            cursor = (resp.get("response_metadata") or {}).get("next_cursor") if resp else None
+            if not cursor:
+                break
+        return None
 
     def _split_message(self, text: str) -> List[str]:
         """Split a long message into chunks that fit within Slack's limit.
@@ -901,29 +1066,15 @@ class SlackMessagingMixin:
                     # must only ever skip OUR OWN messages (R3: a human saying
                     # "Thinking about the Q3 plan" is real context, not a placeholder).
                     sender_type = self.classify_sender(msg)
-                    if sender_type == "self":
-                        # F1 progress-checklist messages carry an invisible marker (their
-                        # "✓ …" shape doesn't match the ":emoji:" filter below). Drop them
-                        # so a mid-generation rebuild never replays them as an assistant turn.
-                        if is_checklist_status_text(text):
-                            continue
-                        # Our transient placeholders/status lines: ":emoji: Thinking..."
-                        # and status updates that share that shape. Precise-match only.
-                        if _SELF_STATUS_RE.match(text) and (
-                            any(marker in text for marker in _SELF_STATUS_MARKERS)
-                            or any(marker in text for marker in pipeline_status_markers())
-                        ):
-                            continue
-                        # Legacy busy/processing notices
-                        if ":warning:" in text and "currently processing" in text:
-                            continue
-                        # Settings button messages
-                        if text == "Settings available":
-                            continue
-                    # Skip our UI-helper messages (channel footer's Configure button,
-                    # Phase H feedback strip) — detected by their block action_ids,
-                    # so a real reply can't false-positive.
-                    if _is_ui_helper_message(msg):
+                    # Our OWN transient chrome (status/placeholder/checklist/"Settings
+                    # available"/pure UI-helper block) must never replay as an assistant turn.
+                    # Factored into is_self_chrome_message so this path and the F47 cold-start
+                    # backfill (channel_pulse.ensure_backfill) can never drift.
+                    if sender_type == "self" and is_self_chrome_message(text, msg):
+                        continue
+                    # A non-self message can still be a pure UI-helper block (its action_ids,
+                    # never text — so a real reply can't false-positive); skip it too.
+                    if sender_type != "self" and _is_ui_helper_message(msg):
                         continue
 
                     # sender_type computed above (drives both the self-only filters and metadata)
@@ -933,6 +1084,17 @@ class SlackMessagingMixin:
 
                     # Clean text
                     text = msg.get("text", "")
+                    # F48 — the DURABILITY half. Slack is the ONLY transcript, so fixing
+                    # only the live path buys exactly one turn: a table ingests Monday and
+                    # Tuesday's rebuild re-drops it, leaving the bot with amnesia about
+                    # content it already discussed. Rendered RAW and combined BEFORE the
+                    # mention pass below, matching the live path so a message serializes
+                    # identically live and rebuilt. Never for our OWN messages: our status
+                    # and welcome cards live in these fields (F47 attribution bug).
+                    if sender_type != "self":
+                        supplementary = extract_supplementary_text(msg, primary_text=text)
+                        if supplementary:
+                            text = f"{text}\n\n{supplementary}" if text.strip() else supplementary
                     if not is_bot:
                         text = self._clean_mentions(text)
                     
@@ -948,7 +1110,12 @@ class SlackMessagingMixin:
                             "type": file_type,
                             "name": file.get("name"),
                             "mimetype": mimetype,
-                            "url": file.get("url_private", file.get("permalink"))
+                            "url": file.get("url_private", file.get("permalink")),
+                            # Match the live path (message_events) so a rebuilt Message carries the
+                            # same provenance: the file id and declared size enable later
+                            # re-download / size-gate decisions.
+                            "id": file.get("id"),
+                            "size": file.get("size"),
                         })
                     
                     messages.append(Message(
@@ -1880,7 +2047,9 @@ class SlackMessagingMixin:
             await self.app.client.chat_postMessage(
                 channel=channel_id,
                 thread_ts=getattr(message, "thread_id", None),
-                text=(model or config.gpt_model),  # fallback text for notifications
+                # Describes the footer's purpose instead of showing a bare model name (which reads
+                # as a spurious standalone message — the "gpt-5.6-sol" post seen live 2026-07-16).
+                text=RESPONSE_FOOTER_FALLBACK_TEXT,
                 blocks=blocks,
             )
         except Exception as e:

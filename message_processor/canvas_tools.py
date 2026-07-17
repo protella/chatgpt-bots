@@ -850,6 +850,12 @@ async def execute_create_channel_canvas(ctx: ToolContext, args: Dict[str, Any]) 
     if not canvas_id:
         return _err("create_failed", "Slack created no canvas id.")
 
+    # F46: a canvas was really written — deliverable work that does not call claim_work. Force
+    # a top-level channel reply into a thread at final-post time (resolve_reply_target).
+    _turn = getattr(ctx, "turn", None)
+    if _turn is not None:
+        _turn.mark_substantive_work()
+
     # No canvases.access.set here, unlike a standalone canvas: the channel canvas belongs to the
     # channel, so Slack shares it in on creation (files.info shows the channel under `shares`
     # with source CHANNEL_TAB) and everyone who can see the channel can already see it.
@@ -1190,6 +1196,11 @@ async def execute_edit_canvas(ctx: ToolContext, args: Dict[str, Any]) -> Dict[st
     except Exception as e:  # noqa: BLE001
         logger.error(f"canvases.edit failed for {canvas_id}: {e}", exc_info=True)
         return _err("edit_failed", f"Slack refused the edit: {e}")
+
+    # F46: a canvas edit is deliverable work (no claim_work here) — thread a top-level reply.
+    _turn = getattr(ctx, "turn", None)
+    if _turn is not None:
+        _turn.mark_substantive_work()
 
     _invalidate_catalog(ctx.channel_id)
     logger.info(f"Edited canvas {canvas_id} ({operation})")
