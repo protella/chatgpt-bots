@@ -97,13 +97,20 @@ class BaseClient(ABC, LoggerMixin):
         pass
 
     @abstractmethod
-    def send_image(self, channel_id: str, thread_id: str, image_data: bytes, filename: str, caption: str = "") -> bool:
-        """Send an image"""
+    async def send_image(self, channel_id: str, thread_id: str, image_data: bytes, filename: str,
+                         caption: str = "", meta_out: Optional[dict] = None) -> Optional[str]:
+        """Send an image. Returns the posted image's URL (truthy on success) or None.
+
+        `meta_out`: optional caller-provided dict a platform MAY populate with delivery facts
+        — meta_out["file_id"] is the uploaded file's id (F7), the only handle from which the
+        image message's own ts can later be resolved. Implementations that report none may
+        ignore it; it defaults to None so non-Slack impls stay compatible."""
         pass
 
     @abstractmethod
-    async def send_image_async(self, channel_id: str, thread_id: str, image_data: bytes, filename: str, caption: str = "") -> bool:
-        """Send an image (async version)"""
+    async def send_image_async(self, channel_id: str, thread_id: str, image_data: bytes, filename: str,
+                               caption: str = "", meta_out: Optional[dict] = None) -> Optional[str]:
+        """Send an image (async version). See send_image for the return/meta_out contract."""
         pass
 
     async def send_file(self, channel_id: str, thread_id: str, file_data,
