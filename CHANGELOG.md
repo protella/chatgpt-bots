@@ -129,6 +129,17 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 🔒 Fixed - Nothing env-shaped can slip past .gitignore
+
+- **Every `.env*` file is ignored now**, not just `.env` on the nose. A bare `.env` rule doesn't
+  match siblings like `.env.bak-keep.txt`, so anything env-shaped is ignored by default and
+  `.env.example` stays published through an explicit negation. If you keep local env variants
+  under other names, they're covered without you doing anything.
+
+> **If you have an existing clone:** `master` was rewritten, so a normal `git pull` will conflict.
+> Re-clone, or `git fetch origin && git reset --hard origin/master`. Feature branches other than
+> `master` were retired.
+
 ### 🧠 Feature - Ambient memory: it remembers what the channel shares
 
 #### Added

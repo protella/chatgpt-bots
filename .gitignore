@@ -1,5 +1,8 @@
-# secrets
-.env
+# secrets — must stay a wildcard. A bare `.env` rule matches ONLY that exact name:
+# siblings like `.env.bak-keep.txt` sail straight past it. Ignore anything env-shaped
+# by default and add an explicit negation for the rare file meant to be published.
+.env*
+!.env.example
 
 # VSCode
 .vscode/
@@ -113,8 +116,7 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
-# Environments (.env is ignored at the top of this file)
-.env.bak
+# Environments (all .env* is ignored at the top of this file)
 .venv
 env/
 venv/
