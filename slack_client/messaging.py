@@ -545,15 +545,31 @@ class SlackMessagingMixin:
     # fits one section when we attach the footer as blocks.
     _SECTION_TEXT_LIMIT = 2900
 
+    # UX cap for the INLINE footer. Wrapping the reply in a section block to carry the
+    # footer makes Slack collapse it behind a "Show more" link once it runs past ~4
+    # wrapped lines in the narrow thread pane. Measured 2026-07-17 in #chatgpt-bot-test:
+    # a section-block reply is fine at 220 chars and collapses at 300, while the SAME text
+    # posted as plain text never collapses at any length. So the tidy inline footer only
+    # rides short, few-line replies; anything longer posts as plain text and takes the
+    # separate footer post, which renders in full. Set well below the 220/300 boundary so
+    # it also survives the narrower right-hand thread flexpane and multi-line (list) replies.
+    _FOOTER_INLINE_MAX = 180
+
     def _compose_reply_with_footer(self, formatted_text: str, footer_blocks: list):
         """Blocks that render the REPLY TEXT plus the footer actions row.
 
         Attaching action blocks alone makes Slack render blocks INSTEAD of the top-level
         `text`, hiding the answer (only the ⚙️ button shows). So the reply rides a leading
-        section block, then the footer actions. Returns None when the text is too long to
-        fit a single section — the caller then posts plain text and lets the separate
-        footer post happen instead."""
-        if not footer_blocks or len(formatted_text) > self._SECTION_TEXT_LIMIT:
+        section block, then the footer actions.
+
+        The catch: that section block collapses behind Slack's "Show more" link once it's
+        more than a few wrapped lines (see _FOOTER_INLINE_MAX); plain text never does. So
+        we inline the footer ONLY for a short, few-line reply that won't collapse. Longer
+        or taller replies return None — the caller then posts plain text and lets the
+        separate footer post happen instead, which renders in full."""
+        if not footer_blocks:
+            return None
+        if len(formatted_text) > self._FOOTER_INLINE_MAX or formatted_text.count("\n") > 2:
             return None
         return [{"type": "section", "text": {"type": "mrkdwn", "text": formatted_text}}] + list(footer_blocks)
 

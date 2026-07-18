@@ -47,6 +47,7 @@ def _real_send_host():
     s._record_own_reply_pulse = SlackMessagingMixin._record_own_reply_pulse.__get__(s)
     s._compose_reply_with_footer = SlackMessagingMixin._compose_reply_with_footer.__get__(s)
     s._SECTION_TEXT_LIMIT = SlackMessagingMixin._SECTION_TEXT_LIMIT
+    s._FOOTER_INLINE_MAX = SlackMessagingMixin._FOOTER_INLINE_MAX
     s.MAX_MESSAGE_LENGTH = 3900
     s.app.client.chat_postMessage = AsyncMock(return_value={"ts": "900.0"})
     pulse = MagicMock()

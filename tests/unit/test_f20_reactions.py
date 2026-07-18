@@ -22,10 +22,14 @@ import prompts
 
 # ------------------------------------------------------------------- point 1+4: prompts
 
-def test_participation_prompt_broadened_guidance():
+def test_participation_prompt_reaction_bar():
     p = prompts.PARTICIPATION_SYSTEM_PROMPT
-    # social-proof: the room already reacting lowers the bar
-    assert "already reacted" in p and "LOWERS the bar" in p
+    # reactions are reserved, not a way to chime into human-to-human talk: the
+    # addressee rules apply to reactions and ordinary chatter earns nothing
+    assert "addressee rules below apply to reactions" in p
+    assert "gets NOTHING" in p
+    # social proof kept but GATED on the assistant genuinely being part of the moment
+    assert "ALREADY placed is low-risk only when" in p
     # taste rails preserved
     assert "heated, sensitive, or personal" in p
     assert "when unsure, ignore" in p

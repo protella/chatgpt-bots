@@ -84,6 +84,9 @@ class SlackSearchToolMixin:
 
         if not getattr(ctx, "action_token", None):
             # Older/replayed events (or non-AI-app surfaces) carry no token.
+            # Log the cause: the registry's generic "-> error" line alone left four
+            # live failures undiagnosable (2026-07-18).
+            self.log_info("search_tool: unavailable — event carried no action_token")
             return {
                 "ok": False,
                 "error": "search_unavailable",
@@ -92,6 +95,7 @@ class SlackSearchToolMixin:
 
         channel_types = self._search_channel_types()
         if not channel_types:
+            self.log_info("search_tool: refused — no searchable channel types configured")
             return {"ok": False, "error": "search_disabled", "message": "No searchable channel types are configured."}
 
         limit = self._clamp_search_limit(args.get("limit"))
@@ -115,6 +119,7 @@ class SlackSearchToolMixin:
         except SlackApiError as e:
             err = e.response.get("error", "unknown") if getattr(e, "response", None) else str(e)
             if err in _TOKEN_ERRORS:
+                self.log_info(f"search_tool: action token rejected ({err}) — degraded to search_unavailable")
                 return {
                     "ok": False,
                     "error": "search_unavailable",
