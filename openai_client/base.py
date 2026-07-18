@@ -215,50 +215,6 @@ class OpenAIClient(LoggerMixin):
                     self.log_error(f"Stream error after {elapsed:.2f}s: {e}")
                 raise
 
-    async def _safe_api_call(
-        self,
-        api_method: Callable,
-        *args,
-        timeout_seconds: Optional[float] = None,
-        operation_type: str = "general",
-        **kwargs,
-    ):
-        """Async wrapper for OpenAI API calls with enforced timeout."""
-
-        # Determine timeout based on operation type and .env settings
-        if timeout_seconds:
-            timeout = timeout_seconds
-        else:
-            timeout = self._get_operation_timeout(operation_type)
-
-        self.log_debug(
-            f"Using timeout: {timeout}s for {operation_type} operation (from .env: "
-            f"read={config.api_timeout_read}s, chunk={config.api_timeout_streaming_chunk}s)"
-        )
-
-        try:
-            # Use asyncio.wait_for for proper async timeout handling
-            result = await asyncio.wait_for(
-                api_method(*args, **kwargs),
-                timeout=timeout
-            )
-            return result
-        except asyncio.TimeoutError:
-            self.log_error(f"API call ({operation_type}) timed out after {timeout}s")
-            # Create TimeoutError with operation_type attribute for smart retry logic
-            timeout_error = TimeoutError(f"OpenAI API call timed out after {timeout} seconds")
-            timeout_error.operation_type = operation_type
-            raise timeout_error
-        except Exception as e:
-            error_msg = str(e).lower()
-            if "timeout" in error_msg or "timed out" in error_msg or "read timeout" in error_msg:
-                self.log_error(f"API call ({operation_type}) timed out after {timeout}s: {e}")
-                # Create TimeoutError with operation_type attribute for smart retry logic
-                timeout_error = TimeoutError(f"OpenAI API call timed out after {timeout} seconds")
-                timeout_error.operation_type = operation_type
-                raise timeout_error
-            raise
-
     async def create_text_response(
         self,
         messages: List[Dict[str, Any]],
@@ -706,6 +662,10 @@ class OpenAIClient(LoggerMixin):
         store: bool = False,
         timeout_seconds: float = 60.0,
         return_metadata: bool = False,
+        prompt_cache_key: Optional[str] = None,
+        usage_sink: Optional[Dict[str, Any]] = None,
+        mcp_tools_sink: Optional[Dict[str, Any]] = None,
+        mcp_results_sink: Optional[List[Dict[str, Any]]] = None,
         artifacts_sink: Optional[List[Dict[str, Any]]] = None,
         container_gone_sink: Optional[List[str]] = None,
     ) -> str:
@@ -723,6 +683,10 @@ class OpenAIClient(LoggerMixin):
             store=store,
             timeout_seconds=timeout_seconds,
             return_metadata=return_metadata,
+            prompt_cache_key=prompt_cache_key,
+            usage_sink=usage_sink,
+            mcp_tools_sink=mcp_tools_sink,
+            mcp_results_sink=mcp_results_sink,
             artifacts_sink=artifacts_sink,
             container_gone_sink=container_gone_sink,
         )

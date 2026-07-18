@@ -9,6 +9,12 @@ from config import config
 from slack_client.formatting.blocks import extract_supplementary_text
 
 
+# Safety ceiling on how many conversations_replies pages a single thread fetch will
+# pull (1000 messages/page). Threads deeper than this are effectively nonexistent, but
+# the cap keeps a pathological thread from spinning the loop; when it's hit we say so.
+_MAX_THREAD_PAGES = 10
+
+
 class SlackHistoryToolMixin:
     """On-demand Slack history-fetch tool (Phase 8).
 
@@ -189,13 +195,42 @@ class SlackHistoryToolMixin:
                     "not a member of, or it doesn't exist. No content can be returned."
                 ),
             }
+        thread_truncated = False
         try:
             if thread_ts:
-                resp = await self.app.client.conversations_replies(channel=channel_id, ts=thread_ts, limit=n)
+                # conversations_replies returns ASCENDING from the thread root, so a
+                # bare limit=n would keep the OLDEST n while the note below promises the
+                # newest. Page to the END of the thread (bounded by _MAX_THREAD_PAGES,
+                # following the response cursor) and keep the NEWEST n — the root for
+                # context, then the most recent replies — so "recent messages" is true.
+                # A single page tops out at 1000, so a thread over that would otherwise
+                # return old messages under a "newest window" label.
+                all_messages: List[Dict[str, Any]] = []
+                cursor: Optional[str] = None
+                for _ in range(_MAX_THREAD_PAGES):
+                    kwargs: Dict[str, Any] = {"channel": channel_id, "ts": thread_ts, "limit": 1000}
+                    if cursor:
+                        kwargs["cursor"] = cursor
+                    resp = await self.app.client.conversations_replies(**kwargs)
+                    all_messages.extend(resp.get("messages") or [])
+                    cursor = (resp.get("response_metadata") or {}).get("next_cursor")
+                    if not cursor:
+                        break
+                else:
+                    # Ran the page cap without draining the cursor: the true newest replies
+                    # are beyond our reach, so the tail below is the newest of what we SAW.
+                    thread_truncated = bool(cursor)
+                if len(all_messages) > n:
+                    # Root (all_messages[0]) + newest (n-1) replies; ascending order kept.
+                    raw = all_messages[:1] + all_messages[-(n - 1):] if n > 1 else all_messages[:1]
+                else:
+                    raw = all_messages
             else:
+                # conversations_history is DESCENDING (newest first), so the first n are
+                # already the newest.
                 resp = await self.app.client.conversations_history(channel=channel_id, limit=n)
-            all_messages = resp.get("messages") or []
-            raw = all_messages[:n]
+                all_messages = resp.get("messages") or []
+                raw = all_messages[:n]
             messages = []
             for m in raw:
                 entry = {
@@ -227,7 +262,8 @@ class SlackHistoryToolMixin:
             # R5: tell the model whether it saw a window or everything — otherwise
             # "50 messages" is indistinguishable from "the newest 50 of 5,000".
             has_more = bool(
-                (resp.get("response_metadata") or {}).get("next_cursor")
+                thread_truncated
+                or (resp.get("response_metadata") or {}).get("next_cursor")
                 or resp.get("has_more")
                 or len(all_messages) > n
             )
@@ -240,7 +276,14 @@ class SlackHistoryToolMixin:
                 "messages": messages,
             }
             if has_more:
-                result["note"] = "Only the newest window was returned; older history exists beyond this."
+                # Be honest about which kind of "more" this is: a normal trim (we have the
+                # true newest) vs. a thread so long we couldn't page to its actual end.
+                result["note"] = (
+                    "This thread is longer than the tool can page through; the newest "
+                    "window returned may not include the most recent messages."
+                    if thread_truncated
+                    else "Only the newest window was returned; older history exists beyond this."
+                )
             return result
         except SlackApiError as e:
             err = e.response.get("error", "unknown") if getattr(e, "response", None) else str(e)

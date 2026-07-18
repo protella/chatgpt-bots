@@ -29,6 +29,7 @@ import asyncio
 import hashlib
 import io
 import re
+import time
 import zipfile
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -62,6 +63,9 @@ _MAGIC: Dict[str, List[bytes]] = {
     "xlsx": [b"PK\x03\x04"],
     "docx": [b"PK\x03\x04"],
     "pptx": [b"PK\x03\x04"],
+    # A plain archive: local-file-header (PK\x03\x04), empty-archive (PK\x05\x06), or spanned
+    # (PK\x07\x08) magic. An advertised "archive" deliverable is delivered as a .zip.
+    "zip": [b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"],
 }
 _OOXML_EXTS = {"xlsx", "docx", "pptx"}
 _TEXT_EXTS = {"csv", "tsv", "json", "txt", "md"}
@@ -392,8 +396,13 @@ async def _stream_download(raw: Any, ref: ArtifactRef, max_bytes: int) -> Option
     return buf.getvalue() or None
 
 
-async def _download(openai_client: Any, ref: ArtifactRef, max_bytes: int) -> Optional[bytes]:
-    """Fetch one container file's bytes, refusing anything over the cap. Never raises."""
+async def _download(openai_client: Any, ref: ArtifactRef, max_bytes: int,
+                    timeout: float = _API_TIMEOUT) -> Optional[bytes]:
+    """Fetch one container file's bytes, refusing anything over the cap. Never raises.
+
+    ``timeout`` lets the caller shrink the per-file bound below ``_API_TIMEOUT`` — when a whole
+    staging phase is on a deadline, the LAST download must not be free to run a full 30s past it.
+    """
     # Free rejection when the listing knows the size. It often does not (`bytes` comes back null
     # for assistant-written files), so this is an optimization — the streaming read below is the
     # actual bound.
@@ -404,7 +413,7 @@ async def _download(openai_client: Any, ref: ArtifactRef, max_bytes: int) -> Opt
     try:
         raw = openai_client.client
         return await asyncio.wait_for(
-            _stream_download(raw, ref, max_bytes), timeout=_API_TIMEOUT)
+            _stream_download(raw, ref, max_bytes), timeout=timeout)
     except asyncio.TimeoutError:
         logger.warning(f"Artifact download timed out: {ref.filename}")
         return None
@@ -541,12 +550,67 @@ def _embedded_member_hashes(candidates: List[Dict[str, Any]]) -> set:
     return hashes
 
 
+def _base_name(ref: ArtifactRef) -> str:
+    return ref.filename.rsplit("/", 1)[-1].lower()
+
+
+def _prioritize_declared(refs: List[ArtifactRef],
+                         expect_filenames: List[str]) -> List[ArtifactRef]:
+    """Move refs that match the declared manifest to the FRONT of the listing.
+
+    The download budget below is spent in listing order, and the listing is the container's
+    creation order — so a deliverable written AFTER >=budget intermediates would never be
+    downloaded, and `_select_candidates` could then never pick it. Ordering (not budget size)
+    is the fix.
+
+    Tiers, because an exact name is a stronger signal than a shared extension:
+      * tier 0 — the file selection will actually claim: an exact-name match, or (for an entry
+        with no exact match) the NEWEST same-extension ref, i.e. the LAST one in listing order.
+        Resolving "newest" from the listing here — not from the downloaded subset later — is what
+        guarantees the exact file selection wants is inside the budget even when the same-ext
+        drafts outnumber it.
+      * tier 1 — the other same-extension drafts (ahead of unrelated intermediates, behind the
+        one that will be claimed).
+      * tier 2 — everything else.
+    The sort is STABLE, so creation order is preserved within each tier.
+    """
+    if not expect_filenames:
+        return refs
+    names = set(expect_filenames)
+    manifest_exts = {f.rpartition(".")[2] for f in expect_filenames if "." in f}
+
+    # Which declared entries already have an exact-name match? Only entries WITHOUT one fall back
+    # to an extension, and each such entry promotes its newest (last-in-listing) same-ext ref.
+    present = {f for f in expect_filenames if any(_base_name(r) == f for r in refs)}
+    promoted: set = set()
+    for fname in expect_filenames:
+        if fname in present or "." not in fname:
+            continue
+        ext = fname.rpartition(".")[2]
+        same = [r for r in refs
+                if _base_name(r).rpartition(".")[2] == ext and id(r) not in promoted]
+        if same:
+            promoted.add(id(same[-1]))  # last in listing order = newest
+
+    def _tier(ref: ArtifactRef) -> int:
+        base = _base_name(ref)
+        if base in names or id(ref) in promoted:
+            return 0
+        if base.rpartition(".")[2] in manifest_exts:
+            return 1
+        return 2
+
+    return sorted(refs, key=_tier)
+
+
 async def _gather_candidates(
     *,
     openai_client: Any,
     container_ids: Optional[List[str]],
     container_manager: Any,
     ledger_key: str,
+    expect_filenames: Optional[List[str]] = None,
+    deadline: Optional[float] = None,
 ) -> tuple:
     """Phase 1 of publication: list the container(s), drop what already went out, and download
     + validate everything that's left. Returns ``(candidates, skipped)``.
@@ -554,6 +618,12 @@ async def _gather_candidates(
     Bytes land in memory and stay there — never on disk (CLAUDE.md). Downloading BEFORE any
     decision is deliberate: whether a chart is a deliverable or an ingredient of the deck beside
     it can only be answered by looking inside the deck.
+
+    ``deadline`` (a ``time.monotonic()`` value) time-bounds the download loop from the INSIDE, so
+    a slow container yields whatever was staged before the budget ran out instead of losing
+    everything to an outer cancel. Per-file bounding (``_API_TIMEOUT``) still applies; this only
+    stops starting NEW downloads once the budget is spent. F14's manifest prioritization runs
+    first, so the files that survive a truncated budget are the declared deliverables.
     """
     refs = await resolve_container_artifacts(openai_client, container_ids or [])
 
@@ -573,6 +643,15 @@ async def _gather_candidates(
     if not refs:
         return [], 0
 
+    # Stamp each ref with its LISTING position (creation order) BEFORE prioritization reshuffles
+    # them, so the "newest same-ext" fallback in _select_candidates resolves against the true
+    # listing order rather than the downloaded subset.
+    listing_order = {id(r): i for i, r in enumerate(refs)}
+
+    # A declared deliverable must be downloaded even if it was written after a budget's worth of
+    # intermediates — so pull the manifest matches to the front before the budget bites.
+    refs = _prioritize_declared(refs, expect_filenames or [])
+
     max_bytes = config.artifact_max_mb * 1024 * 1024
     cap = config.artifact_max_files
     skipped = 0
@@ -588,12 +667,28 @@ async def _gather_candidates(
             skipped = len(refs) - index + 1
             break
 
+        # How much of the time budget is left. <= 0 means STOP starting downloads — hand back what
+        # we already staged (the declared deliverables sorted to the front, so they are what made
+        # it) rather than nothing.
+        remaining = None
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                skipped = len(refs) - index + 1
+                logger.warning(
+                    f"Artifact gather hit its time budget after {len(candidates)} file(s) — "
+                    f"{skipped} container file(s) never examined")
+                break
+
         filename = sanitize_filename(ref.filename, fallback_index=index)
         if not filename:
             logger.warning(f"Artifact rejected (name/extension not allowed): {ref.filename!r}")
             continue
 
-        data = await _download(openai_client, ref, max_bytes)
+        # Bound THIS download by whatever is left of the budget (exact, no floor), so an in-flight
+        # read can't sail a full _API_TIMEOUT past the deadline.
+        dl_timeout = _API_TIMEOUT if remaining is None else min(_API_TIMEOUT, remaining)
+        data = await _download(openai_client, ref, max_bytes, timeout=dl_timeout)
         if not data:
             continue
 
@@ -608,9 +703,50 @@ async def _gather_candidates(
             continue
 
         candidates.append({"ref": ref, "filename": filename, "ext": ext, "data": data,
-                           "digest": hashlib.sha256(data).hexdigest()})
+                           "digest": hashlib.sha256(data).hexdigest(),
+                           "order": listing_order.get(id(ref), index)})
 
     return candidates, skipped
+
+
+def _declared_candidate_ids(candidates: List[Dict[str, Any]],
+                            expect_filenames: List[str]) -> set:
+    """Which candidates actually satisfy the declared manifest, matched entry by entry.
+
+    For each declared filename: every EXACT-name match counts (the model may write the same name
+    more than once, and all such copies were literally asked for). Only when an entry has NO
+    exact-name match does the EXTENSION fallback engage — and then it claims just ONE candidate,
+    the newest same-extension file not already claimed. That "one best" rule is the whole point:
+    a shared extension is a weak signal, so a swarm of `.pptx` drafts must not ALL count as the
+    one `deck.pptx` that was asked for (which would exempt them all from the superseded-draft
+    filter and publish every draft). Creation order is preserved by the caller within an
+    extension, so the last is the finished one.
+    """
+    declared: set = set()
+    lowered = [(c, c["filename"].lower()) for c in candidates]
+
+    # Pass 1 — exact names. An entry satisfied here never reaches the extension fallback.
+    exact_hit: set = set()
+    for fname in expect_filenames:
+        hits = [c for c, low in lowered if low == fname]
+        if hits:
+            exact_hit.add(fname)
+            declared.update(id(c) for c in hits)
+
+    # Pass 2 — extension fallback, one file per still-unsatisfied entry: the NEWEST same-ext
+    # candidate, resolved by LISTING order (`order`, stamped in _gather_candidates before the
+    # prioritized download reshuffles things). Falling back to the candidate's position keeps the
+    # direct-call/test path sensible when no listing order was stamped.
+    for fname in expect_filenames:
+        if fname in exact_hit or "." not in fname:
+            continue
+        ext = fname.rpartition(".")[2]
+        same_ext = [(i, c) for i, c in enumerate(candidates)
+                    if c["ext"] == ext and id(c) not in declared]
+        if same_ext:
+            _, chosen = max(same_ext, key=lambda ic: (ic[1].get("order", ic[0]), ic[0]))
+            declared.add(id(chosen))
+    return declared
 
 
 def _select_candidates(candidates: List[Dict[str, Any]], *, suppress_digests: set,
@@ -633,12 +769,17 @@ def _select_candidates(candidates: List[Dict[str, Any]], *, suppress_digests: se
     # asked for, so anything else in the container is working material. Matched on name, and on
     # extension too — the model does not always honour the filename it was given, and delivering
     # the right document under a slightly wrong name beats delivering nothing.
+    #
+    # A matched candidate is a DECLARED deliverable, and the heuristics below (superseded-draft
+    # pruning, document-image suppression) exist to guess a chat turn's intent — they must never
+    # fire on a file the caller explicitly asked for. A job declaring report.pdf AND
+    # social-card.png would otherwise lose the PNG the moment the PDF made it a "document turn".
+    declared_ids: set = set()
     if expect_filenames:
-        wanted_exts = {f.rpartition(".")[2] for f in expect_filenames if "." in f}
-        keep = [c for c in candidates
-                if c["filename"].lower() in expect_filenames or c["ext"] in wanted_exts]
+        declared_ids = _declared_candidate_ids(candidates, expect_filenames)
+        keep = [c for c in candidates if id(c) in declared_ids]
         if keep:
-            dropped = [c["filename"] for c in candidates if c not in keep]
+            dropped = [c["filename"] for c in candidates if id(c) not in declared_ids]
             if dropped:
                 # Never silently truncate — say what was held back and why.
                 logger.info(f"Artifacts held back (not a declared deliverable): {dropped}")
@@ -663,7 +804,8 @@ def _select_candidates(candidates: List[Dict[str, Any]], *, suppress_digests: se
     for candidate in candidates:
         if candidate["ext"] in _DOCUMENT_EXTS:
             by_ext.setdefault(candidate["ext"], []).append(candidate)
-    superseded = {id(c) for group in by_ext.values() if len(group) > 1 for c in group[:-1]}
+    superseded = {id(c) for group in by_ext.values() if len(group) > 1 for c in group[:-1]
+                  if id(c) not in declared_ids}
     if superseded:
         logger.info(
             "Artifacts held back (superseded drafts of the same document type): "
@@ -700,7 +842,7 @@ def _select_candidates(candidates: List[Dict[str, Any]], *, suppress_digests: se
                 f"Artifact suppressed (embedded in a document we're publishing): {filename}")
             continue
 
-        if publishing_document and ext in _IMAGE_EXTS:
+        if publishing_document and ext in _IMAGE_EXTS and id(candidate) not in declared_ids:
             logger.info(
                 f"Artifact suppressed (an ingredient of the document being published): {filename}")
             continue
@@ -806,7 +948,8 @@ async def _publish_locked(
     """The publication body — gather, select, upload. Runs under the publication latch."""
     candidates, skipped = await _gather_candidates(
         openai_client=openai_client, container_ids=container_ids,
-        container_manager=container_manager, ledger_key=ledger_key)
+        container_manager=container_manager, ledger_key=ledger_key,
+        expect_filenames=expect_filenames)
     if not candidates:
         return []
     accepted = _select_candidates(candidates, suppress_digests=suppress_digests,
@@ -855,14 +998,25 @@ async def stage_artifacts(
     ledger_key: str,
     suppress_digests: Optional[Iterable[str]] = None,
     expect_filenames: Optional[Iterable[str]] = None,
+    time_budget: Optional[float] = None,
 ) -> List[StagedArtifact]:
-    """Gather + select + hold in memory. Publishes NOTHING. Never raises."""
+    """Gather + select + hold in memory. Publishes NOTHING. Never raises.
+
+    ``time_budget`` (seconds) bounds the download loop from the inside: on expiry the files
+    staged SO FAR are returned, never discarded. This replaces an outer ``wait_for`` that
+    cancelled the whole coroutine and lost every file a slow container had already produced.
+    """
     lock = publication_lock(ledger_key)
     try:
         async with lock:
+            # Start the clock once we hold the latch — lock contention must not eat the budget
+            # the downloads need.
+            deadline = (time.monotonic() + time_budget) if time_budget else None
             candidates, skipped = await _gather_candidates(
                 openai_client=openai_client, container_ids=container_ids,
-                container_manager=container_manager, ledger_key=ledger_key)
+                container_manager=container_manager, ledger_key=ledger_key,
+                expect_filenames=[f.lower() for f in (expect_filenames or ())],
+                deadline=deadline)
             if skipped:
                 # Never silently truncate: the model is about to be shown a manifest, and a file
                 # missing from it is a file it cannot choose to publish.

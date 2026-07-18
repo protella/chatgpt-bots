@@ -26,7 +26,7 @@ import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import config
-from image_validation import API_IMAGE_MIMETYPES, sniff_image_mimetype
+from image_validation import API_IMAGE_MIMETYPES, validate_image_bytes
 from logger import setup_logger
 
 logger = setup_logger(name="slack_bot.GateVision")
@@ -72,11 +72,17 @@ def _sniff(raw: bytes) -> Optional[str]:
     """What arrived, or None if it isn't something this gate will show.
 
     Slack serves a LOGIN PAGE (HTML, HTTP 200) when auth is wrong, so "it downloaded fine"
-    proves nothing — the shared sniffer answers what the bytes ACTUALLY are. Re-checking the
-    answer against _SAFE_MIMETYPES is what keeps the gif exclusion honest: `eligible()` screened
-    on the DECLARED mimetype, so a gif labelled image/png reaches this point.
+    proves nothing — the validator answers what the bytes ACTUALLY are. Re-checking the answer
+    against _SAFE_MIMETYPES is what keeps the gif exclusion honest: `eligible()` screened on the
+    DECLARED mimetype, so a gif labelled image/png reaches this point.
+
+    A magic-byte sniff alone is NOT enough here: a valid signature followed by junk (a truncated
+    or otherwise corrupt upload) passes the sniff but then 400s the gate's own vision call, which
+    silently degrades to the text-only retry — a wasted model round. `validate_image_bytes`
+    PARSES the bytes with Pillow (verify + load), so structurally-broken data is turned away here
+    instead of by the API.
     """
-    mime = sniff_image_mimetype(raw)
+    mime, _ = validate_image_bytes(raw)
     return mime if mime in _SAFE_MIMETYPES else None
 
 

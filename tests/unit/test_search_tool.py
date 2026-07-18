@@ -117,6 +117,30 @@ async def test_scope_channel_filters_other_channels():
 
 
 @pytest.mark.asyncio
+async def test_scope_channel_constrains_query_at_api(monkeypatch):
+    """F22: channel scope must append `in:<#CHANNEL_ID>` so the API constrains at the
+    source, not just the post-filter (a workspace-wide top-N could miss the channel)."""
+    bot = _Bot()
+    bot.app.client.api_call = AsyncMock(return_value=_api_response([]))
+    await bot.execute_search_tool(_ctx(), {"query": "budget", "scope": "channel"})
+    sent = bot.app.client.api_call.call_args.kwargs["data"]["query"]
+    assert sent == "budget in:<#C04QDHE8W8M>"
+
+
+@pytest.mark.asyncio
+async def test_scope_workspace_query_unmodified():
+    """F22: workspace scope must NOT inject an in:<#...> operator."""
+    bot = _Bot()
+    bot.app.client.api_call = AsyncMock(return_value=_api_response([]))
+    await bot.execute_search_tool(_ctx(), {"query": "budget", "scope": "workspace"})
+    sent = bot.app.client.api_call.call_args.kwargs["data"]["query"]
+    assert sent == "budget"
+    # and the human-facing echo keeps the original query
+    out = await bot.execute_search_tool(_ctx(), {"query": "budget"})
+    assert out["query"] == "budget"
+
+
+@pytest.mark.asyncio
 async def test_missing_token_falls_back():
     bot = _Bot()
     bot.app.client.api_call = AsyncMock()

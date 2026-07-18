@@ -98,26 +98,35 @@ async def catalog_uploads(processor, thread_key: str, attachments: List[Dict[str
     if not processor.db or not attachments or not image_inputs:
         return
 
-    urls = [a.get("url") for a in attachments
-            if a.get("type") == "image" and a.get("url")]
-    if not urls:
-        return
+    # ONE description PER image, keyed by that image's own url. A single aggregate call over all
+    # uploads returned ONE blurb that was then saved as the analysis of EVERY image — so three
+    # uploaded screenshots became three IDENTICAL catalog entries, and a later "edit the second
+    # one" had nothing to disambiguate on (and could edit the wrong picture, the exact expensive,
+    # irreversible mistake this catalog exists to prevent). Describing each image on its own keeps
+    # edit-target resolution unambiguous.
+    #
+    # Each part carries its own Slack url (utilities._process_attachments stores it on the part),
+    # so we key off that rather than a separately-built url list — the two can drift when an image
+    # is skipped (oversized/undecodable) and is absent from image_inputs but present in the url
+    # list, which would misattribute descriptions.
+    from prompts import IMAGE_ANALYSIS_PROMPT
 
-    try:
-        from prompts import IMAGE_ANALYSIS_PROMPT
-        description = await processor.openai_client.analyze_images(
-            images=image_inputs[:len(urls)],
-            question=IMAGE_ANALYSIS_PROMPT,
-            enhance_prompt=False,
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"Upload cataloging failed for {thread_key}: {e}")
-        return
-
-    if not description:
-        return
-
-    for url in urls:
+    cataloged = 0
+    for part in image_inputs:
+        url = part.get("url") if isinstance(part, dict) else None
+        if not url:
+            continue
+        try:
+            description = await processor.openai_client.analyze_images(
+                images=[part],
+                question=IMAGE_ANALYSIS_PROMPT,
+                enhance_prompt=False,
+            )
+        except Exception as e:  # noqa: BLE001 — a failed description costs an entry, not the turn
+            logger.warning(f"Upload cataloging failed for {thread_key} ({url}): {e}")
+            continue
+        if not description:
+            continue
         try:
             await processor.db.save_image_metadata_async(
                 thread_id=thread_key,
@@ -128,9 +137,11 @@ async def catalog_uploads(processor, thread_key: str, attachments: List[Dict[str
                 metadata={"cataloged": True},
                 message_ts=message_ts,
             )
+            cataloged += 1
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Failed to persist catalog entry for {url}: {e}")
-    logger.info(f"Cataloged {len(urls)} uploaded image(s) for {thread_key}")
+    if cataloged:
+        logger.info(f"Cataloged {cataloged} uploaded image(s) for {thread_key}")
 
 
 def resolve(entries: Optional[List[Dict[str, Any]]], image_id: str) -> Optional[Dict[str, Any]]:

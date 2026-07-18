@@ -14,7 +14,7 @@ import pytz
 
 from base_client import BaseClient, Message
 from config import config, pipeline_status
-from image_validation import ensure_api_compatible
+from image_validation import ensure_api_compatible, TOO_LARGE_AFTER_CONVERSION
 from message_processor.message_timestamps import stamp_content
 from message_processor.people_tools import format_people_summary
 from prompts import (SLACK_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, LOCAL_TOOLS_GUIDANCE,
@@ -447,13 +447,33 @@ class MessageUtilitiesMixin:
                     file_id = attachment.get("id")
                     if file_id:
                         processed_file_ids.add(file_id)
-                    
+
+                    # F5: bound the download BEFORE it buffers. Slack always sends the declared
+                    # size (message_events.py), so an honestly-oversized image is turned away
+                    # without ever pulling it into memory; the same ceiling is passed as max_bytes
+                    # so a missing/dishonest size still can't buffer an unbounded body (the stream
+                    # aborts at the cap and returns None → the download_failed path below).
+                    image_cap = self.image_url_handler.max_image_size
+                    declared_size = attachment.get("size")
+                    if isinstance(declared_size, int) and declared_size > image_cap:
+                        self.log_warning(
+                            f"Rejecting oversized image attachment {file_name}: "
+                            f"{declared_size} bytes > {image_cap} cap")
+                        unsupported_files.append({
+                            "name": file_name,
+                            "type": "image",
+                            "mimetype": attachment.get("mimetype", "unknown"),
+                            "reason": TOO_LARGE_AFTER_CONVERSION,
+                        })
+                        continue
+
                     # Download the image
                     image_data = await client.download_file(
                         attachment.get("url"),
-                        file_id
+                        file_id,
+                        max_bytes=image_cap,
                     )
-                    
+
                     if image_data:
                         # The declared mimetype is not evidence — check the BYTES before they
                         # can ride the request. Nothing used to: Slack types any `image/*` as
@@ -474,6 +494,23 @@ class MessageUtilitiesMixin:
                                 "type": "image",
                                 "mimetype": attachment.get("mimetype", "unknown"),
                                 "reason": reason,
+                            })
+                            continue
+
+                        # F19: the pre-download cap bounded the SOURCE bytes, not the RESULT.
+                        # ensure_api_compatible may transcode a compressed source (BMP/TIFF/…)
+                        # into a much larger PNG, which would then be base64'd and sent unchecked.
+                        # Enforce the ceiling again on the bytes we actually send (parity with the
+                        # URL path at image_url_handler.py).
+                        if len(image_data) > image_cap:
+                            self.log_warning(
+                                f"Rejecting image attachment {file_name}: transcoded to "
+                                f"{len(image_data)} bytes (max {image_cap})")
+                            unsupported_files.append({
+                                "name": file_name,
+                                "type": "image",
+                                "mimetype": attachment.get("mimetype", "unknown"),
+                                "reason": TOO_LARGE_AFTER_CONVERSION,
                             })
                             continue
 
@@ -535,19 +572,42 @@ class MessageUtilitiesMixin:
                     file_id = attachment.get("id")
                     if file_id:
                         processed_file_ids.add(file_id)
-                    
+
+                    # F5: bound the download BEFORE it buffers, using the same ceiling the
+                    # post-download extractor enforces (DocumentHandler.max_document_size). A
+                    # doc whose declared size is already over that limit is turned away without
+                    # ever pulling it into memory; the cap is also passed as max_bytes so a
+                    # missing/dishonest size aborts the stream instead of buffering unbounded.
+                    doc_cap = self.document_handler.max_document_size
+                    declared_size = attachment.get("size")
+                    if isinstance(declared_size, int) and declared_size > doc_cap:
+                        self.log_warning(
+                            f"Rejecting oversized document {file_name}: "
+                            f"{declared_size} bytes > {doc_cap} cap")
+                        unsupported_files.append({
+                            "name": file_name,
+                            "type": "file",
+                            "mimetype": mimetype,
+                            "error": "download_failed",
+                            "too_large": True,
+                            "size_bytes": declared_size,
+                            "limit_bytes": doc_cap,
+                        })
+                        continue
+
                     # Update status to show we're processing the document
                     if thinking_id:
-                        self._update_status(client, message.channel_id, thinking_id, 
-                                          pipeline_status("processing_document", f"Processing {file_name}…", file_name=file_name), 
+                        self._update_status(client, message.channel_id, thinking_id,
+                                          pipeline_status("processing_document", f"Processing {file_name}…", file_name=file_name),
                                           emoji=config.analyze_emoji, thread_id=message.thread_id)
-                    
+
                     # Download the document
                     document_data = await client.download_file(
                         attachment.get("url"),
-                        file_id
+                        file_id,
+                        max_bytes=doc_cap,
                     )
-                    
+
                     if document_data:
                         # Update status to show we're extracting content
                         if thinking_id:
@@ -588,6 +648,19 @@ class MessageUtilitiesMixin:
                                 file_data_b64 = base64.b64encode(document_data).decode("ascii")
                             else:
                                 file_data_b64 = None
+                                # F17: the pre-extraction screen (maybe_native) is byte-only, so a
+                                # scanned PDF under the size cap but OVER native_file_max_pages was
+                                # extracted with ocr_images=False (betting on native delivery) and
+                                # then disqualified here by the page gate. It now has neither native
+                                # rendered pages NOR OCR page images, yet its content note promises
+                                # "provided as rendered pages" — a note with no content behind it.
+                                # Re-extract WITH rendering so the model gets real page images (and,
+                                # if rendering itself fails, an honest failure note instead).
+                                if maybe_native and extracted_content.get("is_image_based"):
+                                    extracted_content = await self.document_handler.safe_extract_content_async(
+                                        document_data, mimetype, file_name,
+                                        ocr_images=True
+                                    )
                                 # Legacy scanned-PDF OCR (flag-off / oversized PDFs
                                 # only) — isolated here; slated for retirement.
                                 image_count = self._apply_scanned_pdf_ocr(
@@ -717,10 +790,20 @@ class MessageUtilitiesMixin:
                     is_pdf = '.pdf' in url_lower
                     is_doc = any(ext in url_lower for ext in ['.docx', '.doc', '.xlsx', '.xls', '.csv', '.txt'])
                     is_image = any(ext in url_lower for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', 'image'])
-                    
+
+                    # F5: a Slack permalink pasted in text has no declared size to pre-check, so
+                    # the streamed max_bytes cap is the ONLY guard against buffering an unbounded
+                    # body. Pick the ceiling by the type the URL advertises — the same caps the
+                    # attachment branches use (documents 50MB, images 20MB). An abort returns None,
+                    # which the download-failed branch below already surfaces honestly.
+                    if (is_pdf or is_doc) and self.document_handler:
+                        url_cap = self.document_handler.max_document_size
+                    else:
+                        url_cap = self.image_url_handler.max_image_size
+
                     # Download the Slack file using the client's download_file method
                     self.log_info(f"Downloading Slack file from URL: {url}")
-                    file_data = await client.download_file(url)
+                    file_data = await client.download_file(url, max_bytes=url_cap)
                     
                     if file_data:
                         if is_pdf or is_doc:
@@ -792,10 +875,29 @@ class MessageUtilitiesMixin:
                                         else:
                                             extracted_content["warning"] = "This PDF appears to be a scanned document"
                                     
+                                    # F26: parity with the attachment path — a document
+                                    # shared by URL must get the SAME attach-time summary,
+                                    # document-ledger row, and extraction-cache warm. Without
+                                    # them the breadcrumb advertises read_document access the
+                                    # tool can't honor (no cached content, no ledger row), and
+                                    # the persisted summary that survives the turn is missing.
+                                    if thinking_id:
+                                        self._update_status(client, message.channel_id, thinking_id,
+                                                          pipeline_status("summarizing_document", f"Summarizing {file_name}…", file_name=file_name),
+                                                          emoji=config.analyze_emoji, thread_id=message.thread_id)
+                                    doc_summary = await self._summarize_document_for_attach(
+                                        extracted_content, file_name, mimetype)
+
+                                    # Warm the read_document extraction LRU (in-memory only)
+                                    if file_id:
+                                        from message_processor.document_tools import _extraction_cache
+                                        _extraction_cache.put(file_id, extracted_content["content"])
+
                                     document_inputs.append({
                                         "filename": file_name,
                                         "mimetype": mimetype,
                                         "content": extracted_content["content"],
+                                        "summary": doc_summary,
                                         "page_structure": extracted_content.get("page_structure"),
                                         "total_pages": extracted_content.get("total_pages"),
                                         "url": url,
@@ -806,6 +908,25 @@ class MessageUtilitiesMixin:
                                         "ocr_processed": extracted_content.get("ocr_processed", False),
                                         "warning": extracted_content.get("warning")
                                     })
+
+                                    # Store summary + metadata + Slack ref (never content)
+                                    thread_key = f"{message.channel_id}:{message.thread_id}"
+                                    document_ledger = self.thread_manager.get_or_create_document_ledger(message.thread_id)
+                                    document_ledger.add_document(
+                                        content=extracted_content["content"],  # transient; summary fallback only
+                                        filename=file_name,
+                                        mime_type=mimetype,
+                                        page_structure=extracted_content.get("page_structure"),
+                                        total_pages=extracted_content.get("total_pages"),
+                                        summary=doc_summary,
+                                        metadata=extracted_content.get("metadata", {}),
+                                        db=self.db,
+                                        thread_id=thread_key,
+                                        message_ts=message.metadata.get("ts") if message.metadata else None,
+                                        file_id=file_id,
+                                        url_private=url,
+                                        size_bytes=len(file_data),
+                                    )
                                     self.log_info(f"Successfully processed document from Slack URL: {file_name}")
                                 else:
                                     self.log_warning(f"Failed to extract content from Slack file URL: {url}")
@@ -837,6 +958,22 @@ class MessageUtilitiesMixin:
                                 })
                                 continue
 
+                            # F19: post-transcode ceiling (parity with the attachment/URL paths) —
+                            # a compressed source can decode+re-encode into a much larger PNG.
+                            image_cap = self.image_url_handler.max_image_size
+                            if len(file_data) > image_cap:
+                                self.log_warning(
+                                    f"Rejecting Slack-URL image {url}: transcoded to "
+                                    f"{len(file_data)} bytes (max {image_cap})")
+                                filename_match = re.search(r'/([^/?]+)(\?|$)', url)
+                                unsupported_files.append({
+                                    "name": filename_match.group(1) if filename_match else url,
+                                    "type": "image",
+                                    "mimetype": "unknown",
+                                    "reason": TOO_LARGE_AFTER_CONVERSION,
+                                })
+                                continue
+
                             base64_data = base64.b64encode(file_data).decode('utf-8')
 
                             image_inputs.append({
@@ -845,7 +982,25 @@ class MessageUtilitiesMixin:
                                 "source": "slack_url",
                                 "original_url": url
                             })
-                            
+
+                            # F18: persist URL-borne images the same way the attachment branch
+                            # does (metadata + URL only, NEVER base64 into the DB), so they enter
+                            # the edit_image catalog and survive a restart's history rebuild.
+                            if self.db:
+                                thread_key = f"{message.channel_id}:{message.thread_id}"
+                                try:
+                                    await self.db.save_image_metadata_async(
+                                        thread_id=thread_key,
+                                        url=url,
+                                        image_type="uploaded",
+                                        prompt=None,
+                                        analysis=None,
+                                        metadata={"file_id": file_id, "source": "slack_url"},
+                                        message_ts=message.metadata.get("ts") if message.metadata else None,
+                                    )
+                                except Exception as e:
+                                    self.log_warning(f"Failed to save Slack-URL image metadata: {e}")
+
                             image_count += 1
                             self.log_info(f"Added Slack file image {image_count}/{max_images}: {url}")
                         else:
@@ -890,7 +1045,25 @@ class MessageUtilitiesMixin:
                 
                 image_count += 1
                 self.log_info(f"Added image from URL {image_count}/{max_images}: {img_data['url']}")
-                
+
+                # F18: persist external URL-borne images (metadata + URL only, NEVER base64
+                # into the DB), so they enter the edit_image catalog and survive a restart's
+                # history rebuild — parity with the attachment/Slack-URL branches.
+                if self.db:
+                    thread_key = f"{message.channel_id}:{message.thread_id}"
+                    try:
+                        await self.db.save_image_metadata_async(
+                            thread_id=thread_key,
+                            url=img_data['url'],
+                            image_type="uploaded",
+                            prompt=None,
+                            analysis=None,
+                            metadata={"source": "url"},
+                            message_ts=message.metadata.get("ts") if message.metadata else None,
+                        )
+                    except Exception as e:
+                        self.log_warning(f"Failed to save URL image metadata: {e}")
+
                 # Store the image data for potential upload to Slack later
                 # This will be handled by the AssetLedger tracking
                 if hasattr(message, 'url_images'):
@@ -1871,21 +2044,6 @@ class MessageUtilitiesMixin:
         thread.stop_event = stop_event  # Attach stop event to thread for later access
         thread.start()
         return thread
-
-    def _is_error_or_busy_response(self, message_text: str) -> bool:
-        """Check if a message is an error or busy response using consistent markers"""
-        if not message_text:
-            return False
-            
-        # Use the consistent error emoji marker
-        if ":warning:" in message_text:
-            return True
-            
-        # Also check config in case emoji was customized
-        if config.error_emoji in message_text:
-            return True
-            
-        return False
 
     async def update_last_image_url(self, channel_id: str, thread_id: str, url: str):
         """Update the last assistant message with the image URL"""

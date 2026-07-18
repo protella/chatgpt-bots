@@ -10,6 +10,7 @@ from typing import Optional
 from logging.handlers import RotatingFileHandler, QueueHandler, QueueListener
 import queue
 import threading
+import warnings
 from typing import Dict
 try:
     from concurrent_log_handler import ConcurrentRotatingFileHandler
@@ -125,8 +126,12 @@ def setup_logger(
                     backupCount=5
                 )
             else:
-                # Fallback to regular RotatingFileHandler with warning
-                main_logger.warning("ConcurrentRotatingFileHandler not available, using standard RotatingFileHandler")
+                # Fallback to regular RotatingFileHandler with warning. Emitted via `warnings`
+                # (not main_logger, which is bound only after this function first returns, nor the
+                # local `logger`, which has no handlers attached yet) so this degrades gracefully
+                # even on the very first setup_logger call instead of raising NameError.
+                warnings.warn("ConcurrentRotatingFileHandler not available, using standard "
+                              "RotatingFileHandler", RuntimeWarning, stacklevel=2)
                 app_handler = RotatingFileHandler(
                     app_log_file,
                     maxBytes=10 * 1024 * 1024,  # 10MB

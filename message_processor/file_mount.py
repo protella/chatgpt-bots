@@ -154,6 +154,13 @@ async def execute_mount_file(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str
     if not container_id:
         return _err("sandbox_unavailable",
                     "There is no code sandbox to mount into on this turn.")
+    # F15: the sandbox idle-expired earlier this turn and was rebuilt as an ephemeral one the
+    # model now runs code in. `container_id` still names the corpse, so mounting into it would
+    # be invisible. Fail fast — a recycled sandbox is not a place to leave a file.
+    if ctx.container_recycled():
+        return _err("container_recycled",
+                    "The code sandbox was recycled mid-turn, so this file can't be mounted "
+                    "into it. Ask again and it will be set up fresh.")
 
     entry = thread_files.resolve(ctx.thread_files, file_id)
     if entry is None:
