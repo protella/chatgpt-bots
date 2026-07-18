@@ -227,6 +227,70 @@ async def test_edit_and_delete_mark_thread_needs_refresh():
     assert "C1:2.0" in refreshed
 
 
+@pytest.mark.asyncio
+async def test_tombstoned_root_takes_deletion_path_not_edit_path():
+    # Deleting a root that has (or had) replies does NOT arrive as message_deleted —
+    # Slack tombstones it via message_changed (nested subtype "tombstone", text
+    # "This message was deleted."). Treated as an edit, the tombstone text got re-fed
+    # into the pulse as content and the edit-triggered engine ran on it (live
+    # 2026-07-18: the model then "remembered" deleted threads as still visible). It
+    # must take the deletion path: purge + refresh, no re-feed, no offer, no edit engine.
+    from types import SimpleNamespace
+
+    from slack_client.event_handlers.message_events import SlackMessageEventsMixin
+
+    refreshed, removed, fed, offered, edit_dispatches = [], [], [], [], []
+    tm = SimpleNamespace(mark_needs_refresh=lambda k: refreshed.append(k))
+
+    class _DB:
+        async def delete_ambient_artifacts_by_source(self, c, t):
+            return 0
+
+    class _Pulse:
+        def remove_message(self, c, t):
+            removed.append((c, t))
+            return True
+
+    class _Svc:
+        def offer_event(self, ev, cl):
+            offered.append(ev)
+
+    class _Host(SlackMessageEventsMixin):
+        def __init__(self):
+            self.processor = SimpleNamespace(ambient_service=_Svc(), thread_manager=tm)
+            self.db = _DB()
+            self.channel_pulse = _Pulse()
+
+        def is_own_message(self, e):
+            return False
+
+        def log_debug(self, *a, **k):
+            pass
+
+        async def _feed_channel_pulse(self, e):
+            fed.append(e)
+
+        def _maybe_edit_triggered_reply(self, event, client):
+            edit_dispatches.append(event)
+
+    host = _Host()
+    # canonical shape: nested subtype "tombstone"
+    await host._ambient_ingest(
+        {"subtype": "message_changed", "channel": "C1",
+         "message": {"ts": "7.0", "subtype": "tombstone",
+                     "text": "This message was deleted."}}, object())
+    # text-only fallback shape (no nested subtype)
+    await host._ambient_ingest(
+        {"subtype": "message_changed", "channel": "C1",
+         "message": {"ts": "8.0", "thread_ts": "8.0",
+                     "text": "This message was deleted."}}, object())
+    assert removed == [("C1", "7.0"), ("C1", "8.0")]      # pulse entries purged
+    assert "C1:7.0" in refreshed and "C1:8.0" in refreshed  # warm threads rebuilt
+    assert fed == []                                        # tombstone never re-fed as content
+    assert offered == []                                    # never offered to ambient memory
+    assert edit_dispatches == []                            # edit engine never runs on it
+
+
 def test_summarize_attachments_kind_breakdown():
     # F14b: count + kind breakdown + filenames only (no content).
     assert _summarize_attachments(None) is None

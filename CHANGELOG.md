@@ -140,6 +140,31 @@ retention** — they're your rollback path, so nothing deletes them but you.
 > Re-clone, or `git fetch origin && git reset --hard origin/master`. Feature branches other than
 > `master` were retired.
 
+### 🤏 Changed - A quieter, better-mannered teammate
+
+- **It no longer 👍s everyday chatter.** Reactions are reserved for things aimed at the bot (a
+  "got it" on an instruction, a thanks that needs no words) or a genuine standout moment it's
+  part of — not agreement between humans, passing quips, or someone else's conversation. It had
+  been reacting almost as often as it replied; per-channel ground rules can still dial it up.
+- **A question handed to another assistant stays theirs.** In a thread that's been 1:1 with the
+  bot, once you turn to someone else by name ("claude, what about you?"), a bare follow-up
+  ("can you see it?") keeps pointing at whoever you addressed — the bot answers again only when
+  you name or @-mention it.
+
+### 📖 Fixed - Replies don't hide behind "Show more"
+
+- **Threaded replies longer than a couple of lines no longer collapse.** The "⚙️ model" footer
+  used to ride every reply inside a Slack section block, which the thread pane truncates behind
+  a "Show more" link after a few lines. The inline footer now rides only short replies; longer
+  ones post as plain text — which Slack never collapses — with the footer following separately.
+
+### 🪦 Fixed - Deleted threads are actually forgotten
+
+- **Deleting a thread's root message now clears it from the bot's channel awareness.** Slack
+  reports that deletion as an *edit* (a "tombstone"), which the bot treated as new content — it
+  kept "seeing" the deleted thread, confidently offered to reply in it, and spent classifier
+  calls judging tombstones. Tombstones now take the same purge path as ordinary deletions.
+
 ### 🧠 Feature - Ambient memory: it remembers what the channel shares
 
 #### Added

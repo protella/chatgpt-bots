@@ -53,16 +53,48 @@ async def test_single_message_attaches_blocks_and_returns_ts():
 
 @pytest.mark.asyncio
 async def test_too_long_for_section_does_not_attach_footer():
-    # A reply that doesn't fit one section block can't carry the footer as blocks — it
-    # posts as plain text and reports footer_attached False so the separate footer posts.
+    # A reply too long to carry the footer as an inline section posts as plain text and
+    # reports footer_attached False so the separate footer posts.
     b = _Bot()
     b.app.client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": "111.0"})
-    long_reply = "x" * 3200  # > section limit (2900), still <= MAX_MESSAGE_LENGTH (3900)
+    long_reply = "x" * 3200  # well past the inline cap, still <= MAX_MESSAGE_LENGTH (3900)
     meta = {}
     await b.send_message("C1", "T1", long_reply, blocks=[{"type": "actions"}], meta_out=meta)
     kwargs = b.app.client.chat_postMessage.await_args.kwargs
     assert "blocks" not in kwargs
     assert kwargs["text"] == long_reply
+    assert meta["footer_attached"] is False
+
+
+@pytest.mark.asyncio
+async def test_medium_reply_skips_inline_footer_to_avoid_show_more():
+    # A section block wrapping a medium-length reply collapses behind Slack's "Show more"
+    # in the thread pane. So a reply past the inline cap (but far under the 2900 section
+    # cap) must NOT ride the inline footer — it posts as plain text (never collapses) and
+    # takes the separate footer post.
+    b = _Bot()
+    b.app.client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": "111.0"})
+    medium = "word " * 60  # ~300 chars — fine for a section's hard cap, collapses in-thread
+    assert len(medium) > b._FOOTER_INLINE_MAX and len(medium) < b._SECTION_TEXT_LIMIT
+    meta = {}
+    await b.send_message("C1", "T1", medium, blocks=[{"type": "actions"}], meta_out=meta)
+    kwargs = b.app.client.chat_postMessage.await_args.kwargs
+    assert "blocks" not in kwargs            # plain text, no collapsible section
+    assert meta["footer_attached"] is False
+
+
+@pytest.mark.asyncio
+async def test_short_but_multiline_reply_skips_inline_footer():
+    # Height, not just length: a short reply with several hard line breaks (a little list)
+    # is tall enough to collapse, so it too falls back to plain text + separate footer.
+    b = _Bot()
+    b.app.client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": "111.0"})
+    listy = "one\ntwo\nthree\nfour\nfive"  # short, but > 2 newlines
+    assert len(listy) < b._FOOTER_INLINE_MAX
+    meta = {}
+    await b.send_message("C1", "T1", listy, blocks=[{"type": "actions"}], meta_out=meta)
+    kwargs = b.app.client.chat_postMessage.await_args.kwargs
+    assert "blocks" not in kwargs
     assert meta["footer_attached"] is False
 
 
