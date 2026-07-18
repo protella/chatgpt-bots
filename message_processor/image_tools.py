@@ -314,59 +314,84 @@ async def execute_generate_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
     thread_key = _thread_key(ctx)
     tm = processor.thread_manager
 
-    # Per-thread cap, checked under the turn's lock (this executor runs inside it).
+    settings, rejected, effective_cfg = _effective_config(ctx.thread_config, args.get("overrides"))
+
+    # RESERVE THE SLOT. The capacity read and this registration must run with NO await between
+    # them. This executor runs under the turn's thread lock, but that does NOT serialize it
+    # against its SIBLINGS: dispatch_all runs a round's tool calls concurrently (asyncio.gather),
+    # so two generate_image calls in one round interleave at every await. The 👀 claim and the
+    # checklist post (both awaits) used to sit between this check and the registration — both
+    # siblings would read the same sub-cap count, both pass, and both register, blowing past the
+    # per-thread cap. Mirrors start_background_job's slot reservation (release on failure below).
+    generation_id = uuid4().hex[:12]
     in_flight = len(tm.generations_in_flight(thread_key))
     if in_flight >= config.max_concurrent_image_generations:
         return _err(
             "at_capacity",
             f"{in_flight} image(s) are already generating in this thread — the limit is "
             f"{config.max_concurrent_image_generations}. Tell the user to wait for one to land.")
-
-    settings, rejected, effective_cfg = _effective_config(ctx.thread_config, args.get("overrides"))
-
-    # F38: arguments are valid and there is capacity — the image IS going to be made. Stake
-    # the 👀 now, after the rejections above, so a bad call or a full queue never flashes an
-    # eye it has to take back.
-    turn = getattr(ctx, "turn", None)
-    if turn is not None:
-        turn.mark_substantive_work()  # F46: real image generation ⇒ thread a top-level reply
-        await turn.claim_work(client, getattr(ctx, "message", None))
-
-    from message_processor.progress import ProgressChecklist
-    # prefer_message=True is NOT the config default, and is forced here on purpose: this job is
-    # DETACHED. Slack's assistant-status surface auto-clears the moment the turn's reply posts,
-    # which is roughly a minute before the image is actually ready — so a status-only checklist
-    # would vanish instantly and the whole generation would run with no indicator at all. A
-    # detached job needs a surface that outlives the turn that started it, exactly like deep
-    # research's status card. The synchronous tools below keep the ephemeral status, because
-    # for them the turn IS still open.
-    checklist = ProgressChecklist(
-        client, ctx.channel_id, ctx.thread_ts, prefer_message=True)
-    try:
-        # No "enhancing prompt" step: the enhancement still happens inside generate_image,
-        # it is simply not the user's business (it is our internal processing, like the
-        # tools we ran). One honest line about the thing they actually asked for.
-        await checklist.step(pipeline_status("generating_image", "Generating image…"),
-                             done_text="Generated image")
-    except Exception as e:  # noqa: BLE001 — a status hiccup must not block the generation
-        logger.debug(f"checklist start failed: {e}")
-
-    generation_id = uuid4().hex[:12]
     tm.register_generation(thread_key, generation_id, prompt[:200])
+
+    # T2-28: from here the slot is RESERVED, and every path out before the detached job takes
+    # ownership must release it — INCLUDING cancellation. A CancelledError is a BaseException, so
+    # the per-await `except Exception` guards below do NOT catch it; without this wrapper a cancel
+    # between the reservation and a successful schedule would leak the thread's generation slot
+    # until the watchdog. Once `scheduled` is True the detached job owns the slot and clears it
+    # itself (handlers/image_gen.py), so we must not release it here.
+    turn = getattr(ctx, "turn", None)
+    scheduled = False
     try:
-        task = processor._schedule_async_call(processor._finish_image_generation_background(
-            client=client, channel_id=ctx.channel_id, thread_id=ctx.thread_ts,
-            thread_key=thread_key, prompt=prompt, enhance=True,
-            conversation_history=None, thread_config=effective_cfg,
-            checklist=checklist, generating_id=None, generation_id=generation_id,
-            message_ts=ctx.trigger_ts, unprompted=False,
-        ))
-    except Exception as e:  # noqa: BLE001
-        logger.error(f"Failed to schedule background generation for {thread_key}: {e}",
-                     exc_info=True)
-        tm.finish_generation(thread_key, generation_id)
-        await processor._abort_checklist(checklist, client, ctx.channel_id, ctx.thread_ts)
-        return _err("schedule_failed", "The image generation could not be started.")
+        # F38: the slot is ours and the image WILL be made — stake the 👀 now, after the
+        # reservation and every rejection above, so a bad call or a full queue never flashes an
+        # eye it has to take back. Best-effort: losing the emoji must never fail a reserved
+        # generation.
+        if turn is not None:
+            turn.mark_substantive_work()  # F46: real image generation ⇒ thread a top-level reply
+            try:
+                await turn.claim_work(client, getattr(ctx, "message", None))
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"claim_work failed: {e}")
+
+        from message_processor.progress import ProgressChecklist
+        # prefer_message=True is NOT the config default, and is forced here on purpose: this job
+        # is DETACHED. Slack's assistant-status surface auto-clears the moment the turn's reply
+        # posts, which is roughly a minute before the image is actually ready — so a status-only
+        # checklist would vanish instantly and the whole generation would run with no indicator at
+        # all. A detached job needs a surface that outlives the turn that started it, exactly like
+        # deep research's status card. The synchronous tools below keep the ephemeral status,
+        # because for them the turn IS still open.
+        checklist = ProgressChecklist(
+            client, ctx.channel_id, ctx.thread_ts, prefer_message=True)
+        try:
+            # No "enhancing prompt" step: the enhancement still happens inside generate_image,
+            # it is simply not the user's business (it is our internal processing, like the
+            # tools we ran). One honest line about the thing they actually asked for.
+            await checklist.step(pipeline_status("generating_image", "Generating image…"),
+                                 done_text="Generated image")
+        except Exception as e:  # noqa: BLE001 — a status hiccup must not block the generation
+            logger.debug(f"checklist start failed: {e}")
+
+        try:
+            task = processor._schedule_async_call(processor._finish_image_generation_background(
+                client=client, channel_id=ctx.channel_id, thread_id=ctx.thread_ts,
+                thread_key=thread_key, prompt=prompt, enhance=True,
+                conversation_history=None, thread_config=effective_cfg,
+                checklist=checklist, generating_id=None, generation_id=generation_id,
+                message_ts=ctx.trigger_ts, unprompted=False,
+            ))
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to schedule background generation for {thread_key}: {e}",
+                         exc_info=True)
+            tm.finish_generation(thread_key, generation_id)
+            await processor._abort_checklist(checklist, client, ctx.channel_id, ctx.thread_ts)
+            return _err("schedule_failed", "The image generation could not be started.")
+        scheduled = True
+    except BaseException:
+        # Reserved but never handed off (a cancellation, or anything the guards above did not
+        # turn into a returned error): release the slot so the per-thread cap doesn't leak.
+        if not scheduled:
+            tm.finish_generation(thread_key, generation_id)
+        raise
 
     if task is not None:
         tm.attach_generation_task(thread_key, generation_id, task)
@@ -431,54 +456,91 @@ async def execute_create_image_asset(ctx, args: Dict[str, Any]) -> Dict[str, Any
             "There is no code sandbox for this thread right now, so an image cannot be "
             "placed in it. Use generate_image to post an image to the thread instead.")
 
-    assets = ctx.sandbox_image_assets if ctx.sandbox_image_assets is not None else []
+    # F15: `container_id` above may point at a corpse — a persistent container can idle-expire
+    # between rounds, and the API call that noticed retries against a fresh ephemeral sandbox and
+    # records the dead id. Pushing bytes into the dead one is a dead drop the model cannot read
+    # back, so fail fast rather than mount into a container it can no longer see.
+    if ctx.container_recycled():
+        return _err(
+            "container_recycled",
+            "The code sandbox was recycled mid-turn, so an image can't be placed in "
+            "it. Use generate_image to post an image to the thread instead.")
+
+    # Reserve the asset slot SYNCHRONOUSLY, before any await. dispatch_all runs a round's tool
+    # calls concurrently (asyncio.gather), so two sibling create_image_asset calls interleave at
+    # the generation await below — a plain check-then-append would let both read a sub-cap length
+    # and both append, exceeding _MAX_ASSETS_PER_TURN. The placeholder holds the slot across the
+    # awaits (in-flight reservations count against the cap) and is filled on success / removed on
+    # failure. image_data=None, so the no-output rescue in main.py skips an unfilled reservation.
+    if ctx.sandbox_image_assets is None:
+        ctx.sandbox_image_assets = []
+    assets = ctx.sandbox_image_assets
     if len(assets) >= _MAX_ASSETS_PER_TURN:
         return _err("at_capacity",
                     f"Already created {len(assets)} sandbox images this turn (limit "
                     f"{_MAX_ASSETS_PER_TURN}). Work with the ones you have.")
+    reservation: Dict[str, Any] = {"_reservation_id": uuid4().hex, "image_data": None}
+    assets.append(reservation)
 
     settings, rejected, _ = _effective_config(ctx.thread_config, args.get("overrides"))
     filename = _safe_filename(args.get("filename") or "image", settings["format"])
 
-    # F38: validated and under the per-turn cap — an image model is about to run. Claim.
-    turn = getattr(ctx, "turn", None)
-    if turn is not None:
-        await turn.claim_work(getattr(ctx, "client", None), getattr(ctx, "message", None))
-
+    # T2-28: the slot is reserved; the `finally` below releases it on EVERY non-success exit —
+    # a returned error (generation/mount failure) AND a cancellation. A CancelledError is a
+    # BaseException the `except Exception` guards can't catch, so without the finally a cancel
+    # after the reservation would leak the placeholder (and the per-turn cap) for good.
+    committed = False
     try:
-        async with _semaphore():
-            image_data = await processor.openai_client.generate_image(
-                prompt=prompt,
-                model=settings["model"],
-                size=settings["size"],
-                quality=settings["quality"],
-                background=settings["background"],
-                format=settings["format"],
-                compression=settings["compression"],
-                enhance_prompt=True,
-                conversation_history=None,
-            )
-    except Exception as e:  # noqa: BLE001 — a tool must never raise into the loop
-        if _moderation_blocked(e):
-            return _err("moderation_blocked", _MODERATION_MESSAGE)
-        logger.error(f"create_image_asset generation failed: {e}", exc_info=True)
-        return _err("generation_failed", "The image could not be generated.")
+        # F38: validated and slot reserved — an image model is about to run. Claim. Best-effort:
+        # losing the 👀 must never fail a reserved asset.
+        turn = getattr(ctx, "turn", None)
+        if turn is not None:
+            try:
+                await turn.claim_work(getattr(ctx, "client", None), getattr(ctx, "message", None))
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"claim_work failed: {e}")
 
-    path = await mount_image_in_container(
-        processor.openai_client, container_id, filename, image_data)
-    if not path:
-        return _err("mount_failed",
-                    "The image was generated but could not be placed in the sandbox.")
+        try:
+            async with _semaphore():
+                image_data = await processor.openai_client.generate_image(
+                    prompt=prompt,
+                    model=settings["model"],
+                    size=settings["size"],
+                    quality=settings["quality"],
+                    background=settings["background"],
+                    format=settings["format"],
+                    compression=settings["compression"],
+                    enhance_prompt=True,
+                    conversation_history=None,
+                )
+        except Exception as e:  # noqa: BLE001 — a tool must never raise into the loop
+            if _moderation_blocked(e):
+                return _err("moderation_blocked", _MODERATION_MESSAGE)
+            logger.error(f"create_image_asset generation failed: {e}", exc_info=True)
+            return _err("generation_failed", "The image could not be generated.")
 
-    if ctx.sandbox_image_assets is None:
-        ctx.sandbox_image_assets = []
-    ctx.sandbox_image_assets.append({
-        "path": path,
-        "filename": filename,
-        "prompt": prompt,
-        "enhanced_prompt": getattr(image_data, "prompt", "") or prompt,
-        "image_data": image_data,
-    })
+        path = await mount_image_in_container(
+            processor.openai_client, container_id, filename, image_data)
+        if not path:
+            return _err("mount_failed",
+                        "The image was generated but could not be placed in the sandbox.")
+
+        # Fill the reservation IN PLACE, keeping its slot in the list (a fresh append could race a
+        # sibling's reservation ordering; mutating the placeholder cannot).
+        reservation.update({
+            "path": path,
+            "filename": filename,
+            "prompt": prompt,
+            "enhanced_prompt": getattr(image_data, "prompt", "") or prompt,
+            "image_data": image_data,
+        })
+        committed = True
+    finally:
+        if not committed:
+            try:
+                assets.remove(reservation)   # release on an error return OR a cancellation
+            except ValueError:
+                pass
 
     logger.info(f"Mounted generated image at {path} in {container_id}")
     result = {
@@ -692,13 +754,18 @@ async def _download_edit_source(client, url: str) -> Tuple[Optional[str], Option
 # --- registration ------------------------------------------------------------------------
 
 def _tools_enabled(cfg: dict) -> bool:
-    return True
+    # F8: ENABLE_IMAGE_TOOLS is the rollback switch. The old classifier fallback is gone, so the
+    # flag's meaning is simply "image tools on/off entirely" — off removes generate_image /
+    # edit_image (and, via _asset_tool_enabled below, create_image_asset).
+    return bool(config.enable_image_tools)
 
 
 def _asset_tool_enabled(cfg: dict) -> bool:
-    """Only offered when the sandbox exists AND has an addressable container. Under
-    ``{"type": "auto"}`` the id is unknown until after the call, so there is nothing to push
-    bytes into — offering the tool would guarantee a failed call."""
+    """Only offered when image tools are enabled AND the sandbox exists with an addressable
+    container. Under ``{"type": "auto"}`` the id is unknown until after the call, so there is
+    nothing to push bytes into — offering the tool would guarantee a failed call."""
+    if not _tools_enabled(cfg):
+        return False
     if not config.enable_code_interpreter:
         return False
     return isinstance(cfg.get(CI_CONTAINER_KEY), str) and bool(cfg.get(CI_CONTAINER_KEY))

@@ -537,8 +537,24 @@ class ThreadManagementMixin:
             refs.setdefault((r.get("kind"), r.get("value")), r)
         refs_list = sorted(refs.values(), key=lambda r: (r.get("kind") or "", r.get("value") or ""))
 
+        # F3: preserved messages (images/summarized docs) still in live state whose ts sits
+        # AT/BEHIND the new boundary are neither summarized nor in the fetched tail — a cold
+        # rebuild fetches oldest=boundary and skips <=boundary, so they'd silently vanish.
+        # Record their ts (merged with prior, since the boundary only advances) so rebuild can
+        # fetch + re-admit them across the boundary. ts refs only, never transcript content.
+        preserved_ts = self._collect_preserved_ts_behind_boundary(thread_state, boundary_ts)
+        prior_preserved = {str(t) for t in ((prior or {}).get("preserved_ts") or [])}
+
+        def _ts_sort(t):
+            try:
+                return float(t)
+            except (TypeError, ValueError):
+                return float("inf")
+        preserved_list = sorted(preserved_ts | prior_preserved, key=_ts_sort)
+
         try:
-            await self.db.save_thread_summary_async(thread_key, summary_text, str(boundary_ts), refs_list)
+            await self.db.save_thread_summary_async(thread_key, summary_text, str(boundary_ts),
+                                                    refs_list, preserved_list)
         except Exception as e:
             self.log_error(f"Failed to persist thread summary for {thread_key}: {e}")
             return
@@ -708,6 +724,47 @@ class ThreadManagementMixin:
                                       ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg')) else "link"
                 refs.append({"kind": kind, "value": url, "name": None})
         return refs
+
+    def _collect_preserved_ts_behind_boundary(self, thread_state, boundary_ts) -> set:
+        """F3: ts of preserved messages (images/summarized docs) in live state sitting
+        AT/BEHIND boundary_ts. These stay in context but are neither summarized nor in the
+        rebuilt tail, so their ts must be recorded to survive a cold rebuild. Synthetic heads
+        (summary head, developer/system) carry no ts and are naturally excluded."""
+        try:
+            boundary_f = float(boundary_ts)
+        except (TypeError, ValueError):
+            return set()
+        out = set()
+        for m in getattr(thread_state, "messages", None) or []:
+            if not self._should_preserve_message(m):
+                continue
+            ts = (m.get("metadata") or {}).get("ts")
+            if not ts:
+                continue
+            try:
+                if float(ts) <= boundary_f:
+                    out.add(str(ts))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _hist_msg_is_preserved_type(self, hist_msg) -> bool:
+        """Classify a RAW history message as a preserved type (image- or document-bearing)
+        from its attachments — the rebuild-time analogue of _should_preserve_message, which
+        runs on already-converted state dicts. Used to fail safe on legacy summary rows
+        (preserved_ts unknown/NULL) where no recorded ts list can be trusted. Covers uploaded
+        AND bot-generated images; document detection needs the handler (absent in some tests,
+        where images still classify)."""
+        for att in (getattr(hist_msg, "attachments", None) or []):
+            att_type = att.get("type")
+            mimetype = att.get("mimetype", "") or ""
+            if att_type == "image" or mimetype.startswith("image/"):
+                return True
+            filename = att.get("name", "") or ""
+            if (att_type == "file" and self.document_handler
+                    and self.document_handler.is_document_file(filename, mimetype)):
+                return True
+        return False
 
     @staticmethod
     def _content_to_text(content) -> str:
@@ -948,11 +1005,23 @@ class ThreadManagementMixin:
                     self.log_warning(f"Could not load thread summary for rebuild: {e}")
 
             summary_boundary = None
+            # F3: preserved messages (images/summarized docs) recorded at/behind the boundary.
+            # They must cross the boundary intact on rebuild; the skip filter exempts these ts.
+            # preserved_ts is None on LEGACY rows (written before the column existed) — we can't
+            # trust a recorded list, so those rebuilds fail safe: full-fetch and re-admit every
+            # behind-boundary message of a PRESERVED TYPE (image/doc-bearing), then backfill the
+            # row so the cost is one-time. An explicit [] means verified-empty (fast tail path).
+            preserved_behind_boundary = set()
+            preserved_ts_unknown = False
+            backfilled_preserved_ts: set = set()  # ts re-admitted on a legacy (unknown) rebuild
             if summary_row:
                 try:
                     summary_boundary = float(summary_row["boundary_ts"])
                 except (TypeError, ValueError):
                     summary_boundary = None
+                _preserved_raw = summary_row.get("preserved_ts")
+                preserved_ts_unknown = _preserved_raw is None
+                preserved_behind_boundary = {str(t) for t in (_preserved_raw or [])}
                 # F51c: fold any late-artifact addenda onto the head. These are for messages
                 # BEHIND the boundary (source_ts <= boundary), so they never collide with the
                 # tail's normal ambient batch-load.
@@ -967,10 +1036,19 @@ class ThreadManagementMixin:
             # boundary — Slack's default inclusive=false); the Python <= filter below
             # stays as belt-and-suspenders for the seam. A HistoryFetchError propagates
             # up so the turn fails loudly instead of answering with amnesia (R1).
+            # F3: when preserved messages (images/summarized docs) sit AT/BEHIND the
+            # boundary — or the row is legacy (unknown) so we can't rule that out — `oldest`
+            # (exclusive-after) can't reach them, so fetch the full thread; the skip filter
+            # below drops the summarized span and re-admits the preserved messages. Only a
+            # KNOWN, verified-empty list keeps the cheap tail-only fetch.
+            fetch_oldest = None
+            if (summary_boundary is not None and not preserved_ts_unknown
+                    and not preserved_behind_boundary):
+                fetch_oldest = summary_row["boundary_ts"]
             history = await client.get_thread_history(
                 message.channel_id,
                 message.thread_id,
-                oldest=(summary_row["boundary_ts"] if summary_boundary is not None else None)
+                oldest=fetch_oldest
             )
 
             # Merge split bot replies ("Continued..." parts) back into single turns and
@@ -1016,10 +1094,6 @@ class ThreadManagementMixin:
                 except Exception as e:
                     self.log_debug(f"root author capture failed: {e}")
 
-            # Track pending image URLs for vision analysis association
-            pending_image_urls = []
-            pending_image_metadata = {}  # Store additional metadata per URL
-
             # F7: batch-fetch this thread's tool-use provenance once, keyed by reply ts, to
             # reinject "[used tools: …]" onto matching assistant turns during the loop below.
             # Messages at/behind the summary boundary are already skipped, so nothing behind
@@ -1039,11 +1113,21 @@ class ThreadManagementMixin:
 
                 # Skip messages already covered by the stored summary head (<= boundary).
                 # Anything after the boundary composes the fresh tail — never duplicated.
+                # F3 exception: a preserved message (image/summarized doc) at/behind the boundary
+                # is NOT in the summary — re-admit it so its asset survives. Which ones to keep:
+                #  - known list: exactly the recorded ts;
+                #  - legacy (unknown): any behind-boundary message of a preserved TYPE, and record
+                #    its ts so the row can be backfilled after this rebuild.
                 if summary_boundary is not None:
                     hist_ts = hist_msg.metadata.get("ts")
                     try:
                         if hist_ts is not None and float(hist_ts) <= summary_boundary:
-                            continue
+                            if preserved_ts_unknown:
+                                if not self._hist_msg_is_preserved_type(hist_msg):
+                                    continue
+                                backfilled_preserved_ts.add(str(hist_ts))
+                            elif str(hist_ts) not in preserved_behind_boundary:
+                                continue
                     except (TypeError, ValueError):
                         pass
                     
@@ -1183,15 +1267,7 @@ class ThreadManagementMixin:
                                 # Mark user messages with uploaded images
                                 message_metadata["type"] = "image_upload"
                                 message_metadata["url"] = att_url
-                                
-                                # Add to pending for vision analysis association
-                                pending_image_urls.append(att_url)
-                                pending_image_metadata[att_url] = {
-                                    "file_id": attachment.get("id"),
-                                    "message_ts": hist_msg.metadata.get("ts") if hist_msg.metadata else None,
-                                    "user_text": hist_msg.text
-                                }
-                                
+
                                 if self.db:
                                     try:
                                         await self.db.save_image_metadata_async(
@@ -1220,7 +1296,14 @@ class ThreadManagementMixin:
                                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                                     doc_row = None
                                     try:
-                                        doc_row = await self.db.get_document_by_filename_async(thread_key, filename)
+                                        # F12: disambiguate same-named uploads by Slack file_id
+                                        # (exact) or nearest upload at/before this message's ts —
+                                        # newest-wins-by-filename gave both the wrong summary/file_id.
+                                        doc_row = await self.db.get_document_for_rebuild_async(
+                                            thread_key, filename,
+                                            file_id=attachment.get("id"),
+                                            message_ts=hist_msg.metadata.get("ts") if hist_msg.metadata else None,
+                                        )
                                     except Exception as row_err:
                                         self.log_debug(f"Doc row lookup failed for {filename}: {row_err}")
 
@@ -1306,57 +1389,45 @@ class ThreadManagementMixin:
                                     self.log_error(f"Error processing document during rebuild: {e}")
                                     # Continue without the document content
                 
-                # Check if this is an assistant message that might be a vision analysis
-                if is_bot and pending_image_urls:
-                    self.log_debug(f"Assistant message with {len(pending_image_urls)} pending images")
-                    self.log_debug(f"Content preview: {content[:100]}...")
-                    
-                    # Check if this is an error/busy response
-                    if self._is_error_or_busy_response(content):
-                        # Error response - clear pending as analysis failed
-                        self.log_debug(f"Found error/busy response, clearing {len(pending_image_urls)} pending images")
-                        pending_image_urls.clear()
-                        pending_image_metadata.clear()
-                    else:
-                        # This is likely the vision analysis for the pending images
-                        self.log_info(f"Found vision analysis for {len(pending_image_urls)} images")
-                        self.log_debug(f"Pending URLs: {pending_image_urls}")
-                        
-                        # Store the analysis for all pending images
-                        if self.db:
-                            for image_url in pending_image_urls:
-                                try:
-                                    # Update the existing image metadata with the analysis
-                                    self.log_debug(f"Storing analysis for: {image_url}")
-                                    await self.db.save_image_metadata_async(
-                                        thread_id=f"{thread_state.channel_id}:{thread_state.thread_ts}",
-                                        url=image_url,
-                                        image_type="uploaded",
-                                        prompt=pending_image_metadata.get(image_url, {}).get("user_text"),
-                                        analysis=content,  # Store the full bot response as analysis
-                                        metadata={
-                                            "file_id": pending_image_metadata.get(image_url, {}).get("file_id"),
-                                            "has_analysis": True
-                                        },
-                                        message_ts=pending_image_metadata.get(image_url, {}).get("message_ts")
-                                    )
-                                    self.log_info(f"Successfully stored vision analysis for image: {image_url[:60]}...")
-                                except Exception as e:
-                                    self.log_error(f"Failed to store vision analysis: {e}", exc_info=True)
-                        else:
-                            self.log_warning("No database available to store vision analysis")
-                        
-                        # Clear pending images after storing
-                        pending_image_urls.clear()
-                        pending_image_metadata.clear()
-                
+                # F37: an uploaded image's vision analysis is persisted live by the addressed
+                # vision path (image_catalog) and the ambient vision worker — those rows survive
+                # a restart. Rebuild must NOT treat the next bot reply as that analysis: an
+                # ordinary conversational reply is not a description of the image, and writing it
+                # into an EMPTY images.analysis row makes ambient memory serve it as "[Visual
+                # context]". So we no longer reconstruct analyses from replies here.
+
                 thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                 message_ts = hist_msg.metadata.get("ts") if hist_msg.metadata else None
                 # During rebuild, skip auto-trim to allow smart trimming with document summarization later
                 self._add_message_with_token_management(thread_state, role, content, db=self.db, thread_key=thread_key, message_ts=message_ts, metadata=message_metadata, skip_auto_trim=True)
             
             self.log_info(f"Rebuilt thread with {len(thread_state.messages)} messages")
-        
+
+            # F3: a legacy (unknown) row just did the fail-safe full rebuild — backfill the
+            # verified preserved-ts list (possibly []) so the next rebuild takes the fast
+            # tail-only path. Preserve the existing summary/boundary/refs; write refs back so
+            # the row's structured refs aren't wiped. One-time cost.
+            if preserved_ts_unknown and summary_row and self.db:
+                try:
+                    def _ts_sort(t):
+                        try:
+                            return float(t)
+                        except (TypeError, ValueError):
+                            return float("inf")
+                    await self.db.save_thread_summary_async(
+                        thread_key,
+                        summary_row["summary_text"],
+                        str(summary_row["boundary_ts"]),
+                        summary_row.get("refs"),
+                        sorted(backfilled_preserved_ts, key=_ts_sort),
+                    )
+                    self.log_info(
+                        f"F3: backfilled preserved_ts for legacy summary row {thread_key} "
+                        f"({len(backfilled_preserved_ts)} preserved message(s) behind boundary)"
+                    )
+                except Exception as e:
+                    self.log_warning(f"F3 preserved_ts backfill failed for {thread_key}: {e}")
+
         # Pre-flight compaction decision after rebuild. Cold rebuild has no usage
         # number yet — the whole assembled context is ESTIMATED at chars/4 (crude is
         # fine under TOKEN_BUFFER_PERCENTAGE headroom; the context_length_exceeded

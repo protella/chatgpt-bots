@@ -21,9 +21,24 @@ from config import config
 from message_processor import gate_vision
 from message_processor.participation import ParticipationEngine
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
-JPEG = b"\xff\xd8\xff" + b"\x00" * 64
+def _real_image(fmt: str) -> bytes:
+    from io import BytesIO
+
+    from PIL import Image
+    buf = BytesIO()
+    Image.new("RGB", (4, 4), "red").save(buf, format=fmt)
+    return buf.getvalue()
+
+
+# Genuinely-decodable images: F38's validator PARSES the bytes with Pillow, so the gate's "good"
+# fixtures must be real pictures, not a signature-plus-junk stub.
+PNG = _real_image("PNG")
+JPEG = _real_image("JPEG")
 HTML = b"<!DOCTYPE html><html><body>Sign in to Slack"
+# A valid PNG signature followed by junk: it SNIFFS as a PNG but does not decode. Before F38 this
+# reached the gate's own vision call and 400'd it (a wasted round that degrades to a blind text
+# retry); now it is turned away here.
+CORRUPT_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
 
 
 def _img(name="meme.png", mime="image/png", size=1234, url="https://files.slack.com/x"):
@@ -79,6 +94,17 @@ async def test_a_slack_login_page_is_not_mistaken_for_an_image():
     """Slack serves an HTML login page with HTTP 200 when auth is wrong, so "it downloaded fine"
     proves nothing. Sniff the bytes; never hand the model a web page dressed as a PNG."""
     parts, status, _shown = await gate_vision.load_for_gate(_client(HTML), [_img()])
+    assert parts == []
+    assert status == gate_vision.UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_structurally_corrupt_image_is_turned_away_not_sent_to_the_model():
+    """F38: magic bytes are not proof. A valid PNG signature followed by junk sniffs as a PNG but
+    does not decode, so it 400s the gate's vision call — a wasted round that then degrades to a
+    blind text-only retry. The Pillow-parsing validator rejects it here, so the gate degrades to
+    UNAVAILABLE up front and the model is honestly told it couldn't see the image."""
+    parts, status, _shown = await gate_vision.load_for_gate(_client(CORRUPT_PNG), [_img()])
     assert parts == []
     assert status == gate_vision.UNAVAILABLE
 

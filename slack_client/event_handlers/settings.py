@@ -131,9 +131,8 @@ class SlackSettingsHandlersMixin:
         option = {
             "text": {"type": "plain_text", "text": "Capture ambient context"},
             "description": {"type": "plain_text",
-                            "text": ("Quietly keep notes on links, images, and files shared here "
-                                     "so I have context later. Off = stop capturing new items; "
-                                     "existing notes age out automatically.")},
+                            "text": ("Quietly note links, images, and files shared here for later "
+                                     "context. Off = stop; old notes age out.")},
             "value": "on",
         }
         element = {"type": "checkboxes", "action_id": "ambient_memory", "options": [option]}

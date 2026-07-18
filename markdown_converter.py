@@ -322,16 +322,46 @@ class MarkdownConverter(LoggerMixin):
         text = re.sub(r'~~(.+?)~~', r'~\1~', text)
         return text
     
+    # Sentence punctuation a greedy URL match sweeps up from the end of a bare URL.
+    _URL_TRAILING_PUNCT = '.,;:!?'
+
+    def _trim_url_tail(self, url: str) -> str:
+        """Trim trailing sentence punctuation and unbalanced ')' from a bare URL.
+
+        A greedy match grabs the period ending a sentence (``…/page.``) or the ')'
+        closing a parenthetical the URL sits inside (``(see …/page)``). Strip those,
+        but KEEP a ')' that balances a '(' in the URL itself — Wikipedia's
+        ``/wiki/Foo_(bar)`` is a real link and must survive intact.
+        """
+        while url:
+            last = url[-1]
+            if last in self._URL_TRAILING_PUNCT:
+                url = url[:-1]
+            elif last == ')' and url.count(')') > url.count('('):
+                url = url[:-1]
+            else:
+                break
+        return url
+
     def _convert_links_slack(self, text: str) -> str:
         """Convert Markdown links to Slack links"""
-        # [text](url) to <url|text>
-        text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<\2|\1>', text)
-        
-        # Bare URLs should be wrapped in <>
-        # Match URLs that aren't already in Slack format
+        # [text](url) to <url|text>. The URL may itself contain balanced parens
+        # (Wikipedia's /wiki/Foo_(bar)), so match a balanced-paren group rather than
+        # stopping at the first ')'. `\([^()]*\)` allows one level of nesting.
+        text = re.sub(
+            r'\[([^\]]+)\]\(((?:[^()]|\([^()]*\))+)\)', r'<\2|\1>', text)
+
+        # Bare URLs should be wrapped in <>. Match URLs not already in Slack format,
+        # then trim any sentence punctuation / unbalanced ')' the greedy match swept
+        # up so the wrapped link stays clickable and the trailing char rides outside.
+        def wrap_bare_url(match: "re.Match") -> str:
+            url = match.group(1)
+            trimmed = self._trim_url_tail(url)
+            return f"<{trimmed}>{url[len(trimmed):]}"
+
         url_pattern = r'(?<!<)(https?://[^\s<>]+)(?!>)'
-        text = re.sub(url_pattern, r'<\1>', text)
-        
+        text = re.sub(url_pattern, wrap_bare_url, text)
+
         return text
     
     def _convert_lists_slack(self, text: str) -> str:

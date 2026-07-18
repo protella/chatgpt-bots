@@ -483,10 +483,15 @@ class TestSanitizeFilename:
 
     @pytest.mark.parametrize("name", [
         "evil.exe", "run.sh", "lib.so", "macro.xlsm", "doc.docm",
-        "page.html", "vector.svg", "archive.zip",
+        "page.html", "vector.svg",
     ])
     def test_disallowed_extensions_refused(self, name):
         assert sanitize_filename(name) is None
+
+    def test_zip_is_allowed(self):
+        # F25: an "archive" deliverable is advertised, so .zip must be publishable — the size
+        # caps, not the extension allowlist, are what bound it.
+        assert sanitize_filename("archive.zip") == "archive.zip"
 
     def test_extensionless_and_dotfiles_refused(self):
         assert sanitize_filename("README") is None

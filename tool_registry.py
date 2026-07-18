@@ -50,6 +50,15 @@ class ToolContext:
     # invented image id is rejected rather than silently editing the wrong picture.
     thread_config: Optional[Dict[str, Any]] = None
     container_id: Optional[str] = None
+    # F15: the SAME list the API layer records dead container ids into (container_gone_sink).
+    # A persistent container confirmed alive at turn start can idle-expire between tool rounds;
+    # when it does, `_create_with_container_recovery` retries that one API call against a fresh
+    # ephemeral sandbox and appends the dead id here. `container_id` above still points at the
+    # corpse, so a within-round mount_file / create_image_asset would push bytes into a
+    # container the model can no longer see. Executors call `container_recycled()` and fail
+    # fast instead. Shared by reference, so the append the API makes is visible here with no
+    # extra plumbing between rounds.
+    container_gone_sink: Optional[List[str]] = None
     image_catalog: Optional[List[Dict[str, Any]]] = None
     # Set True by a detached image generation, so the finalizer can drop the model's ack
     # reply the same way deep research does — the posted image IS the acknowledgment.
@@ -84,6 +93,15 @@ class ToolContext:
     # even though its Response carries no text.
     turn: Any = None
     message: Any = None
+
+    def container_recycled(self) -> bool:
+        """F15: True when this turn's `container_id` died mid-turn and was recorded dead.
+
+        A tool that pushes bytes into the persistent sandbox (mount_file, create_image_asset)
+        checks this before uploading — a recycled container is a dead drop the model cannot
+        read back, so failing fast is honest where a silent write is not."""
+        cid = self.container_id
+        return bool(cid and self.container_gone_sink and cid in self.container_gone_sink)
 
 
 Executor = Callable[[ToolContext, Dict[str, Any]], Awaitable[Dict[str, Any]]]

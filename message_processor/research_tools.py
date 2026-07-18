@@ -575,6 +575,42 @@ def _deliverables_gist(deliverables: List[Dict[str, str]]) -> str:
     return f"{len(names)} files"
 
 
+def _undelivered_deliverables(deliverables: List[Dict[str, str]],
+                              published: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Which DECLARED deliverables never reached the thread. A declared file is covered when a
+    published upload carries its exact name or, failing that, its extension — the same forgiving
+    match the manifest keep uses, because the model does not always honour the filename it was
+    handed. Each published upload is consumed ONCE, so a single shipped PDF can't mark two
+    declared PDFs delivered. A green card must never hide a file the user asked for and did not
+    get."""
+    remaining = list(published)
+
+    # Pass 1 — exact names claim their file first, so an extension match for one deliverable
+    # can't swallow the upload another deliverable needs by name.
+    unmatched: List[Dict[str, str]] = []
+    for d in deliverables:
+        name = (d.get("filename") or "").lower()
+        match = next((p for p in remaining
+                      if name and (p.get("filename") or "").lower() == name), None)
+        if match is not None:
+            remaining.remove(match)
+        else:
+            unmatched.append(d)
+
+    # Pass 2 — extension fallback, one upload per still-unmatched deliverable.
+    missing: List[Dict[str, str]] = []
+    for d in unmatched:
+        ext = (d.get("filename") or "").rpartition(".")[2].lower()
+        match = next((p for p in remaining
+                      if ext and (p.get("filename") or "").rpartition(".")[2].lower() == ext),
+                     None)
+        if match is not None:
+            remaining.remove(match)
+        else:
+            missing.append(d)
+    return missing
+
+
 def _gist(task: str, limit: int = 60) -> str:
     """Compact single-line gist of the task for logs / acks / the label."""
     g = " ".join((task or "").split())
@@ -1231,6 +1267,10 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
 
     artifacts: List[Any] = []
     containers_gone: List[Any] = []
+    # F15: share the dead-container sink with the build's ToolContext (built above, before this
+    # list existed), so mount_file / create_image_asset fail fast with "container_recycled" the
+    # moment the build container idle-expires mid-run instead of pushing bytes into a corpse.
+    build_ctx.container_gone_sink = containers_gone
     timeout_s = float(getattr(config, "deep_research_build_timeout", 600) or 600)
 
     try:
@@ -1283,15 +1323,19 @@ async def _stage_build(processor, *, job_id: str, build: Dict[str, Any]) -> List
 
     manager = getattr(processor, "container_manager", None)
     try:
-        staged = await asyncio.wait_for(
-            stage_artifacts(
-                openai_client=processor.openai_client,
-                ledger_key=build["ledger_key"],
-                container_ids=build["container_ids"],
-                container_manager=manager,
-                suppress_digests=build["suppress_digests"],
-                expect_filenames=build["expect_filenames"]),
-            timeout=config.artifact_publish_timeout)
+        # The time budget lives INSIDE stage_artifacts (per-file, deadline-bounded) rather than
+        # as an outer wait_for: a wrap-and-cancel discarded a deck that had already been staged
+        # the moment one late file pushed the phase past the ceiling. Now the phase returns what
+        # it managed to stage, and the declared deliverables sort to the front so they are what
+        # survives a truncated budget.
+        staged = await stage_artifacts(
+            openai_client=processor.openai_client,
+            ledger_key=build["ledger_key"],
+            container_ids=build["container_ids"],
+            container_manager=manager,
+            suppress_digests=build["suppress_digests"],
+            expect_filenames=build["expect_filenames"],
+            time_budget=config.artifact_publish_timeout)
     except Exception as e:  # noqa: BLE001
         processor.log_error(f"Build phase {job_id} staging failed: {e}", exc_info=True)
         staged = []
@@ -1728,7 +1772,15 @@ async def _transact_delivery(processor, client, *, channel_id: str, thread_root:
     # failed, or the model chose to withhold it). Its reply says which.
     if published:
         names = ", ".join(p["filename"] for p in published)
-        await card.finalize_success(f"Delivered {names} below.")
+        # A declared deliverable that never staged (or the model withheld) is a real loss even
+        # though something shipped — a green card naming only the survivors would hide it.
+        missing = _undelivered_deliverables(deliverables, published)
+        if missing:
+            await card.finalize_partial(
+                f"Delivered {names} below — but couldn't deliver "
+                f"{_deliverables_gist(missing)}.")
+        else:
+            await card.finalize_success(f"Delivered {names} below.")
     elif deliverables:
         await card.finalize_partial(
             f"Posted what I found below — but couldn't deliver "

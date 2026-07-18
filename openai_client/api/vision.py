@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional
 
-from config import config
+from config import clamp_effort, config
 
 # Hard ceiling on one image analysis. A real description is a few hundred characters; this is
 # orders of magnitude above any legitimate answer, so it can only be hit by a stream that is
@@ -31,7 +31,10 @@ async def analyze_images(
     self = client
     detail = detail or config.default_detail_level
     vision_model = model or config.gpt_model
-    vision_effort = reasoning_effort or config.analysis_reasoning_effort
+    # Route through clamp_effort so a legacy/stored 'minimal' (a hard 400 on the 5.6 family)
+    # can never reach the API. This is the effort used by BOTH request-building branches
+    # (streaming + non-streaming), so clamping once here covers them both.
+    vision_effort = clamp_effort(vision_model, reasoning_effort or config.analysis_reasoning_effort)
     vision_verbosity = verbosity or config.analysis_verbosity
 
     # Limit to 10 images
@@ -118,6 +121,7 @@ async def analyze_images(
 
             # Stream the response
             output_text = ""
+            stream_failed = False
             stream = await self._safe_api_call(
                 self.client.responses.create,
                 operation_type="vision_analysis",
@@ -178,8 +182,27 @@ async def analyze_images(
                         continue
                     elif event_type == "response.output_item.done":
                         continue
-                    elif event_type in ["response.done", "response.completed"]:
-                        self.log_debug("Vision stream completed")
+                    elif event_type in ["response.done", "response.completed",
+                                        "response.incomplete", "response.failed"]:
+                        # F9: ALL terminal states, not just done/completed. An incomplete (e.g.
+                        # hit max_output_tokens) or failed response still ends the stream, so the
+                        # final callback flush must fire either way — otherwise a stream that ends
+                        # abnormally leaves the callback's consumer with no terminal signal and
+                        # the partial text unflushed.
+                        if event_type == "response.incomplete":
+                            self.log_warning(
+                                "Vision stream ended incomplete (e.g. hit max_output_tokens); "
+                                "returning the partial text collected so far.")
+                        elif event_type == "response.failed":
+                            # Propagate as an error, consistent with this function's outer
+                            # try/except (log_error + raise). Set a flag and raise AFTER the loop,
+                            # not here: this per-event `except` would swallow the raise into a
+                            # `continue`. A failed response carries no usable text — returning ""
+                            # would masquerade as a clean empty answer.
+                            stream_failed = True
+                        else:
+                            self.log_debug("Vision stream completed")
+                        # ALWAYS flush the terminal callback, whatever the terminal state.
                         if stream_callback:
                             try:
                                 # Support both sync and async callbacks
@@ -196,6 +219,10 @@ async def analyze_images(
                     self.log_warning(f"Error processing vision stream event: {event_error}")
                     continue
 
+            if stream_failed:
+                # Raised OUTSIDE the per-event try so it actually propagates; the function's outer
+                # handler logs it and re-raises, the same path any other vision failure takes.
+                raise RuntimeError("Vision stream reported response.failed")
             return output_text
         else:
             # Non-streaming version

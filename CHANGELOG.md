@@ -129,6 +129,47 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 🛡️ Fixed - Pre-release hardening (full adversarial review)
+
+A ground-up review of the whole codebase before v3 goes live. The changes below are all
+fixes to as-yet-unreleased v3 behaviour — nothing here changes a previously shipped release.
+
+**Things you'd have noticed**
+
+- **Settings no longer refuses to open.** The channel-settings modal was failing outright
+  whenever ambient memory was on — one option's description ran past Slack's length limit and
+  Slack rejected the whole view. Every stored setting is also now coerced against its current
+  option list, so a stale saved image model/size/quality value can't brick the modal either.
+- **Bold stays bold, and links don't break.** Non-streamed replies were being formatted twice,
+  turning `*bold*` into italics; a URL ending a sentence swallowed the period into the link;
+  and links containing parentheses (Wikipedia-style) were mangled. All fixed.
+- **Files you share are actually delivered and read.** Background jobs no longer silently drop a
+  declared deliverable (or ship the wrong same-type draft), `.zip` bundles deliver, and a slow
+  multi-file build keeps the files it already staged instead of losing all of them on a timeout.
+- **Documents and images reach the model.** Scanned PDFs over the page limit are OCR'd instead
+  of being announced as "provided" while empty; images shared as URLs are catalogued (so they
+  can be edited and survive a restart); and each image in a multi-image upload gets its own
+  description instead of one shared blurb.
+- **Thread history survives compaction.** Images and documents shared before a thread was
+  summarised no longer vanish from context after a restart.
+- **Channel search actually searches the channel** instead of filtering a workspace-wide result
+  set, and reading a long thread returns its newest messages, not its oldest.
+
+**Reliability & safety**
+
+- Image-URL fetching now validates against internal addresses and caps the download, closing an
+  SSRF/again-memory exhaustion path; attachment and shared-URL downloads are size-capped up front.
+- Streaming handles the `incomplete`/`failed` terminal states (no more lost tails or mis-counted
+  usage), mid-turn sandbox recycling fails fast instead of writing into a dead container, and a
+  fatal startup error now exits non-zero so supervisors restart it.
+- Concurrent tool calls can no longer exceed the image caps or double-create a channel canvas;
+  nightly backup/cleanup no longer blocks the event loop.
+
+**Dependencies**
+
+- Added `beautifulsoup4` to the lockfile — it was imported for canvas parsing but never
+  declared, so a clean install silently degraded. Run `make install`.
+
 ### 🔒 Fixed - Nothing env-shaped can slip past .gitignore
 
 - **Every `.env*` file is ignored now**, not just `.env` on the nose. A bare `.env` rule doesn't

@@ -178,7 +178,7 @@ class BotConfig:
     
     # Default parameters for text generation
     default_temperature: float = field(default_factory=lambda: float(os.getenv("DEFAULT_TEMPERATURE", "0.8")))
-    default_max_tokens: int = field(default_factory=lambda: int(os.getenv("DEFAULT_MAX_TOKENS", "4096")))
+    default_max_tokens: int = field(default_factory=lambda: int(os.getenv("DEFAULT_MAX_TOKENS", "32768")))
     default_top_p: float = field(default_factory=lambda: float(os.getenv("DEFAULT_TOP_P", "1.0")))
     
     # GPT-5 specific parameters
@@ -792,6 +792,10 @@ class BotConfig:
     #      no-disk rule (CLAUDE.md pitfall 6a) holds with ZERO new local dependencies.
     # The sandbox has no network egress (pip install and exfiltration both impossible).
     enable_code_interpreter: bool = field(default_factory=lambda: os.getenv("ENABLE_CODE_INTERPRETER", "true").lower() == "true")
+    # F34: image generation/editing as TOOLS the model calls in context (default ON). When OFF,
+    # the legacy pre-flight intent classifier + vision/new_image/edit routing in base.py runs
+    # instead (the escape hatch, not the intended path). See Docs/TOOL_SUBSYSTEMS.md.
+    enable_image_tools: bool = field(default_factory=lambda: os.getenv("ENABLE_IMAGE_TOOLS", "true").lower() == "true")
     # Containers are THREAD-SCOPED and persisted: one container per channel/thread, its id kept
     # in `thread_containers` and reused across turns, so the model's working state survives the
     # turn boundary ("clean that up" -> "now chart it" lands in the same /mnt/data).
@@ -815,15 +819,16 @@ class BotConfig:
     # Per-file size ceiling for an outbound artifact. Slack's own limit is far higher; this is
     # our guard against uploading something absurd. Oversized artifacts are dropped with a note.
     artifact_max_mb: int = field(default_factory=lambda: max(1, int(os.getenv("ARTIFACT_MAX_MB", "25"))))
-    # Outbound allowlist by extension. Deliberately excludes executables, archives, and macro-
-    # enabled Office formats (.xlsm/.docm) — the bot must not hand anyone active content.
+    # Outbound allowlist by extension. Deliberately excludes executables and macro-enabled Office
+    # formats (.xlsm/.docm) — the bot must not hand anyone active content. `zip` IS allowed: a
+    # background build can declare an "archive" deliverable, and the size caps above bound it.
     # HTML/SVG are excluded by default too: Slack won't render them inline anyway, and they can
     # carry script. Set ARTIFACT_ALLOWED_EXTENSIONS to override (comma-separated, no dots).
     artifact_allowed_extensions: List[str] = field(default_factory=lambda: [
         e.strip().lower().lstrip(".")
         for e in os.getenv(
             "ARTIFACT_ALLOWED_EXTENSIONS",
-            "png,jpg,jpeg,gif,webp,pdf,csv,tsv,json,txt,md,xlsx,docx,pptx"
+            "png,jpg,jpeg,gif,webp,pdf,csv,tsv,json,txt,md,xlsx,docx,pptx,zip"
         ).split(",") if e.strip()
     ])
     # Whole-phase bound on downloading + uploading a turn's artifacts. The answer is already
