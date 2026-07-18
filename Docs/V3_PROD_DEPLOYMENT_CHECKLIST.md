@@ -81,6 +81,12 @@ Without it, `ENABLE_PDF_OCR=true` degrades **silently** — scanned PDFs just co
 New since v2.5.1: `pytesseract`, `pdf2image`, `aiofiles`, `striprtf` (F49 .rtf extraction), and an
 `openai >= 2.45` bump. `python-magic` is gone (so libmagic is no longer needed).
 
+**Do not skip this install even if the code "looks" already pulled.** `beautifulsoup4` was
+added to the lockfile in the pre-release hardening pass — it's imported for canvas parsing but
+was previously undeclared, so a host that doesn't re-run the install will import-fail its
+fallback and silently return raw HTML as canvas "markdown". The `--require-hashes` install
+above pulls it (and `soupsieve`); confirm with `./bin/python -c "import bs4; print(bs4.__version__)"`.
+
 ## 6. `.env` — edit in place, never overwrite
 
 **Do not copy `.env.example` over it.** Prod's `.env` holds the live secrets
