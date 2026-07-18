@@ -302,10 +302,40 @@ class SlackMessageEventsMixin:
                         pulse.remove_message(channel_id, deleted_ts)
                     # A warm ThreadState may still hold the deleted message — force a rebuild.
                     self._mark_thread_refresh(channel_id, prev.get("thread_ts") or deleted_ts)
+                    self.log_debug(f"message_deleted: purged {channel_id}:{deleted_ts} "
+                                   f"from pulse/artifacts")
                 return
             if subtype == "message_changed":
                 edited = event.get("message") or {}
                 new_ts = edited.get("ts")
+                # Deleting a root that has (or had) replies does NOT arrive as
+                # message_deleted — Slack tombstones it: message_changed whose nested
+                # message carries subtype "tombstone" / the text "This message was
+                # deleted." Treating that as an ordinary edit re-feeds the tombstone text
+                # into the pulse as content and runs the edit-triggered engine on it (seen
+                # live 2026-07-18: six tombstones dispatched, one classified — the model
+                # then "remembered" threads that no longer existed). It is a deletion:
+                # purge the root's pulse entry + ambient artifacts and force a thread
+                # rebuild — never re-feed, never offer, never classify. The thread's
+                # surviving replies keep their own pulse entries, which stays accurate:
+                # Slack keeps them visible under a tombstoned root.
+                if edited.get("subtype") == "tombstone" or (
+                        (edited.get("text") or "").strip() == "This message was deleted."):
+                    if channel_id and new_ts:
+                        db = getattr(self, "db", None)
+                        if db is not None:
+                            try:
+                                await db.delete_ambient_artifacts_by_source(channel_id, new_ts)
+                            except Exception as e:
+                                self.log_debug(f"ambient tombstone delete failed: {e}")
+                        pulse = getattr(self, "channel_pulse", None)
+                        if pulse is not None:
+                            pulse.remove_message(channel_id, new_ts)
+                        self._mark_thread_refresh(
+                            channel_id, edited.get("thread_ts") or new_ts)
+                        self.log_debug(f"tombstoned root: purged {channel_id}:{new_ts} "
+                                       f"(deleted-with-replies)")
+                    return
                 if channel_id and new_ts:
                     db = getattr(self, "db", None)
                     if db is not None:
