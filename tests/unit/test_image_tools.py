@@ -18,6 +18,7 @@ The properties worth defending, in rough order of how much they'd hurt to get wr
 5. **No executor may raise into the tool loop.** A moderation block is a result, not an
    exception.
 """
+import asyncio
 import base64
 import json
 from io import BytesIO
@@ -62,8 +63,11 @@ def _stub_checklist(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _tools_on(monkeypatch):
-    # Image tools are unconditional; only the sandbox is still gated.
+    # Image tools are gated by ENABLE_IMAGE_TOOLS (F8); force it on for the executor tests. The
+    # sandbox is separately gated by enable_code_interpreter. raising=False so this stands whether
+    # or not the config field has landed yet.
     monkeypatch.setattr(config, "enable_code_interpreter", True)
+    monkeypatch.setattr(config, "enable_image_tools", True, raising=False)
 
 
 # ----------------------------------------------------------------------------------- helpers
@@ -668,6 +672,37 @@ async def test_create_asset_sanitizes_the_filename_the_model_chose():
 
 
 @pytest.mark.asyncio
+async def test_create_asset_refuses_a_recycled_container():
+    # F15: the container id can point at a corpse — a persistent sandbox that idle-expired
+    # mid-turn and was recorded dead. Pushing bytes into it is a dead drop the model can't read
+    # back, so create_image_asset must fail fast rather than generate + mount into nothing.
+    oc = _openai()
+    ctx = _ctx(_FakeProcessor(openai_client=oc), container_id="cntr_dead")
+    ctx.container_gone_sink = ["cntr_dead"]
+
+    res = await it.execute_create_image_asset(
+        ctx, {"prompt": "a cover", "filename": "cover.png"})
+
+    assert res["ok"] is False and res["error"] == "container_recycled"
+    assert "generate_image" in res["message"]     # pointed at the tool that still works
+    oc.generate_image.assert_not_awaited()        # nothing spent finding out
+    assert ctx.sandbox_image_assets == []         # no slot reserved
+
+
+@pytest.mark.asyncio
+async def test_create_asset_proceeds_when_a_different_container_was_recycled():
+    # A recycled SIBLING id must not block a live container.
+    oc = _openai(create_path="/mnt/data/cover.png")
+    ctx = _ctx(_FakeProcessor(openai_client=oc), container_id="cntr_live")
+    ctx.container_gone_sink = ["cntr_other_dead"]
+
+    res = await it.execute_create_image_asset(
+        ctx, {"prompt": "a cover", "filename": "cover.png"})
+
+    assert res["ok"] is True and res["path"] == "/mnt/data/cover.png"
+
+
+@pytest.mark.asyncio
 async def test_create_asset_reports_a_failed_mount():
     oc = _openai(create_error=Exception("container is gone"))
     ctx = _ctx(_FakeProcessor(openai_client=oc), container_id="cntr_dead")
@@ -704,6 +739,160 @@ async def test_create_asset_is_capped_per_turn():
 
     assert res["ok"] is False and res["error"] == "at_capacity"
     oc.generate_image.assert_not_awaited()
+
+
+# ============================================================ F28: caps survive concurrent dispatch
+
+
+class _FakeTurn:
+    """A turn whose claim_work actually SUSPENDS, so a round's gathered sibling calls truly
+    interleave — the condition under which a check-then-act cap is bypassed."""
+
+    def __init__(self):
+        self.visible_action_committed = False
+        self.claims = 0
+
+    def mark_substantive_work(self):
+        pass
+
+    async def claim_work(self, *a, **k):
+        self.claims += 1
+        await asyncio.sleep(0)  # a real yield point between the reservation and the work
+
+
+@pytest.mark.asyncio
+async def test_generate_cap_holds_under_concurrent_sibling_calls(monkeypatch):
+    # dispatch_all runs a round's calls with asyncio.gather; before F28 the 👀 claim (an await)
+    # sat between the capacity read and the registration, so two siblings both read a sub-cap
+    # count and both registered. With the reservation moved before any await, exactly one wins.
+    monkeypatch.setattr(config, "max_concurrent_image_generations", 1)
+    proc = _FakeProcessor()
+
+    ctx_a = _ctx(proc)
+    ctx_b = _ctx(proc)
+    ctx_a.turn = _FakeTurn()
+    ctx_b.turn = _FakeTurn()
+
+    res_a, res_b = await asyncio.gather(
+        it.execute_generate_image(ctx_a, {"prompt": "first"}),
+        it.execute_generate_image(ctx_b, {"prompt": "second"}),
+    )
+
+    oks = [r for r in (res_a, res_b) if r["ok"]]
+    caps = [r for r in (res_a, res_b) if not r["ok"] and r["error"] == "at_capacity"]
+    assert len(oks) == 1 and len(caps) == 1
+    # Exactly one generation ever entered the registry — the cap was never bypassed.
+    assert len(proc.thread_manager.generations_in_flight("C1:100.0")) == 1
+    assert len(proc.scheduled) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_asset_cap_holds_under_concurrent_sibling_calls(monkeypatch):
+    # Same race for the synchronous asset tool: before F28 the generation await sat between the
+    # cap check and the append, so N siblings could all pass and overrun _MAX_ASSETS_PER_TURN.
+    monkeypatch.setattr(it, "_MAX_ASSETS_PER_TURN", 1)
+
+    async def _slow_generate(*a, **k):
+        await asyncio.sleep(0)          # suspend, so the siblings interleave
+        return _image_data()
+
+    oc = _openai(generate=AsyncMock(side_effect=_slow_generate), create_path="/mnt/data/a.png")
+    proc = _FakeProcessor(openai_client=oc)
+    # Both calls SHARE one context (a single turn's sandbox_image_assets list is shared across
+    # its gathered tool calls — the real shape of the race).
+    ctx = _ctx(proc, container_id="cntr_abc123")
+
+    res_a, res_b = await asyncio.gather(
+        it.execute_create_image_asset(ctx, {"prompt": "one", "filename": "a.png"}),
+        it.execute_create_image_asset(ctx, {"prompt": "two", "filename": "b.png"}),
+    )
+
+    oks = [r for r in (res_a, res_b) if r["ok"]]
+    caps = [r for r in (res_a, res_b) if not r["ok"] and r["error"] == "at_capacity"]
+    assert len(oks) == 1 and len(caps) == 1
+    # Exactly one asset was recorded — no reservation leaked, none overran the cap.
+    assert len(ctx.sandbox_image_assets) == 1
+    assert ctx.sandbox_image_assets[0]["path"] == "/mnt/data/a.png"
+
+
+@pytest.mark.asyncio
+async def test_generate_releases_slot_on_cancellation():
+    # T2-28: a CancelledError is a BaseException, so the per-await `except Exception` guards can't
+    # catch it. A cancel after the reservation but before the detached job is scheduled must still
+    # release the generation slot, or the thread's cap leaks until the watchdog.
+    proc = _FakeProcessor()
+    ctx = _ctx(proc)
+
+    class _CancelTurn:
+        def mark_substantive_work(self):
+            pass
+
+        async def claim_work(self, *a, **k):
+            raise asyncio.CancelledError()
+
+    ctx.turn = _CancelTurn()
+
+    with pytest.raises(asyncio.CancelledError):
+        await it.execute_generate_image(ctx, {"prompt": "a red cat"})
+
+    assert proc.thread_manager.generations_in_flight("C1:100.0") == []   # slot released
+    assert proc.scheduled == []                                          # nothing detached
+
+
+@pytest.mark.asyncio
+async def test_create_asset_releases_placeholder_on_cancellation():
+    # T2-28: same for the synchronous asset tool — a cancel during generation must release the
+    # placeholder (the finally), not leave it pinning the per-turn cap.
+    oc = _openai(generate=AsyncMock(side_effect=asyncio.CancelledError()))
+    ctx = _ctx(_FakeProcessor(openai_client=oc), container_id="cntr_abc123")
+
+    with pytest.raises(asyncio.CancelledError):
+        await it.execute_create_image_asset(ctx, {"prompt": "x", "filename": "x.png"})
+
+    assert ctx.sandbox_image_assets == []
+
+
+@pytest.mark.asyncio
+async def test_create_asset_reservation_is_released_on_generation_failure():
+    # A failed generation must not leave its reserved slot behind, or the cap would leak down
+    # over a turn until create_image_asset refused a legitimate call.
+    oc = _openai(generate=AsyncMock(side_effect=RuntimeError("boom")))
+    ctx = _ctx(_FakeProcessor(openai_client=oc), container_id="cntr_abc123")
+
+    res = await it.execute_create_image_asset(ctx, {"prompt": "x", "filename": "x.png"})
+
+    assert res["ok"] is False and res["error"] == "generation_failed"
+    assert ctx.sandbox_image_assets == []          # slot released
+
+
+# ============================================================ F8: ENABLE_IMAGE_TOOLS rollback switch
+
+
+@pytest.mark.asyncio
+async def test_image_tools_hidden_when_flag_is_off(monkeypatch):
+    monkeypatch.setattr(config, "enable_image_tools", False, raising=False)
+    registry = ToolRegistry()
+    it.register_image_tools(registry)
+    # A catalog + container would otherwise make edit_image / create_image_asset eligible.
+    cfg = _cfg()
+    cfg[it.CATALOG_KEY] = CATALOG
+    cfg[it.CI_CONTAINER_KEY] = "cntr_abc123"
+    names = {s["name"] for s in registry.schemas(cfg)}
+    assert "generate_image" not in names
+    assert "edit_image" not in names
+    assert "create_image_asset" not in names
+
+
+@pytest.mark.asyncio
+async def test_image_tools_present_when_flag_is_on(monkeypatch):
+    monkeypatch.setattr(config, "enable_image_tools", True, raising=False)
+    registry = ToolRegistry()
+    it.register_image_tools(registry)
+    cfg = _cfg()
+    cfg[it.CATALOG_KEY] = CATALOG
+    cfg[it.CI_CONTAINER_KEY] = "cntr_abc123"
+    names = {s["name"] for s in registry.schemas(cfg)}
+    assert {"generate_image", "edit_image", "create_image_asset"} <= names
 
 
 # ====================================================================== dispatch contract

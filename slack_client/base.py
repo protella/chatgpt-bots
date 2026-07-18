@@ -134,7 +134,10 @@ class SlackBot(SlackMessageEventsMixin,
         # F34: generate_image (detached), create_image_asset (into the sandbox), edit_image.
         # These replaced the intent classifier's image branches — the model decides in
         # context, so it can generate an image AND compute a chart in the same turn.
-        register_image_tools(registry)
+        # F8: gated like its siblings above — ENABLE_IMAGE_TOOLS off is the rollback switch that
+        # takes image tools off the table entirely (the old classifier fallback is gone).
+        if config.enable_image_tools:
+            register_image_tools(registry)
         # F35: mount_file — the bytes of a file the user SHARED (or one we built earlier) into
         # the sandbox. Without it the model could see an attachment but never compute on it.
         register_file_mount_tools(registry)
@@ -173,9 +176,10 @@ class SlackBot(SlackMessageEventsMixin,
         """Get message history for a thread (async version)"""
         return await self.get_thread_history(channel_id, thread_id, limit, oldest=oldest)
 
-    async def download_file_async(self, file_url: str, file_id: str = None) -> Optional[bytes]:
-        """Download a file/image from the platform (async version)"""
-        return await self.download_file(file_url, file_id)
+    async def download_file_async(self, file_url: str, file_id: Optional[str] = None,
+                                  max_bytes: Optional[int] = None) -> Optional[bytes]:
+        """Download a file/image from the platform (async version), aborting past max_bytes when set"""
+        return await self.download_file(file_url, file_id, max_bytes=max_bytes)
     
 
 

@@ -797,8 +797,12 @@ class SettingsModal(LoggerMixin):
             "text": {"type": "mrkdwn", "text": "*Image Generation*"}
         })
 
-        # Image model
-        selected_image_model = settings.get('image_model', config.image_model)
+        # Image model — coerce a stale stored/config value (e.g. a retired gpt-image-1-mini)
+        # to a live option so views.open doesn't reject the block. Also feeds is_image_v2 below.
+        image_model_choices = {'gpt-image-2', 'gpt-image-1'}
+        selected_image_model = self._coerce_choice(
+            settings.get('image_model', config.image_model), image_model_choices,
+            config.image_model if config.image_model in image_model_choices else 'gpt-image-2')
         blocks.append({
             "type": "section",
             "block_id": "image_model_block",
@@ -819,6 +823,9 @@ class SettingsModal(LoggerMixin):
         })
 
         # Image size (orientation)
+        selected_image_size = self._coerce_choice(
+            settings.get('image_size', '1024x1024'),
+            {'1024x1024', '1024x1536', '1536x1024', 'auto'}, '1024x1024')
         blocks.append({
             "type": "section",
             "block_id": "image_size_block",
@@ -828,8 +835,8 @@ class SettingsModal(LoggerMixin):
                 "action_id": "image_size",
                 "placeholder": {"type": "plain_text", "text": "Select size"},
                 "initial_option": {
-                    "text": {"type": "plain_text", "text": self._get_image_size_display(settings.get('image_size', '1024x1024'))},
-                    "value": settings.get('image_size', '1024x1024')
+                    "text": {"type": "plain_text", "text": self._get_image_size_display(selected_image_size)},
+                    "value": selected_image_size
                 },
                 "options": [
                     {"text": {"type": "plain_text", "text": "Square 1:1"}, "value": "1024x1024"},
@@ -841,6 +848,8 @@ class SettingsModal(LoggerMixin):
         })
 
         # Image quality
+        selected_image_quality = self._coerce_choice(
+            settings.get('image_quality', 'auto'), {'auto', 'low', 'medium', 'high'}, 'auto')
         blocks.append({
             "type": "section",
             "block_id": "image_quality_block",
@@ -850,8 +859,8 @@ class SettingsModal(LoggerMixin):
                 "action_id": "image_quality",
                 "placeholder": {"type": "plain_text", "text": "Select quality"},
                 "initial_option": {
-                    "text": {"type": "plain_text", "text": self._get_image_quality_display(settings.get('image_quality', 'auto'))},
-                    "value": settings.get('image_quality', 'auto')
+                    "text": {"type": "plain_text", "text": self._get_image_quality_display(selected_image_quality)},
+                    "value": selected_image_quality
                 },
                 "options": [
                     {"text": {"type": "plain_text", "text": "Auto"}, "value": "auto"},
@@ -872,10 +881,11 @@ class SettingsModal(LoggerMixin):
         if not is_image_v2:
             background_options.insert(1, {"text": {"type": "plain_text", "text": "Transparent"}, "value": "transparent"})
 
-        # Coerce saved 'transparent' to 'auto' when v2 is active so initial_option matches a visible option
-        saved_background = settings.get('image_background', 'auto')
-        if is_image_v2 and saved_background == 'transparent':
-            saved_background = 'auto'
+        # Coerce the saved value against the visible options: 'transparent' vanishes under v2, and
+        # any fully-stale value falls back to 'auto', so initial_option always matches an option.
+        saved_background = self._coerce_choice(
+            settings.get('image_background', 'auto'),
+            {opt['value'] for opt in background_options}, 'auto')
 
         blocks.append({
             "type": "section",
@@ -895,6 +905,8 @@ class SettingsModal(LoggerMixin):
 
         # Input fidelity for edits — hidden on gpt-image-2 (model auto-handles fidelity)
         if not is_image_v2:
+            selected_input_fidelity = self._coerce_choice(
+                settings.get('input_fidelity', 'high'), {'high', 'low'}, 'high')
             blocks.append({
                 "type": "section",
                 "block_id": "input_fidelity_block",
@@ -903,8 +915,8 @@ class SettingsModal(LoggerMixin):
                     "type": "radio_buttons",
                     "action_id": "input_fidelity",
                     "initial_option": {
-                        "text": {"type": "plain_text", "text": self._get_fidelity_display(settings.get('input_fidelity', 'high'))},
-                        "value": settings.get('input_fidelity', 'high')
+                        "text": {"type": "plain_text", "text": self._get_fidelity_display(selected_input_fidelity)},
+                        "value": selected_input_fidelity
                     },
                     "options": [
                         {"text": {"type": "plain_text", "text": "🎨 Preserve Original Style"}, "value": "high"},
@@ -916,6 +928,8 @@ class SettingsModal(LoggerMixin):
         blocks.append({"type": "divider"})
 
         # Vision detail level
+        selected_vision_detail = self._coerce_choice(
+            settings.get('vision_detail', 'auto'), {'auto', 'low', 'high'}, 'auto')
         blocks.append({
             "type": "section",
             "block_id": "vision_detail_block",
@@ -924,8 +938,8 @@ class SettingsModal(LoggerMixin):
                 "type": "radio_buttons",
                 "action_id": "vision_detail",
                 "initial_option": {
-                    "text": {"type": "plain_text", "text": self._get_vision_detail_display(settings.get('vision_detail', 'auto'))},
-                    "value": settings.get('vision_detail', 'auto')
+                    "text": {"type": "plain_text", "text": self._get_vision_detail_display(selected_vision_detail)},
+                    "value": selected_vision_detail
                 },
                 "options": [
                     {"text": {"type": "plain_text", "text": "🤖 Auto"}, "value": "auto"},
@@ -1109,6 +1123,17 @@ class SettingsModal(LoggerMixin):
         }
         return displays.get(level, '📄 Standard')
     
+    @staticmethod
+    def _coerce_choice(value, valid, default):
+        """Return `value` only if it is one of `valid`, else `default`.
+
+        Slack rejects a whole static_select/radio block when its initial_option value is not
+        also present in `options` (invalid_arguments on views.open). A stored value can drift
+        out of range when an option is dropped (e.g. a retired gpt-image-1-mini default), so
+        every stored select value is coerced against its live option list before it is rendered.
+        """
+        return value if value in valid else default
+
     def _get_image_size_display(self, size: str) -> str:
         """Get display name for image size"""
         displays = {

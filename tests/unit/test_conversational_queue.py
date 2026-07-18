@@ -342,3 +342,155 @@ class TestBusyRetirement:
     def test_queued_type_exists_and_is_handled(self):
         assert 'type="queued"' in (REPO / "message_processor/base.py").read_text()
         assert '"queued"' in (REPO / "main.py").read_text()
+
+
+# --- F10: earlier batch messages' attachments are processed, not dropped ---
+
+def _attach_msg(text, *, attachments, user="alice", ts="a.ts", channel="C123", thread="111.0"):
+    return Message(text=text, user_id=user, channel_id=channel, thread_id=thread,
+                   attachments=attachments, metadata={"ts": ts, "username": user})
+
+
+class TestBatchAttachments:
+    """F10: an earlier queued message (not the trigger) carrying attachments used to be
+    appended as TEXT ONLY — its documents got no save_document row (unreachable by
+    read_document/mount_file) and its images rode only ambient dual-write. The drain now runs
+    the SAME attachment pipeline the trigger turn runs for every batched message."""
+
+    @pytest.mark.asyncio
+    async def test_earlier_message_documents_processed_and_folded(self, manager):
+        key = "C123:111.0"
+        state = Mock()
+        state.config_overrides = {}
+        manager.get_thread_async = AsyncMock(return_value=state)
+        earlier = _attach_msg("see attached",
+                              attachments=[{"type": "file", "name": "report.pdf"}], ts="a.ts")
+        manager.enqueue_pending(key, earlier)
+        manager.enqueue_pending(key, _msg("and the summary?", user="bob", username="bob", ts="b.ts"))
+
+        proc = _drain_proc(manager)
+        doc = {"filename": "report.pdf", "summary": "Q3 numbers"}
+        proc._process_attachments = AsyncMock(return_value=([], [doc], []))
+        proc._build_message_with_documents = Mock(
+            side_effect=lambda text, docs: f"{text} [+doc:{docs[0]['filename']}]")
+
+        client = Mock()
+        client.message_handler = Mock()
+        with patch("message_processor.base.asyncio.sleep", new=AsyncMock()), \
+             patch.object(config, "get_thread_config_async",
+                          new=AsyncMock(return_value={"enable_code_interpreter": True})):
+            await proc._dispatch_pending_batch(_msg("done"), client, key)
+
+        # The earlier message's attachments went through the SAME pipeline the trigger uses,
+        # keyed on THAT message and the resolved per-thread CI setting.
+        proc._process_attachments.assert_awaited_once()
+        assert proc._process_attachments.await_args.args[0] is earlier
+        assert proc._process_attachments.await_args.kwargs["code_interpreter_enabled"] is True
+        # Its document summary was folded into that message's appended content.
+        appended = [c.args[2] for c in proc._add_message_with_token_management.call_args_list]
+        assert appended[0] == "alice: see attached [+doc:report.pdf]"
+
+    @pytest.mark.asyncio
+    async def test_earlier_message_images_catalogued(self, manager):
+        key = "C123:111.0"
+        state = Mock()
+        state.config_overrides = {}
+        manager.get_thread_async = AsyncMock(return_value=state)
+        earlier = _attach_msg("look at this",
+                              attachments=[{"type": "image", "name": "shot.png",
+                                            "url": "http://x/shot.png"}], ts="a.ts")
+        manager.enqueue_pending(key, earlier)
+        manager.enqueue_pending(key, _msg("thoughts?", user="bob", username="bob", ts="b.ts"))
+
+        proc = _drain_proc(manager)
+        img_inputs = [{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]
+        proc._process_attachments = AsyncMock(return_value=(img_inputs, [], []))
+        proc._build_message_with_documents = Mock()
+
+        client = Mock()
+        client.message_handler = Mock()
+        # Sync Mock (not the auto-detected AsyncMock) so no un-awaited coroutine is created:
+        # _schedule_async_call is itself a Mock here and would never await a real coroutine.
+        catalog = Mock(return_value=None)
+        with patch("message_processor.base.asyncio.sleep", new=AsyncMock()), \
+             patch.object(config, "get_thread_config_async",
+                          new=AsyncMock(return_value={"enable_code_interpreter": False})), \
+             patch("message_processor.base.image_catalog.catalog_uploads", new=catalog):
+            await proc._dispatch_pending_batch(_msg("done"), client, key)
+
+        # A durable visual description was scheduled for the earlier image (trigger parity).
+        catalog.assert_called_once()
+        cat_args = catalog.call_args.args
+        assert cat_args[2] == earlier.attachments and cat_args[3] == img_inputs
+        # No documents → the document folder is never invoked.
+        proc._build_message_with_documents.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_earlier_images_and_failures_carried_to_trigger(self, manager):
+        """T2-10: earlier messages' image parts AND attachment failures are stashed on the
+        trigger's metadata so its turn can show the images and acknowledge the failures."""
+        key = "C123:111.0"
+        state = Mock()
+        state.config_overrides = {}
+        manager.get_thread_async = AsyncMock(return_value=state)
+        earlier = _attach_msg("pic plus a broken file",
+                              attachments=[{"type": "image", "name": "a.png", "url": "u"}], ts="a.ts")
+        manager.enqueue_pending(key, earlier)
+        manager.enqueue_pending(key, _msg("go", user="bob", username="bob", ts="b.ts"))
+
+        proc = _drain_proc(manager)
+        img = {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+        fail = {"name": "broken.pdf", "error": "download_failed"}
+        proc._process_attachments = AsyncMock(return_value=([img], [], [fail]))
+        proc._build_message_with_documents = Mock()
+        catalog = Mock(return_value=None)
+        client = Mock()
+        client.message_handler = Mock()
+        with patch("message_processor.base.asyncio.sleep", new=AsyncMock()), \
+             patch.object(config, "get_thread_config_async",
+                          new=AsyncMock(return_value={"enable_code_interpreter": False})), \
+             patch("message_processor.base.image_catalog.catalog_uploads", new=catalog):
+            await proc._dispatch_pending_batch(_msg("done"), client, key)
+
+        trigger = client.message_handler.call_args.args[0]
+        assert trigger.metadata["batched_image_inputs"] == [img]
+        assert trigger.metadata["batched_unsupported_files"] == [fail]
+
+    @pytest.mark.asyncio
+    async def test_no_batched_keys_when_earlier_messages_have_no_attachments(self, manager):
+        key = "C123:111.0"
+        state = Mock()
+        state.config_overrides = {}
+        manager.get_thread_async = AsyncMock(return_value=state)
+        manager.enqueue_pending(key, _msg("first", user="a", username="a", ts="a.ts"))
+        manager.enqueue_pending(key, _msg("second", user="b", username="b", ts="b.ts"))
+        proc = _drain_proc(manager)
+        client = Mock()
+        client.message_handler = Mock()
+        with patch("message_processor.base.asyncio.sleep", new=AsyncMock()), \
+             patch.object(config, "get_thread_config_async", new=AsyncMock()):
+            await proc._dispatch_pending_batch(_msg("done"), client, key)
+        trigger = client.message_handler.call_args.args[0]
+        assert "batched_image_inputs" not in trigger.metadata
+        assert "batched_unsupported_files" not in trigger.metadata
+
+    @pytest.mark.asyncio
+    async def test_no_attachments_skips_thread_config_resolution(self, manager):
+        """The common attachment-free batch must NOT pay for a thread-config resolution."""
+        key = "C123:111.0"
+        state = Mock()
+        state.config_overrides = {}
+        manager.get_thread_async = AsyncMock(return_value=state)
+        manager.enqueue_pending(key, _msg("first", user="a", username="a", ts="a.ts"))
+        manager.enqueue_pending(key, _msg("second", user="b", username="b", ts="b.ts"))
+
+        proc = _drain_proc(manager)
+        proc._process_attachments = AsyncMock()
+        client = Mock()
+        client.message_handler = Mock()
+        with patch("message_processor.base.asyncio.sleep", new=AsyncMock()), \
+             patch.object(config, "get_thread_config_async", new=AsyncMock()) as gtc:
+            await proc._dispatch_pending_batch(_msg("done"), client, key)
+
+        gtc.assert_not_awaited()
+        proc._process_attachments.assert_not_awaited()

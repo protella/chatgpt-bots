@@ -177,13 +177,13 @@ class BaseClient(ABC, LoggerMixin):
         pass
 
     @abstractmethod
-    def download_file(self, file_url: str, file_id: str) -> Optional[bytes]:
-        """Download a file/image from the platform"""
+    def download_file(self, file_url: str, file_id: str, max_bytes: Optional[int] = None) -> Optional[bytes]:
+        """Download a file/image from the platform, aborting past max_bytes when set"""
         pass
 
     @abstractmethod
-    async def download_file_async(self, file_url: str, file_id: str) -> Optional[bytes]:
-        """Download a file/image from the platform (async version)"""
+    async def download_file_async(self, file_url: str, file_id: str, max_bytes: Optional[int] = None) -> Optional[bytes]:
+        """Download a file/image from the platform (async version), aborting past max_bytes when set"""
         pass
     
     @abstractmethod

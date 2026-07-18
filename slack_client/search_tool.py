@@ -101,8 +101,17 @@ class SlackSearchToolMixin:
         limit = self._clamp_search_limit(args.get("limit"))
         scope = (args.get("scope") or "workspace").strip().lower()
 
+        # Channel scope must constrain at the API, not merely post-filter the top-N: a
+        # workspace-wide query whose highest-ranked hits all live in other channels
+        # returns a false "no matches" for the current one. Slack honours the
+        # `in:<#CHANNEL_ID>` search operator inside the query string, so scope the query
+        # itself; the channel != ctx.channel_id post-filter below stays as belt-and-braces.
+        api_query = query
+        if scope == "channel" and ctx.channel_id:
+            api_query = f"{query} in:<#{ctx.channel_id}>"
+
         request: Dict[str, Any] = {
-            "query": query,
+            "query": api_query,
             "action_token": ctx.action_token,
             "channel_types": ",".join(channel_types),
             "content_types": "messages",

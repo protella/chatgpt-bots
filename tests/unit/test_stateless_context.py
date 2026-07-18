@@ -543,3 +543,228 @@ async def test_prompt_cache_key_passed_for_gpt55():
         model="gpt-5-mini")
     assert "prompt_cache_key" not in captured
     assert "prompt_cache_retention" not in captured
+
+
+# ------------------------------------------------- Workstream G: state/persistence fixes
+
+def _img_hist(ts, text, url, file_id, mimetype="image/png", name="pic.png", user="U1"):
+    """A human message carrying one uploaded image attachment."""
+    return Message(
+        text=text, user_id=user, channel_id="C1", thread_id="100.0",
+        attachments=[{"type": "image", "url": url, "id": file_id,
+                      "mimetype": mimetype, "name": name}],
+        metadata={"ts": ts, "is_bot": False, "sender_type": "human",
+                  "bot_name": None, "username": "Peter", "reactions": None},
+    )
+
+
+@pytest.mark.asyncio
+async def test_write_thread_summary_records_preserved_ts_behind_boundary(temp_db):
+    """F3: a preserved message (image/summarized doc) kept in live context but sitting
+    at/behind the new boundary has its ts recorded, so a cold rebuild can re-admit it."""
+    thread_key = "C1:100.0"
+    temp_db.get_or_create_thread(thread_key, "C1")
+    proc = _Proc(db=temp_db, openai_client=_mock_openai("s"))
+    state = ThreadState(thread_ts="100.0", channel_id="C1")
+    # Live state still holds a preserved image upload at ts 101.0.
+    state.messages = [
+        {"role": "user", "content": "pic",
+         "metadata": {"ts": "101.0", "type": "image_upload", "url": "https://img/a.png"}},
+    ]
+    # The dropped (summarized) span reaches ts 103.0 — so the boundary lands AHEAD of the image.
+    dropped = [
+        {"role": "user", "content": "chatter", "metadata": {"ts": "101.2"}},
+        {"role": "assistant", "content": "reply", "metadata": {"ts": "103.0"}},
+    ]
+    await proc._write_thread_summary(state, thread_key, dropped)
+
+    row = temp_db.get_thread_summary(thread_key)
+    assert row["boundary_ts"] == "103.0"
+    assert "101.0" in row["preserved_ts"]
+
+
+@pytest.mark.asyncio
+async def test_write_thread_summary_merges_preserved_ts_across_rolls(temp_db):
+    """F3: preserved ts accumulate across successive compactions (the boundary only advances)."""
+    thread_key = "C1:100.0"
+    temp_db.get_or_create_thread(thread_key, "C1")
+    proc = _Proc(db=temp_db, openai_client=_mock_openai("s"))
+    state = ThreadState(thread_ts="100.0", channel_id="C1")
+    state.messages = [
+        {"role": "user", "content": "pic1",
+         "metadata": {"ts": "101.0", "type": "image_upload", "url": "https://img/a.png"}},
+    ]
+    await proc._write_thread_summary(state, thread_key, [
+        {"role": "user", "content": "x", "metadata": {"ts": "102.0"}}])
+    assert temp_db.get_thread_summary(thread_key)["preserved_ts"] == ["101.0"]
+
+    # Second roll: a new preserved image, boundary advances past both.
+    state.messages.append(
+        {"role": "user", "content": "pic2",
+         "metadata": {"ts": "103.0", "type": "image_upload", "url": "https://img/b.png"}})
+    await proc._write_thread_summary(state, thread_key, [
+        {"role": "user", "content": "y", "metadata": {"ts": "104.0"}}])
+    assert temp_db.get_thread_summary(thread_key)["preserved_ts"] == ["101.0", "103.0"]
+
+
+@pytest.mark.asyncio
+async def test_rebuild_readmits_preserved_image_behind_boundary(temp_db):
+    """F3: THE fix — an uploaded image behind the compaction boundary survives a cold
+    rebuild, while an ordinary summarized message at the same depth stays dropped."""
+    thread_key = "C1:100.0"
+    temp_db.get_or_create_thread(thread_key, "C1")
+    temp_db.save_thread_summary(thread_key, "Earlier chatter.", "101.5",
+                                refs=None, preserved_ts=["101.0"])
+    proc = _Proc(db=temp_db)
+    history = [
+        _img_hist("101.0", "here is my diagram", "https://img/diagram.png", "F123"),
+        _hist("101.2", "some covered chatter"),   # <= boundary, not preserved -> dropped
+        _hist("102.0", "fresh tail message"),      # > boundary -> tail
+    ]
+    client = _client_with_history(history)
+    state = await proc._get_or_rebuild_thread_state(_incoming(), client)
+
+    # Preserved messages behind the boundary force a full fetch (oldest exclusive-after
+    # cannot reach them); assert on the MAIN history fetch (call 0).
+    assert client.get_thread_history.call_args_list[0].kwargs.get("oldest") is None
+
+    joined = json.dumps([m.get("content") for m in state.messages])
+    assert "here is my diagram" in joined       # preserved image re-admitted
+    assert "fresh tail message" in joined        # tail intact
+    assert "some covered chatter" not in joined  # summarized span still dropped
+
+
+@pytest.mark.asyncio
+async def test_rebuild_tail_only_when_no_preserved_ts(temp_db):
+    """F3: with nothing preserved behind the boundary, rebuild keeps the tail-only fetch
+    (oldest=boundary) — the full-fetch cost is paid ONLY when an asset is at risk."""
+    thread_key = "C1:100.0"
+    temp_db.get_or_create_thread(thread_key, "C1")
+    temp_db.save_thread_summary(thread_key, "Earlier.", "101.5", refs=None, preserved_ts=[])
+    proc = _Proc(db=temp_db)
+    client = _client_with_history([_hist("102.0", "fresh tail message")])
+    await proc._get_or_rebuild_thread_state(_incoming(), client)
+    assert client.get_thread_history.call_args_list[0].kwargs.get("oldest") == "101.5"
+
+
+@pytest.mark.asyncio
+async def test_rebuild_does_not_store_reply_as_image_analysis(temp_db):
+    """F37: the bot's ordinary reply after an uploaded image must NOT be persisted as that
+    image's vision analysis — ambient memory would otherwise serve it as '[Visual context]'."""
+    thread_key = "C1:100.0"
+    temp_db.get_or_create_thread(thread_key, "C1")
+    proc = _Proc(db=temp_db)
+    history = [
+        _img_hist("101.0", "look at this", "https://img/cat.png", "F1"),
+        _hist("102.0", "Sure, happy to help with that!", user="UBOT", sender="self"),
+    ]
+    await proc._get_or_rebuild_thread_state(_incoming(), _client_with_history(history))
+
+    rows = await temp_db.find_thread_images_async(thread_key)
+    row = next(r for r in rows if r["url"] == "https://img/cat.png")
+    assert not (row.get("analysis") or "").strip()  # reply NOT captured as analysis
+
+
+@pytest.mark.asyncio
+async def test_get_document_for_rebuild_disambiguates_same_filename(temp_db):
+    """F12: two same-named uploads resolve to their OWN row (by file_id, else nearest
+    upload at/before the message ts), not blindly to the newest by filename."""
+    thread_key = "C1:100.0"
+    temp_db.get_or_create_thread(thread_key, "C1")
+    temp_db.save_document(thread_key, "report.pdf", "application/pdf",
+                          summary="OLD SUMMARY", file_id="F_OLD", message_ts="101.0")
+    temp_db.save_document(thread_key, "report.pdf", "application/pdf",
+                          summary="NEW SUMMARY", file_id="F_NEW", message_ts="105.0")
+
+    # Exact file_id wins even when it is the older upload.
+    old = await temp_db.get_document_for_rebuild_async(
+        thread_key, "report.pdf", file_id="F_OLD", message_ts="101.0")
+    assert old["summary"] == "OLD SUMMARY"
+    new = await temp_db.get_document_for_rebuild_async(
+        thread_key, "report.pdf", file_id="F_NEW", message_ts="105.0")
+    assert new["summary"] == "NEW SUMMARY"
+
+    # No file_id: nearest same-named upload at/before this message's ts.
+    by_ts = await temp_db.get_document_for_rebuild_async(
+        thread_key, "report.pdf", file_id=None, message_ts="101.0")
+    assert by_ts["summary"] == "OLD SUMMARY"
+
+    # Legacy (no file_id, no ts): newest-by-filename fallback, unchanged behavior.
+    legacy = await temp_db.get_document_for_rebuild_async(thread_key, "report.pdf")
+    assert legacy["summary"] == "NEW SUMMARY"
+
+
+@pytest.mark.asyncio
+async def test_rebuild_failsafe_on_legacy_null_preserved_ts(temp_db):
+    """F3 remediation: a LEGACY summary row (preserved_ts_json NULL — written before the
+    column existed) must fail safe. NULL is 'unknown', not 'verified empty': rebuild
+    full-fetches and re-admits behind-boundary messages of preserved TYPES (image/doc),
+    so a compacted image survives even though no ts was ever recorded. The row is then
+    backfilled to a verified list so the next rebuild takes the fast tail-only path."""
+    thread_key = "C1:100.0"
+    temp_db.get_or_create_thread(thread_key, "C1")
+    # Simulate a legacy row: NULL preserved_ts_json (no column value).
+    temp_db.conn.execute(
+        "INSERT INTO thread_summaries (thread_id, summary_text, boundary_ts, refs_json, "
+        "preserved_ts_json) VALUES (?, ?, ?, NULL, NULL)",
+        (thread_key, "Earlier chatter.", "101.5"))
+    temp_db.conn.commit()
+    assert temp_db.get_thread_summary(thread_key)["preserved_ts"] is None  # unknown
+
+    proc = _Proc(db=temp_db)
+    history = [
+        _img_hist("101.0", "legacy diagram", "https://img/legacy.png", "FLEG"),  # image behind boundary
+        _hist("101.2", "some covered chatter"),   # <= boundary, plain -> dropped
+        _hist("102.0", "fresh tail message"),      # > boundary -> tail
+    ]
+    client = _client_with_history(history)
+    state = await proc._get_or_rebuild_thread_state(_incoming(), client)
+
+    # Unknown row forces a full fetch (main fetch, call 0).
+    assert client.get_thread_history.call_args_list[0].kwargs.get("oldest") is None
+
+    joined = json.dumps([m.get("content") for m in state.messages])
+    assert "legacy diagram" in joined        # preserved image re-admitted despite NULL row
+    assert "fresh tail message" in joined
+    assert "some covered chatter" not in joined  # plain summarized msg still dropped
+
+    # Row backfilled: NULL -> verified list containing the image ts (one-time upgrade).
+    row = temp_db.get_thread_summary(thread_key)
+    assert row["preserved_ts"] == ["101.0"]
+
+
+@pytest.mark.asyncio
+async def test_rebuild_backfills_empty_list_when_legacy_row_has_no_assets(temp_db):
+    """F3 remediation: a legacy NULL row with NO preserved types behind the boundary
+    backfills to [] (verified empty), converting it to the fast path with no false assets."""
+    thread_key = "C1:100.0"
+    temp_db.get_or_create_thread(thread_key, "C1")
+    temp_db.conn.execute(
+        "INSERT INTO thread_summaries (thread_id, summary_text, boundary_ts, refs_json, "
+        "preserved_ts_json) VALUES (?, ?, ?, NULL, NULL)",
+        (thread_key, "Earlier.", "101.5"))
+    temp_db.conn.commit()
+
+    proc = _Proc(db=temp_db)
+    client = _client_with_history([
+        _hist("101.0", "plain covered chatter"),
+        _hist("102.0", "fresh tail message"),
+    ])
+    await proc._get_or_rebuild_thread_state(_incoming(), client)
+
+    row = temp_db.get_thread_summary(thread_key)
+    assert row["preserved_ts"] == []  # verified empty, no longer unknown
+
+
+@pytest.mark.asyncio
+async def test_save_thread_summary_distinguishes_empty_list_from_null(temp_db):
+    """F3 remediation: an explicit [] persists as verified-empty (not collapsed to NULL),
+    so it is distinguishable from a legacy/unknown row."""
+    thread_key = "C1:100.0"
+    temp_db.get_or_create_thread(thread_key, "C1")
+    # Explicit empty list -> verified empty (round-trips as []).
+    temp_db.save_thread_summary(thread_key, "s", "100.0", refs=None, preserved_ts=[])
+    assert temp_db.get_thread_summary(thread_key)["preserved_ts"] == []
+    # None -> unknown (round-trips as None).
+    temp_db.save_thread_summary(thread_key, "s", "100.0", refs=None, preserved_ts=None)
+    assert temp_db.get_thread_summary(thread_key)["preserved_ts"] is None

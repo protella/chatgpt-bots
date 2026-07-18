@@ -43,6 +43,7 @@ would ever see coming.
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from typing import Any, Dict, List, Optional, Set
@@ -59,6 +60,13 @@ MAX_MARKDOWN_CHARS = 12000
 MAX_READ_CHARS = 12000
 # How many canvases to advertise. The ones anyone means are the recent ones.
 MAX_LIST = 15
+
+# Serializes the check-then-create in execute_create_channel_canvas. Sibling tool calls in one
+# round run concurrently (tool_registry gathers them), so two create_channel_canvas calls could
+# both pass the "does one exist?" check and each create a canvas — and a duplicate channel canvas
+# (with its own permanent tab) can never be removed. One create at a time, workspace-wide; canvas
+# creation is rare enough that a single lock costs nothing.
+_channel_canvas_create_lock = asyncio.Lock()
 # What Slack calls a canvas with no title — which is every channel canvas, permanently.
 UNTITLED = "Untitled"
 
@@ -172,6 +180,11 @@ def _html_to_markdown(html: str) -> str:
     try:
         from bs4 import BeautifulSoup
     except ImportError:  # noqa: BLE001 — degrade to raw text rather than lose the read
+        # beautifulsoup4 is a hard requirement (see requirements.in); reaching here means a
+        # broken install, and the model would silently edit raw HTML it misread as markdown.
+        logger.error("beautifulsoup4 is not installed — canvas HTML cannot be parsed, returning "
+                     "raw HTML. Reinstall dependencies (pip install --require-hashes -r "
+                     "requirements.txt); canvas reads/edits are unreliable until then.")
         return html
 
     soup = BeautifulSoup(html or "", "html.parser")
@@ -823,32 +836,45 @@ async def execute_create_channel_canvas(ctx: ToolContext, args: Dict[str, Any]) 
     # Last line of defence against a second channel canvas: the schema hides this tool once one
     # exists, but the schema is built from a catalog that can be up to _CATALOG_TTL stale, and
     # conversations.canvases.create is NOT idempotent — a second call means a second tab, forever.
-    try:
-        listed = await _async(web.files_list, channel=ctx.channel_id, types="canvases",
-                              limit=MAX_LIST)
-        live = {f["id"] for f in (listed.get("files") or []) if f.get("id")}
-        existing = await _channel_canvas_id(web, ctx.channel_id, live)
-    except Exception as e:  # noqa: BLE001 — don't block creation on a failed pre-check
-        logger.warning(f"Could not pre-check for an existing channel canvas: {e}")
-        existing = None
-    if existing:
-        return _err("already_exists",
-                    "This channel already has a canvas. Edit it with edit_canvas instead of "
-                    "creating another — a channel is meant to have exactly one.",
-                    canvas_id=existing)
+    # The whole check-then-create is serialized so two sibling calls gathered in one round cannot
+    # both pass the existence check and each create a canvas.
+    async with _channel_canvas_create_lock:
+        try:
+            listed = await _async(web.files_list, channel=ctx.channel_id, types="canvases",
+                                  limit=MAX_LIST)
+            live = {f["id"] for f in (listed.get("files") or []) if f.get("id")}
+            existing = await _channel_canvas_id(web, ctx.channel_id, live)
+        except Exception as e:  # noqa: BLE001 — fail CLOSED: a duplicate canvas is unrecoverable
+            logger.error(f"Could not verify whether a channel canvas already exists: {e}",
+                         exc_info=True)
+            return _err("check_failed",
+                        "I couldn't check whether this channel already has a canvas, so I didn't "
+                        "create one — a duplicate channel canvas can't be undone. Try again in a "
+                        "moment.")
+        if existing:
+            return _err("already_exists",
+                        "This channel already has a canvas. Edit it with edit_canvas instead of "
+                        "creating another — a channel is meant to have exactly one.",
+                        canvas_id=existing)
 
-    try:
-        created = await _async(
-            web.conversations_canvases_create, channel_id=ctx.channel_id, title=title,
-            document_content={"type": "markdown",
-                              "markdown": _drop_repeated_title(title, markdown)})
-        canvas_id = created.get("canvas_id")
-    except Exception as e:  # noqa: BLE001
-        logger.error(f"conversations.canvases.create failed: {e}", exc_info=True)
-        return _err("create_failed", f"Slack refused to create the canvas: {e}")
+        try:
+            created = await _async(
+                web.conversations_canvases_create, channel_id=ctx.channel_id, title=title,
+                document_content={"type": "markdown",
+                                  "markdown": _drop_repeated_title(title, markdown)})
+            canvas_id = created.get("canvas_id")
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"conversations.canvases.create failed: {e}", exc_info=True)
+            return _err("create_failed", f"Slack refused to create the canvas: {e}")
 
-    if not canvas_id:
-        return _err("create_failed", "Slack created no canvas id.")
+        if not canvas_id:
+            return _err("create_failed", "Slack created no canvas id.")
+
+        # No canvases.access.set here, unlike a standalone canvas: the channel canvas belongs to
+        # the channel, so Slack shares it in on creation (files.info shows the channel under
+        # `shares` with source CHANNEL_TAB) and everyone who can see the channel can already see
+        # it. Invalidate inside the lock so the next check (ours or a sibling's) SEES this canvas.
+        _invalidate_catalog(ctx.channel_id)
 
     # F46: a canvas was really written — deliverable work that does not call claim_work. Force
     # a top-level channel reply into a thread at final-post time (resolve_reply_target).
@@ -856,10 +882,6 @@ async def execute_create_channel_canvas(ctx: ToolContext, args: Dict[str, Any]) 
     if _turn is not None:
         _turn.mark_substantive_work()
 
-    # No canvases.access.set here, unlike a standalone canvas: the channel canvas belongs to the
-    # channel, so Slack shares it in on creation (files.info shows the channel under `shares`
-    # with source CHANNEL_TAB) and everyone who can see the channel can already see it.
-    _invalidate_catalog(ctx.channel_id)   # the next turn must SEE the canvas we just made
     url = await _permalink(web, canvas_id)
     logger.info(f"Created the channel canvas {canvas_id} ({title!r}) in {ctx.channel_id}")
     return {"ok": True, "canvas_id": canvas_id, "title": title, "is_channel_canvas": True,

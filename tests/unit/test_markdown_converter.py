@@ -741,3 +741,64 @@ class TestDiagnostics:
         assert "*bold*" in result  # Bold converted
         assert "_italic_" in result  # Italic converted
         assert "`code`" in result  # Code preserved
+
+
+class TestLinkConversionEdgeCases:
+    """Regression tests for URL/link conversion (F24 trailing punctuation, F36 balanced parens)."""
+
+    def setup_method(self):
+        self.converter = MarkdownConverter("slack")
+
+    # --- F24: bare URLs must not swallow trailing sentence punctuation ---
+
+    def test_bare_url_trailing_period_excluded(self):
+        result = self.converter.convert("See https://example.com/page. Thanks")
+        assert "<https://example.com/page>" in result
+        assert "page.>" not in result
+
+    def test_bare_url_trailing_comma_excluded(self):
+        result = self.converter.convert("Try https://example.com/a, or not")
+        assert "<https://example.com/a>" in result
+        assert "a,>" not in result
+
+    def test_bare_url_various_trailing_punct(self):
+        for punct in ".,;:!?":
+            result = self.converter.convert(f"Link https://example.com/x{punct}")
+            assert "<https://example.com/x>" in result, f"failed for {punct!r}"
+            # the punctuation still rides just outside the wrapped link
+            assert f"<https://example.com/x>{punct}" in result
+
+    def test_bare_url_unbalanced_trailing_paren_excluded(self):
+        # URL sits inside a parenthetical: the closing ) belongs to the prose.
+        result = self.converter.convert("(see https://example.com/page)")
+        assert "<https://example.com/page>" in result
+        assert "page)>" not in result
+
+    def test_bare_url_balanced_parens_kept(self):
+        # Wikipedia-style URL whose own parens are balanced must stay intact.
+        result = self.converter.convert(
+            "https://en.wikipedia.org/wiki/Python_(programming_language)")
+        assert "<https://en.wikipedia.org/wiki/Python_(programming_language)>" in result
+
+    def test_bare_url_balanced_parens_then_period(self):
+        result = self.converter.convert(
+            "See https://en.wikipedia.org/wiki/Foo_(bar). Done")
+        assert "<https://en.wikipedia.org/wiki/Foo_(bar)>" in result
+        assert "(bar).>" not in result
+
+    # --- F36: [label](url) must handle parens inside the URL ---
+
+    def test_markdown_link_url_with_balanced_parens(self):
+        result = self.converter.convert(
+            "[Wiki](https://en.wikipedia.org/wiki/Foo_(bar))")
+        assert "<https://en.wikipedia.org/wiki/Foo_(bar)|Wiki>" in result
+
+    def test_markdown_link_plain_url_still_works(self):
+        result = self.converter.convert("[Google](https://google.com)")
+        assert "<https://google.com|Google>" in result
+
+    def test_markdown_link_paren_url_does_not_over_consume(self):
+        # A link followed by a parenthetical must not merge them.
+        result = self.converter.convert("[a](https://x.com) (aside)")
+        assert "<https://x.com|a>" in result
+        assert "(aside)" in result

@@ -46,6 +46,27 @@ def _ctx(entries=None, container="cntr_abc", data=b"region,rev\nEast,60000\n"):
 
 
 @pytest.mark.unit
+class TestContainerRecycled:
+    """F15: ToolContext.container_recycled() — the boolean the byte-pushing tools gate on."""
+
+    def test_false_when_sink_empty_or_none(self):
+        assert ToolContext(container_id="c1").container_recycled() is False
+        assert ToolContext(container_id="c1", container_gone_sink=[]).container_recycled() is False
+
+    def test_true_when_own_container_is_in_the_sink(self):
+        assert ToolContext(container_id="c1",
+                           container_gone_sink=["c1"]).container_recycled() is True
+
+    def test_false_for_a_different_dead_container(self):
+        assert ToolContext(container_id="c1",
+                           container_gone_sink=["c2"]).container_recycled() is False
+
+    def test_false_when_there_is_no_container(self):
+        assert ToolContext(container_id=None,
+                           container_gone_sink=["c1"]).container_recycled() is False
+
+
+@pytest.mark.unit
 class TestSchemaGating:
     def test_hidden_without_an_addressable_container(self):
         # Under {"type":"auto"} there is no id to push bytes into — offering the tool would
@@ -81,6 +102,28 @@ class TestExecute:
         assert result["path"] == "/mnt/data/sales.csv"
         raw.containers.files.create.assert_awaited_once()
         assert raw.containers.files.create.call_args.kwargs["container_id"] == "cntr_abc"
+
+    async def test_recycled_container_is_refused_without_uploading(self):
+        # F15: the sandbox idle-expired mid-turn and its id landed in container_gone_sink (the
+        # SAME list the API records dead containers into). Mounting into the corpse would be
+        # invisible to the model, so fail fast — no download, no container upload.
+        ctx, raw = _ctx()
+        ctx.container_gone_sink = ["cntr_abc"]  # == ctx.container_id
+        result = await file_mount.execute_mount_file(ctx, {"file_id": "file_doc_1"})
+
+        assert result["ok"] is False
+        assert result["error"] == "container_recycled"
+        ctx.client.download_file.assert_not_awaited()
+        raw.containers.files.create.assert_not_awaited()
+
+    async def test_unrelated_dead_container_does_not_block_mount(self):
+        # A different thread's dead container in the sink must not trip our live one.
+        ctx, raw = _ctx()
+        ctx.container_gone_sink = ["cntr_someone_else"]
+        result = await file_mount.execute_mount_file(ctx, {"file_id": "file_doc_1"})
+
+        assert result["ok"] is True
+        raw.containers.files.create.assert_awaited_once()
 
     async def test_an_unadvertised_id_is_refused(self):
         ctx, raw = _ctx()

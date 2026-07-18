@@ -2025,9 +2025,18 @@ class SlackMessagingMixin:
         except SlackApiError as e:
             # Handle msg_too_long error specifically
             if e.response.get('error') == 'msg_too_long':
-                self.log_warning("Message too long for Slack, truncating more aggressively")
-                # Try with much shorter message
-                very_short = formatted_text[:2000] + "\n\n*...continued in next message...*"
+                # Backstop only: the streaming handler (handlers/text.py) triggers its own
+                # overflow well before this (message_char_limit << 3700) and owns Part-N
+                # creation. If we still land here, this single chunk is over the API limit
+                # and there is no safe way to post the remainder from the messaging layer —
+                # we have no thread_ts, and an out-of-band post would race the handler's
+                # own chunk bookkeeping. So truncate HONESTLY: never promise a "next
+                # message" that nothing will post, and log the dropped tail loudly.
+                dropped = max(0, len(formatted_text) - 2000)
+                self.log_warning(
+                    f"update_message_streaming: msg_too_long backstop hit — truncating, "
+                    f"~{dropped} chars dropped (no continuation is posted from here)")
+                very_short = formatted_text[:2000].rstrip() + "\n\n*[truncated — too long for Slack]*"
                 if very_short.count('```') % 2 == 1:
                     very_short += '\n```'
                 

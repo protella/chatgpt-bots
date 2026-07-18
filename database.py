@@ -275,12 +275,18 @@ class DatabaseManager(LoggerMixin):
         # Thread summaries table — rolling compaction store for long threads.
         # summary_text covers everything at or before boundary_ts; refs_json preserves
         # structured references (files/images/links) from the summarized span.
+        # preserved_ts_json (F3): Slack ts of messages kept in live context (images/
+        # summarized docs — _should_preserve_message) that sit AT/BEHIND boundary_ts.
+        # They are neither summarized nor in the fetched tail, so a cold rebuild would
+        # drop them; recording their ts lets rebuild fetch + re-admit them across the
+        # boundary. Refs/metadata only — never transcript content (CLAUDE.md §5b).
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS thread_summaries (
                 thread_id TEXT PRIMARY KEY,
                 summary_text TEXT NOT NULL,
                 boundary_ts TEXT NOT NULL,
                 refs_json TEXT,
+                preserved_ts_json TEXT,
                 updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (thread_id) REFERENCES threads(thread_id) ON DELETE CASCADE
             )
@@ -750,6 +756,16 @@ class DatabaseManager(LoggerMixin):
                 """)
                 self.conn.commit()
                 self.log_info("DB: Successfully added message_ts column")
+
+        with self._migration_step("thread_summaries.preserved_ts_json"):
+            # F3: preserved-message ts refs behind the compaction boundary (see CREATE TABLE).
+            cursor = self.conn.execute("PRAGMA table_info(thread_summaries)")
+            ts_columns = [col[1] for col in cursor.fetchall()]
+            if ts_columns and 'preserved_ts_json' not in ts_columns:
+                self.log_info("DB: Adding preserved_ts_json column to thread_summaries")
+                self.conn.execute("ALTER TABLE thread_summaries ADD COLUMN preserved_ts_json TEXT")
+                self.conn.commit()
+                self.log_info("DB: Successfully added preserved_ts_json column")
 
         with self._migration_step("users.real_name"):
             # Check if real_name column exists in users table
@@ -1501,7 +1517,8 @@ class DatabaseManager(LoggerMixin):
         Get the compaction summary row for a thread, if one exists.
 
         Returns:
-            Dict with summary_text, boundary_ts, refs (parsed list), updated_ts — or None.
+            Dict with summary_text, boundary_ts, refs (parsed list), preserved_ts
+            (parsed list), updated_ts — or None.
         """
         cursor = self.conn.execute(
             "SELECT * FROM thread_summaries WHERE thread_id = ?", (thread_id,)
@@ -1511,10 +1528,15 @@ class DatabaseManager(LoggerMixin):
             return None
         summary = dict(row)
         summary["refs"] = json.loads(summary["refs_json"]) if summary.get("refs_json") else []
+        # NULL (legacy row, written before the column existed) stays None = "unknown", which the
+        # rebuild fails safe on; an explicit "[]" means verified-empty (fast tail-only path). F3.
+        _pts = summary.get("preserved_ts_json")
+        summary["preserved_ts"] = json.loads(_pts) if _pts is not None else None
         return summary
 
     def save_thread_summary(self, thread_id: str, summary_text: str, boundary_ts: str,
-                            refs: Optional[List[Dict]] = None):
+                            refs: Optional[List[Dict]] = None,
+                            preserved_ts: Optional[List[str]] = None):
         """
         Upsert the compaction summary for a thread (one row per thread, rolling).
 
@@ -1523,17 +1545,24 @@ class DatabaseManager(LoggerMixin):
             summary_text: Summary covering everything at or before boundary_ts
             boundary_ts: Slack ts of the newest message covered by the summary
             refs: Structured refs (files/images/links) from the summarized span
+            preserved_ts: Slack ts of preserved messages (images/summarized docs) kept
+                in live context but sitting at/behind boundary_ts (F3)
         """
         self.conn.execute("""
-            INSERT INTO thread_summaries (thread_id, summary_text, boundary_ts, refs_json, updated_ts)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO thread_summaries
+                (thread_id, summary_text, boundary_ts, refs_json, preserved_ts_json, updated_ts)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(thread_id) DO UPDATE SET
                 summary_text = excluded.summary_text,
                 boundary_ts = excluded.boundary_ts,
                 refs_json = excluded.refs_json,
+                preserved_ts_json = excluded.preserved_ts_json,
                 updated_ts = CURRENT_TIMESTAMP
         """, (thread_id, summary_text, boundary_ts,
-              json.dumps(refs) if refs else None))
+              json.dumps(refs) if refs else None,
+              # `is not None`, not truthiness: an explicit [] must persist as "[]" (verified
+              # empty), distinct from NULL (legacy/unknown). F3.
+              json.dumps(preserved_ts) if preserved_ts is not None else None))
         self.log_info(f"DB: Saved thread summary for {thread_id} (boundary_ts={boundary_ts})")
 
     def delete_thread_summary(self, thread_id: str):
@@ -2748,25 +2777,35 @@ class DatabaseManager(LoggerMixin):
                     return None
                 summary = dict(row)
                 summary["refs"] = json.loads(summary["refs_json"]) if summary.get("refs_json") else []
+                # NULL (legacy row) -> None = "unknown" (rebuild fails safe); "[]" -> verified
+                # empty (fast tail-only path). F3.
+                _pts = summary.get("preserved_ts_json")
+                summary["preserved_ts"] = json.loads(_pts) if _pts is not None else None
                 return summary
 
     async def save_thread_summary_async(self, thread_id: str, summary_text: str, boundary_ts: str,
-                                        refs: Optional[List[Dict]] = None):
+                                        refs: Optional[List[Dict]] = None,
+                                        preserved_ts: Optional[List[str]] = None):
         """Async version of save_thread_summary (upsert, rolling)."""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA journal_mode=WAL")
 
             await db.execute("""
-                INSERT INTO thread_summaries (thread_id, summary_text, boundary_ts, refs_json, updated_ts)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO thread_summaries
+                    (thread_id, summary_text, boundary_ts, refs_json, preserved_ts_json, updated_ts)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(thread_id) DO UPDATE SET
                     summary_text = excluded.summary_text,
                     boundary_ts = excluded.boundary_ts,
                     refs_json = excluded.refs_json,
+                    preserved_ts_json = excluded.preserved_ts_json,
                     updated_ts = CURRENT_TIMESTAMP
             """, (thread_id, summary_text, boundary_ts,
-                  json.dumps(refs) if refs else None))
+                  json.dumps(refs) if refs else None,
+                  # `is not None`: an explicit [] persists as "[]" (verified empty), distinct
+                  # from NULL (legacy/unknown). F3.
+                  json.dumps(preserved_ts) if preserved_ts is not None else None))
             await db.commit()
         self.log_info(f"DB: Saved thread summary for {thread_id} (boundary_ts={boundary_ts}, async)")
 
@@ -3858,6 +3897,62 @@ class DatabaseManager(LoggerMixin):
                     doc["metadata"] = json.loads(doc["metadata_json"])
                     del doc["metadata_json"]
                 return doc
+
+    async def get_document_for_rebuild_async(self, thread_id: str, filename: str,
+                                             file_id: Optional[str] = None,
+                                             message_ts: Optional[str] = None) -> Optional[Dict]:
+        """Resolve the document row for a SPECIFIC historical upload during rebuild (F12).
+
+        get_document_by_filename_async is newest-wins by filename, so two same-named
+        uploads in one thread both resolve to the newest file's summary/file_id after a
+        restart. Disambiguate with the identity we have in hand for the message we're
+        replaying: the Slack file_id (exact, survives same-name collisions), else the
+        nearest upload at/before this message's ts. Falls back to newest-by-filename so a
+        legacy row (no file_id, no message_ts) still resolves as before."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+
+            row = None
+            # 1. Exact Slack file_id — one upload, one row (renames don't fool it).
+            if file_id:
+                async with db.execute(
+                    """SELECT * FROM documents
+                       WHERE thread_id = ? AND file_id = ?
+                       ORDER BY created_at DESC, id DESC LIMIT 1""",
+                    (thread_id, file_id),
+                ) as cursor:
+                    row = await cursor.fetchone()
+            # 2. Nearest same-named upload at/before this message's ts. Slack ts sort
+            #    lexically only when equal-width, so compare as REAL.
+            if row is None and message_ts:
+                async with db.execute(
+                    """SELECT * FROM documents
+                       WHERE thread_id = ? AND filename = ? AND message_ts IS NOT NULL
+                         AND CAST(message_ts AS REAL) <= CAST(? AS REAL)
+                       ORDER BY CAST(message_ts AS REAL) DESC, id DESC LIMIT 1""",
+                    (thread_id, filename, message_ts),
+                ) as cursor:
+                    row = await cursor.fetchone()
+            # 3. Legacy fallback: newest row for the filename.
+            if row is None:
+                async with db.execute(
+                    """SELECT * FROM documents
+                       WHERE thread_id = ? AND filename = ?
+                       ORDER BY created_at DESC, id DESC LIMIT 1""",
+                    (thread_id, filename),
+                ) as cursor:
+                    row = await cursor.fetchone()
+
+            if not row:
+                return None
+            doc = dict(row)
+            if doc.get("page_structure"):
+                doc["page_structure"] = json.loads(doc["page_structure"])
+            if doc.get("metadata_json"):
+                doc["metadata"] = json.loads(doc["metadata_json"])
+                del doc["metadata_json"]
+            return doc
 
     async def get_or_create_thread_async(self, thread_id: str, channel_id: str,
                                          user_id: Optional[str] = None) -> Dict:

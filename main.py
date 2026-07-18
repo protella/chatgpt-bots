@@ -680,8 +680,10 @@ class ChatBotV2:
                         main_logger.debug("Empty text response (reaction-only) — nothing to post")
                     # If streaming was used, the message is already displayed
                     elif not response.metadata.get("streamed"):
-                        # Format and send text (top-level when placement chose channel)
-                        formatted_text = client.format_text(response.content)
+                        # Send raw content: send_message formats for the platform itself
+                        # (messaging.py). Pre-formatting here double-ran the converter, and
+                        # format_text is NOT idempotent (italic runs before bold, so a second
+                        # pass turns **bold** → *bold* → _bold_ and renders as italic).
                         # F8: attach the settings-footer chrome to the message itself (same
                         # as the native-streaming path's stopStream blocks) instead of a
                         # separate trailing post. Suppressed for top-level channel placement
@@ -699,7 +701,7 @@ class ChatBotV2:
                         sent_ts = await client.send_message(
                             message.channel_id,
                             post_thread_id,
-                            formatted_text,
+                            response.content,
                             blocks=footer_blocks,
                             meta_out=send_meta,
                         )
@@ -1010,7 +1012,11 @@ class ChatBotV2:
                             # carrying the expired note, so mark each for refresh (fail-soft per
                             # thread — a marking failure must not break the sweep loop).
                             try:
-                                swept_keys = self.processor.db.delete_expired_ambient_artifacts(
+                                # Off the event loop: the sweep deletes rows and can block.
+                                # SQLite is threadsafety-3 (serialized), so cross-thread use
+                                # is safe.
+                                swept_keys = await asyncio.to_thread(
+                                    self.processor.db.delete_expired_ambient_artifacts,
                                     days=config.ambient_artifact_retention_days)
                                 tm = getattr(self.processor, "thread_manager", None)
                                 if tm is not None and hasattr(tm, "mark_needs_refresh"):
@@ -1043,7 +1049,9 @@ class ChatBotV2:
                             # Isolated — a failed backup must never kill the cleanup
                             # worker or the bot.
                             try:
-                                self.processor.db.backup_database()
+                                # Off the event loop: conn.backup() can take hundreds of ms
+                                # and would otherwise freeze the bot for its duration.
+                                await asyncio.to_thread(self.processor.db.backup_database)
                                 main_logger.info("Scheduled database backup complete (7-day retention)")
                             except Exception as e:
                                 main_logger.error(f"Scheduled database backup FAILED: {e}")
@@ -1065,6 +1073,7 @@ class ChatBotV2:
         """Run the bot"""
         log_session_start()
 
+        fatal = False
         try:
             await self.initialize()
             self.running = True
@@ -1103,12 +1112,22 @@ class ChatBotV2:
                     pass
 
         except KeyboardInterrupt:
+            # Graceful: Ctrl-C / signal-driven shutdown is a clean stop, exit 0.
             main_logger.info("Received keyboard interrupt")
         except Exception as e:
-            main_logger.error(f"Unexpected error: {e}", exc_info=True)
+            # An UNEXPECTED fatal error — NOT a signal-driven shutdown (those schedule
+            # shutdown() via the handler and return cleanly, or raise CancelledError which
+            # the client.start() block above absorbs). Still run the graceful shutdown in
+            # `finally`, then exit non-zero so a supervisor (systemd/docker) sees a failure
+            # instead of a clean exit 0 that reads as "stopped on purpose".
+            main_logger.critical(f"Fatal error — bot is exiting: {e}", exc_info=True)
+            fatal = True
         finally:
             await self.shutdown()
-    
+
+        if fatal:
+            sys.exit(1)
+
     async def shutdown(self):
         """Shutdown the bot gracefully"""
         if not self.running:

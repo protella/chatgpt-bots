@@ -48,6 +48,24 @@ def _delivered_stream_ts(native_coord, native_finalized: bool,
     return current_message_id if content_delivered else None
 
 
+def _legacy_fallback_target(overflow: Optional[str], native_current_ts: Optional[str],
+                            current_message_id: Optional[str]) -> Optional[str]:
+    """F35: after the native sink fails mid-stream, decide which message id the LEGACY
+    fallback continues editing.
+
+    A failed ROLL (``overflow`` is not None) means the current native part already received
+    its first portion and was closed/abandoned, while the buffer now holds ONLY the remainder.
+    Editing that finished part with the remainder would overwrite its first ~3000 chars, so
+    return None to force the legacy path to SEED A NEW continuation message.
+
+    A non-roll inert failure (``overflow`` is None) leaves the current native message as the
+    live surface, so keep editing it (its ts, falling back to the existing id) — nothing
+    visible is lost."""
+    if overflow is not None:
+        return None
+    return native_current_ts or current_message_id
+
+
 def native_stream_place_in_channel(message: Message) -> bool:
     """Whether the native-stream coordinator should target the channel top level
     (thread_ts None) instead of the thread — this must MATCH where main.py will
@@ -215,7 +233,8 @@ class TextHandlerMixin:
 
     def _build_tool_context(self, message: Message, client: BaseClient,
                             request_config: Optional[dict] = None,
-                            ci_container=None, turn=None) -> ToolContext:
+                            ci_container=None, turn=None,
+                            container_gone_sink: Optional[List[str]] = None) -> ToolContext:
         """Per-request context handed to local tool executors."""
         meta = message.metadata or {}
         channel_id = message.channel_id
@@ -247,6 +266,9 @@ class TextHandlerMixin:
             # the tools array — an image mounted anywhere else is invisible to the model.
             thread_config=cfg,
             container_id=ci_container if isinstance(ci_container, str) else None,
+            # F15: the SAME list the API's container-recovery extends, so an executor can see
+            # its container die mid-turn (container_recycled fail-fast) instead of retrying dead.
+            container_gone_sink=container_gone_sink,
             image_catalog=cfg.get(image_tools.CATALOG_KEY) or [],
             sandbox_image_assets=[],
             # F35: what mount_file may pull into the sandbox, and what it actually did.
@@ -503,7 +525,8 @@ class TextHandlerMixin:
                 # web_search/MCP in the same tools array). Hold the tool_context so we can
                 # read back F30.1's background_job_started signal after the loop.
                 tool_context = self._build_tool_context(message, client, request_config,
-                                                        ci_container, turn=turn)
+                                                        ci_container, turn=turn,
+                                                        container_gone_sink=containers_gone)
                 result = await self.openai_client.create_text_response_with_tool_loop(
                     messages=messages_for_api,
                     tools=tools,
@@ -550,6 +573,10 @@ class TextHandlerMixin:
                         store=False,
                         timeout_seconds=retry_timeout,
                         return_metadata=True,
+                        prompt_cache_key=thread_key,
+                        usage_sink=usage_info,
+                        mcp_tools_sink=mcp_discovered,
+                        mcp_results_sink=mcp_results,
                         artifacts_sink=artifacts,
                         container_gone_sink=containers_gone
                     )
@@ -819,6 +846,24 @@ class TextHandlerMixin:
                     self.log_debug(f"Could not delete message {ts} during {context} cleanup")
             except Exception as e:
                 self.log_debug(f"Error deleting message {ts} during {context} cleanup: {e}")
+
+    async def _post_overflow_part(self, client, channel_id: str, reply_target: Optional[str],
+                                  continuation_text: str) -> Optional[str]:
+        """F21: post a streaming overflow continuation (Part N) as a NEW message, with one retry.
+
+        Returns the new message ts on success, or None if both attempts fail. A None return
+        means "could not create the continuation" — the caller must NEVER fall back to editing
+        the PRIOR part's message id with the overflow text, because that overwrites the
+        already-delivered first part."""
+        result = await client.send_message_get_ts(channel_id, reply_target, continuation_text)
+        if result and result.get("success") and "ts" in result:
+            return result["ts"]
+        self.log_warning("Overflow continuation post failed - retrying once")
+        await asyncio.sleep(1.0)
+        result = await client.send_message_get_ts(channel_id, reply_target, continuation_text)
+        if result and result.get("success") and "ts" in result:
+            return result["ts"]
+        return None
 
     async def _handle_streaming_text_response(self, user_content: Any, thread_state, client: BaseClient,
                                       message: Message, thinking_id: Optional[str] = None,
@@ -1330,11 +1375,18 @@ class TextHandlerMixin:
                 buffer.update_interval_setting(rate_limiter.get_current_interval())
                 current_message_id = native_coord.current_ts or current_message_id
             else:
-                # Went inert mid-stream: legacy edits continue on the native message so
-                # nothing visible is lost.
+                # F35: a failed ROLL (overflow present) closed the current native part with only
+                # its first portion; the buffer now holds ONLY the remainder. Continuing legacy
+                # edits on that finished part would overwrite its first ~3000 chars, so
+                # _legacy_fallback_target returns None to force a NEW continuation message. A
+                # non-roll inert failure keeps editing the still-live current part.
                 rate_limiter.record_failure(is_rate_limit=False)
-                current_message_id = native_coord.current_ts or current_message_id
-                self.log_warning("Native stream went inert — continuing with legacy updates")
+                current_message_id = _legacy_fallback_target(
+                    overflow, native_coord.current_ts, current_message_id)
+                if overflow is not None:
+                    self.log_warning("Native roll failed mid-stream — legacy fallback will post a new continuation message")
+                else:
+                    self.log_warning("Native stream went inert — continuing with legacy updates")
 
         # Define the streaming callback
         async def stream_callback(text_chunk: str):
@@ -1569,40 +1621,36 @@ class TextHandlerMixin:
                             
                             continuation_text = f"{part_prefix(current_part)}{continuation_display} {config.loading_ellipse_emoji}"
 
-                            # Send new message and get its ID. F38: overflow parts go where the
-                            # REPLY goes. This used to pass `thinking_id` as the thread id,
-                            # which on a top-level channel reply nested part 2 in a thread
-                            # under part 1.
-                            new_msg_result = await client.send_message_get_ts(message.channel_id, reply_target, continuation_text)
-                            if new_msg_result and new_msg_result.get("success") and "ts" in new_msg_result:
-                                current_message_id = new_msg_result["ts"]
+                            # Post a NEW message for the overflow part (with one retry). F38:
+                            # overflow parts go where the REPLY goes — passing thinking_id as the
+                            # thread id used to nest part 2 in a thread under part 1.
+                            new_ts = await self._post_overflow_part(
+                                client, message.channel_id, reply_target, continuation_text)
+                            if new_ts:
+                                current_message_id = new_ts
                                 # Reset buffer with the properly fenced overflow content
                                 buffer.reset()
                                 buffer.add_chunk(overflow_with_fence)
                                 buffer.mark_updated()
                                 self.log_info(f"Created overflow message part {current_part}, reopened code block: {was_in_code_block}")
                             else:
-                                # Couldn't get message ID due to async limitations
-                                # Continue without overflow handling (message will be sent but we can't track it)
-                                self.log_warning(f"Could not get message ID for overflow part {current_part} - continuing with current message")
-
-                                # Clean up the thinking emoji from the current message before continuing
-                                # The current message still has the thinking emoji and initial text,
-                                # but we need to replace it with just the overflow content
+                                # F21: the Part-2 post failed even on retry. current_message_id STILL
+                                # points at Part 1 (it is reassigned only in the success branch above).
+                                # The old code then edited current_message_id with the OVERFLOW text —
+                                # overwriting Part 1's first ~3000 chars with the second half of the
+                                # answer. NEVER edit Part 1 with overflow content: keep Part 1 intact
+                                # and abort, swapping only its continuation indicator for an
+                                # interruption notice (mirrors the overflow-update abort path above,
+                                # which returns an error response so no incomplete data is saved).
+                                self.log_error(f"Overflow part {current_part} post failed - keeping Part 1 intact and aborting stream")
+                                current_part -= 1  # the new part was never created
+                                streaming_aborted = True
+                                error_msg = f"{final_first_part}\n\n{config.error_emoji} *Streaming interrupted at message overflow. Partial response shown above.*"
                                 try:
-                                    clean_overflow_text = overflow_with_fence
-                                    cleanup_result = await client.update_message_streaming(message.channel_id, current_message_id, f"{clean_overflow_text} {config.loading_ellipse_emoji}")
-                                    if cleanup_result["success"]:
-                                        self.log_info("Cleaned thinking emoji from current message after overflow failure")
-                                    else:
-                                        self.log_warning(f"Failed to clean thinking emoji after overflow failure: {cleanup_result.get('error', 'Unknown error')}")
-                                except Exception as cleanup_error:
-                                    self.log_error(f"Error cleaning thinking emoji after overflow failure: {cleanup_error}")
-
-                                # Reset buffer but keep using current message ID
-                                buffer.reset()
-                                buffer.add_chunk(overflow_with_fence)
-                                buffer.mark_updated()
+                                    await client.update_message_streaming(message.channel_id, current_message_id, error_msg)
+                                except Exception:
+                                    pass
+                                return
                     except Exception as e:
                         self.log_error(f"Error handling message overflow: {e}")
                 else:
@@ -1794,7 +1842,8 @@ class TextHandlerMixin:
                 # rounds don't stream text; the final round streams normally). Hold the
                 # tool_context so we can read back F30.1's background_job_started signal.
                 tool_context = self._build_tool_context(message, client, request_config,
-                                                        ci_container, turn=turn)
+                                                        ci_container, turn=turn,
+                                                        container_gone_sink=containers_gone)
                 loop_result = await self.openai_client.create_streaming_response_with_tool_loop(
                     messages=messages_for_api,
                     tools=tools,

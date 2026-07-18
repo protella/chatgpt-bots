@@ -371,3 +371,92 @@ async def test_dispatch_routes_new_tools(bot, name, args, client_attr):
     res = await bot.dispatch_history_tool_call(name, args)
     assert res["ok"] is True
     getattr(bot.app.client, client_attr).assert_called()
+
+
+# --- F20: thread branch returns the NEWEST window (root + newest replies), not the oldest ---
+
+@pytest.mark.asyncio
+async def test_thread_returns_root_plus_newest_when_over_limit(bot):
+    """A thread longer than the limit keeps the root (context) + the newest replies,
+    since conversations_replies returns ascending-from-root."""
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    # 6 messages ascending: root, r1..r5
+    msgs = [{"user": "U", "ts": f"1.{i}", "text": f"m{i}"} for i in range(6)]
+    bot.app.client.conversations_replies.return_value = {"messages": msgs}
+    res = await bot.fetch_history_tool("C1", limit=3, thread_ts="1.0")
+    assert res["ok"] is True
+    texts = [m["text"] for m in res["messages"]]
+    # root + newest 2 (m0, then m4, m5) — never the oldest window (m0, m1, m2).
+    assert texts == ["m0", "m4", "m5"]
+    assert res["has_more"] is True
+    assert "note" in res  # truthful "newest window" note now applies
+
+
+@pytest.mark.asyncio
+async def test_thread_fetches_full_thread_not_limited(bot):
+    """The API call must NOT cap at n (that would keep the oldest n); it fetches the
+    thread so the tail can be taken locally."""
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_replies.return_value = {"messages": []}
+    await bot.fetch_history_tool("C1", limit=5, thread_ts="1.0")
+    kw = bot.app.client.conversations_replies.call_args.kwargs
+    assert kw["limit"] != 5  # not the model's requested slice size
+    assert kw["limit"] >= 1000
+
+
+@pytest.mark.asyncio
+async def test_thread_under_limit_returns_all(bot):
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    msgs = [{"user": "U", "ts": f"1.{i}", "text": f"m{i}"} for i in range(3)]
+    bot.app.client.conversations_replies.return_value = {"messages": msgs}
+    res = await bot.fetch_history_tool("C1", limit=10, thread_ts="1.0")
+    assert [m["text"] for m in res["messages"]] == ["m0", "m1", "m2"]
+    assert res["has_more"] is False
+
+
+@pytest.mark.asyncio
+async def test_thread_paginates_until_cursor_exhausted(bot):
+    """F20 remediation: a thread longer than one page must be paged via the response
+    cursor so the NEWEST messages (final page) are returned, not the first page's oldest."""
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    page1 = {"messages": [{"user": "U", "ts": f"1.{i}", "text": f"m{i}"} for i in range(3)],
+             "response_metadata": {"next_cursor": "CUR1"}}
+    page2 = {"messages": [{"user": "U", "ts": f"1.{i}", "text": f"m{i}"} for i in range(3, 6)]}
+    bot.app.client.conversations_replies.side_effect = [page1, page2]
+    res = await bot.fetch_history_tool("C1", limit=2, thread_ts="1.0")
+    assert res["ok"] is True
+    # both pages fetched; the second call carried the cursor from the first page.
+    assert bot.app.client.conversations_replies.await_count == 2
+    second_call = bot.app.client.conversations_replies.call_args_list[1]
+    assert second_call.kwargs.get("cursor") == "CUR1"
+    # newest window across BOTH pages: root (m0) + newest 1 (m5).
+    assert [m["text"] for m in res["messages"]] == ["m0", "m5"]
+    assert res["has_more"] is True
+
+
+@pytest.mark.asyncio
+async def test_thread_pagination_capped_notes_truncation(bot, monkeypatch):
+    """F20 remediation: hitting the page cap before the cursor drains sets has_more and
+    an HONEST note that the newest window may be incomplete (we couldn't reach the end)."""
+    import slack_client.history_tool as ht
+    monkeypatch.setattr(ht, "_MAX_THREAD_PAGES", 2)
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    # Every page returns a cursor, so the thread never drains within the cap.
+    page = {"messages": [{"user": "U", "ts": "1.1", "text": "x"}],
+            "response_metadata": {"next_cursor": "MORE"}}
+    bot.app.client.conversations_replies.return_value = page
+    res = await bot.fetch_history_tool("C1", limit=5, thread_ts="1.0")
+    assert bot.app.client.conversations_replies.await_count == 2  # capped, not infinite
+    assert res["has_more"] is True
+    assert "longer than" in res["note"]
+
+
+@pytest.mark.asyncio
+async def test_thread_single_page_makes_one_call(bot):
+    """A thread that fits one page (no cursor) must not make a second request."""
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_replies.return_value = {
+        "messages": [{"user": "U", "ts": "1.1", "text": "only"}]}
+    res = await bot.fetch_history_tool("C1", limit=10, thread_ts="1.0")
+    assert bot.app.client.conversations_replies.await_count == 1
+    assert res["has_more"] is False

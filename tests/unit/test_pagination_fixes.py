@@ -233,9 +233,19 @@ async def test_get_thread_history_passes_oldest():
 
 
 def test_rebuild_passes_boundary_as_oldest():
+    # R4 + F3: a summary-tail rebuild still fetches only the tail (oldest=boundary) when
+    # nothing is at risk, but falls back to a FULL fetch when preserved messages
+    # (images/summarized docs) sit at/behind the boundary — Slack's `oldest` is
+    # exclusive-after, so those messages can't be reached any other way. Behavioral
+    # coverage of both branches lives in test_stateless_context.py
+    # (test_rebuild_tail_only_when_no_preserved_ts / _readmits_preserved_image_behind_boundary).
     import message_processor.thread_management as tm
     src = inspect.getsource(tm.ThreadManagementMixin._get_or_rebuild_thread_state)
-    assert 'oldest=(summary_row["boundary_ts"]' in src
+    # Tail-only path still passes the boundary as oldest...
+    assert 'fetch_oldest = summary_row["boundary_ts"]' in src
+    # ...gated on there being nothing preserved behind the boundary.
+    assert 'not preserved_behind_boundary' in src
+    assert 'oldest=fetch_oldest' in src
 
 
 # ---------------- R5: has_more ----------------
@@ -335,3 +345,25 @@ def test_overflow_completion_flush_handles_oversize():
     assert "entity_safe_cut(final_part_text, 3800)" in window
     assert "send_message(" in window  # remainder actually posts
     assert "CONTINUATION_HEAD" in window
+
+
+@pytest.mark.asyncio
+async def test_streaming_msg_too_long_backstop_is_honest():
+    """F34: the update_message_streaming msg_too_long backstop truncates HONESTLY —
+    it must not promise a 'continued in next message' that nothing ever posts."""
+    b = _Bot()
+    updates = []
+
+    async def update(channel, ts, text, **kw):
+        updates.append(text)
+        if len(updates) == 1:
+            raise _slack_error(error="msg_too_long", status=400)
+        return {"ok": True}
+
+    b.app.client.chat_update = AsyncMock(side_effect=update)
+    res = await b.update_message_streaming("C1", "ts1", "x" * 5000)
+    assert res["success"] is True
+    fallback = updates[-1]
+    assert "continued in next message" not in fallback.lower()
+    assert "truncated" in fallback.lower()
+    assert len(fallback) < 5000  # the remainder was dropped, not silently promised

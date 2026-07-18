@@ -330,6 +330,8 @@ class _Proc(MessageUtilitiesMixin):
         self.db = None
         self.document_handler = None
         self.image_url_handler = MagicMock()
+        # Real int so the F5 pre-download gate / F19 post-transcode ceiling can compare.
+        self.image_url_handler.max_image_size = 20 * 1024 * 1024
         self.thread_manager = MagicMock()
         for name in ("log_info", "log_debug", "log_warning", "log_error"):
             setattr(self, name, MagicMock())

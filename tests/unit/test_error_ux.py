@@ -131,6 +131,7 @@ def _utils_self():
     fake.db = None
     fake.document_handler = None
     fake.image_url_handler = MagicMock()
+    fake.image_url_handler.max_image_size = 20 * 1024 * 1024
     fake.image_url_handler.process_urls_from_text = AsyncMock(return_value=([], []))
     fake._extract_slack_file_urls = MagicMock(return_value=[])
     return fake

@@ -103,33 +103,22 @@ class TestImageURLHandlerMethods:
     
     @pytest.mark.asyncio
     async def test_validate_image_url_valid(self):
-        """Test validating a valid image URL (aiohttp session mocked)"""
+        """validate_image_url is now a no-network shape check for every host (the guarded download
+        is the real gate), so a well-formed URL passes without touching the session — and never
+        sends an authenticated HEAD that a redirect could leak off-host."""
         from image_url_handler import ImageURLHandler
 
         handler = ImageURLHandler()
 
-        class FakeResponse:
-            status = 200
-            headers = {'content-type': 'image/jpeg'}
+        def _boom():
+            raise AssertionError("validate_image_url must not touch the network")
 
-        class FakeHeadCM:
-            async def __aenter__(self):
-                return FakeResponse()
-
-            async def __aexit__(self, exc_type, exc, tb):
-                return False
-
-        fake_session = Mock()
-        fake_session.head = Mock(return_value=FakeHeadCM())
-
-        with patch.object(handler, '_get_session', return_value=fake_session):
+        with patch.object(handler, '_get_session', side_effect=_boom):
             is_valid, mimetype, error = await handler.validate_image_url(
-                "https://example.com/image.jpg"
+                "https://files.slack.com/image.jpg", auth_token="xoxb-secret"
             )
 
-        assert is_valid is True
-        assert mimetype == "image/jpeg"  # Returns mimetype, not URL
-        assert error is None
+        assert (is_valid, mimetype, error) == (True, None, None)
 
     @pytest.mark.asyncio
     async def test_validate_image_url_invalid(self):

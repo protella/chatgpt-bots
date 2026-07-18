@@ -23,6 +23,32 @@ def _capture_usage(usage_sink, response):
     usage_sink["output_tokens"] = getattr(usage, "output_tokens", 0) or 0
 
 
+def _incomplete_reason(response) -> str:
+    """Best-effort reason string from a `response.incomplete` terminal event."""
+    details = getattr(response, "incomplete_details", None)
+    if details is None:
+        return "unknown"
+    reason = getattr(details, "reason", None)
+    if reason is None and isinstance(details, dict):
+        reason = details.get("reason")
+    return reason or "unknown"
+
+
+def _stream_failure_error(response) -> Exception:
+    """Build the exception a `response.failed` terminal event should raise.
+
+    A failed stream is a real error, so — like the non-streaming path — it propagates to the
+    caller. We surface the API's own error code/message when it carries one."""
+    error = getattr(response, "error", None)
+    code = getattr(error, "code", None)
+    message = getattr(error, "message", None)
+    if isinstance(error, dict):
+        code = error.get("code", code)
+        message = error.get("message", message)
+    detail = message or code or "response.failed with no error detail"
+    return RuntimeError(f"OpenAI streaming response failed: {detail}")
+
+
 async def _create_with_container_recovery(self, request_params: Dict[str, Any],
                                          operation_type: str,
                                          container_gone_sink: Optional[List[str]] = None,
@@ -541,6 +567,9 @@ async def create_streaming_response(
         )
 
         complete_text = ""
+        # A `response.failed` terminal event records its error here; we flush the callback
+        # first (below) and raise it after the loop so it propagates like any other API error.
+        stream_error: Optional[Exception] = None
 
         # Process streaming events with timeout protection
         async for event in self._safe_stream_iteration(response, operation_type):
@@ -599,11 +628,27 @@ async def create_streaming_response(
                                 except Exception as e:
                                     self.log_warning(f"Tool callback error for MCP completion: {e}")
                     continue
-                elif event_type in ["response.done", "response.completed"]:
-                    _capture_usage(usage_sink, getattr(event, "response", None))
-                    self.log_info("Stream completed")
-                    # Signal the callback that streaming is complete with None
-                    # This allows it to flush any remaining buffered text
+                elif event_type in ["response.done", "response.completed",
+                                     "response.incomplete", "response.failed"]:
+                    resp = getattr(event, "response", None)
+                    # Usage rides the terminal event's response object on every outcome, not
+                    # just success — capture it so token budgeting doesn't fall back to chars/4.
+                    _capture_usage(usage_sink, resp)
+                    if event_type == "response.failed":
+                        stream_error = _stream_failure_error(resp)
+                        self.log_error(
+                            f"Stream failed after {len(complete_text)} chars: {stream_error}")
+                    elif event_type == "response.incomplete":
+                        # Truncated (e.g. max_output_tokens / content filter) but the partial
+                        # text is real — return it, exactly as the non-streaming path returns
+                        # whatever text a response carries regardless of status.
+                        self.log_warning(
+                            f"Stream incomplete ({_incomplete_reason(resp)}) after "
+                            f"{len(complete_text)} chars")
+                    else:
+                        self.log_info("Stream completed")
+                    # Always signal completion so the callback flushes any buffered text — a
+                    # failed/incomplete stream that skips this leaves the buffer stuck forever.
                     try:
                         result = stream_callback(None)
                         # If the callback returns a coroutine, await it
@@ -666,11 +711,15 @@ async def create_streaming_response(
                 else:
                     # Only log unhandled events for debugging
                     pass
-                    
+
             except Exception as event_error:
                 self.log_warning(f"Error processing stream event: {event_error}")
                 continue
 
+        # A failed terminal event is raised here (outside the per-event try that would have
+        # swallowed it) so it propagates like every other API error.
+        if stream_error is not None:
+            raise stream_error
         self.log_info(f"Generated streaming response: {len(complete_text)} chars")
         return complete_text
         
@@ -801,6 +850,9 @@ async def create_streaming_response_with_tools(
         # Tool-loop round state: once a local function_call appears in this round, further
         # text deltas are preamble ("let me check…") — don't stream them to the user.
         saw_function_call = False
+        # A `response.failed` terminal event records its error here; it is raised after the
+        # loop (a hard failure has no next round) so it propagates like any other API error.
+        stream_error: Optional[Exception] = None
 
         async def _emit_tool_event(payload: Dict[str, Any]) -> None:
             """F30.1: hand a structured server-tool event to an internal observer (the deep
@@ -921,17 +973,33 @@ async def create_streaming_response_with_tools(
                             # `sandbox:` links that would produce a citation.
                             _note_container(artifacts_sink, item)
                     continue
-                elif event_type in ["response.done", "response.completed"]:
-                    _capture_usage(usage_sink, getattr(event, "response", None))
-                    self.log_info("Stream completed")
-                    # When the round produced local function calls, the tool loop will run
-                    # another round — don't signal completion to the buffer yet.
-                    # (Keyed on actual function calls; reasoning-only sink entries must
-                    # not suppress the final flush.)
-                    if saw_function_call:
+                elif event_type in ["response.done", "response.completed",
+                                     "response.incomplete", "response.failed"]:
+                    resp = getattr(event, "response", None)
+                    # Usage rides the terminal event's response object on every outcome, not
+                    # just success — capture it so token budgeting doesn't fall back to chars/4.
+                    _capture_usage(usage_sink, resp)
+                    if event_type == "response.failed":
+                        stream_error = _stream_failure_error(resp)
+                        self.log_error(
+                            f"Stream failed after {len(complete_text)} chars: {stream_error}")
+                    elif event_type == "response.incomplete":
+                        self.log_warning(
+                            f"Stream incomplete ({_incomplete_reason(resp)}) after "
+                            f"{len(complete_text)} chars")
+                    else:
+                        self.log_info("Stream completed")
+                    # Only a NORMAL completion with local function calls defers the flush — the
+                    # tool loop will run another round, so the buffered text isn't final yet.
+                    # An incomplete or failed terminal has no next round, so it must still flush
+                    # (and, for failed, raise) even when a function call was seen this round —
+                    # otherwise the buffer stays stuck. (Keyed on actual function calls;
+                    # reasoning-only sink entries must not suppress the final flush.)
+                    if saw_function_call and event_type in ("response.done", "response.completed"):
                         break
-                    # Signal the callback that streaming is complete with None
-                    # This allows it to flush any remaining buffered text
+                    # Signal the callback that streaming is complete with None so it flushes
+                    # any buffered text — a failed/incomplete stream that skips this leaves the
+                    # buffer stuck forever.
                     try:
                         result = stream_callback(None)
                         # If the callback returns a coroutine, await it
@@ -999,6 +1067,10 @@ async def create_streaming_response_with_tools(
                 self.log_warning(f"Error processing stream event: {event_error}")
                 continue
 
+        # A failed terminal event is raised here (outside the per-event try that would have
+        # swallowed it) so it reaches the outer handler and propagates like any other error.
+        if stream_error is not None:
+            raise stream_error
         self.log_info(f"Generated streaming response with tools: {len(complete_text)} chars")
         return complete_text
         
@@ -1642,6 +1714,10 @@ async def _create_text_response_with_tools_with_timeout(
     return_metadata: bool = False,
     function_call_sink: Optional[List[Dict[str, Any]]] = None,
     tool_choice: Optional[str] = None,
+    prompt_cache_key: Optional[str] = None,
+    usage_sink: Optional[Dict[str, Any]] = None,
+    mcp_tools_sink: Optional[Dict[str, Any]] = None,
+    mcp_results_sink: Optional[List[Dict[str, Any]]] = None,
     artifacts_sink: Optional[List[Dict[str, Any]]] = None,
     container_gone_sink: Optional[List[str]] = None
 ) -> str:
@@ -1707,6 +1783,14 @@ async def _create_text_response_with_tools_with_timeout(
     else:
         request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
 
+    # Prompt caching — parity with the non-timeout twin. gpt-5.5 keeps the explicit 24h
+    # retention param; the 5.6 family uses implicit caching, and the per-thread cache key still
+    # routes repeat calls to the same cache shard.
+    if model.startswith("gpt-5.5"):
+        request_params["prompt_cache_retention"] = "24h"
+    if prompt_cache_key and (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")):
+        request_params["prompt_cache_key"] = prompt_cache_key
+
     self.log_debug(f"Creating text response with tools and custom timeout {timeout_seconds}s, model {model}, tools: {tools}")
 
     try:
@@ -1720,6 +1804,10 @@ async def _create_text_response_with_tools_with_timeout(
             container_gone_sink=container_gone_sink,
             timeout_seconds=timeout_seconds,
         )
+
+        # Usage-driven context budgeting must not degrade on the retry path — parity with the
+        # non-timeout twin. Without this, a retried turn silently falls back to chars/4.
+        _capture_usage(usage_sink, response)
 
         # Extract text from response and detect tool usage
         output_text = ""
@@ -1736,6 +1824,11 @@ async def _create_text_response_with_tools_with_timeout(
                         tools_actually_used.append(server_label)
                     elif not server_label and "mcp" not in tools_actually_used:
                         tools_actually_used.append("mcp")
+                    # F12: capture the completed call's output text (MCP results are external
+                    # derived artifacts, safe to persist). Skip errored/empty calls. Parity with
+                    # the non-timeout twin — without this, a retry silently drops tool-result
+                    # memory.
+                    _capture_mcp_result(mcp_results_sink, item, server_label)
                 elif item_type == "web_search_call":
                     if "web_search" not in tools_actually_used:
                         tools_actually_used.append("web_search")
@@ -1767,6 +1860,10 @@ async def _create_text_response_with_tools_with_timeout(
                         "type": "reasoning",
                         "item": item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else None,
                     })
+                elif item_type == "mcp_list_tools" and mcp_tools_sink is not None:
+                    # Tool discovery payload — informational cache (server -> tools). Parity with
+                    # the non-timeout twin — without this, a retry silently drops discovery.
+                    _collect_mcp_list_tools(mcp_tools_sink, item)
 
                 # Extract text content
                 if hasattr(item, "content") and item.content:

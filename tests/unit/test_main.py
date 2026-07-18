@@ -149,9 +149,12 @@ class TestChatBotV2MessageHandling:
         client.send_thinking_indicator.assert_called_once()
         client.delete_message.assert_called_once_with("C123", "thinking_123")
         
-        # Verify message sent
-        client.format_text.assert_called_once_with("Hello world")
+        # F11: main.py must NOT pre-format. send_message owns the single conversion
+        # point (format_text is not idempotent — a second pass renders bold as italic),
+        # so raw content flows straight through.
+        client.format_text.assert_not_called()
         client.send_message.assert_called_once()
+        assert client.send_message.call_args.args[2] == "Hello world"
     
     @pytest.mark.asyncio
     async def test_handle_message_streamed_response(self, bot):
@@ -316,6 +319,21 @@ class TestChatBotV2CleanupThread:
         # Verify the method was called (it's a mock)
         bot.processor.thread_manager.cleanup_old_threads.assert_called_with(max_age=48 * 3600)
 
+    def test_blocking_db_ops_offloaded_to_thread(self):
+        """F29: the ambient-artifact sweep and the DB backup are blocking (conn.backup can
+        take hundreds of ms); they must run via asyncio.to_thread, not on the event loop."""
+        import inspect
+        import re
+        import main
+
+        src = inspect.getsource(main.ChatBotV2.start_cleanup_task)
+        assert re.search(
+            r"to_thread\(\s*self\.processor\.db\.delete_expired_ambient_artifacts", src), \
+            "ambient-artifact sweep must be offloaded via asyncio.to_thread"
+        assert re.search(
+            r"to_thread\(\s*self\.processor\.db\.backup_database", src), \
+            "database backup must be offloaded via asyncio.to_thread"
+
 
 class TestChatBotV2Lifecycle:
     """Test bot lifecycle management"""
@@ -368,13 +386,15 @@ class TestChatBotV2Lifecycle:
         mock_config.validate.return_value = None
         mock_client = Mock(db=Mock())
         mock_slackbot_class.return_value = mock_client
+        mock_processor_class.return_value.mcp_manager.has_mcp_servers.return_value = False
         mock_client.start.side_effect = KeyboardInterrupt()
 
         await bot.run()
 
-        # Should handle gracefully
+        # Should handle gracefully — a signal/Ctrl-C stop is exit 0, never sys.exit(1) (F31).
         mock_log_start.assert_called_once()
         mock_log_end.assert_called_once()
+        mock_exit.assert_not_called()
     
     @patch('main.sys.exit')
     @patch('main.log_session_end')
@@ -389,14 +409,17 @@ class TestChatBotV2Lifecycle:
         mock_config.validate.return_value = None
         mock_client = Mock(db=Mock())
         mock_slackbot_class.return_value = mock_client
+        mock_processor_class.return_value.mcp_manager.has_mcp_servers.return_value = False
         mock_client.start.side_effect = Exception("Unexpected error")
 
         await bot.run()
 
-        # Should handle gracefully
+        # F31: graceful shutdown still runs, but an UNEXPECTED fatal error must then
+        # exit non-zero so a supervisor sees the failure (not a clean exit 0).
         mock_log_start.assert_called_once()
         mock_log_end.assert_called_once()
-    
+        mock_exit.assert_called_once_with(1)
+
     @pytest.mark.asyncio
     async def test_shutdown(self, bot):
         """Test shutdown process"""

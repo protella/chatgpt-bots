@@ -246,7 +246,25 @@ class MessageProcessor(ThreadManagementMixin,
                 message, client, thinking_id,
                 code_interpreter_enabled=thread_config.get(
                     'enable_code_interpreter', config.enable_code_interpreter))
-            
+
+            # T2-10: a catch-up trigger carries EARLIER batched messages' already-processed image
+            # parts and attachment failures (staged in _dispatch_pending_batch — re-downloading
+            # here would be wasteful). Merge failures into unsupported_files so the notice below
+            # acknowledges them, and fold the image parts into THIS turn's image_inputs so the
+            # model can actually see them. The trigger's OWN images win the per-turn slots;
+            # earlier-batch images fill what's left; any overflow is noted in the text.
+            batched_image_inputs = (message.metadata or {}).get("batched_image_inputs") or []
+            batched_unsupported = (message.metadata or {}).get("batched_unsupported_files") or []
+            if batched_unsupported:
+                unsupported_files = list(unsupported_files) + list(batched_unsupported)
+            batched_images_omitted = 0
+            if batched_image_inputs:
+                image_cap = 10  # matches _process_attachments' max_images (utilities.py)
+                room = max(0, image_cap - len(image_inputs))
+                if room:
+                    image_inputs = list(image_inputs) + list(batched_image_inputs[:room])
+                batched_images_omitted = max(0, len(batched_image_inputs) - room)
+
             # Files that were accepted but couldn't be fetched/processed create an
             # obligation: use them or tell the user they failed — never answer as
             # if they were never attached.
@@ -257,9 +275,23 @@ class MessageProcessor(ThreadManagementMixin,
                 # If there's also text, images, or documents, continue processing those
                 if (message.text and message.text.strip()) or image_inputs or document_inputs:
                     unsupported_msg += "\n\nI'll process your text/image/document request now."
-                    # Add the unsupported files warning to conversation
+                    # The MIXED path continues on to generate the real reply, so — unlike the
+                    # all-failed branch below, which RETURNS the notice for main.py to post — it
+                    # must deliver this notice itself. Recording it only in thread state (as it
+                    # used to) left the model believing it had acknowledged the failed files while
+                    # the user saw nothing. Post it now, then record the same text as an assistant
+                    # turn so the model's context matches what was actually delivered.
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                     message_ts = message.metadata.get("ts") if message.metadata else None
+                    try:
+                        await client.send_message(
+                            channel_id=message.channel_id,
+                            text=unsupported_msg,
+                            thread_id=message.thread_id,
+                        )
+                    except Exception as notice_err:  # noqa: BLE001 — never fail the turn over the notice
+                        self.log_warning(f"Failed to post mixed-path failed-files notice: {notice_err}")
+                    # Add the unsupported files warning to conversation
                     formatted_content = self._format_user_content_with_username(f"[File(s) not processed: {files_str}]", message)
                     self._add_message_with_token_management(thread_state, "user", formatted_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
                     self._add_message_with_token_management(thread_state, "assistant", unsupported_msg, db=self.db, thread_key=thread_key)
@@ -314,8 +346,15 @@ class MessageProcessor(ThreadManagementMixin,
                             "file_data": f"data:{mimetype};base64,{doc['file_data_b64']}",
                         })
 
+            # T2-10: if the per-turn image cap dropped some earlier-batch images, say so — the
+            # model must not answer as if it saw every image in the catch-up.
+            if batched_images_omitted:
+                enhanced_text += (
+                    f"\n\n[Note: {batched_images_omitted} image(s) from earlier messages in this "
+                    f"catch-up couldn't be attached — the per-message image limit was reached.]")
+
             user_content = self._build_user_content(enhanced_text, image_inputs, file_inputs)
-            
+
             # Check if adding this message would exceed limits and trim if needed
             # We temporarily add the message to check, then remove it
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
@@ -535,9 +574,21 @@ class MessageProcessor(ThreadManagementMixin,
 
                 self.log_info(f"Retrying {operation_type} operation with 60s timeout...")
 
+                # F7: retry with the ORIGINAL multipart user_content, not enhanced_text.
+                # enhanced_text is always in locals (a plain string built at :298), so the old
+                # guard never fell through to user_content — image/file parts (folded into
+                # user_content at :317) were silently dropped on every timeout retry.
+                retry_content = user_content if 'user_content' in locals() else enhanced_text
+                # F7: the first attempt appended this turn's user message to thread state
+                # (text.py:361/376) before the API call timed out. Pop it before retrying so the
+                # retry doesn't append a second copy and duplicate the user turn — mirrors the
+                # context-length cleanup in text.py:612-613.
+                if thread_state.messages and thread_state.messages[-1].get("role") == "user":
+                    thread_state.messages.pop()
+
                 try:
                     response = await self._handle_text_response(
-                        enhanced_text if 'enhanced_text' in locals() else user_content,
+                        retry_content,
                         thread_state, client, message, thinking_id,
                         retry_count=1,
                         artifacts_acc=turn_artifacts, turn=turn
@@ -717,20 +768,36 @@ class MessageProcessor(ThreadManagementMixin,
     def _build_failed_files_notice(unsupported_files: list) -> str:
         """User notice for files that were accepted but not processed.
 
-        Three different failures, three different things worth saying. Download failures get
-        their own actionable line (re-upload). Images we FETCHED and then turned away (F50)
-        carry a `reason` and get told exactly what was wrong with them — routing those through
-        the generic explainer below would print "GIF is supported" underneath a rejected
-        animated GIF, which is worse than saying nothing. Everything else keeps the
-        supported-formats explainer.
+        Four different failures, four different things worth saying. Oversized documents
+        (fix-a1's `too_large` flag) get an honest size-vs-limit line — routing them through the
+        download bucket read "Couldn't Download — try re-uploading", which is misleading advice
+        for a file that arrived fine and was simply too big. Download failures get their own
+        actionable line (re-upload). Images we FETCHED and then turned away (F50) carry a
+        `reason` and get told exactly what was wrong with them — routing those through the
+        generic explainer below would print "GIF is supported" underneath a rejected animated
+        GIF, which is worse than saying nothing. Everything else keeps the supported-formats
+        explainer.
         """
-        download_failures = [f for f in unsupported_files if f.get('error') == 'download_failed']
+        too_large = [f for f in unsupported_files if f.get('too_large')]
+        download_failures = [f for f in unsupported_files
+                             if not f.get('too_large') and f.get('error') == 'download_failed']
         rejected_images = [f for f in unsupported_files
-                           if f.get('error') != 'download_failed' and f.get('reason')]
+                           if not f.get('too_large') and f.get('error') != 'download_failed'
+                           and f.get('reason')]
         truly_unsupported = [f for f in unsupported_files
-                             if f.get('error') != 'download_failed' and not f.get('reason')]
+                             if not f.get('too_large') and f.get('error') != 'download_failed'
+                             and not f.get('reason')]
+
+        def _mb(n):
+            return f"{n / (1024 * 1024):.1f}MB" if isinstance(n, (int, float)) else "?"
 
         sections = []
+        if too_large:
+            lines = "\n".join(
+                f"*{f['name']}* is too large ({_mb(f.get('size_bytes'))}, "
+                f"max {_mb(f.get('limit_bytes'))})"
+                for f in too_large)
+            sections.append("⚠️ *File Too Large*\n\n" + lines)
         if download_failures:
             failed_str = ", ".join(f"*{f['name']}*" for f in download_failures)
             sections.append(
@@ -838,6 +905,11 @@ class MessageProcessor(ThreadManagementMixin,
             return
 
         trigger = batch[-1]
+        # T2-10: earlier messages' image parts + attachment failures are collected here and
+        # carried to the trigger turn — images so the model can actually SEE them (not just
+        # their catalogued description), failures so a dropped file is acknowledged.
+        batched_image_inputs: list = []
+        batched_unsupported_files: list = []
         if len(batch) > 1:
             # Append the earlier messages to warm state now (we hold the lock, the
             # state is current). The trigger message is NOT appended — its own turn
@@ -846,9 +918,44 @@ class MessageProcessor(ThreadManagementMixin,
                 finished_message.thread_id, finished_message.channel_id
             )
             if thread_state is not None:
+                # F10: earlier batch messages' attachments used to be dropped — only text was
+                # appended, so their DOCUMENTS got no save_document row and were unreachable by
+                # read_document/mount_file (and their images rode only ambient dual-write). Resolve
+                # the per-thread code-interpreter setting once, and ONLY when some earlier message
+                # actually carries attachments (the common no-attachment batch stays cheap), so the
+                # attachment pipeline below makes the same native-vs-local call the trigger would.
+                batch_ci_enabled = None
+                if any(qm.attachments for qm in batch[:-1]):
+                    batch_thread_config = await config.get_thread_config_async(
+                        overrides=thread_state.config_overrides,
+                        user_id=finished_message.user_id,
+                        db=self.db,
+                        channel_id=finished_message.channel_id,
+                    )
+                    batch_ci_enabled = batch_thread_config.get(
+                        'enable_code_interpreter', config.enable_code_interpreter)
                 for queued_msg in batch[:-1]:
                     try:
                         content = self._format_user_content_with_username(queued_msg.text or "", queued_msg)
+                        # F10: run the SAME attachment pipeline the trigger turn runs, keyed on this
+                        # message's own ts so documents persist under the right source and images are
+                        # catalogued. Fold the document summaries into this message's appended content
+                        # so the model sees them in context too (the trigger's enhanced_text pattern).
+                        if queued_msg.attachments:
+                            q_image_inputs, q_document_inputs, q_unsupported = await self._process_attachments(
+                                queued_msg, client,
+                                code_interpreter_enabled=batch_ci_enabled)
+                            if q_document_inputs:
+                                content = self._build_message_with_documents(content, q_document_inputs)
+                            if q_image_inputs:
+                                # Catalogue a durable description AND carry the raw parts to the
+                                # trigger turn so the model actually sees the images (T2-10).
+                                self._schedule_async_call(image_catalog.catalog_uploads(
+                                    self, thread_key, queued_msg.attachments, q_image_inputs,
+                                    (queued_msg.metadata or {}).get("ts")))
+                                batched_image_inputs.extend(q_image_inputs)
+                            if q_unsupported:
+                                batched_unsupported_files.extend(q_unsupported)
                         self._add_message_with_token_management(
                             thread_state, "user", content,
                             db=self.db, thread_key=thread_key,
@@ -860,6 +967,13 @@ class MessageProcessor(ThreadManagementMixin,
         if trigger.metadata is None:
             trigger.metadata = {}
         trigger.metadata["queued_batch_size"] = len(batch)
+        # T2-10: hand the trigger turn the earlier messages' image parts and attachment failures.
+        # process_message folds the images into this turn's multipart content (respecting the
+        # per-turn cap) and routes the failures through the failed-files notice.
+        if batched_image_inputs:
+            trigger.metadata["batched_image_inputs"] = batched_image_inputs
+        if batched_unsupported_files:
+            trigger.metadata["batched_unsupported_files"] = batched_unsupported_files
 
         self.log_info(f"Draining {len(batch)} queued message(s) on {thread_key} into one catch-up turn")
         self._schedule_async_call(handler(trigger, client))
