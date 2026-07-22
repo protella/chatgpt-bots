@@ -116,6 +116,22 @@ async def test_fetch_surfaces_attached_file_names(bot):
 
 
 @pytest.mark.asyncio
+async def test_fetch_surfaces_reply_count_so_threads_are_discoverable(bot):
+    # A parent with replies must not read like a dead one-liner: reply_count is the only
+    # signal that fetch_thread_messages(ts) would return a whole discussion.
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": False}}
+    bot.app.client.conversations_history.return_value = {
+        "messages": [
+            {"user": "U1", "ts": "1.1", "text": "shipping the new model", "reply_count": 12},
+            {"user": "U2", "ts": "1.2", "text": "standalone remark"},
+        ]
+    }
+    res = await bot.fetch_history_tool("C_PUBLIC")
+    assert res["messages"][0]["reply_count"] == 12
+    assert "reply_count" not in res["messages"][1]
+
+
+@pytest.mark.asyncio
 async def test_private_member_allowed(bot):
     bot.app.client.conversations_info.return_value = {"channel": {"is_private": True, "is_member": True}}
     bot.app.client.conversations_history.return_value = {"messages": [{"user": "U1", "ts": "1.1", "text": "secret-ok"}]}

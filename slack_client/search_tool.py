@@ -142,16 +142,33 @@ class SlackSearchToolMixin:
 
         raw = resp.get("results", resp) or {}
         messages = raw.get("messages") or []
+        # BF2: render authors by display name, not a raw Slack id — resolved in ONE read-only,
+        # budgeted batch over the bounded result set, so searching never creates user rows or
+        # bumps last_seen. An unresolved id stays raw.
+        api_client = getattr(getattr(self, "app", None), "client", None)
+        resolver = getattr(self, "resolve_usernames", None)
+        # Ordered dedup in result order (Blocker 2): a hash-ordered set would let the remote
+        # budget resolve a different subset across cold starts.
+        author_ids = list(dict.fromkeys(
+            aid for m in messages if (aid := (m.get("author_user_id") or m.get("user")))))
+        name_map = {}
+        if author_ids and resolver:
+            try:
+                name_map = await resolver(author_ids, api_client)
+            except Exception:
+                name_map = {}
         results = []
         for m in messages:
             channel = m.get("channel_id") or (m.get("channel") or {}).get("id") or m.get("channel")
             if scope == "channel" and ctx.channel_id and channel != ctx.channel_id:
                 continue
+            author_id = m.get("author_user_id") or m.get("user")
+            author = name_map.get(author_id, author_id or m.get("username"))
             results.append(
                 {
                     "channel": channel,
                     "ts": m.get("message_ts") or m.get("ts"),
-                    "author": m.get("author_user_id") or m.get("user") or m.get("username"),
+                    "author": author,
                     "text": m.get("content") or m.get("text", ""),
                     "permalink": m.get("permalink"),
                 }

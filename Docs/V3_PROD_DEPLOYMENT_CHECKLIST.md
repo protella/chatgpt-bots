@@ -132,7 +132,19 @@ The other ~84 new keys can be omitted — each has a working default (and every 
 defaults **on**, which is the posture we want), and `.env.example` documents each one inline if you
 prefer to pin them explicitly. Ambient memory (F51: quiet notes on links/images/files for later
 recall) is among the defaults-on set — its ~24 `AMBIENT_*`/`LINK_FETCH_*` knobs and the new
-`DOCUMENT_RETENTION_DAYS`/`EDIT_REPLY_WINDOW_MINUTES` all have working defaults.
+`DOCUMENT_RETENTION_DAYS`/`EDIT_REPLY_WINDOW_MINUTES` all have working defaults. So do the two new
+image-timing knobs (F53) — both govern the same Slack fact, that a file's share record only lands a
+few seconds after upload:
+- `IMAGE_INDICATOR_HOLD_SECONDS` (default `12.0`) — how long the "Uploading…" indicator waits for
+  that share record (which is what makes the image *visible*) before clearing anyway. Measured
+  upload→visible is 2.9s for a small image to 5.4s for a real generation, and it scales with image
+  size. **Visible** bound: too high shows a stale spinner, too low re-opens the dead-air gap. The
+  bot logs the real figure per image, so raise this if you ever see `Image not visible … —
+  completing the indicator anyway` in prod logs.
+- `IMAGE_SHARE_TS_TIMEOUT_SECONDS` (default `15.0`) — how long the tool-provenance resolver polls
+  for that same record so an image message can carry its "made by `generate_image`" note.
+  **Invisible** bound (nobody's watching), so it's deliberately longer; on timeout the image just
+  carries no provenance. Only read when `ENABLE_TOOL_PROVENANCE` is on.
 
 ### 6d. Consider — log levels
 Prod runs `DEBUG` across the board. v3 is considerably chattier (channel pulse, participation

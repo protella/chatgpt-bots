@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import time
 from collections import OrderedDict, deque
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from config import config
 from message_processor.message_timestamps import render_message_timestamp
@@ -167,6 +167,12 @@ class ChannelPulse:
         self._bot_replies: Dict[str, deque] = {}
         # channel -> {thread_ts: first-words label} for envelope thread naming.
         self._thread_labels: Dict[str, Dict[str, str]] = {}
+        # channel -> deque(root ts) known to carry replies. Survives the entry itself: an
+        # EDIT drops the root and re-records it from a message_changed payload that has no
+        # reply_count, and the replies never run again — without this the has-thread marker
+        # would silently disappear on a typo fix. Also covers a reply recorded before its
+        # parent. Bounded by the ring size, oldest evicted.
+        self._thread_roots: Dict[str, deque] = {}
         # F5 per-thread tail: channel -> OrderedDict(root_ts -> deque(tail entries)).
         # Both maps are LRU (whole-thread / whole-channel eviction, oldest first).
         self._thread_tails: "OrderedDict[str, OrderedDict[str, deque]]" = OrderedDict()
@@ -227,10 +233,18 @@ class ChannelPulse:
     def record(self, channel_id: str, *, ts: str, thread_ts: Optional[str],
                user_id: Optional[str], display_name: Optional[str],
                sender_type: str, text: str, is_bot: bool,
-               files: Any = None) -> None:
+               files: Any = None, reply_count: Optional[int] = None) -> None:
         """Feed one message event into the channel's rings (idempotent by (channel, ts)).
         DMs are excluded. F14b: `files` (if any) appends a bracketed attachment note to
-        the recorded text, so both the envelope and thread-tail rendering inherit it."""
+        the recorded text, so both the envelope and thread-tail rendering inherit it.
+
+        `reply_count` is Slack's parent-message count, available ONLY from the backfill's
+        conversations.history payload — live message events never carry it. It is kept as a
+        BOOLEAN "has thread" marker rather than a number: the ring outlives the fetch, so a
+        stored count would go stale as replies land, while the marker only ever flips false→
+        true (a recorded reply marks its parent below). Without it, a top-level message with
+        forty replies under it renders identically to a dead one-liner, and the model has no
+        way to know the thread is worth fetching."""
         if not channel_id or self._is_dm(channel_id) or not ts:
             return
         if self._already_recorded(channel_id, ts):
@@ -242,6 +256,10 @@ class ChannelPulse:
             text = f"{text} {note}" if (text or "").strip() else note
         # Slack sets thread_ts == ts on thread roots; normalize roots/top-level to None
         norm_thread_ts = thread_ts if (thread_ts and thread_ts != ts) else None
+        roots = self._thread_roots.setdefault(channel_id, deque(maxlen=self.size))
+        # A root is threaded if Slack said so (backfill) or if we have already seen one of
+        # its replies — the latter is what makes the marker survive an edit re-record.
+        has_thread = norm_thread_ts is None and (bool(reply_count) or ts in roots)
         entry = {
             "ts": ts,
             "thread_ts": norm_thread_ts,
@@ -255,6 +273,8 @@ class ChannelPulse:
             # thread-tail ring) for render_channel_addressee_tail; deterministic, bounded.
             "tail_text": _escape_tail_text(text),
             "is_bot": is_bot,
+            # True when replies are known to hang off this top-level message (see docstring).
+            "has_thread": has_thread,
             # F51: ready ambient-artifact notes (image/link/file summaries) appended after
             # asynchronous completion via upsert_artifacts(); composed into every renderer at
             # render time so a late summary can still appear. The pre-folded file note above is
@@ -267,6 +287,18 @@ class ChannelPulse:
         if entry["thread_ts"] is None and entry["text"]:
             labels = self._thread_labels.setdefault(channel_id, {})
             labels[ts] = " ".join(entry["text"].split()[:THREAD_LABEL_WORDS])
+        if norm_thread_ts is not None:
+            # A reply proves its parent has a thread — the only signal live events give us,
+            # since they carry no reply_count. Remembered even when the parent is absent
+            # (aged out, or simply not recorded yet).
+            if norm_thread_ts not in roots:
+                roots.append(norm_thread_ts)
+            for parent in buf:
+                if parent["ts"] == norm_thread_ts:
+                    parent["has_thread"] = True
+                    break
+        elif has_thread and ts not in roots:
+            roots.append(ts)
         # F5: mirror into the per-thread tail ring (roots seed their own thread).
         self._record_thread_tail(
             channel_id, ts=ts, root_ts=(norm_thread_ts or ts),
@@ -576,6 +608,9 @@ class ChannelPulse:
                 text=text,
                 is_bot=sender_type != "human",
                 files=m.get("files"),
+                # Only conversations.history carries this; it is what makes threads visible
+                # on a COLD ring, before any live reply arrives to mark its parent.
+                reply_count=m.get("reply_count"),
             )
         # Backfill arrives out of live order; re-sort the ring by ts once.
         buf = self._buffers.get(channel_id)
@@ -937,14 +972,25 @@ class ChannelPulse:
         """Deterministic compact rendering of recent channel activity,
         oldest -> newest, EXCLUDING messages that belong to exclude_thread_ts
         (that thread is already the model's full context)."""
+        return self.render_envelope_with_meta(
+            channel_id, exclude_thread_ts=exclude_thread_ts, max_lines=max_lines)[0]
+
+    def render_envelope_with_meta(
+        self, channel_id: str, exclude_thread_ts: Optional[str] = None, max_lines: int = 15
+    ) -> Tuple[str, int, Optional[str], Optional[str]]:
+        """render_envelope plus BF3 observability: returns
+        (text, line_count, first_ts, last_ts) where the count and span are computed from
+        the EXACT entries that survive thread exclusion AND the max_lines truncation — never
+        parsed back out of the rendered text, since the per-line timestamp can be config-off."""
         buf = self._buffers.get(channel_id)
         if not buf or max_lines <= 0:
-            return ""
+            return "", 0, None, None
         labels = self._thread_labels.get(channel_id, {})
         # F10: same UTC per-message stamp as the thread tail, so the classifier sees when
         # each activity line happened (guarded; config-off leaves the envelope unchanged).
         stamp_on = getattr(config, "enable_message_timestamps", False)
         lines: List[str] = []
+        kept: List[Dict[str, Any]] = []
         for e in buf:
             root = e["thread_ts"] or e["ts"]
             if exclude_thread_ts and root == exclude_thread_ts:
@@ -953,21 +999,26 @@ class ChannelPulse:
                 label = labels.get(e["thread_ts"])
                 where = f'in thread "{label}…"' if label else "in a thread"
             else:
-                where = "top-level"
+                # "has thread" is the hint that this message is worth fetching: the replies
+                # themselves may be outside the ring (a cold start holds top-level only).
+                where = "top-level, has thread" if e.get("has_thread") else "top-level"
             stamp = (render_message_timestamp(e["ts"]) + " ") if stamp_on else ""
             # F20: pinned reaction summary suffix (F7-5 order), omitted when none.
             rx = self.render_reactions(channel_id, e["ts"])
             rx = f" {rx}" if rx else ""
             lines.append(f'- {stamp}{e["display_name"]} ({where}): {e["text"]}'
                          f'{self._artifacts_suffix(e)}{rx}')
+            kept.append(e)
         if not lines:
-            return ""
+            return "", 0, None, None
         lines = lines[-max_lines:]
+        kept = kept[-max_lines:]
         # F47: MODEST peripheral framing. The authoritative "who addresses whom" record is the
         # separate addressee tail (render_channel_addressee_tail); overstating this capped,
         # process-local ring as that record both duplicated its job and read as an invite to
         # continue other conversations. This block is reference-resolution context only.
-        return (
+        text = (
             "[Recent channel activity — peripheral context from OTHER conversations; use it "
             "only to resolve references, don't jump in to continue them]\n" + "\n".join(lines)
         )
+        return text, len(lines), kept[0]["ts"], kept[-1]["ts"]

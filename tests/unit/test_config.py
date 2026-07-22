@@ -99,9 +99,18 @@ class TestBotConfig:
         config = BotConfig()
         assert config.reaction_max_per_message == 4
 
-    def test_f14_cap_overhaul_defaults(self, mock_env):
+    def test_f14_cap_overhaul_defaults(self, mock_env, monkeypatch):
         """F14/F17 defaults: 5 / 60 / 500 / 500 / 20 / 80 / 300 / 90 (F17 raised the
-        two pulse truncations to 500; the hourly cap knob is gone entirely)."""
+        two pulse truncations to 500; the hourly cap knob is gone entirely).
+
+        mock_env only SETS its own keys — it never clears the developer's real .env, so
+        these CODE defaults have to be read with the backing vars removed or a tuned local
+        .env (e.g. a raised CHANNEL_PULSE_SIZE) fails a test that is about the fallbacks."""
+        for key in ("MAX_CONCURRENT_IMAGE_GENERATIONS", "CHANNEL_PULSE_SIZE",
+                    "PULSE_TEXT_TRUNCATE", "PULSE_TAIL_TEXT_TRUNCATE",
+                    "TOOL_PROVENANCE_MAX_ENTRIES", "TOOL_PROVENANCE_GIST_CHARS",
+                    "TOOL_PROVENANCE_LINE_BUDGET", "TOOL_USAGE_RETENTION_DAYS"):
+            monkeypatch.delenv(key, raising=False)
         config = BotConfig()
         assert config.max_concurrent_image_generations == 5
         assert config.channel_pulse_size == 60
