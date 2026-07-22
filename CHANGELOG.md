@@ -129,6 +129,53 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 🤐 Changed - It only speaks up when it can actually help
+
+Live channel testing kept catching the same thing: the bot would join a conversation it had
+nothing to offer, opening with what it *couldn't* do. Three real examples — a budget question,
+"anyone try the 1Password Claude plugin?", and "can I get an approval on this PR?" — each got a
+reply that amounted to "I can't see that, but here's where to look."
+
+- **A reply that starts with a disclaimer isn't a reply.** Before speaking uninvited, it now
+  checks whether it can supply the *kind* of answer asked for. If the honest opening would be
+  "I haven't tried it" / "I can't access that" / "I can't approve that", it stays quiet.
+  Questions asking for teammates' firsthand experience or human authority stay with the humans.
+- **An open question is no longer a reason on its own.** "Anyone know…?" only earns a reply when
+  it can actually answer — and the source has to match the question: a web search can settle a
+  public fact, but it can't manufacture firsthand experience or reveal an internal one. It no
+  longer turns "anyone tried X?" into an unrequested summary of X's marketing page.
+- **Banter gets a reaction, not a speech.** When teasing lands that asks nothing, a single emoji
+  is the whole reply; it speaks only when words are actually invited.
+- **It stops bluffing about things it can't place.** Riffing on a release or inside reference it
+  can't identify from context, it now checks first or keeps the joke unspecific, instead of
+  confidently guessing wrong.
+- **But being spoken to still gets an answer.** Address it by name and you get a straight reply
+  even when the answer is "I can't see our billing from here" — silence is only for the
+  conversations it merely overheard. A name-drop in a message aimed at someone else still isn't
+  a summons.
+
+### 🧵 Changed - It can tell when a message has a discussion under it
+
+- **Threads are no longer invisible from the outside.** A top-level message with forty replies
+  used to look exactly like a throwaway one-liner, so the bot answered from the top line and
+  missed the conversation. It now sees which messages carry threads and reads the relevant one
+  before answering — noticeably better when you ask "what did we land on about X?".
+- **More of the surrounding channel is in view.** The peripheral-context window doubled (30
+  lines, from a 150-message buffer). It's a line count, not a time window, so in a busy channel
+  the old default covered barely half a morning. New installs get this from `.env.example`;
+  existing ones can raise `CHANNEL_PULSE_ENVELOPE_MAX` / `CHANNEL_PULSE_SIZE` to match.
+
+### 🙋 Fixed - People have names in rebuilt conversations
+
+- **No more `U01AB2CD3EF:` in the transcript.** When the bot rebuilds a thread from Slack after a
+  restart — or fetches history or search results — participants are named. Previously anyone not
+  already cached showed up as a raw ID, so it couldn't reliably tell who said what, or even that
+  the person bantering with it was the one who'd started the thread.
+- **Workspace search is no longer offered when Slack won't authorize it.** Slack only issues a
+  search token when you @-mention the bot or DM it, so on a channel message it was reaching for a
+  tool that could never work and burning a couple of seconds failing. It now uses the history
+  tools directly in those turns.
+
 ### 🛡️ Fixed - Pre-release hardening (full adversarial review)
 
 A ground-up review of the whole codebase before v3 goes live. The changes below are all

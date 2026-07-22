@@ -113,12 +113,15 @@ def test_f17_voice_banter_clause_present():
 
 
 def test_f17_participation_banter_clause_present():
-    # F17: playful banter/teasing genuinely AT the assistant is a respond (a short quip)
-    # or react case — not "marginal value" to ignore — but addressee rules still dominate.
-    assert "Playful banter or teasing aimed genuinely AT the assistant is a respond case" \
+    # Item B: playful banter/teasing genuinely AT the assistant is participation-worthy — a
+    # react when an emoji carries the beat, a respond only when words add a distinct beat —
+    # but addressee rules still dominate, and being talked ABOUT is not being talked TO.
+    assert "Playful banter or teasing genuinely aimed AT the assistant is participation-worthy" \
         in PARTICIPATION_SYSTEM_PROMPT
-    assert "not marginal-value noise to ignore" in PARTICIPATION_SYSTEM_PROMPT
+    assert "not marginal-value noise" in PARTICIPATION_SYSTEM_PROMPT
+    assert "a single emoji carries the beat, choose react" in PARTICIPATION_SYSTEM_PROMPT
     assert "never overrides the addressee rules" in PARTICIPATION_SYSTEM_PROMPT
+    assert "merely talking about the assistant stays theirs" in PARTICIPATION_SYSTEM_PROMPT
 
 
 def test_tool_provenance_ground_truth_instruction_present():

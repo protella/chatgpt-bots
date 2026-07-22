@@ -112,7 +112,14 @@ class SlackBot(SlackMessageEventsMixin,
             enabled=lambda cfg: config.enable_no_reply_tool and bool(cfg.get("_unprompted_turn")),
         )
         if config.enable_search_tool:
-            registry.register(self.get_search_tool_schema(), self.execute_search_tool)
+            # BF1: Slack's Data Access API only mints action_token on @mention channel events
+            # and DMs; unmentioned channel-listening turns never carry one, so the search tool
+            # would fail at runtime. The text handler stamps _slack_search_available from the
+            # event's action_token in a COPIED config; hide the schema when it's absent.
+            registry.register(
+                self.get_search_tool_schema(), self.execute_search_tool,
+                enabled=lambda cfg: bool(cfg.get("_slack_search_available")),
+            )
         if config.enable_channel_memory:
             register_memory_tools(registry)  # channel-only; executors refuse DMs
         # Decision #4: the gated set_channel_participation tool — the ONLY path that writes
