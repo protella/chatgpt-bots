@@ -498,9 +498,11 @@ class TestParticipationPromptGuardrails:
         assert "you can chime in again" in p and "react away" in p
 
     def test_prompt_teasing_at_assistant_is_respond_not_backoff(self):
+        # Item B: banter genuinely AT the assistant is participation-worthy (react or a quip),
+        # not backoff; teasing pointed at another party still stays theirs.
         from prompts import PARTICIPATION_SYSTEM_PROMPT as p
-        assert "teasing aimed genuinely AT the assistant is a respond case" in p
-        assert "teasing pointed at another party, stays theirs" in p
+        assert "teasing genuinely aimed AT the assistant is participation-worthy" in p
+        assert "teasing pointed at another party, or a message merely talking about the assistant stays theirs" in p
 
     def test_prompt_forbids_reaction_ack_on_reactions_dimension(self):
         from prompts import PARTICIPATION_SYSTEM_PROMPT as p

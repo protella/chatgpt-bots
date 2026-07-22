@@ -1154,22 +1154,28 @@ class ThreadManagementMixin:
                                     or hist_msg.metadata.get("username")
                                     or "Bot")
                     else:
-                        # Get username from metadata (should be populated by client)
-                        username = hist_msg.metadata.get("username") if hist_msg.metadata else None
-
-                        # If no username in metadata, fetch it from user_id
-                        if not username and hist_msg.user_id:
-                            # Use client's get_username method if available
-                            if hasattr(client, 'get_username'):
-                                # Get the slack_client from metadata if available
-                                slack_client = hist_msg.metadata.get("slack_client") if hist_msg.metadata else None
-                                if slack_client:
-                                    username = await client.get_username(hist_msg.user_id, slack_client)
-                                else:
-                                    # Try without slack_client
-                                    username = hist_msg.user_id  # Fallback to user_id
-                            else:
-                                username = hist_msg.user_id  # Fallback to user_id
+                        metadata = hist_msg.metadata or {}
+                        # BF2 Blocker 1: the PRESENCE of the "username" key proves get_thread_history's
+                        # batched, read-only, budget-bounded resolve already ran for this message —
+                        # so never re-resolve (a per-message get_username here would reintroduce the
+                        # writes, last_seen bumps, and unbounded lookups BF2 removed). An unresolved
+                        # author (key present, value None) falls back to the raw id.
+                        if "username" in metadata:
+                            username = metadata.get("username") or hist_msg.user_id
+                        elif hasattr(client, 'get_username') and hist_msg.user_id:
+                            # Legacy compatibility only: histories built BEFORE BF2 carry no key.
+                            # Guard it — a failing lookup must degrade to the raw id, never abort.
+                            slack_client = (
+                                metadata.get("slack_client")
+                                or getattr(getattr(client, "app", None), "client", None))
+                            try:
+                                username = await client.get_username(hist_msg.user_id, slack_client)
+                            except Exception as e:
+                                self.log_debug(
+                                    f"username resolution failed for {hist_msg.user_id}: {e}")
+                                username = hist_msg.user_id
+                        else:
+                            username = hist_msg.user_id  # Fallback to user_id
 
                         # Default to "User" if still no username
                         if not username:

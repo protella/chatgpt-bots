@@ -240,4 +240,7 @@ def test_limit_clamping():
 def test_guidance_mentions_search():
     from prompts import LOCAL_TOOLS_GUIDANCE
     assert "search_slack" in LOCAL_TOOLS_GUIDANCE
-    assert "fall back" in LOCAL_TOOLS_GUIDANCE.lower()
+    # BF1: the guidance is availability-conditional now — when search_slack is not among the
+    # available tools (no action_token), fall to the fetch tools without comment.
+    assert "When search_slack is available" in LOCAL_TOOLS_GUIDANCE
+    assert "not among the available tools" in LOCAL_TOOLS_GUIDANCE

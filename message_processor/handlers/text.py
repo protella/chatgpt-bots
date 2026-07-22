@@ -170,7 +170,9 @@ class TextHandlerMixin:
         turns that get the silence option — the shared dict is never mutated. Two paths
         qualify: F2 participation-gated (unprompted) turns, and F18 thread-continuation
         turns (wake_source == "thread_continuation"), a 1:1 reply routed straight to the
-        main model. DMs and @-mention/name-summons turns get neither the tool nor a suffix.
+        main model. DMs and real @mentions get neither. Engine-gated bare-name turns carry
+        participation_check=True and therefore receive the F2 tool and suffix; the suffix's
+        addressed-by-name exception prevents an honest direct answer from being suppressed.
         no_reply_tool_available is derived from the resolved schema set (so it's False
         whenever the tool isn't actually exposed — timeout retries that drop the registry,
         config off, prompted turns), and drives the tools array. no_reply_suffix is the
@@ -216,6 +218,11 @@ class TextHandlerMixin:
             meta.get("sender_type") == "human"
             and (meta.get("mentioned_self") is True
                  or meta.get("gate_authorized_structural") is True))
+        # BF1: Slack's Data Access API mints action_token only on @mention channel events and
+        # DMs; unmentioned channel-listening turns (participation-gated and thread-continuation)
+        # never carry one, so search_slack is dead weight there. Gate its schema on the token's
+        # presence — the runtime token checks in search_tool stay as defense in depth.
+        request_config["_slack_search_available"] = bool(meta.get("action_token"))
         if tools_disabled:
             return None, request_config, False, None
         registry = self._get_tool_registry(client, request_config)

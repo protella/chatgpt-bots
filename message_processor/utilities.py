@@ -1448,12 +1448,19 @@ class MessageUtilitiesMixin:
             pulse = getattr(client, "channel_pulse", None)
             if pulse is None or not channel_id or channel_id.startswith("D"):
                 return None
-            envelope = pulse.render_envelope(
+            envelope, line_count, first_ts, last_ts = pulse.render_envelope_with_meta(
                 channel_id,
                 exclude_thread_ts=thread_ts,
                 max_lines=config.channel_pulse_envelope_max,
             )
-            return envelope or None
+            if not envelope:
+                return None
+            # BF3: the span/count come from the exact entries that survived exclusion and
+            # truncation, not from the rendered text (per-line timestamps can be config-off).
+            self.log_debug(
+                f"Pulse envelope injected: channel={channel_id} lines={line_count} "
+                f"span={first_ts}→{last_ts}")
+            return envelope
         except Exception as e:
             self.log_debug(f"pulse envelope build failed: {e}")
             return None

@@ -1005,14 +1005,19 @@ class TestProcessorGlue:
         # builder gains later — F34's generate_image was the first — is not a bug in the
         # wiring this test is about. The gates below are what it actually verifies.)
         assert {"fetch_channel_history", "fetch_thread_messages",
-                "react_to_message", "search_slack", "post_to_thread",
+                "react_to_message", "post_to_thread",
                 "remember_fact", "update_fact", "forget_fact",
                 "read_document", "lookup_user", "list_channel_members",
                 "start_background_job"} <= names
         # …and the per-request gates still hide what this request doesn't qualify for:
-        # no_response_needed needs an unprompted turn (F2), and the image tools that depend on
-        # turn state — a sandbox container / a non-empty image catalog — have neither here (F34).
-        assert names.isdisjoint({"no_response_needed", "create_image_asset", "edit_image"})
+        # no_response_needed needs an unprompted turn (F2), search_slack needs the event's
+        # action_token (BF1), and the image tools that depend on turn state — a sandbox
+        # container / a non-empty image catalog — have neither here (F34).
+        assert names.isdisjoint({"no_response_needed", "search_slack",
+                                 "create_image_asset", "edit_image"})
+        # BF1: search_slack reappears the moment the request carries an action_token.
+        with_token = {t["name"] for t in registry.schemas({"_slack_search_available": True})}
+        assert "search_slack" in with_token
 
     def test_registry_builder_search_gated_off(self, monkeypatch):
         from slack_client.base import SlackBot

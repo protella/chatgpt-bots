@@ -1169,7 +1169,12 @@ class SlackMessagingMixin:
         messages = []
 
         try:
-            # Fetch ALL messages using pagination
+            from slack_client.formatting.text import extract_mention_ids
+            # Fetch page by page; each page is turned into PROVISIONAL Messages immediately and
+            # the raw page dropped, so raw Slack payloads (blocks/files/supplementary) never
+            # accumulate for the whole thread (Blocker 3). Text is left UNCLEANED here — mentions
+            # are cleaned in a final pass, after ONE batched read-only username resolve.
+            provisional = []
             cursor = None
             total_fetched = 0
 
@@ -1191,57 +1196,31 @@ class SlackMessagingMixin:
 
                 result = await self._replies_page_with_retry(kwargs)
                 slack_messages = result.get("messages", [])
-                
+
                 if not slack_messages:
                     break
-                    
-                # Process messages from this batch
+
                 for msg in slack_messages:
                     text = msg.get("text", "")
-                    # Determine sender up front — the placeholder/status filters below
-                    # must only ever skip OUR OWN messages (R3: a human saying
-                    # "Thinking about the Q3 plan" is real context, not a placeholder).
                     sender_type = self.classify_sender(msg)
-                    # Our OWN transient chrome (status/placeholder/checklist/"Settings
-                    # available"/pure UI-helper block) must never replay as an assistant turn.
-                    # Factored into is_self_chrome_message so this path and the F47 cold-start
-                    # backfill (channel_pulse.ensure_backfill) can never drift.
+                    # Skip our OWN transient chrome and pure UI-helper blocks (same rule as before).
                     if sender_type == "self" and is_self_chrome_message(text, msg):
                         continue
-                    # A non-self message can still be a pure UI-helper block (its action_ids,
-                    # never text — so a real reply can't false-positive); skip it too.
                     if sender_type != "self" and _is_ui_helper_message(msg):
                         continue
-
-                    # sender_type computed above (drives both the self-only filters and metadata)
-                    is_bot = bool(msg.get("bot_id"))  # kept for existing readers ("any bot")
+                    is_bot = bool(msg.get("bot_id"))
                     # Display name for bot authors (used to name-prefix other bots like humans)
                     bot_name = msg.get("username") or (msg.get("bot_profile") or {}).get("name")
-
-                    # Clean text
-                    text = msg.get("text", "")
-                    # F48 — the DURABILITY half. Slack is the ONLY transcript, so fixing
-                    # only the live path buys exactly one turn: a table ingests Monday and
-                    # Tuesday's rebuild re-drops it, leaving the bot with amnesia about
-                    # content it already discussed. Rendered RAW and combined BEFORE the
-                    # mention pass below, matching the live path so a message serializes
-                    # identically live and rebuilt. Never for our OWN messages: our status
-                    # and welcome cards live in these fields (F47 attribution bug).
+                    # Combine supplementary BEFORE cleaning, matching the live path, so a mention
+                    # living only in a quoted/table block resolves too. Cleaning is DEFERRED.
                     if sender_type != "self":
                         supplementary = extract_supplementary_text(msg, primary_text=text)
                         if supplementary:
                             text = f"{text}\n\n{supplementary}" if text.strip() else supplementary
-                    if not is_bot:
-                        text = self._clean_mentions(text)
-                    
-                    # Check for files
                     attachments = []
-                    files = msg.get("files", [])
-                    for file in files:
-                        # Determine file type based on mimetype
+                    for file in msg.get("files", []):
                         mimetype = file.get("mimetype", "")
                         file_type = "image" if mimetype.startswith("image/") else "file"
-                        
                         attachments.append({
                             "type": file_type,
                             "name": file.get("name"),
@@ -1253,10 +1232,10 @@ class SlackMessagingMixin:
                             "id": file.get("id"),
                             "size": file.get("size"),
                         })
-                    
-                    messages.append(Message(
-                        text=text,
-                        user_id=msg.get("user", "bot" if is_bot else "unknown"),
+                    author_id = msg.get("user", "bot" if is_bot else "unknown")
+                    provisional.append(Message(
+                        text=text,  # UNCLEANED; mentions cleaned in the final pass below
+                        user_id=author_id,
                         channel_id=channel_id,
                         thread_id=thread_id,
                         attachments=attachments,
@@ -1265,29 +1244,70 @@ class SlackMessagingMixin:
                             "is_bot": is_bot,
                             "sender_type": sender_type,
                             "bot_name": bot_name,
+                            # "username" is filled after the batch resolve; the KEY is ALWAYS set.
                             # Raw reactions from conversations.replies (name/users/count) —
                             # rendered into rebuilt context as a deterministic annotation
                             "reactions": msg.get("reactions") or None
                         }
                     ))
-                
+
                 total_fetched += len(slack_messages)
-                
+
                 # Check if we've hit our limit
                 if limit and total_fetched >= limit:
                     break
-                
+
                 # Check for pagination
-                response_metadata = result.get("response_metadata", {})
-                next_cursor = response_metadata.get("next_cursor")
-                
+                next_cursor = (result.get("response_metadata") or {}).get("next_cursor")
                 if not next_cursor:
-                    # No more messages
                     break
-                    
                 cursor = next_cursor
-                # Continue to next iteration
-            
+
+            # Blocker 2: build an ORDERED, deduped id list so the remote budget resolves the SAME
+            # users across cold starts (set iteration is hash-seed dependent, which would change
+            # rebuilt serialization). Priority when the budget bites on a long thread: the root
+            # author, then authors NEWEST→OLDEST, then mention ids in the same newest→oldest scan
+            # (recent speakers matter most). resolve_usernames preserves this input order.
+            api_client = getattr(getattr(self, "app", None), "client", None)
+            self_id = getattr(self, "bot_user_id", None)
+            ordered_ids = []
+            seen = set()
+
+            def _add(uid):
+                if uid and uid not in ("bot", "unknown") and uid != self_id and uid not in seen:
+                    seen.add(uid)
+                    ordered_ids.append(uid)
+
+            if provisional and provisional[0].metadata.get("sender_type") not in ("self", "other_bot"):
+                _add(provisional[0].user_id)                       # root author first
+            for m in reversed(provisional):                        # then authors newest→oldest
+                if m.metadata.get("sender_type") not in ("self", "other_bot"):
+                    _add(m.user_id)
+            for m in reversed(provisional):                        # then mentions newest→oldest
+                if not m.metadata.get("is_bot"):
+                    for uid in extract_mention_ids(m.text):
+                        _add(uid)
+
+            name_map = {}
+            if ordered_ids:
+                try:
+                    name_map = await self.resolve_usernames(ordered_ids, api_client)
+                except Exception as e:
+                    self.log_debug(f"batch username resolution failed: {e}")
+
+            # Final pass: clean mentions against the now-warmed cache and stamp the author name.
+            # The "username" KEY is ALWAYS set (None when unresolved or not a human author) so the
+            # rebuild consumer treats its presence as proof this batch already ran (Blocker 1).
+            for m in provisional:
+                if not m.metadata.get("is_bot"):
+                    m.text = self._clean_mentions(m.text)
+                if (m.metadata.get("sender_type") not in ("self", "other_bot")
+                        and m.user_id not in ("bot", "unknown")):
+                    m.metadata["username"] = name_map.get(m.user_id)
+                else:
+                    m.metadata["username"] = None
+                messages.append(m)
+
             self.log_info(f"Fetched {len(messages)} messages from thread {thread_id}")
             return messages
             

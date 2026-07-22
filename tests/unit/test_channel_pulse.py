@@ -196,9 +196,88 @@ def test_envelope_thread_vs_top_level_lines(monkeypatch):
     # exact-line assertions stay readable (stamped-envelope coverage lives in F10 tests).
     monkeypatch.setattr(config, "enable_message_timestamps", False)
     env = _seeded_pulse().render_envelope("C1")
-    assert '- Alice (top-level): deploy question here' in env
+    # Alice's root carries a reply, so it renders with the has-thread hint; Cara's doesn't.
+    assert '- Alice (top-level, has thread): deploy question here' in env
     assert '- Bob (in thread "deploy question here…"): reply inside deploy thread' in env
     assert '- Cara (top-level): unrelated top level' in env
+
+
+# ------------------------------------------------------- has-thread marker (thread discovery)
+
+def test_live_reply_marks_its_parent_as_threaded():
+    """A live message event carries no reply_count — the reply itself is the only signal
+    that its parent has a discussion under it."""
+    p = ChannelPulse(size=10)
+    p.record("C1", **_entry("100.0", text="root msg"))
+    assert p._buffers["C1"][0]["has_thread"] is False
+    p.record("C1", **_entry("101.0", text="a reply", thread_ts="100.0", name="Bob"))
+    assert p._buffers["C1"][0]["has_thread"] is True
+
+
+def test_reply_whose_parent_aged_out_is_harmless():
+    p = ChannelPulse(size=2)
+    p.record("C1", **_entry("100.0", text="root msg"))
+    p.record("C1", **_entry("200.0", text="filler"))
+    p.record("C1", **_entry("201.0", text="filler2"))       # evicts the root
+    p.record("C1", **_entry("101.0", text="late reply", thread_ts="100.0"))
+    assert all(not e["has_thread"] for e in p._buffers["C1"])
+
+
+def test_backfill_reply_count_marks_cold_ring(monkeypatch):
+    """The cold-start case: conversations.history returns parents only, so without
+    reply_count a message with 40 replies would look identical to a dead one-liner."""
+    monkeypatch.setattr(config, "enable_message_timestamps", False)
+    p = ChannelPulse(size=10)
+    p.record("C1", **_entry("100.0", text="busy root"), reply_count=40)
+    p.record("C1", **_entry("101.0", text="quiet root"), reply_count=0)
+    env = p.render_envelope("C1")
+    assert "- Alice (top-level, has thread): busy root" in env
+    assert "- Alice (top-level): quiet root" in env
+
+
+def test_reply_count_never_marks_a_reply_itself():
+    p = ChannelPulse(size=10)
+    p.record("C1", **_entry("101.0", text="a reply", thread_ts="100.0"), reply_count=5)
+    assert p._buffers["C1"][0]["has_thread"] is False
+
+
+def test_root_normalized_when_slack_sets_thread_ts_equal_to_ts():
+    """Slack stamps thread_ts == ts on a thread ROOT; record() normalizes that to None, so
+    the root must still take the marker from reply_count."""
+    p = ChannelPulse(size=10)
+    p.record("C1", **_entry("100.0", text="root", thread_ts="100.0"), reply_count=3)
+    e = p._buffers["C1"][0]
+    assert e["thread_ts"] is None and e["has_thread"] is True
+
+
+def test_marker_survives_an_edit_re_record():
+    """An EDIT removes the entry and re-records it from a message_changed payload that
+    carries no reply_count, and the earlier replies never run again — the marker has to
+    come from remembered root state or a typo fix would erase the thread hint."""
+    p = ChannelPulse(size=10)
+    p.record("C1", **_entry("100.0", text="root with a thread"))
+    p.record("C1", **_entry("101.0", text="a reply", thread_ts="100.0", name="Bob"))
+    assert p._buffers["C1"][0]["has_thread"] is True
+
+    p.remove_message("C1", "100.0")                      # edit: drop the stale entry…
+    p.record("C1", **_entry("100.0", text="root with a thread (typo fixed)"))  # …re-feed
+    reroot = [e for e in p._buffers["C1"] if e["ts"] == "100.0"][0]
+    assert reroot["has_thread"] is True
+
+
+def test_reply_recorded_before_its_parent_still_marks_it():
+    p = ChannelPulse(size=10)
+    p.record("C1", **_entry("101.0", text="a reply", thread_ts="100.0", name="Bob"))
+    p.record("C1", **_entry("100.0", text="parent arrives late"))
+    parent = [e for e in p._buffers["C1"] if e["ts"] == "100.0"][0]
+    assert parent["has_thread"] is True
+
+
+def test_known_thread_roots_are_bounded_by_ring_size():
+    p = ChannelPulse(size=3)
+    for i in range(10):
+        p.record("C1", **_entry(f"{i}.1", text="r", thread_ts=f"{i}.0"))
+    assert len(p._thread_roots["C1"]) <= 3
 
 
 def test_envelope_excludes_current_thread():

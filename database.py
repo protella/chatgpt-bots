@@ -3424,6 +3424,28 @@ class DatabaseManager(LoggerMixin):
                 row = await cursor.fetchone()
                 return dict(row) if row else None
 
+    async def get_user_infos_async(self, user_ids) -> Dict[str, Dict]:
+        """BF2 bulk read: {user_id: row-dict} for the given ids in ONE connection, chunked to
+        stay under SQLite's bound-variable limit. Read-only; mirrors get_user_info_async's row
+        shape. Ids with no row are simply absent from the result (never created)."""
+        ids = [u for u in dict.fromkeys(user_ids) if u]
+        if not ids:
+            return {}
+        out: Dict[str, Dict] = {}
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            for i in range(0, len(ids), 500):  # under SQLite's ~999 variable cap
+                chunk = ids[i:i + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                async with db.execute(
+                    f"SELECT * FROM users WHERE user_id IN ({placeholders})", chunk
+                ) as cursor:
+                    async for row in cursor:
+                        d = dict(row)
+                        out[d["user_id"]] = d
+        return out
+
     async def get_all_users_async(self) -> list:
         """F29: all persisted user_info rows (user_id/username/real_name/email/tz), for
         resolving a name → id when lookup_user is called with a name rather than a Slack id.

@@ -3,7 +3,7 @@ from __future__ import annotations
 import aiohttp
 import re
 import time
-from typing import Optional
+from typing import Dict, Iterable, Optional
 
 from slack_sdk.errors import SlackApiError
 
@@ -251,8 +251,103 @@ class SlackUtilitiesMixin:
                 return username
         except Exception as e:
             self.log_debug(f"Could not fetch username for {user_id}: {e}")
-        
+
         return user_id  # Fallback to user ID if fetch fails
+
+    async def resolve_usernames(
+        self, user_ids: Iterable[str], api_client, max_remote_lookups: int = 25
+    ) -> Dict[str, str]:
+        """BF2: batched, request-scoped, READ-ONLY display-name resolver.
+
+        Returns ``{user_id: display_name}`` for the ids it could resolve; ids it could
+        not resolve are OMITTED so the caller falls back to the raw id. Used by the
+        rebuild + tool-result read paths (get_thread_history, history_tool, search_tool),
+        which must never mutate user state just for reading old messages.
+
+        Unlike ``get_username`` — which the LIVE event paths use and which get_or_creates
+        the user row and bumps ``last_seen`` — this writes nothing: it serves the in-memory
+        cache, then a read-only DB lookup (``get_user_info_async``), then at most
+        ``max_remote_lookups`` Slack ``users.info`` calls for the WHOLE request. Ids are
+        deduped first; failures are negative-cached for this call; ids past the budget stay
+        raw. So a cold rebuild of an old thread can't fan out into hundreds of sequential
+        lookups or delay the turn, and a successful fetch is kept in the memory cache only.
+        """
+        cache = self.user_cache  # created by the client; get_username assumes it too
+
+        resolved: Dict[str, str] = {}
+        pending: list = []
+        for uid in user_ids:
+            if not uid or uid in resolved or uid in pending:
+                continue
+            info = cache.get(uid)
+            name = info.get("username") if isinstance(info, dict) else None
+            if name:
+                resolved[uid] = name
+            else:
+                pending.append(uid)
+
+        # Read-only DB pass — ONE bulk read for all pending ids (never get_or_create; reading
+        # must not create rows). `pending` preserves input order, so `still` stays ordered.
+        still: list = []
+        rows = {}
+        if pending:
+            try:
+                rows = await self.db.get_user_infos_async(pending)
+            except Exception as e:
+                self.log_debug(f"resolve_usernames bulk DB read failed: {e}")
+                rows = {}
+        for uid in pending:
+            info = rows.get(uid) or {}
+            name = info.get("username")
+            if name:
+                cache[uid] = {
+                    "username": name,
+                    "real_name": info.get("real_name"),
+                    "email": info.get("email"),
+                    "timezone": info.get("timezone", "UTC"),
+                    "tz_label": info.get("tz_label", "UTC"),
+                    "tz_offset": info.get("tz_offset", 0),
+                }
+                resolved[uid] = name
+            else:
+                still.append(uid)
+
+        # Remote pass — budget-bounded, negative-cached for THIS request, no DB write.
+        if still and api_client is not None and max_remote_lookups > 0:
+            failed: set = set()
+            budget = max_remote_lookups
+            for uid in still:
+                if budget <= 0:
+                    break
+                if uid in failed:
+                    continue
+                budget -= 1
+                try:
+                    result = await api_client.users_info(user=uid)
+                except Exception as e:
+                    self.log_debug(f"resolve_usernames users.info failed for {uid}: {e}")
+                    failed.add(uid)
+                    continue
+                user = (result or {}).get("user") or {}
+                if not (result and result.get("ok")) or not user:
+                    failed.add(uid)
+                    continue
+                profile = user.get("profile", {}) or {}
+                name = (profile.get("display_name") or profile.get("real_name")
+                        or user.get("name"))
+                if not name:
+                    failed.add(uid)
+                    continue
+                cache[uid] = {
+                    "username": name,
+                    "real_name": profile.get("real_name"),
+                    "email": profile.get("email"),
+                    "timezone": user.get("tz", "UTC"),
+                    "tz_label": user.get("tz_label", "UTC"),
+                    "tz_offset": user.get("tz_offset", 0),
+                }
+                resolved[uid] = name
+        return resolved
 
     async def get_user_timezone(self, user_id: str, client) -> str:
         """Get user's timezone, fetching if necessary"""

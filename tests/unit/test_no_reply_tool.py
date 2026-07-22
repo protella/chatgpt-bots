@@ -475,7 +475,15 @@ def test_contract_paragraph_wording():
     from prompts import NO_REPLY_CONTRACT_SUFFIX
     assert NO_REPLY_CONTRACT_SUFFIX.startswith("[You joined this conversation uninvited.")
     assert "no_response_needed" in NO_REPLY_CONTRACT_SUFFIX
-    assert NO_REPLY_CONTRACT_SUFFIX.endswith("over filler.]")
+    assert "prefer no_response_needed over filler." in NO_REPLY_CONTRACT_SUFFIX
+    # C1: the mid-flight escape — an answer that would only admit a limitation is a
+    # no_response_needed, but a substantive answer isn't suppressed for including one,
+    # and a name-summoned turn prefers a brief honest answer over silence.
+    assert 'consist only of "I haven\'t tried it,"' in NO_REPLY_CONTRACT_SUFFIX
+    assert "do not suppress a substantive answer merely because it includes a limitation" \
+        in NO_REPLY_CONTRACT_SUFFIX
+    assert "addressed by name, prefer a brief honest answer over silence" in NO_REPLY_CONTRACT_SUFFIX
+    assert NO_REPLY_CONTRACT_SUFFIX.endswith("over silence.]")
 
 
 def test_continuation_paragraph_wording():

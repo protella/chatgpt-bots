@@ -7,21 +7,6 @@ and, optionally, behaves like a teammate in the channels it's invited to.
 The architecture is stateless: **Slack is the source of truth.** Conversation context is rebuilt from
 Slack history on demand, never mirrored into the database.
 
-## Recent Changes
-
-See [CHANGELOG.md](CHANGELOG.md).
-
-### ⚠️ Upgrading to v3.0.0
-
-v3 is a major release: a new model lineup (**GPT-5.6 Sol/Terra/Luna**), an optional **channel
-teammate** mode (off by default — no behavior change until you enable it), **background deep
-research**, and **conversation history moved out of the database into Slack**.
-
-The upgrade is: `make install` → install the system packages below → update a few `.env` values →
-rebuild your Slack app manifest → start the bot (one-time DB migrations run automatically, taking
-tagged backups first). The exact keys, manifest deltas, and migration log lines are in the
-[CHANGELOG's Upgrade Instructions](CHANGELOG.md) — follow them in order.
-
 ## Features
 
 ### Core
@@ -66,6 +51,21 @@ Flip it on and the bot participates in channels it's invited to:
 - **Live progress** — a native status bubble with rotating, customizable "working…" messages, and a
   ticking checklist on image jobs
 - **Multi-user aware** — keeps track of who said what in shared threads
+
+## Recent Changes
+
+See [CHANGELOG.md](CHANGELOG.md).
+
+### ⚠️ Upgrading to v3.0.0
+
+v3 is a major release: a new model lineup (**GPT-5.6 Sol/Terra/Luna**), an optional **channel
+teammate** mode (off by default — no behavior change until you enable it), **background deep
+research**, and **conversation history moved out of the database into Slack**.
+
+The upgrade is: `make install` → install the system packages below → update a few `.env` values →
+rebuild your Slack app manifest → start the bot (one-time DB migrations run automatically, taking
+tagged backups first). The exact keys, manifest deltas, and migration log lines are in the
+[CHANGELOG's Upgrade Instructions](CHANGELOG.md) — follow them in order.
 
 ## Getting Started
 
@@ -237,3 +237,7 @@ make test-all    # + integration tests (real API keys)
 make lint        # ruff + mypy
 make format      # black + isort
 ```
+
+## License
+
+[MIT](LICENSE) © Peter Rotella

@@ -634,6 +634,53 @@ class TestGetAllUsersAsync:
         assert await temp_db.get_all_users_async() == []
 
 
+class TestGetUserInfosAsync:
+    """BF2: get_user_infos_async — bulk read-only {id: row} for the batched resolver."""
+
+    @pytest.fixture
+    def temp_db(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = DatabaseManager("test")
+            db.db_path = f"{tmpdir}/test.db"
+            db.conn = sqlite3.connect(db.db_path, check_same_thread=False, isolation_level=None)
+            db.conn.row_factory = sqlite3.Row
+            db.init_schema()
+            yield db
+            db.conn.close()
+
+    @pytest.mark.asyncio
+    async def test_bulk_read_maps_ids_to_rows(self, temp_db):
+        await temp_db.get_or_create_user_async("U1", "alice")
+        await temp_db.get_or_create_user_async("U2", "bob")
+        out = await temp_db.get_user_infos_async(["U1", "U2", "U404"])
+        assert set(out) == {"U1", "U2"}                 # missing id simply absent, never created
+        assert out["U1"]["username"] == "alice"
+        assert out["U2"]["username"] == "bob"
+
+    @pytest.mark.asyncio
+    async def test_bulk_read_is_read_only(self, temp_db):
+        # A pure read must not create a row for an unknown id.
+        out = await temp_db.get_user_infos_async(["U_UNSEEN"])
+        assert out == {}
+        assert await temp_db.get_user_info_async("U_UNSEEN") is None
+
+    @pytest.mark.asyncio
+    async def test_bulk_read_empty_and_dedup(self, temp_db):
+        assert await temp_db.get_user_infos_async([]) == {}
+        await temp_db.get_or_create_user_async("U1", "alice")
+        # Duplicates collapse; result still keyed once.
+        out = await temp_db.get_user_infos_async(["U1", "U1", "U1"])
+        assert out == {"U1": out["U1"]} and out["U1"]["username"] == "alice"
+
+    @pytest.mark.asyncio
+    async def test_bulk_read_chunks_beyond_variable_limit(self, temp_db):
+        # More ids than one SQLite IN(...) can bind — the method must chunk, not raise.
+        ids = [f"U{i}" for i in range(1200)]
+        await temp_db.get_or_create_user_async("U1199", "last")
+        out = await temp_db.get_user_infos_async(ids)
+        assert out["U1199"]["username"] == "last"
+
+
 # --------------------------------------------------------------------------
 # v3 migration safety: pre-migration backup + per-step error isolation
 # --------------------------------------------------------------------------

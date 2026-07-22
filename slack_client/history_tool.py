@@ -43,7 +43,10 @@ class SlackHistoryToolMixin:
                     "Fetch a bounded slice of recent messages from a Slack channel the bot can "
                     "access (public channels, or private channels the bot is a member of). Use when "
                     "you need more context than the current thread provides. Each message includes "
-                    "its current emoji reactions (who reacted with what)."
+                    "its current emoji reactions (who reacted with what). A message carrying "
+                    "\"reply_count\" has a THREAD under it whose replies are NOT in this result; "
+                    "when that discussion is relevant to what's being asked, pass that message's "
+                    "ts as fetch_thread_messages' thread_ts to read it."
                 ),
                 "parameters": {
                     "type": "object",
@@ -231,13 +234,39 @@ class SlackHistoryToolMixin:
                 resp = await self.app.client.conversations_history(channel=channel_id, limit=n)
                 all_messages = resp.get("messages") or []
                 raw = all_messages[:n]
+            # BF2: render human authors by display name, not a raw Slack id (Slack is the only
+            # transcript, so a fetched author must read the same as the live path). Resolve the
+            # whole bounded result set in ONE read-only, budgeted batch — reading history must
+            # not create user rows or bump last_seen. An unresolved id stays raw.
+            api_client = getattr(getattr(self, "app", None), "client", None)
+            resolver = getattr(self, "resolve_usernames", None)
+            # Ordered dedup in result order (Blocker 2): a hash-ordered set would let the remote
+            # budget resolve a different subset across cold starts.
+            author_ids = list(dict.fromkeys(
+                m.get("user") for m in raw if m.get("user") and not m.get("bot_id")))
+            name_map = {}
+            if author_ids and resolver:
+                try:
+                    name_map = await resolver(author_ids, api_client)
+                except Exception:
+                    name_map = {}
             messages = []
             for m in raw:
+                author = m.get("user") or m.get("username") or ("bot" if m.get("bot_id") else "unknown")
+                if m.get("user") and not m.get("bot_id"):
+                    author = name_map.get(m.get("user"), author)
                 entry = {
-                    "user": m.get("user") or m.get("username") or ("bot" if m.get("bot_id") else "unknown"),
+                    "user": author,
                     "ts": m.get("ts"),
                     "text": self._text_with_supplementary(m),
                 }
+                # A thread hangs off this message: without it, a parent with forty replies
+                # reads exactly like a dead one-liner and the model can't tell there is
+                # anything to fetch. Fresh from the API on every call (never a stored
+                # snapshot), so the count is accurate at fetch time; pass this `ts` as
+                # fetch_thread_messages' thread_ts to read the replies.
+                if m.get("reply_count"):
+                    entry["reply_count"] = m["reply_count"]
                 # F25: surface attached-file names so the model can reach a document
                 # seen in fetched history via read_document (names, never content).
                 # Cap = 10, Slack's own per-message attachment max — every file on a
