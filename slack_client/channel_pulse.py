@@ -65,6 +65,15 @@ def _ts_key(ts: Any) -> tuple:
         return (0, 0)
 
 
+def _entry_is_in_thread_reply(entry: Dict[str, Any]) -> bool:
+    """True when a ring entry is an ORDINARY in-thread reply — i.e. NOT part of the channel
+    timeline. A recorded entry's thread_ts is normalized to None for top-level messages/roots, so
+    a set thread_ts means "in a thread"; a thread_broadcast is the exception (it was also posted to
+    the channel, so it IS timeline content and is kept). Used by the channel-summary timeline
+    filter (count + ring merge)."""
+    return bool(entry.get("thread_ts")) and entry.get("subtype") != "thread_broadcast"
+
+
 def _sanitize_name(name: Optional[str]) -> str:
     """Neutralize an untrusted display name for the classifier tail: strip control
     chars/newlines and brackets so a user named 'Claude [bot]' can't forge a speaker
@@ -233,7 +242,8 @@ class ChannelPulse:
     def record(self, channel_id: str, *, ts: str, thread_ts: Optional[str],
                user_id: Optional[str], display_name: Optional[str],
                sender_type: str, text: str, is_bot: bool,
-               files: Any = None, reply_count: Optional[int] = None) -> None:
+               files: Any = None, reply_count: Optional[int] = None,
+               subtype: Optional[str] = None) -> None:
         """Feed one message event into the channel's rings (idempotent by (channel, ts)).
         DMs are excluded. F14b: `files` (if any) appends a bracketed attachment note to
         the recorded text, so both the envelope and thread-tail rendering inherit it.
@@ -263,6 +273,10 @@ class ChannelPulse:
         entry = {
             "ts": ts,
             "thread_ts": norm_thread_ts,
+            # Slack subtype (e.g. 'thread_broadcast'): a broadcast is an in-thread reply that was
+            # ALSO posted to the channel, so it IS timeline content — kept where ordinary replies
+            # are dropped (channel-summary timeline filter). None for a plain top-level message.
+            "subtype": subtype,
             "user_id": user_id,
             "display_name": display_name or user_id or ("bot" if is_bot else "unknown"),
             "sender_type": sender_type,
@@ -611,6 +625,9 @@ class ChannelPulse:
                 # Only conversations.history carries this; it is what makes threads visible
                 # on a COLD ring, before any live reply arrives to mark its parent.
                 reply_count=m.get("reply_count"),
+                # Preserve the subtype so the channel-summary timeline filter can keep a
+                # thread_broadcast (timeline content) while dropping ordinary in-thread replies.
+                subtype=m.get("subtype"),
             )
         # Backfill arrives out of live order; re-sort the ring by ts once.
         buf = self._buffers.get(channel_id)
@@ -655,6 +672,52 @@ class ChannelPulse:
                     notes.append(note)
             if notes:
                 self.upsert_artifacts(channel_id, source_ts, notes)
+
+    # --------------------------------------------- channel narrative (Track 1)
+
+    def count_since(self, channel_id: str, after_ts: Optional[str] = None,
+                    *, exclude_self: bool = False, top_level_only: bool = False) -> int:
+        """Number of recorded ring entries strictly newer than `after_ts` (the whole ring
+        when None). Pure in-memory, zero-await — this is what lets the channel-summary refresh
+        decision detect fresh activity WITHOUT an extra Slack call. `exclude_self` drops the
+        bot's own posts (sender_type 'self') so the bot talking to itself can't trip a rebuild.
+        `top_level_only` drops ORDINARY in-thread replies so the count matches the TIMELINE the
+        narrative summarizes — a thread_broadcast is kept (it's also posted to the channel).
+        DMs/unknown channels → 0."""
+        buf = self._buffers.get(channel_id)
+        if not buf:
+            return 0
+        cutoff = _ts_key(after_ts) if after_ts else None
+        n = 0
+        for e in buf:
+            if exclude_self and e.get("sender_type") == "self":
+                continue
+            if top_level_only and _entry_is_in_thread_reply(e):
+                continue
+            if cutoff is not None and _ts_key(e.get("ts")) <= cutoff:
+                continue
+            n += 1
+        return n
+
+    def snapshot(self, channel_id: str) -> List[Dict[str, Any]]:
+        """A shallow, chronological (oldest→newest) COPY of the channel ring, for the
+        channel-summary builder to merge/dedupe with conversations.history. Carries the
+        normalized `thread_ts` (None for top-level/roots, the root ts for replies) so the builder
+        can keep the narrative TIMELINE-only. Never the live deque (callers must not mutate ring
+        state); zero-await; [] for a DM/unknown channel."""
+        buf = self._buffers.get(channel_id)
+        if not buf:
+            return []
+        entries = sorted(buf, key=lambda e: _ts_key(e.get("ts")))
+        return [{
+            "ts": e.get("ts"),
+            "thread_ts": e.get("thread_ts"),
+            "subtype": e.get("subtype"),
+            "display_name": e.get("display_name"),
+            "sender_type": e.get("sender_type"),
+            "is_bot": e.get("is_bot"),
+            "text": e.get("text"),
+        } for e in entries]
 
     # ------------------------------------------------ participation stats (Phase F)
 

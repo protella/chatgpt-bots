@@ -289,6 +289,23 @@ class SlackMessageEventsMixin:
         proc = getattr(self, "processor", None)
         return getattr(proc, "ambient_service", None) if proc is not None else None
 
+    def _channel_summary_service(self):
+        """The ChannelSummaryService (owned by the processor), or None if not wired/available."""
+        proc = getattr(self, "processor", None)
+        return getattr(proc, "channel_summary_service", None) if proc is not None else None
+
+    async def _invalidate_channel_summary(self, channel_id, ts) -> None:
+        """Track 1: an edit/delete of message `ts` may have touched the summarized window — tell
+        the ChannelSummaryService so it invalidates + stops injecting until a rebuild. Best-effort;
+        never raises into the ambient path."""
+        svc = self._channel_summary_service()
+        if svc is None:
+            return
+        try:
+            await svc.note_message_mutation(channel_id, ts)
+        except Exception as e:  # noqa: BLE001
+            self.log_debug(f"channel summary invalidate hook failed: {e}")
+
     def _mark_thread_refresh(self, channel_id: str, thread_root: str) -> None:
         """Flag a thread's warm ThreadState for rebuild-from-Slack. On an edit/delete the pulse is
         corrected, but a live in-memory ThreadState can still hold the deleted/pre-edit message —
@@ -335,6 +352,8 @@ class SlackMessageEventsMixin:
                         pulse.remove_message(channel_id, deleted_ts)
                     # A warm ThreadState may still hold the deleted message — force a rebuild.
                     self._mark_thread_refresh(channel_id, prev.get("thread_ts") or deleted_ts)
+                    # Track 1: a deleted message inside the narrative's window invalidates the cache.
+                    await self._invalidate_channel_summary(channel_id, deleted_ts)
                     self.log_debug(f"message_deleted: purged {channel_id}:{deleted_ts} "
                                    f"from pulse/artifacts")
                 return
@@ -366,6 +385,8 @@ class SlackMessageEventsMixin:
                             pulse.remove_message(channel_id, new_ts)
                         self._mark_thread_refresh(
                             channel_id, edited.get("thread_ts") or new_ts)
+                        # Track 1: a deleted-with-replies root inside the window invalidates too.
+                        await self._invalidate_channel_summary(channel_id, new_ts)
                         self.log_debug(f"tombstoned root: purged {channel_id}:{new_ts} "
                                        f"(deleted-with-replies)")
                     return
@@ -376,6 +397,9 @@ class SlackMessageEventsMixin:
                             await db.delete_ambient_artifacts_by_source(channel_id, new_ts)
                         except Exception as e:
                             self.log_debug(f"ambient reconcile delete failed: {e}")
+                    # Track 1: an edit to a message inside the narrative's window makes the cache
+                    # stale — invalidate and stop injecting until a background rebuild succeeds.
+                    await self._invalidate_channel_summary(channel_id, new_ts)
                     # Re-offer the edited content as a synthetic message event.
                     synthetic = dict(edited)
                     synthetic["channel"] = channel_id
@@ -833,6 +857,9 @@ class SlackMessageEventsMixin:
                 text=text,
                 is_bot=sender_type != "human",
                 files=event.get("files"),
+                # Preserve subtype so the channel-summary timeline filter keeps a thread_broadcast
+                # (timeline content) but drops ordinary in-thread replies.
+                subtype=event.get("subtype"),
             )
         except Exception as e:
             self.log_debug(f"channel_pulse feed failed: {e}")

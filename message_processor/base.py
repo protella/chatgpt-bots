@@ -75,6 +75,13 @@ class MessageProcessor(ThreadManagementMixin,
         self.ambient_service = AmbientArtifactService(
             db=db, openai_client=self.openai_client, channel_pulse=None)
 
+        # Track 1: persistent per-channel "recent channel narrative" cache. The Slack client +
+        # channel pulse are passed per call by the read paths (they already hold them), so this
+        # only needs the db + openai client here. Background builds are fire-and-forget.
+        from message_processor.channel_summary import ChannelSummaryService
+        self.channel_summary_service = ChannelSummaryService(
+            db=db, openai_client=self.openai_client)
+
         if not DOCUMENT_HANDLER_AVAILABLE:
             self.log_warning("DocumentHandler not available - document processing will be disabled")
         self.log_info(f"MessageProcessor initialized {'with' if db else 'without'} database")
@@ -988,6 +995,13 @@ class MessageProcessor(ThreadManagementMixin,
                 await self.ambient_service.shutdown()
             except Exception as e:  # noqa: BLE001
                 self.log_debug(f"Ambient service shutdown error: {e}")
+        # Track 1: drain background channel-summary builds too — they also call the OpenAI client
+        # + DB, so they must finish (or be cancelled) before the client closes under them.
+        if getattr(self, "channel_summary_service", None):
+            try:
+                await self.channel_summary_service.shutdown()
+            except Exception as e:  # noqa: BLE001
+                self.log_debug(f"Channel summary service shutdown error: {e}")
         if hasattr(self, 'openai_client') and self.openai_client:
             await self.openai_client.close()
         # Close thread manager resources if needed

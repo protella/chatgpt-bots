@@ -474,6 +474,13 @@ class TextHandlerMixin:
                                             message=message, thread_state=thread_state)
         if no_reply_suffix:
             suffix = f"{suffix}\n\n{no_reply_suffix}"
+        # Track 1 role authority: the persistent channel narrative is ambient, attacker-
+        # influenceable content, so it rides its OWN untrusted role:user message placed BEFORE
+        # the fresher pulse envelope (the developer suffix still comes LAST). Reads the PRIOR
+        # summary; any rebuild it triggers is detached and only affects later turns.
+        channel_summary_block = await self._build_channel_summary_block(client, message)
+        if channel_summary_block:
+            messages_for_api = messages_for_api + [{"role": "user", "content": channel_summary_block}]
         # F51 role authority: the channel-activity envelope is ambient, attacker-influenceable
         # content (peripheral message text + derived artifact summaries), so it rides as an
         # untrusted USER message — never in the developer suffix — and sits BEFORE the developer
@@ -1024,6 +1031,12 @@ class TextHandlerMixin:
                                             message=message, thread_state=thread_state)
         if no_reply_suffix:
             suffix = f"{suffix}\n\n{no_reply_suffix}"
+        # Track 1 role authority: the persistent channel narrative rides its OWN untrusted
+        # role:user message BEFORE the pulse envelope (see the non-streaming path for rationale);
+        # the developer suffix still comes last. Reads the prior summary; refresh is detached.
+        channel_summary_block = await self._build_channel_summary_block(client, message)
+        if channel_summary_block:
+            messages_for_api = messages_for_api + [{"role": "user", "content": channel_summary_block}]
         # F51 role authority: envelope rides as an untrusted USER message before the developer
         # suffix (see the non-streaming path for the rationale).
         pulse_envelope = self._build_pulse_envelope(
