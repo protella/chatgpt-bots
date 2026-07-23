@@ -262,6 +262,25 @@ class TextHandlerMixin:
             # closed (unauthorized). Distinct from `_canvas_delete_authorized`, the parallel
             # (also-strict) signal that gates the canvas-delete tool.
             structural_change_authorized=bool(cfg.get("_structural_change_authorized", False)),
+            # Channel-read authorization: True only when Slack itself delivered THIS turn's
+            # human message from THIS conversation (markers stamped at the live event entry
+            # points by attest_message_origin), which proves the requester is a member without
+            # a lookup. All three markers must agree with the context being built — a replayed
+            # or synthetic message carries none of them, and a stale one can't match a
+            # different channel — so a forged/stale channel id gets the full membership check
+            # instead of a free pass. Absent → False → full check.
+            origin_membership_attested=bool(
+                meta.get("origin_event_verified") is True
+                and channel_id
+                and meta.get("origin_channel_id") == channel_id
+                and message.user_id
+                and meta.get("origin_user_id") == message.user_id
+            ),
+            # …and that `user_id` is a PERSON. classify_sender's verdict, not raw bot_id
+            # presence, so the dev allowlist that treats user-token posts as human still
+            # authorizes them. Another app's bot gets a context with a real user_id and this
+            # flag False, which the channel-read gate refuses.
+            requester_is_human=(meta.get("sender_type") == "human"),
             processor=self,  # F30: start_deep_research reaches openai_client/scheduling/thread_manager
             # F38: so a slow local tool can stake the 👀 work claim once it knows it is
             # really going to do the work, and a tool that owns its own surface can record

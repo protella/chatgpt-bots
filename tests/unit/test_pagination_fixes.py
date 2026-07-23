@@ -263,7 +263,9 @@ async def test_history_tool_reports_has_more():
         def log_warning(self, *a, **k): pass
 
     h = _Hist()
-    h._channel_is_accessible = AsyncMock(return_value=(True, "ok"))
+    # Stub the tri-state authorization façade (retrieval + delivery) so this test exercises only
+    # the has_more/note logic; a bare ctx=None otherwise fails the delivery layer closed.
+    h._authorize_channel_read = AsyncMock(return_value=("ALLOW", "ok"))
     h.app.client.conversations_history = AsyncMock(return_value={
         "messages": [{"user": "U1", "ts": "1", "text": "x"}],
         "response_metadata": {"next_cursor": "abc"},

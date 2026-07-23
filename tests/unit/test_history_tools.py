@@ -6,6 +6,10 @@ from slack_sdk.errors import SlackApiError
 
 from slack_client.history_tool import SlackHistoryToolMixin
 from config import config
+from tool_registry import ToolContext
+
+REQUESTER = "U_ASKER"
+OUTSIDER = "U_SOMEONE_ELSE"
 
 
 class _Harness(SlackHistoryToolMixin):
@@ -20,6 +24,7 @@ class _Harness(SlackHistoryToolMixin):
         self.app.client.chat_getPermalink = AsyncMock()
         self.app.client.pins_list = AsyncMock()
         self.app.client.users_info = AsyncMock()
+        self.app.client.users_conversations = AsyncMock()
 
     def log_debug(self, *a, **k):
         pass
@@ -44,6 +49,19 @@ def _enable(monkeypatch):
     # Deterministic defaults regardless of env.
     monkeypatch.setattr(config, "enable_history_tools", True)
     monkeypatch.setattr(config, "history_tool_max_messages", 50)
+
+
+def _ctx(channel_id="C1", user_id=REQUESTER, human=True, **kw):
+    """A ToolContext for the requester (2026-07 both-members auth policy). `human` defaults
+    True: only a PERSON's membership authorizes a read — see test_channel_scope_guard.py."""
+    return ToolContext(channel_id=channel_id, user_id=user_id,
+                       requester_is_human=human, **kw)
+
+
+def _member_of(bot, *ids):
+    """Put the requester in exactly these conversations, per users.conversations."""
+    bot.app.client.users_conversations.return_value = {
+        "ok": True, "channels": [{"id": i, "name": i.lower()} for i in ids]}
 
 
 # --- schema / feature flag ---
@@ -77,31 +95,47 @@ def test_limit_clamped(bot):
 
 @pytest.mark.asyncio
 async def test_fetch_passes_clamped_limit(bot):
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
     bot.app.client.conversations_history.return_value = {"messages": []}
-    await bot.fetch_history_tool("C1", limit=9999)
+    await bot.fetch_history_tool("C1", limit=9999, ctx=_ctx())
     assert bot.app.client.conversations_history.call_args.kwargs["limit"] == 50
 
 
 # --- privacy gate ---
 
 @pytest.mark.asyncio
-async def test_public_channel_allowed(bot):
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": False}}
+async def test_public_channel_member_allowed(bot):
+    # Public is no longer a free pass (2026-07 both-members fix): the bot AND the
+    # requester must both be in it.
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C_PUBLIC")
     bot.app.client.conversations_history.return_value = {
         "messages": [{"user": "U1", "ts": "1.1", "text": "hi"}]
     }
-    res = await bot.fetch_history_tool("C_PUBLIC")
+    res = await bot.fetch_history_tool("C_PUBLIC", ctx=_ctx(channel_id="C_PUBLIC"))
     assert res["ok"] is True
     assert res["count"] == 1
     assert res["messages"][0]["text"] == "hi"
 
 
 @pytest.mark.asyncio
+async def test_public_channel_non_member_refused(bot):
+    # The bot being in a public channel does not entitle a non-member requester to read it
+    # through the bot.
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C_OTHER")
+    res = await bot.fetch_history_tool("C_PUBLIC", ctx=_ctx(channel_id="C_PUBLIC"))
+    assert res["ok"] is False and res["error"] == "not_accessible"
+    bot.app.client.conversations_history.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_fetch_surfaces_attached_file_names(bot):
     # F25: file NAMES ride the fetched entry (never content) so the model can reach a
     # document seen in history via read_document. Messages without files are unchanged.
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C_PUBLIC")
     bot.app.client.conversations_history.return_value = {
         "messages": [
             {"user": "U1", "ts": "1.1", "text": "contract attached",
@@ -109,7 +143,7 @@ async def test_fetch_surfaces_attached_file_names(bot):
             {"user": "U2", "ts": "1.2", "text": "no files here"},
         ]
     }
-    res = await bot.fetch_history_tool("C_PUBLIC")
+    res = await bot.fetch_history_tool("C_PUBLIC", ctx=_ctx(channel_id="C_PUBLIC"))
     assert res["ok"] is True
     assert res["messages"][0]["files"] == ["vendor_contract.pdf"]
     assert "files" not in res["messages"][1]
@@ -119,14 +153,15 @@ async def test_fetch_surfaces_attached_file_names(bot):
 async def test_fetch_surfaces_reply_count_so_threads_are_discoverable(bot):
     # A parent with replies must not read like a dead one-liner: reply_count is the only
     # signal that fetch_thread_messages(ts) would return a whole discussion.
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C_PUBLIC")
     bot.app.client.conversations_history.return_value = {
         "messages": [
             {"user": "U1", "ts": "1.1", "text": "shipping the new model", "reply_count": 12},
             {"user": "U2", "ts": "1.2", "text": "standalone remark"},
         ]
     }
-    res = await bot.fetch_history_tool("C_PUBLIC")
+    res = await bot.fetch_history_tool("C_PUBLIC", ctx=_ctx(channel_id="C_PUBLIC"))
     assert res["messages"][0]["reply_count"] == 12
     assert "reply_count" not in res["messages"][1]
 
@@ -134,8 +169,9 @@ async def test_fetch_surfaces_reply_count_so_threads_are_discoverable(bot):
 @pytest.mark.asyncio
 async def test_private_member_allowed(bot):
     bot.app.client.conversations_info.return_value = {"channel": {"is_private": True, "is_member": True}}
+    _member_of(bot, "C_PRIV_MEMBER")
     bot.app.client.conversations_history.return_value = {"messages": [{"user": "U1", "ts": "1.1", "text": "secret-ok"}]}
-    res = await bot.fetch_history_tool("C_PRIV_MEMBER")
+    res = await bot.fetch_history_tool("C_PRIV_MEMBER", ctx=_ctx(channel_id="C_PRIV_MEMBER"))
     assert res["ok"] is True
     assert res["messages"][0]["text"] == "secret-ok"
 
@@ -171,9 +207,10 @@ async def test_missing_channel_refused(bot):
 
 @pytest.mark.asyncio
 async def test_thread_uses_replies(bot):
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
     bot.app.client.conversations_replies.return_value = {"messages": [{"user": "U1", "ts": "1.1", "text": "t"}]}
-    res = await bot.fetch_history_tool("C1", thread_ts="1.0")
+    res = await bot.fetch_history_tool("C1", thread_ts="1.0", ctx=_ctx())
     assert res["ok"] is True
     bot.app.client.conversations_replies.assert_awaited_once()
     bot.app.client.conversations_history.assert_not_called()
@@ -181,18 +218,20 @@ async def test_thread_uses_replies(bot):
 
 @pytest.mark.asyncio
 async def test_channel_uses_history(bot):
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
     bot.app.client.conversations_history.return_value = {"messages": []}
-    await bot.fetch_history_tool("C1")
+    await bot.fetch_history_tool("C1", ctx=_ctx())
     bot.app.client.conversations_history.assert_awaited_once()
     bot.app.client.conversations_replies.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_fetch_api_error_returns_no_content(bot):
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
     bot.app.client.conversations_history.side_effect = SlackApiError("x", {"error": "not_in_channel"})
-    res = await bot.fetch_history_tool("C1")
+    res = await bot.fetch_history_tool("C1", ctx=_ctx())
     assert res["ok"] is False
     assert res["error"] == "not_in_channel"
     assert "messages" not in res
@@ -202,18 +241,22 @@ async def test_fetch_api_error_returns_no_content(bot):
 
 @pytest.mark.asyncio
 async def test_dispatch_channel(bot):
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
     bot.app.client.conversations_history.return_value = {"messages": []}
-    res = await bot.dispatch_history_tool_call("fetch_channel_history", {"channel_id": "C1", "limit": 5})
+    res = await bot.dispatch_history_tool_call(
+        "fetch_channel_history", {"channel_id": "C1", "limit": 5}, _ctx())
     assert res["ok"] is True
     bot.app.client.conversations_history.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_dispatch_thread_with_json_string_args(bot):
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
     bot.app.client.conversations_replies.return_value = {"messages": []}
-    res = await bot.dispatch_history_tool_call("fetch_thread_messages", '{"channel_id": "C1", "thread_ts": "1.0"}')
+    res = await bot.dispatch_history_tool_call(
+        "fetch_thread_messages", '{"channel_id": "C1", "thread_ts": "1.0"}', _ctx())
     assert res["ok"] is True
     bot.app.client.conversations_replies.assert_awaited_once()
 
@@ -222,10 +265,10 @@ async def test_dispatch_thread_with_json_string_args(bot):
 async def test_dispatch_defaults_channel_from_ctx(bot):
     # Regression (2026-07-10): requiring channel_id made the model fabricate IDs
     # (channel_not_found). Omitted channel_id falls back to the current channel.
-    from types import SimpleNamespace
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C_CUR")
     bot.app.client.conversations_history.return_value = {"messages": []}
-    ctx = SimpleNamespace(channel_id="C_CUR", thread_ts="9.0")
+    ctx = _ctx(channel_id="C_CUR", thread_ts="9.0")
     res = await bot.dispatch_history_tool_call("fetch_channel_history", {}, ctx)
     assert res["ok"] is True
     assert bot.app.client.conversations_history.call_args.kwargs["channel"] == "C_CUR"
@@ -233,10 +276,10 @@ async def test_dispatch_defaults_channel_from_ctx(bot):
 
 @pytest.mark.asyncio
 async def test_dispatch_defaults_thread_from_ctx(bot):
-    from types import SimpleNamespace
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C_CUR")
     bot.app.client.conversations_replies.return_value = {"messages": []}
-    ctx = SimpleNamespace(channel_id="C_CUR", thread_ts="9.0")
+    ctx = _ctx(channel_id="C_CUR", thread_ts="9.0")
     res = await bot.dispatch_history_tool_call("fetch_thread_messages", {}, ctx)
     assert res["ok"] is True
     kw = bot.app.client.conversations_replies.call_args.kwargs
@@ -245,8 +288,12 @@ async def test_dispatch_defaults_thread_from_ctx(bot):
 
 @pytest.mark.asyncio
 async def test_dispatch_thread_without_ts_anywhere_is_bad_arguments(bot):
-    from types import SimpleNamespace
-    ctx = SimpleNamespace(channel_id="C_CUR", thread_ts=None)
+    # The gate runs BEFORE argument validation, so an unauthorized channel must be denied as
+    # not_accessible rather than leaking whether it has a thread at all — authorize it first,
+    # so the assertion below is actually exercising the missing-thread_ts branch.
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C_CUR")
+    ctx = _ctx(channel_id="C_CUR", thread_ts=None)
     res = await bot.dispatch_history_tool_call("fetch_thread_messages", {}, ctx)
     assert res["ok"] is False and res["error"] == "bad_arguments"
 
@@ -273,13 +320,14 @@ async def test_dispatch_bad_json(bot):
 
 @pytest.mark.asyncio
 async def test_history_includes_current_reactions(bot):
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C_PUBLIC")
     bot.app.client.conversations_history.return_value = {"messages": [
         {"user": "U1", "ts": "1.1", "text": "hi",
          "reactions": [{"name": "thumbsup", "count": 2, "users": ["U2", "U3"]}]},
         {"user": "U2", "ts": "1.2", "text": "plain"},
     ]}
-    res = await bot.fetch_history_tool("C_PUBLIC")
+    res = await bot.fetch_history_tool("C_PUBLIC", ctx=_ctx(channel_id="C_PUBLIC"))
     assert res["messages"][0]["reactions"] == [{"emoji": "thumbsup", "count": 2, "users": ["U2", "U3"]}]
     assert "reactions" not in res["messages"][1]  # absent when a message has none
 
@@ -288,11 +336,12 @@ async def test_history_includes_current_reactions(bot):
 
 @pytest.mark.asyncio
 async def test_permalink_returned_for_accessible_channel(bot):
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
     bot.app.client.chat_getPermalink.return_value = {
         "permalink": "https://acme.slack.com/archives/C1/p1720500000123456"
     }
-    res = await bot.get_message_permalink_tool("C1", "1720500000.123456")
+    res = await bot.get_message_permalink_tool("C1", "1720500000.123456", ctx=_ctx())
     assert res["ok"] is True
     assert res["permalink"].startswith("https://")
     kwargs = bot.app.client.chat_getPermalink.await_args.kwargs
@@ -310,9 +359,10 @@ async def test_permalink_refused_for_private_non_member(bot):
 
 @pytest.mark.asyncio
 async def test_permalink_api_error_graceful(bot):
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
     bot.app.client.chat_getPermalink.side_effect = SlackApiError("x", {"error": "message_not_found"})
-    res = await bot.get_message_permalink_tool("C1", "9.9")
+    res = await bot.get_message_permalink_tool("C1", "9.9", ctx=_ctx())
     assert res["ok"] is False and res["error"] == "message_not_found"
 
 
@@ -321,10 +371,11 @@ async def test_permalink_api_error_graceful(bot):
 @pytest.mark.asyncio
 async def test_channel_info_returns_facts(bot):
     bot.app.client.conversations_info.return_value = {"channel": {
-        "is_private": False, "name": "menu-insights",
+        "is_private": False, "is_member": True, "name": "menu-insights",
         "topic": {"value": "menus"}, "purpose": {"value": "menu data"}, "num_members": 42,
     }}
-    res = await bot.fetch_channel_info_tool("C1")
+    _member_of(bot, "C1")
+    res = await bot.fetch_channel_info_tool("C1", ctx=_ctx())
     assert res == {"ok": True, "channel": "C1", "name": "menu-insights", "topic": "menus",
                    "purpose": "menu data", "num_members": 42, "is_private": False}
 
@@ -333,22 +384,24 @@ async def test_channel_info_returns_facts(bot):
 
 @pytest.mark.asyncio
 async def test_pins_listed_messages_only(bot):
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
     bot.app.client.pins_list.return_value = {"items": [
         {"message": {"user": "U1", "ts": "1.1", "text": "release checklist",
                      "permalink": "https://acme.slack.com/archives/C1/p11"}},
         {"file": {"id": "F1"}},  # pinned file: skipped
     ]}
-    res = await bot.fetch_pinned_messages_tool("C1")
+    res = await bot.fetch_pinned_messages_tool("C1", ctx=_ctx())
     assert res["ok"] is True and res["count"] == 1
     assert res["pins"][0]["text"] == "release checklist"
 
 
 @pytest.mark.asyncio
 async def test_pins_missing_scope_names_the_fix(bot):
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
     bot.app.client.pins_list.side_effect = SlackApiError("x", {"error": "missing_scope"})
-    res = await bot.fetch_pinned_messages_tool("C1")
+    res = await bot.fetch_pinned_messages_tool("C1", ctx=_ctx())
     assert res["ok"] is False and res["error"] == "missing_scope"
     assert "pins:read" in res["message"]
 
@@ -380,11 +433,12 @@ async def test_user_profile_tool_retired(bot):
     ("fetch_pinned_messages", {"channel_id": "C1"}, "pins_list"),
 ])
 async def test_dispatch_routes_new_tools(bot, name, args, client_attr):
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
     bot.app.client.chat_getPermalink.return_value = {"permalink": "https://x"}
     bot.app.client.pins_list.return_value = {"items": []}
     bot.app.client.users_info.return_value = {"user": {"profile": {}}}
-    res = await bot.dispatch_history_tool_call(name, args)
+    res = await bot.dispatch_history_tool_call(name, args, _ctx())
     assert res["ok"] is True
     getattr(bot.app.client, client_attr).assert_called()
 
@@ -395,11 +449,12 @@ async def test_dispatch_routes_new_tools(bot, name, args, client_attr):
 async def test_thread_returns_root_plus_newest_when_over_limit(bot):
     """A thread longer than the limit keeps the root (context) + the newest replies,
     since conversations_replies returns ascending-from-root."""
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
     # 6 messages ascending: root, r1..r5
     msgs = [{"user": "U", "ts": f"1.{i}", "text": f"m{i}"} for i in range(6)]
     bot.app.client.conversations_replies.return_value = {"messages": msgs}
-    res = await bot.fetch_history_tool("C1", limit=3, thread_ts="1.0")
+    res = await bot.fetch_history_tool("C1", limit=3, thread_ts="1.0", ctx=_ctx())
     assert res["ok"] is True
     texts = [m["text"] for m in res["messages"]]
     # root + newest 2 (m0, then m4, m5) — never the oldest window (m0, m1, m2).
@@ -412,9 +467,10 @@ async def test_thread_returns_root_plus_newest_when_over_limit(bot):
 async def test_thread_fetches_full_thread_not_limited(bot):
     """The API call must NOT cap at n (that would keep the oldest n); it fetches the
     thread so the tail can be taken locally."""
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
     bot.app.client.conversations_replies.return_value = {"messages": []}
-    await bot.fetch_history_tool("C1", limit=5, thread_ts="1.0")
+    await bot.fetch_history_tool("C1", limit=5, thread_ts="1.0", ctx=_ctx())
     kw = bot.app.client.conversations_replies.call_args.kwargs
     assert kw["limit"] != 5  # not the model's requested slice size
     assert kw["limit"] >= 1000
@@ -422,10 +478,11 @@ async def test_thread_fetches_full_thread_not_limited(bot):
 
 @pytest.mark.asyncio
 async def test_thread_under_limit_returns_all(bot):
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
     msgs = [{"user": "U", "ts": f"1.{i}", "text": f"m{i}"} for i in range(3)]
     bot.app.client.conversations_replies.return_value = {"messages": msgs}
-    res = await bot.fetch_history_tool("C1", limit=10, thread_ts="1.0")
+    res = await bot.fetch_history_tool("C1", limit=10, thread_ts="1.0", ctx=_ctx())
     assert [m["text"] for m in res["messages"]] == ["m0", "m1", "m2"]
     assert res["has_more"] is False
 
@@ -434,12 +491,13 @@ async def test_thread_under_limit_returns_all(bot):
 async def test_thread_paginates_until_cursor_exhausted(bot):
     """F20 remediation: a thread longer than one page must be paged via the response
     cursor so the NEWEST messages (final page) are returned, not the first page's oldest."""
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
     page1 = {"messages": [{"user": "U", "ts": f"1.{i}", "text": f"m{i}"} for i in range(3)],
              "response_metadata": {"next_cursor": "CUR1"}}
     page2 = {"messages": [{"user": "U", "ts": f"1.{i}", "text": f"m{i}"} for i in range(3, 6)]}
     bot.app.client.conversations_replies.side_effect = [page1, page2]
-    res = await bot.fetch_history_tool("C1", limit=2, thread_ts="1.0")
+    res = await bot.fetch_history_tool("C1", limit=2, thread_ts="1.0", ctx=_ctx())
     assert res["ok"] is True
     # both pages fetched; the second call carried the cursor from the first page.
     assert bot.app.client.conversations_replies.await_count == 2
@@ -456,12 +514,13 @@ async def test_thread_pagination_capped_notes_truncation(bot, monkeypatch):
     an HONEST note that the newest window may be incomplete (we couldn't reach the end)."""
     import slack_client.history_tool as ht
     monkeypatch.setattr(ht, "_MAX_THREAD_PAGES", 2)
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
     # Every page returns a cursor, so the thread never drains within the cap.
     page = {"messages": [{"user": "U", "ts": "1.1", "text": "x"}],
             "response_metadata": {"next_cursor": "MORE"}}
     bot.app.client.conversations_replies.return_value = page
-    res = await bot.fetch_history_tool("C1", limit=5, thread_ts="1.0")
+    res = await bot.fetch_history_tool("C1", limit=5, thread_ts="1.0", ctx=_ctx())
     assert bot.app.client.conversations_replies.await_count == 2  # capped, not infinite
     assert res["has_more"] is True
     assert "longer than" in res["note"]
@@ -470,9 +529,10 @@ async def test_thread_pagination_capped_notes_truncation(bot, monkeypatch):
 @pytest.mark.asyncio
 async def test_thread_single_page_makes_one_call(bot):
     """A thread that fits one page (no cursor) must not make a second request."""
-    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False}}
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
     bot.app.client.conversations_replies.return_value = {
         "messages": [{"user": "U", "ts": "1.1", "text": "only"}]}
-    res = await bot.fetch_history_tool("C1", limit=10, thread_ts="1.0")
+    res = await bot.fetch_history_tool("C1", limit=10, thread_ts="1.0", ctx=_ctx())
     assert bot.app.client.conversations_replies.await_count == 1
     assert res["has_more"] is False

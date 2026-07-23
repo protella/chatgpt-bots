@@ -93,6 +93,33 @@ class ToolContext:
     # even though its Response carries no text.
     turn: Any = None
     message: Any = None
+    # --- user-scoped channel authorization (2026-07) ---
+    # Every channel-read tool must prove that BOTH the bot AND `user_id` are in the target
+    # conversation before any content is returned. Two fields serve that check:
+    #
+    # `origin_membership_attested` is a NON-INHERITABLE attestation that this context was built
+    # from a genuine Slack-delivered HUMAN message event whose channel is `channel_id` and whose
+    # sender is `user_id` — i.e. Slack itself just proved the requester is in that conversation.
+    # It is set ONLY in handlers/text.py from origin markers stamped at the real event entry
+    # points, and it authorizes skipping the membership lookup for THAT ONE conversation. It must
+    # stay False on every synthetic/replayed/detached context (settings' welcome replay, edit
+    # re-dispatch, background jobs, scheduled work), because `channel_id` alone is forgeable:
+    # a stale context can name a channel the user has since left. Default False = full check.
+    #
+    # `channel_access_memo` is a REQUEST-SCOPED single-flight memo (decision futures + the
+    # requester's conversation set) that dies with this context. Deliberately NOT a TTL/process
+    # cache: a positive answer must never outlive the request that earned it, or someone removed
+    # from a private channel keeps reading it. Its only job is to coalesce the identical
+    # membership walks that a round's parallel tool calls (dispatch_all) would each run.
+    #
+    # `requester_is_human` says `user_id` belongs to a PERSON, not another app's bot user.
+    # Bot-authored messages are deliberately processed (bot<->bot works), and a bot posting
+    # through its own token carries a genuine U… id, so `user_id` alone cannot carry the
+    # policy. Defaults False and is set only where `user_id` is set from a classified message,
+    # so the two can never disagree; a hand-built context has neither and is denied twice over.
+    origin_membership_attested: bool = False
+    requester_is_human: bool = False
+    channel_access_memo: Optional[Dict[Any, Any]] = None
 
     def container_recycled(self) -> bool:
         """F15: True when this turn's `container_id` died mid-turn and was recorded dead.

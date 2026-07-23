@@ -18,6 +18,8 @@ from .utilities import SlackUtilitiesMixin
 from .formatting.text import SlackFormattingMixin
 from .messaging import SlackMessagingMixin, WorkspaceEmojiCache
 from .history_tool import SlackHistoryToolMixin
+from .channel_lookup_tool import (SlackChannelLookupToolMixin,
+                                  register_channel_lookup_tool)
 from .search_tool import SlackSearchToolMixin
 from .channel_pulse import ChannelPulse
 from tool_registry import ToolRegistry
@@ -39,6 +41,7 @@ class SlackBot(SlackMessageEventsMixin,
                SlackFormattingMixin,
                SlackMessagingMixin,
                SlackHistoryToolMixin,
+               SlackChannelLookupToolMixin,
                SlackSearchToolMixin,
                BaseClient):
     """Slack-specific bot implementation"""
@@ -94,6 +97,10 @@ class SlackBot(SlackMessageEventsMixin,
                 schema,
                 lambda ctx, args, _name=name: self.dispatch_history_tool_call(_name, args, ctx),
             )
+        # Name → id resolution for the tools above, scoped to conversations the REQUESTER and
+        # the bot share. Without it "what's in #menu-insights?" from a DM dead-ends: the model
+        # has no id and (correctly) won't invent one.
+        register_channel_lookup_tool(registry, self)
         # F20: no longer gated on a non-empty REACTION_EMOJIS — the default is unrestricted
         # judgment (any standard emoji); an allowlist, when set, only constrains the choice.
         if config.enable_reactions and config.enable_react_tool:

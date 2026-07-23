@@ -10,6 +10,25 @@ from slack_sdk.errors import SlackApiError
 from config import config
 
 
+# Author ids that users.info can never resolve, so looking them up only buys a 404 and a
+# wasted slot in the resolver's remote budget:
+#   "U00" — the placeholder assistant.search.context returns as the author of some results
+#           (observed live; users.info answers user_not_found).
+#   "B…"  — a BOT object id. A bot's USER identity is a separate U/W id; passing the B id is
+#           simply the wrong argument for users.info.
+# Deliberately NOT a length or character-class check: Slack has lengthened ids before and
+# tells apps not to assume their length or composition, so a `^[UW][A-Z0-9]{8,11}$` guard
+# would start silently dropping real users the day ids grow again.
+_SENTINEL_USER_IDS = frozenset({"U00"})
+
+
+def _is_resolvable_user_id(uid: str) -> bool:
+    """False for ids users.info cannot resolve by construction (see above)."""
+    if uid in _SENTINEL_USER_IDS:
+        return False
+    return not uid.startswith("B")
+
+
 def strip_citations(text: str) -> str:
     """
     Strip OpenAI Responses API citation markers from text.
@@ -278,6 +297,8 @@ class SlackUtilitiesMixin:
         pending: list = []
         for uid in user_ids:
             if not uid or uid in resolved or uid in pending:
+                continue
+            if not _is_resolvable_user_id(uid):
                 continue
             info = cache.get(uid)
             name = info.get("username") if isinstance(info, dict) else None

@@ -11,13 +11,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from slack_sdk.errors import SlackApiError
 
 from config import config
+from slack_client.history_tool import SlackHistoryToolMixin
 from slack_client.search_tool import SlackSearchToolMixin
 from tool_registry import ToolContext, ToolRegistry
 
 
-class _Bot(SlackSearchToolMixin):
+class _Bot(SlackSearchToolMixin, SlackHistoryToolMixin):
+    # The real SlackBot mixes search + history on ONE instance; the delivery-audience gate that
+    # search now consults (self._source_is_public / self._bot_team_id) lives in the history mixin.
     def __init__(self):
         self.app = MagicMock()
+        self.self_team_id = "T_TEST"
+        self.bot_user_id = "U_BOT"
 
     def log_debug(self, *a, **k): pass
     def log_info(self, *a, **k): pass
@@ -91,7 +96,9 @@ async def test_search_success_maps_results():
          "content": "we decided fridays", "permalink": "https://x/p1"},
         {"channel": {"id": "C08"}, "ts": "90.2", "user": "U8", "text": "older note"},
     ]))
-    out = await bot.execute_search_tool(_ctx(), {"query": "demo day"})
+    # DM surface: full reach, so the field-mapping + request plumbing this test covers isn't
+    # touched by the delivery-audience filter (which is exercised in test_channel_scope_guard.py).
+    out = await bot.execute_search_tool(_ctx(is_dm=True), {"query": "demo day"})
     assert out["ok"] is True and out["count"] == 2
     first = out["results"][0]
     assert first == {"channel": "C09", "ts": "100.1", "author": "U9",
