@@ -67,6 +67,13 @@ rebuild your Slack app manifest → start the bot (one-time DB migrations run au
 tagged backups first). The exact keys, manifest deltas, and migration log lines are in the
 [CHANGELOG's Upgrade Instructions](CHANGELOG.md) — follow them in order.
 
+**The Slack app manifest changed in v3** — easy to miss on an upgrade, since nothing forces you to
+re-apply it. Re-paste it from `slack_app_manifest.example.yml` to pick up the current scopes and the
+`agent_view` block, then **turn on Agent mode** (App settings → *Agents & AI Apps*) as described in
+[Slack app setup](#slack-app-setup) below. That's what enables the assistant split-view and the
+`action_token` behind `search_slack`, so an upgraded app that skips it keeps working but silently
+loses workspace search and the agent surface.
+
 ## Getting Started
 
 ### Requirements
@@ -110,6 +117,12 @@ paste it. Then:
 1. Enable **Socket Mode** (required — no public webhook URLs needed)
 2. Generate an App-Level Token with `connections:write`
 3. Install to the workspace and copy `SLACK_BOT_TOKEN` (`xoxb-`) and `SLACK_APP_TOKEN` (`xapp-`) into `.env`
+4. **Turn on Agent mode** — in the app's settings under **Agents & AI Apps**, make sure the agent/
+   assistant view is enabled (the pasted manifest's `agent_view` block sets it up, but confirm the
+   toggle is on). **Recommended:** it gives the bot a dedicated assistant split-view with the
+   suggested-prompt chips, and it's what makes Slack mint the per-message `action_token` that powers
+   `search_slack`. With it off, workspace search degrades to "unavailable" and the bot falls back to
+   reading history directly.
 
 The manifest is the authoritative scope list. What each group buys you:
 

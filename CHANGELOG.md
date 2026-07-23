@@ -129,6 +129,22 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 🔒 Fixed - It keeps every conversation in its lane
+
+The bot now respects the edges of each conversation — both what it reads from and where it
+repeats it — so nothing crosses a boundary you wouldn't cross yourself:
+
+- **It only reads conversations you and it are both in.** Ask it about a channel or DM that
+  just one of you belongs to and it declines, with the same wording every time so the refusal
+  can't be turned into a way to probe what exists.
+- **Private content stays out of shared rooms.** Even when you *can* pull something up, the bot
+  won't repeat a private channel's or another DM's content into a channel where other people
+  would see it — it offers to continue in a DM instead. One-on-one with you, it has full reach.
+- **Search follows the same rule.** Workspace search keeps its full power in a DM; in a channel,
+  hits from private conversations are quietly left out rather than surfaced to the room.
+- **It can turn a channel ID into a name.** After a search it can name the channels it found —
+  public names for anyone, and a private name only where it's allowed to be shown.
+
 ### 🤐 Changed - It only speaks up when it can actually help
 
 Live channel testing kept catching the same thing: the bot would join a conversation it had

@@ -97,6 +97,30 @@ def _api_client(ctx: ToolContext) -> Any:
     return getattr(getattr(ctx.client, "app", None), "client", None)
 
 
+def _access_denied_message() -> str:
+    """The one refusal string the channel-read gate uses, so a roster refusal is worded
+    identically to a history refusal (no reason codes reach the model)."""
+    try:
+        from slack_client.history_tool import ACCESS_DENIED_MESSAGE
+        return ACCESS_DENIED_MESSAGE
+    except Exception:
+        return ("I couldn't verify that both you and the bot are in that conversation, so no "
+                "data was returned. I can only read conversations we're both in.")
+
+
+async def _channel_read_authorized(ctx: ToolContext, channel_id: str) -> bool:
+    """Run `channel_id` through the platform's channel-read gate. Fail CLOSED: a client that
+    doesn't expose the gate (another platform, a bare mock) gets no roster."""
+    gate = getattr(ctx.client, "_channel_is_accessible", None)
+    if gate is None:
+        return False
+    try:
+        allowed, _reason = await gate(channel_id, ctx)
+    except Exception:
+        return False
+    return bool(allowed)
+
+
 def _parse_user_id(raw: str) -> Optional[str]:
     """A bare Slack id or a pasted <@U…> mention → the id; else None (it's a name)."""
     m = _MENTION_RE.match(raw)
@@ -204,6 +228,13 @@ async def execute_list_channel_members(ctx: ToolContext, args: Dict[str, Any]) -
     if api is None:
         return {"ok": False, "error": "unavailable",
                 "hint": "Member listing is not available on this platform."}
+    # A roster is channel content: it says who is inside a conversation. It rides the SAME
+    # user-scoped gate as the channel-read tools (both the bot and the requester must be
+    # members), so this can't become the way to enumerate a private channel's people. Pinning
+    # to ctx.channel_id is not sufficient on its own — a replayed context names a channel the
+    # requester may have left. Fail closed if the gate isn't reachable.
+    if not await _channel_read_authorized(ctx, channel_id):
+        return {"ok": False, "error": "not_accessible", "message": _access_denied_message()}
 
     ids: List[str] = []
     cursor = ""
