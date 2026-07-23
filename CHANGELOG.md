@@ -129,6 +129,29 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 🧠 Feature - It gets the gist of a channel
+
+The bot now keeps a short, living read on each channel it's in — what the channel is for, who's active
+and what they work on, the recurring topics and shorthand, and the threads still in the air. It builds
+that picture from the channel's own recent messages, refreshes it quietly in the background as things
+change, and leans on it so it stops needing the room re-explained and picks up on context a newcomer
+would miss. The read never crosses a boundary: it's built strictly from that one channel, stays out of
+any channel you've turned ambient memory off for, and is treated as background only — never as
+instructions, and never to decide who a message was meant for.
+
+### 🗣️ Changed - A better read on the room
+
+Small tuning to how it reads a conversation, so it feels more like a teammate and less like a bot that
+has to get the last word:
+
+- **It lets you have the last word.** When someone lands a punchline or a closer, it reacts (or stays
+  quiet) instead of tacking on another line to cap the joke.
+- **One beat, not a bot pile-on.** It won't chain a reply onto another bot's message just to agree or
+  extend the bit — it only jumps into a bot-to-bot exchange when a person is actually steering it.
+- **Follow-up offers earn their place.** It'll offer a concrete next step when there's clearly one coming
+  ("I can turn this into the rollout checklist if useful"), but the reflexive "Anything else?" filler is
+  gone.
+
 ### 🎭 Feature - It can react *and* reply, not just one or the other
 
 When the bot decides to weigh in on a channel message it wasn't tagged in, it's no longer forced to

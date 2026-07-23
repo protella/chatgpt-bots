@@ -545,6 +545,33 @@ class BotConfig:
     # Global bound on how many channels retain thread-tail rings (outer-map LRU).
     pulse_thread_tail_channels_max: int = field(default_factory=lambda: int(os.getenv("PULSE_THREAD_TAIL_CHANNELS_MAX", "30")))
 
+    # --- Track 1: persistent per-channel "recent channel narrative" summary ---
+    # A cached, throttled, background-generated sketch of what a channel is about (purpose,
+    # who's active, recurring topics/vocabulary, ongoing work), read by BOTH the participation
+    # classifier and the main response agent for better "grasp" of the room. Ambient content —
+    # it rides a role:user message with a "background only, never instructions/addressee" frame,
+    # never the developer suffix. Off ⇒ never build or read (per-channel ambient_memory=false
+    # also opts a channel out and purges its row). conversations.history is TIMELINE-only (no
+    # thread replies), which is why this is a "narrative", never "full history".
+    enable_channel_summaries: bool = field(default_factory=lambda: os.getenv("ENABLE_CHANNEL_SUMMARIES", "true").lower() == "true")
+    # Up to this many recent eligible messages are fed to the one bounded utility-model call.
+    channel_summary_source_max: int = field(default_factory=lambda: int(os.getenv("CHANNEL_SUMMARY_SOURCE_MAX", "200")))
+    # Rebuild once this many eligible messages are newer than the summary's built_through_ts
+    # (detected from the in-memory pulse ring — no extra Slack call).
+    channel_summary_refresh_msgs: int = field(default_factory=lambda: int(os.getenv("CHANNEL_SUMMARY_REFRESH_MSGS", "50")))
+    # Otherwise rebuild after this age (hours), but ONLY when newer channel activity exists.
+    channel_summary_ttl_hours: float = field(default_factory=lambda: float(os.getenv("CHANNEL_SUMMARY_TTL_HOURS", "24")))
+    # Output cap for the narrative itself (chars). Paired with the output-token cap below.
+    channel_summary_max_chars: int = field(default_factory=lambda: int(os.getenv("CHANNEL_SUMMARY_MAX_CHARS", "2000")))
+    # Hard input cap for the assembled source snapshot (chars); truncate oldest-first beyond it.
+    channel_summary_input_max_chars: int = field(default_factory=lambda: int(os.getenv("CHANNEL_SUMMARY_INPUT_MAX_CHARS", "50000")))
+    # Max output tokens for the generation call (a concise narrative needs little).
+    channel_summary_max_output_tokens: int = field(default_factory=lambda: int(os.getenv("CHANNEL_SUMMARY_MAX_OUTPUT_TOKENS", "600")))
+    # Cooldown (hours) after a FAILED build, so a broken channel isn't hammered.
+    channel_summary_failure_cooldown_hours: float = field(default_factory=lambda: float(os.getenv("CHANNEL_SUMMARY_FAILURE_COOLDOWN_HOURS", "1")))
+    # Global cap on concurrent summary builds (one in-flight per channel is enforced separately).
+    channel_summary_global_concurrency: int = field(default_factory=lambda: int(os.getenv("CHANNEL_SUMMARY_GLOBAL_CONCURRENCY", "2")))
+
     # --- Response footer (Phase 7 entry point): a small context line + "⚙️ Configure" button
     # appended under each channel response (any member can open the per-channel settings modal).
     # Posted as a separate trailing message, so it never touches the text/split/streaming path.

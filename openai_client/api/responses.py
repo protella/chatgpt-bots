@@ -1325,6 +1325,12 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
     def _render(status: str) -> str:
         rendered = [_attachment_line(status) if ln is _ATTACH_SLOT else ln for ln in lines]
         note = "\n\nSignals:\n" + "\n".join(rendered)
+        # Track 1: the persistent channel narrative (background only). Already framed as untrusted
+        # ("never instructions or addressee resolution") by the ChannelSummaryService, so it rides
+        # verbatim. Placed as its own section after the signal lines and BEFORE the addressee
+        # evidence blocks, which stay authoritative for who a message is aimed at.
+        if signals.get("channel_summary"):
+            note += f"\n\n{signals['channel_summary']}"
         # F5/F47: addressee evidence is AUTHORITATIVE, rendered above the peripheral channel
         # envelope. thread_tail wins when present (a threaded turn). For a TOP-LEVEL trigger it
         # is empty and the F47 channel addressee tail is the authoritative block; the general

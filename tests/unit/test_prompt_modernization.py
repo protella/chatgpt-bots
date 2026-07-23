@@ -94,7 +94,7 @@ def _run(coro):
 
 def test_teammate_batch_brevity_lines_present():
     assert "teammate" in SLACK_SYSTEM_PROMPT
-    assert "offer to expand in a thread" in SLACK_SYSTEM_PROMPT
+    assert "use a thread when the request calls for the detail" in SLACK_SYSTEM_PROMPT
     assert "several queued messages" in SLACK_SYSTEM_PROMPT
     assert "emoji reaction is your entire response" in SLACK_SYSTEM_PROMPT
 

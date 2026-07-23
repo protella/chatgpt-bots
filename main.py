@@ -200,6 +200,22 @@ class ChatBotV2:
                     except Exception:  # noqa: BLE001 — never cost the gate a verdict
                         workspace_custom_emojis = []
 
+            # Track 1: load the PRIOR channel narrative (never blocks — uses whatever is cached)
+            # and kick a DETACHED refresh decision so the cache stays warm. The classifier reads
+            # the narrative as background for relevance/value only; the framing forbids using it
+            # for addressee resolution. Load via channel_id only (strict per-channel scope).
+            channel_summary = None
+            summary_svc = getattr(self.processor, "channel_summary_service", None)
+            if summary_svc is not None:
+                try:
+                    channel_summary = await summary_svc.render_for_channel(channel_id)
+                except Exception:
+                    channel_summary = None
+                try:
+                    await summary_svc.maybe_refresh(channel_id, client=client, pulse=pulse)
+                except Exception:
+                    pass
+
             verdict = await engine.evaluate(
                 channel_id=channel_id, ts=ts, text=message.text,
                 sender_id=message.user_id,
@@ -213,6 +229,7 @@ class ChatBotV2:
                 channel_topic=channel_topic,
                 channel_canvases=channel_canvases,
                 channel_people=channel_people,
+                channel_summary=channel_summary,
                 capabilities=capabilities,
                 workspace_custom_emojis=workspace_custom_emojis,
                 attachments=message.metadata.get("participation_attachments"),

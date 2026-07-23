@@ -1465,6 +1465,36 @@ class MessageUtilitiesMixin:
             self.log_debug(f"pulse envelope build failed: {e}")
             return None
 
+    async def _build_channel_summary_block(self, client, message) -> Optional[str]:
+        """Track 1: the persistent per-channel 'recent channel narrative', framed as untrusted
+        background and returned so the text handler can inject it as its OWN role:user message —
+        NEVER the developer suffix (that carries developer authority ambient channel content must
+        not have), and placed BEFORE the fresher pulse envelope with the developer suffix still
+        last.
+
+        Reads the PRIOR cached summary (never blocks the turn) and, as a side effect, kicks a
+        DETACHED refresh decision so the cache stays warm — the current turn always uses the block
+        this returns (or none), it never waits on a rebuild. Returns None for DMs, when the feature
+        is disabled / the channel opted out / the cache is invalidated, or when nothing is built
+        yet. Never raises into a turn."""
+        try:
+            svc = getattr(self, "channel_summary_service", None)
+            channel_id = getattr(message, "channel_id", None)
+            if svc is None or not channel_id or str(channel_id).startswith("D"):
+                return None
+            block = await svc.render_for_channel(channel_id)
+            # Detached refresh — fire-and-forget inside the service; the block above is what this
+            # turn uses regardless of whether a rebuild is (or isn't) triggered here.
+            try:
+                pulse = getattr(client, "channel_pulse", None)
+                await svc.maybe_refresh(channel_id, client=client, pulse=pulse)
+            except Exception:  # noqa: BLE001 — a refresh hiccup never affects the injected block
+                pass
+            return block
+        except Exception as e:  # noqa: BLE001
+            self.log_debug(f"channel summary block build failed: {e}")
+            return None
+
     def _build_channel_people_line(self, client, channel_id: Optional[str]) -> Optional[str]:
         """F29: volatile '[Channel people…]' suffix line — member count (from the cached
         channel context; no await) + recently active names (from the pulse ring). Mirrors the

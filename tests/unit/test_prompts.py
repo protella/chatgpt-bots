@@ -24,13 +24,23 @@ class TestPrompts:
         assert "thread" in SLACK_SYSTEM_PROMPT.lower()
 
     def test_slack_prompt_channel_brevity(self):
-        """Channel-brevity etiquette: brief at top level, long-form in threads, offer to expand"""
+        """Channel-brevity etiquette: brief at top level, long-form detail moves to a thread."""
         assert "brief" in SLACK_SYSTEM_PROMPT.lower()
-        assert "offer to expand" in SLACK_SYSTEM_PROMPT.lower()
+        assert "use a thread when the request calls for the detail" in SLACK_SYSTEM_PROMPT
 
     def test_slack_prompt_reaction_as_response(self):
         """A reaction may be the entire response"""
         assert "emoji reaction is your entire response" in SLACK_SYSTEM_PROMPT
+
+    def test_slack_prompt_followups_allowed_only_for_real_next_step(self):
+        """Follow-up offers are permitted ONLY for a concrete emerging next step — never generic
+        filler. Replaces the old blanket 'DO NOT offer follow-up' ban."""
+        assert "Follow-up offers are fine only when" in SLACK_SYSTEM_PROMPT
+        assert "concrete next step" in SLACK_SYSTEM_PROMPT
+        # the filler examples that are still banned
+        assert "Anything else?" in SLACK_SYSTEM_PROMPT
+        # the old blanket prohibition is gone
+        assert "DO NOT offer follow-up questions or actions" not in SLACK_SYSTEM_PROMPT
 
     def test_slack_prompt_batch_answer_rule(self):
         """Phase Q: queued multi-sender batches answered in one coherent reply"""
