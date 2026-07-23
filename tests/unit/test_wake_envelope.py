@@ -15,7 +15,7 @@ from message_processor.utilities import MessageUtilitiesMixin
 class _WakeHost:
     def __init__(self):
         for n in ("_build_wake_envelope", "_wake_trigger_line", "_wake_sender_role",
-                  "_wake_burst_line", "_build_suffix_context"):
+                  "_wake_burst_line", "_reacted_already_note", "_build_suffix_context"):
             setattr(self, n, getattr(MessageUtilitiesMixin, n).__get__(self))
         self._escape_suffix_text = MessageUtilitiesMixin._escape_suffix_text
 
@@ -191,6 +191,28 @@ def test_no_envelope_without_message():
     host = _WakeHost()
     suffix = host._build_suffix_context(client=None, channel_id="C1", thread_ts="T1")
     assert "[Wake context" not in suffix
+
+
+def test_reacted_already_note_present_when_stamped():
+    # react_and_respond: the gate stamped participation_reaction_emoji, so the response suffix
+    # tells the model it already reacted (and not to add a second reaction).
+    host = _WakeHost()
+    suffix = host._build_suffix_context(
+        client=None, channel_id="C1", thread_ts="T1",
+        message=_msg(wake_source="ambient", sender_type="human",
+                     participation_reaction_emoji="tada"),
+        thread_state=_state())
+    assert "You already reacted :tada: to this message" in suffix
+    assert "do not add another reaction to it" in suffix
+
+
+def test_reacted_already_note_absent_without_stamp():
+    host = _WakeHost()
+    suffix = host._build_suffix_context(
+        client=None, channel_id="C1", thread_ts="T1",
+        message=_msg(wake_source="ambient", sender_type="human"),
+        thread_state=_state())
+    assert "already reacted" not in suffix
 
 
 @pytest.mark.asyncio
