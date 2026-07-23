@@ -342,6 +342,7 @@ class ParticipationEngine:
                        channel_topic: Optional[str] = None,
                        channel_canvases: Optional[List[str]] = None,
                        channel_people: Optional[str] = None,
+                       channel_summary: Optional[str] = None,
                        capabilities: Optional[str] = None,
                        workspace_custom_emojis: Optional[List[str]] = None,
                        attachments: Optional[str] = None,
@@ -475,6 +476,10 @@ class ParticipationEngine:
             # stays silent — the main model never gets a turn to notice the canvas.
             "channel_canvases": channel_canvases,
             "channel_people": channel_people,
+            # Track 1: the persistent channel narrative (already framed as untrusted background by
+            # the ChannelSummaryService). Informs relevance/value only — the framing + the system
+            # prompt forbid using it for addressee resolution. None when none is built / opted out.
+            "channel_summary": channel_summary,
             "capabilities": capabilities,
             # C3: extra reaction choices for the classifier (empty when a REACTION_EMOJIS
             # allowlist is set — customs are never injected over the hard constraint).

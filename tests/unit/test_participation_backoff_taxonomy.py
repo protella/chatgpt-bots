@@ -501,6 +501,18 @@ class TestParticipationPromptGuardrails:
         from prompts import PARTICIPATION_SYSTEM_PROMPT as p
         assert "you can chime in again" in p and "react away" in p
 
+    def test_prompt_lets_the_human_have_the_last_word(self):
+        # On a human's punchline/closer, react rather than re-joke (or ignore) — don't add a beat.
+        from prompts import PARTICIPATION_SYSTEM_PROMPT as p
+        assert "Let the human have the last word" in p
+        assert "do not add another verbal beat or re-joke" in p
+
+    def test_prompt_one_message_per_beat_no_bot_chains(self):
+        # Don't chain onto another bot's reply to agree/restate/extend unless a human is driving.
+        from prompts import PARTICIPATION_SYSTEM_PROMPT as p
+        assert "One message per beat" in p
+        assert "a human is actively driving that exchange" in p
+
     def test_prompt_teasing_at_assistant_is_respond_not_backoff(self):
         # Item B: banter genuinely AT the assistant is participation-worthy (react or a quip),
         # not backoff; teasing pointed at another party still stays theirs.

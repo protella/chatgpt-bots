@@ -320,6 +320,28 @@ class DatabaseManager(LoggerMixin):
             ON thread_summary_addenda(thread_id, source_ts, id)
         """)
 
+        # Track 1 — persistent per-channel "recent channel narrative" summary. A cached,
+        # throttled, background-generated sketch of what a channel is about (purpose, who's
+        # active, recurring topics/vocabulary, ongoing work), read by BOTH the participation
+        # classifier and the main response agent for background "grasp" of the room. Like the
+        # rest of the DB it is a DERIVED artifact, never a transcript (Slack is the source of
+        # truth). One row per channel, keyed by channel_id ONLY — every read/write is strictly
+        # WHERE channel_id = ? (no workspace fallback), preserving the shipped scope-guard
+        # boundary. `built_through_ts` is the newest source message folded in (the refresh
+        # boundary); `source_message_count` is how many messages were actually fed to the model
+        # (NOT a lifetime count). `invalidated_at` is set when an in-window edit/delete makes the
+        # cache untrustworthy — both agents stop injecting until a background rebuild clears it.
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS channel_summaries (
+                channel_id TEXT PRIMARY KEY,
+                summary_text TEXT NOT NULL,
+                built_through_ts TEXT NOT NULL,
+                source_message_count INTEGER NOT NULL,
+                generated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                invalidated_at TIMESTAMP
+            )
+        """)
+
         # F32: thread-scoped code-interpreter containers. One OpenAI container per thread, so
         # the model's sandbox state (files in /mnt/data, loaded dataframes) survives the turn
         # boundary within a conversation.
@@ -1412,8 +1434,23 @@ class DatabaseManager(LoggerMixin):
         if built is None:
             return
         sql, params = built
-        self.conn.execute(sql, params)
-        self.conn.commit()
+        if ambient_memory is False:
+            # Track 1: opting out must purge the derived narrative ATOMICALLY with the settings
+            # write. The sync connection is autocommit (isolation_level=None), so two separate
+            # execute()s each self-commit and a trailing commit() binds nothing — take an explicit
+            # BEGIN IMMEDIATE … COMMIT (ROLLBACK on error), mirroring the async path's idiom.
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                self.conn.execute(sql, params)
+                self.conn.execute(
+                    "DELETE FROM channel_summaries WHERE channel_id = ?", (channel_id,))
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        else:
+            self.conn.execute(sql, params)
+            self.conn.commit()
         logger.debug(f"Saved channel_settings for {channel_id}")
 
     # --- Per-channel memory (Phase 9) ---
@@ -2809,6 +2846,82 @@ class DatabaseManager(LoggerMixin):
             await db.commit()
         self.log_info(f"DB: Saved thread summary for {thread_id} (boundary_ts={boundary_ts}, async)")
 
+    # --- Track 1: per-channel "recent channel narrative" summary CRUD --------------------
+    # Every query is strictly WHERE channel_id = ? — NO workspace-scope fallback, so one
+    # channel's narrative can never be read/written under another's id (scope-guard boundary).
+
+    async def get_channel_summary_async(self, channel_id: str) -> Optional[Dict]:
+        """The cached channel narrative row for one channel, or None. Per-channel scope only."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(
+                "SELECT channel_id, summary_text, built_through_ts, source_message_count, "
+                "generated_at, invalidated_at FROM channel_summaries WHERE channel_id = ?",
+                (channel_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def save_channel_summary_async(self, channel_id: str, summary_text: str,
+                                         built_through_ts: str, source_message_count: int):
+        """Upsert a freshly REBUILT channel narrative (one row per channel). Because a rebuild
+        is always from a fresh snapshot, this CLEARS invalidated_at and bumps generated_at —
+        a saved summary is by definition current and injectable again.
+
+        CONDITIONAL on the channel not being explicitly opted out: the INSERT...SELECT writes
+        nothing when channel_settings.ambient_memory = 0, so a build that raced a settings change
+        to ambient_memory=False can never resurrect a summary for an opted-out channel. Returns
+        True when a row was written/updated."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            cur = await db.execute("""
+                INSERT INTO channel_summaries
+                    (channel_id, summary_text, built_through_ts, source_message_count,
+                     generated_at, invalidated_at)
+                SELECT ?, ?, ?, ?, CURRENT_TIMESTAMP, NULL
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM channel_settings
+                    WHERE channel_id = ? AND ambient_memory = 0
+                )
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    summary_text = excluded.summary_text,
+                    built_through_ts = excluded.built_through_ts,
+                    source_message_count = excluded.source_message_count,
+                    generated_at = CURRENT_TIMESTAMP,
+                    invalidated_at = NULL
+            """, (channel_id, summary_text, str(built_through_ts), int(source_message_count),
+                  channel_id))
+            await db.commit()
+            wrote = cur.rowcount != 0
+        if wrote:
+            self.log_info(
+                f"DB: Saved channel summary for {channel_id} "
+                f"(built_through_ts={built_through_ts}, msgs={source_message_count}, async)")
+        else:
+            self.log_debug(
+                f"DB: Skipped channel summary save for {channel_id} — channel opted out of ambient memory")
+        return wrote
+
+    async def invalidate_channel_summary_async(self, channel_id: str):
+        """Mark the cache invalid (an in-window edit/delete touched a summarized message) so
+        both agents STOP injecting it until a background rebuild clears the flag. No-op when no
+        row exists. Per-channel scope only."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute(
+                "UPDATE channel_summaries SET invalidated_at = CURRENT_TIMESTAMP "
+                "WHERE channel_id = ?", (channel_id,))
+            await db.commit()
+
+    async def delete_channel_summary_async(self, channel_id: str):
+        """Delete a channel's cached narrative (per-channel ambient-memory opt-out / cleanup).
+        Per-channel scope only."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("DELETE FROM channel_summaries WHERE channel_id = ?", (channel_id,))
+            await db.commit()
+
     async def update_thread_activity_async(self, thread_id: str):
         """
         Async version of update_thread_activity.
@@ -3081,6 +3194,12 @@ class DatabaseManager(LoggerMixin):
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute(sql, params)
+            # Track 1: turning ambient_memory OFF purges the derived channel narrative in the SAME
+            # transaction, so an in-flight summary build can't leave a row behind for a channel that
+            # just opted out (the summary upsert is likewise blocked while ambient_memory = 0).
+            if ambient_memory is False:
+                await db.execute(
+                    "DELETE FROM channel_summaries WHERE channel_id = ?", (channel_id,))
             await db.commit()
             logger.debug(f"Saved channel_settings for {channel_id} (async)")
 
