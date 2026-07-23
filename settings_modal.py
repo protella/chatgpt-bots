@@ -237,7 +237,7 @@ class SettingsModal(LoggerMixin):
                          "initial_value": directives_value, "max_length": 1000,
                          "placeholder": {"type": "plain_text",
                                          "text": "e.g. Only jump in on deploy failures; otherwise stay quiet."}},
-             "label": {"type": "plain_text", "text": "Channel ground rules (optional)"},
+             "label": {"type": "plain_text", "text": "Channel ground rules"},
              "hint": {"type": "plain_text", "text": "Extra instructions for how I behave in this channel."}},
             {"type": "input", "block_id": "reply_in_channel_block", "optional": True,
              "element": reply_element,
