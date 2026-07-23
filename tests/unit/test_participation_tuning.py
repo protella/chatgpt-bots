@@ -349,6 +349,8 @@ class _HistHarness(SlackHistoryToolMixin, SlackUtilitiesMixin):
         self.app = MagicMock()
         self.app.client.conversations_info = AsyncMock(
             return_value={"channel": {"is_private": False, "is_member": True}})
+        self.app.client.users_conversations = AsyncMock(
+            return_value={"ok": True, "channels": [{"id": "C_PUBLIC", "name": "c_public"}]})
         self.app.client.conversations_history = AsyncMock()
         self.app.client.conversations_replies = AsyncMock()
         self.remote_calls = []
@@ -368,7 +370,8 @@ async def test_history_tool_resolves_authors_read_only():
         {"user": "U1", "ts": "1.2", "text": "again"},
         {"user": "U2", "ts": "1.3", "text": "hi"},
     ]}
-    res = await h.fetch_history_tool("C_PUBLIC")
+    ctx = ToolContext(channel_id="C_PUBLIC", user_id="U_ASKER", requester_is_human=True)
+    res = await h.fetch_history_tool("C_PUBLIC", ctx=ctx)
     assert [m["user"] for m in res["messages"]] == ["alice", "alice", "bob"]
     assert h.remote_calls == ["U2"]                    # U1 from DB; U2 once remotely; deduped
     h.db.get_or_create_user_async.assert_not_called()  # reading history creates no user rows
@@ -381,7 +384,8 @@ async def test_history_tool_unknown_author_falls_back_to_id():
     h.app.client.conversations_history.return_value = {"messages": [
         {"user": "U404", "ts": "1.1", "text": "who dis"},
     ]}
-    res = await h.fetch_history_tool("C_PUBLIC")
+    ctx = ToolContext(channel_id="C_PUBLIC", user_id="U_ASKER", requester_is_human=True)
+    res = await h.fetch_history_tool("C_PUBLIC", ctx=ctx)
     assert res["messages"][0]["user"] == "U404"
 
 
@@ -406,8 +410,11 @@ async def test_search_tool_resolves_authors_read_only():
         {"channel_id": "C09", "message_ts": "100.2", "author_user_id": "U9",
          "content": "still fridays", "permalink": "https://x/p2"},
     ]}})
+    # DM surface: full reach, so this author-resolution test isn't touched by the
+    # delivery-audience filter (exercised in test_channel_scope_guard.py).
     out = await bot.execute_search_tool(
-        ToolContext(channel_id="C04", thread_ts="1.0", trigger_ts="1.0", action_token="tok"),
+        ToolContext(channel_id="C04", thread_ts="1.0", trigger_ts="1.0", action_token="tok",
+                    is_dm=True),
         {"query": "demo day"})
     assert out["ok"] is True
     assert [r["author"] for r in out["results"]] == ["carol", "carol"]

@@ -42,6 +42,39 @@ def _summarize_attachments(files: Any) -> Any:
     return f"{', '.join(parts)} ({', '.join(names)})"
 
 
+def attest_message_origin(message: Message, event: Dict[str, Any],
+                          sender_type: Optional[str]) -> None:
+    """Record that `message` came from a Slack-DELIVERED human event in the conversation it
+    names — the one case where the requester's membership needs no lookup, because Slack just
+    proved it by delivering their message from there.
+
+    Read by handlers/text.py, which turns these markers into
+    ``ToolContext.origin_membership_attested`` for the channel-read authorization gate.
+
+    Called ONLY from the two genuine entry points (a Bolt-delivered app_mention/DM, and a
+    Bolt-delivered channel message). Deliberately NOT called for:
+      * the settings/welcome replay (event_handlers/settings.py), which re-dispatches a
+        message the user sent minutes earlier — they may have left the channel since;
+      * the edit-triggered re-dispatch, whose event we assemble ourselves;
+      * anything without a `user` (bot posts, system subtypes).
+    The markers name the channel and user they were minted for, so a context that later
+    carries a different channel id can't reuse them — id equality alone is forgeable.
+    """
+    if sender_type != "human":
+        return
+    user_id = event.get("user")
+    channel_id = event.get("channel")
+    if not isinstance(user_id, str) or not user_id:
+        return
+    if not isinstance(channel_id, str) or not channel_id:
+        return
+    if user_id != message.user_id or channel_id != message.channel_id:
+        return
+    message.metadata["origin_event_verified"] = True
+    message.metadata["origin_user_id"] = user_id
+    message.metadata["origin_channel_id"] = channel_id
+
+
 class SlackMessageEventsMixin:
     async def _event_to_message(self, event: Dict[str, Any], client) -> Message:
         """Convert a Slack event into the universal Message format (no side effects).
@@ -905,6 +938,9 @@ class SlackMessageEventsMixin:
 
         # Build the universal message (no onboarding side effects) and dispatch.
         message = await self._event_to_message(event, client)
+        # Slack delivered this human message from this channel, so the sender is provably in
+        # it — the channel-read gate may skip the membership lookup for THIS conversation.
+        attest_message_origin(message, event, message.metadata.get("sender_type"))
         # Phase 6: reply in-thread by default (a top-level message keys as its own length-1 thread).
         message.thread_id = thread_ts or ts
         message.metadata["channel_listen"] = True
@@ -958,11 +994,18 @@ class SlackMessageEventsMixin:
         if self.message_handler:
             await self.message_handler(message, self)
 
-    async def _handle_slack_message(self, event: Dict[str, Any], client, wake_source: str = None):
+    async def _handle_slack_message(self, event: Dict[str, Any], client, wake_source: str = None,
+                                    origin_verified: bool = False):
         """Handle a mention/DM event: build the message, run onboarding, dispatch (unchanged).
 
         wake_source (F3): "app_mention" or "dm" — this path is shared by both, so the
-        caller (registration) tags which one so the wake envelope can tell them apart."""
+        caller (registration) tags which one so the wake envelope can tell them apart.
+
+        origin_verified: True only when `event` came straight from Slack (the Bolt handlers in
+        registration.py). It authorizes the membership attestation below. It defaults False
+        because this method is ALSO the entry point for replayed/synthetic events — the
+        post-onboarding welcome replay and the edit-triggered re-dispatch — where the event is
+        reconstructed, possibly minutes later, and must not be treated as live proof."""
 
         # Skip message_changed events
         if event.get("subtype") == "message_changed":
@@ -1016,6 +1059,9 @@ class SlackMessageEventsMixin:
         sender_type = self.classify_sender(event)
         if sender_type == "self":
             return  # loop guard (also guarded upstream for DMs)
+        if origin_verified:
+            # Live Slack delivery of this person's message from this conversation.
+            attest_message_origin(message, event, sender_type)
         if message.channel_id and not message.channel_id.startswith("D"):
             cs = await self._get_channel_settings(message.channel_id)
             # Participation "off" means OFF — the modal promises "never respond in this

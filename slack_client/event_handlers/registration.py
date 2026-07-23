@@ -21,7 +21,10 @@ class SlackRegistrationMixin:
             # a registration host without the message-events mixin (test harnesses) still works.
             if hasattr(self, "_ambient_ingest"):
                 await self._ambient_ingest(event, client)
-            await self._handle_slack_message(event, client, wake_source="app_mention")
+            # origin_verified: this event came straight from Slack, so it attests that the
+            # sender is in this conversation (see attest_message_origin).
+            await self._handle_slack_message(event, client, wake_source="app_mention",
+                                             origin_verified=True)
 
         @self.app.event("message")
         async def handle_message(event, say, client):
@@ -36,7 +39,8 @@ class SlackRegistrationMixin:
                 # DMs from anyone except ourselves (other bots allowed so bot<->bot works).
                 if not self.is_own_message(event):
                     self.log_debug(f"DM message event: channel={event.get('channel')}, ts={event.get('ts')}")
-                    await self._handle_slack_message(event, client, wake_source="dm")
+                    await self._handle_slack_message(event, client, wake_source="dm",
+                                                     origin_verified=True)
             elif channel_type in ("channel", "group", "mpim"):
                 # Phase 5 channel listening — gated by the master switch (DEFAULT OFF). When off,
                 # non-mention channel messages are ignored entirely (mentions still arrive via

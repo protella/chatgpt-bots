@@ -93,9 +93,34 @@ def _users_info(user_id="U07PETER", display="peter", real="Erin Evans",
 
 def _ctx(client, db=None, **kw):
     defaults = dict(channel_id=CHANNEL, thread_ts="1.0", user_id="U07PETER",
-                    client=client, db=db, is_dm=False)
+                    client=client, db=db, is_dm=False, requester_is_human=True)
     defaults.update(kw)
     return ToolContext(**defaults)
+
+
+def _gated_client(members_pages=None, get_username=None):
+    """ctx.client for list_channel_members: the roster gate needs a REAL
+    `_channel_is_accessible`, so mix in the history tool's gate over a mocked async Web
+    API — the requester (U07PETER, per `_ctx`'s default) and the bot are both members of
+    CHANNEL. Follows test_channel_scope_guard.py's `_Bot` pattern."""
+    from slack_client.history_tool import SlackHistoryToolMixin
+
+    class _Bot(SlackHistoryToolMixin):
+        def log_warning(self, *a, **k):
+            pass
+        log_debug = log_info = log_error = log_warning
+
+    bot = _Bot()
+    bot.app = MagicMock()
+    bot.app.client = MagicMock()
+    bot.app.client.conversations_info = AsyncMock(
+        return_value={"ok": True, "channel": {"is_channel": True, "is_private": True, "is_member": True}})
+    bot.app.client.users_conversations = AsyncMock(
+        return_value={"ok": True, "channels": [{"id": CHANNEL, "name": CHANNEL.lower()}]})
+    if members_pages is not None:
+        bot.app.client.conversations_members = AsyncMock(side_effect=list(members_pages))
+    bot.get_username = get_username or AsyncMock(side_effect=lambda uid, c: f"name-of-{uid}")
+    return bot
 
 
 # --------------------------------------------------------- lookup_user
@@ -189,7 +214,7 @@ def _members_page(members, cursor=""):
 @pytest.mark.asyncio
 async def test_list_members_paginates_and_resolves_names():
     pages = [_members_page(["U1", "U2"], cursor="c1"), _members_page(["U3"])]
-    client, api = _client(members_pages=pages)
+    client = _gated_client(members_pages=pages)
     res = await execute_list_channel_members(_ctx(client), {})
     assert res["ok"] and res["total_members"] == 3
     # A3: each member is now {id, name} so the model gets a MENTIONABLE handle (write <@id>),
@@ -201,7 +226,7 @@ async def test_list_members_paginates_and_resolves_names():
     ]
     assert res["shown"] == 3
     assert "truncated" not in res
-    assert api.conversations_members.await_count == 2
+    assert client.app.client.conversations_members.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -209,7 +234,7 @@ async def test_list_members_surfaces_ids_for_mentioning():
     # A3: the id half of every {id, name} pair is the Slack id, so the model can @-mention a
     # member who hasn't spoken by writing <@id> — the whole point of the tool's amendment.
     pages = [_members_page(["U07ALICE", "W02BOB"])]
-    client, _ = _client(members_pages=pages)
+    client = _gated_client(members_pages=pages)
     res = await execute_list_channel_members(_ctx(client), {})
     assert {m["id"] for m in res["members"]} == {"U07ALICE", "W02BOB"}
     assert all(set(m.keys()) == {"id", "name"} for m in res["members"])
@@ -218,7 +243,7 @@ async def test_list_members_surfaces_ids_for_mentioning():
 @pytest.mark.asyncio
 async def test_list_members_caps_names_with_loud_note():
     ids = [f"U{i}" for i in range(MEMBERS_NAME_CAP + 5)]
-    client, api = _client(members_pages=[_members_page(ids)])
+    client = _gated_client(members_pages=[_members_page(ids)])
     res = await execute_list_channel_members(_ctx(client), {})
     assert res["ok"] and res["total_members"] == MEMBERS_NAME_CAP + 5
     assert len(res["members"]) == MEMBERS_NAME_CAP           # names capped
@@ -239,8 +264,11 @@ async def test_list_members_refuses_dm():
 
 @pytest.mark.asyncio
 async def test_list_members_api_error():
-    client, api = _client()
-    api.conversations_members = AsyncMock(return_value={"ok": False, "error": "channel_not_found"})
+    # Authorize the channel first, so the "channel_not_found" this test is actually about
+    # comes from conversations_members, not from the (now separate) authorization gate.
+    client = _gated_client()
+    client.app.client.conversations_members = AsyncMock(
+        return_value={"ok": False, "error": "channel_not_found"})
     res = await execute_list_channel_members(_ctx(client), {})
     assert res["ok"] is False and res["error"] == "channel_not_found"
 
