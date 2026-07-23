@@ -1168,11 +1168,13 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
 
     Returns the raw verdict dict the model emitted; the caller
     (ParticipationEngine.validate_verdict) coerces/validates it. The verdict carries
-    {"action", "emoji", "placement", "reason"} plus, on a `backoff` (participation-feedback)
-    action, the redesign taxonomy — {"dimension", "durability", "scope", "guidance",
-    "memory_op", "structural_request"}. (The old F19 "ack" flag is gone: the 👀 is now staked
-    by the work itself, not predicted here.) Best-effort and CONSERVATIVE: any failure or
-    unparseable output returns {"action": "ignore"}.
+    {"action" (respond | react | react_and_respond | ignore | backoff), "emoji", "placement",
+    "reason"} plus, on a `backoff` (participation-feedback) action, the redesign taxonomy —
+    {"dimension", "durability", "scope", "guidance", "memory_op", "structural_request"}.
+    `react_and_respond` reacts AND replies in one turn (emoji + words); its emoji rides the same
+    "emoji" field as `react`. (The old F19 "ack" flag is gone: the 👀 is now staked by the work
+    itself, not predicted here.) Best-effort and CONSERVATIVE: any failure or unparseable output
+    returns {"action": "ignore"}.
 
     Prompt construction is deterministic: signal lines render in a fixed order so
     identical inputs produce identical payloads."""

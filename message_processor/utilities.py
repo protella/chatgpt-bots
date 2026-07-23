@@ -1694,6 +1694,23 @@ class MessageUtilitiesMixin:
             "addresses all of it."
         )
 
+    def _reacted_already_note(self, message) -> Optional[str]:
+        """The 'you already reacted' suffix line for a react_and_respond turn. The participation
+        gate stamps message.metadata['participation_reaction_emoji'] when it placed a reaction on
+        this message; surface it to the response model so it doesn't add a second reaction on top.
+        Terminal-safe: missing message / non-dict metadata / no stamp → None (nothing added)."""
+        md = getattr(message, "metadata", None) if message is not None else None
+        if not isinstance(md, dict):
+            return None
+        emoji = md.get("participation_reaction_emoji")
+        if not emoji or not isinstance(emoji, str):
+            return None
+        safe = self._escape_suffix_text(emoji, limit=80)
+        if not safe:
+            return None
+        return (f"You already reacted :{safe}: to this message — "
+                "do not add another reaction to it.")
+
     def _build_suffix_context(self, client, channel_id: Optional[str],
                               thread_ts: Optional[str], user_timezone: str = "UTC",
                               user_tz_label: Optional[str] = None,
@@ -1718,6 +1735,13 @@ class MessageUtilitiesMixin:
         wake = self._build_wake_envelope(message, thread_state)
         if wake:
             parts.append(wake)
+        # When the participation gate already dropped a reaction on this message (a react_and_respond
+        # verdict), tell the RESPONSE model so it doesn't add a second one. This rides the volatile
+        # suffix — not the tool-registry no-reply hint — precisely so it survives a tool-disabled or
+        # timeout-retry response attempt, which drops that registry.
+        reacted = self._reacted_already_note(message)
+        if reacted:
+            parts.append(reacted)
         inflight = self._build_generation_inflight_note(channel_id, thread_ts)
         if inflight:
             parts.append(inflight)

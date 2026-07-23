@@ -129,6 +129,28 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 🎭 Feature - It can react *and* reply, not just one or the other
+
+When the bot decides to weigh in on a channel message it wasn't tagged in, it's no longer forced to
+pick between dropping an emoji and writing a reply — it can do both in one beat, the way a teammate
+reacts to a win and then adds a thought. The reaction lands right away; the reply follows. It stays
+just as reserved as before: most messages still get nothing, many get a single clean move, and it
+does both only when the emoji and the words each carry something the other can't.
+
+### 🎚️ Fixed - "Chime in when it's about X" is remembered as a rule, not a settings flip
+
+Tell the bot something like "you're welcome to jump into the banter when it's clearly about the
+bots" and it used to reach for the nearest channel setting — quietly bumping its participation level
+for the *whole* channel and losing your "when it's about X" condition along the way. Now a grant
+that's scoped to a topic, audience, or situation is remembered as a channel preference with the
+condition intact, so it applies exactly where you meant it. Blanket instructions that really are a
+settings change ("only reply when I tag you") still change the setting.
+
+### 🏷️ Fixed - A doubled "(optional)" in Channel Settings
+
+The "Channel ground rules" field in the channel settings dialog labeled itself "(optional)" twice;
+now it says it once.
+
 ### 🔒 Fixed - It keeps every conversation in its lane
 
 The bot now respects the edges of each conversation — both what it reads from and where it

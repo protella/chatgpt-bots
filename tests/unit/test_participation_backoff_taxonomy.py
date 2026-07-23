@@ -486,10 +486,14 @@ class TestParticipationPromptGuardrails:
 
     def test_prompt_structural_request_is_explicit_only_not_soft_feedback(self):
         # The exact incident: a vague "you're a bit chatty" must be a remembered preference, NOT a
-        # structural settings change. structural_request is reserved for an explicit instruction.
+        # structural settings change. structural_request is reserved for an explicit instruction
+        # that maps LOSSLESSLY to a channel setting; a scoped/conditional grant is a preference.
         from prompts import PARTICIPATION_SYSTEM_PROMPT as p
         assert "NOT a structural request" in p
-        assert "explicit, direct instruction to change the CHANNEL'S settings" in p
+        assert "explicit, direct instruction that maps LOSSLESSLY to the channel" in p
+        # A grant scoped to a topic/audience/situation must be recorded as a preference, not a
+        # whole-channel setting flip (the "welcome to banter about bots" incident).
+        assert "BROADEN the instruction beyond its stated condition" in p
 
     def test_prompt_reversal_is_a_backoff_case(self):
         # Negation / reversal ("you can chime in again", "react away") is handled as backoff so it

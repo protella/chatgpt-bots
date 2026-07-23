@@ -72,6 +72,30 @@ class TestVerdictValidation:
         assert ParticipationEngine.validate_verdict(
             {"action": "react", "emoji": "middle_finger"}).emoji == "thumbsup"
 
+    def test_react_and_respond_keeps_valid_emoji_and_placement(self, monkeypatch):
+        # react_and_respond reacts AND replies in one turn: a valid emoji is kept and placement
+        # is coerced exactly like a respond verdict.
+        monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
+        v = ParticipationEngine.validate_verdict(
+            {"action": "react_and_respond", "emoji": ":tada:", "placement": "channel"})
+        assert (v.action, v.emoji, v.placement) == ("react_and_respond", "tada", "channel")
+
+    def test_react_and_respond_no_allowlist_invalid_emoji_downgrades_to_respond(self, monkeypatch):
+        # (a) With NO allowlist, an unresolvable emoji drops the reaction but KEEPS the reply:
+        # downgrade to a plain respond, NEVER to ignore (react→None ignores; this must not).
+        monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
+        v = ParticipationEngine.validate_verdict(
+            {"action": "react_and_respond", "emoji": "bad name!"})
+        assert v.action == "respond" and v.emoji is None
+
+    def test_react_and_respond_allowlist_offlist_falls_back_and_stays(self, monkeypatch):
+        # (b) With an allowlist set, an off-list emoji falls back to the first allowed emoji and the
+        # action STAYS react_and_respond (the emoji resolved, so there is no downgrade).
+        monkeypatch.setattr(config, "reaction_emojis", ["thumbsup", "eyes"], raising=False)
+        v = ParticipationEngine.validate_verdict(
+            {"action": "react_and_respond", "emoji": "middle_finger"})
+        assert v.action == "react_and_respond" and v.emoji == "thumbsup"
+
     def test_bad_placement_coerced_to_thread(self):
         v = ParticipationEngine.validate_verdict({"action": "respond", "placement": "everywhere"})
         assert v.placement == "thread"
@@ -518,6 +542,57 @@ class TestGateWiring:
         assert await app._run_participation_gate(_channel_msg(), client) is None
         # F6 addendum: routed through the guard-aware reservation, not the raw react.
         client._reserve_and_react.assert_awaited_once_with("C1", "10.0", "eyes")
+
+    @pytest.mark.asyncio
+    async def test_react_and_respond_reacts_and_falls_through(self, monkeypatch):
+        # react_and_respond places the gate reaction AND returns the verdict so the response loop
+        # runs — and it stamps the emoji so the response turn's suffix can tell the model.
+        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
+        monkeypatch.setattr(config, "reaction_emojis", ["tada"], raising=False)
+        app, client, _ = _make_app({"action": "react_and_respond", "emoji": "tada"})
+        msg = _channel_msg()
+        verdict = await app._run_participation_gate(msg, client)
+        assert verdict is not None and verdict.action == "react_and_respond"
+        client._reserve_and_react.assert_awaited_once_with("C1", "10.0", "tada")
+        assert msg.metadata["participation_reaction_emoji"] == "tada"
+
+    @pytest.mark.asyncio
+    async def test_queue_redispatch_react_and_respond_twice_places_one(self, monkeypatch):
+        # Queue dedup (i): the SAME Message object is re-run through the gate on redispatch, and the
+        # fresh pass picks a DIFFERENT emoji but the same react_and_respond verdict. The stamp from
+        # the first placement makes the second pass a no-op — exactly ONE reaction total.
+        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
+        monkeypatch.setattr(config, "reaction_emojis", ["tada", "fire"], raising=False)
+        app, client, fake = _make_app({"action": "react_and_respond", "emoji": "tada"})
+        msg = _channel_msg()
+        v1 = await app._run_participation_gate(msg, client)
+        assert v1 is not None and v1.action == "react_and_respond"
+        fake._verdict = {"action": "react_and_respond", "emoji": "fire"}  # redispatch, new emoji
+        v2 = await app._run_participation_gate(msg, client)
+        assert v2 is not None and v2.action == "react_and_respond"
+        assert client._reserve_and_react.await_count == 1
+        client._reserve_and_react.assert_awaited_with("C1", "10.0", "tada")
+        assert msg.metadata["participation_reaction_emoji"] == "tada"
+
+    @pytest.mark.asyncio
+    async def test_queue_redispatch_react_and_respond_then_react_places_one(self, monkeypatch):
+        # Queue dedup (ii): react_and_respond on the first pass, then a redispatch flips to a PLAIN
+        # react with a different emoji. Both branches route through the shared helper, so the stamp
+        # still blocks the second reaction — one reaction total, and the plain react is terminal.
+        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
+        monkeypatch.setattr(config, "reaction_emojis", ["tada", "fire"], raising=False)
+        app, client, fake = _make_app({"action": "react_and_respond", "emoji": "tada"})
+        msg = _channel_msg()
+        v1 = await app._run_participation_gate(msg, client)
+        assert v1 is not None and v1.action == "react_and_respond"
+        fake._verdict = {"action": "react", "emoji": "fire"}  # redispatch flips to plain react
+        v2 = await app._run_participation_gate(msg, client)
+        assert v2 is None  # a plain react is terminal
+        assert client._reserve_and_react.await_count == 1
+        client._reserve_and_react.assert_awaited_with("C1", "10.0", "tada")
 
     @pytest.mark.asyncio
     async def test_backoff_thread_exit_persists_nothing_via_gate(self, monkeypatch):

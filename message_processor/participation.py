@@ -57,7 +57,7 @@ def _ts_seconds(ts: Any) -> float:
     return secs + micros / 1_000_000.0
 
 
-VALID_ACTIONS = ("respond", "react", "ignore", "backoff")
+VALID_ACTIONS = ("respond", "react", "react_and_respond", "ignore", "backoff")
 VALID_PLACEMENTS = ("thread", "channel")
 VALID_LEVELS = ("off", "mentions_only", "judicious", "active")
 
@@ -619,7 +619,10 @@ class ParticipationEngine:
         ignore. F20: by default any syntactically valid standard emoji name is
         accepted (a garbage name downgrades the react to ignore); when a
         REACTION_EMOJIS allowlist is set, an off-list emoji falls back to the
-        first allowlisted emoji (the choice the old wake gate made).
+        first allowlisted emoji (the choice the old wake gate made). A
+        `react_and_respond` verdict coerces its emoji the same way, but an
+        unresolvable emoji downgrades it to a plain `respond` (never ignore) so
+        the worded reply is never lost.
 
         A `backoff` verdict additionally carries the participation-feedback taxonomy
         (dimension/durability/scope/guidance/memory_op/structural_request); each field is
@@ -634,6 +637,14 @@ class ParticipationEngine:
             emoji = ParticipationEngine._coerce_emoji(raw, force_allowlist=True)
             if emoji is None:
                 return ParticipationVerdict(action="ignore", reason="react-no-valid-emoji")
+        elif action == "react_and_respond":
+            # Same allowlist coercion as `react`, but a None emoji must NEVER cost the reply.
+            # react→None downgrades to ignore (a reaction that won't resolve leaves nothing to do);
+            # react_and_respond→None downgrades to a plain `respond` — the words were the point, so
+            # drop just the reaction rather than lose the answer because the emoji was garbage.
+            emoji = ParticipationEngine._coerce_emoji(raw, force_allowlist=True)
+            if emoji is None:
+                action = "respond"
         elif action == "backoff":
             # An OPTIONAL ack emoji; absent/garbage simply means no ack.
             emoji = ParticipationEngine._coerce_emoji(raw, force_allowlist=False)

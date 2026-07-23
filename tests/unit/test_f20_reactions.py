@@ -177,6 +177,21 @@ class TestValidateVerdictUnrestricted:
         v = ParticipationEngine.validate_verdict({"action": "react", "emoji": "joy"})
         assert v.action == "react" and v.emoji == "thumbsup"
 
+    def test_react_and_respond_offlist_falls_back_and_stays(self, monkeypatch):
+        # react_and_respond coerces its emoji through the allowlist exactly like react; an off-list
+        # name falls back to the first allowed emoji and the action STAYS react_and_respond.
+        monkeypatch.setattr(config, "reaction_emojis", ["thumbsup"], raising=False)
+        v = ParticipationEngine.validate_verdict({"action": "react_and_respond", "emoji": "joy"})
+        assert v.action == "react_and_respond" and v.emoji == "thumbsup"
+
+    def test_react_and_respond_bad_emoji_no_allowlist_downgrades_to_respond(self, monkeypatch):
+        # Unlike react (which downgrades to ignore), a react_and_respond whose emoji won't resolve
+        # keeps the worded reply: downgrade to a plain respond with no emoji.
+        monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
+        v = ParticipationEngine.validate_verdict(
+            {"action": "react_and_respond", "emoji": "bad name!"})
+        assert v.action == "respond" and v.emoji is None
+
 
 # -------------------------------------------------------------- point 2: tool-enabled gate
 

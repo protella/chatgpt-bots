@@ -93,10 +93,10 @@ class ChatBotV2:
         refused to build the report, because it could not read the numbers and would not invent
         them. The file was sitting right there in the channel.
 
-        So: run the gate, and if the answer is anything other than "respond", catalog the files
-        anyway. When the answer IS respond, the turn does the richer job (extraction, summaries,
-        visual descriptions) and we leave it alone — `save_document` is a plain INSERT, so
-        cataloguing here as well would just duplicate the row.
+        So: run the gate, and if it stays silent (returns None), catalog the files anyway. When
+        the gate falls through to a reply (respond or react_and_respond), the turn does the richer
+        job (extraction, summaries, visual descriptions) and we leave it alone — `save_document` is
+        a plain INSERT, so cataloguing here as well would just duplicate the row.
         """
         verdict = await self._gate_verdict(message, client)
         if verdict is None and (message.attachments or []):
@@ -106,9 +106,12 @@ class ChatBotV2:
 
     async def _gate_verdict(self, message: Message, client: BaseClient):
         """Phase F gate for UNPROMPTED channel messages: hard rails → debounce →
-        ONE engine call → act. Returns a verdict only for action='respond';
-        every other outcome (ignore / react / backoff / superseded / any failure)
-        is handled here and returns None so the caller stays silent."""
+        ONE engine call → act. Returns a verdict for the fall-through outcomes —
+        'respond', 'react_and_respond', and a backoff that requests an explicit
+        settings change — which the caller runs through the response loop (a
+        react_and_respond has ALREADY placed its gate reaction here). Every
+        terminal outcome (ignore / react / a fully-handled backoff / superseded /
+        any failure) is handled here and returns None so the caller stays silent."""
         engine = self.participation_engine
         if engine is None or not getattr(config, "enable_participation_engine", True):
             return None  # engine off → unaddressed messages stay unanswered (mentions_only behavior)
@@ -226,26 +229,21 @@ class ChatBotV2:
 
             if verdict.action == "react":
                 react_ts = message.metadata.get("ts") or message.thread_id
-                # F6: route the gate's own reaction through the reservation guard so a
-                # later main-model turn on this message honestly sees the slot consumed
-                # (and won't double-add the same emoji). Falls back to the raw react.
-                try:
-                    # Bound the gate's own react by the configured tool-call timeout so a
-                    # wedged Slack call can't stall the turn (the model-invoked react tool
-                    # is already timeout-guarded by the tool loop; this direct path wasn't).
-                    if hasattr(client, "_reserve_and_react"):
-                        await asyncio.wait_for(
-                            client._reserve_and_react(channel_id, react_ts, verdict.emoji),
-                            timeout=config.tool_call_timeout)
-                    elif hasattr(client, "react"):
-                        await asyncio.wait_for(
-                            client.react(channel_id, react_ts, verdict.emoji),
-                            timeout=config.tool_call_timeout)
-                except asyncio.TimeoutError:
-                    main_logger.debug("Participation react timed out")
-                except Exception as e:
-                    main_logger.debug(f"Participation react failed: {e}")
+                # Route through the shared gate-reaction helper (reservation guard + timeout +
+                # once-per-message stamp). A reaction is this verdict's whole response — stay silent.
+                await self._place_gate_reaction(
+                    message, client, channel_id, react_ts, verdict.emoji)
                 return None
+            if verdict.action == "react_and_respond":
+                # BOTH react and reply in one turn: place the gate reaction (same path as `react`),
+                # then fall through to the response loop like `respond` so the words go out too. The
+                # response turn's developer suffix tells the model it already reacted (so it doesn't
+                # add a second reaction). The stamp inside _place_gate_reaction means a queued
+                # redispatch that re-picks a react/react_and_respond verdict can't stack a second one.
+                react_ts = message.metadata.get("ts") or message.thread_id
+                await self._place_gate_reaction(
+                    message, client, channel_id, react_ts, verdict.emoji)
+                return verdict
             if verdict.action == "backoff":
                 # The taxonomy decides what "backoff" means: a durable per-channel preference,
                 # a real thread mute/unmute, a momentary aside (nothing persisted), or an
@@ -269,6 +267,48 @@ class ChatBotV2:
             # Fail-safe stays silence: worst failure mode is a missed reply, never spam.
             main_logger.warning(f"Participation gate error: {e}; staying silent")
             return None
+
+    async def _place_gate_reaction(self, message: Message, client: BaseClient,
+                                   channel_id: str, react_ts: str, emoji: Optional[str]) -> None:
+        """Place a participation-gate reaction ONCE per message, via the reservation guard so a
+        later turn sees the slot consumed. Idempotent across queued redispatch: the SAME Message
+        object is re-run through the gate (Phase Q) and a fresh pass may pick a different emoji or a
+        different reaction-bearing verdict — so every gate-reaction branch (react, react_and_respond,
+        backoff ack) checks the stamp first and no-ops if a gate reaction was already placed. On a
+        genuine placement, stamps message.metadata['participation_reaction_emoji'] so the response
+        turn's developer suffix can tell the model it already reacted."""
+        if not emoji or not react_ts or not channel_id:
+            return
+        md = message.metadata if isinstance(message.metadata, dict) else None
+        # Dedup: a redispatch re-runs this same object through the gate, and a fresh pass can flip
+        # react_and_respond→react (or pick a new emoji) — honor the first placement, never stack.
+        if md is not None and md.get("participation_reaction_emoji"):
+            return
+        result = None
+        try:
+            # Bound the gate's own react by the configured tool-call timeout so a wedged Slack call
+            # can't stall the turn. F6: route through the reservation guard so a later main-model
+            # turn honestly sees the slot consumed (and won't double-add). Falls back to raw react.
+            if hasattr(client, "_reserve_and_react"):
+                result = await asyncio.wait_for(
+                    client._reserve_and_react(channel_id, react_ts, emoji),
+                    timeout=config.tool_call_timeout)
+            elif hasattr(client, "react"):
+                result = await asyncio.wait_for(
+                    client.react(channel_id, react_ts, emoji),
+                    timeout=config.tool_call_timeout)
+        except asyncio.TimeoutError:
+            main_logger.debug("Participation gate react timed out")
+            return
+        except Exception as e:
+            main_logger.debug(f"Participation gate react failed: {e}")
+            return
+        # Stamp ONLY on a genuine placement (_reserve_and_react → {"ok": True}; react → True). On a
+        # cap/busy/timeout failure the slot wasn't taken, so leave the stamp unset: a later attempt
+        # can still try, and the model must never be told it reacted when it didn't.
+        placed = result is True or (isinstance(result, dict) and result.get("ok") is True)
+        if placed and md is not None:
+            md["participation_reaction_emoji"] = emoji
 
     # ---- participation-feedback backoff taxonomy (redesign Layer 2) ----
     # Default guidance text per dimension, used to write a readable preference memory when the
@@ -334,7 +374,7 @@ class ChatBotV2:
         #    react) so a later main-model turn honestly sees the slot consumed. NEVER react when
         #    the feedback is ABOUT reactions — acking "stop reacting" with a reaction is absurd.
         if verdict.emoji and verdict.dimension != "reactions":
-            await self._backoff_ack(client, channel_id, react_ts, verdict.emoji)
+            await self._backoff_ack(message, client, channel_id, react_ts, verdict.emoji)
 
         return False
 
@@ -438,24 +478,13 @@ class ChatBotV2:
             guidance = guidance[:200] + "…"
         return f"Channel participation preference ({dimension}): {guidance}"
 
-    async def _backoff_ack(self, client: BaseClient, channel_id: str,
+    async def _backoff_ack(self, message: Message, client: BaseClient, channel_id: str,
                            react_ts: str, emoji: str) -> None:
-        """Drop the optional acknowledgment reaction, bounded and routed through the same
-        reservation guard the gate's own react uses (main.py gate react) so a later turn sees
-        the slot consumed and never double-adds."""
-        try:
-            if hasattr(client, "_reserve_and_react"):
-                await asyncio.wait_for(
-                    client._reserve_and_react(channel_id, react_ts, emoji),
-                    timeout=config.tool_call_timeout)
-            elif hasattr(client, "react"):
-                await asyncio.wait_for(
-                    client.react(channel_id, react_ts, emoji),
-                    timeout=config.tool_call_timeout)
-        except asyncio.TimeoutError:
-            main_logger.debug("Backoff ack react timed out")
-        except Exception as e:
-            main_logger.debug(f"Backoff ack react failed: {e}")
+        """Drop the optional acknowledgment reaction, routed through the shared gate-reaction
+        helper so it goes through the same reservation guard the gate's own react uses (a later
+        turn sees the slot consumed and never double-adds) AND honors the once-per-message stamp —
+        a react_and_respond→backoff redispatch can't stack a second reaction onto this message."""
+        await self._place_gate_reaction(message, client, channel_id, react_ts, emoji)
 
     @staticmethod
     def _produced_visible_output(response, turn) -> bool:
@@ -532,8 +561,10 @@ class ChatBotV2:
     async def handle_message(self, message: Message, client: BaseClient):
         """Handle incoming message from any platform"""
         # Phase F participation gate: for UNPROMPTED channel messages (judicious/active
-        # levels) the engine decides respond/react/ignore/backoff BEFORE anything is
-        # posted. Only action='respond' falls through.
+        # levels) the engine decides respond/react/react_and_respond/ignore/backoff BEFORE
+        # anything is posted. The reply outcomes fall through (respond, react_and_respond, and
+        # a backoff requesting a settings change); a react_and_respond has already placed its
+        # reaction in the gate, so only the words remain to send.
         placement_verdict = None
         if message.metadata.get("participation_check") is True:
             verdict = await self._run_participation_gate(message, client)

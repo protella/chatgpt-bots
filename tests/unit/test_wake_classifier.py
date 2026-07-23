@@ -56,6 +56,7 @@ class _FakeLLM:
 @pytest.mark.parametrize("raw,expected_action", [
     ('{"action": "respond", "placement": "thread", "reason": "asked us"}', "respond"),
     ('{"action": "react", "emoji": "thumbsup"}', "react"),
+    ('{"action": "react_and_respond", "emoji": "tada", "placement": "channel"}', "react_and_respond"),
     ('{"action": "ignore"}', "ignore"),
     ('{"action": "backoff", "reason": "told to chill"}', "backoff"),
     # code fences / surrounding prose are tolerated
