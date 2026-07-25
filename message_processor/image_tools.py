@@ -543,13 +543,21 @@ async def execute_create_image_asset(ctx, args: Dict[str, Any]) -> Dict[str, Any
                 pass
 
     logger.info(f"Mounted generated image at {path} in {container_id}")
+    # Show it to the model too: it is about to USE this asset (place it in a deck, composite it),
+    # and it cannot judge whether the generation actually came out right from a path string.
+    from message_processor.image_view import stage_produced_image
+    shown = stage_produced_image(ctx, image_data, label="The asset you just generated")
+
     result = {
         "ok": True,
         "path": path,
         "format": settings["format"],
         "size": settings["size"],
         "message": ("The image is now at this path inside the sandbox. Open it from there in "
-                    "your next code_interpreter call. It has NOT been posted to the user."),
+                    "your next code_interpreter call. It has NOT been posted to the user."
+                    + (" It is also attached below so you can see what you got — if it did not "
+                       "come out as intended, fix it before building it into anything."
+                       if shown else "")),
     }
     if rejected:
         result["ignored_overrides"] = rejected
@@ -697,11 +705,23 @@ async def execute_edit_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
     processor.thread_manager.mark_needs_refresh(thread_key)
     logger.info(f"Edited image posted for {thread_key} from {[e['image_id'] for e in resolved]}")
 
+    # Show the model what it just made. It used to get only this text and never the picture, so
+    # it was writing "here's the edit" about something it had not seen — and could not tell the
+    # user the edit had gone wrong, or act on "make the text bigger" from any actual knowledge.
+    from message_processor.image_view import stage_produced_image
+    shown = stage_produced_image(ctx, image_data, label="Your edited image")
+
     result = {
         "ok": True,
         "status": "posted",
-        "message": ("The edited image has been posted to the thread. Acknowledge briefly; do "
-                    "not describe it."),
+        "message": (
+            "The edited image has been posted to the thread, and it is attached below so you can "
+            "see it. Look at it: if it matches what was asked, acknowledge in one short line "
+            "without narrating the picture (everyone can see it). If the edit clearly did NOT do "
+            "what was asked, say so plainly rather than presenting it as a success."
+            if shown else
+            "The edited image has been posted to the thread. Acknowledge briefly; do not "
+            "describe it."),
         "sources": [e["image_id"] for e in resolved],
     }
     if rejected:

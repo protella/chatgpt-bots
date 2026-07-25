@@ -39,9 +39,40 @@ def _describe(entry: Dict[str, Any]) -> str:
     return text[:_DESC_CHARS] + ("…" if len(text) > _DESC_CHARS else "")
 
 
+# How far back the DM widening below reaches. A DM has no thread structure to bound "this
+# conversation", so time is the only honest boundary — a picture from last week is not what
+# "edit that image" means.
+DM_LOOKBACK_HOURS = 24
+
+
+def _entry(row: Dict[str, Any], origin: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    row_id, url = row.get("id"), row.get("url")
+    if row_id is None or not url:
+        return None
+    entry = {
+        "image_id": image_id_for(row_id),
+        "url": url,
+        "kind": row.get("image_type") or "image",
+        "prompt": row.get("prompt") or "",
+        "analysis": row.get("analysis") or "",
+        "created_at": row.get("created_at"),
+    }
+    if origin:
+        entry["origin"] = origin
+    return entry
+
+
 async def build_catalog(db, thread_key: str) -> List[Dict[str, Any]]:
     """This thread's images, newest first, capped. Never raises — no catalog just means the
-    edit tool is not offered this turn."""
+    edit tool is not offered this turn.
+
+    In a DM the thread is widened to the whole conversation (see below): Slack makes every
+    top-level DM message its own thread root, so a picture sent as one message and the request
+    about it sent as the next land under different keys. Strictly scoped, that meant `edit_image`
+    and `view_image` were not even OFFERED on the second message — and the model, left with
+    `generate_image` as the only image tool, re-imagined the picture from scratch instead of
+    editing it.
+    """
     if not db or not thread_key:
         return []
     try:
@@ -52,21 +83,56 @@ async def build_catalog(db, thread_key: str) -> List[Dict[str, Any]]:
 
     entries: List[Dict[str, Any]] = []
     for row in rows or []:
-        row_id, url = row.get("id"), row.get("url")
-        if row_id is None or not url:
-            continue
-        entries.append({
-            "image_id": image_id_for(row_id),
-            "url": url,
-            "kind": row.get("image_type") or "image",
-            "prompt": row.get("prompt") or "",
-            "analysis": row.get("analysis") or "",
-            "created_at": row.get("created_at"),
-        })
+        entry = _entry(row)
+        if entry:
+            entries.append(entry)
 
     # find_thread_images returns oldest-first; the model reasons about "the last one".
     entries.reverse()
+
+    entries.extend(await _dm_widening(db, thread_key, {e["url"] for e in entries},
+                                      room=MAX_CATALOG - len(entries)))
     return entries[:MAX_CATALOG]
+
+
+async def _dm_widening(db, thread_key: str, seen: set, *, room: int) -> List[Dict[str, Any]]:
+    """Recent images from elsewhere in the SAME DM, newest first.
+
+    DMs only, and one DM only: the lookup is a prefix match on this channel id, the same
+    boundary `read_document`'s channel-wide fallback already uses. It never reaches another
+    channel, another DM, or another person — a one-to-one DM is a single conversation that Slack
+    happens to split into roots, not a scope the bot is crossing.
+
+    Channels are deliberately left strict. There a thread IS a real conversation boundary, and
+    offering images from other threads would be a genuine scope change rather than a repair.
+    """
+    # Thread keys contain colons on BOTH sides (channel:thread_ts) — split once, from the left.
+    channel_id = thread_key.split(":", 1)[0]
+    if room <= 0 or not channel_id.startswith("D"):
+        return []
+    if not hasattr(db, "find_channel_images_async"):
+        return []
+    try:
+        rows = await db.find_channel_images_async(
+            channel_id, within_hours=DM_LOOKBACK_HOURS, limit=MAX_CATALOG * 2)
+    except Exception as e:  # noqa: BLE001 — a failed widening is just a narrower catalog
+        logger.debug(f"DM image widening failed for {channel_id}: {e}")
+        return []
+
+    widened: List[Dict[str, Any]] = []
+    for row in rows or []:
+        if row.get("url") in seen:
+            continue
+        entry = _entry(row, origin="earlier in this DM")
+        if not entry:
+            continue
+        seen.add(entry["url"])
+        widened.append(entry)
+        if len(widened) >= room:
+            break
+    if widened:
+        logger.debug(f"DM image catalog widened by {len(widened)} for {channel_id}")
+    return widened
 
 
 def catalog_lines(entries: List[Dict[str, Any]]) -> str:
@@ -74,12 +140,16 @@ def catalog_lines(entries: List[Dict[str, Any]]) -> str:
     lines = []
     for i, e in enumerate(entries):
         marker = " (most recent)" if i == 0 else ""
+        # Say so when an image came from another message in this DM rather than this exchange —
+        # "the image I just sent" and "that chart from earlier" are different requests.
+        if e.get("origin"):
+            marker += f" [{e['origin']}]"
         lines.append(f"{e['image_id']}{marker} — {e['kind']}: {_describe(e)}")
     return "\n".join(lines)
 
 
-async def catalog_uploads(processor, thread_key: str, attachments: List[Dict[str, Any]],
-                          image_inputs: List[str], message_ts: Optional[str] = None) -> None:
+async def catalog_uploads(processor, thread_key: str, image_inputs: List[Dict[str, Any]],
+                          message_ts: Optional[str] = None) -> None:
     """Store a canonical visual description for each image the user just uploaded.
 
     This is the one genuinely load-bearing thing the old vision handler did, and it survives
@@ -95,7 +165,7 @@ async def catalog_uploads(processor, thread_key: str, attachments: List[Dict[str
 
     Never raises: a failed description costs a weaker catalog entry, not the turn.
     """
-    if not processor.db or not attachments or not image_inputs:
+    if not processor.db or not image_inputs:
         return
 
     # ONE description PER image, keyed by that image's own url. A single aggregate call over all
@@ -111,10 +181,37 @@ async def catalog_uploads(processor, thread_key: str, attachments: List[Dict[str
     # list, which would misattribute descriptions.
     from prompts import IMAGE_ANALYSIS_PROMPT
 
+    # Anything that ALREADY has a description does not need a second one.
+    #
+    # Two writers land in `images.analysis`: this function, and the participation gate's per-image
+    # `image_observations` (dual-written by the ambient artifact store). The upsert is
+    # merge-preserving — the first non-empty write wins — so when both ran, one description was
+    # computed and then silently discarded. The loser was usually this one, and this is the
+    # expensive side: the gate's observation rides a classifier call that had to happen anyway,
+    # while every call below is a dedicated primary-model vision request. So read first and
+    # describe only what is genuinely undescribed.
+    described = set()
+    try:
+        for row in (await processor.db.find_thread_images_async(thread_key)) or []:
+            if row.get("url") and (row.get("analysis") or "").strip():
+                described.add(row["url"])
+    except Exception as e:  # noqa: BLE001 — an unreadable catalog just means we describe again
+        logger.debug(f"Could not read existing descriptions for {thread_key}: {e}")
+
     cataloged = 0
+    reused = 0
     for part in image_inputs:
-        url = part.get("url") if isinstance(part, dict) else None
+        if not isinstance(part, dict):
+            continue
+        # An image pulled from a LINK carries `original_url`; only ATTACHMENTS carry `url`
+        # (utilities._process_attachments). Reading `url` alone meant every link-borne image was
+        # skipped here and never described at all — it entered the catalog as "no description
+        # available" and stayed that way.
+        url = part.get("url") or part.get("original_url")
         if not url:
+            continue
+        if url in described:
+            reused += 1
             continue
         try:
             description = await processor.openai_client.analyze_images(
@@ -138,10 +235,14 @@ async def catalog_uploads(processor, thread_key: str, attachments: List[Dict[str
                 message_ts=message_ts,
             )
             cataloged += 1
+            # Guard the rest of THIS call too: the same url can appear twice in one turn's parts
+            # (an attachment that is also linked in the text).
+            described.add(url)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Failed to persist catalog entry for {url}: {e}")
-    if cataloged:
-        logger.info(f"Cataloged {cataloged} uploaded image(s) for {thread_key}")
+    if cataloged or reused:
+        logger.info(f"Cataloged {cataloged} uploaded image(s) for {thread_key}"
+                    + (f" ({reused} already described — no vision call spent)" if reused else ""))
 
 
 def resolve(entries: Optional[List[Dict[str, Any]]], image_id: str) -> Optional[Dict[str, Any]]:

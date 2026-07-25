@@ -16,7 +16,7 @@ class ImageJobMixin:
             thread_key, prompt, enhance, conversation_history, thread_config, checklist,
             generating_id, generation_id, message_ts=None, unprompted=False) -> None:
         """The slow generate_image call plus delivery, run after the thread lock released."""
-        from message_processor.image_delivery import publish_image
+        from message_processor.image_delivery import publish_image, review_produced_image
         from message_processor.image_service import resolve_settings
         status_only = checklist is not None and checklist.surface == "assistant_status"
         settings, _ = resolve_settings(thread_config)
@@ -44,6 +44,15 @@ class ImageJobMixin:
                 # (recoverable via the post-refresh Slack rebuild).
                 await client.handle_error(channel_id, thread_id,
                     "⚠️ I generated the image but couldn't post it. Please try again.")
+            else:
+                # The picture is posted; now let the model SEE it. A detached generation lands
+                # after its turn ended, so this one short call is the only point at which the
+                # model that ordered the image can look at what actually came back. Awaited
+                # rather than detached so it runs while the job's progress surface is still up,
+                # but it can never fail the job — review_produced_image swallows everything.
+                await review_produced_image(
+                    processor=self, client=client, channel_id=channel_id, thread_id=thread_id,
+                    conversation_history=conversation_history, image_data=image_data, ask=prompt)
         except asyncio.CancelledError:
             # Shutdown/cancel: clear the progress surface (message-surface checklists too,
             # which the finally's status-only clear wouldn't reach), then let finally run.

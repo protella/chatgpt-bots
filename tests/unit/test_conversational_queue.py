@@ -421,7 +421,9 @@ class TestBatchAttachments:
         # A durable visual description was scheduled for the earlier image (trigger parity).
         catalog.assert_called_once()
         cat_args = catalog.call_args.args
-        assert cat_args[2] == earlier.attachments and cat_args[3] == img_inputs
+        # The image PARTS are what gets cataloged — the urls are read off the parts themselves,
+        # so a link-borne image (no attachment behind it) is described too.
+        assert cat_args[2] == img_inputs
         # No documents → the document folder is never invoked.
         proc._build_message_with_documents.assert_not_called()
 

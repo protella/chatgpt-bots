@@ -466,3 +466,35 @@ async def test_text_only_message_never_touches_the_ambient_service(monkeypatch):
     await engine.evaluate(channel_id="C1", ts="10.0", text="just chatting",
                           sender_id="U1", client=client)
     assert svc.calls == []
+
+
+def test_api_part_now_stamps_the_configured_detail():
+    """Regression: DEFAULT_DETAIL_LEVEL existed but never reached the main turn's image parts —
+    the builders set no `detail`, so every attached image rode at the API default (`auto`, which
+    downsamples) regardless of the setting. That is how a rollback token got transcribed with the
+    wrong last character and then repeated as fact. api_part is the one choke point every content
+    part crosses, so the default is stamped there; an explicit detail still wins."""
+    from message_processor.utilities import api_part
+    from config import config
+    part = api_part({"type": "input_image", "image_url": "data:x",
+                     "source": "attachment", "url": "u", "file_id": "F1"})
+    assert part["detail"] == config.default_detail_level
+    assert "source" not in part and "file_id" not in part      # whitelist still enforced
+    assert api_part({"type": "input_image", "image_url": "d", "detail": "low"})["detail"] == "low"
+
+
+def test_vision_defaults_are_full_fidelity_on_the_answering_path_and_capped_on_the_gate():
+    """The GATE defaults to `high` — its `image_observations` become the image's durable stored
+    description, so the 512px thumbnail `low` gives it is what every later turn then answers from.
+    `high` rather than `original` because the gate runs on every channel image, so its cost has to
+    stay bounded.
+
+    The answering path defaults to `auto`, which on the 5.6 family means ORIGINAL dimensions with
+    no resize — the maximum. Pinning it to `high` would cap large screenshots, not sharpen them."""
+    from config import BotConfig
+    import os
+    from unittest.mock import patch
+    with patch.dict(os.environ, {}, clear=True):
+        fresh = BotConfig()
+    assert fresh.default_detail_level == "auto"
+    assert fresh.gate_vision_detail == "high"

@@ -10,6 +10,7 @@ from database import DatabaseManager
 from settings_modal import SettingsModal
 from .event_handlers import (
     SlackAssistantEventsMixin,
+    SlackChannelJoinMixin,
     SlackMessageEventsMixin,
     SlackRegistrationMixin,
     SlackSettingsHandlersMixin,
@@ -28,6 +29,7 @@ from message_processor.participation_tools import register_participation_tools
 from message_processor.document_tools import register_document_tools
 from message_processor.image_tools import register_image_tools
 from message_processor.file_mount import register_file_mount_tools
+from message_processor.image_view import register_image_view_tools
 from message_processor.canvas_tools import register_canvas_tools
 from message_processor.people_tools import register_people_tools
 from message_processor.research_tools import register_research_tools
@@ -37,6 +39,7 @@ class SlackBot(SlackMessageEventsMixin,
                SlackSettingsHandlersMixin,
                SlackRegistrationMixin,
                SlackAssistantEventsMixin,
+               SlackChannelJoinMixin,
                SlackUtilitiesMixin,
                SlackFormattingMixin,
                SlackMessagingMixin,
@@ -152,6 +155,13 @@ class SlackBot(SlackMessageEventsMixin,
         # takes image tools off the table entirely (the old classifier fallback is gone).
         if config.enable_image_tools:
             register_image_tools(registry)
+        # view_image — re-attach an EARLIER thread image as real pixels. Only the answered
+        # message's attachments ride as vision, so without this the model can recall that a
+        # screenshot existed but never look at it again; it worked around that by rendering
+        # images in the sandbox, which auto-published the render into the channel. NOT gated on
+        # enable_image_tools: that switch governs CREATING pictures, and being able to see one
+        # that is already in the conversation is plain comprehension.
+        register_image_view_tools(registry)
         # F35: mount_file — the bytes of a file the user SHARED (or one we built earlier) into
         # the sandbox. Without it the model could see an attachment but never compute on it.
         register_file_mount_tools(registry)

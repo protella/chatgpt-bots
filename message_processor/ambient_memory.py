@@ -831,7 +831,12 @@ class AmbientArtifactService:
             data_url = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
             from prompts import IMAGE_ANALYSIS_PROMPT
             description = await self.openai_client.analyze_images(
-                images=[{"type": "input_image", "image_url": data_url, "detail": "low"}],
+                # Detail follows the configured default (HIGH) rather than a hardcoded `low`:
+                # this description IS the durable record of an image the bot never answered, so a
+                # downsampled misread of a number or token becomes the only thing later turns
+                # ever know about it.
+                images=[{"type": "input_image", "image_url": data_url,
+                         "detail": self.config.default_detail_level}],
                 question=IMAGE_ANALYSIS_PROMPT, enhance_prompt=False,
                 model=model,
                 reasoning_effort=clamp_effort(model, self.config.utility_reasoning_effort),

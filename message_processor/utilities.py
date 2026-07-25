@@ -97,7 +97,17 @@ def api_part(part: Dict) -> Dict:
     allowed = _API_PART_KEYS.get(part.get("type"))
     if not allowed:
         return part
-    return {k: v for k, v in part.items() if k in allowed and v is not None}
+    clean = {k: v for k, v in part.items() if k in allowed and v is not None}
+    # Vision detail: the builders above never set one, so every image rode at the API's default
+    # (`auto`, which downsamples) no matter what DEFAULT_DETAIL_LEVEL said — the setting existed
+    # but only ever reached the separate analysis helper. Screenshots of tables, logs and
+    # terminals are most of what gets shared here, and downsampling them is precisely how a
+    # rollback token gets transcribed with the wrong last character. Applied HERE because it is
+    # the one choke point every content part passes through on its way to the API; a part that
+    # set its own detail keeps it.
+    if clean.get("type") == "input_image" and not clean.get("detail"):
+        clean["detail"] = config.default_detail_level
+    return clean
 
 
 def _image_row_is_ambient(img_data: Dict) -> bool:

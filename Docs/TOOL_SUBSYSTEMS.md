@@ -74,6 +74,34 @@ Two traps that already shipped bugs once each:
 - **A reused container's listing is CUMULATIVE** — turn 2 sees turn 1's files. Published file ids
   are persisted (`published_files_json`) because the in-memory dedupe dies with the process.
 
+### Inline sandbox vs a background build job — same sandbox, different waiting room
+
+`code_interpreter` is a **hosted** tool: it sits in the tools array and the model runs it *inside*
+the reply. `start_background_job` is a local function tool that detaches the work. Same container
+image, same access to the thread's files — the difference is entirely who waits and what they see.
+
+**There is no point at which we can intervene in an inline run.** All of a round's sandbox calls
+happen server-side within ONE streaming API call: no round boundary, no chance to inject a
+developer nudge, nothing to cancel that wouldn't kill the whole turn. And once native streaming
+owns the visible message, the status placeholder has been deleted, so tool events are logged and
+suppressed (`handlers/text.py`) — there is no surface left to report progress on. Measured live
+2026-07-24: five sandbox calls in one API call, one of them **10 minutes 3 seconds**, during which
+the reply sat on screen reading "Yep" and the only signal was a 👀 on the user's message.
+
+So the routing decision — inline or background — is made by the model *before* the call, and the
+prompt is the only lever. `CODE_INTERPRETER_GUIDANCE` (prompts.py) tells it inline work is
+measured in seconds and that a build, or a retry after a failed attempt, belongs in
+`start_background_job` mode `build`; the tool's own description says the same from the other side.
+`INLINE_SANDBOX_SLOW_SECONDS` (default 60) exists only to log when that steering fails — it
+cancels and reroutes nothing.
+
+A related presentation bug from the same incident: a hosted tool splits the reply into **separate
+output items**, and concatenating them raw glued two sentences together ("…Claude
+described.Third version is built…"). The seam is inserted at the item boundary in
+`openai_client/api/responses.py` (`_segment_separator`) — paragraph break after a finished
+sentence, a single space if the model stopped mid-sentence. The round-boundary equivalent for
+LOCAL tools is `pending_segment_break` in `handlers/text.py`; the two never overlap.
+
 **Sandbox capabilities** (probed live 2026-07-12, Python 3.13):
 - *Data*: pandas, numpy, scipy, sklearn, statsmodels, sympy, numba, networkx, h5py
 - *Charts*: matplotlib, seaborn, plotly, wordcloud, graphviz + `dot`, pydot

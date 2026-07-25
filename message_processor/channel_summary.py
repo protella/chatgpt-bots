@@ -48,6 +48,12 @@ _EXCLUDE_SUBTYPES = frozenset({
 _DELETED_TEXT = "This message was deleted."
 _PER_MESSAGE_TEXT_CAP = 2000  # per-line clamp before the whole-snapshot char cap
 
+# Slack message-metadata marker stamped on the bot's Track 4 join intro. Kept as a literal here
+# (rather than importing from slack_client.event_handlers.channel_join) to avoid a module cycle —
+# it is a stable cross-module protocol value; the two definitions MUST stay in sync. The join
+# intro is UI, not channel narrative, so a message carrying this marker is excluded from ingestion.
+_INTRO_METADATA_EVENT_TYPE = "channel_intro_posted"
+
 
 class _HistoryFetchError(Exception):
     """conversations.history could not be fetched (no getter, or an API error). Distinct from a
@@ -106,6 +112,11 @@ class ChannelSummaryService:
         # Per-channel lock making "epoch check + save" and "invalidate" mutually exclusive, so the
         # save can't interleave with a concurrent invalidate and clobber it.
         self._save_locks: Dict[str, asyncio.Lock] = {}
+        # Per-channel GENERATION lock. Both the detached refresh (_decide_and_build) and the
+        # synchronous join-intro build (build_for_intro) take it around the actual _build, so a
+        # channel is never generated twice concurrently (the join intro must not bypass Track 1's
+        # one-build-per-channel guarantee); the intro re-reads the stored row after acquiring it.
+        self._build_locks: Dict[str, asyncio.Lock] = {}
         self._closed = False  # set by shutdown() so no new work is scheduled during teardown
 
     # -- config accessors ---------------------------------------------------------------
@@ -210,6 +221,12 @@ class ChannelSummaryService:
         lock = self._save_locks.get(channel_id)
         if lock is None:
             lock = self._save_locks[channel_id] = asyncio.Lock()
+        return lock
+
+    def _build_lock_for(self, channel_id: str) -> asyncio.Lock:
+        lock = self._build_locks.get(channel_id)
+        if lock is None:
+            lock = self._build_locks[channel_id] = asyncio.Lock()
         return lock
 
     async def note_message_mutation(self, channel_id: str, ts: Optional[str]) -> None:
@@ -339,12 +356,25 @@ class ChannelSummaryService:
             row = await self.db.get_channel_summary_async(channel_id)
             newer, ring_total = self._ring_counts(pulse, channel_id, row)
             if not self._decide_build(row, newer_count=newer, ring_total=ring_total):
-                return
-            # Capture the mutation epoch BEFORE the (slow) build; a mutation during it bumps the
-            # epoch and the save below discards the stale output.
-            start_epoch = self._mutation_epoch.get(channel_id, 0)
-            async with self._global_sem:
-                await self._build(channel_id, client, pulse, start_epoch)
+                return  # cheap early-out before contending for the lock
+            # Serialize generation per channel (build lock → global sem, the SAME order
+            # build_for_intro uses, so the two paths can never deadlock).
+            async with self._build_lock_for(channel_id):
+                # RE-READ + RE-DECIDE under the lock: a join-intro build (or another refresh) may
+                # have SAVED a fresh summary while we waited for the lock, which would make this
+                # rebuild redundant. The decision on the pre-lock row is only an early-out.
+                row = await self.db.get_channel_summary_async(channel_id)
+                newer, ring_total = self._ring_counts(pulse, channel_id, row)
+                if not self._decide_build(row, newer_count=newer, ring_total=ring_total):
+                    self.log.debug(
+                        f"channel summary rebuild for {channel_id} skipped — a fresh summary "
+                        f"appeared while awaiting the build lock")
+                    return
+                # Capture the mutation epoch just before the build; a mutation during it bumps the
+                # epoch and the save below discards the stale output.
+                start_epoch = self._mutation_epoch.get(channel_id, 0)
+                async with self._global_sem:
+                    await self._build(channel_id, client, pulse, start_epoch)
         except Exception as e:  # noqa: BLE001 — a failed build must not crash the task
             build_failed = True
             self.log.warning(f"channel summary build failed for {channel_id}: {e}")
@@ -372,15 +402,56 @@ class ChannelSummaryService:
 
     # -- generation ---------------------------------------------------------------------
 
+    async def build_for_intro(self, channel_id: str, *, client: Any = None,
+                              pulse: Any = None) -> Optional[str]:
+        """SYNCHRONOUS build-or-reuse of the channel narrative for the Track 4 join intro.
+
+        Unlike maybe_refresh (detached + throttled), the join intro needs the channel's context
+        RIGHT NOW to compose one message — so this reuses the SAME generation path (_build: same
+        exclusions, caps, and strict per-channel scope) but awaits it: return a fresh stored
+        summary if one exists, else build one now and return its text. Returns the RAW narrative
+        (not the framed render_block header) since the intro composer feeds it to its own prompt.
+
+        Best-effort and self-contained — any failure (including 'nothing eligible' for an
+        empty/new channel) yields None, and the detached maybe_refresh path is untouched."""
+        if not self._enabled() or not self.db or not channel_id or str(channel_id).startswith("D"):
+            return None
+        try:
+            if await self._opted_out(channel_id):
+                return None
+            row = await self.db.get_channel_summary_async(channel_id)
+            if row and not row.get("invalidated_at"):
+                text = (row.get("summary_text") or "").strip()
+                if text:
+                    return text  # a fresh summary already exists — reuse it, no model call
+            # None built (or invalidated) — build synchronously now via the shared generator, but
+            # under the per-channel build lock (build lock → global sem) so we never generate
+            # concurrently with a detached refresh. RE-READ once we hold it: a build that finished
+            # while we waited is reused instead of regenerated.
+            async with self._build_lock_for(channel_id):
+                row = await self.db.get_channel_summary_async(channel_id)
+                if row and not row.get("invalidated_at"):
+                    text = (row.get("summary_text") or "").strip()
+                    if text:
+                        return text
+                start_epoch = self._mutation_epoch.get(channel_id, 0)
+                async with self._global_sem:
+                    return await self._build(channel_id, client, pulse, start_epoch)
+        except Exception as e:  # noqa: BLE001 — the intro is best-effort; never raise into it
+            self.log.debug(f"channel summary build_for_intro failed for {channel_id}: {e}")
+            return None
+
     async def _build(self, channel_id: str, client: Any, pulse: Any,
-                     start_epoch: int = 0) -> None:
+                     start_epoch: int = 0) -> Optional[str]:
         """Rebuild the narrative from a FRESH snapshot and persist it. RAISES on a genuine failure
         (empty generation, or a history-FETCH failure — never save a ring-only fragment over a good
-        summary) so the caller applies the cooldown; returns quietly when there's simply nothing
-        eligible to summarize, or when a mutation during the build made the output stale."""
+        summary) so the caller applies the cooldown; returns None quietly when there's simply
+        nothing eligible to summarize, or when a mutation during the build made the output stale.
+        On success returns the saved narrative text (the detached scheduler ignores it; the Track 4
+        intro build-or-reuse path consumes it)."""
         lines, newest_ts, count = await self._collect_source(channel_id, client, pulse)
         if not lines or not newest_ts:
-            return  # nothing eligible — not a failure, no cooldown
+            return None  # nothing eligible — not a failure, no cooldown
 
         from prompts import CHANNEL_NARRATIVE_PROMPT  # lazy: avoid import cycle at module load
         user_block = (
@@ -413,8 +484,13 @@ class ChannelSummaryService:
             if self._mutation_epoch.get(channel_id, 0) != start_epoch:
                 self.log.debug(
                     f"channel summary build for {channel_id} discarded — mutated during build")
-                return
-            await self.db.save_channel_summary_async(channel_id, summary, str(newest_ts), count)
+                return None
+            wrote = await self.db.save_channel_summary_async(channel_id, summary, str(newest_ts), count)
+        # Return the text ONLY when the save actually persisted it. save_channel_summary_async
+        # rejects the write when the channel opted out of ambient memory mid-generation; in that
+        # case the intro must NOT compose from an unsaved narrative — fall through to None (the
+        # empty-channel path). The detached scheduler ignores this return.
+        return summary if wrote else None
 
     async def _collect_source(self, channel_id: str, client: Any,
                               pulse: Any) -> Tuple[List[str], Optional[str], int]:
@@ -490,6 +566,13 @@ class ChannelSummaryService:
         subtype = m.get("subtype")
         if subtype in _EXCLUDE_SUBTYPES:
             return None
+        # The bot's own Track 4 join intro is UI chrome, not channel content: its generated opener
+        # is real prose that _is_join_intro won't catch, so exclude it by its metadata marker (this
+        # is why _fetch_history requests include_all_metadata). Guards against the intro leaking
+        # into later channel narratives.
+        meta = m.get("metadata")
+        if isinstance(meta, dict) and meta.get("event_type") == _INTRO_METADATA_EVENT_TYPE:
+            return None
         # Timeline-only: an ORDINARY thread reply (thread_ts present and != ts) is not part of the
         # channel timeline. But a thread_broadcast IS — it was posted to the channel too and shows
         # in conversations.history — so keep it. Roots have thread_ts == ts and are kept.
@@ -536,7 +619,10 @@ class ChannelSummaryService:
         if getter is None:
             raise _HistoryFetchError("no conversations_history getter on client")
         try:
-            resp = await getter(channel=channel_id, limit=self._source_max)
+            # include_all_metadata so the bot's own join-intro marker rides along and can be
+            # filtered out in _render_history_line (otherwise Slack strips message metadata).
+            resp = await getter(channel=channel_id, limit=self._source_max,
+                                include_all_metadata=True)
         except Exception as e:
             raise _HistoryFetchError(str(e)) from e
         msgs = (resp or {}).get("messages") if resp else None
