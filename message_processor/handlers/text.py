@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from typing import Any, List, Optional
 
 from base_client import BaseClient, Message, Response
@@ -238,10 +239,32 @@ class TextHandlerMixin:
                                    else NO_REPLY_CONTRACT_SUFFIX)
         return registry, request_config, no_reply_available, no_reply_suffix
 
+    @staticmethod
+    def _current_image_urls(user_content: Any) -> List[str]:
+        """Source urls of the images whose PIXELS already ride this turn.
+
+        The image parts label their origin differently by branch — an attachment carries `url`,
+        a Slack-url or external-url image carries `original_url` (utilities._process_attachments)
+        — so both are collected. Used to stop `view_image` re-attaching a picture the model is
+        already looking at: the catalog is built after these are persisted, so they ARE in it.
+        """
+        if not isinstance(user_content, list):
+            return []
+        urls = []
+        for item in user_content:
+            if not isinstance(item, dict) or item.get("type") != "input_image":
+                continue
+            for key in ("url", "original_url"):
+                value = item.get(key)
+                if value and value not in urls:
+                    urls.append(value)
+        return urls
+
     def _build_tool_context(self, message: Message, client: BaseClient,
                             request_config: Optional[dict] = None,
                             ci_container=None, turn=None,
-                            container_gone_sink: Optional[List[str]] = None) -> ToolContext:
+                            container_gone_sink: Optional[List[str]] = None,
+                            current_image_urls: Optional[List[str]] = None) -> ToolContext:
         """Per-request context handed to local tool executors."""
         meta = message.metadata or {}
         channel_id = message.channel_id
@@ -296,6 +319,11 @@ class TextHandlerMixin:
             # its container die mid-turn (container_recycled fail-fast) instead of retrying dead.
             container_gone_sink=container_gone_sink,
             image_catalog=cfg.get(image_tools.CATALOG_KEY) or [],
+            # view_image stages re-attached earlier images here; the tool loop drains them into
+            # a user message so the model sees the pixels on the next round. The url list is
+            # what it must NOT re-attach — those pixels are already on this turn.
+            pending_vision_parts=[],
+            current_image_urls=list(current_image_urls or []),
             sandbox_image_assets=[],
             # F35: what mount_file may pull into the sandbox, and what it actually did.
             thread_files=cfg.get(file_mount.FILES_KEY) or [],
@@ -557,9 +585,10 @@ class TextHandlerMixin:
                 # Local tools present — run the function-call loop (composes with
                 # web_search/MCP in the same tools array). Hold the tool_context so we can
                 # read back F30.1's background_job_started signal after the loop.
-                tool_context = self._build_tool_context(message, client, request_config,
-                                                        ci_container, turn=turn,
-                                                        container_gone_sink=containers_gone)
+                tool_context = self._build_tool_context(
+                    message, client, request_config, ci_container, turn=turn,
+                    container_gone_sink=containers_gone,
+                    current_image_urls=self._current_image_urls(user_content))
                 result = await self.openai_client.create_text_response_with_tool_loop(
                     messages=messages_for_api,
                     tools=tools,
@@ -1124,6 +1153,11 @@ class TextHandlerMixin:
         # Track which MCP servers were used
         mcp_servers_used = set()
         loop_external_used = []  # web_search/MCP names surfaced by the tool loop (local tools are plumbing, never listed)
+        # Wall clock of the inline sandbox call in flight. An inline code_interpreter call holds
+        # the whole reply — a 10-minute one left the user staring at "Yep" (live 2026-07-24), and
+        # it is invisible in the logs unless we time it. Long ones are a routing failure: that
+        # work belonged in start_background_job. Logged so we can see whether the guidance holds.
+        sandbox_call_started: List[float] = []
 
         # Define tool event callback
         async def tool_callback(tool_type: str, status: str):
@@ -1144,12 +1178,29 @@ class TextHandlerMixin:
                 turn.mark_substantive_work()
                 await turn.claim_work(client, message)
 
+            # Time the inline sandbox (see sandbox_call_started). "interpreting" is a phase of the
+            # call already running, not a new one, so only started/completed move the clock.
+            if tool_type == "code_interpreter":
+                if status == "started":
+                    sandbox_call_started.append(time.monotonic())
+                elif status == "completed" and sandbox_call_started:
+                    elapsed = time.monotonic() - sandbox_call_started.pop()
+                    if elapsed >= config.inline_sandbox_slow_seconds:
+                        self.log_warning(
+                            f"Inline sandbox call held the reply for {elapsed:.0f}s — this "
+                            f"belonged in start_background_job (mode 'build'); the user saw no "
+                            f"progress for the whole run")
+                    else:
+                        self.log_debug(f"Inline sandbox call took {elapsed:.1f}s")
+
             # A local-tool round ends the current text segment: the model's next words are a new
             # round (its own API call), and the buffer would otherwise concatenate them with no
             # gap. Arm the seam break so the next visible chunk gets a paragraph boundary. Keyed
             # on buffered text (NOT visible_content_delivered) so it also fires on final-post-only
-            # turns, where nothing is delivered until the very end. Hosted tools (web_search/MCP)
-            # resolve inside one round and never split the text, so they don't arm it.
+            # turns, where nothing is delivered until the very end. Hosted tools (sandbox, web
+            # search) split the text too, but INSIDE one round, where no round boundary exists to
+            # arm — their seam is inserted at the API layer instead (_segment_separator in
+            # openai_client/api/responses.py), so they must not arm it here as well.
             if (status == "started" and tool_type.startswith("local:")
                     and buffer.get_complete_text().strip()):
                 pending_segment_break = True
@@ -1880,9 +1931,10 @@ class TextHandlerMixin:
                 # Local tools present — streaming function-call loop (intermediate tool
                 # rounds don't stream text; the final round streams normally). Hold the
                 # tool_context so we can read back F30.1's background_job_started signal.
-                tool_context = self._build_tool_context(message, client, request_config,
-                                                        ci_container, turn=turn,
-                                                        container_gone_sink=containers_gone)
+                tool_context = self._build_tool_context(
+                    message, client, request_config, ci_container, turn=turn,
+                    container_gone_sink=containers_gone,
+                    current_image_urls=self._current_image_urls(user_content))
                 loop_result = await self.openai_client.create_streaming_response_with_tool_loop(
                     messages=messages_for_api,
                     tools=tools,

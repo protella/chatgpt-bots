@@ -12,6 +12,40 @@ from prompts import (MEMORY_EXTRACTION_SYSTEM_PROMPT, PARTICIPATION_SYSTEM_PROMP
                      WAKE_CLASSIFIER_SYSTEM_PROMPT)
 
 
+def _segment_separator(text_so_far: str) -> str:
+    """The join between two text segments of ONE reply: paragraph break, space, or nothing.
+
+    A hosted tool splits the model's answer into SEPARATE output items — some text, the call,
+    then more text. Nothing inside either item knows the other exists, so concatenating them raw
+    glues two sentences together with no gap: live 2026-07-24, a code_interpreter round produced
+    "…same approach Claude described.Third version is built via HTML/CSS…". The item boundary is
+    the only place that knows a seam is there, which is why the separator is inserted here rather
+    than in the presentation buffer (the non-streaming paths glue items too).
+
+    A completed sentence gets a paragraph break. Text that stopped MID-sentence — "the total is"
+    → sandbox → "56,088" — gets a single space, because breaking there would be worse than the
+    bug. Text the model already ended in whitespace is left alone.
+    """
+    if not text_so_far or text_so_far[-1].isspace():
+        return ""
+    return ("\n\n" if text_so_far.rstrip("\"'*`)]}”’").endswith((".", "!", "?", "…", ":", ";"))
+            else " ")
+
+
+def _join_output_text(response) -> str:
+    """Concatenate every text item of a non-streaming response, seams included."""
+    text = ""
+    for item in (getattr(response, "output", None) or []):
+        content = getattr(item, "content", None)
+        if not content:
+            continue
+        chunk = "".join(c.text for c in content if getattr(c, "text", None))
+        if not chunk:
+            continue
+        text += _segment_separator(text) + chunk
+    return text
+
+
 def _capture_usage(usage_sink, response):
     """Copy response.usage into the caller's sink (usage-driven context budgeting)."""
     if usage_sink is None or response is None:
@@ -263,14 +297,7 @@ async def create_text_response(
         
         _capture_usage(usage_sink, response)
 
-        # Extract text from response
-        output_text = ""
-        if response.output:
-            for item in response.output:
-                if hasattr(item, "content") and item.content:
-                    for content in item.content:
-                        if hasattr(content, "text"):
-                            output_text += content.text
+        output_text = _join_output_text(response)
 
         self.log_info(f"Generated response: {len(output_text)} chars")
         return output_text
@@ -389,8 +416,8 @@ async def create_text_response_with_tools(
 
         _capture_usage(usage_sink, response)
 
-        # Extract text from response and detect tool usage
-        output_text = ""
+        # Text first (seams and all — see _join_output_text); the loop below is tool bookkeeping.
+        output_text = _join_output_text(response)
         tools_actually_used = []
 
         if response.output:
@@ -442,12 +469,6 @@ async def create_text_response_with_tools(
                 elif item_type == "mcp_list_tools" and mcp_tools_sink is not None:
                     # Tool discovery payload — informational cache (server -> tools)
                     _collect_mcp_list_tools(mcp_tools_sink, item)
-
-                # Extract text content
-                if hasattr(item, "content") and item.content:
-                    for content in item.content:
-                        if hasattr(content, "text"):
-                            output_text += content.text
 
         if tools_actually_used:
             self.log_info(f"Generated response with tools: {len(output_text)} chars, used: {', '.join(tools_actually_used)}")
@@ -567,6 +588,9 @@ async def create_streaming_response(
         )
 
         complete_text = ""
+        # The output item the text deltas are currently arriving from. When it changes mid-reply
+        # a hosted tool ran in between, and the two halves need a seam (_segment_separator).
+        text_item_index: Optional[int] = None
         # A `response.failed` terminal event records its error here; we flush the callback
         # first (below) and raise it after the loop so it propagates like any other API error.
         stream_error: Optional[Exception] = None
@@ -600,6 +624,13 @@ async def create_streaming_response(
                     
                     # If we found text, process it
                     if text_chunk:
+                        # New output item after text already streamed = a hosted tool ran in the
+                        # middle of the reply. Seam the halves, and send the separator through the
+                        # callback too so Slack shows the same text we return.
+                        item_index = getattr(event, 'output_index', None)
+                        if text_item_index is not None and item_index != text_item_index:
+                            text_chunk = _segment_separator(complete_text) + text_chunk
+                        text_item_index = item_index
                         complete_text += text_chunk
                         try:
                             result = stream_callback(text_chunk)
@@ -847,6 +878,9 @@ async def create_streaming_response_with_tools(
         )
 
         complete_text = ""
+        # The output item the text deltas are currently arriving from. When it changes mid-reply
+        # a hosted tool ran in between, and the two halves need a seam (_segment_separator).
+        text_item_index: Optional[int] = None
         # Tool-loop round state: once a local function_call appears in this round, further
         # text deltas are preamble ("let me check…") — don't stream them to the user.
         saw_function_call = False
@@ -902,6 +936,13 @@ async def create_streaming_response_with_tools(
                     if text_chunk and saw_function_call:
                         continue
                     if text_chunk:
+                        # New output item after text already streamed = a HOSTED tool (sandbox,
+                        # web search) ran mid-reply. Seam the halves, and send the separator
+                        # through the callback too so Slack shows the same text we return.
+                        item_index = getattr(event, 'output_index', None)
+                        if text_item_index is not None and item_index != text_item_index:
+                            text_chunk = _segment_separator(complete_text) + text_chunk
+                        text_item_index = item_index
                         complete_text += text_chunk
                         try:
                             result = stream_callback(text_chunk)
@@ -1686,14 +1727,7 @@ async def _create_text_response_with_timeout(
             **request_params
         )
 
-        # Extract text from response
-        output_text = ""
-        if response.output:
-            for item in response.output:
-                if hasattr(item, "content") and item.content:
-                    for content in item.content:
-                        if hasattr(content, "text"):
-                            output_text += content.text
+        output_text = _join_output_text(response)
 
         self.log_info(f"Generated response with custom timeout: {len(output_text)} chars")
         return output_text
@@ -1817,8 +1851,8 @@ async def _create_text_response_with_tools_with_timeout(
         # non-timeout twin. Without this, a retried turn silently falls back to chars/4.
         _capture_usage(usage_sink, response)
 
-        # Extract text from response and detect tool usage
-        output_text = ""
+        # Text first (seams and all — see _join_output_text); the loop below is tool bookkeeping.
+        output_text = _join_output_text(response)
         tools_actually_used = []
 
         if response.output:
@@ -1872,12 +1906,6 @@ async def _create_text_response_with_tools_with_timeout(
                     # Tool discovery payload — informational cache (server -> tools). Parity with
                     # the non-timeout twin — without this, a retry silently drops discovery.
                     _collect_mcp_list_tools(mcp_tools_sink, item)
-
-                # Extract text content
-                if hasattr(item, "content") and item.content:
-                    for content in item.content:
-                        if hasattr(content, "text"):
-                            output_text += content.text
 
         if tools_actually_used:
             self.log_info(f"Generated response with tools and custom timeout: {len(output_text)} chars, used: {', '.join(tools_actually_used)}")

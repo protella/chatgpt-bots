@@ -106,6 +106,27 @@ async def _run_tool_round(
             "output": serialize_tool_result(result_by_id.get(id(entry))),
         })
 
+    # `view_image` re-attaches an EARLIER thread image (whose pixels never rode this turn — only
+    # the answered message's attachments become input_image parts). Drain what it staged into ONE
+    # user message so the model can actually SEE it on the next round.
+    #
+    # Placement and role both matter:
+    #  * AFTER every function_call/function_call_output pair — never between a reasoning item and
+    #    the function_call it belongs to, which reasoning models require to stay adjacent.
+    #  * USER role, not developer: the bytes are untrusted user-supplied content, the same
+    #    boundary the stored image descriptions already respect.
+    # The `_image_id` bookkeeping key is stripped here: our dicts do double duty, and the API
+    # 400s on unknown keys inside a content part.
+    staged = getattr(tool_context, "pending_vision_parts", None) or []
+    fresh = [r for r in staged if r.get("_ready") and not r.get("_replayed")]
+    if fresh:
+        content: List[Dict[str, Any]] = []
+        for reservation in fresh:
+            reservation["_replayed"] = True
+            content.extend(reservation.get("parts") or [])
+        if content:
+            input_items.append({"role": "user", "content": content})
+
 
 def _merge_used(tools_used_all: List[str], round_used: List[str]) -> None:
     for name in round_used:

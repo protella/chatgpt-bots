@@ -104,9 +104,26 @@ DEFAULT_VERBOSITY = "low"
 ANALYSIS_REASONING_EFFORT = "medium"
 ANALYSIS_VERBOSITY = "medium"
 GPT_IMAGE_MODEL = "gpt-image-2"    # unchanged
+DEFAULT_DETAIL_LEVEL = "auto"      # unchanged — and `auto` IS the max, see below
 ```
+
+**Leave `DEFAULT_DETAIL_LEVEL` at `auto`.** On the 5.6 family `auto` (and an omitted detail) is
+equivalent to `original`: the image is sent at its own dimensions with no resize. `high` and `low`
+both resize under a finite limit, so pinning `high` here would *cap* large screenshots rather than
+sharpen them. Set it to `high` only as a deliberate cost cap on very large images.
+
+**`GATE_VISION_DETAIL` is the one that matters, and it now defaults to `high`** (no action needed;
+prod inherits it). The participation gate had its own explicit `low`, which hands the model a
+512px thumbnail — and the gate's `image_observations` become the image's *stored description*, the
+durable record every later turn answers from. At `low` it read a rollback token as `RB-7C10-Q9`
+when the pixels said `RB-7C10-QQ`, and the bot repeated that as fact days later. It is `high`
+rather than `auto`/`original` on purpose: this is the highest-volume vision call in the system
+(every channel image while listening is on) and it runs on the debounce hot path, so its cost has
+to stay bounded. Set `GATE_VISION_DETAIL = "low"` if that volume proves too expensive in prod —
+accepting that image descriptions become unreliable on fine text.
+
 Everything else model-shaped already matches dev (temperature 1.0, top_p 1.0, image size/quality/
-format/fidelity, detail level, empty `WEB_SEARCH_MODEL`).
+format/fidelity, empty `WEB_SEARCH_MODEL`).
 
 ### 6b. Delete — dead in v3 (read by nothing)
 ```

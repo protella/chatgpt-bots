@@ -503,9 +503,12 @@ class MessageProcessor(ThreadManagementMixin,
             # effect — not by routing the whole turn through a vision handler. The image tools
             # claim the upload latch themselves (image_tools.py), so there is no latch to set
             # here either.
-            if image_inputs and message.attachments:
+            # NOT gated on message.attachments: an image pasted as a LINK produces an image_input
+            # with no attachment behind it, and that guard is why link-borne images never earned
+            # a description. catalog_uploads reads the urls off the parts themselves.
+            if image_inputs:
                 self._schedule_async_call(image_catalog.catalog_uploads(
-                    self, thread_key, message.attachments, image_inputs,
+                    self, thread_key, image_inputs,
                     (message.metadata or {}).get("ts")))
 
             response = await self._handle_text_response(
@@ -958,7 +961,7 @@ class MessageProcessor(ThreadManagementMixin,
                                 # Catalogue a durable description AND carry the raw parts to the
                                 # trigger turn so the model actually sees the images (T2-10).
                                 self._schedule_async_call(image_catalog.catalog_uploads(
-                                    self, thread_key, queued_msg.attachments, q_image_inputs,
+                                    self, thread_key, q_image_inputs,
                                     (queued_msg.metadata or {}).get("ts")))
                                 batched_image_inputs.extend(q_image_inputs)
                             if q_unsupported:
