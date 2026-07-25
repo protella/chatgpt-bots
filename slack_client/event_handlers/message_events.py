@@ -1138,6 +1138,18 @@ class SlackMessageEventsMixin:
         
         # Check if user has completed settings
         if not user_prefs.get('settings_completed', False):
+            # V3 channel-teammate: the DM-first onboarding below (public "I've DM'd you" notice +
+            # withholding the answer until the settings modal is completed) must NEVER run in a
+            # channel — it made sense only when a DM was the only way to reach the bot. In any
+            # channel/group/MPIM we answer the mention immediately with channel + default settings,
+            # and — silently, exactly once — DM the settings button so the newcomer can tune it if
+            # they want. No public onboarding chrome, no blocking. DMs keep the full flow below.
+            if message.channel_id and not message.channel_id.startswith('D'):
+                await self._welcome_new_channel_user_via_dm(user_id, client)
+                if self.message_handler:
+                    await self.message_handler(message, self)
+                return
+
             # User hasn't completed settings - check if we've already sent welcome
             if not hasattr(self, '_welcomed_users'):
                 self._welcomed_users = set()
@@ -1312,6 +1324,61 @@ class SlackMessageEventsMixin:
         # Call the message handler if set
         if self.message_handler:
             await self.message_handler(message, self)
+
+    async def _welcome_new_channel_user_via_dm(self, user_id: str, client) -> None:
+        """Silently DM a first-time channel user the Configure Settings button — once, ever.
+
+        The caller has already answered the mention in-channel with default settings; this is a
+        no-pressure, DM-only nudge so they CAN set personal prefs, never a channel post and never a
+        gate. The "once" is a DURABLE DB claim, not an in-memory set: this bot rebuilds from scratch
+        on every restart, so a session guard would re-DM the same newcomer after each deploy. The
+        button value is empty (`{}`) on purpose — it carries NO original-message context, so clicking
+        it opens the settings modal WITHOUT replaying the message we already answered (a replay would
+        double-answer). If the send fails, we release the claim so a later interaction can retry."""
+        try:
+            claimed = await self.db.claim_channel_onboarding_nudge_async(user_id)
+        except Exception as e:
+            self.log_debug(f"Could not claim onboarding nudge for {user_id}: {e}")
+            return
+        if not claimed:
+            return  # already nudged, or a concurrent mention won the claim
+
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": ("👋 Thanks for the mention — I answered you back in the channel. "
+                             "If you'd ever like to set your personal preferences (model, "
+                             "response length, and more), you can do that here. Totally optional.")
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "⚙️ Configure Settings"},
+                        "style": "primary",
+                        "action_id": "open_welcome_settings",
+                        "value": "{}"
+                    }
+                ]
+            }
+        ]
+        try:
+            # Posting to a user id routes to that user's DM with the bot.
+            await client.chat_postMessage(
+                channel=user_id,
+                text="Set your personal preferences anytime (optional).",
+                blocks=blocks
+            )
+        except SlackApiError as e:
+            self.log_debug(f"Could not send silent settings DM to {user_id}: {e}")
+            try:
+                await self.db.clear_channel_onboarding_nudge_async(user_id)
+            except Exception:
+                pass
 
     async def _post_settings_button_if_new_thread(self, message: Message, client, user_prefs: dict):
         """Post a settings button at the start of a new thread"""

@@ -2,6 +2,7 @@
 
 import pytest
 from prompts import (
+    CODE_INTERPRETER_GUIDANCE,
     SLACK_SYSTEM_PROMPT,
     CLI_SYSTEM_PROMPT,
     IMAGE_ANALYSIS_PROMPT,
@@ -110,6 +111,70 @@ class TestPrompts:
             assert "{" not in prompt or "}" not in prompt  # No f-string style
             assert "{{" not in prompt  # No jinja2 style
             assert "${" not in prompt  # No bash/JS style
+
+    def test_ci_guidance_forbids_sandbox_image_inspection(self):
+        """Regression (live): asked whether a posted screenshot was forged, the model pushed the
+        thread's auto-mounted screenshots through matplotlib and published the composite back
+        into the channel as `output_1.png` — titled with their /mnt/data hash names. It already
+        had vision; the sandbox round taught it nothing. The guidance must say so outright."""
+        assert "NEVER push one through the sandbox" in CODE_INTERPRETER_GUIDANCE
+        # ...and must forbid handing an existing thread image back, composites included.
+        assert "NEVER re-post an image that is already in this thread" in CODE_INTERPRETER_GUIDANCE
+        assert "several stitched into one figure" in CODE_INTERPRETER_GUIDANCE
+        # The escape hatch stays open: building something genuinely new is still fair game.
+        assert "Build a NEW image only when the user asked for" in CODE_INTERPRETER_GUIDANCE
+
+    def test_ci_guidance_is_honest_about_which_images_are_visible(self):
+        """The real capability gap behind the bug: only the CURRENT message's attachments ride as
+        pixels (utilities.py sends `input_image`); earlier images enter context as TEXT — either
+        `[Visual context …]` analysis or a bare URL. Telling the model it can see every image
+        would trade a redundant screenshot dump for confident bluffing about unseen pixels, so the
+        guidance must state the split AND give it an honest out."""
+        assert "answering right now are in front of you" in CODE_INTERPRETER_GUIDANCE
+        assert "only a written description, not the" in CODE_INTERPRETER_GUIDANCE
+        assert "Do not bluff from the" in CODE_INTERPRETER_GUIDANCE
+        # The honest out is now a real capability: re-attach the pixels via the tool...
+        assert "call `view_image` and actually look" in CODE_INTERPRETER_GUIDANCE
+        # ...and NOT a trip through the sandbox, which publishes the render as a side effect.
+        assert "do not go hunting through" in CODE_INTERPRETER_GUIDANCE
+
+    def test_ci_guidance_states_attachments_automount(self):
+        """The old text claimed the sandbox 'starts EMPTY'. It doesn't — the turn's attachments
+        auto-mount (handlers/text.py), which is how loose screenshots were sitting in /mnt/data
+        waiting to be re-rendered. A prompt that misdescribes the sandbox invites that bug."""
+        assert "starts EMPTY" not in CODE_INTERPRETER_GUIDANCE
+        assert "land in\n/mnt/data on their own" in CODE_INTERPRETER_GUIDANCE
+        assert "not a to-do list" in CODE_INTERPRETER_GUIDANCE
+
+    def test_ci_guidance_scopes_compute_rule_to_data(self):
+        """'COMPUTE, don't eyeball' must read as being about tabular/numeric data. Left generic
+        ('attached data'), it reads as a standing order to inspect images in the sandbox too."""
+        assert "attached DATA — a spreadsheet, CSV, table" in CODE_INTERPRETER_GUIDANCE
+
+    def test_ci_guidance_routes_long_builds_to_the_background_job(self):
+        """Live 2026-07-24: asked for a slide, the model built it in the INLINE sandbox — one call
+        ran 10 minutes, during which the reply sat frozen at "Yep" with no progress surface (the
+        status placeholder is deleted once the stream owns the message, so there is nothing left
+        to update). The routing decision happens before the call and all of it runs inside one API
+        call, so there is no point at which we can intervene — the prompt is the only lever."""
+        assert "KEEP INLINE SANDBOX WORK SHORT" in CODE_INTERPRETER_GUIDANCE
+        # It must say WHY, or the rule reads as arbitrary and loses to "but I can do it here".
+        assert "nothing you have written reaches the user until the whole turn ends" in \
+            CODE_INTERPRETER_GUIDANCE
+        # ...name the destination, with the mode...
+        assert "`start_background_job`" in CODE_INTERPRETER_GUIDANCE
+        assert "mode\n`build`" in CODE_INTERPRETER_GUIDANCE
+        # ...and cover the retry case, which is how a 30-second attempt becomes ten minutes.
+        assert "if your first approach in here fails" in CODE_INTERPRETER_GUIDANCE
+
+    def test_background_job_tool_advertises_itself_for_slow_sandbox_work(self):
+        """The other half of the same routing fix: the model reading `start_background_job` must
+        recognise the case. Before, `build` read as being only about decks and spreadsheets from
+        material that already exists — nothing said a slow inline build belonged here."""
+        from message_processor.research_tools import get_start_background_job_schema
+        desc = get_start_background_job_schema()["description"]
+        assert "minutes rather than seconds" in desc
+        assert "frozen half-sentence" in desc
 
     @pytest.mark.critical
     def test_critical_prompts_structure(self):

@@ -63,6 +63,13 @@ class SlackRegistrationMixin:
         async def handle_app_context_changed(event):
             await self._handle_app_context_changed(event)
 
+        # --- Track 4: channel join behavior ---
+        @self.app.event("member_joined_channel")
+        async def handle_member_joined_channel(event, client):
+            # Bot added to a channel → post ONE public intro (bot-only trigger + DM/MPIM exclusion
+            # + idempotency + detach all live inside the handler). Best-effort, never raises.
+            await self._handle_member_joined_channel(event, client)
+
         # --- LEGACY agent surface (deprecated by agent_view) ---
         # Keep during the transition (whichever fires, the greeting dedup makes it
         # fire once); remove one release after the manifest fully flips to agent_view.

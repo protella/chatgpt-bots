@@ -93,6 +93,7 @@ settings:
       - reaction_added
       - reaction_removed
       - file_deleted          # F51 ambient memory: purge summaries when a file is removed
+      - member_joined_channel # Track 4: post a one-time intro when the bot is added to a channel
       - app_home_opened       # agent_view lifecycle (current)
       - app_context_changed   # agent_view lifecycle (current)
       # assistant_thread_started / assistant_thread_context_changed were removed 2026-07-16:

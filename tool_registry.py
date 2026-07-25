@@ -60,6 +60,15 @@ class ToolContext:
     # extra plumbing between rounds.
     container_gone_sink: Optional[List[str]] = None
     image_catalog: Optional[List[Dict[str, Any]]] = None
+    # `view_image` stages re-attached EARLIER images here; the tool loop drains them into a
+    # user-role message so the model actually sees the pixels on the next round. Shared by
+    # reference (like container_gone_sink) so no extra plumbing is needed between rounds.
+    # USER role, never developer: these are untrusted user-supplied image bytes.
+    pending_vision_parts: Optional[List[Dict[str, Any]]] = None
+    # Urls of the images whose pixels ALREADY ride this turn. The image catalog is built after
+    # the answered message's attachments are persisted, so those images are IN it — without this,
+    # view_image would happily re-attach a picture already in front of the model.
+    current_image_urls: Optional[List[str]] = None
     # Set True by a detached image generation, so the finalizer can drop the model's ack
     # reply the same way deep research does — the posted image IS the acknowledgment.
     image_generation_started: bool = False

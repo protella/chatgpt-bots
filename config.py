@@ -209,7 +209,19 @@ class BotConfig:
     enable_multimodal_gate: bool = field(default_factory=lambda: os.getenv("ENABLE_MULTIMODAL_GATE", "true").lower() == "true")
     gate_vision_max_images: int = field(default_factory=lambda: int(os.getenv("GATE_VISION_MAX_IMAGES", "2")))
     gate_vision_max_bytes: int = field(default_factory=lambda: int(os.getenv("GATE_VISION_MAX_BYTES", str(5 * 1024 * 1024))))
-    gate_vision_detail: str = field(default_factory=lambda: os.getenv("GATE_VISION_DETAIL", "low"))
+    # HIGH, not low — and this one is not just about the wake decision. The gate's verdict also
+    # carries `image_observations`, and THOSE become the image's stored description: the durable
+    # record every later turn reads and answers from. At `low` the API hands the model a 512px
+    # thumbnail; the gate transcribed a rollback token as `RB-7C10-Q9` when the pixels read
+    # `RB-7C10-QQ`, and the bot then repeated it as fact days later. A cheap wake decision is not
+    # worth a permanently wrong record of what was shared.
+    #
+    # HIGH rather than auto/original on purpose: `high` resizes under a finite limit, so a huge
+    # image has a bounded cost here. This is the highest-VOLUME vision call in the system (every
+    # channel image while listening is on) and it runs on the debounce hot path — it is the one
+    # place an uncapped `original` would hurt. Set GATE_VISION_DETAIL=low to trade transcription
+    # accuracy back for spend.
+    gate_vision_detail: str = field(default_factory=lambda: os.getenv("GATE_VISION_DETAIL", "high"))
 
     # F51 — Ambient memory. Images/links/files posted in a channel or thread are looked at,
     # summarized, and kept as derived artifacts in the running context even when the bot does
@@ -261,7 +273,18 @@ class BotConfig:
     default_image_compression: int = field(default_factory=lambda: int(os.getenv("DEFAULT_IMAGE_COMPRESSION", "100")))  # 100 for PNG, can be less for JPEG/WebP
     default_input_fidelity: str = field(default_factory=lambda: os.getenv("DEFAULT_INPUT_FIDELITY", "high"))  # high or low
     
-    # Vision parameters
+    # Vision parameters — the detail every image part rides at (stamped in utilities.api_part).
+    #
+    # AUTO, and that is the HIGHEST fidelity, not a compromise: on the 5.6 family `auto` and an
+    # omitted detail are equivalent to `original` — the image is sent at its own dimensions, with
+    # no resize. `high` and `low` both resize under a finite limit, so pinning `high` here would
+    # CAP large screenshots, not sharpen them. (This was set to "high" on the belief that `auto`
+    # downsampled; it doesn't, on these models.)
+    #
+    # The transcription bug that started all this was never on this path — it was the participation
+    # gate at its own explicit `low` (a 512px thumbnail). See gate_vision_detail above.
+    #
+    # Set this to `high` only as a deliberate cost cap on very large images.
     default_detail_level: str = field(default_factory=lambda: os.getenv("DEFAULT_DETAIL_LEVEL", "auto"))
     
     # System behavior (will be overridden by platform-specific prompts)
@@ -391,6 +414,13 @@ class BotConfig:
     # enhancement ALWAYS runs — this only decides whether the user has to read it. Off by
     # default: it used to be posted as its own block above every image, which was noise.
     show_enhanced_prompt: bool = field(default_factory=lambda: os.getenv("SHOW_ENHANCED_PROMPT", "false").lower() == "true")
+    # After a DETACHED generate_image posts, hand the picture back to the model for one short
+    # turn so it can actually see what it made and say a line about it (or flag that the image
+    # model missed the brief). The synchronous image tools stage their output into the round
+    # they were called from and need no callback; a detached generation finishes after its turn
+    # has ended, so without this the model never sees a single image it generates. Set
+    # ENABLE_PRODUCED_IMAGE_REVIEW=false to go back to posting the picture with no comment.
+    enable_produced_image_review: bool = field(default_factory=lambda: os.getenv("ENABLE_PRODUCED_IMAGE_REVIEW", "true").lower() == "true")
     # F36: Slack canvases (create/read/edit/list). A canvas is the right home for something the
     # thread keeps returning to — a spec, a checklist — where a message gets buried and a file
     # forks into _final_v3. Needs canvases:read + canvases:write.
@@ -571,6 +601,23 @@ class BotConfig:
     channel_summary_failure_cooldown_hours: float = field(default_factory=lambda: float(os.getenv("CHANNEL_SUMMARY_FAILURE_COOLDOWN_HOURS", "1")))
     # Global cap on concurrent summary builds (one in-flight per channel is enforced separately).
     channel_summary_global_concurrency: int = field(default_factory=lambda: int(os.getenv("CHANNEL_SUMMARY_GLOBAL_CONCURRENCY", "2")))
+
+    # --- Track 4: channel join behavior (one-time intro on being added to a channel) ---
+    # When the bot is ADDED to a real channel it posts ONE public intro: a grounded read on the
+    # room + up to two concrete offers (composed FROM the Track 1 summary), a plain-English "how
+    # to manage my participation" note worded by the channel's CURRENT participation state, and a
+    # Configure button. Fires ONLY for the bot's OWN join (member_joined_channel), never any other
+    # member's; DMs/MPIMs are excluded. Idempotent (durable per-channel lease + a Slack message
+    # metadata marker), fully detached, and best-effort — it never blocks the event or raises.
+    enable_channel_join_intro: bool = field(default_factory=lambda: os.getenv("ENABLE_CHANNEL_JOIN_INTRO", "true").lower() == "true")
+    # How many recent channel messages to scan for our own intro marker before (re)posting — the
+    # crash-safety reconcile that stops a double-post when a prior attempt posted but died before
+    # recording the intro_ts.
+    channel_intro_reconcile_limit: int = field(default_factory=lambda: int(os.getenv("CHANNEL_INTRO_RECONCILE_LIMIT", "50")))
+    # Max output tokens for the ONE utility-model call that composes the channel-read + offers from
+    # the summary. It posts as a threaded reply (room for a lead line + 2-3 concrete offers), so
+    # allow a bit more than a one-liner — still bounded, not an essay.
+    channel_intro_max_output_tokens: int = field(default_factory=lambda: int(os.getenv("CHANNEL_INTRO_MAX_OUTPUT_TOKENS", "500")))
 
     # --- Response footer (Phase 7 entry point): a small context line + "⚙️ Configure" button
     # appended under each channel response (any member can open the per-channel settings modal).
@@ -819,6 +866,12 @@ class BotConfig:
     #      no-disk rule (CLAUDE.md pitfall 6a) holds with ZERO new local dependencies.
     # The sandbox has no network egress (pip install and exfiltration both impossible).
     enable_code_interpreter: bool = field(default_factory=lambda: os.getenv("ENABLE_CODE_INTERPRETER", "true").lower() == "true")
+    # An inline sandbox call runs INSIDE the reply: until it returns, whatever the model has
+    # written is frozen mid-sentence with no progress indicator (the status placeholder is gone
+    # once the stream owns the message). A single call once ran 10 minutes that way. Work that
+    # long belongs in start_background_job, which has a live card — so a call over this threshold
+    # is logged as a routing failure. Observability only: nothing is cancelled or rerouted.
+    inline_sandbox_slow_seconds: float = field(default_factory=lambda: float(os.getenv("INLINE_SANDBOX_SLOW_SECONDS", "60")))
     # F34: image generation/editing as TOOLS the model calls in context (default ON). When OFF,
     # the legacy pre-flight intent classifier + vision/new_image/edit routing in base.py runs
     # instead (the escape hatch, not the intended path). See Docs/TOOL_SUBSYSTEMS.md.

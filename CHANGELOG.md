@@ -129,6 +129,74 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 👋 Feature - It introduces itself when you add it to a channel
+
+Add the bot to a channel and it now says hello once, publicly: a short "I just joined, catching up"
+message, then a thread reply with a grounded read on what the channel is about and one or two
+concrete things it can help with — composed from the channel's own recent messages, not invented
+(a brand-new or empty channel just gets the hello). The same message explains, in plain English,
+how it will behave here and how to change that, with a Configure button for the settings dialog.
+It fires only for its own join, never for anyone else's, never in DMs, and exactly once per
+channel even if Slack redelivers the event.
+
+**New Slack event required:** `member_joined_channel`. Add it to your app manifest (see
+`slack_app_manifest.example.yml`) and reinstall the app, or the intro never fires.
+
+### 🙌 Changed - Newcomers aren't stopped at the door
+
+The first time someone @-mentions the bot in a channel, it now just answers them. Previously they
+got a public "I've DM'd you to get set up" notice and their actual question was held hostage until
+they filled in a settings modal — a flow that only ever made sense back when a DM was the only way
+to reach the bot. It still sends the settings button, quietly, in a DM, exactly once ever, clearly
+marked optional. First contact in a DM keeps the full walk-through.
+
+### ⏱️ Fixed - Long builds show their work instead of freezing mid-sentence
+
+Ask for something that takes real work — a laid-out slide, a report PDF — and the bot would start
+typing ("Yep — I'll build that…"), then stop dead mid-reply while it ground away in its code
+sandbox. One build sat frozen for **ten minutes** with no spinner, no progress, nothing but a 👀 on
+your message, and only finished once the sandbox came back. The problem was where the work ran:
+inside the reply, where there's no room to report progress.
+
+Work like that now goes to a background job — the same one deep research uses — so you get a live
+status card with a ticking checklist while it builds, and the finished file when it's done. Quick
+sandbox work (compute a number, draw one chart) still happens inline where it belongs, in seconds.
+
+### 🔤 Fixed - Sentences no longer run together
+
+When the bot used a tool partway through a reply, the sentence before and the sentence after got
+glued with no space: "…same approach Claude described.Third version is built via HTML/CSS…". Now
+they're properly separated — a paragraph break between two finished sentences, a single space if
+it was genuinely mid-sentence when it stopped to go look something up.
+
+### 👁️ Fixed - It can see the images it makes, and look again at older ones
+
+The bot was writing about pictures it had never seen. It would generate or edit an image, get back
+nothing but a file path, and then confidently tell you "here's your image" — unable to notice the
+image model had drifted off the brief, and unable to act on "now make the text bigger" from any
+real knowledge.
+
+- **It looks at what it produced.** Generated and edited images are shown back to it, so it can
+  tell you when something came out wrong instead of presenting it as a success — and so a picture
+  it's about to drop into a deck is one it has actually looked at.
+- **It can re-open an older image.** Only the image attached to the message being answered is in
+  front of it; anything further up the conversation is just a written description. When a question
+  turns on fine detail — what exactly does that cell say, is this real — it now pulls the picture
+  back up and looks, instead of bluffing from the description.
+- **In DMs it can find images from earlier messages.** Slack starts a fresh thread for every
+  top-level DM, so "restyle that screenshot I just sent" landed in a different conversation from
+  the screenshot and the bot couldn't see it. It now looks across your recent DM messages.
+
+### 🔍 Fixed - Screenshots are read at full resolution
+
+Every image was being sent to the model downsampled, regardless of the quality setting — the
+setting existed but never reached the images in a normal reply. Screenshots of tables, logs and
+terminals are most of what gets shared, and downsampling them is exactly how a serial number comes
+back with the wrong last character. They now go at full size. The same fix applies to images the
+bot quietly catalogs in the background, where the description it writes is the *only* record it
+will ever have. It also stops describing the same image twice when two parts of the pipeline both
+reach for it.
+
 ### 🧠 Feature - It gets the gist of a channel
 
 The bot now keeps a short, living read on each channel it's in — what the channel is for, who's active

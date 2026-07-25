@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any, Tuple
@@ -339,6 +340,42 @@ class DatabaseManager(LoggerMixin):
                 source_message_count INTEGER NOT NULL,
                 generated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 invalidated_at TIMESTAMP
+            )
+        """)
+
+        # Track 4 — channel join intro idempotency. One row per channel records the lifecycle of
+        # the one-time "I've been added here" intro so it is posted EXACTLY once, surviving Slack
+        # event refires AND a crash between posting and recording intro_ts. `status` is the durable
+        # lease: 'pending' (an attempt owns it — a refire must skip), 'posted' (done — never repost),
+        # 'failed' (an attempt died — a genuine refire may retry, guarded by a history reconcile so a
+        # post-then-crash can't double-post). `event_id` is the member_joined_channel event_ts that
+        # started it (debugging only); `intro_ts` is the posted message's ts. Keyed by channel_id
+        # ONLY — no transcript content lives here (Slack is the source of truth).
+        # `owner_token` is minted per acquiring attempt: the failure handler downgrades a 'pending'
+        # row to 'failed' ONLY when its own token matches, so a task that failed before/without
+        # winning the lease can never steal a CONCURRENT attempt's live lease.
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS channel_introductions (
+                channel_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                prepared_text TEXT,
+                event_id TEXT,
+                intro_ts TEXT,
+                owner_token TEXT,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # V3 channel-teammate: a first-time user's @mention in a CHANNEL is answered with channel +
+        # default settings (no DM-first onboarding gate), and we silently DM them the settings button
+        # exactly once so they can tune personal prefs if they want. This table is that "once" guard.
+        # It MUST be durable: in-memory guards die on restart and this bot rebuilds from scratch, so a
+        # session-only set would re-DM the same newcomer after every deploy — the very noise we're
+        # removing. One row per user; presence == already nudged. No transcript content lives here.
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS channel_onboarding_nudges (
+                slack_user_id TEXT PRIMARY KEY,
+                nudged_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -2922,6 +2959,131 @@ class DatabaseManager(LoggerMixin):
             await db.execute("DELETE FROM channel_summaries WHERE channel_id = ?", (channel_id,))
             await db.commit()
 
+    # --- Track 4: channel join intro lease + lifecycle ----------------------------------
+    # Idempotency for the one-time join intro. Every query is WHERE channel_id = ? (per-channel).
+
+    async def try_acquire_channel_intro_lease_async(self, channel_id: str,
+                                                    event_id: Optional[str] = None) -> Dict[str, Any]:
+        """Atomically claim the right to post THIS channel's join intro. Returns a dict:
+          {"acquired": bool, "status": str|None, "prior_status": str|None, "owner_token": str|None}.
+
+        We win (acquired=True, with a freshly minted owner_token) when there was no row, or the
+        previous attempt is 'failed' and we re-claim it. `prior_status` reports what existed BEFORE
+        this claim (None = truly fresh, nothing to double-post; 'failed' = re-acquired, a prior
+        attempt existed and MAY have posted — so the caller must reconcile before reposting). We
+        lose (acquired=False) when a row already sits in 'pending' or 'posted' — and `status`
+        reports which, so the caller can tell "another attempt owns it / may have crashed mid-post"
+        (pending → RECONCILE for our marker) from "already done" (posted → just skip).
+
+        The claim is a SINGLE statement (INSERT ... SELECT WHERE NOT EXISTS ... ON CONFLICT DO
+        UPDATE) so there is no check-then-act race: a concurrent second caller either sees our
+        fresh 'pending' row (NOT EXISTS fails → rowcount 0 → loses) or wrote first (we lose). The
+        prior-status read is a same-connection SELECT before the write — informational only, so its
+        (harmless) staleness under contention never affects the atomic claim."""
+        owner_token = uuid.uuid4().hex
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(
+                "SELECT status FROM channel_introductions WHERE channel_id = ?", (channel_id,)
+            ) as c0:
+                prior = await c0.fetchone()
+            prior_status = prior["status"] if prior else None
+            cur = await db.execute("""
+                INSERT INTO channel_introductions (channel_id, status, event_id, owner_token, updated_at)
+                SELECT ?, 'pending', ?, ?, CURRENT_TIMESTAMP
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM channel_introductions
+                    WHERE channel_id = ? AND status IN ('pending', 'posted')
+                )
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    status = 'pending',
+                    event_id = excluded.event_id,
+                    owner_token = excluded.owner_token,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (channel_id, event_id, owner_token, channel_id))
+            acquired = cur.rowcount != 0
+            await db.commit()
+            if acquired:
+                return {"acquired": True, "status": "pending",
+                        "prior_status": prior_status, "owner_token": owner_token}
+            async with db.execute(
+                "SELECT status FROM channel_introductions WHERE channel_id = ?", (channel_id,)
+            ) as c2:
+                row = await c2.fetchone()
+            return {"acquired": False,
+                    "status": (row["status"] if row else None),
+                    "prior_status": prior_status, "owner_token": None}
+
+    async def mark_channel_intro_posted_async(self, channel_id: str,
+                                             intro_ts: Optional[str]) -> None:
+        """Record that the intro was posted (or reconciled from history): status 'posted' + the
+        message ts. Idempotent — a repeat call just refreshes intro_ts/updated_at. Safe to call
+        without owning the lease: finding our marker in history is itself proof it was posted."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("""
+                INSERT INTO channel_introductions (channel_id, status, intro_ts, updated_at)
+                VALUES (?, 'posted', ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    status = 'posted',
+                    intro_ts = excluded.intro_ts,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (channel_id, str(intro_ts) if intro_ts is not None else None))
+            await db.commit()
+
+    async def mark_channel_intro_failed_async(self, channel_id: str,
+                                             owner_token: Optional[str] = None) -> None:
+        """Flag a failed attempt so a genuine later refire may retry — but ONLY the 'pending' row
+        THIS attempt owns (WHERE status='pending' AND owner_token=?). This never clobbers a
+        'posted' row (a late error can't reopen a sent intro) and never steals a CONCURRENT
+        attempt's live lease (its token differs). Called only by a task that actually acquired the
+        lease; a missing token matches nothing (no-op), failing safe."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute(
+                "UPDATE channel_introductions SET status = 'failed', updated_at = CURRENT_TIMESTAMP "
+                "WHERE channel_id = ? AND status = 'pending' AND owner_token IS ?",
+                (channel_id, owner_token))
+            await db.commit()
+
+    async def get_channel_intro_async(self, channel_id: str) -> Optional[Dict]:
+        """The channel's intro lifecycle row (status/intro_ts/…), or None. Per-channel scope."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(
+                "SELECT channel_id, status, prepared_text, event_id, intro_ts, owner_token, "
+                "updated_at FROM channel_introductions WHERE channel_id = ?", (channel_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def claim_channel_onboarding_nudge_async(self, user_id: str) -> bool:
+        """Atomically claim the one-time channel-onboarding settings DM for this user.
+
+        Returns True EXACTLY ONCE per user — the caller that wins the claim sends the silent DM.
+        Concurrent @mentions and every later interaction (including after a restart) get False, so
+        the newcomer is never re-DM'd. `INSERT OR IGNORE` + rowcount is the atomic test-and-set;
+        there is no check-then-act race. If the send then fails, the caller rolls the claim back via
+        clear_channel_onboarding_nudge_async so a later interaction can retry."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            cur = await db.execute(
+                "INSERT OR IGNORE INTO channel_onboarding_nudges (slack_user_id) VALUES (?)",
+                (user_id,))
+            await db.commit()
+            return cur.rowcount == 1
+
+    async def clear_channel_onboarding_nudge_async(self, user_id: str) -> None:
+        """Release a claimed nudge (used only when the DM send failed) so a future channel
+        interaction can retry the one-time settings DM. No-op if no row exists."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute(
+                "DELETE FROM channel_onboarding_nudges WHERE slack_user_id = ?", (user_id,))
+            await db.commit()
+
     async def update_thread_activity_async(self, thread_id: str):
         """
         Async version of update_thread_activity.
@@ -3990,6 +4152,43 @@ class DatabaseManager(LoggerMixin):
                         del doc["metadata_json"]
                     documents.append(doc)
                 return documents
+
+    async def find_channel_images_async(self, channel_id: str, within_hours: Optional[int] = None,
+                                        limit: int = 50) -> List[Dict]:
+        """Images shared anywhere in a channel, NEWEST FIRST.
+
+        The image twin of get_channel_documents_async, and it exists for the same reason: a
+        thread_id is "channel:thread", so a conversation that fragments across roots hides its own
+        images from itself. That is chronic in DMs, where every top-level message is its own root —
+        send a picture, then ask about it in the next message, and the picture is in another
+        "thread".
+
+        Same privacy boundary as the document lookup: a prefix LIKE on ``channel_id + ':'``, and
+        channel ids are alphanumeric (no LIKE metacharacters), so this cannot escape the channel.
+        `within_hours` bounds it in time; None means no bound.
+        """
+        params: List[Any] = [f"{channel_id}:%"]
+        where = "thread_id LIKE ?"
+        if within_hours is not None:
+            where += " AND created_at >= datetime('now', ?)"
+            params.append(f"-{int(within_hours)} hours")
+        params.append(int(limit))
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(
+                f"SELECT * FROM images WHERE {where} ORDER BY created_at DESC LIMIT ?",
+                tuple(params),
+            ) as cursor:
+                images = []
+                async for row in cursor:
+                    img = dict(row)
+                    if img.get("metadata_json"):
+                        img["metadata"] = json.loads(img["metadata_json"])
+                        del img["metadata_json"]
+                    images.append(img)
+                return images
 
     async def get_channel_documents_async(self, channel_id: str) -> List[Dict]:
         """All documents shared anywhere in a channel (F22 channel-wide access).

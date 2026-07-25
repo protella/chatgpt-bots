@@ -741,6 +741,46 @@ async def test_the_seam_between_a_preamble_and_the_post_tool_text_is_not_jammed(
     assert "Super Heavy.Fixed" not in final
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seconds,warns", [(603.0, True), (4.0, False)])
+async def test_a_slow_inline_sandbox_call_is_logged_as_a_routing_failure(
+        monkeypatch, seconds, warns):
+    """An inline code_interpreter call runs INSIDE the reply, and once the stream owns the message
+    there is no status surface left to report progress on — so the reader watches a frozen
+    half-sentence for its entire duration. One call held a reply for 10 minutes (live 2026-07-24,
+    the "Yep" incident) and left no trace in the logs saying so. That work belongs in
+    start_background_job, which has a live card; the model is steered there by prompt, and this
+    warning is how we find out whether the steering held."""
+    monkeypatch.setattr(config, "enable_no_reply_tool", False, raising=False)
+    monkeypatch.setattr(config, "inline_sandbox_slow_seconds", 60.0, raising=False)
+    from message_processor import file_mount
+    from message_processor.handlers import text as text_handler
+    monkeypatch.setattr(file_mount, "mounted_digests", lambda tc: [], raising=False)
+    clock = iter([0.0, seconds])
+    monkeypatch.setattr(text_handler, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+
+    slack = FakeSlack(native=True)
+    openai = FakeToolLoopOpenAI(slack, ["Yep — building that now."], ["Done."],
+                                tool="code_interpreter")
+    processor = _processor_tools(openai)
+    # The project's loggers don't propagate to root, so caplog can't see them — record directly.
+    warnings, debugs = [], []
+    processor.log_warning = lambda m, *a, **k: warnings.append(str(m))
+    processor.log_debug = lambda m, *a, **k: debugs.append(str(m))
+    msg, ts = _message(), _thread_state()
+
+    await _run(processor, slack, msg, ts, TurnRuntime.for_message(msg, "10.0"))
+
+    slow = [m for m in warnings if "Inline sandbox call held the reply" in m]
+    if warns:
+        assert slow, f"a {seconds:.0f}s inline sandbox call was logged as unremarkable"
+        assert "start_background_job" in slow[0], "the log must name where the work belonged"
+    else:
+        assert not slow, f"a {seconds:.0f}s call is normal sandbox work, not a routing failure"
+        assert any("Inline sandbox call took" in m for m in debugs), (
+            "the call was never timed at all — this test would pass vacuously")
+
+
 def test_the_source_no_longer_claims_an_mcp_retry_keeps_its_partial():
     """The retired grep-test asserted `not failed_mcp_server` as the guard that SKIPPED deleting
     the native partial on an MCP retry. That guard WAS the bug. If it ever comes back, the
