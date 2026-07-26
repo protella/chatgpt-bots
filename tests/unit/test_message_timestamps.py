@@ -285,4 +285,4 @@ def test_channel_activity_envelope_lines_are_stamped():
 # --------------------------------------------------------------- participation prompt
 
 def test_participation_prompt_has_time_awareness_line():
-    assert "always knows the current date and time" in PARTICIPATION_SYSTEM_PROMPT
+    assert "the current date and time (every message it sees is stamped with one)" in PARTICIPATION_SYSTEM_PROMPT

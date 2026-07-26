@@ -111,10 +111,18 @@ class SlackUtilitiesMixin:
             if resp.get("ok"):
                 self.bot_user_id = resp.get("user_id")
                 self.bot_id = resp.get("bot_id")
+                # The handle people actually type ("chatgpt-dev"). Free — auth.test already
+                # returns it. The participation gate is shown only config's BOT_NAME_ALIASES,
+                # and when the deployed handle carries an environment suffix the alias list
+                # doesn't mention, the gate concluded a message addressed to it was addressed
+                # to a DIFFERENT assistant and stayed silent. Config says who it answers to;
+                # this says who it actually IS.
+                self.bot_handle = resp.get("user")
                 # team_id is required by chat.startStream (recipient_team_id) for
                 # channel streaming; stash it here from the same auth.test call.
                 self.self_team_id = resp.get("team_id")
-                self.log_info(f"Resolved bot self-identity: user_id={self.bot_user_id}, bot_id={self.bot_id}")
+                self.log_info(f"Resolved bot self-identity: user_id={self.bot_user_id}, "
+                              f"bot_id={self.bot_id}, handle={self.bot_handle!r}")
             else:
                 self.log_warning(f"auth_test returned not ok: {resp.get('error')}")
         except Exception as e:

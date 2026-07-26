@@ -7,7 +7,7 @@ merge-preserving DB upsert, and the checklist history-filter marker.
 import asyncio
 import sqlite3
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -89,7 +89,6 @@ def _delivery_client(**overrides):
         clear_assistant_status=AsyncMock(return_value=True),
         delete_message=AsyncMock(return_value=True),
         send_thinking_indicator=AsyncMock(return_value="stat1"),
-        channel_pulse=SimpleNamespace(record_bot_reply=MagicMock()),
     )
     for k, v in overrides.items():
         setattr(client, k, v)
@@ -115,7 +114,7 @@ async def test_publish_image_background_success_writes_db_and_accounts():
         processor=proc, client=client, channel_id="C1", thread_id="T1",
         thread_key="C1:T1", image_data=_image_data(), checklist=None,
         generation_id="gen1", prompt="an enhanced prompt", db=db,
-        thread_manager=tm, unprompted=True, message_ts="1.1")
+        thread_manager=tm, message_ts="1.1")
 
     assert url == "https://files.slack.com/img1"
     client.send_image.assert_awaited_once()
@@ -128,8 +127,6 @@ async def test_publish_image_background_success_writes_db_and_accounts():
     row = tm.get_or_create_asset_ledger("T1").images[-1]
     assert row["slack_url"] == url
     assert row["data"] is None
-    # Unprompted channel turn is accounted here, not before delivery.
-    client.channel_pulse.record_bot_reply.assert_called_once()
     # Sync-path persistence helper never used on the background path.
     proc.update_last_image_url.assert_not_awaited()
 
@@ -144,7 +141,7 @@ async def test_publish_image_falsey_url_is_failure():
         processor=_processor(), client=client, channel_id="C1", thread_id="T1",
         thread_key="C1:T1", image_data=_image_data(), checklist=checklist,
         generation_id="gen1", prompt="p", db=db, thread_manager=AsyncThreadStateManager(db=None),
-        unprompted=False, message_ts=None)
+        message_ts=None)
 
     assert url is None
     db.save_image_metadata_async.assert_not_awaited()
@@ -161,7 +158,7 @@ async def test_publish_image_sync_path_persists_directly_and_via_breadcrumb():
         processor=proc, client=client, channel_id="C1", thread_id="T1",
         thread_key="C1:T1", image_data=_image_data(), checklist=None,
         generation_id=None, prompt="", db=db,
-        thread_manager=AsyncThreadStateManager(db=None), unprompted=False,
+        thread_manager=AsyncThreadStateManager(db=None),
         image_type="edited")
 
     assert url == "https://files.slack.com/img1"
@@ -185,7 +182,7 @@ async def test_publish_image_persist_failure_still_reports_posted():
         processor=_processor(), client=client, channel_id="C1", thread_id="T1",
         thread_key="C1:T1", image_data=_image_data(), checklist=checklist,
         generation_id="gen1", prompt="p", db=db,
-        thread_manager=AsyncThreadStateManager(db=None), unprompted=False)
+        thread_manager=AsyncThreadStateManager(db=None))
 
     assert url == "https://files.slack.com/img1"  # still posted
     assert checklist._failed_note is None  # checklist NOT failed

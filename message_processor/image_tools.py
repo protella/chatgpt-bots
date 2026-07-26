@@ -377,7 +377,7 @@ async def execute_generate_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
                 thread_key=thread_key, prompt=prompt, enhance=True,
                 conversation_history=None, thread_config=effective_cfg,
                 checklist=checklist, generating_id=None, generation_id=generation_id,
-                message_ts=ctx.trigger_ts, unprompted=False,
+                message_ts=ctx.trigger_ts,
             ))
         except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to schedule background generation for {thread_key}: {e}",
@@ -690,7 +690,7 @@ async def execute_edit_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
         processor=processor, client=client, channel_id=ctx.channel_id,
         thread_id=ctx.thread_ts, thread_key=thread_key, image_data=image_data,
         checklist=checklist, generation_id=None, prompt=image_data.prompt,
-        db=ctx.db, thread_manager=processor.thread_manager, unprompted=False,
+        db=ctx.db, thread_manager=processor.thread_manager,
         message_ts=ctx.trigger_ts, image_type="edited", provenance_tool="edit_image",
     )
     if not file_url:

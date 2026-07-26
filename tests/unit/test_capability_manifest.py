@@ -224,7 +224,7 @@ class TestClassifyParticipationPayload:
             signals={"capabilities": "image generation and editing",
                      "sender_name": "Peter"})
         prompt = llm.captured_input[1]["content"]
-        alias_pos = prompt.index("The assistant's name in this workspace")
+        alias_pos = prompt.index("The assistant's own names in this workspace")
         cap_pos = prompt.index("The assistant's own tools/data sources")
         sender_pos = prompt.index("Sender: Peter")
         assert alias_pos < cap_pos < sender_pos
@@ -233,8 +233,8 @@ class TestClassifyParticipationPayload:
 class TestPromptRule:
     def test_open_question_rule_present(self):
         from prompts import PARTICIPATION_SYSTEM_PROMPT
-        assert "OPEN question to the room" in PARTICIPATION_SYSTEM_PROMPT
-        assert "tools/data sources" in PARTICIPATION_SYSTEM_PROMPT
+        assert "genuinely open to the channel at large" in PARTICIPATION_SYSTEM_PROMPT
+        assert "tools as they are described to it" in PARTICIPATION_SYSTEM_PROMPT
 
 
 # ------------------------------------------------------ F14b attachment signals

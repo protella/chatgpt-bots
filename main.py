@@ -67,17 +67,6 @@ class ChatBotV2:
         
         main_logger.info("Initialization complete")
     
-    @staticmethod
-    def _is_unprompted_turn(message: Message) -> bool:
-        """F14: whether a posted channel reply counts as UNPROMPTED for pulse pacing.
-
-        A participation-gated turn is unprompted UNLESS it was woken by a name-hit — being
-        called by name is prompted in spirit (like an @-mention), so its reply must not
-        burn the runaway-brake budget."""
-        md = message.metadata or {}
-        return (md.get("participation_check") is True
-                and md.get("participation_name_hit") is not True)
-
     async def _run_participation_gate(self, message: Message, client: BaseClient):
         """The gate, plus the one thing that must happen whether or not we speak.
 
@@ -129,19 +118,18 @@ class ChatBotV2:
             # top-level questions never collide.
             engine.note_arrival(channel_id, ts, message.thread_id, message.user_id)
 
-            # F17: no hourly-cap hard rail — pacing is the classifier's judgment. The
-            # unprompted-reply count is still tallied and fed to the engine as a signal
-            # (below), but a high count never silences a turn before the model sees it.
+            # Pacing is the classifier's judgment, and only its judgment. F17 removed the
+            # hourly-cap hard rail; the count that fed it survived as a signal line until it
+            # was removed too — it never prevented a misfire, and a rate number in a prompt
+            # that is otherwise about WHO a message is for only competed with that judgment.
             name_hit = message.metadata.get("participation_name_hit") is True
 
             channel_activity = None
-            unprompted = 0
             if pulse is not None:
                 channel_activity = pulse.render_envelope(
                     channel_id, exclude_thread_ts=None,
                     max_lines=config.channel_pulse_envelope_max,
                 ) or None
-                unprompted = pulse.unprompted_count_last_hour(channel_id)
 
             memory_facts = []
             try:
@@ -187,16 +175,29 @@ class ChatBotV2:
 
             # C3: workspace custom emoji as EXTRA classifier choices — ONLY when there is no
             # REACTION_EMOJIS allowlist (a set allowlist is the exact hard constraint; customs
-            # are never injected over it). Deterministic sorted cap; stale-ok cache getter.
+            # are never injected over it).
+            #
+            # These are the emoji THIS WORKSPACE actually reacts with, most-used first. The gate
+            # is a single tool-free call whose emoji is placed directly (see _place_gate_reaction),
+            # so unlike the responder it cannot search the catalog — its whole palette has to
+            # arrive in this one prompt, which makes the choice of WHICH names to send the
+            # entire game. It used to send the first N alphabetically out of ~1,400, i.e.
+            # "000, 1password_icon, 2605732e-82a0-46b9-b1e0-ecc4f250eb35, 4cats_q, alabama" —
+            # unusable, and worse than nothing because it is prompt noise the model must read.
+            # Observed usage is the only real ranking signal Slack exposes (there is no
+            # popularity endpoint, and emoji.list carries no tags or descriptions).
+            #
+            # When nothing has been observed yet, send NOTHING. Standard emoji are a clean
+            # fallback the model already knows; an alphabetical slice is not a fallback at all.
             workspace_custom_emojis = []
             if not (config.reaction_emojis or []):
                 emoji_cache = getattr(client, "workspace_emojis", None)
-                if emoji_cache is not None:
+                pulse = getattr(client, "channel_pulse", None)
+                if emoji_cache is not None and pulse is not None:
                     try:
-                        names = emoji_cache.get_custom_emoji_names()
                         cap = max(0, int(getattr(config, "participation_custom_emoji_cap", 32)))
-                        # cap is a hard maximum: 0 → none (never "unlimited"); names[:0] == [].
-                        workspace_custom_emojis = list(names[:cap])
+                        workspace_custom_emojis = pulse.top_custom_reactions(
+                            allowed=emoji_cache.get_custom_emoji_names(), limit=cap)
                     except Exception:  # noqa: BLE001 — never cost the gate a verdict
                         workspace_custom_emojis = []
 
@@ -223,8 +224,8 @@ class ChatBotV2:
                 is_thread_reply=is_thread_reply, level=level,
                 directives=message.metadata.get("channel_directives"),
                 memory_facts=memory_facts, channel_activity=channel_activity,
-                unprompted_last_hour=unprompted,
                 name_hit=name_hit,
+                self_display_name=getattr(client, "bot_handle", None),
                 sender_is_bot=message.metadata.get("participation_sender_bot") is True,
                 channel_topic=channel_topic,
                 channel_canvases=channel_canvases,
@@ -243,6 +244,21 @@ class ChatBotV2:
                 main_logger.debug("Participation gate: superseded during debounce — silent")
                 return None
             main_logger.debug(f"Participation verdict: {verdict.action} ({verdict.reason})")
+            # An overrule means the model's chosen action contradicted its OWN staged findings.
+            # Logged at INFO because a rising rate is a signal about the prompt, not the code: the
+            # invariants are a backstop, and if they start carrying the decision it is the prompt
+            # that needs fixing. No message text here — only the declared classifications.
+            # getattr, not attribute access: verdicts do not all come from validate_verdict (the
+            # edit-reply path and tests construct their own), and a missing field must never turn
+            # into an AttributeError that the gate's except-clause converts into silence.
+            if getattr(verdict, "overruled_by", None):
+                main_logger.info(
+                    f"Participation invariant: "
+                    f"{','.join(getattr(verdict, 'overruled_by', None) or [])} → "
+                    f"{verdict.action} | channel={channel_id} ts={ts} "
+                    f"relation={getattr(verdict, 'relation', None)} "
+                    f"exchange={getattr(verdict, 'exchange_state', None)} "
+                    f"answerability={getattr(verdict, 'answerability', None)}")
 
             if verdict.action == "react":
                 react_ts = message.metadata.get("ts") or message.thread_id
@@ -566,7 +582,7 @@ class ChatBotV2:
                     checklist=None, generation_id=None,
                     prompt=asset.get("enhanced_prompt") or asset.get("prompt") or "",
                     db=getattr(self.processor, "db", None),
-                    thread_manager=self.processor.thread_manager, unprompted=False,
+                    thread_manager=self.processor.thread_manager,
                     message_ts=(message.metadata or {}).get("ts"),
                     provenance_tool="create_image_asset",
                 )
@@ -588,7 +604,9 @@ class ChatBotV2:
             if verdict is None:
                 return
             placement_verdict = verdict.placement
-            # F3: the engine's reason rides the wake envelope for ambient wakes.
+            # Kept for logs and debugging ONLY — deliberately NOT rendered into the wake
+            # envelope any more (see utilities._wake_trigger_line): forwarding the gate's own
+            # justification pre-argued the turn and neutered the no_response_needed veto.
             if isinstance(message.metadata, dict) and getattr(verdict, "reason", None):
                 message.metadata["participation_reason"] = verdict.reason
             # F27: earlier same-author burst messages ride the wake envelope too, so the
@@ -867,9 +885,10 @@ class ChatBotV2:
                         response.content
                     )
 
-            # Phase E/F participation stats (F2: accounted AFTER delivery, honest posted).
-            # Count a reply only when visible content actually went out on an unprompted
-            # (wake-gate) channel turn. Image/background turns account in publish_image.
+            # Post-delivery bookkeeping (F2: accounted AFTER delivery, honest posted). The
+            # reply TALLY that used to live here is gone with the unprompted counter; what
+            # remains is the contract check — a turn that posted nothing and did not call the
+            # terminal no-reply tool is a violation worth catching.
             if (response and message.channel_id and not message.channel_id.startswith("D")
                     and getattr(client, "channel_pulse", None) is not None):
                 terminal = (response.metadata or {}).get("terminal_action")
@@ -885,19 +904,11 @@ class ChatBotV2:
                             response.type == "text"
                             and (response.metadata.get("streamed")
                                  or (response.content or "").strip()))
-                    if posted:
-                        try:
-                            client.channel_pulse.record_bot_reply(
-                                message.channel_id, message.metadata.get("ts"),
-                                unprompted=self._is_unprompted_turn(message),
-                            )
-                        except Exception as e:
-                            main_logger.debug(f"participation stat record failed: {e}")
-                    elif (response.type == "text"
-                          and not (response.content or "").strip()
-                          and not response.metadata.get("reaction_only")):
+                    if (not posted and response.type == "text"
+                            and not (response.content or "").strip()
+                            and not response.metadata.get("reaction_only")):
                         # Bare empty text without the terminal tool: contract violation.
-                        # Fail-safe silence, no quota burn, no re-prompt this phase.
+                        # Fail-safe silence, no re-prompt this phase.
                         main_logger.warning(
                             "Empty text response without a terminal action — posting nothing")
 

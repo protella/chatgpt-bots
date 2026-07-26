@@ -59,7 +59,9 @@ def test_recent_speakers_distinct_newest_first_excludes_self():
     p.record("C1", **_entry("3.0", name="Alice"))                 # dupe (older instance drops)
     p.record("C1", **_entry("4.0", name="ChatGPT", sender="self"))  # bot's own reply excluded
     p.record("C1", **_entry("5.0", name="Claude", sender="other_bot"))  # other bot KEPT
-    assert p.recent_speakers("C1") == ["Claude", "Alice", "Bob"]
+    # Other assistants are MARKED: unmarked, a second assistant's name reads exactly like a
+    # colleague's, and the gate answered messages addressed to it ("hey claude, can you...").
+    assert p.recent_speakers("C1") == ["Claude (assistant)", "Alice", "Bob"]
 
 
 def test_recent_speakers_respects_limit():
@@ -318,15 +320,15 @@ def test_envelope_header_is_modest_peripheral():
 
 # --------------------------------------------------------- participation stats
 
-def test_participation_stat_math():
+def test_the_unprompted_reply_counter_is_gone():
+    """F17 removed the hourly-cap rail; the counter that fed it lingered as a prompt signal
+    until it was removed too. It never prevented a misfire — a rate number in a prompt that is
+    otherwise about WHO a message is for only competed with that judgment. Pacing is the
+    classifier's call now, so nothing should tally replies for it."""
     p = ChannelPulse()
-    now = 10_000.0
-    p.record_bot_reply("C1", "1.0", unprompted=True, now=now - 3599)   # inside window
-    p.record_bot_reply("C1", "2.0", unprompted=True, now=now - 3601)   # outside
-    p.record_bot_reply("C1", "3.0", unprompted=False, now=now)         # prompted: not counted
-    p.record_bot_reply("D1", "4.0", unprompted=True, now=now)          # DM: not counted
-    assert p.unprompted_count_last_hour("C1", now=now) == 1
-    assert p.unprompted_count_last_hour("C2", now=now) == 0
+    assert not hasattr(p, "record_bot_reply")
+    assert not hasattr(p, "unprompted_count_last_hour")
+    assert not hasattr(p, "_bot_replies")
 
 
 # ------------------------------------------------- idempotence / dedup (F5)

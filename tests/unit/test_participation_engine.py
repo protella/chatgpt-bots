@@ -52,6 +52,20 @@ class TestLevelResolution:
         assert resolve_participation_level({"participation_level": "loud"}) == "mentions_only"
 
 
+# A verdict dict carrying the STAGED findings a real classifier reply includes. `_apply_invariants`
+# now fails CLOSED: a speaking action with any stage missing is forced to ignore, because the
+# response is not strict Structured Outputs (arbitrary JSON is lifted out of the text) and a
+# truncated reply would otherwise skip every check on the one path most likely to be garbage.
+# Tests below that only care about gate WIRING or emoji coercion use this so their fixtures are
+# shaped like production traffic; the fail-closed behaviour has its own tests.
+def _staged(action, relation="to_assistant", exchange_state="open",
+            answerability="substantive", **extra):
+    v = {"action": action, "relation": relation, "exchange_state": exchange_state,
+         "answerability": answerability}
+    v.update(extra)
+    return v
+
+
 # ----------------------------------------------------------------- verdict validation
 
 class TestVerdictValidation:
@@ -61,23 +75,45 @@ class TestVerdictValidation:
         assert ParticipationEngine.validate_verdict({"action": "shout"}).action == "ignore"
 
     def test_respond_defaults(self):
-        v = ParticipationEngine.validate_verdict({"action": "respond"})
+        v = ParticipationEngine.validate_verdict(_staged("respond"))
         assert (v.action, v.placement, v.emoji) == ("respond", "thread", None)
+
+    def test_speaking_action_without_staged_findings_fails_closed(self):
+        # The parser lifts whatever JSON object it can find, so a truncated reply can arrive
+        # with an action and no stages — and every stage field coerces to None when missing.
+        # That path used to skip the invariants entirely, i.e. the likeliest-garbage verdict was
+        # the least checked. Silence is the safe direction.
+        # The react actions carry an emoji here on purpose: without one they are already
+        # downgraded by emoji coercion ("react-no-valid-emoji"), which would make this pass
+        # without ever reaching the invariant under test.
+        for action, extra in (("respond", {}),
+                              ("react", {"emoji": "tada"}),
+                              ("react_and_respond", {"emoji": "tada"})):
+            v = ParticipationEngine.validate_verdict({"action": action, **extra})
+            assert v.action == "ignore", action
+            assert v.overruled_by == ["incomplete_stages"], action
+            assert v.emoji is None, action
+        # a PARTIAL set of stages is just as unacceptable
+        v = ParticipationEngine.validate_verdict(
+            {"action": "respond", "relation": "to_assistant"})
+        assert v.action == "ignore" and v.overruled_by == ["incomplete_stages"]
+        # backoff is exempt: it is how "stop participating" arrives, and it never speaks
+        assert ParticipationEngine.validate_verdict({"action": "backoff"}).action == "backoff"
 
     def test_react_allowlist_and_colon_strip(self, monkeypatch):
         monkeypatch.setattr(config, "reaction_emojis", ["thumbsup", "eyes"], raising=False)
         assert ParticipationEngine.validate_verdict(
-            {"action": "react", "emoji": ":eyes:"}).emoji == "eyes"
+            _staged("react", emoji=":eyes:")).emoji == "eyes"
         # off-allowlist → first allowlisted emoji
         assert ParticipationEngine.validate_verdict(
-            {"action": "react", "emoji": "middle_finger"}).emoji == "thumbsup"
+            _staged("react", emoji="middle_finger")).emoji == "thumbsup"
 
     def test_react_and_respond_keeps_valid_emoji_and_placement(self, monkeypatch):
         # react_and_respond reacts AND replies in one turn: a valid emoji is kept and placement
         # is coerced exactly like a respond verdict.
         monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
         v = ParticipationEngine.validate_verdict(
-            {"action": "react_and_respond", "emoji": ":tada:", "placement": "channel"})
+            _staged("react_and_respond", emoji=":tada:", placement="channel"))
         assert (v.action, v.emoji, v.placement) == ("react_and_respond", "tada", "channel")
 
     def test_react_and_respond_no_allowlist_invalid_emoji_downgrades_to_respond(self, monkeypatch):
@@ -85,7 +121,7 @@ class TestVerdictValidation:
         # downgrade to a plain respond, NEVER to ignore (react→None ignores; this must not).
         monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
         v = ParticipationEngine.validate_verdict(
-            {"action": "react_and_respond", "emoji": "bad name!"})
+            _staged("react_and_respond", emoji="bad name!"))
         assert v.action == "respond" and v.emoji is None
 
     def test_react_and_respond_allowlist_offlist_falls_back_and_stays(self, monkeypatch):
@@ -93,11 +129,11 @@ class TestVerdictValidation:
         # action STAYS react_and_respond (the emoji resolved, so there is no downgrade).
         monkeypatch.setattr(config, "reaction_emojis", ["thumbsup", "eyes"], raising=False)
         v = ParticipationEngine.validate_verdict(
-            {"action": "react_and_respond", "emoji": "middle_finger"})
+            _staged("react_and_respond", emoji="middle_finger"))
         assert v.action == "react_and_respond" and v.emoji == "thumbsup"
 
     def test_bad_placement_coerced_to_thread(self):
-        v = ParticipationEngine.validate_verdict({"action": "respond", "placement": "everywhere"})
+        v = ParticipationEngine.validate_verdict(_staged("respond", placement="everywhere"))
         assert v.placement == "thread"
 
     def test_reason_truncated(self):
@@ -108,10 +144,10 @@ class TestVerdictValidation:
     # model had done anything, and the gate dropped a 👀 on that guess. The verdict must
     # carry no such field, and a stale `ack` key from an old prompt must be inert.
     def test_verdict_has_no_ack_field(self):
-        assert not hasattr(ParticipationEngine.validate_verdict({"action": "respond"}), "ack")
+        assert not hasattr(ParticipationEngine.validate_verdict(_staged("respond")), "ack")
 
     def test_stale_ack_key_is_ignored(self):
-        v = ParticipationEngine.validate_verdict({"action": "respond", "ack": True})
+        v = ParticipationEngine.validate_verdict(_staged("respond", ack=True))
         assert v.action == "respond"
         assert not hasattr(v, "ack")
 
@@ -132,9 +168,6 @@ class _FakePulse:
     def __init__(self, count=0):
         self._count = count
 
-    def unprompted_count_last_hour(self, channel_id):
-        return self._count
-
     def render_envelope(self, *a, **k):
         return "[Recent channel activity]\n- Peter (top-level): hi"
 
@@ -143,7 +176,7 @@ class TestDebounceAndRails:
     @pytest.mark.asyncio
     async def test_rapid_fire_collapses_to_latest(self, monkeypatch):
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient({"action": "respond"})
+        fake = _FakeClient(_staged("respond"))
         engine = ParticipationEngine(fake)
         first = asyncio.create_task(engine.evaluate(channel_id="C1", ts="1.0", text="line one"))
         await asyncio.sleep(0.01)
@@ -159,7 +192,7 @@ class TestDebounceAndRails:
         must NOT be dropped because thread B (or another conversation) posted something
         newer in the same channel during the debounce window."""
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient({"action": "respond"})
+        fake = _FakeClient(_staged("respond"))
         engine = ParticipationEngine(fake)
         a = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="10.5", text="question in thread A", thread_root_ts="10.0"))
@@ -175,7 +208,7 @@ class TestDebounceAndRails:
     async def test_thread_message_survives_newer_top_level(self, monkeypatch):
         """F21: a newer TOP-LEVEL message must not supersede a pending thread reply."""
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient({"action": "respond"})
+        fake = _FakeClient(_staged("respond"))
         engine = ParticipationEngine(fake)
         a = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="10.5", text="thread question", thread_root_ts="10.0"))
@@ -191,7 +224,7 @@ class TestDebounceAndRails:
         """F21: within ONE thread the old behavior holds — the newest message of a
         rapid burst supersedes the older ones (its tail covers the batch)."""
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient({"action": "respond"})
+        fake = _FakeClient(_staged("respond"))
         engine = ParticipationEngine(fake)
         first = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="10.5", text="line one", thread_root_ts="10.0"))
@@ -265,7 +298,7 @@ class TestBurstCarryForward:
         """F27: two DIFFERENT users' unrelated top-level messages within the debounce no
         longer collapse — each is the newest in its own per-sender stream, both answered."""
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient({"action": "respond"})
+        fake = _FakeClient(_staged("respond"))
         engine = ParticipationEngine(fake)
         a = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="1.0", text="alice question", sender_id="U1"))
@@ -283,7 +316,7 @@ class TestBurstCarryForward:
         """F27: a same-author fast-follow supersedes the first message, but the survivor
         carries the earlier text so ONE reply covers the whole burst."""
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient({"action": "respond"})
+        fake = _FakeClient(_staged("respond"))
         engine = ParticipationEngine(fake)
         first = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="1.0", text="first thought", sender_id="U1"))
@@ -301,7 +334,7 @@ class TestBurstCarryForward:
     @pytest.mark.asyncio
     async def test_burst_signal_reaches_classifier(self, monkeypatch):
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        cap = _CapturingClient({"action": "respond"})
+        cap = _CapturingClient(_staged("respond"))
         engine = ParticipationEngine(cap)
         first = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="1.0", text="one", sender_id="U1"))
@@ -357,7 +390,7 @@ class TestBurstCarryForward:
         """F27 leaves F21 thread behavior intact: within one thread a cross-author burst
         still collapses to the newest (its in-thread reply has full history)."""
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient({"action": "respond"})
+        fake = _FakeClient(_staged("respond"))
         engine = ParticipationEngine(fake)
         first = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="10.5", text="alice in thread",
@@ -377,7 +410,7 @@ class TestBurstCarryForward:
         carry the superseded — possibly different-author — text: the render sites label it
         "the same sender", so carrying it would misattribute. Carry is top-level-only."""
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        cap = _CapturingClient({"action": "respond"})
+        cap = _CapturingClient(_staged("respond"))
         engine = ParticipationEngine(cap)
         first = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="10.5", text="alice's words",
@@ -397,7 +430,7 @@ class TestBurstCarryForward:
         """F27: a thread survivor discards the carry but must STILL drain its pending bucket
         (memory hygiene) so a busy thread's bucket can't grow unbounded."""
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient({"action": "respond"})
+        fake = _FakeClient(_staged("respond"))
         engine = ParticipationEngine(fake)
         first = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="10.5", text="one",
@@ -445,20 +478,9 @@ class TestGateWiring:
     @pytest.mark.asyncio
     async def test_engine_disabled_stays_silent(self, monkeypatch):
         monkeypatch.setattr(config, "enable_participation_engine", False, raising=False)
-        app, client, fake = _make_app({"action": "respond"})
+        app, client, fake = _make_app(_staged("respond"))
         assert await app._run_participation_gate(_channel_msg(), client) is None
         assert fake.calls == 0
-
-    @pytest.mark.asyncio
-    async def test_high_unprompted_count_still_reaches_engine(self, monkeypatch):
-        # F17: no hourly-cap rail — even a very high recorded unprompted count never
-        # silences a turn before the model sees it. The classifier alone decides.
-        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        app, client, fake = _make_app({"action": "respond"}, pulse=_FakePulse(40))
-        verdict = await app._run_participation_gate(_channel_msg(), client)
-        assert verdict is not None and verdict.action == "respond"
-        assert fake.calls == 1  # engine judged despite 40 unprompted replies on record
 
     @pytest.mark.asyncio
     async def test_name_hit_still_reaches_engine(self, monkeypatch):
@@ -466,7 +488,7 @@ class TestGateWiring:
         # classifier decides if it's a genuine summons.
         monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
         monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        app, client, fake = _make_app({"action": "respond"}, pulse=_FakePulse(40))
+        app, client, fake = _make_app(_staged("respond"), pulse=_FakePulse(40))
         verdict = await app._run_participation_gate(
             _channel_msg(participation_name_hit=True), client)
         assert verdict is not None and verdict.action == "respond"
@@ -476,7 +498,7 @@ class TestGateWiring:
     async def test_respond_verdict_passes_through(self, monkeypatch):
         monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
         monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        app, client, _ = _make_app({"action": "respond", "placement": "thread"})
+        app, client, _ = _make_app(_staged("respond", placement="thread"))
         verdict = await app._run_participation_gate(_channel_msg(), client)
         assert verdict is not None and verdict.action == "respond"
 
@@ -490,7 +512,7 @@ class TestGateWiring:
         monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
         monkeypatch.setattr(config, "enable_ack_reaction", True, raising=False)
         monkeypatch.setattr(config, "ack_reaction_emoji", "eyes", raising=False)
-        app, client, _ = _make_app({"action": "respond"})
+        app, client, _ = _make_app(_staged("respond"))
         verdict = await app._run_participation_gate(_channel_msg(), client)
         assert verdict is not None and verdict.action == "respond"
         client._reserve_and_react.assert_not_awaited()
@@ -503,7 +525,7 @@ class TestGateWiring:
         monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
         monkeypatch.setattr(config, "enable_ack_reaction", True, raising=False)
         monkeypatch.setattr(config, "ack_reaction_emoji", "eyes", raising=False)
-        app, client, _ = _make_app({"action": "respond", "ack": True})
+        app, client, _ = _make_app(_staged("respond", ack=True))
         verdict = await app._run_participation_gate(_channel_msg(), client)
         assert verdict is not None and verdict.action == "respond"
         client._reserve_and_react.assert_not_awaited()
@@ -517,28 +539,23 @@ class TestGateWiring:
         monkeypatch.setattr(config, "enable_ack_reaction", True, raising=False)
         monkeypatch.setattr(config, "ack_reaction_emoji", "eyes", raising=False)
         monkeypatch.setattr(config, "reaction_emojis", ["thumbsup"], raising=False)
-        app, client, _ = _make_app({"action": "react", "emoji": "thumbsup", "ack": True})
+        app, client, _ = _make_app(_staged("react", emoji="thumbsup", ack=True))
         assert await app._run_participation_gate(_channel_msg(), client) is None
         client._reserve_and_react.assert_awaited_once_with("C1", "10.0", "thumbsup")
 
-    def test_is_unprompted_turn_excludes_name_hit(self):
-        # F14: a name-hit respond is prompted in spirit — it must NOT burn the
-        # unprompted runaway-brake budget; an ambient participation reply still does.
+    def test_the_unprompted_turn_helper_is_gone(self):
+        # It existed only to decide whether a posted reply burned the hourly counter.
+        # The counter is gone, so the helper is too; `_unprompted_turn` on the request
+        # config (which exposes no_response_needed) is a DIFFERENT thing and stays.
         from main import ChatBotV2
-        assert ChatBotV2._is_unprompted_turn(_channel_msg()) is True
-        assert ChatBotV2._is_unprompted_turn(
-            _channel_msg(participation_name_hit=True)) is False
-        # A non-gated (e.g. @-mention / DM) turn is never unprompted.
-        assert ChatBotV2._is_unprompted_turn(
-            Message(text="hi", user_id="U1", channel_id="C1", thread_id="10.0",
-                    metadata={"ts": "10.0"})) is False
+        assert not hasattr(ChatBotV2, "_is_unprompted_turn")
 
     @pytest.mark.asyncio
     async def test_react_verdict_reacts_and_stays_silent(self, monkeypatch):
         monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
         monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
         monkeypatch.setattr(config, "reaction_emojis", ["eyes"], raising=False)
-        app, client, _ = _make_app({"action": "react", "emoji": "eyes"})
+        app, client, _ = _make_app(_staged("react", emoji="eyes"))
         assert await app._run_participation_gate(_channel_msg(), client) is None
         # F6 addendum: routed through the guard-aware reservation, not the raw react.
         client._reserve_and_react.assert_awaited_once_with("C1", "10.0", "eyes")
@@ -550,7 +567,7 @@ class TestGateWiring:
         monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
         monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
         monkeypatch.setattr(config, "reaction_emojis", ["tada"], raising=False)
-        app, client, _ = _make_app({"action": "react_and_respond", "emoji": "tada"})
+        app, client, _ = _make_app(_staged("react_and_respond", emoji="tada"))
         msg = _channel_msg()
         verdict = await app._run_participation_gate(msg, client)
         assert verdict is not None and verdict.action == "react_and_respond"
@@ -565,11 +582,11 @@ class TestGateWiring:
         monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
         monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
         monkeypatch.setattr(config, "reaction_emojis", ["tada", "fire"], raising=False)
-        app, client, fake = _make_app({"action": "react_and_respond", "emoji": "tada"})
+        app, client, fake = _make_app(_staged("react_and_respond", emoji="tada"))
         msg = _channel_msg()
         v1 = await app._run_participation_gate(msg, client)
         assert v1 is not None and v1.action == "react_and_respond"
-        fake._verdict = {"action": "react_and_respond", "emoji": "fire"}  # redispatch, new emoji
+        fake._verdict = _staged("react_and_respond", emoji="fire")  # redispatch, new emoji
         v2 = await app._run_participation_gate(msg, client)
         assert v2 is not None and v2.action == "react_and_respond"
         assert client._reserve_and_react.await_count == 1
@@ -584,11 +601,11 @@ class TestGateWiring:
         monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
         monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
         monkeypatch.setattr(config, "reaction_emojis", ["tada", "fire"], raising=False)
-        app, client, fake = _make_app({"action": "react_and_respond", "emoji": "tada"})
+        app, client, fake = _make_app(_staged("react_and_respond", emoji="tada"))
         msg = _channel_msg()
         v1 = await app._run_participation_gate(msg, client)
         assert v1 is not None and v1.action == "react_and_respond"
-        fake._verdict = {"action": "react", "emoji": "fire"}  # redispatch flips to plain react
+        fake._verdict = _staged("react", emoji="fire")  # redispatch flips to plain react
         v2 = await app._run_participation_gate(msg, client)
         assert v2 is None  # a plain react is terminal
         assert client._reserve_and_react.await_count == 1
@@ -634,29 +651,29 @@ class TestGateWiring:
         app.processor.db.add_channel_memory_async.assert_not_awaited()
         app.processor.db.set_channel_settings_async.assert_not_awaited()
 
-    def test_participation_prompt_has_butt_out_memory_line(self):
-        # F15: the classifier learns about butt-out feedback through channel memory —
-        # the prompt must tell it how to weigh recorded/repeated butt-out facts.
+    def test_participation_prompt_treats_remembered_feedback_as_a_soft_rule(self):
+        """Recorded participation preferences bias how eager the assistant is — and nothing more.
+
+        The old prompt escalated REPEATED butt-out facts into a hidden "observe-only" mode. That
+        escalation is gone (codex flagged it, 2026-07-26): repetition of a soft preference should
+        not silently create a stricter mode than any channel setting can express, and channel
+        memory must never outrank the addressee decision either."""
         from prompts import PARTICIPATION_SYSTEM_PROMPT
-        assert "butt-out feedback in the channel memory" in PARTICIPATION_SYSTEM_PROMPT
-        assert "observe-only" in PARTICIPATION_SYSTEM_PROMPT
+        p = PARTICIPATION_SYSTEM_PROMPT
+        assert "remembered preferences can change how eager" in p
+        assert "cannot move a message from someone else's conversation into this one" in p
+        assert "observe-only" not in p
 
     def test_participation_prompt_documents_burst_signal(self):
-        # F27: the prompt must tell the classifier to judge a same-author burst as ONE
-        # combined request.
+        """A same-author burst is one thought split across messages, so it is judged as a whole —
+        otherwise a trailing fragment ("...actually nvm") gets judged alone and the real request
+        goes unanswered."""
         from prompts import PARTICIPATION_SYSTEM_PROMPT
-        assert "Same-author burst" in PARTICIPATION_SYSTEM_PROMPT
-        assert "ONE combined request" in PARTICIPATION_SYSTEM_PROMPT
+        p = PARTICIPATION_SYSTEM_PROMPT
+        assert "same-author burst" in p
+        assert "ONE thought split across messages" in p
+        assert "a reply is expected to cover all of it" in p
 
-    @pytest.mark.asyncio
-    async def test_gate_exception_is_silent(self, monkeypatch):
-        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
-        app, client, _ = _make_app({"action": "respond"})
-        app.participation_engine.evaluate = AsyncMock(side_effect=RuntimeError("boom"))
-        assert await app._run_participation_gate(_channel_msg(), client) is None
-
-
-# ------------------------------------------------------------------ placement wiring
 
 class TestPlacement:
     def _app_with_processor(self, response):

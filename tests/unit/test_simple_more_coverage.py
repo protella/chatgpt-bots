@@ -1,7 +1,7 @@
 """Simple tests for more coverage - testing actual existing methods"""
 
 import pytest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 
 class TestDatabaseMoreMethods:

@@ -152,14 +152,13 @@ async def publish_image(
     prompt: str,
     db,
     thread_manager,
-    unprompted: bool,
     message_ts: Optional[str] = None,
     image_type: str = "generated",
     provenance_tool: Optional[str] = None,
 ) -> Optional[str]:
     """Single owner of image delivery for both the background job and the sync path:
     checklist "Uploading…" transition, upload, falsey-URL = failure, persistence,
-    asset-ledger update, checklist completion, and unprompted participation accounting.
+    asset-ledger update, and checklist completion.
     Returns the file URL, or None on failure.
 
     Upload and persistence are separated: once send_image returns a URL the image IS
@@ -272,15 +271,6 @@ async def publish_image(
             _update_ledger(thread_manager, thread_id, prompt_text, file_url)
     except Exception as e:  # noqa: BLE001
         processor.log_debug(f"warm-state image update failed: {e}")
-
-    # Participation accounting: only a real posted image on an unprompted channel turn.
-    if unprompted and channel_id and not channel_id.startswith("D"):
-        pulse = getattr(client, "channel_pulse", None)
-        if pulse is not None:
-            try:
-                pulse.record_bot_reply(channel_id, message_ts, unprompted=True)
-            except Exception as e:  # noqa: BLE001
-                processor.log_debug(f"participation stat record failed: {e}")
 
     # Two consumers, one question ("has Slack actually SHARED the file yet?"), one resolve.
     holding = checklist is not None and checklist.surface != "none"

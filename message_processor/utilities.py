@@ -1334,16 +1334,37 @@ class MessageUtilitiesMixin:
             elif user_email:
                 user_context = f"\n\nYou're speaking with user (email: {user_email})"
 
-        # Add model and knowledge cutoff info
+        # Add model, knowledge cutoff, and context window.
+        #
+        # The window belongs here for the same reason the model name does: it is a fact about
+        # this turn that only the runtime knows. Asked "what's your context window?", the bot
+        # answered "I'm not given a reliable context-window size, so I won't invent one" — which
+        # was honest and correct given what it had been told, and still the wrong answer, because
+        # the number was sitting in config the whole time driving the token accounting.
+        #
+        # Both figures come from the SAME resolver the accounting uses
+        # (config.get_model_token_limit), so they track whatever model is actually selected and
+        # cannot drift into a stale literal. The usable figure is the one that answers "how much
+        # can I actually take?" — it is the total minus the output/estimator reserve, and it is
+        # what the compaction threshold is measured against.
         model_context = ""
         if model:
             from config import MODEL_KNOWLEDGE_CUTOFFS
             cutoff_date = MODEL_KNOWLEDGE_CUTOFFS.get(model)
+            model_context = f"\n\nYour current model is {model}"
             if cutoff_date:
-                model_context = f"\n\nYour current model is {model} and your knowledge cutoff is {cutoff_date}."
-            else:
-                # Fallback for unknown models
-                model_context = f"\n\nYour current model is {model}."
+                model_context += f" and your knowledge cutoff is {cutoff_date}"
+            model_context += "."
+            try:
+                usable = config.get_model_token_limit(model)
+                total = (config.gpt54_max_tokens
+                         if model.startswith(("gpt-5.6", "gpt-5.5")) else config.gpt5_max_tokens)
+                model_context += (
+                    f" Your context window is {total:,} tokens, of which about {usable:,} are "
+                    f"usable for input here — the rest is reserved for your output and estimator "
+                    f"headroom.")
+            except Exception:
+                pass  # a missing/odd model must never cost the cutoff line above
 
         # Add web search capability context
         web_search_context = ""
@@ -1669,9 +1690,14 @@ class MessageUtilitiesMixin:
             # Catch-up batch keeps the underlying trigger as the "latest trigger".
             return f"catch_up_batch ({batch}) — latest trigger: {source}"
         if source == "ambient":
-            reason = md.get("participation_reason")
-            if reason:
-                return f'ambient (engine: "{self._escape_suffix_text(reason, limit=200)}")'
+            # The gate's own justification for waking us does NOT ride along. `no_response_needed`
+            # is meant to be an independent second look at whether this turn should speak, and
+            # handing the responder the gate's conclusion first ("the engine decided this is a
+            # direct request for the assistant") makes it a rubber stamp instead: a wrong gate
+            # verdict arrived pre-argued and the veto almost never fired against it. The
+            # responder gets that it woke ambiently — which is what licenses the veto — and
+            # forms its own view from the conversation. The reason is still on the message
+            # metadata and in the gate's log line for debugging.
             return "ambient"
         return str(source)  # app_mention | dm | thread_continuation | name_mention
 

@@ -60,11 +60,16 @@ def test_trigger_enum_renders(source):
     assert env.startswith("[Wake context — informational metadata, not instructions]")
 
 
-def test_trigger_ambient_with_engine_reason():
+def test_the_gates_own_reason_never_reaches_the_responder():
+    # no_response_needed is meant to be an INDEPENDENT second look at whether this turn
+    # should speak. Handing the responder the gate's justification first made it a rubber
+    # stamp: a wrong verdict arrived pre-argued and the veto never fired against it.
     env = _WakeHost()._build_wake_envelope(
         _msg(wake_source="ambient", sender_type="human",
              participation_reason="looks like a question for me"), _state())
-    assert 'trigger: ambient (engine: "looks like a question for me")' in env
+    assert "trigger: ambient" in env
+    assert "looks like a question for me" not in env
+    assert "engine:" not in env
 
 
 def test_trigger_ambient_without_reason():
