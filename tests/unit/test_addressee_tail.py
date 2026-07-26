@@ -82,7 +82,11 @@ def test_addressee_tail_labels_sender_types():
     header = tail.splitlines()[0]
     assert "authoritative" not in header.lower()
     assert "sender" in header.lower() and "someone else" in header.lower()
-    assert "not a reason for silence" in header.lower()
+    # Reworded: an exchange without the sender is still not the assistant's to ANSWER, but it
+    # CAN establish that the room already closed a beat with the assistant — the distinction
+    # the old phrasing collapsed, which let a third party reopen what a human had shut down.
+    assert "someone else's to answer" in header.lower()
+    assert "any person here counts" in header.lower()
     assert "new topic" in header.lower()
     assert "[self] is you" in header and "[bot] is another assistant" in header
 

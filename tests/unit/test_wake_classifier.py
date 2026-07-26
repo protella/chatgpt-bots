@@ -88,7 +88,7 @@ async def test_signals_render_into_prompt_deterministically():
     llm = _FakeLLM(text='{"action": "ignore"}')
     signals = {
         "sender_name": "Peter", "is_thread_reply": True, "strictness": "active",
-        "directives": "only deploys", "unprompted_last_hour": 3,
+        "directives": "only deploys",
         "memory_facts": [{"id": 2, "content": "demos are Fridays"},
                          {"id": 1, "content": "Peter owns deploys"}],
         "channel_activity": "[Recent channel activity]\n- Peter (top-level): hi",
@@ -102,8 +102,9 @@ async def test_signals_render_into_prompt_deterministically():
     assert "only deploys" in first
     assert "[#1] Peter owns deploys; [#2] demos are Fridays" in first  # id-sorted
     assert "[Recent channel activity]" in first
-    # F17: unprompted count is still fed as a signal, but with no cap phrasing.
-    assert "unprompted replies in this channel in the last hour: 3" in first
+    # The unprompted-reply count is no longer rendered at all: pacing is the
+    # classifier's judgment, and a rate number only competed with it.
+    assert "unprompted replies" not in first
     assert "self-throttle cap" not in first
 
 
@@ -140,11 +141,18 @@ async def test_f17_utility_output_floor_is_1024():
     # participation classifier, the memory extractor, and the tool-result summarizer.
     # (utility_max_tokens defaults to 20; the floor is what prevents a verdict/JSON
     # from being cut off mid-reasoning and manifesting as unjustified silence.)
+    #
+    # Participation alone sits at 2048: it is the only utility call that runs elevated
+    # reasoning effort (PARTICIPATION_REASONING_EFFORT), and reasoning tokens are billed
+    # against this same cap. At `medium` a live verdict came back EMPTY — thinking had
+    # eaten the whole budget — and the fail-safe silently returned `ignore`, so the gate
+    # never ran. Measured worst case was 815/1024, and a SHORT channel tail is the risk
+    # case because less context to read means more inference to do.
     from openai_client.api.responses import extract_memory, summarize_tool_result
 
     llm = _FakeLLM(text='{"action": "ignore"}')
     await classify_participation(llm, "msg")
-    assert llm.captured_kwargs["max_output_tokens"] == 1024
+    assert llm.captured_kwargs["max_output_tokens"] == 2048
 
     llm2 = _FakeLLM(text='{"action": "none"}')
     await extract_memory(llm2, "some exchange")
@@ -163,57 +171,127 @@ async def test_deprecated_classify_wake_still_importable():
     assert await classify_wake(llm, "anything") == "ignore"
 
 
+
 def test_prompt_carries_addressed_to_someone_else_rule():
-    # Regression guard for the "hey claude, ..." bug (2026-07-10): a message that
-    # names ANOTHER party is never for the assistant, however helpful it could be.
+    """Regression guard for the "hey claude, ..." bug (2026-07-10): a message naming ANOTHER party
+    is never for the assistant, however helpful it could be.
+
+    The old prompt hardcoded the rival assistant's name as an example. That was papering over a
+    DATA gap: the roster the gate sees listed other assistants exactly like colleagues, so
+    "hey <name>" was genuinely ambiguous and the rule had to name one vendor to compensate. The
+    roster now marks them (ChannelPulse.recent_speakers), so the rule stays general and the
+    example is gone. Measured: this scenario went from 1/4 to 4/4 once the marker existed."""
     from prompts import PARTICIPATION_SYSTEM_PROMPT
-    assert "addressed to SOMEONE ELSE" in PARTICIPATION_SYSTEM_PROMPT
-    assert "hey claude" in PARTICIPATION_SYSTEM_PROMPT
+    p = PARTICIPATION_SYSTEM_PROMPT
+    assert "opens with or names another party is THEIRS" in p
+    assert "those are separate participants with their own names" in p
+    # general, not vendor-specific: no rival assistant is named in the policy any more
+    assert "hey claude" not in p.lower()
+
 
 
 def test_prompt_carries_addressee_precedence_over_name_hit():
-    # Regression guard (2026-07-10): "claude, do you still have the chatgpt bot's
-    # repo checked out?" — the alias prefilter flags "chatgpt" (a possessive topic
-    # ref) as a name hit, and the model must not let that outrank the opener
-    # naming another party. Both the rule and the name_hit signal carry it.
+    """Regression guard (2026-07-10): "claude, do you still have the chatgpt bot's repo checked
+    out?" — the alias prefilter flags "chatgpt" (a possessive topic reference) as a name hit, and
+    the model must not let that outrank the opener naming another party. Both the policy and the
+    name_hit signal carry it, and relation="about_assistant" now gives the case a name that
+    _apply_invariants can refuse mechanically."""
     from prompts import PARTICIPATION_SYSTEM_PROMPT
-    assert "the chatgpt bot's repo" in PARTICIPATION_SYSTEM_PROMPT
+    assert "Being named is not the same as being addressed" in PARTICIPATION_SYSTEM_PROMPT
+    assert "about_assistant" in PARTICIPATION_SYSTEM_PROMPT
     import inspect
     from openai_client.api import responses
     src = inspect.getsource(responses.classify_participation)
     assert "DIFFERENT party" in src
+    # the invariant layer refuses a speaking action on an about_assistant verdict
+    from message_processor.participation import ParticipationEngine
+    v = ParticipationEngine.validate_verdict(
+        {"action": "respond", "relation": "about_assistant",
+         "exchange_state": "open", "answerability": "substantive"})
+    assert v.action == "ignore" and v.overruled_by == ["relation_about_assistant"]
+
 
 
 def test_prompt_carries_second_person_continuity_rule():
-    # Regression guard for the "how does your background workspace work?" bug
-    # (2026-07-10): an unnamed "you"-follow-up mid-exchange with another
-    # participant continues THAT exchange — it is not an invitation to jump in.
+    """Regression guard for the "how does your background workspace work?" bug (2026-07-10): an
+    unnamed "you" follow-up mid-exchange with another participant continues THAT exchange and is
+    not an invitation to jump in. The old prompt spelled out the "helpful third voice" temptation
+    at length; the staged form states the principle once and lets relation="to_other" carry it."""
     from prompts import PARTICIPATION_SYSTEM_PROMPT
-    assert '"You" belongs to whoever the sender has been talking to' in PARTICIPATION_SYSTEM_PROMPT
-    assert "helpful third voice" in PARTICIPATION_SYSTEM_PROMPT
+    p = PARTICIPATION_SYSTEM_PROMPT
+    assert "Second person carries the addressee forward" in p
+    assert "changing the subject does not reassign them" in p
+    assert "whoever the sender has been going back and forth with" in p
+
 
 
 def test_prompt_capability_is_not_address():
-    # Regression guard for the "do you stream messages?" bug (2026-07-16): a bare top-level
-    # "you" that continued Peter's exchange with another assistant (Claude) got claimed
-    # because the classifier read "ChatGPT can explain this" as "ChatGPT is addressed". The
-    # rule must span TOP-LEVEL flow (not just threads) and say capability != being addressed.
-    # F47: softened from an absolute ("never, by itself, a reason to claim it") to a
-    # non-overriding form — capability doesn't OVERRIDE a continuing addressee, but may still
-    # justify responding when there is no continuing addressee (a new ask / open-room question).
+    """Regression guard for the "do you stream messages?" bug (2026-07-16): a bare top-level "you"
+    continuing Peter's exchange with another assistant got claimed because the classifier read
+    "ChatGPT can explain this" as "ChatGPT is addressed".
+
+    The staged prompt makes this structural rather than a proviso: capability is Stage 3 and is
+    not even reached until Stage 1 has assigned the message. The clause still leaves room to
+    answer a genuinely open ask, which is what F47 softened it for."""
     from prompts import PARTICIPATION_SYSTEM_PROMPT
-    assert "TOP-LEVEL messages" in PARTICIPATION_SYSTEM_PROMPT
-    assert "could answer never OVERRIDES" in PARTICIPATION_SYSTEM_PROMPT
-    # the softened clause still leaves room to answer a genuinely new / open-room ask
-    assert "open to the room" in PARTICIPATION_SYSTEM_PROMPT
+    p = PARTICIPATION_SYSTEM_PROMPT
+    assert "being able to help is not evidence of having been asked" in p
+    assert "Reach this stage only when Stages 1 and 2 have left room to participate" in p
+    assert p.index("STAGE 1") < p.index("STAGE 3")
+    # still room to answer a genuinely open-room question
+    assert "genuinely open to the channel at large" in p
+
+
+
+@pytest.mark.asyncio
+async def test_gate_is_told_the_resolved_handle_not_just_the_config_aliases():
+    """Live bug (2026-07-26): deployed as "chatgpt-dev" with BOT_NAME_ALIASES=["ChatGPT"], the gate
+    read "chatgpt-dev, what model are you running?" as addressed to a DIFFERENT assistant and
+    stayed silent — verdict relation=to_other, reason "ChatGPT-Dev, a different assistant".
+
+    The alias regex counted it a name hit; the model, shown only the alias list, did not. So the
+    prefilter and the model disagreed about who the bot is. The resolved handle (free from the
+    auth.test that already runs at startup) now leads the identity line, and the aliases follow as
+    other names it answers to."""
+    llm = _FakeLLM(text='{"relation":"to_room","exchange_state":"open",'
+                        '"answerability":"not_applicable","action":"ignore"}')
+    await classify_participation(llm, "chatgpt-dev, what model are you on?",
+                                 signals={"self_display_name": "chatgpt-dev"})
+    rendered = llm.captured_input[1]["content"]
+    assert 'its ONLY ones: "chatgpt-dev" / "ChatGPT"' in rendered
+    assert "all of these are the same assistant" in rendered
+    assert "environment suffix" in rendered
+    # ...and bounded on the other side: the claim must NOT sweep in other assistants' names.
+    # Stated without this, named-other-bot fell to 2/6 — the model started reading "claude" as
+    # a variant of its own name.
+    assert "Any OTHER name belongs to somebody else" in rendered
+    assert "are not variants of these" in rendered
+
+
+@pytest.mark.asyncio
+async def test_identity_line_falls_back_to_config_when_the_handle_is_unknown():
+    """auth.test can fail, and the CLI platform has no handle at all. The line must still name the
+    assistant from config rather than vanishing — losing it entirely would leave the gate with no
+    idea what it is called."""
+    llm = _FakeLLM(text='{"relation":"to_room","exchange_state":"open",'
+                        '"answerability":"not_applicable","action":"ignore"}')
+    await classify_participation(llm, "hi", signals={})
+    rendered = llm.captured_input[1]["content"]
+    assert "its ONLY ones:" in rendered
+    import config as config_module
+    assert config_module.config.bot_name_aliases[0] in rendered
 
 
 def test_prompt_carries_channel_people_rule():
-    # F29: the people signal is teaching material for addressee resolution — names there
-    # are real, distinct participants; an unknown name is never assumed to be the assistant.
+    """F29: the people signal is teaching material for addressee resolution — the names there are
+    real, distinct participants, and an unknown name is never assumed to be the assistant. It now
+    also distinguishes other ASSISTANTS from people, which is what lets the "names another party"
+    rule stay general instead of naming a specific rival."""
     from prompts import PARTICIPATION_SYSTEM_PROMPT
-    assert "Channel people" in PARTICIPATION_SYSTEM_PROMPT
-    assert "never assume an unknown name is the assistant" in PARTICIPATION_SYSTEM_PROMPT
+    p = PARTICIPATION_SYSTEM_PROMPT
+    assert "Channel people" in p
+    assert "marks which of them are other assistants" in p
+    assert "Only the names given as this assistant" in p
 
 
 def test_local_tools_guidance_carries_people_tools():

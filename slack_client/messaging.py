@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional
@@ -319,6 +320,55 @@ class WorkspaceEmojiCache:
         self._refreshing = False
         self._refresh_task = None
 
+    @staticmethod
+    def _tokens(name: str) -> set:
+        """Word-ish pieces of an emoji name, so `party-parrot` and `party_parrot` match alike.
+
+        Single characters are dropped: the stray "a" in a query like "celebrate a win" is a
+        real token of `alphabet-white-a` too, and it floated junk to the top of every result."""
+        return {t for t in re.split(r"[^a-z0-9]+", name.lower()) if len(t) > 1}
+
+    def search(self, query: str, limit: int = 16) -> list:
+        """Rank the workspace's CUSTOM emoji names against a free-text query.
+
+        Purely lexical and in-memory: no API call, no model call, no keyword→emoji table. The
+        model supplies the query and the model picks from what comes back — this only decides
+        which CANDIDATES are worth showing, which is the same job the (alphabetical, useless)
+        prefix slice used to do badly.
+
+        Ranked: exact name > a query token that IS a name token > prefix > substring. Names
+        that match more of the query win within a tier, shorter names break ties (`shipit`
+        should outrank `shipit-parrot-gif` for "ship"). Never raises; returns [] for an empty
+        query or an empty catalog."""
+        q = (query or "").strip().lower()
+        if not q:
+            return []
+        try:
+            names = self.get_custom_emoji_names()
+        except Exception:  # noqa: BLE001 — discovery must never fail a turn
+            return []
+        q_tokens = self._tokens(q)
+        q_flat = re.sub(r"[^a-z0-9]+", "", q)
+        scored = []
+        for name in names:
+            low = name.lower()
+            flat = re.sub(r"[^a-z0-9]+", "", low)
+            n_tokens = self._tokens(name)
+            hits = len(q_tokens & n_tokens)
+            if low == q or flat == q_flat:
+                tier = 0
+            elif hits:
+                tier = 1
+            elif any(flat.startswith(t) or low.startswith(t) for t in q_tokens):
+                tier = 2
+            elif any(t in flat for t in q_tokens if len(t) >= 3):
+                tier = 3
+            else:
+                continue
+            scored.append((tier, -hits, len(name), name))
+        scored.sort()
+        return [s[3] for s in scored[:max(0, int(limit or 0))]]
+
 
 class SlackMessagingMixin:
     async def start(self):
@@ -358,6 +408,13 @@ class SlackMessagingMixin:
             except Exception as e:  # noqa: BLE001 — startup must never break on emoji.list
                 self.log_debug(f"initial workspace emoji refresh failed: {e}")
 
+        # Rehydrate the emoji-usage tally that ranks the gate's custom palette. Without this
+        # the tally restarted empty every time and only refilled from channels that happened
+        # to receive a message afterwards, so the palette was cold for a long while after
+        # every deploy. Fail-soft: no tally just means standard emoji until usage accrues.
+        await self._load_emoji_usage()
+        self._emoji_flush_task = asyncio.create_task(self._emoji_flush_loop())
+
         # Create a task for start_async that can be cancelled
         self._start_task = asyncio.create_task(self.handler.start_async())
 
@@ -384,6 +441,21 @@ class SlackMessagingMixin:
 
     async def stop(self):
         """Stop the Slack bot"""
+        # Stop the periodic emoji-tally flusher. The FINAL snapshot is deliberately NOT taken
+        # here — it happens after socket ingress is torn down below, because a reaction event
+        # arriving between the snapshot and the last event would be silently lost on an
+        # otherwise clean shutdown.
+        task = getattr(self, "_emoji_flush_task", None)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass          # expected: this is our own cancel landing on the child task
+            except Exception as e:  # noqa: BLE001 — a real fault in the loop, worth knowing
+                self.log_debug(f"emoji flush loop ended with an error: {e}")
+            self._emoji_flush_task = None
+
         # F9: stop the liveness monitor first (independent of the handler teardown below).
         monitor = getattr(self, "_socket_liveness", None)
         if monitor is not None:
@@ -505,6 +577,11 @@ class SlackMessagingMixin:
                 await self._cleanup_session()
             except Exception as e:
                 self.log_warning(f"Error cleaning up utilities session: {e}")
+
+        # FINAL emoji-tally snapshot, last thing before returning: socket ingress is down by
+        # now, so nothing can arrive after this and be lost. Taking it at the TOP of stop()
+        # left a window where a late reaction_added was observed but never persisted.
+        await self.flush_emoji_usage()
 
     def _record_own_reply_pulse(self, channel_id: str, thread_id: Optional[str],
                                 ts: Optional[str], text: str) -> None:
@@ -1484,31 +1561,75 @@ class SlackMessagingMixin:
 
     # --- react_to_message local tool (redesign Phase D) ---
 
-    # ~600-char budget for the custom-emoji list injected into a schema/classifier description,
-    # so surfacing customs never bloats every main-model request.
-    _CUSTOM_EMOJI_CHAR_BUDGET = 600
+    async def _load_emoji_usage(self) -> None:
+        """Seed the in-memory emoji tally from the DB at startup. Never raises.
 
-    def _budgeted_custom_emoji_names(self, count_cap: int) -> list:
-        """A deterministic, budgeted slice of the workspace custom-emoji names for a schema
-        description: at most ``count_cap`` names AND within the ~600-char budget. Reads the
-        sync, stale-ok cache getter; returns [] when there are no customs (or no cache)."""
+        Leaves `_emoji_usage_loaded` False on failure, which blocks flushing entirely. Flushes
+        write ABSOLUTE counts, so writing on top of a tally we failed to read would replace the
+        accumulated history with whatever this process happened to observe — a transient read
+        error would silently wipe the table."""
+        pulse = getattr(self, "channel_pulse", None)
+        db = getattr(self, "db", None)
+        if pulse is None or db is None:
+            return
+        try:
+            counts = await db.load_emoji_usage_async()
+            if counts is None:
+                self.log_warning(
+                    "emoji usage tally could not be read; persistence disabled for this run "
+                    "so a partial snapshot cannot overwrite it")
+                return
+            pulse.hydrate_reaction_vocab(counts)
+            self._emoji_usage_loaded = True
+            if counts:
+                self.log_debug(f"emoji usage tally rehydrated: {len(counts)} names")
+        except Exception as e:  # noqa: BLE001 — startup must never break on this
+            self.log_debug(f"emoji usage rehydrate failed: {e}")
+
+    async def _emoji_flush_loop(self) -> None:
+        """Persist the emoji tally on an interval.
+
+        A dedicated timer rather than a write per reaction (far too chatty for a counter
+        nobody reads in real time) and rather than the cleanup worker (cron-scheduled, daily
+        by default — a whole day of reactions to lose). Exits quietly on cancellation."""
+        interval = max(30, int(getattr(config, "emoji_usage_flush_seconds", 300)))
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                await self.flush_emoji_usage()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — a flusher must never take the bot down
+            self.log_debug(f"emoji usage flush loop stopped: {e}")
+
+    async def flush_emoji_usage(self) -> None:
+        """Persist the emoji tally. Called on the periodic tick and once at shutdown.
+
+        Writes absolute counts, so a missed flush loses only the reactions since the last one
+        and can never double-count. Cheap enough to run on a timer (one small upsert batch)
+        and pointless to run per reaction event."""
+        pulse = getattr(self, "channel_pulse", None)
+        db = getattr(self, "db", None)
+        if pulse is None or db is None:
+            return
+        if not getattr(self, "_emoji_usage_loaded", False):
+            return          # never overwrite a tally we could not read — see _load_emoji_usage
+        try:
+            await db.save_emoji_usage_async(pulse.reaction_vocab_snapshot())
+        except Exception as e:  # noqa: BLE001
+            self.log_debug(f"emoji usage flush failed: {e}")
+
+    def _custom_emoji_available(self) -> bool:
+        """Whether the workspace has ANY custom emoji — the cheap check behind the react
+        schema's pointer to search_workspace_emoji. Never raises; False when the cache is
+        absent or has never fetched (emoji:read missing is the de-facto off switch)."""
         cache = getattr(self, "workspace_emojis", None)
         if cache is None:
-            return []
+            return False
         try:
-            names = cache.get_custom_emoji_names()
+            return bool(cache.get_custom_emoji_names())
         except Exception:  # noqa: BLE001 — a schema build must never fail the turn
-            return []
-        cap = max(0, int(count_cap or 0))
-        capped = names[:cap]  # hard max: 0 → none, never "unlimited"
-        out, used = [], 0
-        for name in capped:
-            cost = len(name) + 2  # +2 approximates the ", " separator between names
-            if out and used + cost > self._CUSTOM_EMOJI_CHAR_BUDGET:
-                break
-            out.append(name)
-            used += cost
-        return out
+            return False
 
     def get_react_tool_schema(self, cfg: Optional[dict] = None) -> dict:
         """Registry FACTORY (called per request as ``schema(cfg)``) for the react_to_message
@@ -1523,12 +1644,15 @@ class SlackMessagingMixin:
         if allowed:
             emoji_schema["enum"] = allowed
         else:
-            customs = self._budgeted_custom_emoji_names(
-                getattr(config, "react_tool_custom_emoji_cap", 64))
-            if customs:
+            # No name list here any more. This used to inject the first ~64 custom names
+            # ALPHABETICALLY out of ~1,400 ("000, 1password_icon, 4cats_q, alabama…"), which
+            # spent ~600 chars on every single request to show the model an unusable slice of
+            # its own workspace. search_workspace_emoji reaches all of them on demand instead,
+            # so the pointer costs a fraction of the list and is actually useful.
+            if self._custom_emoji_available():
                 emoji_schema["description"] += (
-                    " This workspace also has custom emoji you may use when one fits, e.g.: "
-                    + ", ".join(customs) + "."
+                    " This workspace also has custom emoji; call search_workspace_emoji to find "
+                    "one by meaning when a workspace-specific reaction would fit better."
                 )
         return {
             "type": "function",
@@ -1550,6 +1674,68 @@ class SlackMessagingMixin:
                 "required": ["emoji"],
             },
         }
+
+    def get_emoji_search_tool_schema(self) -> dict:
+        """Schema for search_workspace_emoji — lookup over the workspace's CUSTOM emoji.
+
+        Only registered when no REACTION_EMOJIS allowlist is set (see _build_tool_registry).
+        The description has to earn its tokens on every request, so it says three things: what
+        this reaches (customs only), when NOT to bother (standard emoji need no lookup), and
+        that the call is silent. That last one matters — a reaction-only turn streams, so a
+        narrated "let me look for an emoji…" would commit visible text and wreck the very
+        thing a wordless reaction is for."""
+        return {
+            "type": "function",
+            "name": "search_workspace_emoji",
+            "description": (
+                "Look up this workspace's CUSTOM emoji by meaning, e.g. 'ship it', 'celebrate "
+                "a win', 'on fire'. Use it when a workspace-specific reaction would land "
+                "better than a generic one; you do NOT need it for standard Slack emoji, "
+                "which you can already name yourself. Returns candidate names to pass to "
+                "react_to_message. Call it silently and say nothing about having searched."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string",
+                              "description": "What the reaction should convey, in a few words."},
+                    "limit": {"type": "integer",
+                              "description": "Max names to return (default 16, max 40)."},
+                },
+                "required": ["query"],
+            },
+        }
+
+    async def execute_emoji_search_tool(self, ctx, args: dict) -> dict:
+        """Executor for search_workspace_emoji. In-memory, read-only, never raises.
+
+        Re-checks the allowlist as defence in depth even though the tool is not registered
+        when one is set: discovery must never become authorization. `execute_react_tool` and
+        the schema enum stay the authority on what may actually be placed."""
+        if not (config.enable_reactions and config.enable_react_tool):
+            return {"ok": False, "error": "disabled", "message": "Reactions are disabled."}
+        if config.reaction_emojis or []:
+            return {"ok": False, "error": "allowlist_active",
+                    "message": "A fixed reaction allowlist is configured; choose from it."}
+        query = (args.get("query") or "").strip()
+        if not query:
+            return {"ok": False, "error": "no_query", "message": "Give a short description."}
+        try:
+            limit = int(args.get("limit") or 16)
+        except (TypeError, ValueError):
+            limit = 16
+        cache = getattr(self, "workspace_emojis", None)
+        if cache is None:
+            return {"ok": True, "query": query, "matches": []}
+        try:
+            matches = cache.search(query, limit=max(1, min(40, limit)))
+        except Exception as e:  # noqa: BLE001 — discovery must never fail a turn
+            self.log_debug(f"emoji search failed: {e}")
+            return {"ok": True, "query": query, "matches": []}
+        return {"ok": True, "query": query, "matches": matches,
+                "note": ("No custom emoji matched; use a standard Slack emoji."
+                         if not matches else
+                         "Custom names — pass one to react_to_message, or use a standard emoji.")}
 
     async def execute_react_tool(self, ctx, args: dict) -> dict:
         """Executor for react_to_message. Syntactic emoji validation (Slack's invalid_name

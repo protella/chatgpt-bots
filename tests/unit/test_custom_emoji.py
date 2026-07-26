@@ -5,11 +5,18 @@ Covers the whole C surface:
   filter, sort + dedupe; retain last-good on error; empty only when never fetched.
 - get_custom_emoji_names(): SYNC + stale-ok — returns last-good immediately, schedules exactly ONE
   background refresh when expired, never raises (incl. no running loop).
-- react_to_message factory: REACTION_EMOJIS empty → budgeted customs in the emoji DESCRIPTION
-  (not an enum), reflecting a refreshed cache without restart, respecting count + char budgets;
-  REACTION_EMOJIS set → enum allowlist and customs suppressed.
-- Classifier plumbing: the "Workspace custom emoji you may also choose…" line renders only when
-  there is no allowlist; the main.py gate feeds a deterministic capped list, and only when empty.
+- react_to_message factory: REACTION_EMOJIS empty → a POINTER to search_workspace_emoji (not a
+  name list), appearing only when the workspace has customs and tracking the live cache;
+  REACTION_EMOJIS set → enum allowlist, customs suppressed, search tool not registered at all.
+- WorkspaceEmojiCache.search(): lexical ranking over the full catalog, single-char tokens dropped.
+- Classifier plumbing: the "Custom emoji THIS WORKSPACE actually reacts with…" line renders only
+  when there is no allowlist; the main.py gate feeds the WORKSPACE-WIDE observed-usage palette
+  (aggregated across every channel, DMs excluded — per-channel left quiet rooms with nothing).
+
+Both name lists used to be an ALPHABETICAL prefix of ~1,400 names, so the model only ever saw
+"000, 1password_icon, 2605732e-82a0-46b9-b1e0-ecc4f250eb35, 4cats_q, alabama…" — prompt noise it
+could not use. The responder now searches on demand; the gate (one tool-free call, emoji placed
+directly) gets what the workspace actually reacts with. Neither ever falls back to alphabetical.
 - _coerce_emoji stays permissive (standard OR custom), reactions.add uses the bare name, unknown
   fails soft. Config defaults (3600/32/64) + .env.example documentation.
 
@@ -27,6 +34,7 @@ import pytest
 from base_client import Message
 from config import config, valid_emoji_name
 from message_processor.participation import ParticipationEngine
+from slack_client.channel_pulse import ChannelPulse
 from slack_client.messaging import SlackMessagingMixin, WorkspaceEmojiCache
 from tool_registry import ToolContext
 
@@ -132,8 +140,9 @@ class _MutableCache:
 def _react_host(cache):
     s = MagicMock()
     s.workspace_emojis = cache
-    s._CUSTOM_EMOJI_CHAR_BUDGET = SlackMessagingMixin._CUSTOM_EMOJI_CHAR_BUDGET
-    s._budgeted_custom_emoji_names = SlackMessagingMixin._budgeted_custom_emoji_names.__get__(s)
+    # Must be bound explicitly: on a bare MagicMock the call would return a truthy Mock, so the
+    # "no customs → no search pointer" case would pass for the wrong reason.
+    s._custom_emoji_available = SlackMessagingMixin._custom_emoji_available.__get__(s)
     s.get_react_tool_schema = SlackMessagingMixin.get_react_tool_schema.__get__(s)
     return s
 
@@ -142,22 +151,36 @@ def _emoji_field(host):
     return host.get_react_tool_schema()["parameters"]["properties"]["emoji"]
 
 
-def test_react_schema_lists_customs_in_description_no_enum(monkeypatch):
+def test_react_schema_points_at_search_not_a_name_list(monkeypatch):
+    # The schema used to inline an ALPHABETICAL prefix of the custom names. With ~1,400 emoji
+    # in a real workspace that spent ~600 chars per request on "000, 1password_icon, 4cats_q,
+    # alabama…" — a slice the model could not use and had to read anyway. It now points at
+    # search_workspace_emoji, which reaches all of them on demand for a fraction of the tokens.
     monkeypatch.setattr(config, "reaction_emojis", [])
     emoji = _emoji_field(_react_host(_MutableCache(["party_parrot", "shipit"])))
     assert "enum" not in emoji                            # an enum would forbid standard emoji
-    assert "custom emoji" in emoji["description"]
-    assert "party_parrot" in emoji["description"] and "shipit" in emoji["description"]
+    assert "search_workspace_emoji" in emoji["description"]
+    # the names themselves must NOT be inlined any more
+    assert "party_parrot" not in emoji["description"]
+    assert "shipit" not in emoji["description"]
+
+
+def test_react_schema_omits_search_pointer_without_customs(monkeypatch):
+    # No customs (or no emoji:read scope) → don't advertise a tool with nothing to find.
+    monkeypatch.setattr(config, "reaction_emojis", [])
+    emoji = _emoji_field(_react_host(_MutableCache([])))
+    assert "search_workspace_emoji" not in emoji["description"]
 
 
 def test_react_schema_reflects_live_cache_without_restart(monkeypatch):
+    # The factory is still called per request, so the pointer appears/disappears with the
+    # live cache rather than at process start.
     monkeypatch.setattr(config, "reaction_emojis", [])
-    cache = _MutableCache(["party_parrot"])
+    cache = _MutableCache([])
     host = _react_host(cache)
-    assert "party_parrot" in _emoji_field(host)["description"]
+    assert "search_workspace_emoji" not in _emoji_field(host)["description"]
     cache.set(["shipit"])                                 # refreshed at runtime
-    d2 = _emoji_field(host)["description"]
-    assert "shipit" in d2 and "party_parrot" not in d2
+    assert "search_workspace_emoji" in _emoji_field(host)["description"]
 
 
 def test_react_schema_enum_suppresses_customs(monkeypatch):
@@ -165,24 +188,6 @@ def test_react_schema_enum_suppresses_customs(monkeypatch):
     emoji = _emoji_field(_react_host(_MutableCache(["party_parrot"])))
     assert emoji["enum"] == ["thumbsup", "eyes"]          # allowlist is the hard constraint
     assert "party_parrot" not in emoji["description"]     # customs never injected over it
-
-
-def test_react_schema_respects_count_cap(monkeypatch):
-    monkeypatch.setattr(config, "reaction_emojis", [])
-    monkeypatch.setattr(config, "react_tool_custom_emoji_cap", 3, raising=False)
-    names = [f"c{i}" for i in range(10)]                  # short → count cap binds
-    desc = _emoji_field(_react_host(_MutableCache(names)))["description"]
-    assert [n for n in names if n in desc] == ["c0", "c1", "c2"]
-
-
-def test_react_schema_respects_char_budget(monkeypatch):
-    monkeypatch.setattr(config, "reaction_emojis", [])
-    monkeypatch.setattr(config, "react_tool_custom_emoji_cap", 100, raising=False)
-    names = [f"emoji_{i:02d}_" + "x" * 90 for i in range(20)]   # ~99 chars each → char budget binds
-    desc = _emoji_field(_react_host(_MutableCache(names)))["description"]
-    listed = [n for n in names if n in desc]
-    assert 0 < len(listed) < 20                           # the ~600-char budget dropped most
-    assert names[0] in desc and names[-1] not in desc
 
 
 # =============================================================== classifier plumbing
@@ -207,9 +212,12 @@ async def _classifier_prompt(signals):
 async def test_classifier_renders_customs_when_no_allowlist(monkeypatch):
     monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
     prompt = await _classifier_prompt({"workspace_custom_emojis": ["party_parrot", "shipit"]})
-    assert ("Workspace custom emoji you may also choose when one fits: party_parrot, shipit"
-            in prompt)
-    assert "standard Slack emoji remain allowed" in prompt
+    # Framed as the ROOM'S vocabulary, in observed-usage order — not a neutral catalog slice.
+    # The ordering carries the ranking, so the line must present it as meaningful.
+    assert "Custom emoji THIS WORKSPACE actually reacts with, most-used first" in prompt
+    assert "party_parrot, shipit" in prompt
+    assert "every standard Slack emoji also remains available" in prompt
+    assert "this team's own vocabulary" in prompt
 
 
 @pytest.mark.asyncio
@@ -217,7 +225,7 @@ async def test_classifier_omits_customs_when_allowlist_set(monkeypatch):
     monkeypatch.setattr(config, "reaction_emojis", ["thumbsup"], raising=False)
     prompt = await _classifier_prompt({"workspace_custom_emojis": ["party_parrot"]})
     assert "Allowed reaction emoji (choose one): thumbsup" in prompt
-    assert "Workspace custom emoji you may also choose" not in prompt
+    assert "actually reacts with" not in prompt
 
 
 @pytest.mark.asyncio
@@ -225,7 +233,7 @@ async def test_classifier_no_customs_line_when_none(monkeypatch):
     monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
     prompt = await _classifier_prompt({})
     assert "any standard Slack emoji name (shorthand, no colons)" in prompt
-    assert "Workspace custom emoji you may also choose" not in prompt
+    assert "actually reacts with" not in prompt
 
 
 def _gate_app(monkeypatch, customs):
@@ -257,12 +265,53 @@ def _gate_app(monkeypatch, customs):
 
 
 @pytest.mark.asyncio
-async def test_gate_feeds_capped_customs_when_no_allowlist(monkeypatch):
+async def test_gate_feeds_observed_customs_ranked_by_use(monkeypatch):
+    # The gate's palette is what the WORKSPACE reacts with, most-used first — not an
+    # alphabetical slice. `rare` is alphabetically first and least used; it must come LAST.
     monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
     monkeypatch.setattr(config, "participation_custom_emoji_cap", 3, raising=False)
-    app, client, msg, captured = _gate_app(monkeypatch, [f"c{i}" for i in range(10)])
+    app, client, msg, captured = _gate_app(
+        monkeypatch, ["rare", "shipit", "party_parrot", "elsewhere"])
+    pulse = ChannelPulse()
+    for _ in range(5):
+        pulse.add_reaction("C1", "10.0", "shipit")
+    for _ in range(3):
+        pulse.add_reaction("C1", "11.0", "party_parrot")
+    pulse.add_reaction("C1", "12.0", "rare")
+    pulse.add_reaction("C1", "12.5", "rare")
+    pulse.add_reaction("C1", "13.0", "thumbsup")     # standard → not a custom, filtered out
+    pulse.add_reaction("CZ", "14.0", "elsewhere")    # another channel DOES count (workspace-wide)
+    client.channel_pulse = pulse
     assert await app._gate_verdict(msg, client) is None          # ignore verdict → silent
-    assert captured["workspace_custom_emojis"] == ["c0", "c1", "c2"]  # deterministic capped slice
+    # cap=3 → the three most-used. `elsewhere` (1 use, another channel) IS counted but ranks
+    # 4th, so it falls outside the cap; the next test proves cross-channel aggregation directly.
+    assert captured["workspace_custom_emojis"] == ["shipit", "party_parrot", "rare"]
+
+
+@pytest.mark.asyncio
+async def test_gate_palette_includes_other_channels(monkeypatch):
+    # Same setup, cap raised: the emoji seen only in ANOTHER channel now appears. This is the
+    # whole point of the workspace-wide tally — a channel with no reactions of its own still
+    # gets the team's vocabulary instead of nothing.
+    monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
+    monkeypatch.setattr(config, "participation_custom_emoji_cap", 10, raising=False)
+    app, client, msg, captured = _gate_app(monkeypatch, ["elsewhere"])
+    pulse = ChannelPulse()
+    pulse.add_reaction("CZ", "14.0", "elsewhere")        # never seen in C1, the gated channel
+    client.channel_pulse = pulse
+    assert await app._gate_verdict(msg, client) is None
+    assert captured["workspace_custom_emojis"] == ["elsewhere"]
+
+
+@pytest.mark.asyncio
+async def test_gate_sends_no_customs_when_nothing_observed_yet(monkeypatch):
+    # The point of the rewrite: with no observed usage the gate sends NOTHING rather than
+    # falling back to an alphabetical slice. Standard emoji are the fallback; junk is not.
+    monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
+    app, client, msg, captured = _gate_app(monkeypatch, [f"c{i}" for i in range(10)])
+    client.channel_pulse = ChannelPulse()                        # nothing observed yet
+    assert await app._gate_verdict(msg, client) is None
+    assert captured["workspace_custom_emojis"] == []
 
 
 @pytest.mark.asyncio
@@ -348,11 +397,16 @@ async def test_react_add_unknown_emoji_fails_soft(monkeypatch):
 def test_config_custom_emoji_defaults_and_documented():
     assert config.workspace_emoji_ttl_seconds == 3600
     assert config.participation_custom_emoji_cap == 32
-    assert config.react_tool_custom_emoji_cap == 64
+    assert config.emoji_usage_flush_seconds == 300
     example = pathlib.Path(".env.example").read_text()
     for key in ("WORKSPACE_EMOJI_TTL_SECONDS", "PARTICIPATION_CUSTOM_EMOJI_CAP",
-                "REACT_TOOL_CUSTOM_EMOJI_CAP"):
+                "EMOJI_USAGE_FLUSH_SECONDS"):
         assert key in example
+    # REACT_TOOL_CUSTOM_EMOJI_CAP is gone: it only ever capped an ALPHABETICAL slice of the
+    # custom names for the react schema, and keeping a deliberately off-path selector around
+    # "for future callers" just invites its accidental return.
+    assert not hasattr(config, "react_tool_custom_emoji_cap")
+    assert "REACT_TOOL_CUSTOM_EMOJI_CAP" not in example
 
 
 def test_local_tools_guidance_mentions_workspace_custom_emoji():
@@ -366,3 +420,289 @@ def test_valid_emoji_name_accepts_custom_shorthand():
     # The custom names surfaced everywhere share the standard emoji charset.
     assert valid_emoji_name("party_parrot") and valid_emoji_name("shipit")
     assert not valid_emoji_name("bad name!")
+
+
+# =============================================================== search (the discovery half)
+
+def _search_cache(names):
+    c = WorkspaceEmojiCache.__new__(WorkspaceEmojiCache)
+    c._names = tuple(sorted(names))
+    c._expiry = float("inf")      # never expired → the getter won't try to schedule a refresh
+    c._refreshing = False
+    return c
+
+
+def test_search_exact_name_wins_outright():
+    cache = _search_cache(["shipit", "shipit-parrot-gif", "unrelated"])
+    got = cache.search("shipit")
+    assert got[0] == "shipit"
+    assert "unrelated" not in got
+
+
+def test_search_tiers_token_then_prefix_then_substring():
+    # "ship" is a whole TOKEN of ship-of-theseus, only a PREFIX of shipit, and merely a
+    # SUBSTRING of battleship — which is exactly the order they should come back in.
+    cache = _search_cache([
+        "battleship", "ship-of-theseus", "shipit", "shipit-parrot-gif", "unrelated"])
+    got = cache.search("ship")
+    assert got[0] == "ship-of-theseus"                       # token hit beats everything below
+    assert got.index("shipit") < got.index("battleship")     # prefix beats substring
+    # within the prefix tier the shorter name wins: `shipit` before `shipit-parrot-gif`
+    assert got.index("shipit") < got.index("shipit-parrot-gif")
+    assert "unrelated" not in got
+
+
+def test_search_ignores_punctuation_and_separator_style():
+    cache = _search_cache(["party_parrot", "absolutecinema"])
+    assert "party_parrot" in cache.search("party-parrot")   # _ vs - must not matter
+    assert cache.search("absolute cinema") == ["absolutecinema"]  # spaces vs concatenation
+
+
+def test_search_drops_single_char_tokens():
+    # REGRESSION: the stray "a" in "celebrate a win" is also a token of `alphabet-white-a`,
+    # which floated alphabet junk to the top of every multi-word query.
+    cache = _search_cache(["alphabet-white-a", "celebrate-happy", "a-team"])
+    got = cache.search("celebrate a win")
+    assert got == ["celebrate-happy"]
+    assert "alphabet-white-a" not in got
+
+
+def test_search_empty_query_and_empty_catalog_are_safe():
+    assert _search_cache(["shipit"]).search("") == []
+    assert _search_cache(["shipit"]).search("   ") == []
+    assert _search_cache([]).search("anything") == []
+
+
+def test_search_respects_limit():
+    cache = _search_cache([f"fire-{i}" for i in range(30)])
+    assert len(cache.search("fire", limit=5)) == 5
+    assert cache.search("fire", limit=0) == []
+
+
+# =============================================================== search_workspace_emoji tool
+
+def _search_host(names):
+    s = MagicMock()
+    s.workspace_emojis = _search_cache(names)
+    s.log_debug = lambda *a, **k: None
+    s.get_emoji_search_tool_schema = SlackMessagingMixin.get_emoji_search_tool_schema.__get__(s)
+    s.execute_emoji_search_tool = SlackMessagingMixin.execute_emoji_search_tool.__get__(s)
+    return s
+
+
+def test_search_tool_schema_tells_the_model_to_stay_quiet():
+    # A reaction-only turn STREAMS: a narrated "let me look for an emoji…" would commit
+    # visible text and destroy the wordless reaction the search exists to enable.
+    d = _search_host(["shipit"]).get_emoji_search_tool_schema()["description"]
+    assert "silently" in d
+    assert "do NOT need it for standard Slack emoji" in d or "not need it for standard" in d
+
+
+@pytest.mark.asyncio
+async def test_search_tool_returns_matches(monkeypatch):
+    monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
+    monkeypatch.setattr(config, "enable_reactions", True, raising=False)
+    monkeypatch.setattr(config, "enable_react_tool", True, raising=False)
+    out = await _search_host(["shipit", "nope"]).execute_emoji_search_tool(None, {"query": "ship it"})
+    assert out["ok"] is True and out["matches"] == ["shipit"]
+
+
+@pytest.mark.asyncio
+async def test_search_tool_refuses_under_an_allowlist(monkeypatch):
+    # Defence in depth: the tool isn't even registered when an allowlist is set, but discovery
+    # must never become authorization if it somehow is.
+    monkeypatch.setattr(config, "reaction_emojis", ["thumbsup"], raising=False)
+    monkeypatch.setattr(config, "enable_reactions", True, raising=False)
+    monkeypatch.setattr(config, "enable_react_tool", True, raising=False)
+    out = await _search_host(["shipit"]).execute_emoji_search_tool(None, {"query": "ship"})
+    assert out["ok"] is False and out["error"] == "allowlist_active"
+
+
+@pytest.mark.asyncio
+async def test_search_tool_never_raises_on_a_broken_cache(monkeypatch):
+    monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
+    monkeypatch.setattr(config, "enable_reactions", True, raising=False)
+    monkeypatch.setattr(config, "enable_react_tool", True, raising=False)
+    host = _search_host(["shipit"])
+    host.workspace_emojis.search = MagicMock(side_effect=RuntimeError("boom"))
+    out = await host.execute_emoji_search_tool(None, {"query": "ship"})
+    assert out["ok"] is True and out["matches"] == []      # degrades to "use a standard emoji"
+
+
+def test_search_tool_not_registered_under_an_allowlist():
+    import inspect
+    from slack_client import base
+    src = inspect.getsource(base.SlackBot._build_tool_registry)
+    assert "search_workspace_emoji" in src
+    # registration sits behind the same no-allowlist guard as the customs themselves
+    assert "if not (config.reaction_emojis or [])" in src
+
+
+# =============================================================== observed-usage palette
+
+def test_top_custom_reactions_ranks_by_count_and_filters_to_customs():
+    pulse = ChannelPulse()
+    for _ in range(4):
+        pulse.add_reaction("C1", "1.0", "shipit")
+    pulse.add_reaction("C1", "2.0", "party_parrot")
+    pulse.add_reaction("C1", "3.0", "thumbsup")            # standard, not in `allowed`
+    got = pulse.top_custom_reactions(allowed=["shipit", "party_parrot"], limit=10)
+    assert got == ["shipit", "party_parrot"]
+
+
+def test_top_custom_reactions_aggregates_across_channels():
+    # WORKSPACE-wide on purpose. Scoped per-channel, a quiet or freshly-joined channel got an
+    # empty palette — which is most channels most of the time, and after every restart.
+    pulse = ChannelPulse()
+    for _ in range(3):
+        pulse.add_reaction("C1", "1.0", "shipit")
+    pulse.add_reaction("C2", "2.0", "party_parrot")        # a DIFFERENT channel still counts
+    assert pulse.top_custom_reactions(allowed=["shipit", "party_parrot"]) == [
+        "shipit", "party_parrot"]
+
+
+def test_top_custom_reactions_empty_before_anything_is_observed():
+    assert ChannelPulse().top_custom_reactions(allowed=["shipit"]) == []
+
+
+def test_top_custom_reactions_ignores_dm_reactions():
+    # DMs are excluded from the tally, same guard as the social-proof store.
+    pulse = ChannelPulse()
+    pulse.add_reaction("D123", "1.0", "shipit")
+    assert pulse.top_custom_reactions(allowed=["shipit"]) == []
+
+
+def test_top_custom_reactions_decrements_on_removal():
+    pulse = ChannelPulse()
+    pulse.add_reaction("C1", "1.0", "shipit")
+    pulse.add_reaction("C1", "2.0", "party_parrot")
+    pulse.remove_reaction("C1", "1.0", "shipit")
+    assert pulse.top_custom_reactions(allowed=["shipit", "party_parrot"]) == ["party_parrot"]
+
+
+def test_top_custom_reactions_drops_emoji_deleted_since_they_were_observed():
+    pulse = ChannelPulse()
+    pulse.add_reaction("C1", "1.0", "since_deleted")
+    assert pulse.top_custom_reactions(allowed=["shipit"]) == []
+
+
+@pytest.mark.asyncio
+async def test_backfill_seeds_reactions_from_history():
+    # conversations.history already carries reactions; without seeding them a FIRST-EVER run has
+    # an empty palette until someone reacts live. Exercised for real rather than by reading the
+    # source, because the interesting behaviour is the interaction with hydration below.
+    client = SimpleNamespace(conversations_history=AsyncMock(return_value={"messages": [
+        {"ts": "1.0", "user": "U1", "text": "deploy is green",
+         "reactions": [{"name": "shipit", "count": 3}, {"name": "tada", "count": 1}]},
+        {"ts": "2.0", "user": "U2", "text": "nice"},
+    ]}))
+    bot = SimpleNamespace(classify_sender=lambda m: "human", user_cache={})
+    pulse = ChannelPulse()
+    await pulse.ensure_backfill("C1", client, bot)
+    assert pulse.reaction_vocab_snapshot() == {"shipit": 3, "tada": 1}
+
+
+@pytest.mark.asyncio
+async def test_backfill_does_not_double_count_a_persisted_tally():
+    # THE RESTART BUG. Hydration happens in start() before the socket opens; each channel's
+    # backfill then re-reads the same historical reactions. Counting them again inflated every
+    # emoji in recent history by its whole count on EVERY restart (measured 100 -> 104).
+    client = SimpleNamespace(conversations_history=AsyncMock(return_value={"messages": [
+        {"ts": "1.0", "user": "U1", "text": "deploy is green",
+         "reactions": [{"name": "shipit", "count": 4}]},
+    ]}))
+    bot = SimpleNamespace(classify_sender=lambda m: "human", user_cache={})
+    pulse = ChannelPulse()
+    pulse.hydrate_reaction_vocab({"shipit": 100})        # what the last run persisted
+    await pulse.ensure_backfill("C1", client, bot)
+    assert pulse.reaction_vocab_snapshot() == {"shipit": 100}
+    # a LIVE reaction still counts — only history replays are suppressed
+    pulse.add_reaction("C1", "9.0", "shipit")
+    assert pulse.reaction_vocab_snapshot() == {"shipit": 101}
+
+
+# =============================================================== persistence of the tally
+
+def test_hydrate_merges_and_never_shrinks_observed_counts():
+    # The backfill fires on a channel's first message and can beat the DB load. Rehydrating
+    # must not roll the tally BACKWARDS to whatever the last flush happened to catch.
+    pulse = ChannelPulse()
+    for _ in range(4):
+        pulse.add_reaction("C1", "1.0", "shipit")            # observed live: 4
+    pulse.hydrate_reaction_vocab({"shipit": 2, "party_parrot": 9})
+    snap = pulse.reaction_vocab_snapshot()
+    assert snap["shipit"] == 4                               # kept the larger, not the persisted 2
+    assert snap["party_parrot"] == 9                         # and gained what it had not seen
+
+
+def test_hydrate_tolerates_junk():
+    pulse = ChannelPulse()
+    pulse.hydrate_reaction_vocab({"": 5, "ok": "not-a-number", ":fine:": 3, "neg": -2, "z": 0})
+    assert pulse.reaction_vocab_snapshot() == {"fine": 3}     # colons stripped, junk dropped
+    pulse.hydrate_reaction_vocab(None)                        # no-op, must not raise
+    assert pulse.reaction_vocab_snapshot() == {"fine": 3}
+
+
+def test_snapshot_is_a_copy_and_content_free():
+    pulse = ChannelPulse()
+    pulse.add_reaction("C1", "1.0", "shipit")
+    snap = pulse.reaction_vocab_snapshot()
+    snap["shipit"] = 999                                      # mutating the copy must not leak
+    assert pulse.reaction_vocab_snapshot()["shipit"] == 1
+    # name -> count only: no channel, ts, author or text can be reconstructed from it
+    assert all(isinstance(k, str) and isinstance(v, int) for k, v in
+               pulse.reaction_vocab_snapshot().items())
+
+
+@pytest.mark.asyncio
+async def test_emoji_usage_round_trips_through_the_db(tmp_path):
+    import sqlite3
+    from database import DatabaseManager
+    db = DatabaseManager("test")
+    db.db_path = str(tmp_path / "t.db")          # same repoint the DB suite's fixture uses
+    db.conn = sqlite3.connect(db.db_path, check_same_thread=False, isolation_level=None)
+    db.init_schema()
+    await db.save_emoji_usage_async({"shipit": 4, "party_parrot": 1, "gone": 0})
+    assert await db.load_emoji_usage_async() == {"shipit": 4, "party_parrot": 1}  # zero pruned
+    # absolute counts: a later save REPLACES rather than accumulating, and drops missing names
+    await db.save_emoji_usage_async({"shipit": 6})
+    assert await db.load_emoji_usage_async() == {"shipit": 6}
+    await db.save_emoji_usage_async({})
+    assert await db.load_emoji_usage_async() == {}
+
+
+@pytest.mark.asyncio
+async def test_flush_and_load_never_raise_without_db_or_pulse():
+    host = MagicMock()
+    host.log_debug = lambda *a, **k: None
+    host.channel_pulse = None
+    host.db = None
+    host._load_emoji_usage = SlackMessagingMixin._load_emoji_usage.__get__(host)
+    host.flush_emoji_usage = SlackMessagingMixin.flush_emoji_usage.__get__(host)
+    await host._load_emoji_usage()
+    await host.flush_emoji_usage()
+
+
+@pytest.mark.asyncio
+async def test_flush_survives_a_failing_db():
+    host = MagicMock()
+    host.log_debug = lambda *a, **k: None
+    host.channel_pulse = ChannelPulse()
+    host.channel_pulse.add_reaction("C1", "1.0", "shipit")
+    host.db = MagicMock()
+    host.db.save_emoji_usage_async = AsyncMock(side_effect=RuntimeError("locked"))
+    host.flush_emoji_usage = SlackMessagingMixin.flush_emoji_usage.__get__(host)
+    await host.flush_emoji_usage()          # must not propagate
+
+
+def test_shutdown_flushes_the_tally_after_ingress_stops():
+    # A wiring guard, deliberately by inspection: stop() tears down sockets and sessions that are
+    # impractical to stand up here. What it pins is the ORDER — the final snapshot must come
+    # after the handler teardown, or a reaction arriving late in shutdown is observed and never
+    # persisted. It also pins that the periodic task is cancelled rather than left running.
+    import inspect
+    src = inspect.getsource(SlackMessagingMixin.stop)
+    assert "_emoji_flush_task" in src and "task.cancel()" in src
+    assert src.count("flush_emoji_usage") == 1, "the final flush should happen exactly once"
+    assert src.index("_emoji_flush_task") < src.index("await self.flush_emoji_usage()")
+    assert src.index("self.handler") < src.index("await self.flush_emoji_usage()")

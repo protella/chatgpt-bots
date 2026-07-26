@@ -195,7 +195,11 @@ class BotConfig:
     # debounce window — not on the response critical path — so `low` costs nothing
     # the user can feel. Verified live 2026-07-10: none = 0/3, low = 3/3 on the
     # mid-exchange follow-up case.
-    participation_reasoning_effort: str = field(default_factory=lambda: os.getenv("PARTICIPATION_REASONING_EFFORT", "low"))
+    # `medium`, matching .env.example and the deploy checklist. `low` used to be the code
+    # default, so any deployment that omitted the variable silently got the measurably worse
+    # setting (low scored 46/66 on the misfire replay, medium 49/66). NOT monotonic — `high`
+    # scores worse than `low`, so do not raise this.
+    participation_reasoning_effort: str = field(default_factory=lambda: os.getenv("PARTICIPATION_REASONING_EFFORT", "medium"))
 
     # F40 — the wake gate SEES attached images (user report 2026-07-13: a meme captioned only
     # ":dogkek:" earned a :joy: reaction the gate had inferred from the emoji in the caption,
@@ -499,11 +503,13 @@ class BotConfig:
     # customs are never injected over it). No explicit off-switch: absent the emoji:read scope
     # the fetch fails soft and the name set simply stays empty.
     workspace_emoji_ttl_seconds: int = field(default_factory=lambda: int(os.getenv("WORKSPACE_EMOJI_TTL_SECONDS", "3600")))
+    # How often the observed emoji-usage tally is written to the DB (floor 30s). Absolute
+    # counts, so a missed flush costs only the reactions since the last one.
+    emoji_usage_flush_seconds: int = field(default_factory=lambda: int(os.getenv("EMOJI_USAGE_FLUSH_SECONDS", "300")))
     # Deterministic sorted cap of custom names fed to the participation classifier as signals.
     participation_custom_emoji_cap: int = field(default_factory=lambda: int(os.getenv("PARTICIPATION_CUSTOM_EMOJI_CAP", "32")))
     # Cap of custom names listed in the react_to_message tool-schema description (also budgeted
     # by a per-request char budget so surfacing customs never bloats every main-model request).
-    react_tool_custom_emoji_cap: int = field(default_factory=lambda: int(os.getenv("REACT_TOOL_CUSTOM_EMOJI_CAP", "64")))
 
     # --- Outbound self-prefix hygiene (Phase 3.4) ---
     # Leading "Name:" prefixes to strip from the model's reply so it never answers as "ChatGPT: …"

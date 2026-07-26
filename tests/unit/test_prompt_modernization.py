@@ -112,16 +112,18 @@ def test_f17_voice_banter_clause_present():
     assert "one good line beats three" in SLACK_SYSTEM_PROMPT
 
 
-def test_f17_participation_banter_clause_present():
-    # Item B: playful banter/teasing genuinely AT the assistant is participation-worthy — a
-    # react when an emoji carries the beat, a respond only when words add a distinct beat —
-    # but addressee rules still dominate, and being talked ABOUT is not being talked TO.
+
+def test_f17_participation_banter_clause_is_gone():
+    """Superseded 2026-07-26 — see test_b_banter_rule_replaced for the full story. F17 added a
+    clause making teasing aimed at the assistant participation-worthy; it turned out to be the
+    mechanism behind a real misfire (the bot replying to a jab 52s after being told to hush) and
+    was removed. Kept as an inverted guard so the clause cannot quietly return."""
     assert "Playful banter or teasing genuinely aimed AT the assistant is participation-worthy" \
-        in PARTICIPATION_SYSTEM_PROMPT
-    assert "not marginal-value noise" in PARTICIPATION_SYSTEM_PROMPT
-    assert "a single emoji carries the beat, choose react" in PARTICIPATION_SYSTEM_PROMPT
-    assert "never overrides the addressee rules" in PARTICIPATION_SYSTEM_PROMPT
-    assert "merely talking about the assistant stays theirs" in PARTICIPATION_SYSTEM_PROMPT
+        not in PARTICIPATION_SYSTEM_PROMPT
+    assert "not marginal-value noise" not in PARTICIPATION_SYSTEM_PROMPT
+    # the addressee discipline it was supposed to defer to is now structural, not a proviso
+    assert "STAGE 1 — WHOSE MESSAGE IS THIS?" in PARTICIPATION_SYSTEM_PROMPT
+    assert "about_assistant" in PARTICIPATION_SYSTEM_PROMPT
 
 
 def test_tool_provenance_ground_truth_instruction_present():

@@ -1,7 +1,7 @@
 """F40 — the wake gate has to look at the picture before it reacts to it.
 
 The bug, live (2026-07-13): a meme was posted with the caption ":dogkek:" and nothing else. The
-gate returned `{"action":"react","emoji":"joy","reason":"A laughing reaction fits the playful
+gate returned `{"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action":"react","emoji":"joy","reason":"A laughing reaction fits the playful
 meme post."}` — a confident opinion about an image it had never seen. It had reasoned from the
 emoji SHORTCODE in the caption, and from a prompt line that told it, untruthfully, that it "can
 view and analyze attachments".
@@ -149,7 +149,7 @@ class _FakeOpenAI:
             raise RuntimeError("400 unsupported image format")
         out = MagicMock()
         content = MagicMock()
-        content.text = '{"action":"react","emoji":"joy"}'
+        content.text = '{"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action":"react","emoji":"joy"}'
         item = MagicMock()
         item.content = [content]
         out.output = [item]
@@ -283,7 +283,7 @@ async def test_the_dogkek_case_the_gate_now_sees_the_meme(monkeypatch):
     monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
     monkeypatch.setattr(config, "enable_multimodal_gate", True, raising=False)
     openai = MagicMock()
-    openai.classify_participation = AsyncMock(return_value={"action": "react", "emoji": "joy"})
+    openai.classify_participation = AsyncMock(return_value={"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "react", "emoji": "joy"})
     engine = ParticipationEngine(openai)
 
     await engine.evaluate(channel_id="C1", ts="10.0", text=":dogkek:", sender_id="U1",
@@ -403,7 +403,7 @@ async def test_engine_verdict_is_unaffected_by_a_broken_piggyback(monkeypatch):
 
     client = _GateClient(PNG, _Boom())
     openai = MagicMock()
-    openai.classify_participation = AsyncMock(return_value={"action": "react", "emoji": "eyes"})
+    openai.classify_participation = AsyncMock(return_value={"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "react", "emoji": "eyes"})
     engine = ParticipationEngine(openai)
 
     verdict = await engine.evaluate(channel_id="C1", ts="10.0", text="x", sender_id="U1",

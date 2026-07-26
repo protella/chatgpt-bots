@@ -69,6 +69,22 @@ VALID_DURABILITIES = ("momentary", "standing")
 VALID_SCOPES = ("thread", "channel")
 VALID_STRUCTURAL = ("none", "participation", "placement", "both")
 
+# The staged verdict's intermediate classifications. The gate used to emit only a decision
+# ({action, placement, reason}), which left its actual reasoning invisible and unfalsifiable: a
+# verdict claiming "this is a direct request for the assistant" about a message aimed at the
+# humans in the room parsed exactly as cleanly as a correct one. Requiring the model to commit to
+# WHOSE message it is, whether the exchange is even open, and whether it can really answer, makes
+# those three findings checkable against the action it chose — see _apply_invariants, which is the
+# only place a verdict can be overruled, and which reads nothing but these declared fields.
+VALID_RELATIONS = ("to_assistant", "to_other", "about_assistant", "to_room", "unclear")
+VALID_EXCHANGE_STATES = ("open", "closed_by_human", "reopened")
+VALID_ANSWERABILITY = ("substantive", "limitation_only", "requires_human", "not_applicable")
+
+# Actions that put the assistant into the conversation. `backoff` is deliberately absent: it is
+# how participation FEEDBACK is handled, it arrives precisely when a human is shutting the
+# assistant down, and _apply_backoff is already conservative about what it may persist.
+SPEAKING_ACTIONS = ("respond", "react", "react_and_respond")
+
 MODE_TO_LEVEL = {"off": "off", "tag_only": "mentions_only", "auto_respond": "judicious"}
 LEVEL_TO_MODE = {"off": "off", "mentions_only": "tag_only",
                  "judicious": "auto_respond", "active": "auto_respond"}
@@ -167,6 +183,15 @@ class ParticipationVerdict:
     # longer a thread-mute add/unmute verb; `structural_request` an explicit channel-settings
     # change that the main model, not the engine, applies via the gated
     # set_channel_participation tool.
+    # The staged classifications behind the action (see VALID_RELATIONS above). None only for a
+    # verdict that predates the staged prompt, in which case no invariant can fire.
+    relation: Optional[str] = None
+    exchange_state: Optional[str] = None
+    answerability: Optional[str] = None
+    # Names of the invariants that overruled the model's own action, for the gate to log. Empty
+    # on the overwhelming majority of verdicts; a rising rate here means the prompt and the
+    # invariants disagree about something and the prompt is what should change.
+    overruled_by: Optional[List[str]] = None
     dimension: Optional[str] = None
     durability: Optional[str] = None
     scope: Optional[str] = None
@@ -336,8 +361,8 @@ class ParticipationEngine:
                        directives: Optional[str] = None,
                        memory_facts: Optional[List[Dict[str, Any]]] = None,
                        channel_activity: Optional[str] = None,
-                       unprompted_last_hour: int = 0,
                        name_hit: bool = False,
+                       self_display_name: Optional[str] = None,
                        sender_is_bot: bool = False,
                        channel_topic: Optional[str] = None,
                        channel_canvases: Optional[List[str]] = None,
@@ -467,8 +492,11 @@ class ParticipationEngine:
             # F47: authoritative addressee evidence for a top-level trigger (None for threaded
             # turns, which already carry thread_tail). Rendered above the peripheral envelope.
             "channel_addressee_tail": channel_addressee_tail,
-            "unprompted_last_hour": int(unprompted_last_hour),
             "name_hit": bool(name_hit),
+            # Who the bot actually is in this workspace, as resolved at startup — distinct
+            # from the names it ANSWERS to (config aliases). See the identity line in
+            # classify_participation for why both are needed.
+            "self_display_name": self_display_name,
             "sender_is_bot": bool(sender_is_bot),
             "channel_topic": channel_topic,
             # F36: the gate never sees tool schemas, so without this a passive
@@ -619,6 +647,87 @@ class ParticipationEngine:
         return emoji if valid_emoji_name(emoji) else None
 
     @staticmethod
+    def _apply_invariants(verdict: "ParticipationVerdict") -> "ParticipationVerdict":
+        """Refuse a verdict whose ACTION contradicts the model's own STAGED FINDINGS.
+
+        This is the enforcement half of the staged prompt, and the reason the stages are output
+        fields rather than private reasoning. It never sees the message: no text, no sender, no
+        aliases, no keywords, no regex. It compares declared enums to the chosen action, so the
+        model still does every bit of the understanding — this only refuses to let it conclude
+        something its own analysis does not support. A verdict from before the staged prompt
+        carries no findings and passes through untouched.
+
+        Each rule below corresponds to a measured false positive on the replay corpus in
+        tests/integration/participation_scenarios.py, and every one of them downgrades toward
+        SILENCE. That direction is deliberate: the gate's measured error profile was 27 false
+        positives and zero false negatives, so the costly mistake is speaking out of turn, and a
+        missed answer is one somebody can simply ask for again.
+        """
+        action, fired = verdict.action, []
+        if action not in SPEAKING_ACTIONS:
+            return verdict
+
+        # FAIL CLOSED on an incomplete verdict. The response is not strict Structured Outputs —
+        # the parser lifts whatever JSON object it can find — so a truncated or malformed reply
+        # can arrive with an action and no stages, and every field below coerces to None when
+        # it is missing or off-enum. Letting that through meant the one path most likely to be
+        # garbage was also the one path that skipped every check. A speaking action has to show
+        # its work; silence is the safe direction, and the model is asked for all four fields.
+        if (verdict.relation is None or verdict.exchange_state is None
+                or verdict.answerability is None):
+            verdict.action = "ignore"
+            verdict.emoji = None
+            verdict.overruled_by = ["incomplete_stages"]
+            return verdict
+
+        # A message the model itself says belongs to someone else, is merely ABOUT the assistant,
+        # or whose owner it could not determine, is not an opening — however much the assistant
+        # might have to offer. Ownership precedes capability; this is the invariant for the
+        # original misfire, where a collective "check your prompts" aimed at the room was answered
+        # because the assistant had opinions about prompts.
+        if verdict.relation in ("to_other", "about_assistant", "unclear"):
+            action, _ = "ignore", fired.append(f"relation_{verdict.relation}")
+
+        # A human has landed the closing beat. Words would re-open something the room finished,
+        # and conceding a correction only makes the assistant the subject of the channel. A plain
+        # reaction still stands: acknowledging a thanks with an emoji is not talking over anyone.
+        elif verdict.exchange_state == "closed_by_human":
+            if action == "respond":
+                action, _ = "ignore", fired.append("exchange_closed")
+            elif action == "react_and_respond":
+                action, _ = "react", fired.append("exchange_closed_words_dropped")
+
+        # Nobody asked the assistant in particular, and by its own reckoning it cannot supply the
+        # kind of answer wanted. An unrequested capability disclaimer, adjacent summary, or
+        # restatement is not value — it is the assistant volunteering into a room that did not
+        # call on it. A question genuinely put TO the assistant is exempt: there, an honest "I
+        # can't see that from here" beats leaving someone on read.
+        if (action in SPEAKING_ACTIONS and verdict.relation == "to_room"
+                and verdict.answerability in ("limitation_only", "requires_human")):
+            action, _ = "ignore", fired.append(f"room_{verdict.answerability}")
+
+        # Nothing was ASKED (`not_applicable`) and nobody addressed the assistant, yet it wants
+        # to use WORDS. Stage 3 says not_applicable is the reaction case and Stage 4 says words
+        # need a positive case; a reply here contradicts both of its own findings. The emoji
+        # survives — a reaction is the move this combination is actually for — and a message put
+        # TO the assistant is untouched, because being asked nothing directly still deserves an
+        # acknowledgement rather than being ignored.
+        if (verdict.relation == "to_room" and verdict.answerability == "not_applicable"
+                and action in ("respond", "react_and_respond")):
+            if action == "react_and_respond":
+                action, _ = "react", fired.append("room_nothing_asked_words_dropped")
+            else:
+                action, _ = "ignore", fired.append("room_nothing_asked")
+
+        if not fired:
+            return verdict
+        verdict.action = action
+        verdict.overruled_by = fired
+        if action == "ignore":
+            verdict.emoji = None
+        return verdict
+
+    @staticmethod
     def validate_verdict(raw: Any) -> ParticipationVerdict:
         """Coerce a raw model dict into a safe verdict. Anything malformed →
         ignore. F20: by default any syntactically valid standard emoji name is
@@ -670,4 +779,10 @@ class ParticipationEngine:
             verdict.memory_op = _coerce_memory_op(raw.get("memory_op"))
             structural = str(raw.get("structural_request") or "none").strip().lower()
             verdict.structural_request = structural if structural in VALID_STRUCTURAL else "none"
-        return verdict
+        # The staged findings. A missing/garbage field coerces to None, which makes the
+        # corresponding invariant inapplicable rather than guessed at — an unparseable stage is
+        # not evidence for or against speaking.
+        verdict.relation = _coerce_enum(raw.get("relation"), VALID_RELATIONS)
+        verdict.exchange_state = _coerce_enum(raw.get("exchange_state"), VALID_EXCHANGE_STATES)
+        verdict.answerability = _coerce_enum(raw.get("answerability"), VALID_ANSWERABILITY)
+        return ParticipationEngine._apply_invariants(verdict)

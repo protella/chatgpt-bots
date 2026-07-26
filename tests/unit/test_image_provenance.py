@@ -134,7 +134,7 @@ async def _publish(processor, client, provenance_tool=None, checklist=None):
     return await image_delivery.publish_image(
         processor=processor, client=client, channel_id="C1", thread_id="1.0",
         thread_key="C1:1.0", image_data=_ImageData(), checklist=checklist, generation_id=None,
-        prompt="a cat", db=None, thread_manager=MagicMock(), unprompted=False,
+        prompt="a cat", db=None, thread_manager=MagicMock(),
         provenance_tool=provenance_tool)
 
 

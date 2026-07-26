@@ -99,6 +99,7 @@ GPT_MODEL = "gpt-5.6-sol"          # was gpt-5.5
 UTILITY_MODEL = "gpt-5.6-luna"     # was gpt-5-mini  ← MUST change; gpt-5-mini is gone from v3
 UTILITY_REASONING_EFFORT = "low"   # adaptive on Luna: 0 reasoning tokens on trivial verdicts, thinks only when needed (benchmarked 2026-07-16)
 UTILITY_VERBOSITY = "low"
+PARTICIPATION_REASONING_EFFORT = "medium"   # was "low" — see below
 DEFAULT_REASONING_EFFORT = "low"
 DEFAULT_VERBOSITY = "low"
 ANALYSIS_REASONING_EFFORT = "medium"
@@ -111,6 +112,14 @@ DEFAULT_DETAIL_LEVEL = "auto"      # unchanged — and `auto` IS the max, see be
 equivalent to `original`: the image is sent at its own dimensions with no resize. `high` and `low`
 both resize under a finite limit, so pinning `high` here would *cap* large screenshots rather than
 sharpen them. Set it to `high` only as a deliberate cost cap on very large images.
+
+**`PARTICIPATION_REASONING_EFFORT` is `medium`, not `low`.** It is the one effort that does NOT
+follow `UTILITY_REASONING_EFFORT`. The gate decides whether the bot speaks at all in a channel, and
+at `low` it misresolves who a message is addressed to: measured on a replay of a real 2026-07-25
+misfire, `low` got 46/66 scenarios right and `medium` 49/66, and `low` was the setting that let the
+bot answer a message aimed at the humans in the room. Note the curve is NOT monotonic — `high`
+scored *worse* than `low` on the headline case, because the extra reasoning talks itself past the
+addressee rules. Do not "improve" this to `high`.
 
 **`GATE_VISION_DETAIL` is the one that matters, and it now defaults to `high`** (no action needed;
 prod inherits it). The participation gate had its own explicit `low`, which hands the model a

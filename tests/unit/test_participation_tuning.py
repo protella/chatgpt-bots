@@ -27,44 +27,72 @@ from tool_registry import ToolContext, ToolRegistry
 
 # =========================================================== prompt wording (A1/A2/B/C1/C2)
 
+
 def test_a1_value_floor_present():
+    """The value floor survives the staged rewrite as Stage 3, and it is REACHED only after
+    ownership is settled — which is the whole point of the ordering. The old prompt stated the
+    same floor as one of 34 flat rules, and at low effort a value judgment routinely outranked
+    the addressee judgment it was supposed to follow."""
     p = PARTICIPATION_SYSTEM_PROMPT
-    assert "Judge value by whether the assistant can supply the kind of answer requested" in p
-    assert "sketch the honest lead of the reply" in p
-    assert "A capability disclaimer plus a pointer, a restatement, or an unsolicited summary" in p
-    assert "Requests for human firsthand experience or human action/authority" in p
-    assert "An internal-fact question is a respond case only when" in p
+    assert "CAN THE ASSISTANT ACTUALLY SUPPLY WHAT IS ASKED" in p
+    assert "Reach this stage only when Stages 1 and 2 have left room to participate" in p
+    # lacking the requested access/authority is not substantive value
+    assert "requires_human" in p and "limitation_only" in p
+    assert "firsthand human experience" in p
+    assert "authority to act where it holds no tool" in p
+    # ordering is asserted, not just presence: Stage 1 must appear before Stage 3
+    assert p.index("STAGE 1") < p.index("STAGE 3")
+
 
 
 def test_a1_value_floor_exempts_direct_summons():
-    """Live regression (2026-07-21): the floor swallowed "chatgpt, do you know X?" —
-    a bare-name summon is gated, so the floor must not reach it or the responder's
-    honest-answer contract (C1) never runs."""
+    """Live regression (2026-07-21): the floor swallowed "chatgpt, do you know X?" — a bare-name
+    summon is gated, so the floor must not reach it or the responder's honest-answer contract
+    never runs. Staged form: the exemption hangs off Stage 1 rather than being a proviso buried
+    in the floor's own paragraph, and an unrequested disclaimer is still refused."""
     p = PARTICIPATION_SYSTEM_PROMPT
-    assert "This floor applies only AFTER the addressee is resolved" in p
-    assert "genuinely and currently put to THIS assistant by one of its own names" in p
-    assert "being left on read is worse than a one-line" in p
-    # the carve-out must not re-open the name-drop hole the addressee rules close
-    assert "A name-drop, a quotation, or the assistant as a topic of discussion is not a summons" in p
+    assert "Whether a limitation is worth SAYING depends on Stage 1" in p
+    assert "deserves a straight" in p and "rather than being left on read" in p
+    assert "Nobody is owed an unrequested disclaimer" in p
+    # and the carve-out must not re-open the name-drop hole Stage 1 closes
+    assert "Being named is not the same as being addressed" in p
+
 
 
 def test_a2_open_question_rule_replaced():
+    """An open question to the room resets the addressee but does not by itself justify words:
+    the answer has to be one the assistant can actually give. In the staged prompt this is
+    relation="to_room" plus Stage 3, and it is ALSO enforced in code — see
+    ParticipationEngine._apply_invariants, which refuses to_room + limitation_only/requires_human
+    however confidently the model chose to speak."""
     p = PARTICIPATION_SYSTEM_PROMPT
-    assert "resets the addressee, but does not by itself justify a response" in p
-    assert "The source must match the question" in p
-    assert 'Do not turn "anyone tried X?" into an unsolicited web summary' in p
-    # the old open-question wording is gone
+    assert "genuinely open to the channel at large" in p
+    assert "the room asked something open that it can directly answer" in p
+    # the old wording, and the old license to volunteer, are both gone
     assert "a colleague with the data at hand would speak up" not in p
     assert "that those tools can answer directly is a respond case" not in p
 
 
+
 def test_b_banter_rule_replaced():
+    """DELIBERATE REVERSAL (2026-07-26). The old prompt said playful teasing aimed at the
+    assistant was "participation-worthy... an invitation to play along". That clause is why the
+    bot answered "Chatgpt, you are right!" 52 seconds after a human told it to hush: the teasing
+    named it, so the clause licensed a reply, and it outranked nothing. Codex identified it
+    independently as the cause, and removing it is measured to help — the scenario went from 0/6
+    to passing on the replay corpus.
+
+    Teasing is no longer a reason to speak. It is judged like anything else: whose message is it,
+    is the exchange still open, does a reply add something. What remains is that a joke aimed at
+    the assistant is not participation FEEDBACK either, so it must not be misrouted to backoff."""
     p = PARTICIPATION_SYSTEM_PROMPT
-    assert "Playful banter or teasing genuinely aimed AT the assistant is participation-worthy" in p
-    assert "a single emoji carries the beat, choose react" in p
-    assert "merely talking about the assistant stays theirs" in p
-    # old banter wording is gone
-    assert "is a respond case, not marginal-value noise to ignore" not in p
+    assert "Playful banter or teasing genuinely aimed AT the assistant is participation-worthy" not in p
+    assert "invitation to play along" not in p
+    # what replaced it: the exchange-state boundary, which a joke cannot lift
+    assert "being teased or told it was right after being shut down is the tail of that beat" in p
+    assert "Only an explicit welcome back or a real new ask reopens it" in p
+    # backoff stays reserved for actual participation feedback
+    assert "never for ordinary disagreement between people" in p
 
 
 def test_c1_mid_flight_escape_present():

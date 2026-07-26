@@ -1224,14 +1224,37 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
     shown = len(images or [])
     # Identity anchor so the model can recognize addressing by name — including
     # typos and case variants ("chatgpt-dve, help") that the deterministic
-    # alias prefilter misses. Config aliases are constant, so this line is
-    # deterministic (cache-friendly).
+    # alias prefilter misses.
+    #
+    # The RESOLVED handle leads, because it is the ground truth about who this bot is, and the
+    # configured aliases are only a list of names it also answers to. When those disagreed the
+    # gate got it exactly backwards: deployed as "chatgpt-dev" with aliases ["ChatGPT"], it read
+    # "chatgpt-dev, what model are you running?" as addressed to *a different assistant* and
+    # stayed silent — the alias regex counted it a name hit, the model did not. That failure got
+    # sharper once the channel roster began marking other assistants, because the gate then had
+    # a category to file the "unknown" name under. Both facts have to be present and it has to
+    # know which is which.
+    #
+    # Per-process constants, so the line stays byte-identical across calls (cache-friendly).
     aliases = list(getattr(config, "bot_name_aliases", None) or [])
-    if aliases:
+    handle = str(signals.get("self_display_name") or "").strip()
+    if handle or aliases:
+        primary = handle or aliases[0]
+        others = [a for a in aliases if a.strip().lower() != primary.strip().lower()]
+        # The claim has to be bounded on BOTH sides. Stated only as "these are my names" the gate
+        # disowned its own deployed handle; stated as "any of these, even misspelled or suffixed"
+        # it swung the other way and started claiming OTHER assistants' names as variants of its
+        # own (named-other-bot fell to 2/6). So: this exact set, plus obvious misspellings OF this
+        # set — and everything outside it belongs to someone else.
+        named = " / ".join([f'"{primary}"'] + [f'"{o}"' for o in others])
         lines.append(
-            f"- The assistant's name in this workspace: {aliases[0]}"
-            + (f" (also answers to: {', '.join(aliases[1:])})" if len(aliases) > 1 else "")
-            + ". Messages addressing it by name — even misspelled — are meant for it."
+            f"- The assistant's own names in this workspace, and its ONLY ones: {named}"
+            + (" (all of these are the same assistant — this one — including with an environment "
+               "suffix)" if others else "")
+            + ". A message using one of them, or an obvious misspelling of one, is addressed to "
+              "it. Any OTHER name belongs to somebody else, however similar it looks or however "
+              "much the assistant could have helped — other assistants here have their own names "
+              "and are not variants of these."
         )
     # F11: the assistant's own tools/data sources, rendered immediately after the alias
     # identity line — both constant per process, maximizing the shared cache prefix.
@@ -1288,10 +1311,6 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
             "or reference like \"the chatgpt bot's repo\"), not a summons."
         )
     lines.append(f"- Strictness: {signals.get('strictness') or 'judicious'}")
-    lines.append(
-        f"- Assistant's unprompted replies in this channel in the last hour: "
-        f"{int(signals.get('unprompted_last_hour') or 0)}"
-    )
     # F20: unrestricted by default (any standard Slack emoji); an explicit REACTION_EMOJIS
     # allowlist, when set, is surfaced as the constrained choice. Fixed ordering (cache).
     allow = [e.strip().strip(":") for e in (getattr(config, "reaction_emojis", None) or []) if e and e.strip().strip(":")]
@@ -1306,9 +1325,10 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
                    if str(e).strip().strip(":")]
         if customs:
             lines.append(
-                "- Workspace custom emoji you may also choose when one fits: "
+                "- Custom emoji THIS WORKSPACE actually reacts with, most-used first — prefer "
+                "one of these when it fits the moment, since it is this team's own vocabulary: "
                 + ", ".join(customs)
-                + "; standard Slack emoji remain allowed."
+                + "; every standard Slack emoji also remains available."
             )
     if signals.get("directives"):
         lines.append(f"- Channel ground rules (honor them): {signals['directives']}")
@@ -1407,9 +1427,13 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
     request_params = {
         "model": config.utility_model,
         "input": conversation_messages,
-        # JSON verdict + reasoning-model preamble needs more room than a one-word
-        # classification; same floor the memory extractor uses.
-        "max_output_tokens": max(1024, config.utility_max_tokens),
+        # Reasoning tokens are billed against this cap, so the floor has to cover the
+        # THINKING plus the JSON, not just the JSON. At `medium` effort a live verdict
+        # came back empty — reasoning had consumed the whole budget — and the fail-safe
+        # silently returned `ignore`, so the gate never actually ran. Measured worst case
+        # is 815 of 1024, and counterintuitively a SHORT channel tail is the risk case:
+        # less context to read means more inference to do. Unused tokens are not billed.
+        "max_output_tokens": max(2048, config.utility_max_tokens),
         "store": False,
     }
     # Utility model is a GPT-5-series reasoning model (gpt-5-mini)

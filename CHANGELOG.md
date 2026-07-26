@@ -77,6 +77,13 @@ documented inline there):
   top-level mentions (long-form asks thread; quick answers stay top-level)
 - `ENABLE_EDIT_TRIGGERED_REPLIES=false` — meaningful edits to recent messages get the same
   respond/ignore judgment as new messages (typo fixes stay silent)
+- `PARTICIPATION_REASONING_EFFORT=medium` — how hard it thinks about whether a message is for
+  it. **The code default is now `medium`, not `low`** — resolving who a message is addressed to
+  is the hardest call it makes, and `low` gets it wrong measurably more often. Do not raise it
+  to `high`: this is not monotonic, and `high` scored *worse* than `low` on the same replay
+  (it reasons its way around the addressee rules).
+- `EMOJI_USAGE_FLUSH_SECONDS=300` — how often the observed emoji-usage tally is saved, so the
+  reaction vocabulary survives restarts. Rarely worth changing.
 - `ENABLE_LINK_PREVIEWS=false` — links in the bot's posts stay inline; set true for Slack's
   preview cards (this is a change from v2 behavior, where Slack unfurled them)
 - `STATUS_LOADING_MESSAGES_FILE` — optional branded "working…" messages for the
@@ -128,6 +135,59 @@ destructive step. Watch for these lines, in order:
 From then on the database backs itself up nightly (7-day retention) as part of the scheduled
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
+
+### 🤔 Changed - A much better read on whether a message is even for it
+
+A real incident drove this: in a channel where someone told the humans to *"check your prompts
+based on the article i shared yesterday"* — about a different vendor's tool — the bot answered,
+then agreed it should trim its own prompts, then spoke again 52 seconds after being told to hush.
+Three separate faults, none of them "it was too chatty".
+
+The judgment is now staged. Before deciding what to do, it settles three things in order: **whose
+message is this**, **is this exchange still open to me**, and **can I actually supply what's being
+asked**. Only then does it choose. Those answers are checked against the action it picked, so it
+can't decide something its own reading doesn't support — if it concludes a message belongs to
+someone else, it cannot then reply to it.
+
+- **Ownership comes before helpfulness.** A message aimed at the room's humans, or at another
+  assistant by name, gets nothing — however much it had to offer.
+- **A correction that lands is finished.** It no longer agrees with the criticism, restates it, or
+  apologises; that only makes it the subject of the room. Being teased or told it was right *after*
+  being shut down is the tail of that beat, not an invitation back in.
+- **It knows its own name here.** It was treating its own workspace handle as somebody else's name
+  and ignoring people who addressed it correctly.
+- **It answers plain facts about itself** — which model it's running, its context window, what its
+  tools reach — instead of hedging on things it was simply never told. It still won't invent what
+  it doesn't have.
+
+On a replay of 43 real and constructed channel situations, unwanted replies dropped from 27 to 3
+with no loss on the messages it *should* answer.
+
+### 🎨 Changed - Reactions that fit the moment, in your workspace's own emoji
+
+It reaches for an emoji when that's the whole reply — a thanks, an FYI, a delegation, a win
+landing — instead of either saying nothing or writing a paragraph. And it picks one that suits the
+subject rather than reflexively 👍: 🎉 for a ship, 🚨 for an incident, 🚀 for a launch.
+
+It can also use **your workspace's custom emoji**, and now finds them by meaning — ask for
+something that fits "a deploy that went badly" and it can surface your `:dumpster-fire:`.
+Previously it was shown the first few dozen custom emoji *alphabetically*, which in a workspace
+with a thousand of them meant it only ever saw names like `000` and `1password_icon`. It now
+ranks them by what your workspace actually reacts with, learned from real usage and remembered
+across restarts.
+
+A reaction is held to a lower bar than words, because it doesn't take the floor — but only on
+whether it's *worth* it. Whose conversation it is still applies exactly as it does to a reply, so
+this is not a back door into an exchange that isn't its own.
+
+Custom emoji need the `emoji:read` scope from step 4 above; without it standard emoji still work
+and nothing errors.
+
+### 🔇 Fixed - It occasionally went silent for no reason
+
+The judgment call that decides whether to speak could run out of room mid-thought and come back
+empty, which was silently read as "say nothing". Rare, but it meant an addressed question could
+go unanswered with nothing in the logs to explain it.
 
 ### 👋 Feature - It introduces itself when you add it to a channel
 
