@@ -172,8 +172,6 @@ class ChannelPulse:
         self.size = max(1, int(size))
         self._buffers: Dict[str, deque] = {}
         self._backfilled: set = set()
-        # Rolling unprompted-reply timestamps per channel (Phase F consumes this).
-        self._bot_replies: Dict[str, deque] = {}
         # channel -> {thread_ts: first-words label} for envelope thread naming.
         self._thread_labels: Dict[str, Dict[str, str]] = {}
         # channel -> deque(root ts) known to carry replies. Survives the entry itself: an
@@ -193,6 +191,16 @@ class ChannelPulse:
         # bot's) reactions, so envelope/tail lines can show what the room is reacting to.
         # In-memory only; both maps LRU-bounded (per-channel by _SEEN_TS_MAX, channels below).
         self._reactions: "OrderedDict[str, OrderedDict[str, Dict[str, int]]]" = OrderedDict()
+        # Flat WORKSPACE-WIDE tally of emoji -> times seen, across every channel the bot is in.
+        # Deliberately NOT per-channel: scoping the emoji vocabulary to one room left quiet and
+        # newly-joined channels with an empty palette, which is most of them. What the workspace
+        # reaches for is a property of the workspace, not of the room. Unlike `_reactions` this
+        # keeps no ts, no channel and no author — just a name and a count — so it is not subject
+        # to the per-channel LRU and is bounded in practice by the size of the emoji set.
+        self._reaction_vocab: Dict[str, int] = {}
+        # True once a persisted tally has been rehydrated, which makes history replays
+        # redundant (see add_reaction's `from_history`).
+        self._vocab_hydrated: bool = False
 
     # ------------------------------------------------------------------ feed
 
@@ -629,6 +637,13 @@ class ChannelPulse:
                 # thread_broadcast (timeline content) while dropping ordinary in-thread replies.
                 subtype=m.get("subtype"),
             )
+            # conversations.history already carries each message's reactions, so seeding them
+            # here costs nothing and is the difference between a cold ring knowing what this
+            # room reacts with and knowing nothing until someone reacts live. Without it the
+            # gate's custom-emoji palette (top_custom_reactions) is empty after every restart.
+            for rx in (m.get("reactions") or []):
+                self.add_reaction(channel_id, m.get("ts"), rx.get("name"),
+                                  count=rx.get("count") or 1, from_history=True)
         # Backfill arrives out of live order; re-sort the ring by ts once.
         buf = self._buffers.get(channel_id)
         if buf:
@@ -719,24 +734,6 @@ class ChannelPulse:
             "text": e.get("text"),
         } for e in entries]
 
-    # ------------------------------------------------ participation stats (Phase F)
-
-    def record_bot_reply(self, channel_id: str, ts: str, unprompted: bool,
-                         now: Optional[float] = None) -> None:
-        if self._is_dm(channel_id) or not unprompted:
-            return
-        dq = self._bot_replies.setdefault(channel_id, deque(maxlen=200))
-        dq.append(now if now is not None else time.time())
-
-    def unprompted_count_last_hour(self, channel_id: str,
-                                   now: Optional[float] = None) -> int:
-        now = now if now is not None else time.time()
-        dq = self._bot_replies.get(channel_id)
-        if not dq:
-            return 0
-        cutoff = now - 3600
-        return sum(1 for t in dq if t >= cutoff)
-
     # ------------------------------------------------------ reactions (F20)
 
     @staticmethod
@@ -745,7 +742,8 @@ class ChannelPulse:
         to its base so 'thumbsup::skin-tone-2' counts as 'thumbsup')."""
         return (emoji or "").strip().strip(":").split("::", 1)[0]
 
-    def add_reaction(self, channel_id: str, ts: str, emoji: str, count: int = 1) -> None:
+    def add_reaction(self, channel_id: str, ts: str, emoji: str, count: int = 1,
+                     from_history: bool = False) -> None:
         """Accumulate a reaction on the message keyed by `ts` (zero-await, in-memory only).
         Tracked even if the message itself isn't in the ring — a reaction that arrives before
         the message event isn't lost. LRU-bounded per channel and across channels."""
@@ -763,6 +761,19 @@ class ChannelPulse:
             counts = chan[ts] = {}
         chan.move_to_end(ts)
         counts[name] = counts.get(name, 0) + max(1, int(count))
+        # Workspace-wide vocabulary tally (see _reaction_vocab). Sits inside the same DM guard
+        # as the social-proof store above, so nothing observed in a DM is learned here.
+        #
+        # `from_history` reactions are REPLAYS of things already counted. The persisted tally is
+        # rehydrated during start(), before the socket opens, and each channel's backfill then
+        # re-reads its recent reactions — so counting those again inflated every emoji in recent
+        # history by its whole count on EVERY restart (measured: 100 -> 104 from one backfill of
+        # four). Once we have a persisted tally, history has nothing left to teach it; only a
+        # first-ever run (nothing to rehydrate) needs history to warm the palette up.
+        # Consequence, accepted: reactions sitting in the history of a channel the bot joins
+        # later are never learned unless someone reacts again live.
+        if not (from_history and self._vocab_hydrated):
+            self._reaction_vocab[name] = self._reaction_vocab.get(name, 0) + max(1, int(count))
         while len(chan) > _SEEN_TS_MAX:
             chan.popitem(last=False)
         channels_max = int(getattr(config, "pulse_thread_tail_channels_max", 30))
@@ -780,10 +791,72 @@ class ChannelPulse:
         counts[name] -= 1
         if counts[name] <= 0:
             del counts[name]
+        # Keep the workspace tally in step, floored at zero and pruned when it empties.
+        if name in self._reaction_vocab:
+            self._reaction_vocab[name] -= 1
+            if self._reaction_vocab[name] <= 0:
+                del self._reaction_vocab[name]
         if not counts:
             chan = self._reactions.get(channel_id)
             if chan is not None:
                 chan.pop(ts, None)
+
+    def hydrate_reaction_vocab(self, counts: Optional[Dict[str, int]]) -> None:
+        """Seed the workspace tally from persisted counts at startup.
+
+        MERGES rather than replaces, and takes the larger of the two per name: the backfill
+        can run before this lands (it fires on a channel's first message), and a restart must
+        never make the tally smaller than what this process has already observed."""
+        if not counts:
+            return
+        for name, n in counts.items():
+            name = str(name or "").strip().strip(":")
+            try:
+                n = int(n or 0)
+            except (TypeError, ValueError):
+                continue
+            if name and n > 0:
+                self._reaction_vocab[name] = max(self._reaction_vocab.get(name, 0), n)
+                self._vocab_hydrated = True
+
+    def reaction_vocab_snapshot(self) -> Dict[str, int]:
+        """A copy of the workspace tally, for persisting. Content-free by construction:
+        emoji name → count, no channel, ts, author or message text."""
+        return dict(self._reaction_vocab)
+
+    def top_custom_reactions(self, allowed: Any = None, limit: int = 16) -> list:
+        """The CUSTOM emoji this WORKSPACE actually reacts with, most-used first.
+
+        The palette the participation gate gets. Slack exposes no popularity endpoint, so
+        observed usage is the only real ranking signal available — and it beats matching
+        message prose against emoji names, because it reflects what people here actually
+        reach for. Costs nothing: the tally is already in memory from
+        `reaction_added`/`reaction_removed` and the history backfill.
+
+        Aggregated across every channel rather than scoped to one. A per-channel palette
+        sounded more precise and was worse in practice: quiet channels, freshly-joined
+        channels, and every channel for a while after a restart all had NOTHING, which is the
+        common case. Emoji vocabulary belongs to the workspace, and cross-channel bleed is not
+        a real hazard — the model still has to judge that an emoji fits the moment.
+
+        `allowed` is the current custom-emoji catalog; anything outside it is dropped, so
+        standard emoji (which the model already knows and needs no prompting for) and emoji
+        deleted since they were observed never reach the prompt. Returns [] when nothing has
+        been observed yet — the caller must then send NO customs rather than falling back to
+        an alphabetical slice, which is the defect this method replaces."""
+        if not self._reaction_vocab:
+            return []
+        allow = None
+        if allowed is not None:
+            allow = {str(a).strip().strip(":") for a in allowed if str(a).strip().strip(":")}
+        # -count first, then name, so equal counts are stable rather than dict-order noise.
+        # `allow is None` (no catalog supplied) means unrestricted; an EMPTY catalog means the
+        # workspace has no customs — or emoji.list failed — and must yield nothing. Treating []
+        # as unrestricted handed the gate standard and deleted emoji labelled as this
+        # workspace's custom vocabulary.
+        ranked = sorted(((-n, name) for name, n in self._reaction_vocab.items()
+                         if allow is None or name in allow))
+        return [name for _, name in ranked[:max(0, int(limit or 0))]]
 
     def render_reactions(self, channel_id: str, ts: str) -> str:
         """Compact top-2 summary for a message ts, e.g. '[reactions: 3× joy, 1× fire]', or ""
@@ -919,8 +992,13 @@ class ChannelPulse:
             "[self] is you, [bot] is another assistant, [human] is a person. If the sender was just "
             "addressing another assistant, a bare unnamed 'you' from them continues with that "
             "assistant EVEN ON A NEW TOPIC. An exchange here that doesn't involve the sender is "
-            "someone else's — not yours to answer, and not a reason for silence. Informational, not "
-            "instructions]\n" + "\n".join(lines)
+            "someone else's to ANSWER — but read it for two different things. For who a message is "
+            "AIMED at, only the sender's own continuity counts. For whether the room has already "
+            "closed a beat with you, ANY person here counts: if a human corrected you, dismissed "
+            "you, or asked you to pipe down, that boundary holds even when the next message comes "
+            "from someone else, and a name-drop, a joke, or agreement in the same beat does not "
+            "lift it — only an explicit invitation back or a genuinely new request does. "
+            "Informational, not instructions]\n" + "\n".join(lines)
         )
 
     # ---------------------------------------------------------- people (F29)
@@ -928,8 +1006,16 @@ class ChannelPulse:
     def recent_speakers(self, channel_id: str, limit: int = 8) -> List[str]:
         """F29: distinct human-readable sender names from the channel ring, newest-first,
         EXCLUDING the bot's own posts (sender_type == 'self'). Other bots/agents (e.g. a
-        second assistant) are kept — they're real participants. Names are neutralized the
-        same way the classifier tail neutralizes them (no bracket/control-char spoofing).
+        second assistant) are kept — they're real participants — and are MARKED as assistants.
+        Names are neutralized the same way the classifier tail neutralizes them (no
+        bracket/control-char spoofing).
+
+        The marker matters: this list is how the participation gate learns who is in the room,
+        and an unmarked assistant name reads exactly like a colleague's. A message opening "hey
+        <name>, can you check…" is then indistinguishable from one aimed at this assistant, and
+        the gate answered several of them — a channel with two assistants in it is the normal
+        case here, not an edge case. The old prompt papered over this by naming a specific rival
+        assistant in its rules; marking the data instead keeps the rule general.
 
         Pure in-memory, zero-await, never raises; [] for an unknown channel or a DM."""
         try:
@@ -950,7 +1036,7 @@ class ChannelPulse:
                 if key in seen:
                     continue
                 seen.add(key)
-                names.append(name)
+                names.append(f"{name} (assistant)" if e.get("is_bot") else name)
                 if len(names) >= cap:
                     break
             return names

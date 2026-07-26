@@ -24,15 +24,32 @@ import prompts
 
 def test_participation_prompt_reaction_bar():
     p = prompts.PARTICIPATION_SYSTEM_PROMPT
-    # reactions are reserved, not a way to chime into human-to-human talk: the
-    # addressee rules apply to reactions and ordinary chatter earns nothing
-    assert "addressee rules below apply to reactions" in p
-    assert "gets NOTHING" in p
+    # A reaction clears a LOWER bar than words, because it does not take the floor. The
+    # staged rewrite originally held emoji to the same "must be able to supply something"
+    # bar as a reply, which drove the measured react rate from 6/165 to 0/228 — the bot
+    # went mute on thanks, FYIs and delegations that a teammate would simply 👍.
+    assert "A reaction clears a lower bar" in p
+    assert "does not take the floor" in p
+    # ...but WHOSE the message is still governs an emoji exactly as it governs a reply.
+    # That is the half of the old rule that must survive: the lower bar is about VALUE,
+    # never about ownership, or reactions become the side door the misfire came through.
+    assert "not a side door into somebody else's exchange" in p
+    assert "governs an emoji exactly as it governs a reply" in p
+    assert "Most messages get nothing" in p
     # social proof kept but GATED on the assistant genuinely being part of the moment
     assert "ALREADY placed is low-risk only when" in p
     # taste rails preserved
     assert "heated, sensitive, or personal" in p
-    assert "when unsure, ignore" in p
+    # the tiebreak ladder: words > emoji > nothing, by cost of being wrong
+    assert "the emoji is the cheaper mistake" in p
+    assert "prefer nothing" in p
+    # aptness: the emoji IS the message, so a reflex 👍 wastes it. Live, the first three
+    # reacts the rebuilt gate produced were :+1:, :eyes:, :+1: — correct lane, no taste.
+    assert "fits THIS moment rather than a default" in p
+    assert "let the subject matter choose" in p
+    assert "Apt beats safe" in p
+    # ...bounded on the other side, so "be creative" does not become mugging for laughs
+    assert "do not strain for a joke" in p
     # any-standard-emoji wording (no curated palette)
     assert "any standard Slack emoji name" in p
 
@@ -52,9 +69,9 @@ def test_local_tools_guidance_softened():
 def test_f24_participation_prompt_prefers_react():
     p = prompts.PARTICIPATION_SYSTEM_PROMPT
     # preference wording: react over respond when an emoji fully carries the reply
-    assert 'PREFER "react" over "respond"' in p
+    assert 'prefer "react" over "respond"' in p
     # delegation/FYI example present
-    assert "instruction or delegation" in p and "FYI" in p
+    assert "a wordless acknowledgement of something aimed at it" in p and "FYI" in p
     # redundant-acknowledgment rule present
     assert "ALREADY acknowledged with a reaction" in p
 
@@ -163,25 +180,25 @@ def test_valid_emoji_name_matrix():
 class TestValidateVerdictUnrestricted:
     def test_off_list_name_accepted_by_default(self, monkeypatch):
         monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
-        v = ParticipationEngine.validate_verdict({"action": "react", "emoji": ":joy:"})
+        v = ParticipationEngine.validate_verdict({"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "react", "emoji": ":joy:"})
         assert v.action == "react" and v.emoji == "joy"
 
     def test_malformed_name_downgrades_to_ignore(self, monkeypatch):
         monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
-        v = ParticipationEngine.validate_verdict({"action": "react", "emoji": "bad name!"})
+        v = ParticipationEngine.validate_verdict({"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "react", "emoji": "bad name!"})
         assert v.action == "ignore"
 
     def test_allowlist_enforced_when_configured(self, monkeypatch):
         monkeypatch.setattr(config, "reaction_emojis", ["thumbsup", "eyes"], raising=False)
         # off-list falls back to first allowlisted emoji
-        v = ParticipationEngine.validate_verdict({"action": "react", "emoji": "joy"})
+        v = ParticipationEngine.validate_verdict({"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "react", "emoji": "joy"})
         assert v.action == "react" and v.emoji == "thumbsup"
 
     def test_react_and_respond_offlist_falls_back_and_stays(self, monkeypatch):
         # react_and_respond coerces its emoji through the allowlist exactly like react; an off-list
         # name falls back to the first allowed emoji and the action STAYS react_and_respond.
         monkeypatch.setattr(config, "reaction_emojis", ["thumbsup"], raising=False)
-        v = ParticipationEngine.validate_verdict({"action": "react_and_respond", "emoji": "joy"})
+        v = ParticipationEngine.validate_verdict({"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "react_and_respond", "emoji": "joy"})
         assert v.action == "react_and_respond" and v.emoji == "thumbsup"
 
     def test_react_and_respond_bad_emoji_no_allowlist_downgrades_to_respond(self, monkeypatch):
@@ -189,7 +206,7 @@ class TestValidateVerdictUnrestricted:
         # keeps the worded reply: downgrade to a plain respond with no emoji.
         monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
         v = ParticipationEngine.validate_verdict(
-            {"action": "react_and_respond", "emoji": "bad name!"})
+            {"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "react_and_respond", "emoji": "bad name!"})
         assert v.action == "respond" and v.emoji is None
 
 

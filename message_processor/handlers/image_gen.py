@@ -8,13 +8,13 @@ class ImageJobMixin:
 
     Both methods are driven by the F34 image TOOLS (message_processor/image_tools.py) — the
     detached ``generate_image`` schedules the job from inside the tool loop, where there is no
-    Message object, only a ToolContext. That is why the signature takes ``message_ts`` /
-    ``unprompted`` rather than the triggering message.
+    Message object, only a ToolContext. That is why the signature takes ``message_ts``
+    rather than the triggering message.
     """
 
     async def _finish_image_generation_background(self, *, client, channel_id, thread_id,
             thread_key, prompt, enhance, conversation_history, thread_config, checklist,
-            generating_id, generation_id, message_ts=None, unprompted=False) -> None:
+            generating_id, generation_id, message_ts=None) -> None:
         """The slow generate_image call plus delivery, run after the thread lock released."""
         from message_processor.image_delivery import publish_image, review_produced_image
         from message_processor.image_service import resolve_settings
@@ -36,7 +36,7 @@ class ImageJobMixin:
                 processor=self, client=client, channel_id=channel_id, thread_id=thread_id,
                 thread_key=thread_key, image_data=image_data, checklist=checklist,
                 generation_id=generation_id, prompt=image_data.prompt, db=self.db,
-                thread_manager=self.thread_manager, unprompted=unprompted,
+                thread_manager=self.thread_manager,
                 message_ts=message_ts, provenance_tool="generate_image",
             )
             if file_url is None:

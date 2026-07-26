@@ -63,6 +63,8 @@ class SlackBot(SlackMessageEventsMixin,
         # Bot self-identity (populated once via auth_test on start; used to tell our own
         # messages apart from other bots'/humans' — see classify_sender / is_own_message)
         self.bot_user_id = None
+        self.bot_handle = None   # resolved Slack handle; see _ensure_self_identity
+        self._emoji_flush_task = None  # periodic emoji-tally persister; started in start()
         self.bot_id = None
         self.app_id = None
         # Workspace team_id (from auth_test); chat.startStream now requires it as
@@ -111,6 +113,13 @@ class SlackBot(SlackMessageEventsMixin,
             # the emoji-field description reflects the live custom-emoji cache without a restart.
             registry.register(self.get_react_tool_schema, self.execute_react_tool,
                               name="react_to_message")
+            # Discovery for the ~1,400 custom emoji that cannot all fit in a schema description.
+            # Hidden entirely under a REACTION_EMOJIS allowlist: there, the enum IS the palette
+            # and searching a catalog the model may not draw from would only invite refusals.
+            if not (config.reaction_emojis or []):
+                registry.register(self.get_emoji_search_tool_schema(),
+                                  self.execute_emoji_search_tool,
+                                  name="search_workspace_emoji")
         # F23: cross-thread reply into a DIFFERENT thread of the current channel (write-scoped
         # to this channel; muted target threads refused by the executor).
         if config.enable_post_to_thread_tool:

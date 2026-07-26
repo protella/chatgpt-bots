@@ -26,13 +26,30 @@ from message_processor.participation import ParticipationEngine, ParticipationVe
 # ----------------------------------------------------------------- verdict parsing
 
 class TestExpandedVerdictParsing:
-    def test_old_shape_still_parses_with_defaults(self):
+    def test_old_shape_parses_but_no_longer_speaks(self):
+        # DELIBERATE REVERSAL. This used to assert that a pre-staged-prompt verdict still spoke,
+        # as rollback insurance while the staged prompt was new. The staged prompt is now the
+        # only prompt, so a verdict with no staged findings does not mean "old bot" — it means
+        # the reply was truncated or malformed, and that was the ONE path skipping every
+        # invariant. It now fails closed. Parsing is unchanged; only the action is refused.
         v = ParticipationEngine.validate_verdict(
             {"action": "respond", "emoji": None, "placement": "channel", "reason": "hi"})
-        assert (v.action, v.placement) == ("respond", "channel")
+        assert v.action == "ignore"
+        assert v.overruled_by == ["incomplete_stages"]
+        assert v.placement == "channel"          # every other field still parses as before
+        assert v.reason == "hi"
         # new fields default and never leak onto a non-backoff verdict
         assert v.dimension is None and v.durability is None and v.scope is None
         assert v.guidance == "" and v.memory_op == "none" and v.structural_request == "none"
+
+    def test_full_staged_shape_speaks(self):
+        # The counterpart: a complete verdict is untouched, so the reversal above is about
+        # MISSING findings, not about tightening what a well-formed verdict may do.
+        v = ParticipationEngine.validate_verdict(
+            {"action": "respond", "relation": "to_assistant", "exchange_state": "open",
+             "answerability": "substantive", "placement": "channel", "reason": "hi"})
+        assert (v.action, v.placement) == ("respond", "channel")
+        assert v.overruled_by is None
 
     def test_backoff_taxonomy_parsed(self):
         v = ParticipationEngine.validate_verdict({
@@ -489,11 +506,11 @@ class TestParticipationPromptGuardrails:
         # structural settings change. structural_request is reserved for an explicit instruction
         # that maps LOSSLESSLY to a channel setting; a scoped/conditional grant is a preference.
         from prompts import PARTICIPATION_SYSTEM_PROMPT as p
-        assert "NOT a structural request" in p
-        assert "explicit, direct instruction that maps LOSSLESSLY to the channel" in p
+        assert "Use \"none\" for soft preferences and momentary asides" in p
+        assert "an explicit instruction that maps LOSSLESSLY onto the channel" in p
         # A grant scoped to a topic/audience/situation must be recorded as a preference, not a
         # whole-channel setting flip (the "welcome to banter about bots" incident).
-        assert "BROADEN the instruction beyond its stated condition" in p
+        assert "BROADEN the instruction past its stated condition" in p
 
     def test_prompt_reversal_is_a_backoff_case(self):
         # Negation / reversal ("you can chime in again", "react away") is handled as backoff so it
@@ -504,21 +521,33 @@ class TestParticipationPromptGuardrails:
     def test_prompt_lets_the_human_have_the_last_word(self):
         # On a human's punchline/closer, react rather than re-joke (or ignore) — don't add a beat.
         from prompts import PARTICIPATION_SYSTEM_PROMPT as p
-        assert "Let the human have the last word" in p
-        assert "do not add another verbal beat or re-joke" in p
+        assert "a person has just landed the closing beat" in p
+        assert "Only an explicit welcome back or a real new ask reopens it" in p
 
     def test_prompt_one_message_per_beat_no_bot_chains(self):
-        # Don't chain onto another bot's reply to agree/restate/extend unless a human is driving.
-        from prompts import PARTICIPATION_SYSTEM_PROMPT as p
-        assert "One message per beat" in p
-        assert "a human is actively driving that exchange" in p
+        """One clean move per beat, and never a reply chained onto another assistant's reply just
+        to agree or extend the bit. The old prompt carved an exception for "a human is actively
+        driving that exchange"; the staged form drops the carve-out because Stage 1 already
+        decides whether the message is the assistant's to answer."""
+        from prompts import PARTICIPATION_SYSTEM_PROMPT
+        p = PARTICIPATION_SYSTEM_PROMPT
+        assert "One clean move per beat" in p
+        assert "never chain onto another assistant's reply merely to agree" in p
+        assert "restating it in words is noise" in p
 
-    def test_prompt_teasing_at_assistant_is_respond_not_backoff(self):
-        # Item B: banter genuinely AT the assistant is participation-worthy (react or a quip),
-        # not backoff; teasing pointed at another party still stays theirs.
-        from prompts import PARTICIPATION_SYSTEM_PROMPT as p
-        assert "teasing genuinely aimed AT the assistant is participation-worthy" in p
-        assert "teasing pointed at another party, or a message merely talking about the assistant stays theirs" in p
+    def test_prompt_teasing_at_assistant_is_not_routed_to_backoff(self):
+        """Teasing is not participation FEEDBACK — a jab must not be misread as an instruction to
+        pipe down, or a joke would silently rewrite the channel's settings.
+
+        Note what changed on 2026-07-26: teasing is also no longer a reason to SPEAK. The old
+        clause calling it "participation-worthy" was the mechanism behind a real misfire (a reply
+        landing 52s after a human said "Hush"), so it was removed — see
+        test_participation_tuning.test_b_banter_rule_replaced. Both halves matter: a joke is
+        neither feedback nor an invitation."""
+        from prompts import PARTICIPATION_SYSTEM_PROMPT
+        p = PARTICIPATION_SYSTEM_PROMPT
+        assert "never for ordinary disagreement between people" in p
+        assert "participation-worthy" not in p
 
     def test_prompt_forbids_reaction_ack_on_reactions_dimension(self):
         from prompts import PARTICIPATION_SYSTEM_PROMPT as p

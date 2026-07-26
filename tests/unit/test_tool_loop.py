@@ -923,7 +923,7 @@ def test_participation_prompt_routes_explicit_reaction_requests_to_respond():
     # F6 addendum: an explicit "add some reactions" request must NOT die at the gate's
     # single-emoji react verdict — route it to respond so the main model places them.
     from prompts import PARTICIPATION_SYSTEM_PROMPT
-    assert "EXPLICITLY asks the assistant to add a reaction" in PARTICIPATION_SYSTEM_PROMPT
+    assert "explicitly ASKS the assistant to place a reaction" in PARTICIPATION_SYSTEM_PROMPT
     assert 'choose "respond"' in PARTICIPATION_SYSTEM_PROMPT
 
 

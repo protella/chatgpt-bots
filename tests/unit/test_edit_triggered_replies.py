@@ -354,7 +354,7 @@ class _RecordingClient:
 @pytest.mark.asyncio
 async def test_engine_folds_edit_block_into_classifier_prompt(monkeypatch):
     monkeypatch.setattr(config, "participation_debounce_seconds", 0.0, raising=False)
-    client = _RecordingClient({"action": "respond"})
+    client = _RecordingClient({"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "respond"})
     client._edit_reply_ctx_map["C1|100.1"] = {
         "old_text": "please review", "new_text": "please review the Q3 numbers",
         "already_replied": True,
@@ -364,7 +364,7 @@ async def test_engine_folds_edit_block_into_classifier_prompt(monkeypatch):
         channel_id="C1", ts="100.1", text="please review the Q3 numbers", client=client)
     assert verdict.action == "respond"
     assert client.calls == 1
-    # The classifier saw the [EDIT] block with the old text + already-replied note; the verdict's
+    # The classifier saw the \"[EDIT]\" note block with the old text + already-replied note; the verdict's
     # own text stays untouched for the responder.
     assert "[EDIT]" in client.last_text
     assert "please review" in client.last_text
@@ -403,8 +403,8 @@ async def test_ordinary_message_untouched_by_edit_plumbing(monkeypatch):
 
 def test_participation_prompt_carries_edit_rubric():
     assert "[EDIT]" in PARTICIPATION_SYSTEM_PROMPT
+    assert '"[EDIT]" note' in PARTICIPATION_SYSTEM_PROMPT
     lower = PARTICIPATION_SYSTEM_PROMPT.lower()
-    assert "edited message" in lower
     assert "typo" in lower
     assert "correction" in lower
 
@@ -416,7 +416,7 @@ async def test_edit_supersedes_original_in_flight_evaluation(monkeypatch):
     """The ORIGINAL (pre-edit) message is mid-debounce when an edit supersedes it: its evaluation
     must return None (no stale respond), exactly as a newer burst arrival would cause."""
     monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-    client = _RecordingClient({"action": "respond"})
+    client = _RecordingClient({"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "respond"})
     engine = ParticipationEngine(client)
     # Kick off the original's evaluation, then supersede it mid-debounce (as the edit path does).
     task = asyncio.create_task(engine.evaluate(
@@ -434,7 +434,7 @@ async def test_edits_own_reevaluation_survives_supersession(monkeypatch):
     """The edit's OWN fresh evaluation carries edit context and must NOT be dropped by the
     supersession mark (only the context-free stale original is)."""
     monkeypatch.setattr(config, "participation_debounce_seconds", 0.0, raising=False)
-    client = _RecordingClient({"action": "respond"})
+    client = _RecordingClient({"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "respond"})
     client._edit_reply_ctx_map["C1|100.1"] = {
         "old_text": "review", "new_text": "review the Q3 numbers", "already_replied": False}
     engine = ParticipationEngine(client)
