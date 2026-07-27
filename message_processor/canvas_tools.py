@@ -876,12 +876,6 @@ async def execute_create_channel_canvas(ctx: ToolContext, args: Dict[str, Any]) 
         # it. Invalidate inside the lock so the next check (ours or a sibling's) SEES this canvas.
         _invalidate_catalog(ctx.channel_id)
 
-    # F46: a canvas was really written — deliverable work that does not call claim_work. Force
-    # a top-level channel reply into a thread at final-post time (resolve_reply_target).
-    _turn = getattr(ctx, "turn", None)
-    if _turn is not None:
-        _turn.mark_substantive_work()
-
     url = await _permalink(web, canvas_id)
     logger.info(f"Created the channel canvas {canvas_id} ({title!r}) in {ctx.channel_id}")
     return {"ok": True, "canvas_id": canvas_id, "title": title, "is_channel_canvas": True,
@@ -1218,11 +1212,6 @@ async def execute_edit_canvas(ctx: ToolContext, args: Dict[str, Any]) -> Dict[st
     except Exception as e:  # noqa: BLE001
         logger.error(f"canvases.edit failed for {canvas_id}: {e}", exc_info=True)
         return _err("edit_failed", f"Slack refused the edit: {e}")
-
-    # F46: a canvas edit is deliverable work (no claim_work here) — thread a top-level reply.
-    _turn = getattr(ctx, "turn", None)
-    if _turn is not None:
-        _turn.mark_substantive_work()
 
     _invalidate_catalog(ctx.channel_id)
     logger.info(f"Edited canvas {canvas_id} ({operation})")

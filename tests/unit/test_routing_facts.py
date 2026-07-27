@@ -274,7 +274,7 @@ def test_turn_runtime_and_tool_exposure_agree_with_the_fact(mock_env, monkeypatc
                                                             expect_silence):
     """One value drives both, so the UI policy and the tool can never drift apart."""
     monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
-    turn = TurnRuntime.for_message(_msg(**meta), "1.1")
+    turn = TurnRuntime.for_message(_msg(**meta), channel_post_allowed=False)
     assert turn.silence_capable is expect_silence
 
     host = _MatHost(_registry())
@@ -287,7 +287,7 @@ def test_turn_runtime_and_tool_exposure_agree_with_the_fact(mock_env, monkeypatc
 def test_the_config_switch_still_closes_the_silence_option(mock_env, monkeypatch):
     """The route says silence is ALLOWED; the flag says the tool that performs it exists."""
     monkeypatch.setattr(config, "enable_no_reply_tool", False, raising=False)
-    turn = TurnRuntime.for_message(_msg(gate_required=True, silence_capable=True), "1.1")
+    turn = TurnRuntime.for_message(_msg(gate_required=True, silence_capable=True), channel_post_allowed=False)
     assert turn.silence_capable is False
 
 

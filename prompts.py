@@ -104,25 +104,6 @@ Output ONLY a JSON object, no prose, in exactly this shape. Fill "relation", "ex
 {"relation": "to_assistant" | "to_other" | "about_assistant" | "to_room" | "unclear", "exchange_state": "open" | "closed_by_human" | "reopened", "answerability": "substantive" | "limitation_only" | "requires_human" | "not_applicable", "action": "respond" | "react" | "react_and_respond" | "ignore" | "backoff", "emoji": "<a standard Slack emoji name (or one from the allowed list, if given); the reaction when action=react or react_and_respond, an optional ack when action=backoff, else empty>", "placement": "thread" | "channel", "reason": "<one short sentence>", "dimension": "reactions" | "replies" | "verbosity" | "thread_participation", "durability": "momentary" | "standing", "scope": "thread" | "channel", "guidance": "<short preference text>", "memory_op": "none" | "add" | "update:<id>" | "delete:<id>", "structural_request": "none" | "participation" | "placement" | "both", "image_observations": ["<per-image factual observations, in order>"]}"""
 
 
-# F46 — placement judgment for an ADDRESSED turn. Unlike PARTICIPATION_SYSTEM_PROMPT above, the
-# assistant WAS addressed (an @mention or a name-wake) and IS going to answer — the only question
-# is WHERE the top-level reply belongs. Mirrors the participation prompt's "placement" rubric but
-# never reuses it verbatim: that prompt assumes the assistant was NOT addressed, which is false here.
-PLACEMENT_SYSTEM_PROMPT = """You decide WHERE an AI assistant should post its reply in a Slack channel. The assistant was directly addressed (an @mention or by name) and IS going to answer — do NOT decide whether to reply, only whether the reply reads better as a top-level channel message or under a thread.
-
-Choose "thread" when:
-- the reply is likely to be long, or a deliberately requested long-form deliverable (e.g. "write me a three-paragraph story", "draft the announcement", "give me a detailed rundown") — long-form belongs in a thread so it doesn't dominate the channel;
-- back-and-forth is likely (a follow-up or clarification will probably continue) — a thread keeps the exchange attached to its question;
-- the triggering message addressed multiple parties, or another assistant is likely to answer too — everyone's replies then collect under the message instead of scattering the channel.
-
-Choose "channel" when the reply is a short answer the whole room benefits from seeing inline, or a quick conversational beat (a one-liner, an acknowledgment, a fact anyone scanning the channel would want at a glance).
-
-Judge the REQUEST, not raw verbosity: a quick question that happens to get a wordy answer still belongs in the channel — thread only for deliberately-requested long-form. When genuinely balanced, prefer "channel" (the assistant was summoned at channel level).
-
-Output ONLY a JSON object, no prose, exactly this shape:
-{"placement": "thread" | "channel", "reason": "<one short sentence>"}"""
-
-
 MEMORY_EXTRACTION_SYSTEM_PROMPT = """You maintain a small long-term memory for an AI assistant scoped to ONE Slack channel. After each exchange you decide whether there is a DURABLE, channel-relevant fact worth remembering for future conversations.
 
 WORTH remembering (examples): stable preferences ("they like terse answers"), where things live ("deploys go through #ops"), team conventions, ongoing project context, who owns what, decisions that will matter later.
@@ -370,6 +351,25 @@ THREAD_ACTIVITY_NO_REPLY_SUFFIX = (
     "anything else you do this round still happens. NEVER post a placeholder announcing you're "
     "staying quiet or deferring to them; silence means silence. Never call it to wait for work "
     "you started yourself: finish it and report it.]"
+)
+
+
+# Volatile developer-suffix paragraph, added ONLY on turns where `set_reply_destination` is
+# exposed — a top-level message in a channel that allows both destinations. Everywhere else the
+# route has already decided and there is nothing to say.
+#
+# The default is REVERSED from the utility-model classifier this replaces: that one answered
+# "channel" whenever it was unsure (and on every error), so an ambiguous long answer landed in
+# the room. A thread costs a reader one click; a wall of text at channel level costs everyone
+# who scrolls past it. When it is genuinely balanced, the thread is the kinder default.
+DESTINATION_CONTRACT_SUFFIX = (
+    "[This message is at the top level of a channel where you may reply either way, so choose "
+    "before you write: call set_reply_destination exactly once, then answer. `thread` keeps the "
+    "reply under the message — right for anything long, detailed, specialized, or mainly of "
+    "interest to the person who asked. `channel` posts at the top level, where everyone reading "
+    "along sees it without opening anything — right for a short answer the room genuinely "
+    "benefits from. If it is a close call, choose thread: a thread costs one click to read, and "
+    "a long answer at channel level costs everyone scrolling past it.]"
 )
 
 

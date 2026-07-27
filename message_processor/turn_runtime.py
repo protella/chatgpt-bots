@@ -19,10 +19,14 @@ So the turn carries its own state:
 * ``silence_capable`` — the same predicate that decides whether ``no_response_needed`` is
   exposed to the model. One value drives both, so the tool and the UI policy can never drift
   apart: if the model can stay quiet, we don't pre-announce that it won't.
-* ``reply_thread_id`` — where a reply actually goes (None = top-level in the channel). The
-  streaming paths used to infer this from ``message.thread_id``, which is only ever right
-  because the placeholder already existed in the correct place. Take the placeholder away
-  and a top-level ambient reply lands in a thread instead.
+* ``reply_destination`` + ``destination_source`` + ``destination_selected`` +
+  ``destination_locked`` — WHERE the reply goes, WHO decided, whether the decision has been
+  made yet, and whether it can still change. Destination used to be a boolean
+  (``place_in_channel``) recomputed in four places from a channel setting, a gate verdict and
+  a "did the turn do real work" heuristic — so the streaming coordinator, the footer, the
+  wake envelope and the ledger could each believe something different about one reply. Now
+  one turn states it once, and the MODEL makes the call on the only route where there is a
+  call to make (`set_reply_destination`).
 * ``ack_lease`` — the receipt for a 👀 this turn placed, and the only thing that lets it be
   taken back.
 
@@ -42,6 +46,20 @@ from message_processor import participation_telemetry
 
 logger = setup_logger(name="slack_bot.TurnRuntime")
 
+# Where a reply can go. `dm` is its own value rather than a flavour of `thread`: a DM has no
+# other option, and collapsing it into `thread` loses the distinction between "there was no
+# choice" and "the choice was made and came out this way".
+DESTINATION_DM = "dm"
+DESTINATION_THREAD = "thread"
+DESTINATION_CHANNEL = "channel"
+DESTINATIONS = frozenset({DESTINATION_DM, DESTINATION_THREAD, DESTINATION_CHANNEL})
+# The values the MODEL may choose between. A DM is not on the menu — nothing to decide.
+SELECTABLE_DESTINATIONS = (DESTINATION_THREAD, DESTINATION_CHANNEL)
+
+SOURCE_STRUCTURAL = "structural"
+SOURCE_MODEL = "model"
+SOURCE_DEFAULT = "default"
+
 
 @dataclass
 class TurnRuntime:
@@ -50,12 +68,22 @@ class TurnRuntime:
     silence_capable: bool = False
     progress_enabled: bool = True
     reply_thread_id: Optional[str] = None
-    final_post_only: bool = False
-    # F46: did this turn do real, thread-worthy work? Set by mark_substantive_work() at every
-    # site that stakes a work claim (a hosted tool ran, an MCP call was made, or a slow local
-    # deliverable tool ran). Drives resolve_reply_target's top-level→thread override. Tracked
-    # SEPARATELY from the 👀/claim_work, which early-returns when enable_ack_reaction is off.
-    did_substantive_work: bool = False
+    # --- where this turn's reply goes, stated rather than inferred ---
+    # WHERE: "dm" | "thread" | "channel". Always populated, from the first moment of the turn.
+    reply_destination: str = DESTINATION_THREAD
+    # WHO decided: "structural" (the route left no choice), "model" (it called the tool), or
+    # "default" (it was offered the choice and did not take it).
+    destination_source: str = SOURCE_STRUCTURAL
+    # False ONLY while an eligible top-level turn is still waiting for the model to choose. It
+    # is the flag that keeps a surface from being minted in a place the answer may not go.
+    destination_selected: bool = True
+    # True once a reply surface exists. After that the destination is a fact about Slack, not a
+    # preference — a late change would leave a message stranded in the other place.
+    destination_locked: bool = False
+    # The model was offered the choice, produced words, and never called the tool. Recorded (not
+    # corrected): the answer is delivered in the default thread, and the miss is a prompt problem
+    # worth counting rather than a delivery problem worth guessing about.
+    destination_contract_miss: bool = False
     # Did THIS turn put one of our emoji on a message? Set by the react tool at the moment the
     # reaction lands, because that is the only place every reacting path passes through. It used
     # to be derived per-Response in the handlers, and only the no-reply branch actually built
@@ -74,63 +102,144 @@ class TurnRuntime:
     visible_action_committed: bool = False
     _claiming: bool = field(default=False, repr=False)
 
+    @property
+    def final_post_only(self) -> bool:
+        """F39 — the "(edited)" rule. Slack can only STREAM into a thread: chat.startStream
+        REQUIRES thread_ts. So a reply headed for the top level of a channel has no native path,
+        and the legacy fallback fakes streaming by posting a stub and chat.update-ing it — which
+        stamps the message "(edited)" forever. A human teammate doesn't post a stub and revise it
+        in public; they post once, finished.
+
+        So a channel-destined turn writes NOTHING until the answer is whole. DMs and threads are
+        unaffected: they stream exactly as before. This is now derived rather than stored,
+        because it was only ever a restatement of where the reply is going, and two fields for
+        one fact is how they came to disagree."""
+        return self.reply_destination == DESTINATION_CHANNEL
+
     @classmethod
-    def for_message(cls, message: Any, reply_thread_id: Optional[str]) -> "TurnRuntime":
-        """Silence-capable == the routing fact of the same name, and nothing else. Which routes
-        may end without words is decided once at dispatch (routing_facts.py); this used to
-        re-derive it from a gate flag plus a `wake_source` string, which is a second copy of
-        that table living where nobody would think to update it. The config switch stays
-        here — the route says whether silence is allowed, the flag says whether the tool that
-        performs it exists. Mirrors text.py::_materialize_request_tools; keep them in step."""
+    def for_message(cls, message: Any, *, channel_post_allowed: bool = False) -> "TurnRuntime":
+        """Open a turn with its destination already stated.
+
+        Three of the four routes have no decision to make, and say so with
+        `destination_source="structural"`: a DM has nowhere else to go, a reply inside an
+        existing thread belongs to that thread, and a channel that forbids top-level replies has
+        settled the question in its settings. Only a top-level trigger in a channel that allows
+        both is genuinely open — and that turn starts UNSELECTED, defaulting to the thread, and
+        shows nothing anywhere until the model chooses.
+
+        Silence-capable == the routing fact of the same name, and nothing else (routing_facts.py).
+        The config switch stays here: the route says whether silence is allowed, the flag says
+        whether the tool that performs it exists. Mirrors text.py::_materialize_request_tools."""
         meta = getattr(message, "metadata", None) or {}
         silence_capable = (meta.get("silence_capable") is True
                            and bool(getattr(config, "enable_no_reply_tool", True)))
-
-        # F39 — the "(edited)" rule. Slack can only STREAM into a thread: chat.startStream
-        # REQUIRES thread_ts. So a reply we're about to post at the top level of a channel has
-        # no native path, and the legacy fallback fakes streaming by posting a stub and
-        # chat.update-ing it — which stamps the message "(edited)" forever. A human teammate
-        # doesn't post a stub and revise it in public; they post once, finished. Neither does
-        # Claude, which is why its top-level replies carry no edit marker and ours did.
-        #
-        # So these turns write NOTHING until the answer is whole: no placeholder, no composer
-        # status (it would auto-open a thread anyway), no edit loop. Just the finished message.
-        # DMs are excluded — they also can't stream natively, but a DM is a conversation, not a
-        # public channel, and losing the live reveal there is a real cost with no edit-marker
-        # complaint attached. Threads keep streaming exactly as before.
         channel_id = str(getattr(message, "channel_id", "") or "")
-        final_post_only = (reply_thread_id is None and bool(channel_id)
-                           and not channel_id.startswith("D"))
+        thread_id = getattr(message, "thread_id", None)
+
+        if channel_id.startswith("D"):
+            destination, selected = DESTINATION_DM, True
+        elif meta.get("ts") != thread_id or not channel_post_allowed:
+            # An existing thread, or a channel whose settings forbid a top-level reply.
+            destination, selected = DESTINATION_THREAD, True
+        else:
+            # Both destinations legal: the model decides, and until it does the answer is
+            # provisionally headed for the thread.
+            destination, selected = DESTINATION_THREAD, False
+
         return cls(
             silence_capable=silence_capable,
-            # A turn that may say nothing shows no chrome; neither does one that can't show
-            # chrome without editing it into the answer afterwards.
-            progress_enabled=not (silence_capable or final_post_only),
-            reply_thread_id=reply_thread_id,
-            final_post_only=final_post_only,
+            # A turn that may say nothing shows no chrome; neither does one that cannot show
+            # chrome without editing it into the answer afterwards; neither does one that does
+            # not yet know WHERE its chrome would go.
+            progress_enabled=not (silence_capable
+                                  or destination == DESTINATION_CHANNEL
+                                  or not selected),
+            reply_thread_id=None if destination == DESTINATION_CHANNEL else thread_id,
+            reply_destination=destination,
+            destination_source=SOURCE_STRUCTURAL if selected else SOURCE_DEFAULT,
+            destination_selected=selected,
         )
 
-    def mark_substantive_work(self) -> None:
-        """F46: record that this turn did real, thread-worthy work (a hosted tool ran, an MCP
-        call was made, or a deliverable local tool ran). Drives the top-level→thread override at
-        final-post time. Separate from claim_work()/the 👀, which is gated on enable_ack_reaction."""
-        self.did_substantive_work = True
+    def select_destination(self, destination: Any, message: Any = None) -> dict:
+        """The model's choice, from `set_reply_destination`. Returns the tool result.
+
+        Refuses rather than guesses, in every direction: an unrecognized value, a second call
+        that contradicts the first, and any call once a surface exists. The last one matters
+        most — after a message is up, moving the destination would leave that message stranded
+        in a place the rest of the answer is not going. An identical repeat is fine and changes
+        nothing (models re-state decisions; that is not a conflict)."""
+        if destination not in SELECTABLE_DESTINATIONS:
+            return {"ok": False, "error": "invalid_destination",
+                    "message": ("`destination` must be exactly one of "
+                                f"{', '.join(SELECTABLE_DESTINATIONS)}.")}
+        if self.destination_locked:
+            return {"ok": False, "error": "destination_locked",
+                    "message": ("The reply has already started going out — its destination "
+                                "cannot change now.")}
+        if self.destination_source == SOURCE_STRUCTURAL:
+            # A DM, a thread, a channel that forbids top-level replies, or a turn that already
+            # posted a notice. The route decided, so there is nothing to choose — and the tool
+            # is not offered on these turns at all. This is the backstop for the gap between
+            # those two facts: the registry checks `enabled` when it builds the SCHEMA set, not
+            # again at dispatch, so a call that arrives anyway must be refused by the state
+            # rather than silently overwrite it.
+            return {"ok": False, "error": "destination_not_open",
+                    "message": ("This reply's destination is already settled by where the "
+                                "conversation is — there is nothing to choose here.")}
+        if self.destination_selected and self.destination_source == SOURCE_MODEL:
+            if destination == self.reply_destination:
+                return {"ok": True, "destination": destination, "idempotent": True}
+            return {"ok": False, "error": "destination_conflict",
+                    "message": (f"You already chose `{self.reply_destination}` for this reply. "
+                                "One destination per turn.")}
+        self.reply_destination = destination
+        self.destination_source = SOURCE_MODEL
+        self.destination_selected = True
+        self.reply_thread_id = (None if destination == DESTINATION_CHANNEL
+                                else getattr(message, "thread_id", self.reply_thread_id))
+        return {"ok": True, "destination": destination}
+
+    def settle_structural_thread(self) -> None:
+        """A visible surface already exists in the thread — a prior-timeout notice, a
+        failed-files notice — so the question is settled by fact rather than by preference.
+
+        Both notices post BEFORE the model runs. Leaving the turn open after one would let the
+        model send the answer to the channel top level, splitting a single turn across two
+        surfaces: a warning in the thread and the answer somewhere else. So the destination
+        becomes the thread, STRUCTURALLY (the route left no choice — this is not a model that
+        declined to choose, so it is not a contract miss), and it locks. The tool is not exposed
+        on a settled turn, so the model is never offered a choice that no longer exists."""
+        if self.destination_locked:
+            return
+        self.reply_destination = DESTINATION_THREAD
+        self.destination_source = SOURCE_STRUCTURAL
+        self.destination_selected = True
+        self.destination_locked = True
+
+    def settle_default_destination(self) -> None:
+        """Words are arriving and the model never chose. The answer is NOT dropped and NOT
+        guessed at from its text: it goes to the default (the thread), and the miss is recorded
+        so a prompt that keeps producing it is visible in the ledger rather than only in the
+        room."""
+        if self.destination_selected:
+            return
+        self.destination_selected = True
+        self.destination_source = SOURCE_DEFAULT
+        self.destination_contract_miss = True
+
+    def lock_destination(self) -> None:
+        """A reply surface now exists. Idempotent; called from every path that mints one."""
+        self.destination_locked = True
 
     def resolve_reply_target(self, message: Any) -> Optional[str]:
-        """F46: the thread_ts a final reply should go to. A top-level channel reply (reply_thread_id
-        is None, final_post_only) that did substantive work is threaded under the trigger; otherwise
-        the original target stands. Mutates message.metadata['place_in_channel']=False when it flips,
-        so attribution/footer render as a threaded reply. Idempotent; fail-open."""
-        try:
-            if (self.final_post_only and self.reply_thread_id is None
-                    and self.did_substantive_work):
-                meta = getattr(message, "metadata", None)
-                if isinstance(meta, dict):
-                    meta["place_in_channel"] = False
-                return getattr(message, "thread_id", None)
-        except Exception:
-            pass
-        return self.reply_thread_id
+        """The thread_ts a reply should be posted with — None means top-level in the channel.
+
+        A pure mapping from the stated destination, nothing more. It used to also carry a
+        substantive-work override that re-threaded a channel reply after the fact, which is a
+        heuristic second-guessing a decision the model is now asked to make outright."""
+        if self.reply_destination == DESTINATION_CHANNEL:
+            return None
+        return getattr(message, "thread_id", None) if message is not None else self.reply_thread_id
 
     async def claim_work(self, client: Any, message: Any) -> None:
         """Real work is starting: stake the 👀 claim on the triggering message.

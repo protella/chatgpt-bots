@@ -434,16 +434,6 @@ class OpenAIClient(LoggerMixin):
         return await responses_api.classify_participation(
             self, text=text, signals=signals, images=images)
 
-    async def classify_placement(
-        self,
-        text: str,
-        *,
-        signals: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        """F46 placement judgment for an ADDRESSED turn: "thread" | "channel". Fail-open —
-        any error/timeout/parse failure returns "channel" (today's top-level mention behavior)."""
-        return await responses_api.classify_placement(self, text=text, signals=signals)
-
     async def extract_memory(
         self,
         exchange_text: str,

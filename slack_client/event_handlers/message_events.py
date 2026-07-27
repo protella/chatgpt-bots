@@ -14,6 +14,19 @@ from slack_client.channel_pulse import pulse_supplementary_budget as _pulse_supp
 from slack_client.formatting.blocks import extract_supplementary_text
 
 
+def _channel_post_allowed(cs: Any) -> bool:
+    """Does this channel allow a reply at the TOP LEVEL, rather than only inside a thread?
+
+    A row's EXPLICIT True/False wins; None (inherit) or no row at all falls back to the global
+    default. Stamped as a real boolean on every dispatch: the old convention wrote the key only
+    when it was true, so "threads only" and "nobody resolved this yet" were the same absence —
+    and every consumer had to re-derive the setting to tell them apart."""
+    value = (cs or {}).get("reply_in_channel")
+    if value is None:
+        value = config.reply_in_channel_default
+    return bool(value)
+
+
 def _summarize_attachments(files: Any) -> Any:
     """F14b: compact summary of a message's files for the participation classifier —
     count + kind breakdown + filenames only, never content. Images (mimetype image/*)
@@ -789,11 +802,7 @@ class SlackMessageEventsMixin:
             message.metadata["participation_images"] = gate_images
         if cs and cs.get("directives"):
             message.metadata["channel_directives"] = cs["directives"]
-        reply_in_channel = (cs or {}).get("reply_in_channel")
-        if reply_in_channel is None:
-            reply_in_channel = config.reply_in_channel_default
-        if reply_in_channel:
-            message.metadata["reply_in_channel"] = True
+        message.metadata["channel_post_allowed"] = _channel_post_allowed(cs)
 
         self.log_debug(
             f"Edit-triggered engine dispatch: channel={channel_id}, ts={msg_ts}, level={level}, "
@@ -1014,16 +1023,10 @@ class SlackMessageEventsMixin:
         # Phase 7: carry per-channel ground rules + placement into the response pipeline.
         if cs and cs.get("directives"):
             message.metadata["channel_directives"] = cs["directives"]
-        # reply_in_channel resolution (redesign Layer 1): a row's EXPLICIT True/False wins;
-        # None (inherit) OR no row at all falls back to the global default. The old `elif` hung
-        # off `if cs:`, so a channel WITH a row but a NULL reply_in_channel never reached the
-        # default and was silently forced to threads-only. The engine still judges placement
-        # per message when top-level replies are allowed.
-        reply_in_channel = (cs or {}).get("reply_in_channel")
-        if reply_in_channel is None:
-            reply_in_channel = config.reply_in_channel_default
-        if reply_in_channel:
-            message.metadata["reply_in_channel"] = True
+        # Whether a top-level reply is ALLOWED here (redesign Layer 1). An allowance, not a
+        # mandate: where both destinations are legal the model chooses per reply
+        # (set_reply_destination). Always stamped, true or false.
+        message.metadata["channel_post_allowed"] = _channel_post_allowed(cs)
 
         self.log_debug(
             f"Channel message dispatch: channel={channel_id}, ts={ts}, level={level}, "
@@ -1075,6 +1078,10 @@ class SlackMessageEventsMixin:
         stamp_routing_facts(message, gate_required=False, silence_capable=False,
                             addressed=True, ts=event.get("ts"),
                             thread_ts=event.get("thread_ts"))
+        # Explicit default. A DM has no channel settings and no top level to post at, and the
+        # non-DM block below overwrites this with the resolved allowance — but every dispatched
+        # message carries the key either way, so nothing downstream has to guess.
+        message.metadata["channel_post_allowed"] = False
         user_id = event.get("user")
 
         # Phase E: an @mention in a channel is also a wake — seed the pulse ring so the
@@ -1124,16 +1131,11 @@ class SlackMessageEventsMixin:
                     return
             if cs and cs.get("directives"):
                 message.metadata["channel_directives"] = cs["directives"]
-            # B1: the mention path must resolve placement too, or main.py place_in_channel
-            # is always False and every @mention reply threads. Mirror the channel-dispatch
-            # path (~392): a row's EXPLICIT True/False wins; None/absent falls back to the
-            # global default. A mention carries no engine verdict, so a truthy setting on a
-            # top-level trigger yields a top-level reply (the user summoned us at channel level).
-            reply_in_channel = (cs or {}).get("reply_in_channel")
-            if reply_in_channel is None:
-                reply_in_channel = config.reply_in_channel_default
-            if reply_in_channel:
-                message.metadata["reply_in_channel"] = True
+            # B1: the mention path resolves the allowance too — without it an @mention could
+            # never reply at channel level, whatever the channel's settings say. Same rule as
+            # the channel-dispatch path: a row's EXPLICIT True/False wins, None/absent falls
+            # back to the global default. It permits the choice; the model makes it.
+            message.metadata["channel_post_allowed"] = _channel_post_allowed(cs)
         if sender_type == "other_bot":
             if self.message_handler:
                 await self.message_handler(message, self)

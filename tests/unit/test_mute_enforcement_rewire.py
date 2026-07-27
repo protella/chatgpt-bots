@@ -87,7 +87,7 @@ async def test_null_reply_in_channel_inherits_default(judicious, monkeypatch):
     bot = _make_bot({"response_mode": "auto_respond", "reply_in_channel": None})
     await bot._handle_channel_message(_evt(text="lunch anyone?"), bot.app.client)
     msg = bot.message_handler.await_args.args[0]
-    assert msg.metadata.get("reply_in_channel") is True
+    assert msg.metadata.get("channel_post_allowed") is True
 
 
 @pytest.mark.asyncio
@@ -96,7 +96,7 @@ async def test_explicit_false_reply_in_channel_forces_threads(judicious, monkeyp
     bot = _make_bot({"response_mode": "auto_respond", "reply_in_channel": False})
     await bot._handle_channel_message(_evt(text="lunch anyone?"), bot.app.client)
     msg = bot.message_handler.await_args.args[0]
-    assert msg.metadata.get("reply_in_channel") is not True
+    assert msg.metadata.get("channel_post_allowed") is False
 
 
 @pytest.mark.asyncio
@@ -105,7 +105,7 @@ async def test_no_row_inherits_default(judicious, monkeypatch):
     bot = _make_bot(None)
     await bot._handle_channel_message(_evt(text="lunch anyone?"), bot.app.client)
     msg = bot.message_handler.await_args.args[0]
-    assert msg.metadata.get("reply_in_channel") is True
+    assert msg.metadata.get("channel_post_allowed") is True
 
 
 @pytest.mark.asyncio
@@ -114,4 +114,4 @@ async def test_no_row_default_off_stays_threads(judicious, monkeypatch):
     bot = _make_bot(None)
     await bot._handle_channel_message(_evt(text="lunch anyone?"), bot.app.client)
     msg = bot.message_handler.await_args.args[0]
-    assert msg.metadata.get("reply_in_channel") is not True
+    assert msg.metadata.get("channel_post_allowed") is False

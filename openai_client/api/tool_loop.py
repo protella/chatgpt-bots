@@ -217,6 +217,30 @@ def _invalid_silence_reason_result() -> Dict[str, Any]:
     }
 
 
+def _free_call_overrides(calls: List[Dict[str, Any]], free_names: set,
+                        remaining_allowance: int) -> Dict[int, Any]:
+    """Refuse the free calls in this round that exceed the per-round burst cap or the remaining
+    free allowance — BEFORE they are dispatched. Returns result_overrides for _run_tool_round,
+    which answers them without running them (a function_call left without a
+    function_call_output earns a 400 on the next request).
+
+    Shared by BOTH loops on purpose. It lived inside the streaming one, and the non-streaming
+    loop consequently had no notion of a free call at all — so a bookkeeping call there spent
+    the same budget a real tool does."""
+    if not free_names:
+        return {}
+    allowed = min(_FREE_CALLS_PER_ROUND, max(0, remaining_allowance))
+    overrides: Dict[int, Any] = {}
+    taken = 0
+    for c in calls:
+        if c.get("name") not in free_names:
+            continue
+        taken += 1
+        if taken > allowed:
+            overrides[id(c)] = _EXCESS_FREE_RESULT
+    return overrides
+
+
 def _no_reply_call(calls: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return next((c for c in calls if c.get("name") == _NO_REPLY_TOOL), None)
 
@@ -359,9 +383,17 @@ async def create_text_response_with_tool_loop(
     registry: ToolRegistry,
     tool_context: ToolContext,
     prior_committed: bool = False,
+    free_tools: Optional[Iterable[str]] = None,
     **params: Any,
 ) -> Dict[str, Any]:
     """Non-streaming response with local tool execution.
+
+    ``free_tools`` (F37) names BOOKKEEPING calls — they produce nothing a user can see, so they
+    do not spend the productive budget and never displace a real tool. Same rule the streaming
+    loop applies, and it is here because it was NOT: this loop charged every call, so a
+    bookkeeping call on the non-streaming path quietly cost a slot a real one needed. A round of
+    nothing BUT free calls costs no round either, but free rounds have their own ceiling, so
+    "free" can never mean "unbounded".
 
     Returns {"text", "tools_used", "local_tool_calls"} — ``local_tool_calls`` is the
     ordered [{"name", "ok"}] record of every local call (e.g. for reaction-only detection).
@@ -377,6 +409,32 @@ async def create_text_response_with_tool_loop(
     tool_choice: Optional[str] = None
     rounds = 0
     total_calls = 0
+    free_names = {str(n) for n in (free_tools or ())}
+    free_rounds = 0
+    free_calls = 0
+    free_rounds_cap = max(1, config.max_tool_rounds * _FREE_ROUND_CEILING)
+    free_calls_cap = max(1, config.max_tool_calls_per_turn * _FREE_ROUND_CEILING)
+
+    def _charge(calls: List[Dict[str, Any]], suppressed: Dict[int, Any]) -> None:
+        """Bill a round. A round of PURE bookkeeping costs no round and no productive call;
+        anything else is fully charged, though the free calls riding in a mixed round stay
+        free. Only calls that actually RAN are billed — a suppressed one did no work."""
+        nonlocal rounds, total_calls, free_rounds, free_calls
+        ran = [c for c in calls if id(c) not in suppressed]
+        free = [c for c in ran if c.get("name") in free_names]
+        productive = [c for c in ran if c.get("name") not in free_names]
+        free_calls += len(free)
+        if not productive and calls:
+            free_rounds += 1
+            return
+        rounds += 1
+        total_calls += len(productive)
+
+    def _capped() -> bool:
+        return (rounds >= config.max_tool_rounds
+                or total_calls >= config.max_tool_calls_per_turn
+                or free_rounds >= free_rounds_cap or free_calls >= free_calls_cap)
+
     # F30: expose this turn's live input (stable reference — appended in place across rounds)
     # plus the developer prompt/model, so a detached job can snapshot the full context by copy.
     if tool_context is not None:
@@ -409,10 +467,13 @@ async def create_text_response_with_tool_loop(
         if terminal_call is not None:
             silence_reason = _silence_reason(terminal_call)
             if silence_reason is not None and not prior_committed:
+                suppressed = _free_call_overrides(calls, free_names,
+                                                  free_calls_cap - free_calls)
                 return await _handle_no_reply_terminal(
                     self, registry, tool_context, calls, terminal_call, silence_reason,
                     tools_used_all, local_tool_calls,
-                    remaining_budget=config.max_tool_calls_per_turn - total_calls)
+                    remaining_budget=config.max_tool_calls_per_turn - total_calls,
+                    result_overrides=suppressed or None, free_tools=free_tools)
             # Either the reason is not one of the eight, or a prior attempt already exposed
             # visible text (honoring silence now would orphan it). Reject the terminal (feed
             # the matching error back), run every sibling, and continue so the model decides
@@ -427,24 +488,27 @@ async def create_text_response_with_tool_loop(
                     f"{_NO_REPLY_TOOL} called after a prior attempt already exposed text — "
                     "rejecting; model must complete the reply")
                 terminal_result = _INVALID_NO_REPLY_RESULT
-            rounds += 1
-            total_calls += len(calls)
+            suppressed = _free_call_overrides(calls, free_names,
+                                              free_calls_cap - free_calls)
+            _charge(calls, suppressed)
             await _run_tool_round(
                 self, registry, tool_context, sink, input_items, local_tool_calls,
-                result_overrides=_terminal_overrides(calls, terminal_call, terminal_result))
+                result_overrides={**suppressed,
+                                  **_terminal_overrides(calls, terminal_call, terminal_result)})
             _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")])
-            if rounds >= config.max_tool_rounds or total_calls >= config.max_tool_calls_per_turn:
+            if _capped():
                 self.log_warning(
                     f"Tool loop cap hit ({rounds} rounds / {total_calls} calls) — forcing final answer")
                 tool_choice = "none"
             continue
 
-        rounds += 1
-        total_calls += len(calls)
-        await _run_tool_round(self, registry, tool_context, sink, input_items, local_tool_calls)
+        suppressed = _free_call_overrides(calls, free_names, free_calls_cap - free_calls)
+        _charge(calls, suppressed)
+        await _run_tool_round(self, registry, tool_context, sink, input_items, local_tool_calls,
+                              result_overrides=suppressed or None)
         _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")])
 
-        if rounds >= config.max_tool_rounds or total_calls >= config.max_tool_calls_per_turn:
+        if _capped():
             self.log_warning(
                 f"Tool loop cap hit ({rounds} rounds / {total_calls} calls) — forcing final answer"
             )
@@ -506,22 +570,8 @@ async def create_streaming_response_with_tool_loop(
     budget = {"rounds": 0, "calls": 0, "free_rounds": 0, "free_calls": 0}
 
     def _suppress_excess_free(calls: List[Dict[str, Any]]) -> Dict[int, Any]:
-        """Refuse the free calls in this round that exceed the burst cap or the remaining free
-        allowance — BEFORE they are dispatched. Returns result_overrides for _run_tool_round,
-        which answers them without running them (a function_call left without a
-        function_call_output earns a 400 on the next request)."""
-        if not free_names:
-            return {}
-        allowed = min(_FREE_CALLS_PER_ROUND, max(0, free_calls_cap - budget["free_calls"]))
-        overrides: Dict[int, Any] = {}
-        taken = 0
-        for c in calls:
-            if c.get("name") not in free_names:
-                continue
-            taken += 1
-            if taken > allowed:
-                overrides[id(c)] = _EXCESS_FREE_RESULT
-        return overrides
+        return _free_call_overrides(calls, free_names,
+                                    free_calls_cap - budget["free_calls"])
 
     def _charge(calls: List[Dict[str, Any]], suppressed: Dict[int, Any]) -> None:
         """Bill a round. A round of PURE bookkeeping costs no round and no productive call;

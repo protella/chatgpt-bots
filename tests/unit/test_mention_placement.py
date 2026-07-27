@@ -93,7 +93,7 @@ async def test_mention_row_true_stamps_true(monkeypatch):
     monkeypatch.setattr(config, "reply_in_channel_default", False, raising=False)  # default OFF…
     bot = _make_bot({"response_mode": "auto_respond", "reply_in_channel": True})   # …row wins
     await bot._handle_slack_message(_evt(), bot.app.client, wake_source="app_mention")
-    assert _dispatched(bot).metadata.get("reply_in_channel") is True
+    assert _dispatched(bot).metadata.get("channel_post_allowed") is True
 
 
 @pytest.mark.asyncio
@@ -101,7 +101,7 @@ async def test_mention_row_false_never_stamps(monkeypatch):
     monkeypatch.setattr(config, "reply_in_channel_default", True, raising=False)   # default ON…
     bot = _make_bot({"response_mode": "auto_respond", "reply_in_channel": False})  # …explicit False wins
     await bot._handle_slack_message(_evt(), bot.app.client, wake_source="app_mention")
-    assert _dispatched(bot).metadata.get("reply_in_channel") is not True
+    assert _dispatched(bot).metadata.get("channel_post_allowed") is False
 
 
 @pytest.mark.asyncio
@@ -109,7 +109,7 @@ async def test_mention_row_null_inherits_default_true(monkeypatch):
     monkeypatch.setattr(config, "reply_in_channel_default", True, raising=False)
     bot = _make_bot({"response_mode": "auto_respond", "reply_in_channel": None})
     await bot._handle_slack_message(_evt(), bot.app.client, wake_source="app_mention")
-    assert _dispatched(bot).metadata.get("reply_in_channel") is True
+    assert _dispatched(bot).metadata.get("channel_post_allowed") is True
 
 
 @pytest.mark.asyncio
@@ -117,7 +117,7 @@ async def test_mention_no_row_inherits_default(monkeypatch):
     monkeypatch.setattr(config, "reply_in_channel_default", True, raising=False)
     bot = _make_bot(None)   # no channel settings row at all
     await bot._handle_slack_message(_evt(), bot.app.client, wake_source="app_mention")
-    assert _dispatched(bot).metadata.get("reply_in_channel") is True
+    assert _dispatched(bot).metadata.get("channel_post_allowed") is True
 
 
 @pytest.mark.asyncio
@@ -125,7 +125,7 @@ async def test_mention_no_row_default_off_stays_unstamped(monkeypatch):
     monkeypatch.setattr(config, "reply_in_channel_default", False, raising=False)
     bot = _make_bot(None)
     await bot._handle_slack_message(_evt(), bot.app.client, wake_source="app_mention")
-    assert _dispatched(bot).metadata.get("reply_in_channel") is not True
+    assert _dispatched(bot).metadata.get("channel_post_allowed") is False
 
 
 @pytest.mark.asyncio
@@ -135,7 +135,7 @@ async def test_dm_mention_never_stamps(monkeypatch):
     bot = _make_bot({"reply_in_channel": True})  # even a truthy row can't reach a DM
     await bot._handle_slack_message(
         _evt(channel="D123", text="hi"), bot.app.client, wake_source="dm")
-    assert _dispatched(bot).metadata.get("reply_in_channel") is not True
+    assert _dispatched(bot).metadata.get("channel_post_allowed") is False
 
 
 @pytest.mark.asyncio
@@ -148,7 +148,7 @@ async def test_other_bot_top_level_mention_stamps_and_dispatches(monkeypatch):
     await bot._handle_slack_message(
         _evt(user="UCLAUDE"), bot.app.client, wake_source="app_mention")
     bot.message_handler.assert_awaited_once()
-    assert _dispatched(bot).metadata.get("reply_in_channel") is True
+    assert _dispatched(bot).metadata.get("channel_post_allowed") is True
 
 
 @pytest.mark.asyncio
@@ -162,7 +162,9 @@ async def test_self_sender_short_circuits_without_dispatch(monkeypatch):
 
 # ============================================================ layer 2: main.py placement effect
 
-def _place_app(resp_meta=None, content="answer"):
+def _place_app(resp_meta=None, content="answer", chooses=None):
+    """`chooses` stands in for the model calling set_reply_destination mid-turn: the fake
+    processor makes the choice on the live TurnRuntime, exactly where the real tool would."""
     from main import ChatBotV2
     app = ChatBotV2.__new__(ChatBotV2)
     app.participation_engine = None
@@ -171,7 +173,13 @@ def _place_app(resp_meta=None, content="answer"):
     resp.type = "text"
     resp.content = content
     resp.metadata = dict(resp_meta or {})
-    app.processor.process_message = AsyncMock(return_value=resp)
+
+    async def _process(message, client, thinking_id=None, turn=None):
+        if chooses and turn is not None:
+            turn.select_destination(chooses, message=message)
+        return resp
+
+    app.processor.process_message = AsyncMock(side_effect=_process)
     app.processor.thread_manager = MagicMock(spec=[])  # no in-flight/upload-latch attrs
     client = MagicMock()
     client.channel_pulse = None
@@ -192,9 +200,15 @@ def _mention_msg(meta, thread_id="10.0", channel_id="C1"):
 
 
 @pytest.mark.asyncio
-async def test_top_level_mention_posts_top_level():
+async def test_a_top_level_mention_threads_unless_the_model_says_otherwise():
+    """The allowance is not the decision. A mention used to go top-level automatically; now the
+    default is the thread, and only the model's own call moves it into the room."""
     app, client, _ = _place_app()
-    await app.handle_message(_mention_msg({"reply_in_channel": True}), client)
+    await app.handle_message(_mention_msg({"channel_post_allowed": True}), client)
+    assert client.send_message.await_args.args[1] == "10.0"
+
+    app, client, _ = _place_app(chooses="channel")
+    await app.handle_message(_mention_msg({"channel_post_allowed": True}), client)
     assert client.send_message.await_args.args[1] is None   # top-level (post_thread_id None)
 
 
@@ -203,7 +217,7 @@ async def test_in_thread_mention_still_threads():
     app, client, _ = _place_app()
     # A mention INSIDE a thread (ts != thread_id) is never a top-level trigger.
     await app.handle_message(
-        _mention_msg({"ts": "11.0", "reply_in_channel": True}, thread_id="10.0"), client)
+        _mention_msg({"ts": "11.0", "channel_post_allowed": True}, thread_id="10.0"), client)
     assert client.send_message.await_args.args[1] == "10.0"
 
 
@@ -211,7 +225,7 @@ async def test_in_thread_mention_still_threads():
 async def test_dm_mention_stays_threaded():
     app, client, _ = _place_app()
     await app.handle_message(
-        _mention_msg({"reply_in_channel": True}, channel_id="D123"), client)
+        _mention_msg({"channel_post_allowed": True}, channel_id="D123"), client)
     assert client.send_message.await_args.args[1] == "10.0"   # DMs never move top-level
 
 
@@ -219,10 +233,11 @@ async def test_dm_mention_stays_threaded():
 async def test_artifacts_thread_under_top_level_mention(monkeypatch):
     # B2: the reply lands top-level, but the code-interpreter artifact still threads off
     # message.thread_id (post_thread_id is None on a top-level reply).
-    app, client, _ = _place_app(resp_meta={"artifact_containers": ["cont_1"]})
+    app, client, _ = _place_app(resp_meta={"artifact_containers": ["cont_1"]},
+                                chooses="channel")
     published = AsyncMock(return_value=["file_1"])
     monkeypatch.setattr("message_processor.artifacts.publish_artifacts", published)
-    await app.handle_message(_mention_msg({"reply_in_channel": True}), client)
+    await app.handle_message(_mention_msg({"channel_post_allowed": True}), client)
     assert client.send_message.await_args.args[1] is None          # reply top-level
     assert published.await_args.kwargs["thread_id"] == "10.0"      # artifact threads
     assert published.await_args.kwargs["thread_key"] == "C1:10.0"
@@ -231,9 +246,9 @@ async def test_artifacts_thread_under_top_level_mention(monkeypatch):
 @pytest.mark.asyncio
 async def test_sandbox_rescue_threads_under_top_level_mention():
     # B2: rescued sandbox images are handed message.thread_id, never the None post_thread_id.
-    app, client, _ = _place_app()
+    app, client, _ = _place_app(chooses="channel")
     app._rescue_sandbox_images = AsyncMock(return_value=0)
-    await app.handle_message(_mention_msg({"reply_in_channel": True}), client)
+    await app.handle_message(_mention_msg({"channel_post_allowed": True}), client)
     assert client.send_message.await_args.args[1] is None          # reply top-level
     assert app._rescue_sandbox_images.await_args.args[3] == "10.0"  # 4th positional arg
 
@@ -250,7 +265,7 @@ async def test_thread_verdict_overrides_setting_and_artifacts_still_thread(monke
     published = AsyncMock(return_value=["file_1"])
     monkeypatch.setattr("message_processor.artifacts.publish_artifacts", published)
     await app.handle_message(
-        _mention_msg({"reply_in_channel": True, "gate_required": True,
+        _mention_msg({"channel_post_allowed": True, "gate_required": True,
                       "silence_capable": True}), client)
     assert client.send_message.await_args.args[1] == "10.0"        # threaded (verdict wins)
     assert published.await_args.kwargs["thread_id"] == "10.0"

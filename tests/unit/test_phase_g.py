@@ -360,31 +360,22 @@ def _placement_msg(metadata, channel_id="C123CHAN", thread_id="111.0"):
                    thread_id=thread_id, metadata=metadata)
 
 
-def test_native_placement_honors_main_stamp_over_channel_setting():
-    """A top-level trigger in a reply_in_channel channel whose participation verdict
-    said "thread": main.py stamps place_in_channel=False and threads the reply. The
-    coordinator must follow the stamp — recomputing from the channel setting built it
-    with thread=None, silently forcing legacy fallback on a threaded reply."""
-    from message_processor.handlers.text import native_stream_place_in_channel
-    msg = _placement_msg({"ts": "111.0", "reply_in_channel": True,
-                          "place_in_channel": False})
-    assert native_stream_place_in_channel(msg) is False
+def test_the_native_coordinator_targets_the_turns_destination():
+    """The coordinator used to recompute placement from metadata, which could disagree with
+    where main.py actually posted — building a thread=None stream for a reply that threaded, so
+    native streaming silently fell back to legacy. There is one answer now, on the turn."""
+    from message_processor.turn_runtime import TurnRuntime
 
+    msg = _placement_msg({"ts": "111.0"})
+    threaded = TurnRuntime.for_message(msg, channel_post_allowed=False)
+    assert threaded.resolve_reply_target(msg) == "111.0"
+    assert not threaded.final_post_only            # a thread CAN stream natively
 
-def test_native_placement_stamp_true_targets_channel_top_level():
-    from message_processor.handlers.text import native_stream_place_in_channel
-    msg = _placement_msg({"ts": "111.0", "reply_in_channel": True,
-                          "place_in_channel": True})
-    assert native_stream_place_in_channel(msg) is True
+    eligible = TurnRuntime.for_message(msg, channel_post_allowed=True)
+    eligible.select_destination("channel", message=msg)
+    assert eligible.resolve_reply_target(msg) is None
+    assert eligible.final_post_only                # …the channel top level cannot
 
-
-def test_native_placement_fallback_recompute_without_stamp():
-    """Paths that bypass main.py's stamp keep the original rule: reply_in_channel +
-    top-level trigger + real channel → top level; thread replies and DMs thread."""
-    from message_processor.handlers.text import native_stream_place_in_channel
-    top = _placement_msg({"ts": "111.0", "reply_in_channel": True})
-    assert native_stream_place_in_channel(top) is True
-    threaded = _placement_msg({"ts": "222.0", "reply_in_channel": True})  # ts != thread_id
-    assert native_stream_place_in_channel(threaded) is False
-    dm = _placement_msg({"ts": "111.0", "reply_in_channel": True}, channel_id="D123DM")
-    assert native_stream_place_in_channel(dm) is False
+    dm = _placement_msg({"ts": "111.0"}, channel_id="D123DM")
+    dm_turn = TurnRuntime.for_message(dm, channel_post_allowed=True)
+    assert dm_turn.reply_destination == "dm" and not dm_turn.final_post_only

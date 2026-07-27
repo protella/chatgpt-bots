@@ -32,7 +32,7 @@ def _message(*, channel="C1", thread="10.0", ts="10.0", **meta):
 
 def test_ambient_channel_message_is_silence_capable(monkeypatch):
     monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
-    turn = TurnRuntime.for_message(_message(silence_capable=True), "10.0")
+    turn = TurnRuntime.for_message(_message(silence_capable=True), channel_post_allowed=False)
     assert turn.silence_capable is True
     assert turn.progress_enabled is False       # show nothing until it commits
 
@@ -41,8 +41,7 @@ def test_thread_continuation_is_silence_capable(monkeypatch):
     """The one that bit the user live: a 1:1 thread reply skips the gate entirely, so the
     model is the ONLY decider — and it can still bow out."""
     monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
-    turn = TurnRuntime.for_message(
-        _message(silence_capable=True, wake_source="thread_continuation"), "10.0")
+    turn = TurnRuntime.for_message(_message(silence_capable=True, wake_source="thread_continuation"), channel_post_allowed=False)
     assert turn.silence_capable is True
     assert turn.progress_enabled is False
 
@@ -50,7 +49,7 @@ def test_thread_continuation_is_silence_capable(monkeypatch):
 def test_an_addressed_turn_still_shows_progress(monkeypatch):
     """A DM or an @-mention always gets an answer, so it keeps its indicator."""
     monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
-    turn = TurnRuntime.for_message(_message(wake_source="app_mention"), "10.0")
+    turn = TurnRuntime.for_message(_message(wake_source="app_mention"), channel_post_allowed=False)
     assert turn.silence_capable is False
     assert turn.progress_enabled is True
 
@@ -58,7 +57,7 @@ def test_an_addressed_turn_still_shows_progress(monkeypatch):
 def test_no_reply_tool_disabled_means_the_turn_always_answers(monkeypatch):
     """With the tool off the model CANNOT stay silent, so there is nothing to defer for."""
     monkeypatch.setattr(config, "enable_no_reply_tool", False, raising=False)
-    turn = TurnRuntime.for_message(_message(silence_capable=True), "10.0")
+    turn = TurnRuntime.for_message(_message(silence_capable=True), channel_post_allowed=False)
     assert turn.silence_capable is False
     assert turn.progress_enabled is True
 
@@ -256,11 +255,11 @@ def test_every_streaming_message_creation_uses_the_reply_target():
     placeholder away and a top-level channel reply lands inside a thread instead. Every one of
     them must now use the turn's chosen destination.
 
-    F46: the zero-chunk final post now targets the RESOLVED destination — `effective_target =
-    turn.resolve_reply_target(message)`, i.e. `reply_target` refined by the substantive-work
-    thread override (a top-level channel reply that did real work threads under the trigger).
-    The seed / overflow parts still use `reply_target` directly. What must NEVER come back is
-    `message.thread_id` (the thread the trigger merely lives in).
+    The zero-chunk final post targets `effective_target`, which is the same bound destination —
+    it used to be `reply_target` refined by a substantive-work thread override, and that
+    heuristic is gone: the destination is now decided once, by the model, and every site reads
+    it. What must NEVER come back is `message.thread_id` (the thread the trigger merely lives
+    in).
     """
     import inspect
     from message_processor.handlers.text import TextHandlerMixin
@@ -271,7 +270,7 @@ def test_every_streaming_message_creation_uses_the_reply_target():
         f"a streaming message-creation site targets neither reply_target nor the resolved "
         f"effective_target (a regression to message.thread_id?): {targets}")
     assert "effective_target" in targets, (
-        "the final-post site must use the resolved effective_target (F46 late thread override)")
+        "the final-post site must use the bound effective_target")
     src = inspect.getsource(TextHandlerMixin._handle_streaming_text_response)
     assert "effective_target = " in src and "resolve_reply_target(message)" in src, (
         "effective_target must be bound to the turn's resolved reply destination")
@@ -280,13 +279,13 @@ def test_every_streaming_message_creation_uses_the_reply_target():
 def test_the_reply_target_is_the_turns_chosen_destination(monkeypatch):
     """None means top-level in the channel — not "the thread the trigger was in"."""
     monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
-    top_level = TurnRuntime.for_message(
-        _message(silence_capable=True), None)   # main.py chose channel placement
-    assert top_level.reply_thread_id is None
+    message = _message(silence_capable=True)
+    chose_channel = TurnRuntime.for_message(message, channel_post_allowed=True)
+    chose_channel.select_destination("channel", message=message)
+    assert chose_channel.resolve_reply_target(message) is None
 
-    threaded = TurnRuntime.for_message(
-        _message(silence_capable=True), "10.0")
-    assert threaded.reply_thread_id == "10.0"
+    threaded = TurnRuntime.for_message(message, channel_post_allowed=False)
+    assert threaded.resolve_reply_target(message) == "10.0"
 
 
 # --------------------------------------------------------------- retry ownership
@@ -390,7 +389,7 @@ async def test_prior_timeout_notice_still_shows_on_a_top_level_reply(monkeypatch
     a standalone post, never edited into anything. Key it on SILENCE, not on progress."""
     monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
     turn = TurnRuntime(silence_capable=False, progress_enabled=False,
-                       reply_thread_id=None, final_post_only=True)
+                       reply_thread_id=None, reply_destination="channel")
 
     shown, still_flagged = await _timeout_notice_shown_for(turn, monkeypatch)
 

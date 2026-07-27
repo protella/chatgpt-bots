@@ -189,10 +189,16 @@ async def test_main_top_level_channel_placement_suppresses_footer():
     bot = _make_bot()
     client = _client()
     resp = Response(type="text", content="quick answer", metadata={"streamed": False, "model": "m"})
-    bot.processor.process_message = AsyncMock(return_value=resp)
-    # Top-level channel trigger with reply_in_channel → place_in_channel True.
+
+    async def _process(message, client_, thinking_id=None, turn=None):
+        # The model chose the channel mid-turn, exactly as set_reply_destination does.
+        if turn is not None:
+            turn.select_destination("channel", message=message)
+        return resp
+
+    bot.processor.process_message = AsyncMock(side_effect=_process)
     message = Message(text="q", user_id="U1", channel_id="C1", thread_id="200.0",
-                      metadata={"ts": "200.0", "reply_in_channel": True})
+                      metadata={"ts": "200.0", "channel_post_allowed": True})
 
     await bot.handle_message(message, client)
 
