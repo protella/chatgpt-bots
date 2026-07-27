@@ -11,7 +11,7 @@ from thread_manager import AsyncThreadStateManager
 from openai_client import OpenAIClient
 from config import config, pipeline_status
 from logger import LoggerMixin
-from . import channel_steering, image_catalog, participation_telemetry
+from . import channel_steering, image_catalog, participation_telemetry, routing_facts
 from .containers import ContainerManager
 from .message_timestamps import stamp_content
 from .thread_management import ThreadManagementMixin
@@ -191,6 +191,12 @@ class MessageProcessor(ThreadManagementMixin,
                 client,
                 thinking_id
             )
+
+            # The gate's coalesced cohort becomes real conversation, before anything reads the
+            # thread. Earlier sends of one burst are separate top-level Slack messages, so the
+            # rebuild above cannot have found them, and without this the turn answers the newest
+            # fragment as if the rest were never said. Merged once, deduplicated by source ts.
+            self._merge_gate_cohort(message, thread_state)
 
             # F3: if the root author is still unknown and THIS message is the thread root
             # (a new top-level message whose warm state skipped the rebuild), the sender is
@@ -1031,6 +1037,29 @@ class MessageProcessor(ThreadManagementMixin,
             if attempt_id:
                 absorbed.append(attempt_id)
         participation_telemetry.stage_queue_links(trigger, absorbed)
+        # THE BATCH ITSELF, as typed sources for the trigger's gate. Without this the redispatch
+        # gate sees one message and decides for all of them, so a no-wake throws away everything
+        # that queued behind it — messages that are in Slack, and now in this thread's state, but
+        # that nobody ever answers. The gate should judge the batch it is actually standing in
+        # front of.
+        #
+        # And if any of them had ALREADY earned a turn, there is nothing left to judge: the
+        # requirement is cleared and the responder decides what to say. (Both matter — the first
+        # covers ambient messages nobody has ruled on, the second covers an @mention that had the
+        # bad luck to queue behind one.)
+        from .participation import source_from_message
+        if routing_facts.absorb_owed_answer(trigger, batch[:-1]):
+            # This turn is an ungated route now, so the trigger must stop carrying the attempt
+            # from its earlier gated pass — that attempt is CLOSED, and left in place it would
+            # attribute this turn's reactions to it and swallow this turn's terminal event
+            # entirely. The detached id joins the absorbed sources so it still says what became
+            # of it.
+            detached = participation_telemetry.detach_attempt(trigger)
+            if detached:
+                participation_telemetry.stage_queue_links(trigger, [detached])
+        if isinstance(trigger.metadata, dict) and len(batch) > 1:
+            trigger.metadata["carried_gate_sources"] = tuple(
+                source_from_message(m) for m in batch[:-1])
         # T2-10: earlier messages' image parts + attachment failures are collected here and
         # carried to the trigger turn — images so the model can actually SEE them (not just
         # their catalogued description), failures so a dropped file is acknowledged.

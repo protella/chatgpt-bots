@@ -35,11 +35,13 @@ Slack history on demand, never mirrored into the database.
 Flip it on and the bot participates in channels it's invited to:
 - **Knows when to speak** — replies when it can genuinely help, reacts when an emoji says it better,
   and stays out of human-to-human conversation. Pacing is the model's judgment, not a numeric quota
-- **Takes feedback** — tell it to pipe down in a thread and it does, permanently, for that thread
-  (mentions and name-summons still work) and remembers the preference channel-wide
-- **Per-channel control for anyone** — participation level (off / mentions-only / judicious /
-  active), channel directives, reply placement, and the channel's model/effort/verbosity, all set via
-  the ⚙️ Configure button under any bot reply
+- **Takes feedback** — tell it to be quieter, stay out of a topic, or keep answers short, and it
+  writes that down as this channel's standing policy and follows it until somebody changes it.
+  Ask plainly for a settings change ("only reply when I tag you") and it makes the change instead.
+  An explicit @mention always reaches it — unless participation is set to off, which means off
+- **Per-channel control for anyone** — participation level (off / mentions-only / on), the channel's
+  standing policy, reply placement, and its model/effort/verbosity, all set via the ⚙️ Configure
+  button under any bot reply
 - **Per-channel memory** — durable facts (decisions, conventions, preferences) recalled in later
   conversations; the bot manages them itself, and you can view and correct them
 - **No busy rejections** — messages that arrive mid-response are queued and answered together

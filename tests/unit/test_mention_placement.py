@@ -9,8 +9,9 @@ Two layers:
 
 2. main.py (handle_message): with reply_in_channel now settable on a mention turn, place_in_channel
    can be True → the reply posts top-level, BUT code-interpreter artifacts (B2) and rescued sandbox
-   images (B2) STILL thread off message.thread_id, never top-level; and an engine "thread" verdict
-   still overrides the setting.
+   images (B2) STILL thread off message.thread_id, never top-level. (The gate no longer votes on
+   placement — it returns one bit — so a woken turn simply takes the default thread unless the
+   model itself calls set_reply_destination.)
 
 Real decision code, stubbed I/O — no network/DB.
 """
@@ -22,7 +23,7 @@ import pytest
 
 from base_client import Message
 from config import config
-from message_processor.participation import ParticipationVerdict
+from message_processor.participation import WakeDecision
 from slack_client.event_handlers.message_events import SlackMessageEventsMixin
 
 
@@ -254,18 +255,22 @@ async def test_sandbox_rescue_threads_under_top_level_mention():
 
 
 @pytest.mark.asyncio
-async def test_thread_verdict_overrides_setting_and_artifacts_still_thread(monkeypatch):
-    # The engine's "thread" placement verdict overrides reply_in_channel (an ALLOWANCE, not a
-    # mandate); the reply threads, and the artifact threads off the same root either way.
+async def test_a_woken_turn_threads_by_default_and_artifacts_still_thread(monkeypatch):
+    """Re-baselined: the gate no longer carries a placement at all.
+
+    This used to assert that the engine's "thread" placement verdict overrode reply_in_channel.
+    The gate forms its answer before the reply exists, so it cannot know where the reply belongs —
+    the field is gone from the decision (one bit: wake or not) and delivery ignores the gate
+    entirely. What survives, and is what this now pins: a woken turn that makes no destination
+    choice threads (the default), and the code-interpreter artifact threads off the same root
+    either way."""
     app, client, _ = _place_app(resp_meta={"artifact_containers": ["cont_1"]})
     app.participation_engine = MagicMock()
-    verdict = ParticipationVerdict(action="respond", emoji="", placement="thread",
-                                   reason="worth a thread")
-    app._run_participation_gate = AsyncMock(return_value=verdict)
+    app._run_participation_gate = AsyncMock(return_value=WakeDecision(wake=True))
     published = AsyncMock(return_value=["file_1"])
     monkeypatch.setattr("message_processor.artifacts.publish_artifacts", published)
     await app.handle_message(
         _mention_msg({"channel_post_allowed": True, "gate_required": True,
                       "silence_capable": True}), client)
-    assert client.send_message.await_args.args[1] == "10.0"        # threaded (verdict wins)
+    assert client.send_message.await_args.args[1] == "10.0"        # threaded (the default)
     assert published.await_args.kwargs["thread_id"] == "10.0"

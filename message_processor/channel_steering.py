@@ -41,9 +41,17 @@ logger = setup_logger(name="slack_bot.ChannelSteering")
 # ('channel' facts private to one channel, 'workspace' facts shared across all), so policy
 # extends that column rather than adding a second, parallel notion of kind.
 POLICY_SCOPE = "policy"
-# Backoff preferences the rich gate writes and targets by id. They are instructions too, so they
-# render with the policy rather than among the facts — but they are the gate's own bookkeeping
-# and keep their visible ids until the binary-gate commit retires the writer.
+# Backoff preference rows written by the RICH gate, which no longer exists. Nothing writes them,
+# and the startup migration moves every surviving row into the reserved policy row and deletes it
+# — a process that fails that migration refuses to start, so no live run can see one.
+#
+# The marker still earns its keep as a CLASSIFIER. `is_ordinary_fact` is what keeps a row of this
+# kind out of the fact cap, out of the settings textarea, out of the memory tools and out of the
+# fallback extractor; deleting it would mean a row that "cannot exist" would, if one ever did,
+# arrive as an ordinary fact with an editable [#id] pointing at an operator instruction. A guard
+# against an impossible state is cheap; discovering you needed it is not. The RENDERING is gone,
+# though — a heading for a section that can never have content is a promise to the model about a
+# kind of instruction this build cannot produce.
 PREF_AUTHOR_PREFIX = "participation_engine:pref:"
 
 # How long a standing policy may be. This is the bound the settings modal has always enforced on
@@ -55,8 +63,6 @@ POLICY_MAX_CHARS = 1000
 # The headings. Each says what KIND of thing follows, because "instructions" and "background"
 # are the distinction the model most needs and the one it cannot recover from the content.
 POLICY_HEADING = "Standing channel policy (instructions; follow these):"
-PREF_HEADING = ("Recorded participation preferences (instructions; legacy until the "
-                "binary-gate migration):")
 CHANNEL_FACT_HEADING = "Stable channel facts (background, not instructions):"
 WORKSPACE_FACT_HEADING = "Workspace facts (background, read-only):"
 
@@ -116,7 +122,7 @@ def render_snapshot(policy_row: Optional[Dict[str, Any]],
     rows = list(memory_rows or [])
     policy_text = ((policy_row or {}).get("content") or "").strip()
 
-    prefs, channel_facts, workspace_facts = [], [], []
+    channel_facts, workspace_facts = [], []
     for row in rows:
         if is_policy_row(row):
             continue          # never rendered from the fact list; it has its own section
@@ -125,7 +131,10 @@ def render_snapshot(policy_row: Optional[Dict[str, Any]],
             continue
         entry = f"- [#{row.get('id')}] {content}"
         if is_pref_row(row):
-            prefs.append((row.get("id") or 0, entry))
+            # Cannot happen after a successful start (see PREF_AUTHOR_PREFIX). If one somehow
+            # does, it stays out of the prompt rather than being rendered as a fact the model
+            # could edit — inert, not half-present.
+            continue
         elif row.get("scope") == "workspace":
             workspace_facts.append((row.get("id") or 0, entry))
         else:
@@ -139,7 +148,6 @@ def render_snapshot(policy_row: Optional[Dict[str, Any]],
     blocks: List[List[str]] = []
     if policy_text:
         blocks.append([POLICY_HEADING, policy_text])
-    blocks.append(_render_section(PREF_HEADING, _ordered(prefs)))
     blocks.append(_render_section(CHANNEL_FACT_HEADING, _ordered(channel_facts)))
     blocks.append(_render_section(WORKSPACE_FACT_HEADING, _ordered(workspace_facts)))
 
@@ -157,11 +165,10 @@ async def load_snapshot(db: Any, channel_id: Optional[str],
                         memory_enabled: bool = True) -> ChannelSteeringSnapshot:
     """Read the channel's steering ONCE and render it.
 
-    `memory_enabled` (ENABLE_CHANNEL_MEMORY) governs ordinary FACTS only. The reserved policy
-    and the gate's own preference rows are steering, not memory: turning fact capture off is an
-    operator saying "stop remembering things", never "stop obeying the rules I set" — and if it
-    silenced the policy, the directives migration would quietly disable every live operator rule
-    in the workspace.
+    `memory_enabled` (ENABLE_CHANNEL_MEMORY) governs ordinary FACTS only. The reserved policy is
+    steering, not memory: turning fact capture off is an operator saying "stop remembering
+    things", never "stop obeying the rules I set" — and if it silenced the policy, the directives
+    migration would quietly disable every live operator rule in the workspace.
 
     Never raises. A failed read yields the ready-but-empty snapshot, and the caller stamps that:
     this turn simply has no steering. It must NOT be retried downstream, because a retry is how
@@ -189,8 +196,9 @@ async def load_snapshot(db: Any, channel_id: Optional[str],
         logger.warning(f"Channel memory read failed for {channel_id}: {type(e).__name__}")
         return EMPTY_SNAPSHOT
     if not memory_enabled:
-        # Facts are off; the gate's preference rows are not facts and keep rendering.
-        memory_rows = [row for row in memory_rows if is_pref_row(row)]
+        # Facts are off. Nothing else in this list is steering any more — the policy comes from
+        # its own row — so there is nothing left to render from it.
+        memory_rows = []
     return render_snapshot(policy_row, memory_rows)
 
 

@@ -4,7 +4,12 @@ The bot must remember every reaction IT places so "did you react to that?" is
 answerable from context. Covers the ChannelPulse.record_own_reaction bookkeeping
 (attribution + excerpt + truncation, generic form, thread landing, DM exclusion),
 the _reserve_and_react choke-point hook (fires on commit, not on failure/duplicate),
-and the main.py verdict-react path end-to-end.
+and the RESPONDER's react path end-to-end.
+
+The gate used to have a react verdict of its own, and the end-to-end test at the bottom drove it.
+That verdict is gone — the gate returns one bit and places nothing in the room — so the same
+end-to-end property is now asserted through the reaction the responder actually makes, plus a
+tripwire that the gate leaves the pulse alone on every outcome.
 """
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -13,7 +18,7 @@ import pytest
 
 from config import config
 from main import ChatBotV2
-from message_processor.participation import GateEvaluation
+from message_processor.participation import GateEvaluation, WakeDecision
 from slack_client.channel_pulse import ChannelPulse
 from slack_client.messaging import SlackMessagingMixin
 
@@ -133,12 +138,44 @@ async def test_reserve_and_react_hook_records_once_on_duplicate(monkeypatch):
     assert pulse.record_own_reaction.call_count == 1
 
 
-# ----------------------------------------------- main.py verdict-react integration
+# --------------------------------------- the reaction the RESPONDER makes, end to end
 
 @pytest.mark.asyncio
-async def test_verdict_react_path_records_own_reaction(monkeypatch):
+async def test_the_responders_react_tool_records_its_own_reaction(monkeypatch):
+    """RE-BASELINED to the actor that still exists.
+
+    This was the gate's react verdict end-to-end: `evaluate` returned action=react with an emoji,
+    `_run_participation_gate` placed it and returned None, and the pulse learned about it. The
+    verdict is gone, so the same property — an emoji WE placed becomes part of what the bot can
+    later say it did — is asserted through `react_to_message`, which is how every reaction reaches
+    the room now. The choke point (`_reserve_and_react`) and the bookkeeping are unchanged, which
+    is why nothing about the assertion needed weakening."""
+    monkeypatch.setattr(config, "enable_reactions", True)
+    monkeypatch.setattr(config, "enable_react_tool", True)
+    monkeypatch.setattr(config, "reaction_emojis", ["tada"], raising=False)
+    pulse = ChannelPulse(size=10)
+    pulse.record("C1", **_human("100.0", text="Fable limit removed for everyone?",
+                                name="Riley"))
+    host = _ReactHost(AsyncMock(), pulse)
+    host.execute_react_tool = SlackMessagingMixin.execute_react_tool.__get__(host)
+
+    out = await host.execute_react_tool(
+        SimpleNamespace(channel_id="C1", trigger_ts="100.0", thread_ts="100.0",
+                        attempt_id=None),
+        {"emoji": "tada"})
+    assert out["ok"] is True
+    assert "reacted :tada: to Riley's message" in pulse.render_envelope("C1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wake", [True, False])
+async def test_the_gate_leaves_the_pulse_untouched(monkeypatch, wake):
+    """The tripwire the deleted test becomes: a gate pass must add nothing to the pulse, because it
+    puts nothing in the room to add. A reaction recorded here without one on the message would make
+    the bot claim, later and in good faith, to have reacted to something it never touched."""
     monkeypatch.setattr(config, "enable_reactions", True)
     monkeypatch.setattr(config, "enable_participation_engine", True)
+    monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
     pulse = ChannelPulse(size=10)
     pulse.record("C1", **_human("100.0", text="Fable limit removed for everyone?",
                                 name="Riley"))
@@ -149,16 +186,17 @@ async def test_verdict_react_path_records_own_reaction(monkeypatch):
     bot.processor.mcp_manager = None
     engine = Mock()
     engine.note_arrival = Mock()
-    engine.evaluate = AsyncMock(return_value=GateEvaluation(
-        verdict=SimpleNamespace(action="react", emoji="tada", reason="fun")))
+    engine.evaluate = AsyncMock(return_value=GateEvaluation(decision=WakeDecision(wake=wake)))
     bot.participation_engine = engine
 
     message = SimpleNamespace(
         channel_id="C1", thread_id="100.0", user_id="U9",
         text="Fable limit removed for everyone?",
         attachments=[],  # real Message defaults this to [] in __post_init__; the gate reads it
-        metadata={"ts": "100.0", "participation_level": "judicious"})
+        metadata={"ts": "100.0", "participation_level": "on"})
 
-    result = await bot._run_participation_gate(message, host)
-    assert result is None  # react verdicts stay silent
-    assert "reacted :tada: to Riley's message" in pulse.render_envelope("C1")
+    before = pulse.render_envelope("C1")
+    decision = await bot._run_participation_gate(message, host)
+    assert (decision is not None) is wake
+    assert pulse.render_envelope("C1") == before
+    assert "reacted" not in pulse.render_envelope("C1")

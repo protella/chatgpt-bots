@@ -648,16 +648,28 @@ class TestCanvasesAreChannelContext:
         # ...and it rides the prompt only in a CHANNEL, where a canvas can actually exist.
         assert "channel_info is not None and config.enable_canvas_tools" in src
 
-    def test_the_participation_gate_is_told_too(self):
+    def test_the_participation_gate_is_no_longer_told(self):
+        """INVERTED for the binary gate.
+
+        The canvas catalogue was a gate input so the rich gate could tell that "add it to the
+        agenda" referred to a document that exists here — a judgment about what a message is ASKING
+        FOR, which the gate no longer makes. It decides whether the responder runs; the responder
+        gets the catalogue (asserted in the test above) and it is the one that has to know.
+
+        Asserted at the signature so the input is unbuildable, not merely unused: a kwarg the gate
+        silently swallowed would let a caller believe the catalogue had been sent."""
         import inspect
         from openai_client.api import responses
         src = inspect.getsource(responses)
-        assert 'signals.get("channel_canvases")' in src
-        assert "Channel canvases" in src
+        assert 'signals.get("channel_canvases")' not in src
+        assert "Channel canvases" not in src
 
         from message_processor.participation import ParticipationEngine
         sig = inspect.signature(ParticipationEngine.evaluate)
-        assert "channel_canvases" in sig.parameters
+        assert "channel_canvases" not in sig.parameters
+        # What the gate DOES take instead, so the inversion reads as a replacement, not a hole:
+        # the canonical steering snapshot, and the message's own facts.
+        assert "channel_steering_text" in sig.parameters
 
 
 @pytest.mark.unit

@@ -88,23 +88,23 @@ class TestAtomicSetter:
         # #9: an idempotent structural write (SAME value) must NOT rewrite updated_ts/updated_by —
         # "field supplied" is not "value changed". A re-save of unchanged settings by a different
         # actor must not make that actor look like the last editor.
-        temp_db.set_channel_settings("C1", participation_level="judicious", updated_by="alice")
+        temp_db.set_channel_settings("C1", participation_level="on", updated_by="alice")
         temp_db.conn.execute(
             "UPDATE channel_settings SET updated_ts = '2000-01-01 00:00:00' WHERE channel_id = 'C1'")
-        temp_db.set_channel_settings("C1", participation_level="judicious", updated_by="bob")
+        temp_db.set_channel_settings("C1", participation_level="on", updated_by="bob")
         row = temp_db.get_channel_settings("C1")
-        assert row["participation_level"] == "judicious"   # value intact
+        assert row["participation_level"] == "on"   # value intact
         assert row["updated_by"] == "alice"                # NOT stolen by the no-op write
         assert row["updated_ts"] == "2000-01-01 00:00:00"  # NOT bumped
 
     def test_mixed_write_with_a_real_change_still_bumps(self, temp_db):
         # A batch where one provided structural field is unchanged but another genuinely changes
         # still counts as a real edit → attribution bumps.
-        temp_db.set_channel_settings("C1", participation_level="judicious", reply_in_channel=True,
+        temp_db.set_channel_settings("C1", participation_level="on", reply_in_channel=True,
                                      updated_by="alice")
         temp_db.conn.execute(
             "UPDATE channel_settings SET updated_ts = '2000-01-01 00:00:00' WHERE channel_id = 'C1'")
-        temp_db.set_channel_settings("C1", participation_level="judicious", reply_in_channel=False,
+        temp_db.set_channel_settings("C1", participation_level="on", reply_in_channel=False,
                                      updated_by="bob")
         row = temp_db.get_channel_settings("C1")
         assert row["reply_in_channel"] is False
@@ -147,13 +147,16 @@ class TestNullInheritance:
         temp_db.set_channel_settings("C1", verbosity="low")  # response_mode + level both NULL
         cs = temp_db.get_channel_settings("C1")
         # NULL participation_level + NULL response_mode → falls back to the global default mode.
-        assert resolve_participation_level(cs) == "judicious"
+        # auto_respond resolves to "on": `judicious` and `active` were two dials on a gate that
+        # weighed how much value a reply would add, a question the binary gate does not ask, so
+        # both migrated to one honest level.
+        assert resolve_participation_level(cs) == "on"
 
     def test_explicit_level_still_wins_over_null_mode(self, temp_db):
-        temp_db.set_channel_settings("C1", participation_level="active")  # response_mode stays NULL
+        temp_db.set_channel_settings("C1", participation_level="on")  # response_mode stays NULL
         cs = temp_db.get_channel_settings("C1")
         assert cs["response_mode"] is None
-        assert resolve_participation_level(cs) == "active"
+        assert resolve_participation_level(cs) == "on"
 
 
 # --------------------------------------------------------------------------- pure builder unit

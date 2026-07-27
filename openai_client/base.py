@@ -413,26 +413,14 @@ class OpenAIClient(LoggerMixin):
 
     async def classify_wake(
         self,
-        text: str,
-        signals: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        """DEPRECATED (Phase F): use classify_participation. Kept one release for rollback."""
-        return await responses_api.classify_wake(self, text=text, signals=signals)
-
-    async def classify_participation(
-        self,
-        text: str,
-        signals: Optional[Dict[str, Any]] = None,
-        images: Optional[List[Dict[str, Any]]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Phase F participation judgment: the raw JSON verdict dict, or None when the call
-        failed or produced nothing parseable (the engine renders that as fail-safe silence and
-        records it as a classifier failure, not as a verdict of 'ignore').
-
-        F40: `images` are sanitized `input_image` parts (gate_vision) so the gate can judge a
-        picture on its content instead of its filename."""
-        return await responses_api.classify_participation(
-            self, text=text, signals=signals, images=images)
+        *,
+        sources: Any,
+        channel_steering_text: Optional[str] = None,
+    ) -> Optional[bool]:
+        """THE gate call: one bit. True/False as the model decided, or None when it produced
+        nothing usable — which the engine turns into a decline, never into a decision."""
+        return await responses_api.classify_wake(
+            self, sources=sources, channel_steering_text=channel_steering_text)
 
     async def extract_memory(
         self,

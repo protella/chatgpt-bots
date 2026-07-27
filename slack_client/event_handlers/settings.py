@@ -369,6 +369,14 @@ class SlackSettingsHandlersMixin:
             state = view.get('state', {}).get('values', {})
             sel = state.get('participation_block', {}).get('participation_level', {}).get('selected_option') or {}
             level_sel = sel.get('value', 'inherit')
+            # A modal opened BEFORE this release still offers `judicious` and `active`, and its
+            # Save arrives here with one of them selected. Written verbatim it would put a level
+            # back into the database that this build does not recognise — after the startup
+            # migration has already cleaned that channel — and the resolver would then read it as
+            # mentions_only, quieter than the person clicking Save intended. They meant "on"; both
+            # old values meant "on" under a binary gate, which is exactly why they were merged.
+            from message_processor.participation import normalize_legacy_level
+            level_sel = normalize_legacy_level(level_sel)
             # Dual-write (Phase F): participation_level is authoritative; response_mode is
             # kept in lockstep so legacy readers stay consistent. 'inherit' clears BOTH.
             participation_level = None if level_sel == 'inherit' else level_sel

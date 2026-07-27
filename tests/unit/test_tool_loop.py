@@ -919,12 +919,23 @@ class TestReactTool:
         assert out["ok"] is False and out["error"] == "reaction_cap"
 
 
-def test_participation_prompt_routes_explicit_reaction_requests_to_respond():
-    # F6 addendum: an explicit "add some reactions" request must NOT die at the gate's
-    # single-emoji react verdict — route it to respond so the main model places them.
-    from prompts import PARTICIPATION_SYSTEM_PROMPT
-    assert "explicitly ASKS the assistant to place a reaction" in PARTICIPATION_SYSTEM_PROMPT
-    assert 'choose "respond"' in PARTICIPATION_SYSTEM_PROMPT
+def test_an_explicit_reaction_request_can_no_longer_die_at_the_gate():
+    """RE-BASELINED: the failure mode this guarded is now structurally impossible.
+
+    F6 addendum: "add some reactions to that" used to be answered by the gate's own react verdict,
+    which placed exactly ONE emoji and ended the turn — so the request was half-served and the main
+    model never ran. The prompt clause asserted here routed it to `respond` instead.
+
+    The gate has no react verdict and no emoji: it returns one bit, and every reaction in the room
+    is placed by the responder through react_to_message (which the cap test above exercises). There
+    is no clause to assert, so this asserts the absence of the mechanism — a react action back in
+    the gate's vocabulary is the regression."""
+    from prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT
+    for retired in ('choose "respond"', "react_and_respond", '"react"'):
+        assert retired not in WAKE_CLASSIFIER_SYSTEM_PROMPT, retired
+    # The gate's only output is a bool, so it cannot name an emoji even if it wanted to.
+    from message_processor.participation import WakeDecision
+    assert list(WakeDecision.__dataclass_fields__) == ["wake"]
 
 
 # --------------------------------------------------------------------------- processor glue

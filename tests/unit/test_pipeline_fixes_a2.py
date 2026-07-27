@@ -124,6 +124,12 @@ class _TimeoutHarness:
     def log_warning(self, *a, **k): pass
     def log_error(self, *a, **k): pass
 
+    # process_message folds the gate's coalesced cohort into the turn's input before anything reads
+    # the thread. This harness stubs its collaborators one by one, so the new call needs a stub too;
+    # a message with no cohort merges nothing.
+    def _merge_gate_cohort(self, message, thread_state):
+        return 0
+
     # collaborators
     async def _get_or_rebuild_thread_state(self, message, client, thinking_id):
         return self._thread_state
@@ -300,6 +306,12 @@ class _MergeHarness:
     def log_debug(self, *a, **k): pass
     def log_warning(self, *a, **k): pass
     def log_error(self, *a, **k): pass
+
+    # process_message folds the gate's coalesced cohort into the turn's input before anything reads
+    # the thread. This harness stubs its collaborators one by one, so the new call needs a stub too;
+    # a message with no cohort merges nothing.
+    def _merge_gate_cohort(self, message, thread_state):
+        return 0
 
     async def _get_or_rebuild_thread_state(self, message, client, thinking_id):
         return self._thread_state

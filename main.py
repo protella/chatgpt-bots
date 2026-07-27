@@ -8,14 +8,13 @@ import signal
 import asyncio
 import argparse
 import time
-from typing import Any, Dict, Optional
-from config import GUIDANCE_TRUNCATION_CHARS, config
+from typing import Optional
+from config import config
 from logger import log_session_start, log_session_end, main_logger
 from message_processor.base import MessageProcessor
 from message_processor import channel_steering, participation_telemetry, routing_facts
 from message_processor.participation import (ParticipationEngine,
-                                             render_capabilities_line)
-from message_processor.people_tools import format_people_summary
+                                             resolve_participation_level)
 from message_processor.stale_send_guard import (ConversationWatermarks,
                                                 StaleSendSuppressed)
 from message_processor.turn_runtime import TurnRuntime
@@ -90,22 +89,38 @@ class ChatBotV2:
             # nobody ever set a rule. Nothing downstream can detect that, and the operator finds
             # out from the noise. A process that refuses to start is visible in the first place
             # anyone looks, and the fix (a reachable database) is the same either way.
-            migrated, failed, fatal = 0, 0, None
-            try:
-                migrated, failed = \
-                    await self.client.db.migrate_channel_directives_to_policy_async()
-            except Exception as e:  # noqa: BLE001 — reported below, then fatal
-                fatal = f"could not run ({type(e).__name__}: {e})"
-            if fatal is None and failed:
-                fatal = f"failed for {failed} channel(s), {migrated} migrated"
-            if fatal:
-                main_logger.error(
-                    f"Channel directives migration {fatal}. Refusing to start: channel policies "
-                    f"set before this release live in a column nothing reads any more, so those "
-                    f"channels' operator rules would be silently ignored. Fix the database "
-                    f"and restart.")
-                sys.exit(1)
-                return  # sys.exit is stubbed in some harnesses; never fall through into a live bot
+            # Each migration moves state OUT of a store this build no longer reads, so each is
+            # fatal on failure for the same reason: the bot would come up looking healthy while
+            # quietly ignoring something an operator set. `why` says what would be silently lost,
+            # because that is the sentence whoever reads the log needs.
+            for migrate, what, why in (
+                (self.client.db.migrate_channel_directives_to_policy_async,
+                 "channel directives",
+                 "channel policies set before this release live in a column nothing reads any "
+                 "more, so those channels' operator rules would be silently ignored"),
+                (self.client.db.migrate_participation_levels_to_binary_async,
+                 "participation levels",
+                 "a channel still set to judicious or active has a level this build does not "
+                 "recognise, and would fall back to mentions_only — quieter than its operator "
+                 "chose, with nothing to say so"),
+                (self.client.db.migrate_participation_prefs_to_policy_async,
+                 "participation preferences",
+                 "the backoff preference rows are no longer written or read, so a channel's "
+                 "recorded 'react less here' would stop being obeyed without anyone clearing it"),
+            ):
+                migrated, failed, fatal = 0, 0, None
+                try:
+                    migrated, failed = await migrate()
+                except Exception as e:  # noqa: BLE001 — reported below, then fatal
+                    fatal = f"could not run ({type(e).__name__}: {e})"
+                if fatal is None and failed:
+                    fatal = f"failed for {failed} channel(s), {migrated} migrated"
+                if fatal:
+                    main_logger.error(
+                        f"Migration of {what} {fatal}. Refusing to start: {why}. Fix the database "
+                        f"and restart.")
+                    sys.exit(1)
+                    return  # sys.exit is stubbed in some harnesses; never fall through to a live bot
         else:
             main_logger.error(f"Unknown platform: {self.platform}")
             sys.exit(1)
@@ -144,45 +159,49 @@ class ChatBotV2:
         refused to build the report, because it could not read the numbers and would not invent
         them. The file was sitting right there in the channel.
 
-        So: run the gate, and if it stays silent (returns None), catalog the files anyway. When
-        the gate falls through to a reply (respond or react_and_respond), the turn does the richer
-        job (extraction, summaries, visual descriptions) and we leave it alone — `save_document` is
-        a plain INSERT, so cataloguing here as well would just duplicate the row.
+        So: run the gate, and if it does not wake (returns None), catalog the files anyway. On a
+        wake the turn does the richer job (extraction, summaries, visual descriptions) and we leave
+        it alone — `save_document` is a plain INSERT, so cataloguing here as well would just
+        duplicate the row. A message whose own attempt was superseded is covered too: its files are
+        catalogued by that attempt, and its text reaches the model in the survivor's cohort.
         """
-        verdict = await self._gate_verdict(message, client)
+        decision = await self._gate_verdict(message, client)
         # The ONE place that answers "did the gate hand this on" — for the routing fact and for
-        # the ledger alike. It used to be three separate marks inside the gate, one per
-        # fall-through branch, which is three chances for a new branch to forget. Written on
-        # every run (not only on a wake) so a queued redispatch's second gate cannot inherit the
-        # first gate's answer.
-        routing_facts.set_gate_woke(message, verdict is not None)
-        if verdict is not None:
+        # the ledger alike. Written on every run (not only on a wake) so a queued redispatch's
+        # second gate cannot inherit the first gate's answer.
+        routing_facts.set_gate_woke(message, decision is not None)
+        if decision is not None:
             participation_telemetry.mark_gate_woke(message)
-        if verdict is None and (message.attachments or []):
+        if decision is None and (message.attachments or []):
             self.processor._schedule_async_call(
                 thread_files.catalog_unattended(self.processor, client, message))
-        return verdict
+        return decision
 
     async def _gate_verdict(self, message: Message, client: BaseClient):
-        """Phase F gate for UNPROMPTED channel messages: hard rails → debounce →
-        ONE engine call → act. Returns a verdict for the fall-through outcomes —
-        'respond', 'react_and_respond', and a backoff that requests an explicit
-        settings change — which the caller runs through the response loop (a
-        react_and_respond has ALREADY placed its gate reaction here). Every
-        terminal outcome (ignore / react / a fully-handled backoff / superseded /
-        any failure) is handled here and returns None so the caller stays silent."""
+        """The binary wake gate for UNPROMPTED channel messages: hard rails → debounce cohort →
+        ONE model call → one bit.
+
+        Returns a WakeDecision(wake=True) for the caller to run through the responder, and None
+        for every terminal outcome the gate owns — a decision not to wake, a cohort collapse, an
+        edit cancellation, an image-only cohort, a classifier failure, or a crash. All of those
+        are silence, and each closes its own attempt here."""
         # Mint this attempt's id FIRST — before the engine check below, so even an engine-off
         # decline is a countable attempt with a start AND a terminal event, and so a redispatch
         # of this same Message object is recorded as a linked second attempt rather than
         # overwriting the first.
         attempt_id = participation_telemetry.begin_attempt(message)
-        # True once a verdict has been recorded, so the except-clause below can tell a gate that
-        # failed to DECIDE from a gate that decided and then failed to ACT.
-        verdict_recorded = False
+        # True once a decision has been recorded, so the except-clause below can tell a gate that
+        # failed to DECIDE from a gate that decided and then failed to hand off.
+        decision_recorded = False
         try:
             channel_id = message.channel_id
             ts = message.metadata.get("ts") or message.thread_id
-            level = message.metadata.get("participation_level") or "judicious"
+            # The canonical level, for slicing the ledger — not a prompt input. `judicious` was
+            # the old default and is no longer a level at all; an absent value means this message
+            # took a path that did not stamp one, so fall back to what the channel would resolve to
+            # rather than naming a level that cannot exist.
+            level = (message.metadata.get("participation_level")
+                     or resolve_participation_level(None))
             # The denominator. Logged BEFORE any of the context-building I/O below, so a message
             # that dies to an exception on the way to the model is still counted as gated.
             #
@@ -202,7 +221,11 @@ class ChatBotV2:
                 sender_is_bot=message.metadata.get("participation_sender_bot") is True,
                 sender_type=message.metadata.get("sender_type"),
                 wake_source=message.metadata.get("wake_source"),
-                has_images=bool(message.metadata.get("participation_images")),
+                # Whether the message CARRIES images, read off the attachments themselves. It is
+                # a slicing fact about the traffic, not a prompt input: the gate never sees the
+                # pictures, so nothing is stamped on the message for it to see.
+                has_images=any((a or {}).get("type") == "image"
+                               for a in (message.attachments or [])),
                 has_attachments=bool(message.attachments or []),
                 # A re-gate of the SAME message, behind the Phase Q queue. Its verdict may differ
                 # from the first attempt's, and averaging the two as independent decisions would
@@ -227,8 +250,6 @@ class ChatBotV2:
                 # engine off → unaddressed messages stay unanswered (mentions_only behavior)
                 return None
 
-            pulse = getattr(client, "channel_pulse", None)
-
             # F5 fix (b): register this message's ts as its conversation's newest BEFORE
             # the memory/topic awaits below — an older event delayed by that I/O must not
             # overwrite a newer event's debounce marker and win the race. F21: the marker
@@ -236,19 +257,6 @@ class ChatBotV2:
             # scopes the top-level stream per author so different people's unrelated
             # top-level questions never collide.
             engine.note_arrival(channel_id, ts, message.thread_id, message.user_id)
-
-            # Pacing is the classifier's judgment, and only its judgment. F17 removed the
-            # hourly-cap hard rail; the count that fed it survived as a signal line until it
-            # was removed too — it never prevented a misfire, and a rate number in a prompt
-            # that is otherwise about WHO a message is for only competed with that judgment.
-            name_hit = message.metadata.get("participation_name_hit") is True
-
-            channel_activity = None
-            if pulse is not None:
-                channel_activity = pulse.render_envelope(
-                    channel_id, exclude_thread_ts=None,
-                    max_lines=config.channel_pulse_envelope_max,
-                ) or None
 
             # THE channel-steering read for this turn — the only one. It is rendered once and
             # STAMPED on the message, so if this gate wakes, the responder builds its prompt from
@@ -261,202 +269,79 @@ class ChatBotV2:
                 self.processor.db, channel_id,
                 memory_enabled=bool(getattr(config, "enable_channel_memory", True))))
 
-            channel_topic = None
-            num_members = None
-            fetch_ctx = getattr(client, "get_channel_context", None)
-            if fetch_ctx:
-                try:
-                    ctx = await fetch_ctx(channel_id)
-                    channel_topic = (ctx or {}).get("topic") or None
-                    num_members = (ctx or {}).get("num_members")
-                except Exception:
-                    channel_topic = None
-                    num_members = None
-
-            # F29: people signal — member count + recently active names (from the pulse ring)
-            # — so the classifier can resolve WHO a message (and its "you") is aimed at.
-            recent_names = []
-            if pulse is not None:
-                try:
-                    recent_names = pulse.recent_speakers(channel_id)
-                except Exception:
-                    recent_names = []
-            channel_people = format_people_summary(num_members, recent_names)
-
-            is_thread_reply = bool(ts and message.thread_id and message.thread_id != ts)
-            # F11: inventory of the assistant's own tools/data sources so the classifier
-            # can weigh whether it is well-suited to answer an open question to the room.
-            capabilities = render_capabilities_line(getattr(self.processor, "mcp_manager", None))
-            # F36: canvases are channel furniture, like the topic. Cached per channel.
-            channel_canvases = []
-            try:
-                from message_processor import canvas_tools
-                channel_canvases = [c["title"] for c in
-                                    await canvas_tools.build_catalog(client, channel_id)]
-            except Exception:  # noqa: BLE001 — never cost the gate a verdict
-                channel_canvases = []
-
-            # C3: workspace custom emoji as EXTRA classifier choices — ONLY when there is no
-            # REACTION_EMOJIS allowlist (a set allowlist is the exact hard constraint; customs
-            # are never injected over it).
-            #
-            # These are the emoji THIS WORKSPACE actually reacts with, most-used first. The gate
-            # is a single tool-free call whose emoji is placed directly (see _place_gate_reaction),
-            # so unlike the responder it cannot search the catalog — its whole palette has to
-            # arrive in this one prompt, which makes the choice of WHICH names to send the
-            # entire game. It used to send the first N alphabetically out of ~1,400, i.e.
-            # "000, 1password_icon, 2605732e-82a0-46b9-b1e0-ecc4f250eb35, 4cats_q, alabama" —
-            # unusable, and worse than nothing because it is prompt noise the model must read.
-            # Observed usage is the only real ranking signal Slack exposes (there is no
-            # popularity endpoint, and emoji.list carries no tags or descriptions).
-            #
-            # When nothing has been observed yet, send NOTHING. Standard emoji are a clean
-            # fallback the model already knows; an alphabetical slice is not a fallback at all.
-            workspace_custom_emojis = []
-            if not (config.reaction_emojis or []):
-                emoji_cache = getattr(client, "workspace_emojis", None)
-                pulse = getattr(client, "channel_pulse", None)
-                if emoji_cache is not None and pulse is not None:
-                    try:
-                        cap = max(0, int(getattr(config, "participation_custom_emoji_cap", 32)))
-                        workspace_custom_emojis = pulse.top_custom_reactions(
-                            allowed=emoji_cache.get_custom_emoji_names(), limit=cap)
-                    except Exception:  # noqa: BLE001 — never cost the gate a verdict
-                        workspace_custom_emojis = []
-
-            # Track 1: load the PRIOR channel narrative (never blocks — uses whatever is cached)
-            # and kick a DETACHED refresh decision so the cache stays warm. The classifier reads
-            # the narrative as background for relevance/value only; the framing forbids using it
-            # for addressee resolution. Load via channel_id only (strict per-channel scope).
-            channel_summary = None
-            summary_svc = getattr(self.processor, "channel_summary_service", None)
-            if summary_svc is not None:
-                try:
-                    channel_summary = await summary_svc.render_for_channel(channel_id)
-                except Exception:
-                    channel_summary = None
-                try:
-                    await summary_svc.maybe_refresh(channel_id, client=client, pulse=pulse)
-                except Exception:
-                    pass
-
+            # NOTHING ELSE IS GATHERED HERE, and the absence is the commit. The rich gate built a
+            # pulse envelope, a thread tail, an addressee tail, a channel topic, a member count, a
+            # recent-speakers line, a canvas catalogue, a capability inventory, a custom-emoji
+            # shortlist and a channel narrative — half a dozen API calls and cache reads on the hot
+            # path of a decision the whole turn waits for — to support judgments about addressee,
+            # answerability and which emoji to place. The gate makes none of those judgments now,
+            # so every one of those inputs was work spent on a question nobody asks.
             evaluation = await engine.evaluate(
                 channel_id=channel_id, ts=ts, text=message.text,
                 sender_id=message.user_id,
-                sender_name=message.metadata.get("user_real_name") or message.metadata.get("username"),
-                is_thread_reply=is_thread_reply, level=level,
+                sender_name=(message.metadata.get("user_real_name")
+                             or message.metadata.get("username")),
+                sender_type=message.metadata.get("sender_type"),
                 channel_steering_text=steering.text,
-                channel_activity=channel_activity,
-                name_hit=name_hit,
-                self_display_name=getattr(client, "bot_handle", None),
-                sender_is_bot=message.metadata.get("participation_sender_bot") is True,
-                channel_topic=channel_topic,
-                channel_canvases=channel_canvases,
-                channel_people=channel_people,
-                channel_summary=channel_summary,
-                capabilities=capabilities,
-                workspace_custom_emojis=workspace_custom_emojis,
+                # Names and types, already summarized at dispatch. No pixels: the binary gate
+                # does not look at images, so nothing is downloaded for it and nothing waits on it.
                 attachments=message.metadata.get("participation_attachments"),
-                # F40: descriptors only — the engine downloads the pixels itself, and only once
-                # the message has survived the debounce.
-                images=message.metadata.get("participation_images"),
                 client=client,
-                pulse=pulse, thread_root_ts=message.thread_id,
+                thread_root_ts=message.thread_id,
+                # The edit's OWN marker, so only the edit's attempt can claim the stashed
+                # before/after text — the superseded original carries no marker and gets none.
+                edit_marker=(message.metadata or {}).get("edit_reply_marker"),
+                # A Phase-Q drain folds queued messages into this turn; they never had a debounce
+                # window of their own, so they join the cohort here rather than being decided for
+                # in absentia by whatever happened to arrive last.
+                carried_sources=(message.metadata or {}).get("carried_gate_sources"),
                 attempt_id=attempt_id,
             )
             gate_latency_ms = int((time.monotonic() - gate_started_at) * 1000)
-            verdict = evaluation.verdict
-            # A decline is TERMINAL and its detail was already recorded by the engine (which
-            # alone knows the survivor ts / the exception type). The outer backstop that used to
-            # log a second `no_verdict` decline here is gone: it double-counted every
-            # supersession, and a ledger whose declines outnumber its attempts measures nothing.
-            # `classifier_error` arrives WITH a manufactured fail-safe `ignore` verdict — the
-            # silence is byte-identical to before, but it is not scored as the model's judgment
-            # and it produces no gate_decision.
-            if evaluation.decline_cause or verdict is None:
+            decision = evaluation.decision
+            # A decline is TERMINAL, and its detail was already recorded by the engine — which
+            # alone knows the survivor ts or the exception type. `classifier_error` is a decline
+            # like any other now: the rich gate manufactured a fail-safe `ignore` and emitted it as
+            # a decision, which scored a provider outage as the model choosing restraint.
+            if evaluation.decline_cause or decision is None:
                 main_logger.debug(
-                    f"Participation gate: no verdict to act on "
-                    f"({evaluation.decline_cause or 'superseded'}) — silent")
+                    f"Wake gate: nothing to act on "
+                    f"({evaluation.decline_cause or 'no_decision'}) — silent")
                 participation_telemetry.finish_attempt(
                     message, "none", ended_by="gate", cause=evaluation.decline_cause,
                     gate_ms=gate_latency_ms, classifier_ms=evaluation.classifier_ms)
                 return None
-            participation_telemetry.gate_decision(
-                channel_id, ts, verdict, attempt_id=attempt_id,
-                gate_ms=gate_latency_ms, classifier_ms=evaluation.classifier_ms)
-            verdict_recorded = True
-            main_logger.debug(f"Participation verdict: {verdict.action} ({verdict.reason})")
-            # An overrule means the model's chosen action contradicted its OWN staged findings.
-            # Logged at INFO because a rising rate is a signal about the prompt, not the code: the
-            # invariants are a backstop, and if they start carrying the decision it is the prompt
-            # that needs fixing. No message text here — only the declared classifications.
-            # getattr, not attribute access: verdicts do not all come from validate_verdict (the
-            # edit-reply path and tests construct their own), and a missing field must never turn
-            # into an AttributeError that the gate's except-clause converts into silence.
-            if getattr(verdict, "overruled_by", None):
-                main_logger.info(
-                    f"Participation invariant: "
-                    f"{','.join(getattr(verdict, 'overruled_by', None) or [])} → "
-                    f"{verdict.action} | channel={channel_id} ts={ts} "
-                    f"relation={getattr(verdict, 'relation', None)} "
-                    f"exchange={getattr(verdict, 'exchange_state', None)} "
-                    f"answerability={getattr(verdict, 'answerability', None)}")
 
-            if verdict.action == "react":
-                react_ts = message.metadata.get("ts") or message.thread_id
-                # Route through the shared gate-reaction helper (reservation guard + timeout +
-                # once-per-message stamp). A reaction is this verdict's whole response — stay silent.
-                placed = await self._place_gate_reaction(
-                    message, client, channel_id, react_ts, verdict.emoji)
-                # The emoji IS the turn, so whether it landed decides what the room saw. A
-                # react verdict whose reaction was refused or timed out showed nothing at all,
-                # and filing it as reaction_only would report a reaction that is not there.
-                participation_telemetry.finish_attempt(
-                    message, "reaction_only" if placed else "none",
-                    ended_by="gate", action=verdict.action)
+            participation_telemetry.gate_decision(
+                channel_id, ts, wake=decision.wake, attempt_id=attempt_id,
+                gate_ms=gate_latency_ms, classifier_ms=evaluation.classifier_ms,
+                source_count=len(evaluation.sources),
+                newest_source_ts=(evaluation.sources[-1].ts if evaluation.sources else None))
+            decision_recorded = True
+
+            if not decision.wake:
+                # A DECISION to stay out, and the only gate-terminal outcome that earns the
+                # `silence` label. It carries no reason — not to the log, not to the ledger, not to
+                # anywhere: a gate reason was free prose about someone's message that ended up
+                # forwarded into the responder's prompt, where it pre-argued the turn.
+                #
+                # And no `silence_reason` either. That eight-value enum belongs to the RESPONDER,
+                # which can say why it chose to stay quiet after seeing everything; the gate knows
+                # only that it did not open.
+                participation_telemetry.finish_attempt(message, "silence", ended_by="gate")
                 return None
-            if verdict.action == "react_and_respond":
-                # BOTH react and reply in one turn: place the gate reaction (same path as `react`),
-                # then fall through to the response loop like `respond` so the words go out too. The
-                # response turn's developer suffix tells the model it already reacted (so it doesn't
-                # add a second reaction). The stamp inside _place_gate_reaction means a queued
-                # redispatch that re-picks a react/react_and_respond verdict can't stack a second one.
-                react_ts = message.metadata.get("ts") or message.thread_id
-                await self._place_gate_reaction(
-                    message, client, channel_id, react_ts, verdict.emoji)
-                # The responder owns the end of this turn, so it owns the terminal event too.
-                # (The wake itself is recorded once by the caller, for every fall-through.)
-                return verdict
-            if verdict.action == "backoff":
-                # The taxonomy decides what "backoff" means: a durable per-channel preference,
-                # a real thread mute/unmute, a momentary aside (nothing persisted), or an
-                # explicit channel-settings change — the last one falls through to the response
-                # loop so the MAIN model applies it (with judgment) via set_channel_participation.
-                fall_through, ack_placed = await self._apply_backoff(message, client, verdict)
-                if fall_through:
-                    return verdict
-                # Fully handled here. An ack reaction that LANDED is what the room saw, so this
-                # is not a silent turn — the feedback was visibly acknowledged. Without a
-                # reaction (feedback about reactions never gets one, and a failed add is not
-                # one) nothing was shown and it is a silence.
-                participation_telemetry.finish_attempt(
-                    message, "reaction_only" if ack_placed else "silence",
-                    ended_by="gate", action=verdict.action, detail="backoff")
-                return None
-            if verdict.action == "respond":
-                # F38: the gate no longer acks. It used to drop a 👀 here on a respond+ack
-                # verdict, but that reaction was a PREDICTION that work was coming — made
-                # before the model had done anything, and demonstrably overeager (it acked
-                # "Never tried this. Not sure how it will turn out", a passing comment). A
-                # teammate who drops eyes and then does nothing is misleading. The 👀 is now
-                # a CLAIM ON WORK, staked by TurnRuntime.claim_work when a tool actually
-                # starts doing something slow, and taken back if that work produces nothing.
-                return verdict
-            # ignore — the model was asked and chose to say nothing. A DECISION, and the only
-            # gate-terminal outcome that deserves the `silence` label.
-            participation_telemetry.finish_attempt(
-                message, "silence", ended_by="gate", action=verdict.action)
-            return None
+
+            # Wake. Everything about what to SAY — words, a reaction instead, where it lands,
+            # whether to change a setting, whether to say nothing after all — belongs to the
+            # responder from here, which is the model that can actually see the conversation.
+            #
+            # The cohort rides along so the turn answers the whole burst rather than only its
+            # newest fragment. Typed records, merged into the responder's real input — not prose
+            # metadata describing messages it cannot see.
+            if isinstance(message.metadata, dict) and evaluation.sources:
+                message.metadata["gate_sources"] = evaluation.sources
+            return decision
+
         except Exception as e:
             # Fail-safe stays silence: worst failure mode is a missed reply, never spam.
             main_logger.warning(f"Participation gate error: {e}; staying silent")
@@ -469,7 +354,7 @@ class ChatBotV2:
             # up (a reaction, a backoff write, the handoff), and filing that as a classifier
             # decline would report the model as unable to judge when its judgment is on record
             # two lines above.
-            cause = "action_error" if verdict_recorded else "error"
+            cause = "action_error" if decision_recorded else "error"
             participation_telemetry.gate_declined(
                 message.channel_id, (message.metadata or {}).get("ts") or message.thread_id,
                 cause=cause, attempt_id=attempt_id, detail=type(e).__name__)
@@ -477,269 +362,6 @@ class ChatBotV2:
                 message, "none", ended_by="gate", cause=cause,
                 detail=type(e).__name__)
             return None
-
-    async def _place_gate_reaction(self, message: Message, client: BaseClient,
-                                   channel_id: str, react_ts: str, emoji: Optional[str],
-                                   origin: str = "gate") -> bool:
-        """Place a participation-gate reaction ONCE per message, via the reservation guard so a
-        later turn sees the slot consumed. Idempotent across queued redispatch: the SAME Message
-        object is re-run through the gate (Phase Q) and a fresh pass may pick a different emoji or a
-        different reaction-bearing verdict — so every gate-reaction branch (react, react_and_respond,
-        backoff ack) checks the stamp first and no-ops if a gate reaction was already placed. On a
-        genuine placement, stamps message.metadata['participation_reaction_emoji'] so the response
-        turn's developer suffix can tell the model it already reacted.
-
-        Returns True when the gate's emoji IS on the message when this returns — a genuine
-        placement now, or one this same message already made on an earlier pass. The caller uses
-        it to say what the room saw, and a refused or failed add showed nothing. `origin`
-        separates a social gate reaction from a backoff acknowledgment: the second is a fixed
-        protocol move, not taste, and pooling them would make the gate's emoji diversity look
-        better than it is."""
-        attempt_id = participation_telemetry.attempt_id_for(message)
-
-        def _record(result_name: str, *, detail=None) -> None:
-            if not attempt_id:
-                return
-            participation_telemetry.reaction(
-                channel_id, react_ts, operation="add", result=result_name, origin=origin,
-                emoji=emoji, target_ts=react_ts, attempt_id=attempt_id, detail=detail)
-
-        # Each early return below is an intent that never reached Slack. They were invisible
-        # before, which made "the gate stopped reacting" impossible to distinguish from "the
-        # gate stopped choosing emoji".
-        if not emoji or not react_ts or not channel_id:
-            _record("refused", detail="invalid_target")
-            return False
-        md = message.metadata if isinstance(message.metadata, dict) else None
-        # Dedup: a redispatch re-runs this same object through the gate, and a fresh pass can flip
-        # react_and_respond→react (or pick a new emoji) — honor the first placement, never stack.
-        #
-        # TRUE, not False: the stamp is only ever written on a genuine placement, so reaching it
-        # means OUR emoji is on that message right now. The caller asks "what did the room see",
-        # and the room sees an emoji — returning False here filed a redispatched `react` as
-        # `none` and a stamped backoff ack as `silence`, both describing an empty message that
-        # visibly has a reaction on it. (The reaction row stays `already_present`: we did not
-        # place one on THIS pass, and counting it as a placement would double the gate's
-        # reaction rate on every redispatch.)
-        if md is not None and md.get("participation_reaction_emoji"):
-            _record("already_present", detail="already_stamped")
-            return True
-        result = None
-        try:
-            # Bound the gate's own react by the configured tool-call timeout so a wedged Slack call
-            # can't stall the turn. F6: route through the reservation guard so a later main-model
-            # turn honestly sees the slot consumed (and won't double-add). Falls back to raw react.
-            if hasattr(client, "_reserve_and_react"):
-                result = await asyncio.wait_for(
-                    client._reserve_and_react(channel_id, react_ts, emoji),
-                    timeout=config.tool_call_timeout)
-            elif hasattr(client, "react"):
-                result = await asyncio.wait_for(
-                    client.react(channel_id, react_ts, emoji),
-                    timeout=config.tool_call_timeout)
-        except asyncio.TimeoutError:
-            main_logger.debug("Participation gate react timed out")
-            _record("failed", detail="timeout")
-            return False
-        except Exception as e:
-            main_logger.debug(f"Participation gate react failed: {e}")
-            _record("failed", detail=type(e).__name__)
-            return False
-        # Stamp ONLY on a genuine placement (_reserve_and_react → {"ok": True}; react → True). On a
-        # cap/busy/timeout failure the slot wasn't taken, so leave the stamp unset: a later attempt
-        # can still try, and the model must never be told it reacted when it didn't.
-        placed = result is True or (isinstance(result, dict) and result.get("ok") is True)
-        # Recorded either way: a verdict that CHOSE an emoji and lost it to the per-message cap is
-        # a different story from one that never wanted to react, and only this line tells them
-        # apart afterwards. `idempotent` from the reservation layer means somebody else's emoji
-        # was already there — present, but not placed by us.
-        if placed and isinstance(result, dict) and result.get("idempotent"):
-            _record("already_present")
-        elif placed:
-            _record("added")
-        else:
-            _record("failed",
-                    detail=(result.get("error") if isinstance(result, dict) else None))
-        if placed and md is not None:
-            md["participation_reaction_emoji"] = emoji
-        return placed
-
-    # ---- participation-feedback backoff taxonomy (redesign Layer 2) ----
-    # Default guidance text per dimension, used to write a readable preference memory when the
-    # classifier gives no `guidance` of its own.
-    _PREF_DEFAULT_GUIDANCE = {
-        "reactions": "react less often in this channel",
-        "replies": "reply more sparingly in this channel",
-        "verbosity": "keep replies short in this channel",
-        "thread_participation": "participate more sparingly in this channel",
-    }
-
-    async def _apply_backoff(self, message: Message, client: BaseClient,
-                             verdict) -> tuple[bool, bool]:
-        """Route a participation-feedback ('backoff') verdict through the redesign taxonomy.
-
-        Returns (fall_through, ack_placed). `fall_through` is True when the message should go
-        to the MAIN response loop — an explicit channel-settings change the model applies with
-        judgment via the gated set_channel_participation tool — and False when the feedback was
-        fully handled here: a durable per-channel preference (memory), or a momentary/
-        thread-scoped aside that persists nothing. `ack_placed` says whether the optional
-        acknowledgment reaction actually landed, which is the only thing that makes a handled
-        backoff visible in the room at all.
-
-        Structural settings (participation level / placement) are NEVER written here. This
-        routine only ever touches per-channel preference MEMORY, so a "react less" can no
-        longer clobber a channel's response mode — the incident this redesign fixes. A
-        thread-scoped "stop replying here" is guidance for the current message only; it writes
-        nothing durable (there is no per-thread mute — that mechanism was removed)."""
-        channel_id = message.channel_id
-        react_ts = message.metadata.get("ts") or message.thread_id
-
-        # 1. Explicit structural request → the model owns it. Nothing durable is written here;
-        #    the taxonomy deliberately keeps settings changes in the response loop.
-        if verdict.structural_request and verdict.structural_request != "none":
-            main_logger.info(
-                f"Participation backoff: explicit structural request "
-                f"({verdict.structural_request}) in {channel_id} — routing to the response loop")
-            return True, False
-
-        standing = verdict.durability == "standing"
-        db = getattr(self.processor, "db", None)
-
-        # 2. The ONLY durable effect is a per-channel preference marker, and only for a
-        #    standing, CHANNEL-scoped verdict. A momentary "not now" persists nothing; a
-        #    thread-scoped "stop replying here" is guidance for this message alone — there is
-        #    no per-thread mute to write (the mute mechanism was removed, so a thread aside can
-        #    neither clobber channel settings nor leave a durable record). Any other/missing
-        #    scope also writes nothing.
-        if (standing and db is not None and verdict.scope == "channel"
-                and getattr(config, "enable_channel_memory", True)):
-            try:
-                await self._apply_pref_memory(channel_id, verdict)
-            except Exception as e:
-                main_logger.warning(f"Backoff durable write failed: {e}")
-
-        # 4. Conditional ack. Routed through the reservation/timeout path (like the gate's own
-        #    react) so a later main-model turn honestly sees the slot consumed. NEVER react when
-        #    the feedback is ABOUT reactions — acking "stop reacting" with a reaction is absurd.
-        ack_placed = False
-        if verdict.emoji and verdict.dimension != "reactions":
-            ack_placed = await self._backoff_ack(
-                message, client, channel_id, react_ts, verdict.emoji)
-
-        return False, ack_placed
-
-    # Reserved author prefix for the engine's own per-dimension preference markers. The backoff
-    # memory CRUD may ONLY ever touch rows under this prefix — never a human's fact and never a
-    # workspace fact (both of which get_channel_memory_async also returns).
-    _PREF_MARKER_PREFIX = "participation_engine:pref:"
-
-    def _own_pref_row(self, fact: Dict[str, Any]) -> bool:
-        """True only for one of the engine's OWN channel-scope preference markers. Guards the
-        backoff CRUD so an `update:<id>`/`delete:<id>` verdict can never rewrite or delete a
-        workspace or human memory fact (redesign BLOCKER #4)."""
-        return (((fact.get("scope") or "channel") == "channel")
-                and str(fact.get("author") or "").startswith(self._PREF_MARKER_PREFIX))
-
-    def _is_own_dimension_pref(self, fact: Dict[str, Any], marker: str) -> bool:
-        """Stronger than `_own_pref_row`: True only for THIS dimension's own channel-scope marker
-        row (`author == marker`). SHOULD-FIX 1: an `update:<id>`/`delete:<id>` verdict names a
-        raw fact id, and `_own_pref_row` alone would accept ANY of the engine's markers — so a
-        `reactions` verdict could rewrite or delete the `verbosity` marker. Requiring the author
-        to equal the current dimension's marker refuses a cross-dimension id (it then falls back
-        to this dimension's own marker row)."""
-        return self._own_pref_row(fact) and str(fact.get("author") or "") == marker
-
-    async def _apply_pref_memory(self, channel_id: str, verdict) -> None:
-        """Record / refine / remove ONE per-channel, per-dimension participation preference.
-
-        Keyed by a stable marker author `participation_engine:pref:<dimension>` so a repeat
-        "react less" UPDATES the single marker row instead of accumulating duplicate facts —
-        the false "REPEATED = observe-only" escalation the redesign removes.
-
-        Scope discipline (BLOCKER #4): every write here is confined to the engine's OWN marker
-        rows. An `update:<id>`/`delete:<id>` that names a workspace or human fact is REFUSED and
-        falls back to the per-dimension marker path; it never rewrites or deletes someone else's
-        memory. The add/refresh path goes through the atomic upsert_channel_pref_memory helper
-        (SHOULD-FIX #8), which enforces one marker row per dimension, the MEMORY_MAX_ROWS cap,
-        and the marker author — with no read-all-then-insert race."""
-        db = self.processor.db
-        dimension = verdict.dimension or "replies"
-        marker = f"{self._PREF_MARKER_PREFIX}{dimension}"
-        op = verdict.memory_op
-        existing = await db.get_channel_memory_async(channel_id) or []
-
-        # Reversal: delete the recorded preference. An explicit [#id] is honored ONLY when it
-        # names one of our OWN markers; otherwise fall back to this dimension's marker row. A
-        # workspace/human id is never deleted.
-        if op.startswith("delete"):
-            target = None
-            if op.startswith("delete:"):
-                wanted = int(op.split(":", 1)[1])
-                cand = next((f for f in existing if f.get("id") == wanted), None)
-                # SHOULD-FIX 1: only THIS dimension's own marker — a cross-dimension id is refused.
-                if cand is not None and self._is_own_dimension_pref(cand, marker):
-                    target = cand
-            if target is None:
-                target = next(
-                    (f for f in existing if self._is_own_dimension_pref(f, marker)), None)
-            if target is not None:
-                await db.delete_channel_memory_async(target["id"])
-                main_logger.info(
-                    f"Participation reversal: removed preference [#{target['id']}] in {channel_id}")
-            return
-
-        content = self._pref_memory_content(verdict, dimension)
-
-        # Explicit update of a specific numbered fact — honored ONLY for our own marker rows.
-        # Updating in place keeps that row's marker author. A non-owned or stale id is refused and
-        # falls through to the atomic marker upsert (which (re)writes the per-dimension marker).
-        if op.startswith("update:"):
-            wanted = int(op.split(":", 1)[1])
-            row = next((f for f in existing if f.get("id") == wanted), None)
-            # SHOULD-FIX 1: only THIS dimension's own marker may be updated in place. A row owned
-            # by a DIFFERENT dimension (or a workspace/human fact) is refused and falls through to
-            # the marker upsert, so a verdict never corrupts another dimension's preference.
-            if row is not None and self._is_own_dimension_pref(row, marker):
-                await db.update_channel_memory_async(row["id"], content)
-                main_logger.info(f"Participation preference updated [#{row['id']}] in {channel_id}")
-                return
-            # non-owned / cross-dimension / stale id — fall through to the marker upsert
-
-        # add / refresh: exactly one preference row per dimension, written atomically with the
-        # marker author and the MEMORY_MAX_ROWS cap enforced inside the helper.
-        cap = max(1, getattr(config, "memory_max_rows", 25))
-        new_id = await db.upsert_channel_pref_memory(channel_id, marker, content, max_rows=cap)
-        if new_id is None:
-            main_logger.debug(
-                f"Participation preference at memory cap and no marker row in {channel_id} — "
-                "not adding (won't evict a human's memory)")
-        else:
-            main_logger.info(
-                f"Participation preference recorded/refreshed [#{new_id}] ({dimension}) in {channel_id}")
-
-    def _pref_memory_content(self, verdict, dimension: str) -> str:
-        """The stored preference sentence: the classifier's normalized guidance when present,
-        else a sensible per-dimension default, tagged with the dimension for readability."""
-        guidance = " ".join((verdict.guidance or "").split())
-        if not guidance:
-            guidance = self._PREF_DEFAULT_GUIDANCE.get(
-                dimension, "participate more sparingly in this channel")
-        elif len(guidance) > GUIDANCE_TRUNCATION_CHARS:
-            guidance = guidance[:GUIDANCE_TRUNCATION_CHARS] + "…"
-        return f"Channel participation preference ({dimension}): {guidance}"
-
-    async def _backoff_ack(self, message: Message, client: BaseClient, channel_id: str,
-                           react_ts: str, emoji: str) -> bool:
-        """Drop the optional acknowledgment reaction, routed through the shared gate-reaction
-        helper so it goes through the same reservation guard the gate's own react uses (a later
-        turn sees the slot consumed and never double-adds) AND honors the once-per-message stamp —
-        a react_and_respond→backoff redispatch can't stack a second reaction onto this message.
-
-        Recorded under its own origin. This emoji is a protocol acknowledgment of feedback, not
-        a social reaction the classifier chose for its own sake, and counting it as one would
-        quietly improve every "is its emoji use varied?" number with a fixed move."""
-        return await self._place_gate_reaction(message, client, channel_id, react_ts, emoji,
-                                               origin="backoff_ack")
 
     @staticmethod
     def _produced_visible_output(response, turn) -> bool:
@@ -799,14 +421,15 @@ class ChatBotV2:
         if (turn is not None and getattr(turn, "visible_action_committed", False)) \
                 or meta.get("background_job_started"):
             return "detached"
+        # The gate no longer places reactions, so there is no gate stamp to consult here: every
+        # reaction on the message is this turn's own.
         if (meta.get("response_reaction_committed") is True
-                or (turn is not None and getattr(turn, "reaction_committed", False))
-                or bool((message.metadata or {}).get("participation_reaction_emoji"))):
+                or (turn is not None and getattr(turn, "reaction_committed", False))):
             return "reaction_only"
         return "stale_suppressed"
 
     @staticmethod
-    def _classify_visible_action(response, turn, gate_reaction_visible: bool = False) -> str:
+    def _classify_visible_action(response, turn) -> str:
         """The ONE outcome the room saw, as a single label for the telemetry ledger.
 
         Deliberately a pure function rather than an expression inside handle_message: what
@@ -821,11 +444,12 @@ class ChatBotV2:
         are identical in the room and opposite in meaning — one is the model choosing, the other
         is the contract failing — so the ledger has to keep them apart.
 
-        `gate_reaction_visible` is the one fact this function cannot see for itself: on a
-        `react_and_respond` the GATE already put an emoji on the message before the responder
-        ran, so a responder that then vetoes with no_response_needed did not leave the room
-        silent. The caller reads it off the message stamp and passes it in — the function stays
-        pure, which is why every one of these labels is testable as a table.
+        There is no gate reaction to account for any more. The rich gate could place an emoji
+        before the responder ran, so a responder that then vetoed with no_response_needed had not
+        actually left the room silent, and this function needed to be told. The binary gate puts
+        nothing in the room, so every reaction on the message belongs to this turn and the function
+        can see all of its own inputs — which is why every one of these labels is testable as a
+        table.
         """
         if response is None:
             # The responder handed back nothing at all. Not the gate's `none` (which means a
@@ -853,10 +477,7 @@ class ChatBotV2:
             # participates without words, which is the very rate this ledger exists to measure.
             # The model's stated reason still rides the event, separately.
             #
-            # The gate's own emoji counts for exactly the same reason: on react_and_respond the
-            # reaction is already up when the responder decides to use no words, and calling
-            # that turn a silence describes an empty message that is visibly reacted to.
-            if (meta.get("response_reaction_committed") is True or gate_reaction_visible
+            if (meta.get("response_reaction_committed") is True
                     or (turn is not None and getattr(turn, "reaction_committed", False))):
                 return "reaction_only"
             return "silence"     # the model chose it, via the terminal tool
@@ -944,15 +565,13 @@ class ChatBotV2:
         # of turns that exist stay in step.
         lease = self.watermarks.begin_turn(message)
         try:
-            # Phase F participation gate: for UNPROMPTED channel messages (judicious/active
-            # levels) the engine decides respond/react/react_and_respond/ignore/backoff BEFORE
-            # anything is posted. The reply outcomes fall through (respond, react_and_respond, and
-            # a backoff requesting a settings change); a react_and_respond has already placed its
-            # reaction in the gate, so only the words remain to send.
+            # The binary wake gate: for UNPROMPTED channel messages (every ordinary message at
+            # level `on`, a bare-name message at `mentions_only`) it decides whether the responder
+            # runs at all. Nothing is posted before it, and nothing is decided by it beyond that bit.
             gate_required = message.metadata.get("gate_required") is True
             if gate_required:
                 try:
-                    verdict = await self._run_participation_gate(message, client)
+                    decision = await self._run_participation_gate(message, client)
                 finally:
                     # AFTER the gate, and in a `finally`: the attempt is minted INSIDE that
                     # await, so a cancellation or a raise on the way back out would otherwise
@@ -961,17 +580,11 @@ class ChatBotV2:
                     # not exist yet, and the ungated turn's links are written later still, at the
                     # conversation lock (see MessageProcessor.process_message).
                     participation_telemetry.emit_queue_links(message, gate_required=True)
-                if verdict is None:
+                if decision is None:
                     return
-                # Kept for logs and debugging ONLY — deliberately NOT rendered into the wake
-                # envelope any more (see utilities._wake_trigger_line): forwarding the gate's own
-                # justification pre-argued the turn and neutered the no_response_needed veto.
-                if isinstance(message.metadata, dict) and getattr(verdict, "reason", None):
-                    message.metadata["participation_reason"] = verdict.reason
-                # F27: earlier same-author burst messages ride the wake envelope too, so the
-                # reply is told to cover the whole burst, not just the triggering fragment.
-                if isinstance(message.metadata, dict) and getattr(verdict, "burst_earlier", None):
-                    message.metadata["participation_burst_earlier"] = verdict.burst_earlier
+                # Nothing is copied off the decision. It carries one bit, and the cohort it judged
+                # was already stamped on the message by the gate — as typed records that become
+                # real responder input, not prose metadata about messages the model cannot see.
 
             # WHERE the reply goes is the turn's own state now, opened here and settled by the
             # model on the one route where there is a choice (set_reply_destination). The gate's
@@ -1227,11 +840,9 @@ class ChatBotV2:
                 # ledger documented as gate attempts — and what keeps a turn the gate already
                 # closed (a react verdict that fell through to nothing) from closing twice.
                 meta = (response.metadata or {}) if response is not None else {}
-                # What the GATE put in the room before the responder ran. The stamp is written
-                # only on a genuine placement, so it is a fact about Slack, not an intention.
-                gate_reaction = bool((message.metadata or {}).get(
-                    "participation_reaction_emoji"))
-                kind = self._classify_visible_action(response, turn, gate_reaction)
+                # No gate reaction to account for any more: the gate places nothing in the room, so
+                # every reaction on this message came from this turn.
+                kind = self._classify_visible_action(response, turn)
                 # A destination is reported only for a delivered reply on a turn that actually
                 # settled one. Computed once — three fields read it, and they must agree.
                 _records_destination = bool(
@@ -1261,7 +872,7 @@ class ChatBotV2:
                     # this is true on a reply that also reacted and on a reaction-only turn —
                     # not just on the one branch that happened to build the metadata field.
                     reaction_visible=bool(
-                        gate_reaction or meta.get("response_reaction_committed") is True
+                        meta.get("response_reaction_committed") is True
                         or (turn is not None and getattr(turn, "reaction_committed", False))),
                     # WHICH model wrote it. Per-user and per-thread overrides mean two rows in
                     # this ledger can come from different models, and a reply-quality comparison
@@ -1375,10 +986,7 @@ class ChatBotV2:
                 if delivered:
                     participation_telemetry.finish_attempt(
                         message,
-                        self._classify_visible_action(
-                            response, turn,
-                            bool((message.metadata or {}).get(
-                                "participation_reaction_emoji"))),
+                        self._classify_visible_action(response, turn),
                         ended_by="responder", post_delivery_error=type(e).__name__)
                 else:
                     participation_telemetry.finish_attempt(
