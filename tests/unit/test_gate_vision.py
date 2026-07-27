@@ -246,7 +246,9 @@ async def test_an_outage_is_not_retried_as_if_the_image_were_at_fault():
                                   "image_status": gate_vision.VISIBLE}, images=parts)
 
     assert len(fake.calls) == 1, "an outage must not be retried as an image problem"
-    assert verdict == {"action": "ignore"}, "and it still fails safe"
+    # None, not a forged {"action": "ignore"}: the engine renders both as the same silence, but
+    # only None lets the ledger tell an outage apart from the model choosing to stay quiet.
+    assert verdict is None, "and it still fails safe"
 
 
 # --------------------------------------------------------------------- engine wiring
@@ -267,9 +269,9 @@ async def test_nothing_downloads_until_the_message_survives_the_debounce(monkeyp
 
     import asyncio
     task = asyncio.create_task(supersede())
-    verdict = await engine.evaluate(
+    verdict = (await engine.evaluate(
         channel_id="C1", ts="10.0", text=":dogkek:", sender_id="U1",
-        images=[_img()], client=client)
+        images=[_img()], client=client)).verdict
     await task
 
     assert verdict is None, "superseded"
@@ -305,8 +307,8 @@ async def test_an_unreadable_image_still_gets_a_verdict_just_a_blind_one(monkeyp
     c = MagicMock()
     c.download_file = AsyncMock(side_effect=RuntimeError("nope"))
 
-    verdict = await engine.evaluate(channel_id="C1", ts="10.0", text="look at this",
-                                    sender_id="U1", images=[_img()], client=c)
+    verdict = (await engine.evaluate(channel_id="C1", ts="10.0", text="look at this",
+                                     sender_id="U1", images=[_img()], client=c)).verdict
 
     assert verdict is not None, "a broken download must not swallow the wake"
     kwargs = openai.classify_participation.await_args.kwargs
@@ -383,8 +385,9 @@ async def test_engine_piggybacks_observations_to_ambient(monkeypatch):
         "image_observations": ["A screenshot of a terminal showing a Python stack trace."]})
     engine = ParticipationEngine(openai)
 
-    verdict = await engine.evaluate(channel_id="C1", ts="10.0", text="see this log",
-                                    sender_id="U1", images=[_img()], client=client)
+    verdict = (await engine.evaluate(channel_id="C1", ts="10.0", text="see this log",
+                                     sender_id="U1", images=[_img()],
+                                     client=client)).verdict
 
     assert verdict.action == "ignore"
     assert svc.calls == [("C1", "10.0",
@@ -406,8 +409,8 @@ async def test_engine_verdict_is_unaffected_by_a_broken_piggyback(monkeypatch):
     openai.classify_participation = AsyncMock(return_value={"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "react", "emoji": "eyes"})
     engine = ParticipationEngine(openai)
 
-    verdict = await engine.evaluate(channel_id="C1", ts="10.0", text="x", sender_id="U1",
-                                    images=[_img()], client=client)
+    verdict = (await engine.evaluate(channel_id="C1", ts="10.0", text="x", sender_id="U1",
+                                     images=[_img()], client=client)).verdict
     assert verdict.action == "react" and verdict.emoji == "eyes"
 
 
@@ -444,8 +447,8 @@ async def test_engine_releases_held_images_on_supersession(monkeypatch):
         engine.note_arrival("C1", "20.0", None, "U1")
 
     task = asyncio.create_task(supersede())
-    verdict = await engine.evaluate(channel_id="C1", ts="10.0", text=":x:", sender_id="U1",
-                                    images=[_img()], client=client)
+    verdict = (await engine.evaluate(channel_id="C1", ts="10.0", text=":x:", sender_id="U1",
+                                     images=[_img()], client=client)).verdict
     await task
 
     assert verdict is None

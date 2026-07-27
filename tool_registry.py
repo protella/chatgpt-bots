@@ -26,6 +26,11 @@ class ToolContext:
     channel_id: Optional[str] = None
     thread_ts: Optional[str] = None
     trigger_ts: Optional[str] = None      # ts of the message we're answering
+    # The participation gate's id for THIS attempt, when the turn came from the gate at all
+    # (None for mentions, DMs and direct thread continuations). Tools that place a reaction
+    # record it so the row joins to the decision that produced the turn — and so the ledger
+    # can suppress rows for turns that had no gate decision behind them.
+    attempt_id: Optional[str] = None
     action_token: Optional[str] = None    # from the triggering Slack event (search API)
     user_id: Optional[str] = None         # triggering user (provenance for memory writes)
     client: Any = None                    # platform client (e.g. SlackBot)

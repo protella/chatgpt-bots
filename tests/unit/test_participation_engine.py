@@ -181,7 +181,7 @@ class TestDebounceAndRails:
         first = asyncio.create_task(engine.evaluate(channel_id="C1", ts="1.0", text="line one"))
         await asyncio.sleep(0.01)
         second = asyncio.create_task(engine.evaluate(channel_id="C1", ts="2.0", text="line two"))
-        r1, r2 = await asyncio.gather(first, second)
+        r1, r2 = (r.verdict for r in await asyncio.gather(first, second))
         assert r1 is None            # superseded — silent
         assert r2.action == "respond"
         assert fake.calls == 1       # ONE engine call for the burst
@@ -199,7 +199,7 @@ class TestDebounceAndRails:
         await asyncio.sleep(0.01)
         b = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="20.5", text="chatter in thread B", thread_root_ts="20.0"))
-        ra, rb = await asyncio.gather(a, b)
+        ra, rb = (r.verdict for r in await asyncio.gather(a, b))
         assert ra is not None and ra.action == "respond"   # thread A still judged
         assert rb is not None and rb.action == "respond"
         assert fake.calls == 2                             # both conversations evaluated
@@ -215,7 +215,7 @@ class TestDebounceAndRails:
         await asyncio.sleep(0.01)
         b = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="30.0", text="unrelated top-level"))  # roots key as |top
-        ra, rb = await asyncio.gather(a, b)
+        ra, rb = (r.verdict for r in await asyncio.gather(a, b))
         assert ra is not None and rb is not None
         assert fake.calls == 2
 
@@ -231,7 +231,7 @@ class TestDebounceAndRails:
         await asyncio.sleep(0.01)
         second = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="10.6", text="line two", thread_root_ts="10.0"))
-        r1, r2 = await asyncio.gather(first, second)
+        r1, r2 = (r.verdict for r in await asyncio.gather(first, second))
         assert r1 is None            # superseded within the conversation
         assert r2.action == "respond"
         assert fake.calls == 1
@@ -250,10 +250,10 @@ class TestDebounceAndRails:
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.02, raising=False)
         fake = _FakeClient({"action": "ignore"})
         engine = ParticipationEngine(fake)
-        r1, r2 = await asyncio.gather(
+        r1, r2 = (r.verdict for r in await asyncio.gather(
             engine.evaluate(channel_id="C1", ts="1.0", text="a"),
             engine.evaluate(channel_id="C2", ts="1.0", text="b"),
-        )
+        ))
         assert r1 is not None and r2 is not None
         assert fake.calls == 2
 
@@ -265,7 +265,8 @@ class TestDebounceAndRails:
             async def classify_participation(self, *a, **k):
                 raise RuntimeError("api down")
 
-        v = await ParticipationEngine(_Boom()).evaluate(channel_id="C1", ts="1.0", text="x")
+        v = (await ParticipationEngine(_Boom()).evaluate(
+            channel_id="C1", ts="1.0", text="x")).verdict
         assert v.action == "ignore"
 
     def test_hourly_cap_rail_removed(self):
@@ -305,7 +306,7 @@ class TestBurstCarryForward:
         await asyncio.sleep(0.01)
         b = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="2.0", text="bob question", sender_id="U2"))
-        ra, rb = await asyncio.gather(a, b)
+        ra, rb = (r.verdict for r in await asyncio.gather(a, b))
         assert ra is not None and ra.action == "respond"
         assert rb is not None and rb.action == "respond"
         assert fake.calls == 2                       # both evaluated independently
@@ -323,7 +324,7 @@ class TestBurstCarryForward:
         await asyncio.sleep(0.01)
         second = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="2.0", text="actually also this", sender_id="U1"))
-        r1, r2 = await asyncio.gather(first, second)
+        r1, r2 = (r.verdict for r in await asyncio.gather(first, second))
         assert r1 is None                            # superseded — silent
         assert r2.action == "respond"
         assert r2.burst_earlier == ["first thought"]
@@ -399,7 +400,7 @@ class TestBurstCarryForward:
         second = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="10.6", text="bob in thread",
             sender_id="U2", thread_root_ts="10.0"))   # different author, SAME thread
-        r1, r2 = await asyncio.gather(first, second)
+        r1, r2 = (r.verdict for r in await asyncio.gather(first, second))
         assert r1 is None                              # still collapses in-thread
         assert r2.action == "respond"
         assert fake.calls == 1
@@ -419,7 +420,7 @@ class TestBurstCarryForward:
         second = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="10.6", text="bob's reply",
             sender_id="U2", thread_root_ts="10.0"))   # different author, same thread
-        r1, r2 = await asyncio.gather(first, second)
+        r1, r2 = (r.verdict for r in await asyncio.gather(first, second))
         assert r1 is None
         assert r2.action == "respond"
         assert not r2.burst_earlier                    # None/empty — no cross-author carry
