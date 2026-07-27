@@ -3,7 +3,7 @@
 Covers the trigger rules (bot's OWN join only; other joins / DMs / MPIMs ignored), the feature
 flag, detachment (the event handler schedules a background task and returns without awaiting the
 build/post), idempotency (a durable per-channel lease + a crash-then-retry reconcile via the Slack
-message-metadata marker), the participation-state wording variants (judicious / mentions_only /
+message-metadata marker), the participation-state wording variants (on / mentions_only /
 off — with `off` using the "won't respond even to tags" wording + Configure and NO plain-English
 tuning line), the empty-channel case (omit the read + offers, still post the how-to), and the
 Configure button + metadata marker on the posted message.
@@ -400,7 +400,8 @@ async def test_empty_channel_omits_read_still_posts_howto(temp_db):
     findings = _findings_kwargs(bot.app.client.chat_postMessage)
     assert findings["thread_ts"] == "1700.0001"
     # The how-to still posts, with the Configure button.
-    assert "chime in selectively" in findings["text"] or "mentions only" in findings["text"] \
+    assert "chime in when I can add something concrete" in findings["text"] \
+        or "mentions only" in findings["text"] \
         or "Participation is currently off" in findings["text"]
     assert _actions_button(findings["blocks"])["action_id"] == "open_channel_settings"
 
@@ -419,10 +420,17 @@ async def test_read_and_offers_come_only_from_grounded_summary(temp_db):
 
 # ------------------------------------------------------------------ participation-state wording
 
-def test_howto_judicious():
-    txt = SlackChannelJoinMixin._participation_howto("judicious")
-    assert "I'll chime in selectively when I can add something concrete." in txt
+def test_howto_on():
+    txt = SlackChannelJoinMixin._participation_howto("on")
+    assert "chime in when I can add something concrete" in txt
     assert "You can tune that in plain English" in txt
+
+
+def test_howto_unknown_level_uses_the_quietest_speaking_wording():
+    # An unrecognized level must never over-promise. resolve_participation_level degrades an
+    # unknown to mentions_only, and the wording follows it rather than claiming full participation.
+    txt = SlackChannelJoinMixin._participation_howto("judicious")
+    assert "mentions only" in txt
 
 
 def test_howto_mentions_only():
@@ -443,7 +451,7 @@ def test_howto_off_says_wont_respond_even_to_tags_and_omits_tuning():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("level,needle", [
-    ("judicious", "chime in selectively"),
+    ("on", "chime in when I can add something concrete"),
     ("mentions_only", "mentions only"),
     ("off", "won't respond even to tags"),
 ])

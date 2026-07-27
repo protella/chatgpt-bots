@@ -122,18 +122,18 @@ class TestPlacementSubmit:
     async def test_untouched_null_channel_stays_null(self, temp_db):
         # An inheriting channel (reply_in_channel NULL) that the user opens and saves WITHOUT
         # touching placement must remain NULL — never frozen into an explicit True/False row.
-        await temp_db.set_channel_settings_async("C1", participation_level="active")
+        await temp_db.set_channel_settings_async("C1", participation_level="on")
         before = await temp_db.get_channel_settings_async("C1")
         assert before["reply_in_channel"] is None  # precondition: inheriting
 
         host = _make_host(temp_db)
         client = SimpleNamespace(chat_postEphemeral=AsyncMock())
-        # Modal reflects the stored row: participation 'active', placement 'inherit' (untouched).
-        await _submit(host, _state(participation="active", placement="inherit"), client)
+        # Modal reflects the stored row: participation 'on', placement 'inherit' (untouched).
+        await _submit(host, _state(participation="on", placement="inherit"), client)
 
         row = await temp_db.get_channel_settings_async("C1")
         assert row["reply_in_channel"] is None          # STILL inheriting, not frozen
-        assert row["participation_level"] == "active"   # untouched fields preserved
+        assert row["participation_level"] == "on"       # untouched fields preserved
 
     async def test_channel_option_writes_true(self, temp_db):
         host = _make_host(temp_db)
@@ -176,18 +176,18 @@ class TestOverlayInFlightState:
     def test_inherit_participation_clears_stale_response_mode(self):
         # Stored an explicit mode; user moved the control to 'inherit'. BOTH columns must clear so
         # the builder's legacy fallback can't resurrect the stored mode and reselect the old level.
-        cs = self._overlay({"participation_level": "active", "response_mode": "auto_respond"},
+        cs = self._overlay({"participation_level": "on", "response_mode": "auto_respond"},
                            participation="inherit")
         assert cs["participation_level"] is None
         assert cs["response_mode"] is None
 
     def test_edited_participation_wins_and_syncs_mode(self):
         cs = self._overlay({"participation_level": "mentions_only", "response_mode": "tag_only"},
-                           participation="active")
-        assert cs["participation_level"] == "active"
+                           participation="on")
+        assert cs["participation_level"] == "on"
         # response_mode kept in lockstep (LEVEL_TO_MODE), not left stale.
         from message_processor.participation import LEVEL_TO_MODE
-        assert cs["response_mode"] == LEVEL_TO_MODE.get("active")
+        assert cs["response_mode"] == LEVEL_TO_MODE.get("on")
 
     def test_placement_tristate_roundtrip(self):
         assert self._overlay({}, placement="inherit")["reply_in_channel"] is None
@@ -204,12 +204,12 @@ _STORED = {"participation_level": "mentions_only", "response_mode": "tag_only",
            "model": None, "reasoning_effort": None, "verbosity": None}
 
 # In-flight edits the user made but has NOT saved when they click a re-render button.
-_EDITED = dict(participation="active", policy=None, placement="inherit")
+_EDITED = dict(participation="on", policy=None, placement="inherit")
 
 
 def _assert_edits_survived(rebuilt):
     """The rebuilt modal must show the in-flight edits, not the stored row."""
-    assert _block(rebuilt, "participation_block")["element"]["initial_option"]["value"] == "active"
+    assert _block(rebuilt, "participation_block")["element"]["initial_option"]["value"] == "on"
     assert _block(rebuilt, "policy_block")["element"]["initial_value"] == ""      # cleared, not restored
     assert _block(rebuilt, "reply_in_channel_block")["element"]["initial_option"]["value"] == "inherit"
 

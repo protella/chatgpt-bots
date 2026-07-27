@@ -41,7 +41,10 @@ def test_schema_shape_and_enums():
     s = get_set_channel_participation_schema()
     assert s["type"] == "function" and s["name"] == "set_channel_participation"
     props = s["parameters"]["properties"]
-    assert props["participation"]["enum"] == ["mentions_only", "judicious", "active", "off"]
+    assert props["participation"]["enum"] == ["on", "mentions_only", "off"]
+    # The enum is exactly the three legal levels — a "how chatty" dial is no longer offered.
+    from message_processor.participation import VALID_LEVELS
+    assert set(props["participation"]["enum"]) == set(VALID_LEVELS)
     assert props["placement"]["enum"] == ["threads_only", "channel_allowed"]
     # current-channel-only: no channel_id parameter is exposed
     assert "channel_id" not in props
@@ -64,7 +67,7 @@ def test_description_states_explicit_only_guardrails():
 async def test_unaddressed_turn_refused():
     # The hard, in-code gate: on a turn the bot was NOT directly addressed on (an injected,
     # hallucinated, or quoted call), the settings write must be refused — no DB write.
-    db = _db(before={"participation_level": "judicious"})
+    db = _db(before={"participation_level": "on"})
     res = await execute_set_channel_participation(
         _ctx(db, structural_change_authorized=False), {"participation": "mentions_only"})
     assert res["ok"] is False and res["error"] == "not_addressed"
@@ -74,7 +77,7 @@ async def test_unaddressed_turn_refused():
 @pytest.mark.asyncio
 async def test_addressed_turn_authorizes_the_write():
     # The same call on a directly-addressed turn goes through and writes.
-    before = {"participation_level": "judicious", "reply_in_channel": True}
+    before = {"participation_level": "on", "reply_in_channel": True}
     after = {"participation_level": "mentions_only", "reply_in_channel": True}
     db = _db(before=before, after=after)
     res = await execute_set_channel_participation(
@@ -115,7 +118,12 @@ async def test_requires_at_least_one_field():
 @pytest.mark.asyncio
 async def test_invalid_enums_rejected():
     db = _db(before={})
+    # "judicious"/"active" are retired names, so they are now just as invalid as "loud" —
+    # the tool must refuse them rather than quietly writing an unreadable level.
     r1 = await execute_set_channel_participation(_ctx(db), {"participation": "loud"})
+    for retired in ("judicious", "active"):
+        rr = await execute_set_channel_participation(_ctx(db), {"participation": retired})
+        assert rr["error"] == "bad_arguments"
     r2 = await execute_set_channel_participation(_ctx(db), {"placement": "everywhere"})
     assert r1["error"] == "bad_arguments" and r2["error"] == "bad_arguments"
     db.set_channel_settings_async.assert_not_awaited()
@@ -134,7 +142,7 @@ async def test_no_channel_and_no_db_refused():
 @pytest.mark.asyncio
 async def test_participation_write_is_atomic_and_lockstep(monkeypatch):
     monkeypatch.setattr(config, "reply_in_channel_default", True, raising=False)
-    before = {"participation_level": "judicious", "reply_in_channel": True}
+    before = {"participation_level": "on", "reply_in_channel": True}
     after = {"participation_level": "mentions_only", "reply_in_channel": True}
     db = _db(before=before, after=after)
     res = await execute_set_channel_participation(_ctx(db), {"participation": "mentions_only"})
@@ -145,14 +153,14 @@ async def test_participation_write_is_atomic_and_lockstep(monkeypatch):
     assert kwargs["response_mode"] == "tag_only"  # LEVEL_TO_MODE[mentions_only]
     assert "reply_in_channel" not in kwargs
     assert kwargs["updated_by"] == "U07PETER"
-    assert res["old"]["participation"] == "judicious"
+    assert res["old"]["participation"] == "on"
     assert res["new"]["participation"] == "mentions_only"
 
 
 @pytest.mark.asyncio
 async def test_placement_only_write_leaves_participation_untouched():
-    before = {"participation_level": "active", "reply_in_channel": True}
-    after = {"participation_level": "active", "reply_in_channel": False}
+    before = {"participation_level": "on", "reply_in_channel": True}
+    after = {"participation_level": "on", "reply_in_channel": False}
     db = _db(before=before, after=after)
     res = await execute_set_channel_participation(_ctx(db), {"placement": "threads_only"})
     kwargs = db.set_channel_settings_async.await_args.kwargs
@@ -163,14 +171,14 @@ async def test_placement_only_write_leaves_participation_untouched():
 
 
 @pytest.mark.asyncio
-async def test_both_fields_and_active_maps_to_auto_respond():
-    before = {"participation_level": "judicious", "reply_in_channel": False}
-    after = {"participation_level": "active", "reply_in_channel": True}
+async def test_both_fields_and_on_maps_to_auto_respond():
+    before = {"participation_level": "mentions_only", "reply_in_channel": False}
+    after = {"participation_level": "on", "reply_in_channel": True}
     db = _db(before=before, after=after)
     res = await execute_set_channel_participation(
-        _ctx(db), {"participation": "active", "placement": "channel_allowed"})
+        _ctx(db), {"participation": "on", "placement": "channel_allowed"})
     kwargs = db.set_channel_settings_async.await_args.kwargs
-    assert kwargs["participation_level"] == "active"
+    assert kwargs["participation_level"] == "on"
     assert kwargs["response_mode"] == "auto_respond"
     assert kwargs["reply_in_channel"] is True
     assert res["ok"] is True
@@ -185,16 +193,16 @@ async def test_null_reply_in_channel_inherits_default_in_effective(monkeypatch):
     after = {"participation_level": "off", "reply_in_channel": None}
     db = _db(before=before, after=after)
     res = await execute_set_channel_participation(_ctx(db), {"participation": "off"})
-    # before: participation inherited from global auto_respond → judicious; placement from default True
-    assert res["old"] == {"participation": "judicious", "placement": "channel_allowed"}
+    # before: participation inherited from global auto_respond → on; placement from default True
+    assert res["old"] == {"participation": "on", "placement": "channel_allowed"}
     assert res["new"]["participation"] == "off"
 
 
 @pytest.mark.asyncio
 async def test_no_op_change_reports_no_change():
-    before = {"participation_level": "judicious", "reply_in_channel": True}
+    before = {"participation_level": "on", "reply_in_channel": True}
     db = _db(before=before, after=before)
-    res = await execute_set_channel_participation(_ctx(db), {"participation": "judicious"})
+    res = await execute_set_channel_participation(_ctx(db), {"participation": "on"})
     assert res["ok"] is True
     assert "nothing changed" in res["confirmation"].lower()
 

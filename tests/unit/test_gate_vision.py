@@ -1,17 +1,30 @@
-"""F40 — the wake gate has to look at the picture before it reacts to it.
+"""F40 — the image-loading module, kept; the gate that used it, gone.
 
-The bug, live (2026-07-13): a meme was posted with the caption ":dogkek:" and nothing else. The
-gate returned `{"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action":"react","emoji":"joy","reason":"A laughing reaction fits the playful
-meme post."}` — a confident opinion about an image it had never seen. It had reasoned from the
-emoji SHORTCODE in the caption, and from a prompt line that told it, untruthfully, that it "can
-view and analyze attachments".
+THE ORIGINAL BUG, live (2026-07-13): a meme was posted with the caption ":dogkek:" and nothing
+else, and the rich gate returned `{"action":"react","emoji":"joy","reason":"A laughing reaction
+fits the playful meme post."}` — a confident opinion about an image it had never seen, reasoned
+from the emoji SHORTCODE in the caption. F40's answer was to show it the picture: reacting to
+something you have not looked at is the same dishonesty as an 👀 with no work behind it.
 
-Reacting to a picture you haven't looked at is the same dishonesty as an 👀 with no work behind
-it. So: if an image is attached and we can safely show it, the gate sees it — and when we
-CAN'T show it, the gate is told so in plain words instead of being left to guess.
+COMMIT 6 ANSWERS IT THE OTHER WAY. The gate no longer reacts, so it has no opinion to be wrong
+about. It decides one thing — whether the responder runs — and a picture cannot change that answer
+in a way its filename does not, so the gate does not look at images at all. Everything that made
+the pictures reach it is deleted: the `images=` parameter, the prompt's image_status line, the
+observation harvest, the gate→ambient piggyback, and the ambient hold that waited for the gate's
+decision. The ambient worker analyses images on its own schedule, immediately, whatever the gate
+decides — which is strictly better, because nothing now waits on a resolver that might not come.
+
+What SURVIVES here, and why the file survives with it:
+
+* `message_processor/gate_vision.py` — the eligibility/fetch/validate module. It has no runtime
+  caller now and is scheduled for deletion in the cleanup commit; until then its own tests are the
+  only thing keeping it honest, so they stay (spec §8).
+* the ONE tripwire section, asserting there is no way back in: the engine takes no images, the
+  ambient predicate is a hard False, and the harvest is gone.
+* the two vision-default tests at the bottom, which are about the ANSWERING path's image fidelity
+  and never had anything to do with the gate.
 """
 
-import asyncio
 import base64
 from unittest.mock import AsyncMock, MagicMock
 
@@ -19,7 +32,6 @@ import pytest
 
 from config import config
 from message_processor import gate_vision
-from message_processor.participation import ParticipationEngine
 
 def _real_image(fmt: str) -> bytes:
     from io import BytesIO
@@ -133,342 +145,96 @@ async def test_the_flag_turns_it_all_off(monkeypatch):
     assert parts == [] and status == gate_vision.NONE
 
 
-# --------------------------------------------------------------------- the prompt tells the truth
+# --------------------------------------------------------------------- the way back in is shut
 
-class _FakeOpenAI:
-    """Enough of the OpenAI client for the real classify_participation to run against."""
+@pytest.mark.asyncio
+async def test_the_engine_cannot_be_handed_an_image():
+    """The `images=` parameter is gone from `evaluate`, which is what makes "the gate does not look
+    at pictures" structural rather than a habit. Asserted as a TypeError because a silently-ignored
+    kwarg would let a caller believe it had sent something."""
+    from message_processor.participation import ParticipationEngine
 
-    def __init__(self, fail_first=False):
-        self.calls = []
-        self.fail_first = fail_first
-        self.client = MagicMock()
-
-    async def _safe_api_call(self, fn, operation_type=None, **params):
-        self.calls.append(params)
-        if self.fail_first and len(self.calls) == 1:
-            raise RuntimeError("400 unsupported image format")
-        out = MagicMock()
-        content = MagicMock()
-        content.text = '{"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action":"react","emoji":"joy"}'
-        item = MagicMock()
-        item.content = [content]
-        out.output = [item]
-        return out
-
-    def log_debug(self, *a, **k):
-        pass
-
-    def log_warning(self, *a, **k):
-        pass
-
-
-def _rendered(params) -> str:
-    """The user block the model actually receives, however it was structured."""
-    block = params["input"][-1]["content"]
-    if isinstance(block, list):
-        return " ".join(p.get("text", "") for p in block if p.get("type") == "input_text")
-    return block
-
-
-async def _classify(images, status, fail_first=False):
-    from openai_client.api.responses import classify_participation
-    fake = _FakeOpenAI(fail_first=fail_first)
-    verdict = await classify_participation(
-        fake, text=":dogkek:",
-        signals={"attachments": "1 image (meme.png)", "image_status": status},
-        images=images)
-    return fake, verdict
+    engine = ParticipationEngine(MagicMock())
+    parts, status, _shown = await gate_vision.load_for_gate(_client(PNG), [_img()])
+    assert parts, "fixture sanity: the module still loads an image"
+    with pytest.raises(TypeError):
+        await engine.evaluate(channel_id="C1", ts="10.0", text=":dogkek:", images=parts)
+    # And the harvest that turned a verdict's `image_observations` into stored descriptions.
+    assert not hasattr(ParticipationEngine, "_harvest_image_observations")
+    assert not hasattr(ParticipationEngine, "_ambient_service")
 
 
 @pytest.mark.asyncio
-async def test_when_the_model_can_see_the_image_the_prompt_says_so():
-    parts, _, _shown = await gate_vision.load_for_gate(_client(PNG), [_img()])
-    fake, verdict = await _classify(parts, gate_vision.VISIBLE)
+async def test_the_attachment_reaches_the_gate_as_a_name_and_a_type():
+    """What the gate gets INSTEAD, so this is not merely a deletion.
 
-    prompt = _rendered(fake.calls[0])
-    assert "shown to you below" in prompt
-    assert "untrusted" in prompt, "text inside an image is content under discussion, not orders"
-    # The image rides as its own content part — never interpolated into the prompt string.
-    content = fake.calls[0]["input"][-1]["content"]
-    assert isinstance(content, list)
-    assert [p["type"] for p in content] == ["input_text", "input_image"]
-    assert "base64" not in prompt
-    assert verdict["action"] == "react"
+    A descriptor — "meme.png (image)" — and the rendered prompt says outright that the contents are
+    not shown. That is the honest version of F40's problem: rather than promising the model a look
+    at the picture (or explaining why it cannot have one), it is told what was attached and nothing
+    more, and it is deciding something a filename can support."""
+    from message_processor.participation import SourceMessage
+    from openai_client.api.responses import _render_wake_source
 
-
-@pytest.mark.asyncio
-async def test_when_it_cannot_see_the_image_it_is_told_not_to_guess():
-    """The old prompt said "The assistant can view and analyze attachments" unconditionally — a
-    claim about the ANSWERING model, fed to a classifier that could see nothing. The model took
-    it as licence to have an opinion about the picture. That IS the :dogkek: bug."""
-    fake, _ = await _classify([], gate_vision.UNAVAILABLE)
-
-    prompt = _rendered(fake.calls[0])
-    assert "CANNOT see it" in prompt
-    assert "filename" in prompt and "emoji in the caption" in prompt
-    assert "can view and analyze attachments" not in prompt
+    block = _render_wake_source(SourceMessage(
+        ts="10.0", text=":dogkek:", sender_name="Peter", sender_type="human",
+        attachments=("meme.png (image)",)), index=0, total=1)
+    assert "meme.png (image)" in block
+    assert "contents not shown to you" in block
+    for retired in ("image_status", "cannot see", "do not guess"):
+        assert retired not in block
 
 
-@pytest.mark.asyncio
-async def test_an_image_the_api_rejects_costs_us_the_picture_not_the_wake():
-    """If the image itself 400s, judging on the text is a far better outcome than losing the
-    wake entirely — but the retry must TELL the model it is now blind."""
-    parts, _, _shown = await gate_vision.load_for_gate(_client(PNG), [_img()])
-    fake, verdict = await _classify(parts, gate_vision.VISIBLE, fail_first=True)
+def test_nothing_holds_an_ambient_image_for_the_gate():
+    """The hold was only safe while a resolver was guaranteed to release it, and the resolver WAS
+    the gate's post-decision callback. With no callback, a held image would sit until a bounded
+    timeout expired — analysis delayed for no benefit, on every image in every channel. The
+    predicate stays as a named False rather than vanishing into its call site, because it is what a
+    reader looks for when asking "does anything still block ambient vision"."""
+    from slack_client.event_handlers.message_events import SlackMessageEventsMixin
 
-    assert len(fake.calls) == 2, "it should have retried without the image"
-    retry = fake.calls[1]["input"][-1]["content"]
-    assert isinstance(retry, str), "the retry carries no image parts"
-    assert "CANNOT see it" in retry
-    # The retry must RE-RENDER the whole signal block, not bolt a correction onto the old one.
-    # Appending "you can't see it" to a block that still said "shown to you below" left the
-    # model holding two contradictory claims and no image to resolve them against.
-    assert "shown to you below" not in retry, "the retry still claims the image is visible"
-    assert verdict["action"] == "react", "the wake survived"
+    host = SlackMessageEventsMixin.__new__(SlackMessageEventsMixin)
+    for event in ({"files": [{"mimetype": "image/png", "name": "x.png"}]},
+                  {"files": []}, {}, {"subtype": "file_share"}):
+        assert SlackMessageEventsMixin._gate_will_see_images(host, event) is False
 
 
 @pytest.mark.asyncio
-async def test_an_outage_is_not_retried_as_if_the_image_were_at_fault():
-    """Retrying on ANY exception meant a timeout or a 429 bought a second 30-second utility
-    call — doubling the stall on the debounce hot path for a request that was never going to
-    succeed. Only an image REJECTION earns the text-only retry."""
-    from openai_client.api.responses import classify_participation
-    parts, _, _shown = await gate_vision.load_for_gate(_client(PNG), [_img()])
+async def test_no_message_touches_the_ambient_service_from_the_gate(monkeypatch):
+    """Widened from "a text-only message never piggybacks" to "nothing does".
 
-    class _Down(_FakeOpenAI):
-        async def _safe_api_call(self, fn, operation_type=None, **params):
-            self.calls.append(params)
-            raise TimeoutError("upstream connect timeout")
-
-    fake = _Down()
-    verdict = await classify_participation(
-        fake, text="hi", signals={"attachments": "1 image (meme.png)",
-                                  "image_status": gate_vision.VISIBLE}, images=parts)
-
-    assert len(fake.calls) == 1, "an outage must not be retried as an image problem"
-    # None, not a forged {"action": "ignore"}: the engine renders both as the same silence, but
-    # only None lets the ledger tell an outage apart from the model choosing to stay quiet.
-    assert verdict is None, "and it still fails safe"
-
-
-# --------------------------------------------------------------------- engine wiring
-
-@pytest.mark.asyncio
-async def test_nothing_downloads_until_the_message_survives_the_debounce(monkeypatch):
-    """A superseded burst must not spend bandwidth fetching pictures for a verdict that is
-    thrown away — so the download lives AFTER the supersession check, not before it."""
-    monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-    openai = MagicMock()
-    openai.classify_participation = AsyncMock(return_value={"action": "ignore"})
-    engine = ParticipationEngine(openai)
-    client = _client(PNG)
-
-    # A newer message in the same stream lands during our debounce window.
-    async def supersede():
-        engine.note_arrival("C1", "20.0", None, "U1")
-
-    import asyncio
-    task = asyncio.create_task(supersede())
-    verdict = (await engine.evaluate(
-        channel_id="C1", ts="10.0", text=":dogkek:", sender_id="U1",
-        images=[_img()], client=client)).verdict
-    await task
-
-    assert verdict is None, "superseded"
-    client.download_file.assert_not_awaited()
-    openai.classify_participation.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_the_dogkek_case_the_gate_now_sees_the_meme(monkeypatch):
-    """End to end: caption is a single emoji shortcode, all the meaning is in the picture."""
+    The piggyback existed so ONE look at an image served both the verdict and the stored
+    description. The gate takes no look, so it has nothing to hand over — and with an IMAGE
+    attached, which is the case that used to call `resolve_gate`, it still calls nothing. Note what
+    is also asserted: no download. Nothing is fetched for a decision that cannot use it."""
     monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-    monkeypatch.setattr(config, "enable_multimodal_gate", True, raising=False)
+    from message_processor.participation import ParticipationEngine
+
+    class _Svc:
+        def __init__(self):
+            self.calls = []
+
+        def resolve_gate(self, channel_id, source_ts, observations):
+            self.calls.append((channel_id, source_ts, dict(observations)))
+
+    class _Client:
+        def __init__(self, svc):
+            self._svc = svc
+            self.download_file = AsyncMock(return_value=PNG)
+
+        def _ambient_service(self):
+            return self._svc
+
+    svc = _Svc()
+    client = _Client(svc)
     openai = MagicMock()
-    openai.classify_participation = AsyncMock(return_value={"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "react", "emoji": "joy"})
+    openai.classify_wake = AsyncMock(return_value=True)
     engine = ParticipationEngine(openai)
 
-    await engine.evaluate(channel_id="C1", ts="10.0", text=":dogkek:", sender_id="U1",
-                          images=[_img()], client=_client(PNG))
-
-    kwargs = openai.classify_participation.await_args.kwargs
-    assert kwargs["images"], "the gate reacted to a meme without being shown the meme"
-    assert kwargs["images"][0]["type"] == "input_image"
-    assert kwargs["signals"]["image_status"] == gate_vision.VISIBLE
-
-
-@pytest.mark.asyncio
-async def test_an_unreadable_image_still_gets_a_verdict_just_a_blind_one(monkeypatch):
-    """The gate must never go silent because a file wouldn't load — that drops the wake."""
-    monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-    openai = MagicMock()
-    openai.classify_participation = AsyncMock(return_value={"action": "ignore"})
-    engine = ParticipationEngine(openai)
-    c = MagicMock()
-    c.download_file = AsyncMock(side_effect=RuntimeError("nope"))
-
-    verdict = (await engine.evaluate(channel_id="C1", ts="10.0", text="look at this",
-                                     sender_id="U1", images=[_img()], client=c)).verdict
-
-    assert verdict is not None, "a broken download must not swallow the wake"
-    kwargs = openai.classify_participation.await_args.kwargs
-    assert not kwargs.get("images")
-    assert kwargs["signals"]["image_status"] == gate_vision.UNAVAILABLE
-
-
-@pytest.mark.asyncio
-async def test_a_text_only_message_is_completely_unaffected(monkeypatch):
-    monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-    openai = MagicMock()
-    openai.classify_participation = AsyncMock(return_value={"action": "ignore"})
-    engine = ParticipationEngine(openai)
-
-    await engine.evaluate(channel_id="C1", ts="10.0", text="just chatting", sender_id="U1")
-
-    kwargs = openai.classify_participation.await_args.kwargs
-    assert "images" not in kwargs, (
-        "a text-only judgment must keep its exact old call shape — not one token different")
-    assert kwargs["signals"]["image_status"] == gate_vision.NONE
-
-
-# ------------------------------------------------ F51b gate/ambient piggyback (engine seam)
-
-class _RecordingService:
-    """Records resolve_gate calls — stands in for the AmbientArtifactService the gate reaches
-    through the Slack facade."""
-
-    def __init__(self):
-        self.calls = []
-
-    def resolve_gate(self, channel_id, source_ts, observations):
-        self.calls.append((channel_id, source_ts, dict(observations)))
-
-
-class _GateClient:
-    def __init__(self, payload=PNG, svc=None):
-        self._svc = svc
-        self.download_file = AsyncMock(return_value=payload)
-
-    def _ambient_service(self):
-        return self._svc
-
-
-def test_harvest_image_observations_maps_and_drops_defensively():
-    h = ParticipationEngine._harvest_image_observations
-    shown = [{"id": "F1"}, {"id": "F2"}]
-    # exact count, both usable → mapped by file id, in order
-    assert h({"image_observations": ["a", "b"]}, shown) == {"F1": "a", "F2": "b"}
-    # wrong count → ALL dropped (order can't be trusted); the worker covers them
-    assert h({"image_observations": ["only one"]}, shown) == {}
-    # missing / non-list / non-dict → {}
-    assert h({"action": "ignore"}, shown) == {}
-    assert h({"image_observations": "nope"}, shown) == {}
-    assert h(None, shown) == {}
-    # correctly-sized but a blank / non-string entry is skipped; the valid one is kept
-    assert h({"image_observations": ["  ", "keep"]}, shown) == {"F2": "keep"}
-    assert h({"image_observations": ["a", 5]}, shown) == {"F1": "a"}
-    # no images shown → nothing to harvest
-    assert h({"image_observations": ["a"]}, []) == {}
-
-
-@pytest.mark.asyncio
-async def test_engine_piggybacks_observations_to_ambient(monkeypatch):
-    """The gate looked at the image; its per-image observation is handed to ambient memory keyed
-    by Slack file id — one look serving both the verdict and the stored observation."""
-    monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-    monkeypatch.setattr(config, "enable_multimodal_gate", True, raising=False)
-    svc = _RecordingService()
-    client = _GateClient(PNG, svc)
-    openai = MagicMock()
-    openai.classify_participation = AsyncMock(return_value={
-        "action": "ignore",
-        "image_observations": ["A screenshot of a terminal showing a Python stack trace."]})
-    engine = ParticipationEngine(openai)
-
-    verdict = (await engine.evaluate(channel_id="C1", ts="10.0", text="see this log",
-                                     sender_id="U1", images=[_img()],
-                                     client=client)).verdict
-
-    assert verdict.action == "ignore"
-    assert svc.calls == [("C1", "10.0",
-                          {"F1": "A screenshot of a terminal showing a Python stack trace."})]
-
-
-@pytest.mark.asyncio
-async def test_engine_verdict_is_unaffected_by_a_broken_piggyback(monkeypatch):
-    """Verdict safety is absolute: an exploding ambient service can never alter the verdict."""
-    monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-    monkeypatch.setattr(config, "enable_multimodal_gate", True, raising=False)
-
-    class _Boom:
-        def resolve_gate(self, *a, **k):
-            raise RuntimeError("ambient is down")
-
-    client = _GateClient(PNG, _Boom())
-    openai = MagicMock()
-    openai.classify_participation = AsyncMock(return_value={"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "react", "emoji": "eyes"})
-    engine = ParticipationEngine(openai)
-
-    verdict = (await engine.evaluate(channel_id="C1", ts="10.0", text="x", sender_id="U1",
-                                     images=[_img()], client=client)).verdict
-    assert verdict.action == "react" and verdict.emoji == "eyes"
-
-
-@pytest.mark.asyncio
-async def test_engine_releases_when_the_gate_is_blind(monkeypatch):
-    """Images attached but unshowable → the gate produces no observations and resolve_gate is
-    called with {}, releasing the held jobs to the ordinary vision worker."""
-    monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-    svc = _RecordingService()
-    c = MagicMock()
-    c.download_file = AsyncMock(side_effect=RuntimeError("nope"))
-    c._ambient_service = lambda: svc
-    openai = MagicMock()
-    openai.classify_participation = AsyncMock(return_value={"action": "ignore"})
-    engine = ParticipationEngine(openai)
-
-    await engine.evaluate(channel_id="C1", ts="10.0", text="x", sender_id="U1",
-                          images=[_img()], client=c)
-    assert svc.calls == [("C1", "10.0", {})]
-
-
-@pytest.mark.asyncio
-async def test_engine_releases_held_images_on_supersession(monkeypatch):
-    """A superseded burst releases its held images promptly (not left to the hold timeout), and
-    still never downloads a picture for a verdict it throws away."""
-    monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-    svc = _RecordingService()
-    client = _GateClient(PNG, svc)
-    openai = MagicMock()
-    openai.classify_participation = AsyncMock(return_value={"action": "ignore"})
-    engine = ParticipationEngine(openai)
-
-    async def supersede():
-        engine.note_arrival("C1", "20.0", None, "U1")
-
-    task = asyncio.create_task(supersede())
-    verdict = (await engine.evaluate(channel_id="C1", ts="10.0", text=":x:", sender_id="U1",
-                                     images=[_img()], client=client)).verdict
-    await task
-
-    assert verdict is None
-    assert svc.calls == [("C1", "10.0", {})]
-    client.download_file.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_text_only_message_never_touches_the_ambient_service(monkeypatch):
-    """No images → no piggyback at all; the ambient service is never even fetched or called."""
-    monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-    svc = _RecordingService()
-    client = _GateClient(PNG, svc)
-    openai = MagicMock()
-    openai.classify_participation = AsyncMock(return_value={"action": "ignore"})
-    engine = ParticipationEngine(openai)
-
-    await engine.evaluate(channel_id="C1", ts="10.0", text="just chatting",
-                          sender_id="U1", client=client)
+    for text in ("just chatting", "what do we think?"):
+        await engine.evaluate(channel_id="C1", ts="10.0", text=text, sender_id="U1",
+                              attachments=["meme.png (image)"], client=client)
     assert svc.calls == []
+    client.download_file.assert_not_awaited()
 
 
 def test_api_part_now_stamps_the_configured_detail():
@@ -486,18 +252,18 @@ def test_api_part_now_stamps_the_configured_detail():
     assert api_part({"type": "input_image", "image_url": "d", "detail": "low"})["detail"] == "low"
 
 
-def test_vision_defaults_are_full_fidelity_on_the_answering_path_and_capped_on_the_gate():
-    """The GATE defaults to `high` — its `image_observations` become the image's durable stored
-    description, so the 512px thumbnail `low` gives it is what every later turn then answers from.
-    `high` rather than `original` because the gate runs on every channel image, so its cost has to
-    stay bounded.
+def test_the_answering_path_defaults_to_full_fidelity():
+    """`auto` on the 5.6 family means ORIGINAL dimensions with no resize — the maximum. Pinning it
+    to `high` would cap large screenshots, not sharpen them.
 
-    The answering path defaults to `auto`, which on the 5.6 family means ORIGINAL dimensions with
-    no resize — the maximum. Pinning it to `high` would cap large screenshots, not sharpen them."""
+    The companion assertion (GATE_VISION_DETAIL defaults to `high`) is dropped: it was justified by
+    the gate's observations becoming the image's durable stored description, and the gate produces
+    no observations. The setting still exists and is read by gate_vision, which has no runtime
+    caller — pinning the default of a knob nothing turns would only make the cleanup commit look
+    like a regression."""
     from config import BotConfig
     import os
     from unittest.mock import patch
     with patch.dict(os.environ, {}, clear=True):
         fresh = BotConfig()
     assert fresh.default_detail_level == "auto"
-    assert fresh.gate_vision_detail == "high"

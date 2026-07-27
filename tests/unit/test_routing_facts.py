@@ -82,7 +82,9 @@ def _dispatched(bot):
 
 
 @pytest.fixture
-def judicious(monkeypatch):
+def listening(monkeypatch):
+    """A channel at the talkative level. Named for what it means now: `judicious` was one of two
+    restraint dials on the rich gate and both collapsed into `on` when the gate became one bit."""
     monkeypatch.setattr(config, "channel_response_mode", "auto_respond", raising=False)
     monkeypatch.setattr(config, "bot_name_aliases", ["ChatGPT"], raising=False)
     monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
@@ -92,7 +94,7 @@ def judicious(monkeypatch):
 # ------------------------------------------------------------- the route truth table
 
 @pytest.mark.asyncio
-async def test_ambient_channel_message_is_gated_and_may_stay_silent(judicious):
+async def test_ambient_channel_message_is_gated_and_may_stay_silent(listening):
     bot = _make_bot()
     await bot._handle_channel_message(_evt(text="anyone know the q3 numbers?"), bot.app.client)
     md = _dispatched(bot)
@@ -104,7 +106,7 @@ async def test_ambient_channel_message_is_gated_and_may_stay_silent(judicious):
 
 @pytest.mark.asyncio
 async def test_direct_thread_continuation_skips_the_gate_but_keeps_the_silence_option(
-        judicious, monkeypatch):
+        listening, monkeypatch):
     """The 1:1 continuation runs no gate, so the model is the only decider — and it may still
     decide there is nothing to add."""
     bot = _make_bot()
@@ -119,7 +121,7 @@ async def test_direct_thread_continuation_skips_the_gate_but_keeps_the_silence_o
 
 
 @pytest.mark.asyncio
-async def test_engine_off_legacy_name_wake_owes_an_answer(judicious, monkeypatch):
+async def test_engine_off_legacy_name_wake_owes_an_answer(listening, monkeypatch):
     """No engine means no judgment: the deterministic wake answers, and it does not get the
     silence option a judged turn gets."""
     monkeypatch.setattr(config, "enable_participation_engine", False, raising=False)
@@ -132,7 +134,7 @@ async def test_engine_off_legacy_name_wake_owes_an_answer(judicious, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_app_mention_is_addressed_and_owes_an_answer(judicious):
+async def test_app_mention_is_addressed_and_owes_an_answer(listening):
     bot = _make_bot({"response_mode": "auto_respond"})
     await bot._handle_slack_message(_evt(text="<@UBOT> hi"), bot.app.client,
                                     wake_source="app_mention")
@@ -143,7 +145,7 @@ async def test_app_mention_is_addressed_and_owes_an_answer(judicious):
 
 
 @pytest.mark.asyncio
-async def test_dm_is_addressed_and_owes_an_answer(judicious):
+async def test_dm_is_addressed_and_owes_an_answer(listening):
     bot = _make_bot()
     await bot._handle_slack_message(_evt(channel="D1", text="hey"), bot.app.client,
                                     wake_source="dm")
@@ -154,7 +156,7 @@ async def test_dm_is_addressed_and_owes_an_answer(judicious):
 
 
 @pytest.mark.asyncio
-async def test_a_dm_thread_reply_is_still_addressed_not_thread_activity(judicious):
+async def test_a_dm_thread_reply_is_still_addressed_not_thread_activity(listening):
     """Topology never overrides explicit addressing: every message in a DM is for us."""
     bot = _make_bot()
     await bot._handle_slack_message(_evt(channel="D1", ts="60.0", thread_ts="50.0"),
@@ -163,8 +165,8 @@ async def test_a_dm_thread_reply_is_still_addressed_not_thread_activity(judiciou
 
 
 @pytest.mark.asyncio
-async def test_edit_redispatch_is_gated_ambient_traffic(judicious, monkeypatch):
-    bot = _make_bot({"participation_level": "judicious"})
+async def test_edit_redispatch_is_gated_ambient_traffic(listening, monkeypatch):
+    bot = _make_bot({"participation_level": "on"})
     synthetic = {"channel": "C1", "ts": "200.0", "user": "UHUMAN", "text": "the numbers again"}
     await bot._dispatch_edit_to_engine(bot.app.client, synthetic, "C1", "200.0",
                                        "the numbers", "the numbers again")
@@ -175,7 +177,7 @@ async def test_edit_redispatch_is_gated_ambient_traffic(judicious, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_gated_thread_message_is_thread_activity(judicious):
+async def test_a_gated_thread_message_is_thread_activity(listening):
     """A thread reply the gate judges (not a 1:1 continuation — another bot is in the thread)
     is thread activity, and it is still gated."""
     bot = _make_bot()
@@ -188,7 +190,7 @@ async def test_a_gated_thread_message_is_thread_activity(judicious):
 
 
 @pytest.mark.asyncio
-async def test_a_name_hit_does_not_make_a_message_addressed(judicious):
+async def test_a_name_hit_does_not_make_a_message_addressed(listening):
     """The whole reason posture exists: "ChatGPT was wrong earlier" matches the name regex and
     is NOT addressed to us. The narrower name provenance is unchanged."""
     bot = _make_bot()

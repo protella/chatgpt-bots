@@ -1,13 +1,19 @@
-"""F11 — capability manifest for the participation classifier.
+"""F11 — the capability manifest, now with nothing to feed.
 
-Covers `render_capabilities_line` (pure composition from config + mcp_manager),
-its forwarding through `ParticipationEngine.evaluate()` into the signals dict, the
-`classify_participation` payload carrying (or omitting) the line at its fixed
-position after the alias identity line, and the new prompt judgment rule.
+`render_capabilities_line` is a pure function of already-loaded config + mcp_manager, and its whole
+composition contract is still tested below: web-search flag, MCP descriptions, label fallback,
+insertion order, determinism, the never-empty guard. That part is untouched and worth keeping.
+
+WHAT IT FED IS GONE. The inventory existed so the rich gate could judge ANSWERABILITY — "could the
+assistant actually supply what is being asked?" — which is a question the binary gate does not ask.
+It decides whether the responder runs, and the responder knows its own tools by having them. So the
+`capabilities=` parameter, the signals key, and the prompt's "The assistant's own tools/data
+sources" line are all deleted, and the tests that asserted the hop are inverted into tripwires.
+
+The function itself has zero callers now and is scheduled for deletion in the cleanup commit
+(spec §8). Until then its unit tests are the only thing keeping it honest, so they stay.
 """
 from __future__ import annotations
-
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -129,112 +135,79 @@ class TestRenderCapabilitiesLine:
                         "analyzing images and documents shared in chat")
 
 
-# ------------------------------------------------------- evaluate() forwards capabilities
+# ------------------------------------------- the inventory no longer reaches the gate
 
 class _CapturingClient:
-    def __init__(self, verdict=None):
-        self._verdict = verdict or {"action": "ignore"}
-        self.captured = None
+    """Records the cohort and steering the gate actually sends."""
 
-    async def classify_participation(self, text, signals=None):
-        self.captured = signals
-        return self._verdict
+    def __init__(self, wake=False):
+        self._wake = wake
+        self.sources = None
+        self.steering = None
+
+    async def classify_wake(self, *, sources, channel_steering_text=None):
+        self.sources = tuple(sources)
+        self.steering = channel_steering_text
+        return self._wake
 
 
-class TestEvaluateForwardsCapabilities:
+class TestTheInventoryIsNotAGateInput:
     @pytest.mark.asyncio
-    async def test_capabilities_copied_into_signals(self, monkeypatch):
+    async def test_evaluate_will_not_accept_a_capability_line(self, monkeypatch):
+        """INVERTED from "capabilities are copied into the signals dict".
+
+        Asserted as a TypeError rather than as an absent signal, because a silently-swallowed kwarg
+        would let a caller believe the gate had been told what the bot can do."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
+        engine = ParticipationEngine(_CapturingClient())
+        with pytest.raises(TypeError):
+            await engine.evaluate(channel_id="C1", ts="1.0", text="hi",
+                                  capabilities=render_capabilities_line(None))
+
+    @pytest.mark.asyncio
+    async def test_the_classifier_gets_the_message_and_the_steering_and_nothing_else(
+            self, monkeypatch):
+        """The positive half: what the gate DOES send. Two arguments, so there is no signals dict
+        for an inventory (or a people line, or a pulse) to be added back into."""
         monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
         client = _CapturingClient()
-        engine = ParticipationEngine(client)
-        await engine.evaluate(channel_id="C1", ts="1.0", text="hi",
-                              capabilities="web search; image generation and editing")
-        assert client.captured["capabilities"] == "web search; image generation and editing"
+        await ParticipationEngine(client).evaluate(
+            channel_id="C1", ts="1.0", text="anyone know gen z ice cream trends?")
+        assert [s.text for s in client.sources] == ["anyone know gen z ice cream trends?"]
+        assert client.steering is None
 
-    @pytest.mark.asyncio
-    async def test_capabilities_defaults_none(self, monkeypatch):
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        client = _CapturingClient()
-        engine = ParticipationEngine(client)
-        await engine.evaluate(channel_id="C1", ts="1.0", text="hi")
-        assert client.captured["capabilities"] is None
+    def test_the_inventory_has_no_runtime_caller_left(self):
+        """The other half of the deletion: nothing builds the line for the gate any more.
 
+        `render_capabilities_line` survives as a function with no callers (cleanup commit 7), so the
+        check is over the modules that used to call it — main.py built it on the gate's hot path,
+        which is where half a dozen API reads and cache lookups went to support a judgment the gate
+        stopped making."""
+        import inspect
+        import main
+        from message_processor import participation
+        from openai_client.api import responses
 
-# ------------------------------------------------- classify_participation payload
-
-class _FakeContent:
-    def __init__(self, text):
-        self.text = text
-
-
-class _FakeItem:
-    def __init__(self, text):
-        self.content = [_FakeContent(text)]
-
-
-class _FakeResp:
-    def __init__(self, text):
-        self.output = [_FakeItem(text)]
-
-
-class _FakeLLM:
-    def __init__(self, text='{"action": "ignore"}'):
-        self._text = text
-        self.client = MagicMock()
-        self.captured_input = None
-
-    async def _safe_api_call(self, *a, **k):
-        self.captured_input = k.get("input")
-        return _FakeResp(self._text)
-
-    def log_debug(self, *a, **k):
-        pass
-
-    def log_warning(self, *a, **k):
-        pass
-
-
-class TestClassifyParticipationPayload:
-    @pytest.mark.asyncio
-    async def test_capabilities_line_present_when_set(self):
-        from openai_client.api.responses import classify_participation
-        llm = _FakeLLM()
-        await classify_participation(
-            llm, "anyone know gen z ice cream trends?",
-            signals={"capabilities": "web search; menu & flavor trend data"})
-        prompt = llm.captured_input[1]["content"]
-        assert "The assistant's own tools/data sources" in prompt
-        assert "menu & flavor trend data" in prompt
-
-    @pytest.mark.asyncio
-    async def test_capabilities_line_omitted_when_absent(self):
-        from openai_client.api.responses import classify_participation
-        llm = _FakeLLM()
-        await classify_participation(llm, "msg", signals={})
-        assert "tools/data sources" not in llm.captured_input[1]["content"]
-
-    @pytest.mark.asyncio
-    async def test_capabilities_line_follows_alias_line(self, monkeypatch):
-        # Fixed position: immediately after the alias identity line, before the sender.
-        monkeypatch.setattr(config, "bot_name_aliases", ["chatgpt"], raising=False)
-        from openai_client.api.responses import classify_participation
-        llm = _FakeLLM()
-        await classify_participation(
-            llm, "msg",
-            signals={"capabilities": "image generation and editing",
-                     "sender_name": "Peter"})
-        prompt = llm.captured_input[1]["content"]
-        alias_pos = prompt.index("The assistant's own names in this workspace")
-        cap_pos = prompt.index("The assistant's own tools/data sources")
-        sender_pos = prompt.index("Sender: Peter")
-        assert alias_pos < cap_pos < sender_pos
+        assert "render_capabilities_line" not in inspect.getsource(main)
+        assert "capabilities" not in inspect.getsource(participation.ParticipationEngine.evaluate)
+        assert "capabilities" not in inspect.getsource(responses.classify_wake)
 
 
 class TestPromptRule:
-    def test_open_question_rule_present(self):
-        from prompts import PARTICIPATION_SYSTEM_PROMPT
-        assert "genuinely open to the channel at large" in PARTICIPATION_SYSTEM_PROMPT
-        assert "tools as they are described to it" in PARTICIPATION_SYSTEM_PROMPT
+    def test_the_answerability_rule_went_with_the_stage_that_asked_it(self):
+        """The rule this file's last test asserted ("a question genuinely open to the channel at
+        large... judged against the tools as they are described to it") was Stage 3 of the rich
+        prompt — the value floor, which is exactly what the inventory was FOR. The binary prompt
+        does not weigh whether an answer is available; when it is unsure it wakes, and the responder
+        (which has the tools rather than a description of them) decides.
+
+        Asserted as an absence so the floor cannot creep back in without its inputs."""
+        from prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT as p
+        for retired in ("tools as they are described to it",
+                        "genuinely open to the channel at large", "own tools/data sources"):
+            assert retired not in p, retired
+        # What replaced it, in one line: generosity, because the responder can still say nothing.
+        assert "When you are unsure, wake it" in p
 
 
 # ------------------------------------------------------ F14b attachment signals
@@ -247,46 +220,55 @@ class TestF14bCapabilityEntry:
         assert "analyzing images and documents shared in chat" in render_capabilities_line(None)
 
 
-class TestF14bEvaluateForwardsAttachments:
+class TestF14bAttachmentsAreDescriptorsOnTheSourceRecord:
     @pytest.mark.asyncio
-    async def test_attachments_copied_into_signals(self, monkeypatch):
+    async def test_attachments_ride_the_source_record_as_name_and_type(self, monkeypatch):
+        """RE-BASELINED in shape, not in substance: the gate still learns that something was
+        attached and what it is called.
+
+        It used to arrive as one prose sentence assembled in the event handler ("1 image
+        (food.png)") and pasted into the prompt — an event handler writing part of a prompt. It is
+        now a tuple of "name (kind)" descriptors on the typed SourceMessage, and the renderer
+        renders it."""
         monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        client = _CapturingClient()
-        engine = ParticipationEngine(client)
-        await engine.evaluate(channel_id="C1", ts="1.0", text="what do we think?",
-                              attachments="1 image (food.png)")
-        assert client.captured["attachments"] == "1 image (food.png)"
+        client = _CapturingClient(wake=True)
+        await ParticipationEngine(client).evaluate(
+            channel_id="C1", ts="1.0", text="what do we think?",
+            attachments=["food.png (image)", "brief.pdf (file)"])
+        assert client.sources[0].attachments == ("food.png (image)", "brief.pdf (file)")
 
     @pytest.mark.asyncio
-    async def test_attachments_defaults_none(self, monkeypatch):
+    async def test_attachments_default_to_an_empty_tuple(self, monkeypatch):
+        # Empty tuple rather than None: callers iterate unconditionally, and "no files" is not a
+        # missing value.
         monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        client = _CapturingClient()
-        engine = ParticipationEngine(client)
-        await engine.evaluate(channel_id="C1", ts="1.0", text="hi")
-        assert client.captured["attachments"] is None
+        client = _CapturingClient(wake=True)
+        await ParticipationEngine(client).evaluate(channel_id="C1", ts="1.0", text="hi")
+        assert client.sources[0].attachments == ()
 
 
-class TestF14bClassifyPayload:
-    @pytest.mark.asyncio
-    async def test_attachment_line_present_when_set(self):
-        from openai_client.api.responses import classify_participation
-        llm = _FakeLLM()
-        await classify_participation(
-            llm, "what do we think? good marketing material?",
-            signals={"sender_name": "Peter", "attachments": "1 image (food.png)"})
-        prompt = llm.captured_input[1]["content"]
-        assert "Attached to the message: 1 image (food.png)." in prompt
-        # F40: the old line here said "The assistant can view and analyze attachments" — a claim
-        # about the ANSWERING model, fed unconditionally to a classifier that could see nothing.
-        # The model took it as licence to opine on a picture it had never seen (the :dogkek:
-        # reaction). With no image_status signal, the honest line is: you see the name, not the
-        # contents — but the assistant can open it if it decides to respond.
-        assert "Only the filename and type" in prompt
-        assert "can view and analyze attachments" not in prompt
+class TestF14bTheRenderedLineIsStillHonest:
+    def test_the_gate_is_told_it_cannot_see_the_contents(self):
+        """F40's honesty fix, carried across the rewrite.
 
-    @pytest.mark.asyncio
-    async def test_attachment_line_omitted_when_absent(self):
-        from openai_client.api.responses import classify_participation
-        llm = _FakeLLM()
-        await classify_participation(llm, "msg", signals={"sender_name": "Peter"})
-        assert "Attached to the message" not in llm.captured_input[1]["content"]
+        The old line claimed "The assistant can view and analyze attachments" — a fact about the
+        ANSWERING model, fed unconditionally to a classifier that could see nothing, and the model
+        took it as licence to opine on a picture it had never seen (the :dogkek: reaction). The
+        binary gate never looks at images at all, so the rendered block says so outright."""
+        from message_processor.participation import SourceMessage
+        from openai_client.api.responses import _render_wake_source
+
+        block = _render_wake_source(SourceMessage(
+            ts="1.0", text="what do we think? good marketing material?", sender_name="Peter",
+            sender_type="human", attachments=("food.png (image)",)), index=0, total=1)
+        assert "food.png (image)" in block
+        assert "contents not shown to you" in block
+        assert "can view and analyze attachments" not in block
+
+    def test_no_attachment_line_when_there_are_no_files(self):
+        from message_processor.participation import SourceMessage
+        from openai_client.api.responses import _render_wake_source
+
+        block = _render_wake_source(SourceMessage(
+            ts="1.0", text="msg", sender_name="Peter", sender_type="human"), index=0, total=1)
+        assert "Attached" not in block

@@ -9,16 +9,20 @@ Covers the whole C surface:
   name list), appearing only when the workspace has customs and tracking the live cache;
   REACTION_EMOJIS set → enum allowlist, customs suppressed, search tool not registered at all.
 - WorkspaceEmojiCache.search(): lexical ranking over the full catalog, single-char tokens dropped.
-- Classifier plumbing: the "Custom emoji THIS WORKSPACE actually reacts with…" line renders only
-  when there is no allowlist; the main.py gate feeds the WORKSPACE-WIDE observed-usage palette
-  (aggregated across every channel, DMs excluded — per-channel left quiet rooms with nothing).
+- The observed-usage TALLY (ChannelPulse.top_custom_reactions): ranked by count, workspace-wide,
+  DMs excluded, decremented on removal, and dropping names deleted since they were seen.
+- reactions.add uses the bare name; unknown fails soft. Config defaults + .env.example docs.
 
-Both name lists used to be an ALPHABETICAL prefix of ~1,400 names, so the model only ever saw
+THE GATE IS NO LONGER A CONSUMER OF ANY OF THIS. The emoji shortlist and the `_coerce_emoji`
+repair step existed because the rich gate PICKED an emoji and placed it itself, before the
+responder ran. It picks nothing now — it returns one bit — so the palette has no gate to feed and
+a coerced emoji has no placer. Those tests are inverted into tripwires below; the tally and the
+cache keep their own unit coverage, because the RESPONDER still reacts and
+`search_workspace_emoji` still answers from the same catalog.
+
+(Both name lists used to be an ALPHABETICAL prefix of ~1,400 names, so the model only ever saw
 "000, 1password_icon, 2605732e-82a0-46b9-b1e0-ecc4f250eb35, 4cats_q, alabama…" — prompt noise it
-could not use. The responder now searches on demand; the gate (one tool-free call, emoji placed
-directly) gets what the workspace actually reacts with. Neither ever falls back to alphabetical.
-- _coerce_emoji stays permissive (standard OR custom), reactions.add uses the bare name, unknown
-  fails soft. Config defaults (3600/32/64) + .env.example documentation.
+could not use. The responder searches on demand instead, which is the surviving half of that fix.)
 
 All in-memory; no network/DB.
 """
@@ -31,7 +35,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from base_client import Message
 from config import config, valid_emoji_name
 from message_processor.participation import ParticipationEngine
 from slack_client.channel_pulse import ChannelPulse
@@ -190,187 +193,83 @@ def test_react_schema_enum_suppresses_customs(monkeypatch):
     assert "party_parrot" not in emoji["description"]     # customs never injected over it
 
 
-# =============================================================== classifier plumbing
-
-async def _classifier_prompt(signals):
-    """Render classify_participation's user-message content with a stubbed API call."""
-    from openai_client.api import responses as responses_api
-    captured = {}
-
-    async def _fake(self, fn, *, operation_type, **params):
-        captured["input"] = params["input"]
-        return SimpleNamespace(output=[])
-
-    host = MagicMock()
-    host._safe_api_call = _fake.__get__(host)
-    host.classify_participation = responses_api.classify_participation.__get__(host)
-    await host.classify_participation(text="hi", signals=signals)
-    return captured["input"][1]["content"]
-
+# ================================================ the palette is not a gate input any more
 
 @pytest.mark.asyncio
-async def test_customs_are_offered_as_names_with_no_popularity_claim(monkeypatch):
-    """Custom names are worth surfacing; a ranking over them is not, at any list length.
+async def test_the_gate_cannot_be_handed_a_palette(monkeypatch):
+    """INVERTED from four tests that fed the gate a ranked palette and checked what it received.
 
-    Measured 2026-07-26 in the shared test channel, both assistants answering the same room:
-    ranking these by observed use and calling them "this team's own vocabulary" concentrated our
-    social reactions onto 14 distinct emoji across 38, with :dumpster-fire: alone at 24%.
-    Anthropic's bot spread 43 reactions over 32 distinct names, most-used at 7% — and it has no
-    ranked palette at all, just an opt-in name lookup. So the tally no longer steers anything and
-    the list carries no ordering claim. Names the model cannot guess exist (:absolutecinema:) are
-    the entire remaining value.
+    They asserted the workspace-wide observed-usage list arrived ranked, aggregated across
+    channels, empty before anything was observed, and suppressed under an allowlist. All four
+    described an input to a decision the gate no longer makes — WHICH emoji to place — so there is
+    no successor assertion, only the absence. Asserted at the signature, because a swallowed kwarg
+    would let a caller believe a palette had been sent."""
+    monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
+    from message_processor.participation import ParticipationEngine as _Engine
 
-    A previous revision gated the framing on a hand-picked count of observed names. That was an
-    arbitrary threshold and is gone; there is one framing at every length."""
-    monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
-    for names in (["squirrel", "dumpster-fire", "absolutecinema"],
-                  ["party_parrot", "shipit", "rocket", "facepalm", "yay", "boom", "sadpanda",
-                   "tada2", "yolo"]):
-        prompt = await _classifier_prompt({"workspace_custom_emojis": names})
-        assert ", ".join(names) in prompt
-        # No claim that the order means anything, or that these are what the team favours.
-        assert "most-used first" not in prompt
-        assert "this team's own vocabulary" not in prompt
-        assert "prefer one of these" not in prompt
-        assert "do not stretch one to fit" in prompt
-        # Standard emoji stay on the table, so the model can still react with anything apt.
-        assert "any standard Slack emoji name (shorthand, no colons)" in prompt
+    class _Client:
+        async def classify_wake(self, *, sources, channel_steering_text=None):
+            return False
+
+    engine = _Engine(_Client())
+    with pytest.raises(TypeError):
+        await engine.evaluate(channel_id="C1", ts="1.0", text="hi",
+                              workspace_custom_emojis=["party_parrot"])
 
 
-@pytest.mark.asyncio
-async def test_classifier_omits_customs_when_allowlist_set(monkeypatch):
-    monkeypatch.setattr(config, "reaction_emojis", ["thumbsup"], raising=False)
-    prompt = await _classifier_prompt({"workspace_custom_emojis": ["party_parrot"]})
-    assert "Allowed reaction emoji (choose one): thumbsup" in prompt
-    assert "actually reacts with" not in prompt
+def test_nothing_builds_a_palette_for_the_gate_any_more(monkeypatch):
+    """The producer side. main.py used to rank the tally and cap it on the gate's hot path, and the
+    classifier rendered it as an emoji shortlist. Both are gone; the tally itself is untouched (see
+    the top_custom_reactions tests below), because the responder's react tool and
+    search_workspace_emoji still work from the same data."""
+    import inspect
+    import main
+    from openai_client.api import responses
 
-
-@pytest.mark.asyncio
-async def test_classifier_no_customs_line_when_none(monkeypatch):
-    monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
-    prompt = await _classifier_prompt({})
-    assert "any standard Slack emoji name (shorthand, no colons)" in prompt
-    assert "actually reacts with" not in prompt
-
-
-def _gate_app(monkeypatch, customs):
-    """A gate wired to a fake engine, plus the declines it produced.
-
-    `evaluate` returns a GateEvaluation, which is what the engine actually returns — a bare
-    ParticipationVerdict makes the gate raise on `.decline_cause` and swallow it as silence, so
-    these tests passed while asserting the classifier inputs of a call the real code never
-    completes. `declines` exists so each test can prove the gate ran its real path.
-    """
-    from main import ChatBotV2
-    from message_processor.participation import GateEvaluation, ParticipationVerdict
-    monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
-    monkeypatch.setattr("message_processor.canvas_tools.build_catalog",
-                        AsyncMock(return_value=[]))
-    app = ChatBotV2.__new__(ChatBotV2)
-    app.processor = MagicMock()
-    app.processor.db.get_channel_memory_async = AsyncMock(return_value=[])
-    captured = {}
-    declines = []
-
-    async def _eval(**kw):
-        captured.update(kw)
-        return GateEvaluation(verdict=ParticipationVerdict(action="ignore"))
-
-    def _decline(channel_id=None, trigger_ts=None, cause=None, **fields):
-        declines.append(cause)
-
-    monkeypatch.setattr("message_processor.participation_telemetry.gate_declined", _decline)
-    app.participation_engine = MagicMock()
-    app.participation_engine.evaluate = _eval
-    app.participation_engine.note_arrival = MagicMock()
-    client = MagicMock()
-    client.channel_pulse = None
-    client.get_channel_context = AsyncMock(return_value={})
-    client.workspace_emojis = _MutableCache(customs)
-    msg = Message(text="x", user_id="U1", channel_id="C1", thread_id="10.0",
-                  metadata={"ts": "10.0", "gate_required": True,
-                            "silence_capable": True,
-                            "participation_level": "judicious"})
-    return app, client, msg, captured, declines
-
-
-@pytest.mark.asyncio
-async def test_gate_feeds_observed_customs_ranked_by_use(monkeypatch):
-    # The gate's palette is what the WORKSPACE reacts with, most-used first — not an
-    # alphabetical slice. `rare` is alphabetically first and least used; it must come LAST.
-    monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
-    monkeypatch.setattr(config, "participation_custom_emoji_cap", 3, raising=False)
-    app, client, msg, captured, declines = _gate_app(
-        monkeypatch, ["rare", "shipit", "party_parrot", "elsewhere"])
-    pulse = ChannelPulse()
-    for _ in range(5):
-        pulse.add_reaction("C1", "10.0", "shipit")
-    for _ in range(3):
-        pulse.add_reaction("C1", "11.0", "party_parrot")
-    pulse.add_reaction("C1", "12.0", "rare")
-    pulse.add_reaction("C1", "12.5", "rare")
-    pulse.add_reaction("C1", "13.0", "thumbsup")     # standard → not a custom, filtered out
-    pulse.add_reaction("CZ", "14.0", "elsewhere")    # another channel DOES count (workspace-wide)
-    client.channel_pulse = pulse
-    assert await app._gate_verdict(msg, client) is None          # ignore verdict → silent
-    # cap=3 → the three most-used. `elsewhere` (1 use, another channel) IS counted but ranks
-    # 4th, so it falls outside the cap; the next test proves cross-channel aggregation directly.
-    assert captured["workspace_custom_emojis"] == ["shipit", "party_parrot", "rare"]
-    assert declines == []            # the real gate path ran, not its except-clause
-
-
-@pytest.mark.asyncio
-async def test_gate_palette_includes_other_channels(monkeypatch):
-    # Same setup, cap raised: the emoji seen only in ANOTHER channel now appears. This is the
-    # whole point of the workspace-wide tally — a channel with no reactions of its own still
-    # gets the team's vocabulary instead of nothing.
-    monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
-    monkeypatch.setattr(config, "participation_custom_emoji_cap", 10, raising=False)
-    app, client, msg, captured, declines = _gate_app(monkeypatch, ["elsewhere"])
-    pulse = ChannelPulse()
-    pulse.add_reaction("CZ", "14.0", "elsewhere")        # never seen in C1, the gated channel
-    client.channel_pulse = pulse
-    assert await app._gate_verdict(msg, client) is None
-    assert captured["workspace_custom_emojis"] == ["elsewhere"]
-    assert declines == []
-
-
-@pytest.mark.asyncio
-async def test_gate_sends_no_customs_when_nothing_observed_yet(monkeypatch):
-    # The point of the rewrite: with no observed usage the gate sends NOTHING rather than
-    # falling back to an alphabetical slice. Standard emoji are the fallback; junk is not.
-    monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
-    app, client, msg, captured, declines = _gate_app(monkeypatch, [f"c{i}" for i in range(10)])
-    client.channel_pulse = ChannelPulse()                        # nothing observed yet
-    assert await app._gate_verdict(msg, client) is None
-    assert captured["workspace_custom_emojis"] == []
-    assert declines == []
-
-
-@pytest.mark.asyncio
-async def test_gate_omits_customs_when_allowlist_set(monkeypatch):
-    monkeypatch.setattr(config, "reaction_emojis", ["thumbsup"], raising=False)
-    app, client, msg, captured, declines = _gate_app(monkeypatch, ["party_parrot"])
-    assert await app._gate_verdict(msg, client) is None
-    assert captured["workspace_custom_emojis"] == []             # never injected over an allowlist
-    assert declines == []
+    for src in (inspect.getsource(main), inspect.getsource(responses.classify_wake)):
+        assert "workspace_custom_emojis" not in src
+        assert "participation_custom_emoji_cap" not in src
+    from prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT as p
+    for retired in ("Allowed reaction emoji", "actually reacts with", "do not stretch one to fit",
+                    "any standard Slack emoji name"):
+        assert retired not in p, retired
 
 
 # =============================================================== _coerce_emoji + executor
 
-class TestCoerceEmojiPermissive:
-    def test_standard_and_custom_accepted_without_allowlist(self, monkeypatch):
-        monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
-        assert ParticipationEngine._coerce_emoji({"emoji": "joy"}, True) == "joy"
-        # A workspace custom name (same charset) is accepted; a valid standard emoji is NEVER
-        # rejected just because it isn't in the custom set.
-        assert ParticipationEngine._coerce_emoji({"emoji": ":party_parrot:"}, True) == "party_parrot"
-        assert ParticipationEngine._coerce_emoji({"emoji": "bad name!"}, True) is None
+class TestTheEmojiRepairStepIsGoneWithThePlacer:
+    def test_the_engine_no_longer_coerces_an_emoji(self):
+        """`_coerce_emoji` took the classifier's chosen emoji and repaired it — stripped colons,
+        fell back to the first allowlisted name, rejected junk. It existed because the GATE placed
+        the reaction; nothing in the gate chooses an emoji now, so there is nothing to repair.
 
-    def test_allowlist_still_constrains(self, monkeypatch):
+        The behaviour it protected did not disappear, it moved: the responder's react tool does its
+        own colon-stripping, charset check and allowlist enforcement, which is asserted in the
+        executor tests immediately below and in test_participation_telemetry.py's refusal rows."""
+        assert not hasattr(ParticipationEngine, "_coerce_emoji")
+
+    @pytest.mark.asyncio
+    async def test_the_responder_path_still_strips_colons_and_obeys_the_allowlist(self,
+                                                                                 monkeypatch):
+        # The surviving half, in one place: a custom name passes with its colons stripped when
+        # there is no allowlist, and an off-list name is refused when there is one.
+        monkeypatch.setattr(config, "enable_reactions", True, raising=False)
+        monkeypatch.setattr(config, "enable_react_tool", True, raising=False)
+        monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
+        host = MagicMock()
+        host.execute_react_tool = SlackMessagingMixin.execute_react_tool.__get__(host)
+        host._reserve_and_react = AsyncMock(return_value={"ok": True})
+        ctx = ToolContext(channel_id="C1", thread_ts="100.0", trigger_ts="123.4")
+        assert (await host.execute_react_tool(ctx, {"emoji": ":party_parrot:"}))["ok"] is True
+        host._reserve_and_react.assert_awaited_once_with("C1", "123.4", "party_parrot")
+
         monkeypatch.setattr(config, "reaction_emojis", ["thumbsup"], raising=False)
-        assert ParticipationEngine._coerce_emoji({"emoji": "party_parrot"}, True) == "thumbsup"
-        assert ParticipationEngine._coerce_emoji({"emoji": "party_parrot"}, False) is None
+        host._reserve_and_react.reset_mock()
+        out = await host.execute_react_tool(ctx, {"emoji": "party_parrot"})
+        # Refused outright rather than silently rewritten to thumbsup: the gate coerced because it
+        # had to place SOMETHING, and the responder can simply not react.
+        assert out["ok"] is False and out["error"] == "emoji_not_allowed"
+        host._reserve_and_react.assert_not_awaited()
 
 
 @pytest.mark.asyncio

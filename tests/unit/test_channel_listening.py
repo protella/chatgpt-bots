@@ -13,7 +13,7 @@ from base_client import Message
 from config import config
 from message_processor.utilities import build_roster_text
 from slack_client.event_handlers.message_events import (
-    SlackMessageEventsMixin, _summarize_attachments)
+    SlackMessageEventsMixin, _attachment_descriptors)
 from slack_client.utilities import SlackUtilitiesMixin
 
 
@@ -291,27 +291,37 @@ async def test_tombstoned_root_takes_deletion_path_not_edit_path():
     assert edit_dispatches == []                            # edit engine never runs on it
 
 
-def test_summarize_attachments_kind_breakdown():
-    # F14b: count + kind breakdown + filenames only (no content).
-    assert _summarize_attachments(None) is None
-    assert _summarize_attachments([]) is None
-    assert _summarize_attachments(
-        [{"name": "food.png", "mimetype": "image/png"}]) == "1 image (food.png)"
-    assert _summarize_attachments([
+def test_attachment_descriptors_name_and_kind_per_file():
+    """Re-baselined for the binary gate: this used to assert one prose sentence
+    ("1 image, 1 file (chart.png, notes.pdf)") that this helper assembled and the gate prompt
+    pasted in whole — i.e. an event handler was writing part of a prompt. It now returns one
+    "name (kind)" descriptor per file and the renderer does the rendering.
+
+    Names and types only, and no content: the gate it feeds never opens anything. Empty tuple
+    rather than None for "no files", so callers can iterate unconditionally."""
+    assert _attachment_descriptors(None) == ()
+    assert _attachment_descriptors([]) == ()
+    assert _attachment_descriptors(
+        [{"name": "food.png", "mimetype": "image/png"}]) == ("food.png (image)",)
+    assert _attachment_descriptors([
         {"name": "report.pdf", "mimetype": "application/pdf"},
         {"name": "data.csv", "mimetype": "text/csv"},
-    ]) == "2 files (report.pdf, data.csv)"
-    # Mixed: images counted/listed first.
-    assert _summarize_attachments([
+    ]) == ("report.pdf (file)", "data.csv (file)")
+    # Mixed kinds keep SLACK'S order, not a kind-sorted one: the descriptors are per-message
+    # facts, and reordering them would misstate what was uploaded when.
+    assert _attachment_descriptors([
         {"name": "chart.png", "mimetype": "image/png"},
         {"name": "notes.pdf", "mimetype": "application/pdf"},
-    ]) == "1 image, 1 file (chart.png, notes.pdf)"
+    ]) == ("chart.png (image)", "notes.pdf (file)")
+    # A file with no name at all still gets a descriptor — the gate learning "something was
+    # attached" is the point, and a dropped entry would understate the message.
+    assert _attachment_descriptors([{"mimetype": "image/png"}]) == ("file (image)",)
 
 
 @pytest.mark.asyncio
 async def test_file_share_sets_participation_attachments_signal(tag_only):
-    # F14b end-to-end: a file_share that reaches the engine gate carries an attachment
-    # summary in metadata so the classifier isn't blind to the uploaded artifact.
+    # F14b end-to-end: a file_share that reaches the gate carries its attachment DESCRIPTORS in
+    # metadata (names and types, never pixels) so the gate is not blind to the uploaded artifact.
     bot = _make_bot()
     await bot._handle_channel_message(
         _evt(subtype="file_share", text="ChatGPT good marketing material?",
@@ -321,7 +331,7 @@ async def test_file_share_sets_participation_attachments_signal(tag_only):
     bot.message_handler.assert_called_once()
     msg = bot.message_handler.call_args[0][0]
     assert msg.metadata.get("gate_required") is True
-    assert msg.metadata.get("participation_attachments") == "1 image (poster.png)"
+    assert msg.metadata.get("participation_attachments") == ("poster.png (image)",)
 
 
 @pytest.mark.asyncio
@@ -423,7 +433,9 @@ async def test_auto_respond_gate_routes_unaddressed(monkeypatch):
     bot.message_handler.assert_called_once()
     msg = bot.message_handler.call_args[0][0]
     assert msg.metadata.get("gate_required") is True
-    assert msg.metadata.get("participation_level") == "judicious"  # auto_respond ≡ judicious
+    # auto_respond ≡ "on" now. `judicious` and `active` were two dials on a gate that weighed
+    # "is this worth saying"; the binary gate does not ask that, so both migrated to one level.
+    assert msg.metadata.get("participation_level") == "on"
 
 
 @pytest.mark.asyncio

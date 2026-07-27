@@ -1,8 +1,24 @@
 """Live eval harness for the participation gate.
 
-Replays `participation_scenarios.SCENARIOS` through the real `classify_participation` — the same
-signal rendering, model, effort and parsing the bot uses — N times each, and scores the verdicts.
-Costs real API calls, so it is a harness you run deliberately, not part of `make test`.
+RETIRED PENDING A RE-BASELINE, and deliberately left un-rewritten. It scores the RICH gate: it
+replays scenarios through `classify_participation` and grades the returned
+respond/react/react_and_respond/ignore/backoff action against each scenario's `must_be` set. The
+binary gate answers a different question — one bit, "does the responder run" — so none of those
+labels exist any more and the harness cannot run at all (the function it imports is gone).
+
+It is NOT mechanically portable, which is why this is a note rather than a patch. Mapping the old
+labels onto wake/no-wake is easy (anything that spoke or reacted → wake, `ignore` → no wake) but
+it would grade the new gate against the old gate's standard, and the standard is exactly what the
+binary design changes: the gate is now meant to be GENEROUS, because a false wake costs one call
+and can end in the responder's own declared silence, while a false sleep loses the answer. Several
+scenarios whose `must_be` is `{"ignore"}` are now legitimately wakes. Re-baselining that corpus is
+a judgment call for whoever owns the quality bar, not a rename.
+
+The corpus itself (`participation_scenarios.py`) is still good data and still pure: the
+2026-07-25 #tech-coding-with-ai incident messages in it are the whole reason this gate was
+rebuilt.
+
+Neither this file nor the corpus is part of `make test`; nothing imports them at runtime.
 
     python3 tests/integration/participation_eval.py                    # 5 trials, live config
     python3 tests/integration/participation_eval.py -n 8 -e medium     # override effort

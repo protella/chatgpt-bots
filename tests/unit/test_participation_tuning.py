@@ -1,10 +1,18 @@
 """Participation tuning + 3 bug fixes (2026-07-21).
 
-Covers the prompt-wording contracts (A1 value floor, A2 open-question rule, B banter
-rule, C1 mid-flight escape, C2 truthfulness sentence), the C1 real-event composition,
-and the three bug fixes: BF1 (search_slack gated on the event's action_token), BF2
-(username resolution in rebuilt history and tool-returned histories), and BF3 (pulse
-envelope observability).
+Covers the surviving prompt-wording contracts (C1 mid-flight escape, C2 truthfulness sentence),
+the C1 real-event composition, and the three bug fixes: BF1 (search_slack gated on the event's
+action_token), BF2 (username resolution in rebuilt history and tool-returned histories), and BF3
+(pulse envelope observability).
+
+MOST OF THE PROMPT SECTION IS GONE, and it went with the prompt it described. Four tests here
+(A1 value floor, A1's direct-summons exemption, A2's open-question rule, B's banter reversal) each
+pinned sentences of PARTICIPATION_SYSTEM_PROMPT — the rich gate's staged
+addressee/exchange-state/answerability rubric. The binary gate decides one bit and does not weigh
+whether a reply is worth making, so there is no successor sentence to re-point them at; asserting
+one would be inventing a contract. What DID survive is the part that was never about wording but
+about levers: the clauses below must not come back. The positive contract for the new prompt lives
+in tests/unit/test_wake_classifier.py.
 """
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -13,8 +21,8 @@ import pytest
 
 from config import config
 from prompts import (
-    PARTICIPATION_SYSTEM_PROMPT,
     SLACK_SYSTEM_PROMPT,
+    WAKE_CLASSIFIER_SYSTEM_PROMPT,
     CHANNEL_ACTIVITY_NO_REPLY_SUFFIX,
 )
 from slack_client.history_tool import SlackHistoryToolMixin
@@ -25,74 +33,7 @@ from slack_client.utilities import SlackUtilitiesMixin
 from tool_registry import ToolContext, ToolRegistry
 
 
-# =========================================================== prompt wording (A1/A2/B/C1/C2)
-
-
-def test_a1_value_floor_present():
-    """The value floor survives the staged rewrite as Stage 3, and it is REACHED only after
-    ownership is settled — which is the whole point of the ordering. The old prompt stated the
-    same floor as one of 34 flat rules, and at low effort a value judgment routinely outranked
-    the addressee judgment it was supposed to follow."""
-    p = PARTICIPATION_SYSTEM_PROMPT
-    assert "CAN THE ASSISTANT ACTUALLY SUPPLY WHAT IS ASKED" in p
-    assert "Reach this stage only when Stages 1 and 2 have left room to participate" in p
-    # lacking the requested access/authority is not substantive value
-    assert "requires_human" in p and "limitation_only" in p
-    assert "firsthand human experience" in p
-    assert "authority to act where it holds no tool" in p
-    # ordering is asserted, not just presence: Stage 1 must appear before Stage 3
-    assert p.index("STAGE 1") < p.index("STAGE 3")
-
-
-
-def test_a1_value_floor_exempts_direct_summons():
-    """Live regression (2026-07-21): the floor swallowed "chatgpt, do you know X?" — a bare-name
-    summon is gated, so the floor must not reach it or the responder's honest-answer contract
-    never runs. Staged form: the exemption hangs off Stage 1 rather than being a proviso buried
-    in the floor's own paragraph, and an unrequested disclaimer is still refused."""
-    p = PARTICIPATION_SYSTEM_PROMPT
-    assert "Whether a limitation is worth SAYING depends on Stage 1" in p
-    assert "deserves a straight" in p and "rather than being left on read" in p
-    assert "Nobody is owed an unrequested disclaimer" in p
-    # and the carve-out must not re-open the name-drop hole Stage 1 closes
-    assert "Being named is not the same as being addressed" in p
-
-
-
-def test_a2_open_question_rule_replaced():
-    """An open question to the room resets the addressee but does not by itself justify words:
-    the answer has to be one the assistant can actually give. In the staged prompt this is
-    relation="to_room" plus Stage 3, and it is ALSO enforced in code — see
-    ParticipationEngine._apply_invariants, which refuses to_room + limitation_only/requires_human
-    however confidently the model chose to speak."""
-    p = PARTICIPATION_SYSTEM_PROMPT
-    assert "genuinely open to the channel at large" in p
-    assert "the room asked something open that it can directly answer" in p
-    # the old wording, and the old license to volunteer, are both gone
-    assert "a colleague with the data at hand would speak up" not in p
-    assert "that those tools can answer directly is a respond case" not in p
-
-
-
-def test_b_banter_rule_replaced():
-    """DELIBERATE REVERSAL (2026-07-26). The old prompt said playful teasing aimed at the
-    assistant was "participation-worthy... an invitation to play along". That clause is why the
-    bot answered "Chatgpt, you are right!" 52 seconds after a human told it to hush: the teasing
-    named it, so the clause licensed a reply, and it outranked nothing. Codex identified it
-    independently as the cause, and removing it is measured to help — the scenario went from 0/6
-    to passing on the replay corpus.
-
-    Teasing is no longer a reason to speak. It is judged like anything else: whose message is it,
-    is the exchange still open, does a reply add something. What remains is that a joke aimed at
-    the assistant is not participation FEEDBACK either, so it must not be misrouted to backoff."""
-    p = PARTICIPATION_SYSTEM_PROMPT
-    assert "Playful banter or teasing genuinely aimed AT the assistant is participation-worthy" not in p
-    assert "invitation to play along" not in p
-    # what replaced it: the exchange-state boundary, which a joke cannot lift
-    assert "being teased or told it was right after being shut down is the tail of that beat" in p
-    assert "Only an explicit welcome back or a real new ask reopens it" in p
-    # backoff stays reserved for actual participation feedback
-    assert "never for ordinary disagreement between people" in p
+# =========================================================== prompt wording (C1/C2)
 
 
 def test_c1_mid_flight_escape_present():
@@ -618,15 +559,24 @@ async def test_name_resolution_budget_favours_the_newest_speakers():
     assert h.remote_calls[0] == "U_NEW"
 
 
-def test_no_special_case_bends_the_react_preference():
-    """The reverted room-humour lean. The owner asked for a slight lean toward reacting to funny
-    posts; measured live it fired on 5 of 5 jokes, and the owner's verdict was that the bot reacts
-    "the same way over and over". Both codex and the reference implementation say the same thing:
-    a special-case exception per topic is the wrong lever, and Claude Tag has no humour clause at
-    all. Stage 4's preference ordering stands unqualified."""
-    p = PARTICIPATION_SYSTEM_PROMPT
-    assert "between an emoji and nothing, prefer nothing" in p
-    assert "Room-wide humour" not in p
-    assert "lean slightly toward reacting" not in p
-    # and the older banter-licenses-a-REPLY clause stays removed (see test_b_banter_rule_replaced)
-    assert "invitation to play along" not in p
+def test_no_special_case_and_no_reply_lever_returns_to_the_gate_prompt():
+    """The reverted levers, as one inverted guard against the prompt that exists now.
+
+    Two separate reversals, both about the same mistake — teaching the gate to WANT an outcome:
+
+    * the room-humour lean. The owner asked for a slight bias toward reacting to funny posts;
+      measured live it fired on 5 of 5 jokes and the verdict was that the bot reacts "the same way
+      over and over". A per-topic special case is the wrong lever, and the reference implementation
+      has no humour clause at all.
+    * the banter licence. "Playful teasing aimed AT the assistant is participation-worthy... an
+      invitation to play along" is why the bot answered "Chatgpt, you are right!" 52 seconds after
+      being told to hush. Removing it took that scenario from 0/6 to passing.
+
+    Under a binary gate these would be worse, not better: the gate cannot react or play along at
+    all, so a clause pushing it toward either can only make it wake on things nobody addressed. The
+    emoji-vs-nothing preference the humour lean qualified is the RESPONDER's to make now, which is
+    why nothing positive is asserted here."""
+    p = WAKE_CLASSIFIER_SYSTEM_PROMPT
+    for lever in ("Room-wide humour", "lean slightly toward reacting", "invitation to play along",
+                  "participation-worthy", "prefer nothing"):
+        assert lever not in p, f"a retired participation lever is back in the gate prompt: {lever}"

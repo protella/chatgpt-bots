@@ -20,8 +20,9 @@ THE FOUR FACTS
     name wake — those go straight to the responder.
 
 ``gate_woke`` (bool)
-    A required gate handed THIS attempt to the full responder (respond, react_and_respond, or a
-    backoff that falls through). Initialized False at stamp time and written centrally when the
+    A required gate handed THIS attempt to the full responder — the gate said wake, and nothing
+    else, because that is the whole of what it says. Initialized False at stamp time and written
+    centrally when the
     gate returns a verdict, so it is never a guess about what the gate did. It is meaningless
     without `gate_required`: ``gate_required=False`` with ``gate_woke=True`` is an illegal state
     and `set_gate_woke` refuses to create it.
@@ -98,6 +99,82 @@ def stamp_routing_facts(message: Any, *, gate_required: bool, silence_capable: b
         return None
     meta.update(facts)
     return facts
+
+
+def owes_answer(message: Any) -> bool:
+    """True when this message has ALREADY earned a turn and is still waiting for one.
+
+    Two ways to earn it: nobody gated it (a DM, a real @mention, the engine-off name wake — we
+    were addressed and an answer is owed), or a gate ran and said wake. Either way the decision
+    is made and the only thing outstanding is the turn itself."""
+    meta = getattr(message, "metadata", None)
+    if not isinstance(meta, dict):
+        return False
+    return meta.get(GATE_REQUIRED) is not True or meta.get(GATE_WOKE) is True
+
+
+def owes_words(message: Any) -> bool:
+    """True when this message was ADDRESSED — a DM, a real @mention, the engine-off name wake.
+
+    Stronger than `owes_answer`, and the difference is the whole of `silence_capable`: somebody
+    spoke to us directly, so a turn that ends in silence is a turn that ignored them. An ambient
+    message a gate woke on is owed a TURN but not necessarily words — the responder can see the
+    conversation and may legitimately find nothing worth adding.
+
+    BOTH facts, not just `gate_required`. "Ungated" is not a synonym for "addressed": a
+    deterministic 1:1 thread continuation skips the gate too, and is stamped silence_capable ON
+    PURPOSE — no gate ran, so the responder is the only decider, and it is allowed to decide there
+    is nothing to say. Reading the absence of a gate as an obligation to speak would absorb one of
+    those into a batch and take that decision away, which is the same class of mistake in the
+    opposite direction: manufacturing words instead of losing them.
+
+    The route that owes words is the one stamped `gate_required=False` AND `silence_capable=False`
+    — which is exactly how `stamp_routing_facts` records "somebody asked us directly"."""
+    meta = getattr(message, "metadata", None)
+    if not isinstance(meta, dict):
+        return False
+    return meta.get(GATE_REQUIRED) is False and meta.get(SILENCE_CAPABLE) is False
+
+
+def absorb_owed_answer(trigger: Any, absorbed: Any) -> bool:
+    """A batch that already contains an answer we owe is NOT re-judged. Returns whether the
+    trigger's gate requirement was cleared.
+
+    The Phase-Q drain folds several queued messages into one catch-up turn whose TRIGGER is the
+    newest of them. If that trigger happens to be gate-routed, the whole batch inherits its
+    verdict — so a no-wake there silently discards messages that had already been addressed to us,
+    or that a gate had already decided to answer, purely because something ambient landed after
+    them. The messages are still in Slack and still in the thread state; what is lost is the reply
+    somebody was waiting for, with no trace of the loss anywhere.
+
+    So an owed answer survives absorption: the successor turn runs, and the responder — which can
+    see all of it — decides what to say. The gate is not consulted a second time about a question
+    that was already settled."""
+    meta = getattr(trigger, "metadata", None)
+    if not isinstance(meta, dict) or meta.get(GATE_REQUIRED) is not True:
+        return False
+    if not any(owes_answer(m) for m in (absorbed or [])):
+        return False
+    meta[GATE_REQUIRED] = False
+    meta[GATE_WOKE] = False
+    # And the OBLIGATION travels with the answer, not just the permission to run. An absorbed
+    # @mention owes WORDS: the trigger was ambient, so it arrived here silence-capable, and
+    # leaving it that way lets the responder end this turn with `no_response_needed` on a batch
+    # containing a message somebody addressed to us directly. That is the original bug wearing a
+    # different hat — the reply is still lost, just one layer further down.
+    #
+    # An absorbed message that a GATE woke on is different and keeps silence_capable True: it was
+    # never addressed to us, and the responder — which can see the whole conversation, where the
+    # gate saw one moment — is entitled to conclude there is nothing worth adding.
+    if any(owes_words(m) for m in absorbed):
+        meta[SILENCE_CAPABLE] = False
+        logger.info(
+            "Queued batch carries a message addressed to us — the catch-up turn owes words")
+    else:
+        logger.info(
+            "Queued batch carries an answer already owed — the catch-up turn runs without "
+            "re-gating")
+    return True
 
 
 def set_gate_woke(message: Any, woke: bool) -> None:

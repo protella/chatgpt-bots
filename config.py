@@ -40,10 +40,10 @@ def valid_emoji_name(name: str) -> bool:
     return bool(name) and bool(_EMOJI_NAME_RE.match(name))
 
 
-# How much of a model-authored justification we keep when storing one. Used by the participation
-# backoff's per-channel preference sentence (main.py) and by the telemetry ledger's `reason`
-# fields. ONE bound, shared: both are the classifier's own prose about a human's message, and a
-# second number here would be a second, quieter privacy policy.
+# How much of a model-authored justification we keep when storing one. The binary gate authors no
+# prose at all — no reason, no guidance — so nothing on the gate path uses this today; it stays as
+# the ONE bound any future model-authored field must share, because a second number here would be
+# a second, quieter privacy policy.
 GUIDANCE_TRUNCATION_CHARS = 200
 
 
@@ -632,7 +632,7 @@ class BotConfig:
     enable_response_footer: bool = field(default_factory=lambda: os.getenv("ENABLE_RESPONSE_FOOTER", "true").lower() == "true")
 
     # --- ParticipationEngine (redesign Phase F) ---
-    # Judgment layer for UNPROMPTED channel participation (judicious/active channels).
+    # Judgment layer for UNPROMPTED channel participation (channels at level `on`).
     # Replaces the wake classifier. When false, unaddressed channel messages are ignored
     # without any model call (every channel behaves like mentions_only/tag_only);
     # @mentions, name-wakes, 1:1 threads, and DMs are unaffected either way.
@@ -656,17 +656,17 @@ class BotConfig:
     # Only edits of messages younger than this (age from the ORIGINAL post time, not the edit
     # time) are ever considered — an edit to last week's message never re-triggers.
     edit_reply_window_minutes: int = field(default_factory=lambda: int(os.getenv("EDIT_REPLY_WINDOW_MINUTES", "60")))
-    # F17: the hourly-cap hard rail is gone. Unprompted replies are still counted and fed to
-    # the classifier as a signal, but pacing is the model's judgment, not a numeric ceiling —
-    # MAX_UNPROMPTED_REPLIES_PER_HOUR is retired (frontier models don't run away unless asked).
-    # Participation-backoff redesign: a "backoff" verdict is no longer one blunt action. The
-    # taxonomy routes each case — a standing per-CHANNEL preference is a channel-memory marker;
-    # a thread-scoped "stop replying here" is guidance for the current message only and persists
-    # NOTHING (the per-thread mute table was removed); a momentary "not now" likewise persists
-    # nothing; and an explicit channel-settings change goes through the gated
-    # set_channel_participation tool. The acknowledgement reaction is CONDITIONAL now (driven by
-    # the classifier, and never emitted when the feedback is about reactions), not an always-on
-    # emoji. SNOOZE_ACK_EMOJI is a retained legacy default; the engine picks the ack per verdict.
+    # F17: the hourly-cap hard rail is gone, and so is the rate signal that outlived it —
+    # MAX_UNPROMPTED_REPLIES_PER_HOUR is retired, and the gate is not told how often it has spoken.
+    # Pacing belongs to the responder, which can see whether the room wants another word.
+    # The gate no longer produces participation FEEDBACK of its own. A person telling the
+    # assistant how to behave here simply wakes the responder, which records it with the memory
+    # tools or applies it with set_channel_participation under the commit-3 authorization gate —
+    # judgment made by the model that can see the conversation, not by a classifier that saw one
+    # message and wrote to the database on the strength of it.
+    # The backoff acknowledgement emoji. DEAD in this build: the gate placed it when it handled
+    # participation feedback itself, and it handles none. Kept for one release so a rollback finds
+    # its setting intact; it has no reader (see the cleanup commit).
     snooze_ack_emoji: str = field(default_factory=lambda: os.getenv("SNOOZE_ACK_EMOJI", "zipper_mouth_face").strip().strip(":"))
 
     # F19: "I'm looking at it" acknowledgment reaction. When a reply will take real work

@@ -58,7 +58,7 @@ class TestChannelSettingsModal:
         cs = {"response_mode": "auto_respond", "reply_in_channel": True}
         view = modal.build_channel_settings_modal(
             "C2", cs, "tag_only", channel_policy={"content": "only deploys"})
-        assert self._block(view, "participation_block")["element"]["initial_option"]["value"] == "judicious"
+        assert self._block(view, "participation_block")["element"]["initial_option"]["value"] == "on"
         # The standing policy comes from the reserved policy ROW, never from the settings row.
         assert self._block(view, "policy_block")["element"]["initial_value"] == "only deploys"
         # reply_in_channel True → "channel"; False → "threads"; None → "inherit".

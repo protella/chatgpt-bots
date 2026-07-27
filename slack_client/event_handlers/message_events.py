@@ -27,33 +27,24 @@ def _channel_post_allowed(cs: Any) -> bool:
     return bool(value)
 
 
-def _summarize_attachments(files: Any) -> Any:
-    """F14b: compact summary of a message's files for the participation classifier —
-    count + kind breakdown + filenames only, never content. Images (mimetype image/*)
-    and other files are counted separately; filenames render images-first.
+def _attachment_descriptors(files: Any) -> tuple:
+    """Names and TYPES of a message's files, one descriptor each — e.g. ("food.png (image)",
+    "report.pdf (file)").
 
-    Examples: "1 image (food.png)", "2 files (report.pdf, data.csv)",
-    "1 image, 1 file (chart.png, notes.pdf)". Returns None when there are no files."""
-    if not files:
-        return None
-    image_names, file_names = [], []
-    for f in files:
-        f = f or {}
-        name = f.get("name") or "file"
-        if str(f.get("mimetype", "") or "").startswith("image/"):
-            image_names.append(name)
-        else:
-            file_names.append(name)
-    parts = []
-    n_img, n_file = len(image_names), len(file_names)
-    if n_img:
-        parts.append(f"{n_img} image" + ("s" if n_img != 1 else ""))
-    if n_file:
-        parts.append(f"{n_file} file" + ("s" if n_file != 1 else ""))
-    if not parts:
-        return None
-    names = image_names + file_names
-    return f"{', '.join(parts)} ({', '.join(names)})"
+    Names and types only, never content: the gate this feeds does not look inside anything, and it
+    is deciding whether the responder runs rather than what the file says. It used to be a single
+    prose sentence ("1 image, 1 file (chart.png, notes.pdf)") assembled here and pasted into the
+    prompt — which meant this function was quietly writing part of a prompt.
+
+    The per-descriptor format belongs to the gate (``participation.describe_attachment``), because
+    the gate CLASSIFIES on it: a captionless cohort is only structurally uninteresting when every
+    attachment is an image, and a format invented independently at each end is how that check
+    quietly starts matching a spreadsheet. Empty tuple when there are no files.
+    """
+    from message_processor.participation import describe_attachment
+
+    return tuple(describe_attachment((f or {}).get("name"), (f or {}).get("mimetype"))
+                 for f in (files or []))
 
 
 def attest_message_origin(message: Message, event: Dict[str, Any],
@@ -449,42 +440,28 @@ class SlackMessageEventsMixin:
             # Ordinary content: enqueue. Own messages are excluded (recursion guard).
             if self.is_own_message(event):
                 return
-            # F51b: if this message is headed into the participation wake gate, HOLD its ambient
-            # image jobs so the gate's single vision look serves the stored observations too,
-            # instead of the worker downloading + analyzing the same picture a second time.
-            svc.offer_event(event, facade, defer_images=self._gate_will_see_images(event))
+            # Ambient images are admitted IMMEDIATELY. Nothing downstream waits on the gate any
+            # more (see _gate_will_see_images), so there is nothing to defer them for.
+            svc.offer_event(event, facade)
         except Exception as e:  # noqa: BLE001
             self.log_debug(f"ambient ingest failed: {e}")
 
     def _gate_will_see_images(self, event: Dict[str, Any]) -> bool:
-        """F51b: whether this message's ambient images should be HELD for the participation wake
-        gate (which already downloads and shows them) rather than analyzed a second time by the
-        vision worker.
+        """ALWAYS FALSE. Ambient images are never held for the gate any more.
 
-        True only when the gate could plausibly run on this message: ambient image memory is on
-        (else nothing is stored either way), channel listening + the participation engine + the
-        multimodal gate are all on, it's a real channel (not a DM), it carries files, and it does
-        NOT @-mention the bot — a mention is answered directly and skips the gate. This is a cheap,
-        conservative predicate: a held image the gate never resolves is admitted after a bounded
-        timeout, so a false positive only DELAYS analysis, and a false negative just keeps today's
-        behavior (worker analyzes immediately). Never raises."""
-        try:
-            if not (config.enable_ambient_memory and config.enable_ambient_image_memory
-                    and config.enable_channel_listening
-                    and getattr(config, "enable_participation_engine", True)
-                    and getattr(config, "enable_multimodal_gate", True)):
-                return False
-            channel_id = event.get("channel")
-            if not channel_id or channel_id.startswith("D") or not event.get("files"):
-                return False
-            bot_user_id = getattr(self, "bot_user_id", None)
-            if bot_user_id:
-                from slack_client.formatting.text import text_mentions_user
-                if text_mentions_user(event.get("text") or "", bot_user_id):
-                    return False  # answered via app_mention; the gate won't run on this message
-            return True
-        except Exception:  # noqa: BLE001 — never let the hold predicate break ingest
-            return False
+        The rich gate downloaded a message's pictures to judge it, so holding the ambient vision
+        job meant one look served both the verdict and the stored observation. The binary gate does
+        not look at images at all — it decides whether the responder RUNS, and a picture cannot
+        change that answer in a way its filename does not.
+
+        So there is nothing to wait for, and waiting was the risk: a hold is only safe while some
+        resolver is guaranteed to release it, and the resolver was the gate's own post-decision
+        callback. With no gate callback, a held image would sit until a bounded timeout expired —
+        analysis delayed for no benefit, on every image in every channel. The predicate stays as a
+        named False rather than vanishing into its call site, because it is what a reader looks for
+        when asking "does anything still block ambient vision".
+        """
+        return False
 
     # ------------------------------------------------------------- F52: edit-triggered replies
 
@@ -571,16 +548,22 @@ class SlackMessageEventsMixin:
         return f"{channel_id}|{ts}" in seen
 
     def _stash_edit_context(self, channel_id: str, msg_ts: str, *, old_text: str,
-                            new_text: str, already_replied: bool) -> None:
+                            new_text: str, already_replied: bool, marker: str) -> None:
         """Stash edit context on THIS facade (which the engine's evaluate is handed as `client`),
-        keyed by (channel, ts). evaluate pops it and folds old-text/already-replied into the
-        classifier prompt. Bounded so a long-lived process can't accumulate stale contexts."""
+        keyed by (channel, ts, MARKER).
+
+        The marker is ownership. An edit keeps its original Slack timestamp, so (channel, ts) alone
+        cannot distinguish the edit's own evaluation from the stale original attempt it superseded —
+        and whichever ran first popped the context. The original could therefore arrive holding the
+        edit's before/after text, conclude it WAS the edit, and in doing so skip the supersession
+        check meant to silence it. Only the attempt carrying this marker may consume it. Bounded so
+        a long-lived process can't accumulate stale contexts."""
         from collections import OrderedDict
         store = getattr(self, "_edit_reply_ctx_map", None)
         if store is None:
             store = OrderedDict()
             self._edit_reply_ctx_map = store
-        key = f"{channel_id}|{msg_ts}"
+        key = f"{channel_id}|{msg_ts}|{marker}"
         store[key] = {"old_text": old_text or "", "new_text": new_text or "",
                       "already_replied": bool(already_replied)}
         store.move_to_end(key)
@@ -738,8 +721,8 @@ class SlackMessageEventsMixin:
         """F52: send a non-mention channel edit through the participation engine, respecting the
         SAME gating a new message gets, and stashing the edit context so the classifier can make
         the typo-vs-meaning call. Mirrors _handle_channel_message's participation-check condition:
-        the engine only judges a message a new post would also reach (judicious/active always; a
-        name/mention hit under any mode). An edit that a new message wouldn't respond to stays
+        the gate only judges a message a new post would also reach (level `on` always; a
+        name/mention hit under any level). An edit that a new message wouldn't respond to stays
         silent."""
         from message_processor.participation import resolve_participation_level
         cs = await self._get_channel_settings(channel_id)
@@ -753,16 +736,20 @@ class SlackMessageEventsMixin:
         bot_uid = getattr(self, "bot_user_id", None)
         mention_present = bool(bot_uid and text_mentions_user(new_text, bot_uid))
         name_hit = self._text_mentions_bot_name(new_text)
-        if not (mention_present or name_hit or level in ("judicious", "active")):
+        if not (mention_present or name_hit or level == "on"):
             return  # mentions_only + no mention/name → silent, exactly as a new ambient message is
 
-        # Seed the pulse (idempotent) so the classifier envelope has content, matching the wake path.
+        # Seed the pulse (idempotent, once per channel per process). NOT for the gate — the binary
+        # gate has no envelope and never reads the pulse. For the RESPONDER, which still renders
+        # "[Recent channel activity]" on a channel turn: an edit is the one route into a woken turn
+        # that does not pass the ordinary dispatch path's backfill, so without this an edit in a
+        # channel nothing else has touched since startup answers with an empty envelope.
         pulse = getattr(self, "channel_pulse", None)
         if pulse is not None:
             try:
                 await pulse.ensure_backfill(channel_id, self.app.client, self)
             except Exception as e:  # noqa: BLE001
-                self.log_debug(f"edit engine backfill failed: {e}")
+                self.log_debug(f"edit pulse backfill failed: {e}")
 
         # Already-replied signal: _thread_participation runs one conversations.replies and reports
         # bot_present — the bot already appears in this message's thread (a top-level answer lands
@@ -775,9 +762,11 @@ class SlackMessageEventsMixin:
         except Exception as e:  # noqa: BLE001
             self.log_debug(f"edit already-replied probe failed: {e}")
 
-        # Stash the edit context where evaluate (handed this same facade as `client`) reads it.
+        # Stash the edit context where evaluate (handed this same facade as `client`) reads it,
+        # under THIS edit's marker so only this attempt can claim it.
         self._stash_edit_context(channel_id, msg_ts, old_text=old_text,
-                                 new_text=new_text, already_replied=already_replied)
+                                 new_text=new_text, already_replied=already_replied,
+                                 marker=str(marker or ""))
 
         message = await self._event_to_message(synthetic, client)
         message.thread_id = synthetic.get("thread_ts") or msg_ts
@@ -799,13 +788,9 @@ class SlackMessageEventsMixin:
             message.metadata["wake_source"] = "name_mention"
         else:
             message.metadata["wake_source"] = "ambient"
-        attach_summary = _summarize_attachments(synthetic.get("files"))
-        if attach_summary:
-            message.metadata["participation_attachments"] = attach_summary
-        gate_images = [a for a in (message.attachments or [])
-                       if (a or {}).get("type") == "image" and (a or {}).get("url")]
-        if gate_images:
-            message.metadata["participation_images"] = gate_images
+        descriptors = _attachment_descriptors(synthetic.get("files"))
+        if descriptors:
+            message.metadata["participation_attachments"] = descriptors
         message.metadata["channel_post_allowed"] = _channel_post_allowed(cs)
 
         self.log_debug(
@@ -915,9 +900,8 @@ class SlackMessageEventsMixin:
 
         channel_id = event.get("channel")
         cs = await self._get_channel_settings(channel_id)
-        # Phase F: participation levels (off / mentions_only / judicious / active).
-        # participation_level wins over the legacy response_mode; both map cleanly
-        # (off≡off, tag_only≡mentions_only, auto_respond≡judicious).
+        # Participation levels (off / mentions_only / on). participation_level wins over the
+        # legacy response_mode; both map cleanly (off≡off, tag_only≡mentions_only, auto_respond≡on).
         from message_processor.participation import resolve_participation_level
         level = resolve_participation_level(cs)
         if level == "off":
@@ -959,16 +943,16 @@ class SlackMessageEventsMixin:
                 if pulse is not None and pulse.thread_has_other_bot(channel_id, thread_ts):
                     direct_continuation = False
 
-        # Decide (Phase F, revised): 1:1 thread continuation → respond directly;
-        # judicious/active → engine judges every message; mentions_only → engine
-        # judges ONLY name-bearing messages (zero model cost otherwise); engine
-        # disabled → legacy deterministic name wake (humans only — a bot naming us
-        # must never trigger a judgment-free reply, that's a loop seed).
+        # Decide: 1:1 thread continuation → respond directly; `on` → the gate judges every
+        # message; `mentions_only` → the gate judges ONLY name-bearing messages (zero model cost
+        # otherwise, and a real @mention never arrives here — it comes via app_mention); engine
+        # disabled → legacy deterministic name wake (humans only — a bot naming us must never
+        # trigger a judgment-free reply, that's a loop seed).
         engine_on = getattr(config, "enable_participation_engine", True)
         gate_required = False
         if direct_continuation:
             pass  # respond directly
-        elif engine_on and (level in ("judicious", "active") or name_hit):
+        elif engine_on and (level == "on" or name_hit):
             gate_required = True
         elif not engine_on and name_hit and not sender_is_bot:
             pass  # legacy deterministic name wake (engine disabled)
@@ -1012,18 +996,13 @@ class SlackMessageEventsMixin:
                 message.metadata["participation_name_hit"] = True
             if sender_is_bot:
                 message.metadata["participation_sender_bot"] = True
-            # F14b: summarize any files so the classifier knows an artifact is attached
-            # (the gate got file_share through, but text-only signals hid the image).
-            attach_summary = _summarize_attachments(event.get("files"))
-            if attach_summary:
-                message.metadata["participation_attachments"] = attach_summary
-            # F40: and hand it the IMAGES themselves — descriptors only here. Nothing is
-            # downloaded until the message survives the debounce, so a superseded burst never
-            # spends bandwidth on pictures whose verdict is thrown away.
-            gate_images = [a for a in (message.attachments or [])
-                           if (a or {}).get("type") == "image" and (a or {}).get("url")]
-            if gate_images:
-                message.metadata["participation_images"] = gate_images
+            # Names and types of any files, so the gate knows an artifact is attached. The
+            # PIXELS no longer ride along: the binary gate does not look at images (it decides
+            # whether the responder runs, and the responder is what actually reads the picture),
+            # so nothing is downloaded for it and no ambient work waits on it.
+            descriptors = _attachment_descriptors(event.get("files"))
+            if descriptors:
+                message.metadata["participation_attachments"] = descriptors
         # Whether a top-level reply is ALLOWED here (redesign Layer 1). An allowance, not a
         # mandate: where both destinations are legal the model chooses per reply
         # (set_reply_destination). Always stamped, true or false.

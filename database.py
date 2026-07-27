@@ -50,11 +50,19 @@ def normalize_memory_line(text: str) -> str:
 def merged_policy_text(current: str, incoming: str) -> Optional[str]:
     """Both texts, or one, or neither — the rule for folding an incoming policy into a stored one.
 
-    Used by the directives migration and by a legacy modal's submission, which are the only two
-    paths that CANNOT know what the stored policy is (one predates it, the other predates the
-    field). Guessing which text the operator meant is not their call, and silently dropping
-    either is how a live rule disappears — so both survive as separate lines, deduplicated only
-    on exact equality after whitespace normalization.
+    Used by the directives migration, the preference-row migration, and by a legacy modal's
+    submission — the only paths that CANNOT know what the stored policy is (two predate it, one
+    predates the field). Guessing which text the operator meant is not their call, and silently
+    dropping either is how a live rule disappears — so both survive as separate lines,
+    deduplicated only on exact equality after whitespace normalization.
+
+    Dedup is per LINE, not per blob. One incoming text was enough while the directives column was
+    the only legacy source: one column, one rule, and `current` was whatever the operator typed.
+    The preference migration folds SEVERAL legacy rows into the same policy one after another, so
+    by the second fold `current` is already multi-line — and a blob comparison would happily
+    append a line that sits verbatim two lines above it. The rule itself is unchanged (exact
+    equality after whitespace normalization); only the unit it applies to. Every single-line case,
+    which is every pre-existing caller's case, folds exactly as it always did.
 
     Returns None when there is nothing to store. Note the asymmetry with a deliberate REPLACE: a
     writer that can see the current policy replaces it wholesale; a writer that cannot, merges.
@@ -65,9 +73,20 @@ def merged_policy_text(current: str, incoming: str) -> Optional[str]:
         return current or None
     if not current:
         return incoming
-    if normalize_memory_line(current) == normalize_memory_line(incoming):
-        return current                      # the same rule arriving twice
-    return f"{current}\n{incoming}"
+    # `current` is kept verbatim — it is what a human last saw and may contain its own blank
+    # lines or indentation. Only the INCOMING lines are filtered and normalized.
+    seen = {normalize_memory_line(line) for line in current.splitlines()}
+    seen.discard("")
+    additions: List[str] = []
+    for line in incoming.splitlines():
+        key = normalize_memory_line(line)
+        if not key or key in seen:
+            continue                        # the same rule arriving twice
+        seen.add(key)                       # …and twice within one incoming text
+        additions.append(line.strip())
+    if not additions:
+        return current
+    return "\n".join([current, *additions])
 
 
 def memory_content_hash(text: str) -> str:
@@ -99,6 +118,31 @@ def _encode_muted_threads(val) -> Optional[str]:
     except (ValueError, TypeError):
         return None
 
+
+# The participation vocabulary the binary gate retired, and the single value it retired into.
+#
+# Frozen here on purpose rather than imported from message_processor.participation: a migration
+# describes a database as it WAS, and its two legacy names no longer appear in VALID_LEVELS at
+# all. Sourcing the target from the live tuple would be worse still — a later rename of the
+# vocabulary would silently rewrite what this historical migration claims to have written.
+#
+# `judicious` and `active` were two dials on a gate that weighed how much value was enough to
+# speak. The binary gate does not ask that question, so the two names describe one behavior and
+# collapse into it. `off`, `mentions_only` and NULL (inherit the global default) keep their exact
+# meaning and are not touched.
+_LEGACY_PARTICIPATION_LEVELS = ("judicious", "active")
+_PARTICIPATION_LEVEL_ON = "on"
+
+# The author marker the retired backoff writer stamped on its preference rows — the same string as
+# channel_steering.PREF_AUTHOR_PREFIX and as the partial unique index's own predicate.
+#
+# A frozen copy rather than an import, for the same reason as the levels above: this is the name
+# rows in an OLD database carry, and the constant it mirrors belongs to a writer that the binary
+# gate deletes. A migration that imports its legacy vocabulary from live code stops being able to
+# read old data the moment that code is cleaned up — and it would also drag the whole
+# message_processor import graph into database.py at migration time, which is a lot of surface for
+# one string. If the two ever disagree, the DB's own index predicate is the tiebreaker.
+_LEGACY_PREF_AUTHOR_PREFIX = "participation_engine:pref:"
 
 # channel_settings columns whose write is a real, attributed structural edit. Touching any of
 # them bumps updated_ts/updated_by; a write that touches only the non-structural columns
@@ -3800,6 +3844,202 @@ class DatabaseManager(LoggerMixin):
         if migrated:
             logger.info(
                 f"DB: migrated channel directives to policy rows for {migrated} channel(s)")
+        return migrated, failed
+
+    async def migrate_participation_levels_to_binary_async(self) -> tuple:
+        """Collapse the retired participation levels onto the binary gate's single ON value.
+
+        `judicious` and `active` meant the same thing the moment the gate became one bit — see
+        _LEGACY_PARTICIPATION_LEVELS. A channel left on either name would be read by a gate whose
+        vocabulary no longer contains it, and an unknown level falls back to the global default:
+        an operator who deliberately turned this channel ON could find it inheriting `off`.
+
+        IDEMPOTENT and safe to interrupt. One UPDATE per channel, each its own transaction, so a
+        channel that cannot be written costs only itself — the same per-channel bargain the
+        directives migration makes. A rerun matches no legacy names and does nothing.
+
+        `response_mode` is deliberately LEFT ALONE. It is dual-written by the settings modal and
+        its legacy mapping (auto_respond ↔ on) already reads correctly, so rewriting it would
+        change nothing except the one column a rollback to the previous release still reads.
+
+        updated_ts/updated_by are not bumped either: this is housekeeping, not an edit, and
+        stamping it would make the migration look like the last human to touch the channel's
+        settings — the same rule the channel_settings writer follows for non-structural columns.
+
+        Returns ``(migrated, failed)``, counting CHANNELS, so the startup caller can abort on
+        `failed` exactly as it does for the directives migration.
+        """
+        placeholders = ", ".join("?" for _ in _LEGACY_PARTICIPATION_LEVELS)
+        migrated = 0
+        failed = 0
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            # LOWER(TRIM(...)) on both sides: the modal only ever wrote these lowercase, but a
+            # value hand-edited into the DB is exactly the kind of row that would otherwise be
+            # left behind to fall back to the global default.
+            async with db.execute(
+                f"SELECT channel_id, participation_level FROM channel_settings "
+                f"WHERE participation_level IS NOT NULL "
+                f"AND LOWER(TRIM(participation_level)) IN ({placeholders})",
+                _LEGACY_PARTICIPATION_LEVELS
+            ) as cursor:
+                rows = await cursor.fetchall()
+            for row in rows:
+                channel_id = row["channel_id"]
+                try:
+                    await db.execute(
+                        f"UPDATE channel_settings SET participation_level = ? "
+                        f"WHERE channel_id = ? "
+                        f"AND LOWER(TRIM(participation_level)) IN ({placeholders})",
+                        (_PARTICIPATION_LEVEL_ON, channel_id, *_LEGACY_PARTICIPATION_LEVELS))
+                    await db.commit()
+                    migrated += 1
+                except Exception as e:  # noqa: BLE001 — every channel gets its own attempt
+                    failed += 1
+                    try:
+                        await db.rollback()
+                    except Exception:
+                        pass
+                    logger.error(
+                        f"DB: participation-level migration failed for {channel_id} "
+                        f"({type(e).__name__}); it is still on "
+                        f"'{row['participation_level']}', which the binary gate cannot read and "
+                        f"will treat as the global default")
+        if migrated:
+            logger.info(
+                f"DB: collapsed legacy participation levels to "
+                f"'{_PARTICIPATION_LEVEL_ON}' for {migrated} channel(s)")
+        return migrated, failed
+
+    async def migrate_participation_prefs_to_policy_async(self) -> tuple:
+        """Move every legacy backoff preference row into its channel's reserved policy row.
+
+        The rich gate recorded a "stop doing X here" verdict as a channel_memory row authored
+        ``participation_engine:pref:<dimension>`` and rendered it as an instruction. That writer is
+        gone with the binary gate, and so is the section that rendered those rows — so their text
+        is now steering that nothing reads. It is a standing instruction a person actually gave
+        ("react less in here"), which is precisely what the reserved policy row is for, so that is
+        where it goes.
+
+        COPY, VERIFY, THEN DELETE — in ONE transaction per channel. The policy row is written
+        first and the legacy rows dropped only after that write lands, so an interruption anywhere
+        leaves every preference exactly where it was rather than half-moved. Grouped by channel
+        because a single transaction for the whole database would let one unwritable channel
+        discard every other channel's preferences with it.
+
+        Merging goes through ``merged_policy_text`` so this cannot drift from the directives
+        migration: existing policy lines are kept verbatim, preference text is appended as its own
+        line, and a line already present (after whitespace normalization) is not repeated. Nothing
+        is ever truncated or summarized — a preference the bot has been obeying must survive the
+        move intact. The rows are folded in id order, so the same database always produces the same
+        policy text, which is what keeps the rendered steering block byte-stable.
+
+        Blank preference rows are deleted without a policy write: they carry nothing to preserve,
+        and leaving them behind would make a rerun report work forever.
+
+        IDEMPOTENT. A rerun finds no ``participation_engine:pref:*`` rows and does nothing.
+
+        Returns ``(migrated, failed)``, counting CHANNELS, so the startup caller can abort on
+        `failed` exactly as it does for the directives migration. A nonzero `failed` is not
+        survivable: nothing renders those rows any more, so the channel is quietly disobeying an
+        instruction it was given until a later run succeeds.
+        """
+        # The author marker IS the identity of these rows — the same predicate the classifier
+        # (channel_steering.is_pref_row) and the writer's unique index key on, so what this
+        # migration moves cannot drift from what the code called a preference. Scope is
+        # deliberately NOT in the predicate for the same reason.
+        migrated = 0
+        failed = 0
+        async with aiosqlite.connect(self.db_path, isolation_level=None) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA busy_timeout=5000")
+            # An enumeration pass, and ONLY that: which channels have work. Every value this
+            # migration actually merges is re-read inside the per-channel lock below, because
+            # between this scan and that write a person can save the settings modal or the model
+            # can call the policy tool — and a merge built on a policy read out here would quietly
+            # revert theirs, having already deleted the only other copy of the text.
+            async with db.execute(
+                "SELECT DISTINCT channel_id FROM channel_memory "
+                "WHERE author LIKE ? || '%' ORDER BY channel_id",
+                (_LEGACY_PREF_AUTHOR_PREFIX,)
+            ) as cursor:
+                channel_ids = [row["channel_id"] for row in await cursor.fetchall()]
+            for channel_id in channel_ids:
+                try:
+                    # IMMEDIATE: the write lock is taken BEFORE the reads, so a concurrent policy
+                    # writer serializes behind this rather than racing inside it.
+                    await db.execute("BEGIN IMMEDIATE")
+                    async with db.execute(
+                        "SELECT id, content FROM channel_memory "
+                        "WHERE channel_id = ? AND author LIKE ? || '%' ORDER BY id",
+                        (channel_id, _LEGACY_PREF_AUTHOR_PREFIX)
+                    ) as pref_cursor:
+                        pref_rows = await pref_cursor.fetchall()
+                    if not pref_rows:
+                        # Migrated by another process (or another run) between the scan and the
+                        # lock. Nothing to do, and nothing to report as failure.
+                        await db.execute("COMMIT")
+                        continue
+                    async with db.execute(
+                        "SELECT content FROM channel_memory "
+                        "WHERE scope = 'policy' AND channel_id = ? LIMIT 1",
+                        (channel_id,)
+                    ) as pol_cursor:
+                        existing = await pol_cursor.fetchone()
+                    current = (existing["content"] or "").strip() if existing else ""
+                    content = current
+                    # id order: deterministic, and it preserves the order the preferences were
+                    # actually recorded in, which is the closest thing to the operator's own
+                    # sequence that survives.
+                    for pref in pref_rows:
+                        content = merged_policy_text(content, pref["content"] or "") or ""
+                    ids = [pref["id"] for pref in pref_rows]
+                    if content and content != current:
+                        # On a fresh row the migration signs it; on an existing one the author is
+                        # left as it is, because the operator who wrote that policy is still its
+                        # author — we only appended to it. Same shape as the directives migration.
+                        await db.execute(
+                            "INSERT INTO channel_memory (channel_id, scope, content, author) "
+                            "VALUES (?, 'policy', ?, 'migration:participation_prefs') "
+                            "ON CONFLICT (channel_id) WHERE scope = 'policy' "
+                            "DO UPDATE SET content = excluded.content, "
+                            "              updated_ts = CURRENT_TIMESTAMP",
+                            (channel_id, content))
+                        # Read the policy back before anything is dropped. The legacy rows are the
+                        # only remaining copy of this text, so "the write succeeded" has to be
+                        # observed, not assumed.
+                        async with db.execute(
+                            "SELECT content FROM channel_memory "
+                            "WHERE scope = 'policy' AND channel_id = ? LIMIT 1",
+                            (channel_id,)
+                        ) as verify_cursor:
+                            stored = await verify_cursor.fetchone()
+                        if not stored or (stored["content"] or "") != content:
+                            raise RuntimeError("policy row did not take the merged text")
+                    # ONLY the rows just copied, and only now.
+                    await db.execute(
+                        f"DELETE FROM channel_memory "
+                        f"WHERE id IN ({', '.join('?' for _ in ids)}) AND author LIKE ? || '%'",
+                        (*ids, _LEGACY_PREF_AUTHOR_PREFIX))
+                    await db.execute("COMMIT")
+                    migrated += 1
+                except Exception as e:  # noqa: BLE001 — every channel gets its own attempt
+                    failed += 1
+                    try:
+                        await db.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    logger.error(
+                        f"DB: participation-preference→policy migration failed for {channel_id} "
+                        f"({type(e).__name__}); its preference rows are untouched, and nothing "
+                        f"renders them any more, so those instructions will NOT be obeyed until "
+                        f"this succeeds")
+        if migrated:
+            logger.info(
+                f"DB: migrated legacy participation preferences into policy rows for "
+                f"{migrated} channel(s)")
         return migrated, failed
 
     async def add_channel_memory_async(self, channel_id: str, content: str, scope: str = "channel",

@@ -1,10 +1,22 @@
 """F20 — human-style reactions on others' posts.
 
-Covers the five design points: broadened react-verdict prompt guidance + softened
-main-model etiquette; unrestricted standard-emoji judgment at all four enforcement
-points (schema enum, executor, classifier signal line, validate_verdict) with the
-optional REACTION_EMOJIS allowlist still honored; and the pulse-ring social-proof
-signal (reaction_added/removed accumulation + envelope/tail summary rendering).
+Covers what remains of the five design points: the main model's react etiquette
+(LOCAL_TOOLS_GUIDANCE), unrestricted standard-emoji judgment at the two enforcement points that
+still exist (schema enum, executor) with the optional REACTION_EMOJIS allowlist still honored, tool
+registration, and the pulse-ring social-proof signal (reaction_added/removed accumulation +
+envelope/tail summary rendering).
+
+TWO OF THE FOUR ENFORCEMENT POINTS ARE GONE, along with the prompt they served. The gate used to
+CHOOSE the emoji and place it — hence a react verdict, `validate_verdict`'s emoji coercion, and a
+rendered palette/allowlist line in the gate prompt. The binary gate returns one bit and places
+nothing, so the choosing moved wholly to the responder, where the schema enum and the executor
+already enforced the same rules. What is deleted here is the duplicate enforcement on a chooser
+that no longer exists; what survives is the enforcement on the one that does.
+
+The F20/F24 prompt tests went with PARTICIPATION_SYSTEM_PROMPT. Their content — a reaction clears a
+lower bar than words, ownership still governs, prefer an emoji when it fully carries the reply, do
+not strain for a joke — was guidance for CHOOSING an emoji, which the responder's own prompt and
+tool guidance now own; the surviving assertions are on LOCAL_TOOLS_GUIDANCE below.
 """
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -20,38 +32,30 @@ from message_processor.participation import ParticipationEngine
 import prompts
 
 
-# ------------------------------------------------------------------- point 1+4: prompts
+# --------------------------------------------------- point 1+4: the responder's etiquette
 
-def test_participation_prompt_reaction_bar():
-    p = prompts.PARTICIPATION_SYSTEM_PROMPT
-    # A reaction clears a LOWER bar than words, because it does not take the floor. The
-    # staged rewrite originally held emoji to the same "must be able to supply something"
-    # bar as a reply, which drove the measured react rate from 6/165 to 0/228 — the bot
-    # went mute on thanks, FYIs and delegations that a teammate would simply 👍.
-    assert "A reaction clears a lower bar" in p
-    assert "does not take the floor" in p
-    # ...but WHOSE the message is still governs an emoji exactly as it governs a reply.
-    # That is the half of the old rule that must survive: the lower bar is about VALUE,
-    # never about ownership, or reactions become the side door the misfire came through.
-    assert "not a side door into somebody else's exchange" in p
-    assert "governs an emoji exactly as it governs a reply" in p
-    assert "Most messages get nothing" in p
-    # social proof kept but GATED on the assistant genuinely being part of the moment
-    assert "ALREADY placed is low-risk only when" in p
-    # taste rails preserved
-    assert "heated, sensitive, or personal" in p
-    # the tiebreak ladder: words > emoji > nothing, by cost of being wrong
-    assert "the emoji is the cheaper mistake" in p
-    assert "prefer nothing" in p
-    # aptness: the emoji IS the message, so a reflex 👍 wastes it. Live, the first three
-    # reacts the rebuilt gate produced were :+1:, :eyes:, :+1: — correct lane, no taste.
-    assert "fits THIS moment rather than a default" in p
-    assert "let the subject matter choose" in p
-    assert "Apt beats safe" in p
-    # ...bounded on the other side, so "be creative" does not become mugging for laughs
-    assert "do not strain for a joke" in p
-    # any-standard-emoji wording (no curated palette)
-    assert "any standard Slack emoji name" in p
+def test_the_gate_prompt_carries_no_reaction_guidance_at_all():
+    """The inverted remains of two deleted tests.
+
+    They asserted a dozen sentences of the rich gate's reaction rubric: the lower bar, the ownership
+    rule, the social-proof gate, the taste rails, the words > emoji > nothing ladder, "Apt beats
+    safe", the any-standard-emoji wording, and F24's preference for reacting when an emoji fully
+    carries the reply. Every one of them was instruction for CHOOSING an emoji, and the gate chooses
+    nothing — so there is no successor sentence, and asserting one would invent a contract.
+
+    The measurement that produced those sentences is not lost: it argued that reactions should clear
+    a lower bar than words, which is now the responder's judgment to make with the whole thread in
+    front of it rather than a classifier's with one message."""
+    p = prompts.WAKE_CLASSIFIER_SYSTEM_PROMPT
+    for retired in ("A reaction clears a lower bar", "does not take the floor",
+                    "Most messages get nothing", "the emoji is the cheaper mistake",
+                    "prefer nothing", "Apt beats safe", "do not strain for a joke",
+                    "any standard Slack emoji name", 'prefer "react" over "respond"',
+                    "ALREADY acknowledged with a reaction"):
+        assert retired not in p, retired
+    # The one thing it DOES say about reacting: that the assistant it wakes may react instead of
+    # speaking. That is context for the wake decision, not instruction about which emoji.
+    assert "add an emoji reaction instead of speaking" in p
 
 
 def test_local_tools_guidance_softened():
@@ -65,16 +69,6 @@ def test_local_tools_guidance_softened():
 
 
 # ------------------------------------------------------------------ F24: reaction-preference
-
-def test_f24_participation_prompt_prefers_react():
-    p = prompts.PARTICIPATION_SYSTEM_PROMPT
-    # preference wording: react over respond when an emoji fully carries the reply
-    assert 'prefer "react" over "respond"' in p
-    # delegation/FYI example present
-    assert "a wordless acknowledgement of something aimed at it" in p and "FYI" in p
-    # redundant-acknowledgment rule present
-    assert "ALREADY acknowledged with a reaction" in p
-
 
 def test_f24_local_tools_guidance_broadened():
     g = prompts.LOCAL_TOOLS_GUIDANCE
@@ -175,39 +169,28 @@ def test_valid_emoji_name_matrix():
     assert not valid_emoji_name("x" * 65)
 
 
-# ------------------------------------------------------------- point 2: validate_verdict
+# ------------------------------------- point 2: the verdict-side enforcement is gone
 
-class TestValidateVerdictUnrestricted:
-    def test_off_list_name_accepted_by_default(self, monkeypatch):
-        monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
-        v = ParticipationEngine.validate_verdict({"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "react", "emoji": ":joy:"})
-        assert v.action == "react" and v.emoji == "joy"
+def test_the_verdict_side_emoji_enforcement_is_gone():
+    """Five tests collapse here, and nothing they covered is unprotected.
 
-    def test_malformed_name_downgrades_to_ignore(self, monkeypatch):
-        monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
-        v = ParticipationEngine.validate_verdict({"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "react", "emoji": "bad name!"})
-        assert v.action == "ignore"
+    They exercised `validate_verdict`'s emoji handling: an off-list name accepted by default, a
+    malformed one downgrading react → ignore, an allowlist coercing to its first entry, and the two
+    react_and_respond variants (off-list falls back and stays; unresolvable drops the emoji but
+    keeps the reply). All of it repaired an emoji the GATE had chosen so the gate could place it.
 
-    def test_allowlist_enforced_when_configured(self, monkeypatch):
-        monkeypatch.setattr(config, "reaction_emojis", ["thumbsup", "eyes"], raising=False)
-        # off-list falls back to first allowlisted emoji
-        v = ParticipationEngine.validate_verdict({"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "react", "emoji": "joy"})
-        assert v.action == "react" and v.emoji == "thumbsup"
-
-    def test_react_and_respond_offlist_falls_back_and_stays(self, monkeypatch):
-        # react_and_respond coerces its emoji through the allowlist exactly like react; an off-list
-        # name falls back to the first allowed emoji and the action STAYS react_and_respond.
-        monkeypatch.setattr(config, "reaction_emojis", ["thumbsup"], raising=False)
-        v = ParticipationEngine.validate_verdict({"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "react_and_respond", "emoji": "joy"})
-        assert v.action == "react_and_respond" and v.emoji == "thumbsup"
-
-    def test_react_and_respond_bad_emoji_no_allowlist_downgrades_to_respond(self, monkeypatch):
-        # Unlike react (which downgrades to ignore), a react_and_respond whose emoji won't resolve
-        # keeps the worded reply: downgrade to a plain respond with no emoji.
-        monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
-        v = ParticipationEngine.validate_verdict(
-            {"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "react_and_respond", "emoji": "bad name!"})
-        assert v.action == "respond" and v.emoji is None
+    There is no verdict and no gate-placed reaction. The identical rules are enforced where the
+    emoji is actually chosen — the schema enum above and the executor above that — and the executor
+    tests cover the same three cases against the live path."""
+    assert not hasattr(ParticipationEngine, "validate_verdict")
+    assert not hasattr(ParticipationEngine, "_coerce_emoji")
+    assert not hasattr(ParticipationEngine, "_apply_invariants")
+    import message_processor.participation as participation
+    assert not hasattr(participation, "ParticipationVerdict")
+    # No action vocabulary survives anywhere in the module either — `react` and
+    # `react_and_respond` were the only reasons an emoji ever reached it.
+    assert not hasattr(participation, "VALID_ACTIONS")
+    assert not hasattr(participation, "SPEAKING_ACTIONS")
 
 
 # -------------------------------------------------------------- point 2: tool-enabled gate
@@ -236,37 +219,28 @@ def test_gate_registers_react_with_empty_default(monkeypatch):
     assert "react_to_message" in {t["name"] for t in registry.schemas()}
 
 
-# ----------------------------------------------------------------- point 2: classifier line
+# ------------------------------------------- point 2: the gate is told about no palette
 
-async def _capture_classifier_prompt(monkeypatch):
-    """Run classify_participation with a stubbed API call; return the user-message text
-    (which carries the rendered signal lines)."""
-    from openai_client.api import responses as responses_api
-    captured = {}
+@pytest.mark.parametrize("allowlist", [[], ["thumbsup", "eyes"]])
+def test_the_gate_prompt_renders_neither_a_palette_nor_an_allowlist(monkeypatch, allowlist):
+    """INVERTED from two tests that asserted the rendered signal line, one per allowlist state.
 
-    async def _fake_safe_api_call(self, fn, *, operation_type, **params):
-        captured["input"] = params["input"]
-        return SimpleNamespace(output=[])
+    The line existed so the gate could pick from a legal set. With no picking, rendering it would
+    describe an ability the gate does not have — and the allowlist itself is still honoured, at the
+    schema and the executor, which is where a name the model proposes actually gets checked."""
+    monkeypatch.setattr(config, "reaction_emojis", allowlist, raising=False)
+    import inspect
+    from openai_client.api import responses
 
-    host = MagicMock()
-    host._safe_api_call = _fake_safe_api_call.__get__(host)
-    host.classify_participation = responses_api.classify_participation.__get__(host)
-    await host.classify_participation(text="hi", signals={})
-    return captured["input"][1]["content"]
-
-
-@pytest.mark.asyncio
-async def test_classifier_signal_line_any_emoji_by_default(monkeypatch):
-    monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
-    prompt = await _capture_classifier_prompt(monkeypatch)
-    assert "any standard Slack emoji name (shorthand, no colons)" in prompt
-
-
-@pytest.mark.asyncio
-async def test_classifier_signal_line_allowlist_when_configured(monkeypatch):
-    monkeypatch.setattr(config, "reaction_emojis", ["thumbsup", "eyes"], raising=False)
-    prompt = await _capture_classifier_prompt(monkeypatch)
-    assert "Allowed reaction emoji (choose one): thumbsup, eyes" in prompt
+    src = inspect.getsource(responses.classify_wake)
+    assert "reaction_emojis" not in src
+    assert "Allowed reaction emoji" not in src
+    # ...and nothing in the rendered source block either: it describes the message, not the palette.
+    from message_processor.participation import SourceMessage
+    block = responses._render_wake_source(
+        SourceMessage(ts="1.0", text="hi", sender_name="Peter", sender_type="human"),
+        index=0, total=1)
+    assert "emoji" not in block.lower()
 
 
 # --------------------------------------------------------------- point 3: pulse social proof

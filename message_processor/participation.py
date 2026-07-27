@@ -1,26 +1,45 @@
-"""ParticipationEngine — Phase F decision engine for channel participation.
+"""ParticipationEngine — the binary wake gate.
 
-Replaces the one-word wake classifier with a judgment layer that decides, per
-unprompted channel message, whether the bot should respond, react, stay silent,
-or back off — using real channel context (ChannelPulse envelope), the channel's
-steering block (standing policy + remembered facts, rendered once per turn by
-message_processor/channel_steering.py), and the bot's own recent participation rate.
+ONE QUESTION, ONE BIT. This engine decides whether the full responder runs on an unprompted
+channel message. That is all it decides. It does not choose words, reactions, placement, or
+settings; it does not rank how much value a reply would add; it does not report why. Those were
+the rich gate's job, and the rich gate was wrong about them in a way that could not be fixed by
+better prompting: it made visible-action decisions from a thin slice of context, before the model
+that actually had the context ever got a turn.
 
-Authority order (cheap → expensive), enforced in code not prompt:
-  prefilters (message_events: own message / subtype / level=off / muted-thread /
-  addressed-short-circuit / mentions_only) → debounce → ONE utility-model call → verdict.
-  (The old hourly hard cap was retired in F17 — pacing is the model's judgment, not a ceiling.)
+WHY A BIT IS BETTER THAN A VERDICT. Every extra field the old verdict carried became a control
+bus. `action` branched the caller four ways; `emoji` placed a reaction the responder then had to
+be told about; `reason` was forwarded into the responder's prompt and pre-argued the turn;
+`memory_op` and the backoff taxonomy wrote to the database from a classifier that had seen one
+message. Each field was individually defensible and collectively a second, dumber assistant
+sitting in front of the real one. Deleting them is the point of this commit, not a side effect.
 
-@mentions, name-wakes, 1:1 threads, and DMs NEVER reach this engine — they are
-answered directly (told to be quiet ≠ deaf).
+THE TRADE IS DELIBERATE. A one-bit gate is worse at deciding "is this worth answering", because
+it is judging on less. It compensates by being generous: if a full turn could plausibly be
+useful, it wakes the responder, which has the whole thread, the tools, and the option of saying
+nothing at all (declared silence). A false wake costs one utility call and ends in silence; a
+false sleep loses the answer entirely. So the gate leans toward waking, and the responder — which
+can actually tell — owns the decision to speak.
+
+PROMPT INPUTS, and only these: the canonical channel-steering snapshot (commit 5, byte-for-byte
+identical to the responder's copy), and the ordered source messages of this debounce cohort. No
+pulse envelope, no thread tail, no people line, no topic, no canvases, no summary, no
+capabilities, no name-hit, no level, no emoji palette, and no pixels. Those inputs existed to
+support judgments the gate no longer makes.
+
+Authority order (cheap → expensive), enforced in code and not by prompt:
+  prefilters (message_events: own message / subtype / level=off / addressed short-circuit /
+  mentions_only) → debounce cohort → ONE utility-model call → one bit.
+
+@mentions, 1:1 thread continuations, and DMs NEVER reach this engine — they are answered
+directly. Told to be quiet is not the same as deaf.
 
 Legacy compatibility — participation levels vs. response_mode:
   response_mode "off"          ≡ level "off"
   response_mode "tag_only"     ≡ level "mentions_only"
-  response_mode "auto_respond" ≡ level "judicious" (default engine strictness)
-  level "active" has no legacy equivalent (maps back to "auto_respond")
-A row's participation_level, when set, WINS over its response_mode. The channel
-modal writes both columns in lockstep so legacy readers stay consistent.
+  response_mode "auto_respond" ≡ level "on"
+A row's participation_level, when set, WINS over its response_mode. The channel modal writes
+both columns in lockstep so a rollback's legacy reader stays consistent.
 """
 from __future__ import annotations
 
@@ -29,100 +48,76 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from config import config, valid_emoji_name
-from message_processor import gate_vision, participation_telemetry
+from config import config
+from message_processor import participation_telemetry
 
 # ONE comparator, shared with the stale-send guard. It lived here in a second copy, and two
-# definitions of "which message is newer" is one too many for a codebase where both the burst
+# definitions of "which message is newer" is one too many for a codebase where both the cohort
 # collapse and the send guard turn on that question.
 from message_processor.stale_send_guard import primary_scope_key as _primary_scope_key
 from message_processor.stale_send_guard import ts_key as _ts_key
 
 logger = logging.getLogger(__name__)
 
-# F27: cap the number of distinct conversation streams the burst-carry map tracks, so a
-# long-lived process can't accumulate one pending bucket per (channel, author) forever.
-_MAX_PENDING_KEYS = 512
-# F27: how many earlier same-author messages a survivor may carry into one combined reply.
-_MAX_BURST_CARRY = 3
+
+# The three levels a channel can actually be in under a binary gate.
+#
+# `judicious` and `active` are gone. They were two dials on a rich gate that weighed "is this
+# worth saying" — a question the binary gate does not ask and cannot answer, because it decides
+# only whether the responder RUNS. Keeping both names would have promised a distinction the code
+# no longer makes, so they migrate to one honest value.
+#
+#   off            — no channel response at all, INCLUDING an explicit @mention.
+#   mentions_only  — a real @mention goes straight to the responder; a bare-name message is
+#                    judged by the gate; a deterministic 1:1 continuation stays direct.
+#   on             — all otherwise-eligible ambient and name traffic is judged by the gate.
+VALID_LEVELS = ("off", "mentions_only", "on")
+
+# The legacy response_mode column is still dual-written so a rollback can read it.
+MODE_TO_LEVEL = {"off": "off", "tag_only": "mentions_only", "auto_respond": "on"}
+LEVEL_TO_MODE = {"off": "off", "mentions_only": "tag_only", "on": "auto_respond"}
 
 
-def _ts_seconds(ts: Any) -> float:
-    """Float seconds for a Slack ts, for freshness-window arithmetic (F27)."""
-    secs, micros = _ts_key(ts)
-    return secs + micros / 1_000_000.0
+# The two levels that were merged into `on`. A pre-deploy modal still offers them, and a
+# rollback-and-forward could reintroduce them, so the mapping outlives the migration that ran once.
+_MERGED_INTO_ON = ("judicious", "active")
 
 
-VALID_ACTIONS = ("respond", "react", "react_and_respond", "ignore", "backoff")
-VALID_PLACEMENTS = ("thread", "channel")
-VALID_LEVELS = ("off", "mentions_only", "judicious", "active")
+def normalize_legacy_level(value: Any) -> Any:
+    """Map a retired level onto the one that replaced it, leaving everything else alone.
 
-# Participation-backoff redesign (Layer 2): the taxonomy a `backoff` verdict carries so the
-# engine can tell a passing "not now" from a durable "stop doing X here" — and never confuse
-# a soft preference with an explicit settings change.
-VALID_DIMENSIONS = ("reactions", "replies", "verbosity", "thread_participation")
-VALID_DURABILITIES = ("momentary", "standing")
-VALID_SCOPES = ("thread", "channel")
-VALID_STRUCTURAL = ("none", "participation", "placement", "both")
-
-# The staged verdict's intermediate classifications. The gate used to emit only a decision
-# ({action, placement, reason}), which left its actual reasoning invisible and unfalsifiable: a
-# verdict claiming "this is a direct request for the assistant" about a message aimed at the
-# humans in the room parsed exactly as cleanly as a correct one. Requiring the model to commit to
-# WHOSE message it is, whether the exchange is even open, and whether it can really answer, makes
-# those three findings checkable against the action it chose — see _apply_invariants, which is the
-# only place a verdict can be overruled, and which reads nothing but these declared fields.
-VALID_RELATIONS = ("to_assistant", "to_other", "about_assistant", "to_room", "unclear")
-VALID_EXCHANGE_STATES = ("open", "closed_by_human", "reopened")
-VALID_ANSWERABILITY = ("substantive", "limitation_only", "requires_human", "not_applicable")
-
-# Actions that put the assistant into the conversation. `backoff` is deliberately absent: it is
-# how participation FEEDBACK is handled, it arrives precisely when a human is shutting the
-# assistant down, and _apply_backoff is already conservative about what it may persist.
-SPEAKING_ACTIONS = ("respond", "react", "react_and_respond")
-
-MODE_TO_LEVEL = {"off": "off", "tag_only": "mentions_only", "auto_respond": "judicious"}
-LEVEL_TO_MODE = {"off": "off", "mentions_only": "tag_only",
-                 "judicious": "auto_respond", "active": "auto_respond"}
-
-
-def _coerce_enum(value: Any, allowed: tuple) -> Optional[str]:
-    """Lowercased value if it is one of `allowed`, else None (a malformed field never leaks)."""
-    v = str(value or "").strip().lower()
-    return v if v in allowed else None
-
-
-def _coerce_memory_op(value: Any) -> str:
-    """Normalize the `memory_op` field to none | add | delete | update:<id> | delete:<id>.
-
-    `update:<id>`/`delete:<id>` target a specific channel-memory row. Bare `add`/`delete`
-    (which carry no row id) are still accepted for backward-compatible parsing, but no longer
-    drive a thread mute — thread-scoped feedback is guidance-only and persists nothing.
-    Anything malformed degrades to "none" (no durable action)."""
-    s = str(value or "none").strip().lower()
-    if s in ("none", "add", "delete"):
-        return s
-    for op in ("update", "delete"):
-        prefix = op + ":"
-        if s.startswith(prefix):
-            ident = s[len(prefix):].strip()
-            if ident.isdigit():
-                return f"{op}:{ident}"
-    return "none"
+    `judicious` and `active` both meant "the gate judges every message", which is what `on` means
+    now — so a submission carrying one of them is honoured rather than refused or written through
+    verbatim. Anything else (including 'inherit' and None) passes through untouched."""
+    if isinstance(value, str) and value.strip().lower() in _MERGED_INTO_ON:
+        return "on"
+    return value
 
 
 def resolve_participation_level(channel_settings: Optional[Dict[str, Any]]) -> str:
     """Effective participation level for a channel.
 
-    participation_level (if set) wins; else derive from the row's response_mode;
-    else from the global default mode. Unknown values degrade to mentions_only
-    (the safe pre-F behavior)."""
+    participation_level (if set) wins; else derive from the row's response_mode; else from the
+    global default mode. Unknown values degrade to mentions_only — the quiet direction.
+
+    ABSENT and PRESENT-BUT-INVALID are not the same thing, and conflating them escalates. An
+    absent level means "this channel never chose one", so the legacy response_mode (or the global
+    default) is the honest answer. A level that is present but not one we recognise — a
+    `judicious` row the migration failed to reach, a hand-edited value, a future level after a
+    rollback — is a channel that DID choose something we cannot honour, and falling through to
+    response_mode would read `auto_respond` and resolve it to `on`. That turns an unreadable
+    setting into the most talkative one available. Unrecognised means quiet."""
     cs = channel_settings or {}
-    level = (cs.get("participation_level") or "").strip().lower()
+    raw_level = cs.get("participation_level")
+    level = (raw_level or "").strip().lower()
     if level in VALID_LEVELS:
         return level
+    if level:
+        logger.warning(
+            "Unrecognised participation_level %r — treating this channel as mentions_only", level)
+        return "mentions_only"
     mode = (cs.get("response_mode")
             or getattr(config, "channel_response_mode", "tag_only")
             or "tag_only").strip().lower()
@@ -130,9 +125,16 @@ def resolve_participation_level(channel_settings: Optional[Dict[str, Any]]) -> s
 
 
 def render_capabilities_line(mcp_manager: Any = None) -> Optional[str]:
-    """Semicolon-joined inventory of the assistant's own tools/data sources, for
-    the participation classifier (F11). Pure function of already-loaded config +
-    mcp_manager.servers — zero I/O, deterministic per process.
+    """Semicolon-joined inventory of the assistant's own tools/data sources.
+
+    NO RUNTIME CALLERS. It existed so the rich gate could weigh whether the assistant was
+    well-suited to answer an open question — an answerability judgment the binary gate does not
+    make, because it decides only whether the responder RUNS and the responder knows its own tools.
+    Kept for one release (it dies in the cleanup commit) so nothing else that might want an honest
+    capability inventory has to reinvent it.
+
+    Pure function of already-loaded config + mcp_manager.servers — zero I/O, deterministic per
+    process.
 
     - "web search" when config.enable_web_search;
     - "image generation and editing" (always true for this bot);
@@ -165,67 +167,118 @@ def render_capabilities_line(mcp_manager: Any = None) -> Optional[str]:
     return "; ".join(caps)
 
 
-@dataclass
-class ParticipationVerdict:
-    action: str = "ignore"
-    emoji: Optional[str] = None
-    placement: str = "thread"
-    reason: str = ""
-    # Participation-backoff redesign (Layer 2): the taxonomy a `backoff` verdict carries.
-    # All defaulted so a pre-redesign verdict ({action, emoji, placement, reason}) still parses
-    # unchanged. `dimension` is which behavior the feedback is about; `durability` momentary vs
-    # standing; `scope` "channel" (a channel-wide preference) vs "thread" (guidance for the
-    # current message only — a thread-scoped aside persists nothing now that the per-thread mute
-    # mechanism is gone); `guidance` the normalized preference text; `memory_op` the durable
-    # record to make on CHANNEL memory (add / update:<id> / delete:<id> / none) — it is no
-    # longer a thread-mute add/unmute verb; `structural_request` an explicit channel-settings
-    # change that the main model, not the engine, applies via the gated
-    # set_channel_participation tool.
-    # The staged classifications behind the action (see VALID_RELATIONS above). None only for a
-    # verdict that predates the staged prompt, in which case no invariant can fire.
-    relation: Optional[str] = None
-    exchange_state: Optional[str] = None
-    answerability: Optional[str] = None
-    # Names of the invariants that overruled the model's own action, for the gate to log. Empty
-    # on the overwhelming majority of verdicts; a rising rate here means the prompt and the
-    # invariants disagree about something and the prompt is what should change.
-    overruled_by: Optional[List[str]] = None
-    dimension: Optional[str] = None
-    durability: Optional[str] = None
-    scope: Optional[str] = None
-    guidance: str = ""
-    memory_op: str = "none"
-    structural_request: str = "none"
-    # F38: the `ack` bit is GONE. The classifier used to predict "this reply implies real
-    # work" and the gate dropped a 👀 on the strength of that guess — before the model had
-    # done anything, and often wrongly (it acked a passing comment). The 👀 is now staked by
-    # the work itself, when a slow tool actually starts, and retracted if the work produces
-    # nothing. A classifier cannot know that in advance, so it no longer tries.
-    # F27: earlier messages from the SAME sender that this survivor carries forward, so its
-    # single reply covers the whole same-author burst. Oldest-first, newest 3 at most.
-    # Attached by evaluate() after validate_verdict returns (validate_verdict stays pure).
-    burst_earlier: Optional[List[str]] = None
+# How many distinct edit-supersession MARKS to remember. Marks are bookkeeping about messages
+# that have already been handled elsewhere, not enrolled messages, so bounding them can never
+# discard something waiting for a turn. (The cohort map below is deliberately NOT bounded — see
+# `_enroll_source`.)
+_MAX_SUPERSESSION_KEYS = 512
+
+
+# How an attachment is described to the gate: name plus KIND, and nothing else. Defined here,
+# beside the record that carries it, because two places need to agree — the Slack facade builds
+# these strings and the gate classifies on them, and a format invented at each end is how
+# "captionless image" quietly starts matching a spreadsheet.
+IMAGE_KIND = "image"
+FILE_KIND = "file"
+
+
+def describe_attachment(name: Optional[str], mimetype: Optional[str]) -> str:
+    """One attachment as `name (kind)`. Names and types only — never content."""
+    kind = IMAGE_KIND if str(mimetype or "").startswith("image/") else FILE_KIND
+    return f"{name or 'file'} ({kind})"
+
+
+def is_image_descriptor(descriptor: Any) -> bool:
+    """Whether a descriptor built by ``describe_attachment`` names an image."""
+    return str(descriptor or "").endswith(f"({IMAGE_KIND})")
+
+
+@dataclass(frozen=True)
+class SourceMessage:
+    """ONE message the gate is judging, as typed data rather than prose.
+
+    The old gate flattened a burst into a list of quoted strings and pasted them into the prompt
+    with a sentence explaining what they were. That lost the sender, the time, and the topology —
+    exactly the facts that decide whether a burst is one thought or two people talking — and the
+    same lost detail then had to be re-invented as metadata prose for the responder. A record
+    keeps them, so the classifier prompt and the responder's input can both be built from it.
+
+    `attachments` carries names and types ONLY. No pixels, and no generated descriptions: the
+    binary gate does not look at images (see the module docstring), and a description written by
+    another model is a claim about content this gate cannot check.
+    """
+
+    ts: str
+    text: str = ""
+    sender_id: Optional[str] = None
+    sender_name: Optional[str] = None
+    sender_type: Optional[str] = None
+    thread_root_ts: Optional[str] = None
+    attachments: Tuple[str, ...] = ()
+    # Present only for an edit: what it said before, what it says now, and whether the assistant
+    # had already replied. Intrinsic to THIS message — not general channel history.
+    edit: Optional[Dict[str, Any]] = None
+
+    @property
+    def is_thread_reply(self) -> bool:
+        return bool(self.thread_root_ts and self.thread_root_ts != self.ts)
+
+
+def source_from_message(message: Any) -> SourceMessage:
+    """A SourceMessage from a dispatched Message.
+
+    Lives here, beside the record it builds, so the queue drain and the gate cannot disagree about
+    what a source IS — the drain needs this to hand a coalesced batch to the gate, and a second
+    mapping written at the call site is how the two would drift."""
+    meta = getattr(message, "metadata", None) or {}
+    return SourceMessage(
+        ts=str(meta.get("ts") or getattr(message, "thread_id", "") or ""),
+        text=getattr(message, "text", "") or "",
+        sender_id=getattr(message, "user_id", None),
+        sender_name=meta.get("user_real_name") or meta.get("username"),
+        sender_type=meta.get("sender_type"),
+        thread_root_ts=getattr(message, "thread_id", None),
+        attachments=tuple(meta.get("participation_attachments") or ()),
+    )
+
+
+@dataclass(frozen=True)
+class WakeDecision:
+    """The whole output of the gate: one bit.
+
+    Nothing else, on purpose. A confidence would need a threshold nobody has measured. A reason
+    would become the next control bus — the rich gate's `reason` was forwarded into the
+    responder's prompt, where it pre-argued the turn and neutered the responder's own option to
+    stay silent — and it would carry a summary of someone's message into the telemetry besides.
+    """
+
+    wake: bool
 
 
 @dataclass
 class GateEvaluation:
-    """What ONE evaluation produced — the verdict, and, when there isn't one to act on, why.
+    """What ONE evaluation produced: the decision, or — when there is nothing to act on — why.
 
-    `evaluate()` used to return `ParticipationVerdict | None`, which left the caller unable to
-    tell a burst collapse from an edit cancellation from a provider outage. It could only find
-    out by reading the engine's log lines, which is a side channel between two layers of the
-    same call: the caller owns the turn's single terminal event and has to be able to say what
-    ended it. So the cause comes back in the return value.
+    `evaluate()` used to return a verdict-or-None, which left the caller unable to tell a cohort
+    collapse from an edit cancellation from a provider outage. It could only find out by reading
+    the engine's log lines, which is a side channel between two layers of one call: the caller
+    owns the turn's single terminal event and has to be able to say what ended it.
 
-    `decline_cause` is superseded | edit_superseded | classifier_error, or None on a real
-    verdict. On `classifier_error` the `verdict` field is still populated — validate_verdict(None)
-    produces the fail-safe `ignore` exactly as before, so terminal behaviour is unchanged — but
-    the cause says it was manufactured, and the caller must not score it as judgment.
+    `decision` is None whenever there is no bit to act on. `decline_cause` says which kind of
+    nothing it was — superseded | edit_superseded | classifier_error. Note the difference from
+    the rich gate: a classifier failure no longer manufactures a decision. It produces None, and
+    the caller ends the turn as `none` rather than scoring a fail-safe silence as judgment.
+
+    `sources` is the cohort this evaluation actually judged, oldest first. It is returned (not
+    just consumed) because the caller stamps it on the surviving Message so the responder answers
+    the whole burst rather than only its newest fragment.
     """
-    verdict: Optional[ParticipationVerdict] = None
+
+    decision: Optional[WakeDecision] = None
     decline_cause: Optional[str] = None
     # The model call alone, in ms. NOT the gate's wall time, which is mostly debounce.
     classifier_ms: Optional[int] = None
+    sources: Tuple[SourceMessage, ...] = ()
 
 
 class ParticipationEngine:
@@ -239,17 +292,25 @@ class ParticipationEngine:
         # newer elsewhere in the channel. F27: top-level streams are now keyed per SENDER
         # too, so two different people's unrelated top-level questions never collide.
         self._latest: Dict[str, str] = {}
-        # F27: burst carry-forward. conversation key -> OrderedDict[ts -> text] of messages
-        # seen in that stream but not yet consumed. A superseded evaluation leaves its entry
-        # for the burst's survivor (the newest message) to collect, so ONE reply can cover
-        # a same-author fast-follow rather than answering only the latest fragment. Bounded
-        # by _MAX_PENDING_KEYS; each bucket self-drains when its survivor runs.
-        self._pending: "OrderedDict[str, OrderedDict[str, str]]" = OrderedDict()
+        # THE COHORT MAP: conversation key -> {ts: SourceMessage} for messages enrolled in this
+        # stream and not yet judged. A superseded evaluation LEAVES its record for the cohort's
+        # survivor (the newest message) to collect, so one turn answers the whole burst instead of
+        # only its newest fragment.
+        #
+        # Deliberately UNBOUNDED, and that is a correctness requirement rather than an oversight.
+        # It used to evict the oldest bucket past a cap and drop entries older than a freshness
+        # window — both of which could silently discard a message somebody had actually sent, in
+        # the one data structure whose whole job is not to lose it. Buckets are removed when their
+        # survivor drains them (`_drain_cohort`) or when a stream is cancelled
+        # (`discard_source`); a stream with an enrolled message always has a survivor, because the
+        # newest ts of any cohort survives its own debounce unless a newer one takes over as
+        # survivor.
+        self._cohorts: "OrderedDict[str, OrderedDict[str, SourceMessage]]" = OrderedDict()
         # F52: messages whose in-flight evaluation an EDIT has explicitly cancelled. An edit
         # keeps the SAME ts, so a newer arrival can never supersede the original the ordinary
         # way (note_arrival is monotonic on ts); supersede() marks it here and evaluate() drops
         # the stale original — the edit's OWN re-evaluation, which carries edit context, is
-        # exempt. conv key -> set of superseded ts. Bounded by _MAX_PENDING_KEYS.
+        # exempt. conv key -> set of superseded ts. Bounded by _MAX_SUPERSESSION_KEYS.
         self._edit_superseded: "OrderedDict[str, set]" = OrderedDict()
 
     @staticmethod
@@ -289,7 +350,7 @@ class ParticipationEngine:
         fresh edit-context evaluation for a meaning edit. The original evaluation keyed on the
         SAME ts and so can never be superseded by a newer arrival; mark it here and evaluate()
         drops it, exactly as a newer burst message would. The edit's OWN re-evaluation carries
-        edit context and is exempt. Idempotent; bounded by _MAX_PENDING_KEYS."""
+        edit context and is exempt. Idempotent; bounded by _MAX_SUPERSESSION_KEYS."""
         if not channel_id or not ts:
             return
         key = self._conv_key(channel_id, ts, thread_root, sender_id)
@@ -299,7 +360,7 @@ class ParticipationEngine:
             self._edit_superseded[key] = bucket
         bucket.add(str(ts))
         self._edit_superseded.move_to_end(key)
-        while len(self._edit_superseded) > _MAX_PENDING_KEYS:
+        while len(self._edit_superseded) > _MAX_SUPERSESSION_KEYS:
             self._edit_superseded.popitem(last=False)
 
     def _consume_edit_supersession(self, key: str, ts: str) -> bool:
@@ -313,541 +374,256 @@ class ParticipationEngine:
             return True
         return False
 
-    def _register_pending(self, key: str, ts: str, text: Optional[str]) -> None:
-        """F27: record (ts, text) in its conversation's pending bucket so a later survivor
-        can carry it. Evicts the oldest bucket once the map exceeds _MAX_PENDING_KEYS."""
-        bucket = self._pending.get(key)
+    def _enroll_source(self, key: str, source: SourceMessage) -> None:
+        """Record a source in its conversation's cohort so a later survivor carries it.
+
+        No cap and no eviction: see `self._cohorts`. Re-enrolling the same ts (an edit keeps its
+        original timestamp) REPLACES the record, so the cohort holds the current text rather than
+        two versions of one message."""
+        bucket = self._cohorts.get(key)
         if bucket is None:
             bucket = OrderedDict()
-            self._pending[key] = bucket
-        bucket[ts] = text or ""
-        self._pending.move_to_end(key)
-        while len(self._pending) > _MAX_PENDING_KEYS:
-            self._pending.popitem(last=False)
+            self._cohorts[key] = bucket
+        bucket[source.ts] = source
+        self._cohorts.move_to_end(key)
 
-    def _collect_burst(self, key: str, own_ts: str, debounce_seconds: float) -> List[str]:
-        """F27: called by the survivor of a debounce window to DRAIN its pending bucket.
-        Collect-and-remove every pending entry in `key` strictly older than own_ts
-        (oldest-first) plus own entry; drop entries older than own_ts − max(15, 5×debounce)
-        seconds as stale leftovers (a survivor that never ran must not leak minutes-old
-        texts into a fresh burst); cap the returned texts at the newest _MAX_BURST_CARRY,
-        logging any further drop. The draining is unconditional (memory hygiene for every
-        stream, thread or top-level); evaluate() decides whether to CARRY the result — only
-        top-level survivors do, where the per-sender key guarantees the texts are same-author.
-        Thread survivors call this to empty their bucket but discard the returned list."""
-        bucket = self._pending.get(key)
+    def _drain_cohort(self, key: str, own_ts: str) -> Tuple[SourceMessage, ...]:
+        """Called by the survivor of a debounce window: take every source in this stream up to and
+        including its own, oldest first, and remove them from the map.
+
+        Strictly-newer entries are LEFT behind — they belong to a later survivor, and taking them
+        would judge a message whose own debounce has not finished. Everything else goes into this
+        cohort whatever its age: the freshness window that used to drop old entries was a silent
+        message-loss path, and a stale enrollment can only exist if its own evaluation never ran,
+        which is a bug to see rather than to paper over.
+        """
+        bucket = self._cohorts.get(key)
         if not bucket:
-            return []
+            return ()
         own_key = _ts_key(own_ts)
-        window = max(15.0, 5.0 * float(debounce_seconds or 0.0))
-        cutoff = _ts_seconds(own_ts) - window
-        carried: List[tuple] = []  # (ts_key, text), strictly-older + fresh
-        stale_dropped = 0
+        taken: List[Tuple[Tuple[int, int], SourceMessage]] = []
         for pts in list(bucket.keys()):
-            if pts == own_ts:
-                del bucket[pts]  # own entry — remove, never carry
-                continue
-            pkey = _ts_key(pts)
-            if pkey >= own_key:
-                continue  # newer/equal — leave for its own survivor
-            text = bucket.pop(pts)  # collect-and-remove (removal prevents later leak)
-            if _ts_seconds(pts) < cutoff:
-                stale_dropped += 1
-                continue
-            carried.append((pkey, text))
+            if _ts_key(pts) > own_key:
+                continue                      # newer — leave it for its own survivor
+            taken.append((_ts_key(pts), bucket.pop(pts)))
         if not bucket:
-            self._pending.pop(key, None)
-        if stale_dropped:
-            logger.debug(
-                "F27: dropped %d stale pending entr%s from burst %s (older than freshness window)",
-                stale_dropped, "y" if stale_dropped == 1 else "ies", key)
-        carried.sort(key=lambda kt: kt[0])  # oldest-first
-        texts = [t for _, t in carried]
-        if len(texts) > _MAX_BURST_CARRY:
-            dropped = len(texts) - _MAX_BURST_CARRY
-            logger.debug(
-                "F27: burst %s carried %d messages; keeping newest %d, dropping %d oldest",
-                key, len(texts), _MAX_BURST_CARRY, dropped)
-            texts = texts[-_MAX_BURST_CARRY:]
-        return texts
+            self._cohorts.pop(key, None)
+        taken.sort(key=lambda pair: pair[0])   # oldest first: the order they were said in
+        return tuple(source for _, source in taken)
+
+    def discard_source(self, channel_id: str, ts: Optional[str],
+                       thread_root: Optional[str] = None,
+                       sender_id: Optional[str] = None) -> None:
+        """Withdraw ONE cancelled source from its conversation, leaving everything else standing.
+
+        The cohort map is unbounded, so a cancelled evaluation has to clean up after itself rather
+        than wait to be evicted. What it must NOT do is clear the conversation: a cohort is shared
+        by every message in that stream, and its other members are live evaluations sleeping
+        through their own debounce.
+
+        Both directions of that mistake lose messages, and neither is visible afterwards:
+
+          * cancel the NEWEST and drop the bucket — the older sleepers' sources are gone, and
+            `_latest` still names the cancelled ts, so when a sleeper wakes it finds itself
+            superseded by a message that no longer exists and returns nothing. The whole stream
+            evaporates.
+          * cancel an OLDER one and drop the bucket — the live newer survivor loses the very
+            sources it was going to answer for, and never learns they existed.
+
+        So: remove our own record, and if we were the debounce marker, hand that role to the
+        newest source still enrolled (or clear it when we were the last one out). Moving `_latest`
+        backwards is safe here and only here — `note_arrival` is monotonic precisely so a stale
+        ARRIVAL cannot do this, while a withdrawal genuinely means the newer message is gone."""
+        if not channel_id or not ts:
+            return
+        key = self._conv_key(channel_id, ts, thread_root, sender_id)
+        bucket = self._cohorts.get(key)
+        if bucket is not None:
+            bucket.pop(str(ts), None)
+            if not bucket:
+                self._cohorts.pop(key, None)
+        if self._latest.get(key) != ts:
+            return                      # somebody newer is already the survivor; nothing to hand on
+        remaining = self._cohorts.get(key)
+        if remaining:
+            self._latest[key] = max(remaining, key=_ts_key)
+        else:
+            self._latest.pop(key, None)
 
     # ------------------------------------------------------------- evaluate
 
     async def evaluate(self, *, channel_id: str, ts: str, text: str,
                        sender_id: Optional[str] = None,
                        sender_name: Optional[str] = None,
-                       is_thread_reply: bool = False,
-                       level: str = "judicious",
+                       sender_type: Optional[str] = None,
                        channel_steering_text: Optional[str] = None,
-                       channel_activity: Optional[str] = None,
-                       name_hit: bool = False,
-                       self_display_name: Optional[str] = None,
-                       sender_is_bot: bool = False,
-                       channel_topic: Optional[str] = None,
-                       channel_canvases: Optional[List[str]] = None,
-                       channel_people: Optional[str] = None,
-                       channel_summary: Optional[str] = None,
-                       capabilities: Optional[str] = None,
-                       workspace_custom_emojis: Optional[List[str]] = None,
-                       attachments: Optional[str] = None,
-                       images: Optional[List[Dict]] = None,
+                       attachments: Optional[List[str]] = None,
                        client: Any = None,
-                       pulse: Any = None,
                        thread_root_ts: Optional[str] = None,
+                       edit_marker: Optional[str] = None,
+                       carried_sources: Optional[List[SourceMessage]] = None,
                        attempt_id: Optional[str] = None) -> GateEvaluation:
-        """Debounced judgment, returned as a GateEvaluation.
+        """Debounce, coalesce, ask once, return one bit.
 
-        `verdict` is None when superseded — a newer message in the SAME conversation (this
-        thread, or this sender's top-level stream — F21/F27) arrived during the debounce
-        window. `decline_cause` says which kind of nothing that was, because the CALLER owns
-        the turn's single terminal event and cannot read it off a log line. `attempt_id` is
-        the gate's id for this attempt; it rides the diagnostics and changes no behaviour.
+        `decision` is None when there is nothing to act on, and `decline_cause` says which kind of
+        nothing — the CALLER owns the turn's single terminal event and cannot read that off a log
+        line. `attempt_id` rides the diagnostics and changes no behaviour.
 
-        F27: the survivor of a same-author TOP-LEVEL burst
-        collects the superseded siblings' texts into burst_earlier so its ONE reply covers
-        the whole burst; a superseded evaluation returns no verdict but LEAVES its pending
-        entry for that survivor. Activity in other conversations (or from other senders at
-        top level) never supersedes.
+        The cohort: every source enrolled in this conversation up to and including this one goes to
+        the classifier, oldest first, and comes back on the GateEvaluation so the responder answers
+        the whole burst. Conversation identity is unchanged — a thread keys on its root and
+        collapses cross-author (the reply lands in-thread with full history); a top-level stream
+        keys per sender, so two people's unrelated questions are never merged into one.
 
-        Burst CARRY is top-level-only: a top-level stream key (channel|top|<sender>) is
-        per-author, so its collected siblings are guaranteed same-sender. A thread key
-        (channel|root) still collapses cross-author (F21) and its survivor may be a
-        DIFFERENT author than the superseded messages — carrying those would misattribute
-        them, and the render sites label the carried text "the same sender". So thread
-        survivors still DRAIN their bucket (load-bearing memory hygiene — a busy thread's
-        bucket must not grow unbounded) but DISCARD the texts; in-thread coverage already
-        works pre-F27 because the reply lands in-thread with full history."""
+        Nothing here waits on anything else. The gate does not look at images, does not hold
+        ambient work, and has no callback anyone can block on: the ambient worker analyses images
+        on its own schedule, immediately, whatever this decides.
+        """
         key = self._conv_key(channel_id, ts, thread_root_ts, sender_id)
-        is_top_level = not (thread_root_ts and thread_root_ts != ts)
-        # F51b: the ambient service (reached via the same facade the gate downloads through) holds
-        # this message's ambient IMAGE jobs while the gate runs, so ONE vision look serves both the
-        # verdict and the stored observations. Only relevant when this message actually carries
-        # images; a text-only judgment is byte-for-byte unchanged.
-        svc = self._ambient_service(client) if images else None
-        self.note_arrival(channel_id, ts, thread_root_ts, sender_id)  # monotonic; a stale caller can't clobber a newer marker
-        self._register_pending(key, ts, text)  # F27: enroll before the await so the survivor can find us
+        # Monotonic; a stale caller can't clobber a newer marker.
+        self.note_arrival(channel_id, ts, thread_root_ts, sender_id)
+
+        # The edit context belongs to THIS attempt or to nobody: it is keyed by the edit's own
+        # marker, so the original attempt (which carries no marker) cannot pop the edit's context
+        # and mistake itself for the edit. Taken BEFORE the debounce so the enrolled record holds
+        # it — the cohort is what reaches the model, and an edit's before/after text is intrinsic
+        # to the message rather than context about the channel.
+        edit_context = self._take_edit_context(client, channel_id, ts, edit_marker)
+
+        source = SourceMessage(
+            ts=str(ts), text=text or "", sender_id=sender_id, sender_name=sender_name,
+            sender_type=sender_type, thread_root_ts=thread_root_ts,
+            attachments=tuple(attachments or ()), edit=edit_context)
+        # Enrolled BEFORE the await, so a survivor that arrives during our debounce finds us.
+        self._enroll_source(key, source)
+
+        # Messages a Phase-Q queue drain folded into this turn. They never got a debounce window of
+        # their own — they arrived while an earlier turn held the lock — so the gate would
+        # otherwise judge this batch on its newest message alone and discard the rest. Enrolled
+        # with the same identity rules as any other source; older ones are drained into this
+        # cohort below, and one that is somehow newer is left for its own survivor.
+        for carried in (carried_sources or ()):
+            if carried.ts and carried.ts != source.ts:
+                self._enroll_source(key, carried)
+
         wait = max(0.0, float(getattr(config, "participation_debounce_seconds", 3.0)))
         if wait:
-            await asyncio.sleep(wait)
+            try:
+                await asyncio.sleep(wait)
+            except asyncio.CancelledError:
+                # The one place this turn can be cancelled after enrolling and before draining.
+                # The cohort map is deliberately unbounded — eviction there is a silent
+                # message-loss path — so a cancelled stream has to clear itself explicitly or its
+                # entry stays forever, and worse, gets swept into some later survivor's cohort as
+                # a message from the distant past. Nothing else is owed here: the sources were
+                # never judged, and re-raising leaves the caller's cancellation intact.
+                self.discard_source(channel_id, ts, thread_root_ts, sender_id)
+                raise
+
         if self._latest.get(key) != ts:
-            # Superseded — our pending entry stays for the burst's survivor. Release any held
-            # image jobs promptly to the vision worker (this message's own images still get
-            # analyzed; the gate just never looked at them). Never let it affect the return.
+            # Superseded. Our record STAYS enrolled for the survivor, so nothing this person said
+            # is lost — it arrives at both models as part of the survivor's cohort.
             participation_telemetry.gate_declined(
                 channel_id, ts, cause="superseded", attempt_id=attempt_id,
                 survivor_ts=self._latest.get(key))
-            if svc is not None:
-                try:
-                    svc.resolve_gate(channel_id, ts, {})
-                except Exception:  # noqa: BLE001
-                    pass
             return GateEvaluation(decline_cause="superseded")
 
-        # F52: an edit-triggered evaluation carries edit context (old text + already-replied),
-        # stashed on the Slack facade by the message-events edit path and keyed by (channel, ts).
-        # Popped HERE — after supersession — so a superseded burst never consumes it. It is folded
-        # into the classifier's view of the message (below); the Message.text the responder later
-        # sees stays the clean edited text. None for every ordinary (non-edit) message.
-        edit_context = self._take_edit_context(client, channel_id, ts)
-
-        # F52 double-answer fix (deterministic half): an EDIT explicitly cancelled THIS message's
-        # original evaluation. The edit is handled elsewhere — Slack's app_mention for a
-        # mention-added edit, or a fresh edit-context evaluation for a meaning edit — so the stale
-        # original must stay silent. The edit's OWN re-evaluation carries edit_context and is
-        # exempt (only the context-free original consumes the mark). This is the primary fix; the
-        # queue-drop backstop covers a respond dispatch that already slipped into the busy queue.
+        # An EDIT explicitly cancelled THIS message's original evaluation. The edit is handled
+        # elsewhere — Slack's app_mention for a mention-added edit, or the edit's own
+        # marker-carrying re-evaluation — so the stale original must stay silent. Only the
+        # context-free original consumes the mark; the edit's own attempt carries a marker and is
+        # exempt, which is now structural rather than a coincidence of pop ordering.
         if edit_context is None and self._consume_edit_supersession(key, ts):
             participation_telemetry.gate_declined(channel_id, ts, cause="edit_superseded",
                                                   attempt_id=attempt_id)
-            if svc is not None:
-                try:
-                    svc.resolve_gate(channel_id, ts, {})
-                except Exception:  # noqa: BLE001
-                    pass
             return GateEvaluation(decline_cause="edit_superseded")
 
-        # F27: we survived the debounce — always drain this stream's pending siblings (bucket
-        # hygiene), but only CARRY them as a burst at top level, where the per-sender key
-        # guarantees they are the same author. Thread survivors drain-and-discard.
-        collected = self._collect_burst(key, ts, wait)
-        burst_earlier = collected if is_top_level else []
+        sources = self._drain_cohort(key, ts)
+        if not sources:
+            # Defensive: our own enrollment is always in there. An empty drain would mean the
+            # cohort was cleared underneath us, and judging nothing is not a judgment.
+            sources = (source,)
 
-        # F5: render the thread tail HERE (after the debounce + supersession check) —
-        # pure in-memory, zero latency, reflecting thread state at classification time.
-        thread_tail = None
-        if pulse is not None and thread_root_ts:
-            try:
-                thread_tail = pulse.render_thread_tail(
-                    channel_id, thread_root_ts, before_ts=ts) or None
-            except Exception:
-                thread_tail = None
+        # A cohort of nothing but captionless IMAGES. Someone dropped pictures into the channel and
+        # said nothing — there is no question, no addressee and no text to judge, so there is
+        # nothing for a wake decision to be about. Structural, and named as such in the ledger
+        # rather than dressed up as the model choosing silence: no classifier runs and no responder
+        # wakes. What DOES still happen matters — the ambient worker analyses the pictures on its
+        # own schedule, and the caller catalogues the files — because declining to answer a wordless
+        # upload is not the same as forgetting it happened. (A captionless message cannot be
+        # name-tagged, and a real @mention never reaches this gate, so "captionless" is already
+        # "untagged".)
+        #
+        # IMAGES SPECIFICALLY, and the distinction is not pedantry. A wordless PDF or spreadsheet
+        # dropped into a channel is a document somebody may well want read — the responder can open
+        # it, and often should — so treating "no caption" as "nothing to do" for those would skip
+        # both models on exactly the material this bot is best at. A picture with no caption is the
+        # narrow case where there is genuinely nothing being asked.
+        attached = [d for s in sources for d in s.attachments]
+        if (attached and all(is_image_descriptor(d) for d in attached)
+                and not any((s.text or "").strip() for s in sources)):
+            participation_telemetry.gate_declined(
+                channel_id, ts, cause="image_only", attempt_id=attempt_id,
+                source_count=len(sources))
+            return GateEvaluation(decline_cause="image_only", sources=sources)
 
-        # F47: a TOP-LEVEL trigger has an EMPTY thread tail (it sits ON the root, which
-        # render_thread_tail excludes), so it carries no authoritative record of who the sender
-        # has been addressing — the gap that let a bare "you" continuing another assistant's
-        # exchange get wrongly claimed. Give the classifier that evidence from the channel ring.
-        # Threaded turns already have the authoritative thread_tail, so they skip this. Fail-open:
-        # a rendering error degrades to no signal, never to silence.
-        channel_addressee_tail = None
-        if pulse is not None and is_top_level:
-            try:
-                channel_addressee_tail = pulse.render_channel_addressee_tail(
-                    channel_id, before_ts=ts) or None
-            except Exception:
-                channel_addressee_tail = None
-
-        # F40: the pixels, not the filename. Loaded HERE — after the supersession check — so a
-        # superseded burst never downloads images for a verdict that is about to be discarded.
-        # `image_status` tells the prompt the truth: seen, or attached-but-unavailable. Any
-        # failure degrades to a text-only judgment; it must never turn into silence.
-        image_parts, image_status, shown_descriptors = [], gate_vision.NONE, []
-        if images and client is not None:
-            try:
-                image_parts, image_status, shown_descriptors = await gate_vision.load_for_gate(
-                    client, images)
-            except Exception as e:  # noqa: BLE001
-                logger.debug(f"Gate vision failed, judging on text alone: {e}")
-                image_parts, image_status, shown_descriptors = [], gate_vision.UNAVAILABLE, []
-        elif images:
-            image_status = gate_vision.UNAVAILABLE
-
-        signals = {
-            "image_status": image_status,
-            "sender_name": sender_name,
-            "is_thread_reply": is_thread_reply,
-            "strictness": level,
-            # ONE block of channel steering, rendered by the caller and inserted verbatim.
-            # The gate used to take the operator's rules and the raw memory rows as two separate
-            # inputs and render them itself, which is how it and the responder came to describe
-            # the same channel differently. See message_processor/channel_steering.py.
-            "channel_steering_text": channel_steering_text,
-            "channel_activity": channel_activity,
-            "thread_tail": thread_tail,
-            # F47: authoritative addressee evidence for a top-level trigger (None for threaded
-            # turns, which already carry thread_tail). Rendered above the peripheral envelope.
-            "channel_addressee_tail": channel_addressee_tail,
-            "name_hit": bool(name_hit),
-            # Who the bot actually is in this workspace, as resolved at startup — distinct
-            # from the names it ANSWERS to (config aliases). See the identity line in
-            # classify_participation for why both are needed.
-            "self_display_name": self_display_name,
-            "sender_is_bot": bool(sender_is_bot),
-            "channel_topic": channel_topic,
-            # F36: the gate never sees tool schemas, so without this a passive
-            # "we should update the devops agenda" reads as idle chatter and it
-            # stays silent — the main model never gets a turn to notice the canvas.
-            "channel_canvases": channel_canvases,
-            "channel_people": channel_people,
-            # Track 1: the persistent channel narrative (already framed as untrusted background by
-            # the ChannelSummaryService). Informs relevance/value only — the framing + the system
-            # prompt forbid using it for addressee resolution. None when none is built / opted out.
-            "channel_summary": channel_summary,
-            "capabilities": capabilities,
-            # C3: extra reaction choices for the classifier (empty when a REACTION_EMOJIS
-            # allowlist is set — customs are never injected over the hard constraint).
-            "workspace_custom_emojis": workspace_custom_emojis or [],
-            "attachments": attachments,
-            "burst_earlier": burst_earlier,
-            # F52: present for inspection/tests only — classify_participation renders no line for
-            # it (the delivery is the [EDIT] block folded into the message text below).
-            "edit_context": edit_context,
-        }
-        # F52: fold the edit context into the message the CLASSIFIER sees, not the Message.text
-        # the responder later uses. The system prompt's edited-message rule reads the [EDIT] block.
-        classifier_text = self._augment_text_with_edit(text, edit_context) if edit_context else text
-        # Timed around the model call and NOTHING else. The gate's own wall time is dominated
-        # by the debounce sleep, so reading it as classifier latency blames the provider for a
-        # delay we chose. Measured on failure too — a timeout's duration is the story.
+        # Timed around the model call and NOTHING else. The gate's own wall time is dominated by
+        # the debounce sleep, so reading it as classifier latency blames the provider for a delay
+        # we chose. Measured on failure too — a timeout's duration is the story.
         classifier_started = time.monotonic()
         detail: Optional[str] = None
+        raw: Optional[bool] = None
         try:
-            # `images` only rides when there ARE images: the text-only call keeps its exact old
-            # shape, so nothing that never sees a picture changes behaviour by one token.
-            call_kwargs = {"text": classifier_text, "signals": signals}
-            if image_parts:
-                call_kwargs["images"] = image_parts
-            raw = await self.openai_client.classify_participation(**call_kwargs)
-        except Exception as e:  # noqa: BLE001
-            raw = None  # fail-safe: silence, never spam
+            raw = await self.openai_client.classify_wake(
+                sources=sources, channel_steering_text=channel_steering_text)
+        except Exception as e:  # noqa: BLE001 — fail-safe is silence, never spam
             detail = type(e).__name__
         classifier_ms = int((time.monotonic() - classifier_started) * 1000)
-        # `raw is None` is now the single failure signal: classify_participation returns None on
-        # its own internal fail-safes (API exception, unparseable output) instead of a forged
-        # {"action": "ignore"}. Downstream this still becomes an `ignore` verdict, so behaviour
-        # is byte-identical — but an `ignore` the MODEL chose and an `ignore` we manufactured
-        # after an outage are no longer the same row, and a bad afternoon at the provider is
-        # never scored as good judgment.
-        classifier_failed = raw is None
-        if classifier_failed:
+
+        if raw is None:
+            # No bit. NOT a decision, and deliberately not dressed as one: the rich gate
+            # manufactured a fail-safe `ignore` here, which is silence either way but scored a
+            # provider outage as the model choosing restraint. The caller ends the turn as `none`.
             participation_telemetry.gate_declined(
                 channel_id, ts, cause="classifier_error", attempt_id=attempt_id,
                 detail=detail, classifier_ms=classifier_ms,
-                # WHICH model failed. `gate_decision` carries this, so without it here a utility
-                # model swap can be judged on its verdicts but not on its failure rate — and the
+                # WHICH model failed. gate_decision carries this, so without it here a utility
+                # model swap can be judged on its decisions but not on its failure rate — and the
                 # failure rate is the half that decides whether the swap was worth it.
                 model=getattr(config, "utility_model", None))
-        verdict = self.validate_verdict(raw)
-        # F27: attach AFTER validate_verdict (which stays pure) so the survivor's reply can
-        # be told about the earlier same-author messages it must also address.
-        if burst_earlier:
-            verdict.burst_earlier = burst_earlier
-        # F51b: the gate has classified — hand the outcome to ambient memory. This is the ONLY
-        # coupling to the verdict, and it is one-way and total: the verdict is already built and is
-        # returned no matter what happens here. Per-image observations that parsed cleanly are
-        # stored as gate-sourced artifacts (no second vision call); any image without a usable
-        # observation (blind gate, malformed/wrong-count array, storage disabled) is released to
-        # the vision worker so it is still analyzed exactly once.
-        if svc is not None:
-            try:
-                observations = self._harvest_image_observations(raw, shown_descriptors)
-                svc.resolve_gate(channel_id, ts, observations)
-            except Exception as e:  # noqa: BLE001 — piggyback never alters/delays the verdict
-                logger.debug(f"gate/ambient piggyback failed (worker path covers): {e}")
-        return GateEvaluation(
-            verdict=verdict,
-            decline_cause="classifier_error" if classifier_failed else None,
-            classifier_ms=classifier_ms)
+            return GateEvaluation(decline_cause="classifier_error",
+                                  classifier_ms=classifier_ms, sources=sources)
+
+        return GateEvaluation(decision=WakeDecision(wake=bool(raw)),
+                              classifier_ms=classifier_ms, sources=sources)
 
     @staticmethod
-    def _take_edit_context(client: Any, channel_id: str, ts: str) -> Optional[Dict[str, Any]]:
-        """F52: pop this message's edit context from the Slack facade, where the message-events
-        edit path stashed it, keyed by (channel, ts) — the SAME ts an edit keeps. Returns None
-        for every ordinary message (the store is absent) or in tests without a facade. Popping
-        (not peeking) means a re-evaluation of the same ts falls back to a plain judgment.
+    def _take_edit_context(client: Any, channel_id: str, ts: str,
+                           marker: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Pop this attempt's edit context from the Slack facade, where the message-events edit
+        path stashed it — keyed by (channel, ts, MARKER).
+
+        The marker is why this is safe. An edit keeps its original Slack timestamp, so
+        (channel, ts) alone does not distinguish the edit's own re-evaluation from the stale
+        original attempt it superseded, and whichever ran first popped the context. That made
+        ownership a race: the original could arrive holding the edit's before/after text and
+        conclude it WAS the edit, which also suppressed the supersession check that was supposed
+        to silence it. Only the attempt carrying the edit's marker may consume it; an attempt with
+        no marker (every ordinary message, and the superseded original) gets None.
+
+        Popping rather than peeking means a second evaluation of the same edit falls back to a
+        plain judgment instead of replaying stale before-text.
 
         The store must be an ACTUAL dict, not merely truthy. A MagicMock client answers every
-        attribute with another truthy mock whose .pop() returns a mock, so `not store` let a
-        fake edit context through: the classifier prompt silently grew an [EDIT] block and the
-        edit-supersession check was suppressed. That made a whole class of test pass against a
-        prompt production never sends — evidence about a code path that does not exist."""
-        if client is None or not channel_id or not ts:
+        attribute with another truthy mock whose .pop() returns a mock, so `not store` let a fake
+        edit context through — and a whole class of test then passed against a prompt production
+        never sends."""
+        if client is None or not channel_id or not ts or not marker:
             return None
         store = getattr(client, "_edit_reply_ctx_map", None)
         if not isinstance(store, dict) or not store:
             return None
         try:
-            return store.pop(f"{channel_id}|{ts}", None)
-        except Exception:  # noqa: BLE001 — the piggyback must never break the verdict
+            return store.pop(f"{channel_id}|{ts}|{marker}", None)
+        except Exception:  # noqa: BLE001 — must never break the decision
             return None
-
-    @staticmethod
-    def _augment_text_with_edit(text: str, ec: Dict[str, Any]) -> str:
-        """F52: build the classifier-only view of an edited message — the clean edited text plus a
-        labeled [EDIT] block giving what it said before and whether the assistant already replied.
-        The system prompt's edited-message rule reads this block to make the typo-vs-meaning call."""
-        old = str((ec or {}).get("old_text") or "").strip()
-        replied = bool((ec or {}).get("already_replied"))
-        note = ["[EDIT] The author edited this message after posting it."]
-        note.append(f'Before the edit it read: "{old}".' if old
-                    else "It had no text before the edit.")
-        note.append(
-            "The assistant already replied to it earlier — respond only if the edit changes the "
-            "meaning enough to need a correction or a real answer."
-            if replied else "The assistant has not replied to it yet.")
-        return f"{text}\n\n" + " ".join(note)
-
-    @staticmethod
-    def _ambient_service(client: Any) -> Any:
-        """The AmbientArtifactService, reached through the Slack facade the gate is handed.
-
-        The engine is constructed with only the OpenAI client (main.py), so the piggyback finds
-        the service via the same `self`-facade the gate already uses to download images. Returns
-        None in tests / when it isn't wired — the piggyback then simply no-ops and the ordinary
-        ambient vision worker covers the image."""
-        if client is None:
-            return None
-        getter = getattr(client, "_ambient_service", None)
-        if callable(getter):
-            try:
-                return getter()
-            except Exception:  # noqa: BLE001
-                return None
-        return getattr(getattr(client, "processor", None), "ambient_service", None)
-
-    @staticmethod
-    def _harvest_image_observations(raw: Any, shown: List[Dict]) -> Dict[str, str]:
-        """Map the classifier's `image_observations` back to Slack file ids — defensively.
-
-        Verdict safety is absolute: this runs only AFTER validate_verdict and touches nothing on
-        it. A missing/malformed array, or one whose length does not match the images actually
-        shown (so per-image order can't be trusted), yields {} — those images fall to the normal
-        ambient vision worker. Within a correctly-sized array, a blank/non-string entry is skipped
-        (its file id is left to the worker) and the rest are kept."""
-        if not shown or not isinstance(raw, dict):
-            return {}
-        obs = raw.get("image_observations")
-        if not isinstance(obs, list) or len(obs) != len(shown):
-            if obs is not None:
-                logger.debug(
-                    "gate observations dropped: %s entries for %d shown image(s)",
-                    len(obs) if isinstance(obs, list) else "non-list", len(shown))
-            return {}
-        out: Dict[str, str] = {}
-        for d, text in zip(shown, obs):
-            fid = (d or {}).get("id")
-            if fid and isinstance(text, str) and text.strip():
-                out[str(fid)] = text.strip()
-        return out
-
-    # ------------------------------------------------------------- validate
-
-    @staticmethod
-    def _coerce_emoji(raw: dict, force_allowlist: bool) -> Optional[str]:
-        """Resolve the verdict's emoji. F20: by default any syntactically valid standard emoji
-        name is accepted; a REACTION_EMOJIS allowlist, when set, constrains the choice. For a
-        REACT verdict (force_allowlist=True) an off-list/garbage name falls back to the first
-        allowlisted emoji (the old wake gate's choice), and None means "downgrade to ignore".
-        For a backoff ACK (force_allowlist=False) an off-list/garbage/empty name means simply
-        no ack — a reaction is never forced onto the sender who just asked for restraint."""
-        allow = [e.strip().strip(":") for e in (getattr(config, "reaction_emojis", None) or [])
-                 if e and e.strip().strip(":")]
-        emoji = str(raw.get("emoji") or "").strip().strip(":")
-        if allow:
-            if emoji in allow:
-                return emoji
-            return allow[0] if force_allowlist else None
-        # C3: stay PERMISSIVE with no allowlist — any syntactically valid shorthand is accepted,
-        # which covers BOTH standard emoji AND a workspace custom name (same charset). Never gate
-        # on the custom set: a valid standard emoji must never be rejected for not being a custom.
-        return emoji if valid_emoji_name(emoji) else None
-
-    @staticmethod
-    def _apply_invariants(verdict: "ParticipationVerdict") -> "ParticipationVerdict":
-        """Refuse a verdict whose ACTION contradicts the model's own STAGED FINDINGS.
-
-        This is the enforcement half of the staged prompt, and the reason the stages are output
-        fields rather than private reasoning. It never sees the message: no text, no sender, no
-        aliases, no keywords, no regex. It compares declared enums to the chosen action, so the
-        model still does every bit of the understanding — this only refuses to let it conclude
-        something its own analysis does not support. A verdict from before the staged prompt
-        carries no findings and passes through untouched.
-
-        Each rule below corresponds to a measured false positive on the replay corpus in
-        tests/integration/participation_scenarios.py, and every one of them downgrades toward
-        SILENCE. That direction is deliberate: the gate's measured error profile was 27 false
-        positives and zero false negatives, so the costly mistake is speaking out of turn, and a
-        missed answer is one somebody can simply ask for again.
-        """
-        action, fired = verdict.action, []
-        if action not in SPEAKING_ACTIONS:
-            return verdict
-
-        # FAIL CLOSED on an incomplete verdict. The response is not strict Structured Outputs —
-        # the parser lifts whatever JSON object it can find — so a truncated or malformed reply
-        # can arrive with an action and no stages, and every field below coerces to None when
-        # it is missing or off-enum. Letting that through meant the one path most likely to be
-        # garbage was also the one path that skipped every check. A speaking action has to show
-        # its work; silence is the safe direction, and the model is asked for all four fields.
-        if (verdict.relation is None or verdict.exchange_state is None
-                or verdict.answerability is None):
-            verdict.action = "ignore"
-            verdict.emoji = None
-            verdict.overruled_by = ["incomplete_stages"]
-            return verdict
-
-        # A message the model itself says belongs to someone else, is merely ABOUT the assistant,
-        # or whose owner it could not determine, is not an opening — however much the assistant
-        # might have to offer. Ownership precedes capability; this is the invariant for the
-        # original misfire, where a collective "check your prompts" aimed at the room was answered
-        # because the assistant had opinions about prompts.
-        if verdict.relation in ("to_other", "about_assistant", "unclear"):
-            action, _ = "ignore", fired.append(f"relation_{verdict.relation}")
-
-        # A human has landed the closing beat. Words would re-open something the room finished,
-        # and conceding a correction only makes the assistant the subject of the channel. A plain
-        # reaction still stands: acknowledging a thanks with an emoji is not talking over anyone.
-        elif verdict.exchange_state == "closed_by_human":
-            if action == "respond":
-                action, _ = "ignore", fired.append("exchange_closed")
-            elif action == "react_and_respond":
-                action, _ = "react", fired.append("exchange_closed_words_dropped")
-
-        # Nobody asked the assistant in particular, and by its own reckoning it cannot supply the
-        # kind of answer wanted. An unrequested capability disclaimer, adjacent summary, or
-        # restatement is not value — it is the assistant volunteering into a room that did not
-        # call on it. A question genuinely put TO the assistant is exempt: there, an honest "I
-        # can't see that from here" beats leaving someone on read.
-        if (action in SPEAKING_ACTIONS and verdict.relation == "to_room"
-                and verdict.answerability in ("limitation_only", "requires_human")):
-            action, _ = "ignore", fired.append(f"room_{verdict.answerability}")
-
-        # Nothing was ASKED (`not_applicable`) and nobody addressed the assistant, yet it wants
-        # to use WORDS. Stage 3 says not_applicable is the reaction case and Stage 4 says words
-        # need a positive case; a reply here contradicts both of its own findings. The emoji
-        # survives — a reaction is the move this combination is actually for — and a message put
-        # TO the assistant is untouched, because being asked nothing directly still deserves an
-        # acknowledgement rather than being ignored.
-        if (verdict.relation == "to_room" and verdict.answerability == "not_applicable"
-                and action in ("respond", "react_and_respond")):
-            if action == "react_and_respond":
-                action, _ = "react", fired.append("room_nothing_asked_words_dropped")
-            else:
-                action, _ = "ignore", fired.append("room_nothing_asked")
-
-        if not fired:
-            return verdict
-        verdict.action = action
-        verdict.overruled_by = fired
-        if action == "ignore":
-            verdict.emoji = None
-        return verdict
-
-    @staticmethod
-    def validate_verdict(raw: Any) -> ParticipationVerdict:
-        """Coerce a raw model dict into a safe verdict. Anything malformed →
-        ignore. F20: by default any syntactically valid standard emoji name is
-        accepted (a garbage name downgrades the react to ignore); when a
-        REACTION_EMOJIS allowlist is set, an off-list emoji falls back to the
-        first allowlisted emoji (the choice the old wake gate made). A
-        `react_and_respond` verdict coerces its emoji the same way, but an
-        unresolvable emoji downgrades it to a plain `respond` (never ignore) so
-        the worded reply is never lost.
-
-        A `backoff` verdict additionally carries the participation-feedback taxonomy
-        (dimension/durability/scope/guidance/memory_op/structural_request); each field is
-        parsed defensively and defaults so the caller never has to guard for absence."""
-        if not isinstance(raw, dict):
-            return ParticipationVerdict(action="ignore", reason="malformed-verdict")
-        action = str(raw.get("action") or "").strip().lower()
-        if action not in VALID_ACTIONS:
-            return ParticipationVerdict(action="ignore", reason="invalid-action")
-        emoji = None
-        if action == "react":
-            emoji = ParticipationEngine._coerce_emoji(raw, force_allowlist=True)
-            if emoji is None:
-                return ParticipationVerdict(action="ignore", reason="react-no-valid-emoji")
-        elif action == "react_and_respond":
-            # Same allowlist coercion as `react`, but a None emoji must NEVER cost the reply.
-            # react→None downgrades to ignore (a reaction that won't resolve leaves nothing to do);
-            # react_and_respond→None downgrades to a plain `respond` — the words were the point, so
-            # drop just the reaction rather than lose the answer because the emoji was garbage.
-            emoji = ParticipationEngine._coerce_emoji(raw, force_allowlist=True)
-            if emoji is None:
-                action = "respond"
-        elif action == "backoff":
-            # An OPTIONAL ack emoji; absent/garbage simply means no ack.
-            emoji = ParticipationEngine._coerce_emoji(raw, force_allowlist=False)
-        placement = str(raw.get("placement") or "thread").strip().lower()
-        if placement not in VALID_PLACEMENTS:
-            placement = "thread"
-        # F38: an `ack` key from a stale prompt (or a model that remembers the old contract)
-        # is simply ignored — the field is gone from the verdict.
-        verdict = ParticipationVerdict(
-            action=action, emoji=emoji, placement=placement,
-            reason=str(raw.get("reason") or "")[:300],
-        )
-        if action == "backoff":
-            verdict.dimension = _coerce_enum(raw.get("dimension"), VALID_DIMENSIONS)
-            verdict.durability = _coerce_enum(raw.get("durability"), VALID_DURABILITIES)
-            verdict.scope = _coerce_enum(raw.get("scope"), VALID_SCOPES)
-            verdict.guidance = str(raw.get("guidance") or "").strip()[:300]
-            verdict.memory_op = _coerce_memory_op(raw.get("memory_op"))
-            structural = str(raw.get("structural_request") or "none").strip().lower()
-            verdict.structural_request = structural if structural in VALID_STRUCTURAL else "none"
-        # The staged findings. A missing/garbage field coerces to None, which makes the
-        # corresponding invariant inapplicable rather than guessed at — an unparseable stage is
-        # not evidence for or against speaking.
-        verdict.relation = _coerce_enum(raw.get("relation"), VALID_RELATIONS)
-        verdict.exchange_state = _coerce_enum(raw.get("exchange_state"), VALID_EXCHANGE_STATES)
-        verdict.answerability = _coerce_enum(raw.get("answerability"), VALID_ANSWERABILITY)
-        return ParticipationEngine._apply_invariants(verdict)
