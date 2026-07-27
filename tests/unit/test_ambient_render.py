@@ -188,20 +188,17 @@ def _record(p, channel="C1", ts="1.0", thread_ts=None, text="hello"):
              sender_type="human", text=text, is_bot=False)
 
 
-def test_pulse_upsert_appears_in_all_three_renderers():
+def test_pulse_upsert_appears_in_the_envelope():
+    # Was "…in all three renderers". The two thread/addressee tail renderers were gate prompt
+    # surfaces and are gone, so the envelope is the only renderer of an artifact note now — and
+    # the per-thread ring, which holds actor state and no text, is deliberately not written.
     p = ChannelPulse(size=30)
-    # A threaded reply (root 1.0) so both the channel buffer and the thread-tail ring hold it.
     _record(p, ts="1.0", text="root msg")
     _record(p, ts="2.0", thread_ts="1.0", text="a chart was posted")
     note = "[image (analyzed): benchmark chart]"
     assert p.upsert_artifacts("C1", "2.0", [note]) is True
-
-    env = p.render_envelope("C1")
-    tail = p.render_thread_tail("C1", "1.0", before_ts="9.0")
-    addr = p.render_channel_addressee_tail("C1", before_ts="9.0")
-    assert note in env
-    assert note in tail
-    assert note in addr
+    assert note in p.render_envelope("C1")
+    assert all("artifacts" not in e for e in p._thread_tails["C1"]["1.0"])
 
 
 def test_pulse_upsert_idempotent_and_late():

@@ -11,7 +11,7 @@ from uuid import uuid4
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_sdk.errors import SlackApiError
 
-from base_client import HistoryFetchError, Message, Response
+from base_client import HistoryFetchError, Message
 from config import SUPPORTED_CHAT_MODELS, config, pipeline_status_markers, valid_emoji_name
 from message_processor import participation_telemetry
 from message_processor.stale_send_guard import StaleSendSuppressed
@@ -417,13 +417,6 @@ class SlackMessagingMixin:
             except Exception as e:  # noqa: BLE001 — startup must never break on emoji.list
                 self.log_debug(f"initial workspace emoji refresh failed: {e}")
 
-        # Rehydrate the emoji-usage tally that ranks the gate's custom palette. Without this
-        # the tally restarted empty every time and only refilled from channels that happened
-        # to receive a message afterwards, so the palette was cold for a long while after
-        # every deploy. Fail-soft: no tally just means standard emoji until usage accrues.
-        await self._load_emoji_usage()
-        self._emoji_flush_task = asyncio.create_task(self._emoji_flush_loop())
-
         # Create a task for start_async that can be cancelled
         self._start_task = asyncio.create_task(self.handler.start_async())
 
@@ -450,21 +443,6 @@ class SlackMessagingMixin:
 
     async def stop(self):
         """Stop the Slack bot"""
-        # Stop the periodic emoji-tally flusher. The FINAL snapshot is deliberately NOT taken
-        # here — it happens after socket ingress is torn down below, because a reaction event
-        # arriving between the snapshot and the last event would be silently lost on an
-        # otherwise clean shutdown.
-        task = getattr(self, "_emoji_flush_task", None)
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass          # expected: this is our own cancel landing on the child task
-            except Exception as e:  # noqa: BLE001 — a real fault in the loop, worth knowing
-                self.log_debug(f"emoji flush loop ended with an error: {e}")
-            self._emoji_flush_task = None
-
         # F9: stop the liveness monitor first (independent of the handler teardown below).
         monitor = getattr(self, "_socket_liveness", None)
         if monitor is not None:
@@ -586,11 +564,6 @@ class SlackMessagingMixin:
                 await self._cleanup_session()
             except Exception as e:
                 self.log_warning(f"Error cleaning up utilities session: {e}")
-
-        # FINAL emoji-tally snapshot, last thing before returning: socket ingress is down by
-        # now, so nothing can arrive after this and be lost. Taking it at the TOP of stop()
-        # left a window where a late reaction_added was observed but never persisted.
-        await self.flush_emoji_usage()
 
     def _record_own_reply_pulse(self, channel_id: str, thread_id: Optional[str],
                                 ts: Optional[str], text: str) -> None:
@@ -1630,64 +1603,6 @@ class SlackMessagingMixin:
 
     # --- react_to_message local tool (redesign Phase D) ---
 
-    async def _load_emoji_usage(self) -> None:
-        """Seed the in-memory emoji tally from the DB at startup. Never raises.
-
-        Leaves `_emoji_usage_loaded` False on failure, which blocks flushing entirely. Flushes
-        write ABSOLUTE counts, so writing on top of a tally we failed to read would replace the
-        accumulated history with whatever this process happened to observe — a transient read
-        error would silently wipe the table."""
-        pulse = getattr(self, "channel_pulse", None)
-        db = getattr(self, "db", None)
-        if pulse is None or db is None:
-            return
-        try:
-            counts = await db.load_emoji_usage_async()
-            if counts is None:
-                self.log_warning(
-                    "emoji usage tally could not be read; persistence disabled for this run "
-                    "so a partial snapshot cannot overwrite it")
-                return
-            pulse.hydrate_reaction_vocab(counts)
-            self._emoji_usage_loaded = True
-            if counts:
-                self.log_debug(f"emoji usage tally rehydrated: {len(counts)} names")
-        except Exception as e:  # noqa: BLE001 — startup must never break on this
-            self.log_debug(f"emoji usage rehydrate failed: {e}")
-
-    async def _emoji_flush_loop(self) -> None:
-        """Persist the emoji tally on an interval.
-
-        A dedicated timer rather than a write per reaction (far too chatty for a counter
-        nobody reads in real time) and rather than the cleanup worker (cron-scheduled, daily
-        by default — a whole day of reactions to lose). Exits quietly on cancellation."""
-        interval = max(30, int(getattr(config, "emoji_usage_flush_seconds", 300)))
-        try:
-            while True:
-                await asyncio.sleep(interval)
-                await self.flush_emoji_usage()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001 — a flusher must never take the bot down
-            self.log_debug(f"emoji usage flush loop stopped: {e}")
-
-    async def flush_emoji_usage(self) -> None:
-        """Persist the emoji tally. Called on the periodic tick and once at shutdown.
-
-        Writes absolute counts, so a missed flush loses only the reactions since the last one
-        and can never double-count. Cheap enough to run on a timer (one small upsert batch)
-        and pointless to run per reaction event."""
-        pulse = getattr(self, "channel_pulse", None)
-        db = getattr(self, "db", None)
-        if pulse is None or db is None:
-            return
-        if not getattr(self, "_emoji_usage_loaded", False):
-            return          # never overwrite a tally we could not read — see _load_emoji_usage
-        try:
-            await db.save_emoji_usage_async(pulse.reaction_vocab_snapshot())
-        except Exception as e:  # noqa: BLE001
-            self.log_debug(f"emoji usage flush failed: {e}")
-
     def _custom_emoji_available(self) -> bool:
         """Whether the workspace has ANY custom emoji — the cheap check behind the react
         schema's pointer to search_workspace_emoji. Never raises; False when the cache is
@@ -2569,34 +2484,3 @@ class SlackMessagingMixin:
             )
         except Exception as e:
             self.log_debug(f"Could not post response footer: {e}")
-
-    async def handle_response(self, channel_id: str, thread_id: str, response: Response):
-        """Handle a Response object and send to Slack"""
-        if response.type == "text":
-            await self.send_message(channel_id, thread_id, response.content)  # unleased-ok: platform-agnostic Response dispatcher; the Slack turn posts through main.py with the lease
-        elif response.type == "image":
-            # response.content should be ImageData
-            image_data = response.content
-            file_url = await self.send_image(
-                channel_id,
-                thread_id,
-                image_data.to_bytes(),
-                f"generated_image.{image_data.format}",
-                ""  # No caption - prompt already displayed via streaming
-            )
-            
-            # Store the URL in the image data for tracking
-            if file_url:
-                image_data.slack_url = file_url
-                
-        elif response.type == "reaction":
-            # Phase 4: respond with emoji reaction(s) instead of (or before) text.
-            # content is an emoji name or list; metadata.react_ts is the target message
-            # (falls back to the thread root if not provided).
-            target_ts = (response.metadata or {}).get("react_ts") or thread_id
-            emojis = response.content if isinstance(response.content, list) else [response.content]
-            for emoji in emojis:
-                await self.react(channel_id, target_ts, emoji)
-        elif response.type == "error":
-            formatted_error = self.format_error_message(response.content)
-            await self.send_message(channel_id, thread_id, formatted_error)  # unleased-ok: same dispatcher — the Slack error path posts through main.py

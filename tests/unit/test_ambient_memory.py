@@ -5,7 +5,6 @@ the DB is a real temp SQLite so schema + queries are exercised for real."""
 import asyncio
 import sqlite3
 import tempfile
-import time
 
 import pytest
 
@@ -512,81 +511,6 @@ async def test_claim_persist_failure_means_job_not_accepted(db, monkeypatch):
     assert not s._inflight                              # slot released for a future retry
 
 
-# --------------------------------------------------------------- shutdown of HELD jobs (items 4/5)
-
-def _held(s, job):
-    """Seed a gate-held job into _deferred as _defer_image would (timer omitted: shutdown skips a
-    None timer)."""
-    s._deferred[job.key()] = {"job": job, "timer": None}
-
-
-async def test_shutdown_held_claim_failure_enqueues_for_drain(db, monkeypatch):
-    """Item 4: shutdown must HONOR _persist_claim's False return. When the durable claim can't
-    commit, the held job is handed to its worker queue (the drain that follows may still process
-    it) instead of vanishing with the cancelled timer and discarded singleflight key."""
-    s = _svc(db)
-    for kind in am._KINDS:
-        s._queues[kind] = asyncio.Queue(maxsize=64)
-    job = _Job(kind="image", channel_id="C1", source_ts="1.1", conversation_ts="1.1", ref="F1")
-    _held(s, job)
-
-    async def boom(*a, **k):
-        raise RuntimeError("db is down")
-
-    monkeypatch.setattr(db, "insert_pending_ambient_artifact", boom)
-
-    await s.shutdown(timeout=0.1)
-
-    q = s._queues[am.KIND_IMAGE]
-    assert q.qsize() == 1 and q.get_nowait() is job   # enqueued for the drain, not dropped
-    assert not s._deferred                            # the hold was resolved either way
-
-
-async def test_shutdown_held_claim_failure_queue_full_is_logged_not_crashed(db, monkeypatch):
-    """Item 4: if the worker queue is already full, there is nothing more to do at shutdown — the
-    loss is logged loudly and shutdown still completes cleanly (never raises)."""
-    s = _svc(db)
-    for kind in am._KINDS:
-        s._queues[kind] = asyncio.Queue(maxsize=1)
-    s._queues[am.KIND_IMAGE].put_nowait(object())     # fill it so put_nowait raises QueueFull
-    job = _Job(kind="image", channel_id="C1", source_ts="1.1", conversation_ts="1.1", ref="F1")
-    _held(s, job)
-
-    async def boom(*a, **k):
-        raise RuntimeError("db is down")
-
-    monkeypatch.setattr(db, "insert_pending_ambient_artifact", boom)
-
-    await s.shutdown(timeout=0.1)                      # must not raise
-
-    assert not s._deferred
-    assert s._queues[am.KIND_IMAGE].qsize() == 1       # unchanged; the held job could not be added
-
-
-async def test_shutdown_bounds_each_held_persist_and_falls_back_on_timeout(db, monkeypatch):
-    """Item 5: a locked/slow DB must not let a held persist blow past shutdown's budget. Each
-    per-job _persist_claim is bounded (2s); a timeout counts as a persist-failure and takes item
-    4's fallback path."""
-    s = _svc(db)
-    for kind in am._KINDS:
-        s._queues[kind] = asyncio.Queue(maxsize=64)
-    job = _Job(kind="image", channel_id="C1", source_ts="1.1", conversation_ts="1.1", ref="F1")
-    _held(s, job)
-
-    async def hang(*a, **k):
-        await asyncio.sleep(60)                        # a locked / very slow database
-
-    monkeypatch.setattr(db, "insert_pending_ambient_artifact", hang)
-
-    started = time.monotonic()
-    await s.shutdown(timeout=0.1)
-    elapsed = time.monotonic() - started
-
-    assert elapsed < 10                                # bounded by the per-job wait_for, not sleep(60)
-    q = s._queues[am.KIND_IMAGE]
-    assert q.qsize() == 1 and q.get_nowait() is job    # timeout → treated as failure → enqueued
-
-
 # ------------------------------------------------------------------- production wiring (MUST-FIX 1)
 
 async def test_ambient_ingest_hands_service_the_facade_not_raw_client(db):
@@ -731,7 +655,14 @@ def test_render_artifact_note_sanitized():
     assert "\n" not in note
 
 
-# --------------------------------------------------------- F51b gate/ambient piggyback
+# --------------------------------------------------------- images go straight to the worker
+#
+# An ambient image used to be HELD here while its message went through the rich gate: that gate
+# downloaded the picture to judge the message, so one look could serve both the verdict and the
+# stored description, and the gate's post-decision callback released the hold. The binary gate
+# never looks at a picture — so there is no second look to save, and nothing left that would ever
+# call the release. What these tests pin is the shape that replaced it: images are admitted on the
+# same path as links and files, immediately, and analyzed exactly once.
 
 def _img_event(fid="F1", ts="1.1", text="look at this"):
     return {"channel": "C1", "ts": ts, "text": text,
@@ -747,198 +678,61 @@ def _started_svc(db, pulse=None, openai=None):
     return s
 
 
-async def test_gate_piggyback_stores_observation_and_skips_worker(db):
-    """Common path: an image deferred for the gate, resolved WITH an observation, is stored as a
-    gate-sourced artifact (ready row + ledger dual-write + pulse note) and the vision worker never
-    runs for it — one look, both outputs."""
+async def test_an_ambient_image_is_admitted_immediately_and_analyzed_exactly_once(db):
+    """The whole point of the deletion: no hold, no timer, one analysis.
+
+    Admission is asserted BEFORE anything resolves the message — nothing is waited for — and the
+    resulting job is then processed to show the vision call happens once and lands as an ordinary
+    worker-sourced artifact (not the retired `gate_vision` provenance)."""
     openai, pulse = FakeOpenAI(), FakePulse()
     s = _started_svc(db, pulse=pulse, openai=openai)
-    s.offer_event(_img_event(), FakeClient(), defer_images=True)
-    key = ("C1", "1.1", am.KIND_IMAGE, "F1")
-    assert key in s._deferred                       # held, not admitted
-    assert s._queues[am.KIND_IMAGE].empty()
 
-    s.resolve_gate("C1", "1.1", {"F1": "A bar chart of Q3 revenue by region, three bars labeled."})
+    s.offer_event(_img_event(), FakeClient())
     await asyncio.gather(*list(s._bg_tasks), return_exceptions=True)
 
+    q = s._queues[am.KIND_IMAGE]
+    assert q.qsize() == 1                                   # admitted straight away
+    job = q.get_nowait()
+    assert job.ref == "F1"
+    assert not hasattr(s, "_deferred")                      # no hold state exists to strand it
+
+    await s._process(job)
+    assert openai.vision_calls == 1                         # exactly once
     art = (await db.get_ambient_artifacts_for_messages("C1", ["1.1"]))["1.1"][0]
     assert art["status"] == "ready"
-    assert art["derivation_source"] == "gate_vision"          # provenance recorded
-    assert art["model"] == am.config.utility_model            # the model that actually looked
-    assert "revenue" in art["summary"]
-    assert openai.vision_calls == 0                           # NO second vision call
-    assert s._queues[am.KIND_IMAGE].empty()                  # worker job never admitted
-    assert not s._deferred and not s._inflight
-    # surfaces in the pulse exactly like a worker-sourced artifact
-    assert pulse.calls and "revenue" in pulse.calls[-1][2][0]
+    assert art["derivation_source"] == "vision_worker"
+    assert pulse.calls and "benchmark" in pulse.calls[-1][2][0]
     # dual-written into the image ledger so read/edit paths see it
     imgs = await db.get_images_by_message_async("C1:1.1", "1.1")
     assert imgs and imgs[0]["analysis"]
 
 
-async def test_gate_piggyback_malformed_observations_release_to_worker(db):
-    """Gate blind / observations missing or malformed → the held image is ADMITTED to the vision
-    worker (analyzed as normal), and NO gate-sourced artifact is written."""
-    s = _started_svc(db)
-    s.offer_event(_img_event(), FakeClient(), defer_images=True)
-    assert ("C1", "1.1", am.KIND_IMAGE, "F1") in s._deferred
+async def test_duplicate_image_offers_admit_one_job(db):
+    """The same upload arrives twice (the parallel app_mention + message events). Singleflight now
+    lives entirely in `_admit` — the hold used to reserve the slot instead — so exactly one job is
+    admitted and exactly one artifact is written."""
+    openai = FakeOpenAI()
+    s = _started_svc(db, openai=openai)
 
-    s.resolve_gate("C1", "1.1", {})                          # nothing for F1
+    s.offer_event(_img_event(), FakeClient())
+    s.offer_event(_img_event(), FakeClient())               # duplicate
     await asyncio.gather(*list(s._bg_tasks), return_exceptions=True)
 
-    assert not s._deferred
     q = s._queues[am.KIND_IMAGE]
-    assert not q.empty()                                     # admitted to the worker
-    assert q.get_nowait().ref == "F1"
-    rows = (await db.get_ambient_artifacts_for_messages("C1", ["1.1"])).get("1.1", [])
-    assert all(r["derivation_source"] != "gate_vision" for r in rows)   # gate wrote nothing
-
-
-async def test_gate_hold_timeout_admits_when_gate_never_reports(db):
-    """A held image the gate never resolves (message not gated, or superseded and never released)
-    must not be stranded — the bounded timer admits it to the worker."""
-    s = _started_svc(db)
-    # Shrink the hold so the test doesn't wait 45s.
-    import message_processor.ambient_memory as mod
-    orig = mod._GATE_HOLD_SECONDS
-    mod._GATE_HOLD_SECONDS = 0.02
-    try:
-        s.offer_event(_img_event(), FakeClient(), defer_images=True)
-        assert ("C1", "1.1", am.KIND_IMAGE, "F1") in s._deferred
-        await asyncio.sleep(0.05)                            # let the timer fire
-        await asyncio.gather(*list(s._bg_tasks), return_exceptions=True)
-    finally:
-        mod._GATE_HOLD_SECONDS = orig
-    assert not s._deferred
-    assert not s._queues[am.KIND_IMAGE].empty()             # admitted after the timeout
-    assert s._queues[am.KIND_IMAGE].get_nowait().ref == "F1"
-
-
-async def test_gate_store_respects_channel_opt_out(db):
-    """A gate-sourced store obeys the per-channel opt-out exactly like the worker: nothing is
-    persisted, and the singleflight slot is released."""
-    db.conn.execute("INSERT INTO channel_settings (channel_id, ambient_memory) VALUES ('C1', 0)")
-    db.conn.commit()
-    openai = FakeOpenAI()
-    s = _svc(db, openai=openai)
-    job = _Job(kind="image", channel_id="C1", source_ts="1.1", conversation_ts="1.1",
-               ref="F1", url="https://files/f1", filename="chart.png", mimetype="image/png")
-    s._inflight.add(job.key())
-    await s._store_gate_observation(job, "an observation")
-    assert (await db.get_ambient_artifacts_for_messages("C1", ["1.1"])) == {}
-    assert openai.vision_calls == 0
-    assert job.key() not in s._inflight
-
-
-async def test_race_worker_finishes_first_gate_result_discarded(db):
-    """Race direction 1: the worker readies the artifact first; a late gate store finds a ready
-    row and DISCARDS its result (no overwrite, no double-store)."""
-    openai = FakeOpenAI()
-    s = _svc(db, openai=openai)
-    job = _Job(kind="image", channel_id="C1", source_ts="1.1", conversation_ts="1.1",
-               ref="F1", url="https://files/f1", filename="chart.png", mimetype="image/png")
-    await s._process(job)                                    # worker wins
+    assert q.qsize() == 1
+    await s._process(q.get_nowait())
     assert openai.vision_calls == 1
-    before = (await db.get_ambient_artifacts_for_messages("C1", ["1.1"]))["1.1"][0]
-    assert before["derivation_source"] == "vision_worker"
-
-    s._inflight.add(job.key())                              # slot resolve_gate would hold
-    await s._store_gate_observation(job, "the gate's late low-detail take")
-    after = (await db.get_ambient_artifacts_for_messages("C1", ["1.1"]))["1.1"][0]
-    assert after["derivation_source"] == "vision_worker"    # unchanged
-    assert after["summary"] == before["summary"]            # not overwritten
-    assert job.key() not in s._inflight                     # released in finally
-
-
-async def test_race_gate_finishes_first_worker_skips(db):
-    """Race direction 2: the gate readies the artifact first; the worker, arriving after, sees the
-    ready row and SKIPS — no second vision call, the gate's row stands."""
-    openai = FakeOpenAI()
-    s = _svc(db, openai=openai)
-    job = _Job(kind="image", channel_id="C1", source_ts="1.1", conversation_ts="1.1",
-               ref="F1", url="https://files/f1", filename="chart.png", mimetype="image/png")
-    s._inflight.add(job.key())
-    await s._store_gate_observation(job, "A dashboard screenshot with three KPI tiles.")
-    art = (await db.get_ambient_artifacts_for_messages("C1", ["1.1"]))["1.1"][0]
-    assert art["derivation_source"] == "gate_vision" and art["status"] == "ready"
-
-    await s._process(job)                                   # worker arrives late
-    assert openai.vision_calls == 0                         # skipped, no vision call
-    still = (await db.get_ambient_artifacts_for_messages("C1", ["1.1"]))["1.1"][0]
-    assert still["derivation_source"] == "gate_vision"      # gate's row stands
-
-
-async def test_deferred_offer_is_singleflight_across_duplicate_events(db):
-    """The same upload arrives twice (the parallel app_mention + message events). Only one held
-    job exists, and resolving it stores exactly one artifact."""
-    s = _started_svc(db)
-    s.offer_event(_img_event(), FakeClient(), defer_images=True)
-    s.offer_event(_img_event(), FakeClient(), defer_images=True)   # duplicate
-    held = [k for k in s._deferred if k[1] == "1.1" and k[3] == "F1"]
-    assert len(held) == 1
-    s.resolve_gate("C1", "1.1", {"F1": "A single held image, described once."})
-    await asyncio.gather(*list(s._bg_tasks), return_exceptions=True)
     rows = (await db.get_ambient_artifacts_for_messages("C1", ["1.1"]))["1.1"]
     assert len([r for r in rows if r["status"] == "ready"]) == 1
 
 
-async def test_gate_store_failure_releases_job_to_worker(db, monkeypatch):
-    """Finding 5: if the storage sequence raises (e.g. a transient SQLite lock), the held image
-    must NOT be dropped — resolve_gate already cancelled its hold timer, so a swallowed exception
-    would strand it. Instead it is RELEASED to the ordinary vision worker and still analyzed."""
-    openai = FakeOpenAI()
-    s = _started_svc(db, openai=openai)
-
-    # The store's very first DB write raises — the transient-lock case the finding calls out —
-    # then the lock clears, so the RELEASE path's own claim insert succeeds and the job enqueues.
-    real_insert = db.insert_pending_ambient_artifact
-    calls = {"n": 0}
-
-    async def flaky(*a, **k):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise sqlite3.OperationalError("database is locked")
-        return await real_insert(*a, **k)
-    monkeypatch.setattr(db, "insert_pending_ambient_artifact", flaky)
-
-    job = _Job(kind="image", channel_id="C1", source_ts="1.1", conversation_ts="1.1",
-               ref="F1", url="https://files/f1", filename="chart.png", mimetype="image/png")
-    s._inflight.add(job.key())
-    await s._store_gate_observation(job, "an observation the store failed to persist")
-    # Released to the worker admission path (off-loop task), which re-reserves + enqueues.
-    await asyncio.gather(*list(s._bg_tasks), return_exceptions=True)
-
-    assert not s._deferred
-    q = s._queues[am.KIND_IMAGE]
-    assert not q.empty()                                  # admitted, not dropped
-    admitted = q.get_nowait()
-    assert admitted.ref == "F1"
-    assert job.key() in s._inflight                       # slot held for the worker to release
-    assert openai.vision_calls == 0                       # store failed before any vision call
-
-
-async def test_shutdown_persists_held_jobs_for_recovery(db):
-    """Finding 6: a job HELD for the gate at shutdown has no durable row. Shutdown must persist a
-    pending claim for each held job BEFORE draining so recover_pending finds it after restart —
-    an image claim becomes an honest failed/interrupted row, never a silent permanent absence."""
+def test_offer_event_cannot_be_asked_to_hold_an_image(db):
+    """Structural, not habitual: the parameter is GONE, so a caller that tries to defer fails
+    loudly. A silently-ignored kwarg would let a call site believe images were being held for a
+    resolver that no longer exists."""
     s = _started_svc(db)
-    s.offer_event(_img_event(), FakeClient(), defer_images=True)
-    key = ("C1", "1.1", am.KIND_IMAGE, "F1")
-    assert key in s._deferred
-    # Nothing durable yet while held.
-    assert (await db.get_ambient_artifacts_for_messages("C1", ["1.1"])) == {}
-
-    await s.shutdown(timeout=1.0)
-
-    # A durable pending row now exists for the held image, and the held set is cleared.
-    assert not s._deferred and not s._inflight
-    pend = await db.get_pending_ambient_artifacts()
-    assert [(p["channel_id"], p["source_ts"], p["kind"], p["ref"]) for p in pend] \
-        == [("C1", "1.1", am.KIND_IMAGE, "F1")]
-
-    # recover_pending on the fresh process turns the un-resumable image claim into an honest
-    # failed/interrupted row (its download url was never persisted) — visible, not a zombie.
-    s2 = _svc(db)
-    await s2.recover_pending()
-    row = (await db.get_ambient_artifacts_for_messages("C1", ["1.1"]))["1.1"][0]
-    assert row["status"] == "failed" and row["error_code"] == "interrupted"
+    with pytest.raises(TypeError):
+        s.offer_event(_img_event(), FakeClient(), defer_images=True)
+    for retired in ("_defer_image", "resolve_gate", "_store_gate_observation",
+                    "_gate_hold_timeout"):
+        assert not hasattr(s, retired), f"{retired} survived the hold's deletion"

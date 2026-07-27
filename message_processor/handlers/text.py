@@ -2328,8 +2328,19 @@ class TextHandlerMixin:
                 return Response(
                     type="text",
                     content="",
+                    # The sandbox products ride along, exactly as they do on the terminal branch
+                    # above and on this branch's non-streaming twin. A turn can start a background
+                    # job AND build something in the same round — a chart computed from real data,
+                    # a file mounted for it — and dropping these here meant the job ate the chart:
+                    # delivery never learned it existed, and nothing downstream could notice,
+                    # because a suppressed ack reply looks identical either way.
                     metadata={"streamed": True, "background_job_started": True,
-                              "model": thread_config.get("model"), "posted": False}
+                              "model": thread_config.get("model"), "posted": False,
+                              "artifact_containers": artifact_containers,
+                              "sandbox_image_assets": sandbox_assets,
+                              "mounted_digests": mounted_digests,
+                              "response_reaction_committed":
+                                  _reaction_committed(local_tool_calls)}
                 )
 
             # Build list of tools used (unified attribution). EXTERNAL sources only

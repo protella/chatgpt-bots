@@ -1,7 +1,9 @@
 """Phase 4 — emoji reactions as a response.
 
 Covers: the client react() capability (success / already_reacted / error / disabled / colon
-stripping), the Response.reaction() helper, and the handle_response 'reaction' branch.
+stripping) and the Response.reaction() helper. (The `handle_response` dispatcher that
+consumed a reaction Response is gone — it was a platform-agnostic alternate delivery path with no
+callers, and the Slack turn posts through main.py with the stale-send lease.)
 """
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -90,23 +92,3 @@ def test_response_reaction_helper():
     r2 = Response.reaction(["tada", "thumbsup"])
     assert r2.type == "reaction" and r2.content == ["tada", "thumbsup"]
     assert r2.metadata == {}
-
-
-@pytest.mark.asyncio
-async def test_handle_response_reaction_branch(monkeypatch):
-    monkeypatch.setattr(config, "enable_reactions", True)
-    host = _MsgClient(SimpleNamespace())
-    host.react = AsyncMock(return_value=True)
-    await host.handle_response("C1", "T1", Response.reaction(["eyes", "tada"], target_ts="55.5"))
-    assert host.react.await_count == 2
-    host.react.assert_any_await("C1", "55.5", "eyes")
-    host.react.assert_any_await("C1", "55.5", "tada")
-
-
-@pytest.mark.asyncio
-async def test_handle_response_reaction_defaults_to_thread_root(monkeypatch):
-    monkeypatch.setattr(config, "enable_reactions", True)
-    host = _MsgClient(SimpleNamespace())
-    host.react = AsyncMock(return_value=True)
-    await host.handle_response("C1", "T1", Response.reaction("eyes"))  # no target_ts
-    host.react.assert_any_await("C1", "T1", "eyes")

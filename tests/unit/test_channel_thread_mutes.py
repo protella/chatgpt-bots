@@ -42,11 +42,11 @@ def temp_db():
 class TestAtomicSetter:
     def test_partial_update_preserves_untouched_fields(self, temp_db):
         temp_db.set_channel_settings("C1", response_mode="auto_respond",
-                                     verbosity="low", participation_level="active")
+                                     verbosity="low", participation_level="on")
         temp_db.set_channel_settings("C1", verbosity="high")  # only verbosity
         row = temp_db.get_channel_settings("C1")
         assert row["response_mode"] == "auto_respond"
-        assert row["participation_level"] == "active"
+        assert row["participation_level"] == "on"
         assert row["verbosity"] == "high"
 
     def test_non_structural_write_does_not_bump_authorship(self, temp_db):
@@ -205,7 +205,10 @@ class TestMigration:
         assert "participation_engine:10.0" not in authors
         assert "someuser" in authors
 
-        # structural columns untouched by the migration
+        # Structural columns untouched by THIS migration. The seeded `judicious` is deliberate —
+        # it is what a pre-binary-gate row actually looks like, and the point here is that the
+        # memory cleanup does not touch it. Rewriting it to `on` is a different migration's job
+        # (migrate_participation_levels_to_binary_async), covered in test_participation_migrations.
         row = temp_db.get_channel_settings("C1")
         assert row["response_mode"] == "auto_respond"
         assert row["participation_level"] == "judicious"

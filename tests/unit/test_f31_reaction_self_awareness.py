@@ -60,15 +60,18 @@ def test_record_own_reaction_generic_when_target_missing():
     assert "'s message" not in env
 
 
-def test_record_own_reaction_thread_target_lands_in_thread_tail():
+def test_record_own_reaction_thread_target_lands_under_the_thread_root():
     p = ChannelPulse(size=10)
     # A reply inside a thread rooted at 50.0.
     p.record("C1", **_human("60.0", text="a reply in the thread", thread_ts="50.0",
                             name="Carol"))
-    p.record_own_reaction("C1", message_ts="60.0", emoji="fire")
-    # The synthetic entry must appear in that thread's classifier tail.
-    tail = p.render_thread_tail("C1", "50.0", before_ts=None)
-    assert "reacted :fire:" in tail
+    receipt = p.record_own_reaction("C1", message_ts="60.0", emoji="fire")
+    # The synthetic entry is filed under the thread ROOT, not the reply's own ts — otherwise it
+    # would mint a bogus top-level entry and thread label. The prose tail that used to prove this
+    # by rendering is gone, so assert the receipt and the actor ring it names.
+    assert receipt["root_ts"] == "50.0"
+    assert receipt["synth_ts"] in [e["ts"] for e in p._thread_tails["C1"]["50.0"]]
+    assert "reacted :fire:" in p.render_envelope("C1")
 
 
 def test_record_own_reaction_dm_excluded():

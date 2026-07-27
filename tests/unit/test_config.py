@@ -107,7 +107,7 @@ class TestBotConfig:
         these CODE defaults have to be read with the backing vars removed or a tuned local
         .env (e.g. a raised CHANNEL_PULSE_SIZE) fails a test that is about the fallbacks."""
         for key in ("MAX_CONCURRENT_IMAGE_GENERATIONS", "CHANNEL_PULSE_SIZE",
-                    "PULSE_TEXT_TRUNCATE", "PULSE_TAIL_TEXT_TRUNCATE",
+                    "PULSE_TEXT_TRUNCATE",
                     "TOOL_PROVENANCE_MAX_ENTRIES", "TOOL_PROVENANCE_GIST_CHARS",
                     "TOOL_PROVENANCE_LINE_BUDGET", "TOOL_USAGE_RETENTION_DAYS"):
             monkeypatch.delenv(key, raising=False)
@@ -115,7 +115,6 @@ class TestBotConfig:
         assert config.max_concurrent_image_generations == 5
         assert config.channel_pulse_size == 60
         assert config.pulse_text_truncate == 500
-        assert config.pulse_tail_text_truncate == 500
         assert config.tool_provenance_max_entries == 20
         assert config.tool_provenance_gist_chars == 80
         assert config.tool_provenance_line_budget == 300
@@ -128,7 +127,7 @@ class TestBotConfig:
 
     @patch.dict(os.environ, {
         "CHANNEL_PULSE_SIZE": "12",
-        "PULSE_TEXT_TRUNCATE": "111", "PULSE_TAIL_TEXT_TRUNCATE": "222",
+        "PULSE_TEXT_TRUNCATE": "111",
         "TOOL_PROVENANCE_MAX_ENTRIES": "7", "TOOL_PROVENANCE_GIST_CHARS": "40",
         "TOOL_PROVENANCE_LINE_BUDGET": "150", "TOOL_USAGE_RETENTION_DAYS": "30",
     })
@@ -137,7 +136,6 @@ class TestBotConfig:
         config = BotConfig()
         assert config.channel_pulse_size == 12
         assert config.pulse_text_truncate == 111
-        assert config.pulse_tail_text_truncate == 222
         assert config.tool_provenance_max_entries == 7
         assert config.tool_provenance_gist_chars == 40
         assert config.tool_provenance_line_budget == 150

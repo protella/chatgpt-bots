@@ -112,11 +112,11 @@ old generations are eventually deleted, not kept. Any analysis of more than the 
 has to read `participation.jsonl.1` … `.5` as well, and has to accept that history older than
 those five generations is gone.
 
-PRIVACY. Raw trigger text is never intentionally logged, and as of v7 nothing model-authored is
-logged either. The rich gate wrote a `reason` and a `guidance` — summaries of a human's message,
-truncated to a shared bound because truncation lowers exposure even though it cannot promise none.
-The binary gate produces neither, so the exposure is gone rather than bounded. `truncate_reason`
-survives for whatever future field needs the same treatment; it has no current caller.
+PRIVACY. Nothing model-authored is written here at all. The rich gate wrote a `reason` and a
+`guidance` — summaries of a human's message — and bounded them with a shared truncation, which
+lowers exposure without promising none. The binary gate produces neither, so the exposure is gone
+rather than bounded, and the truncation helper went with it: a bound with no field to bound is an
+invitation to add one back without thinking about what it would carry.
 
 `v` is the contract version. Bump it when a field changes MEANING, and equally when event
 CARDINALITY or TERMINAL SEMANTICS change (one visible_action per attempt is part of the
@@ -136,7 +136,7 @@ import uuid
 from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from typing import Any, Optional
 
-from config import GUIDANCE_TRUNCATION_CHARS, config
+from config import config
 from logger import (LOG_ROTATION_BACKUP_COUNT, LOG_ROTATION_MAX_BYTES,
                     USE_CONCURRENT_HANDLER, setup_logger)
 
@@ -469,18 +469,6 @@ def record(event: str, *, channel_id: Optional[str] = None,
         sink.info(json.dumps(payload, default=str))
     except Exception as e:  # noqa: BLE001 — a lost line is never worth a lost turn
         logger.debug(f"Participation telemetry write failed: {e}")
-
-
-def truncate_reason(text: Any) -> Optional[str]:
-    """Bound a model-authored justification before it is written down. See PRIVACY above."""
-    if not text:
-        return None
-    trimmed = str(text).strip()
-    if not trimmed:
-        return None
-    if len(trimmed) > GUIDANCE_TRUNCATION_CHARS:
-        return trimmed[:GUIDANCE_TRUNCATION_CHARS] + "…"
-    return trimmed
 
 
 # ------------------------------------------------------------------ the attempt lifecycle

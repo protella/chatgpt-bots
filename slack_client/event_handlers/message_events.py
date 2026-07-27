@@ -225,7 +225,14 @@ class SlackMessageEventsMixin:
         return self._resolve_mode(await self._get_channel_settings(channel_id))
 
     def _text_mentions_bot_name(self, text: str) -> bool:
-        """True if one of the bot's name aliases appears as a whole word (case-insensitive)."""
+        """Deterministic addressing prefilter used only to decide whether configured
+        name-addressing makes a message eligible for dispatch. It never decides relevance, wake,
+        reply, silence, placement, or settings.
+
+        True if one of the bot's name aliases appears as a whole word (case-insensitive). Whether
+        the name is an ADDRESS ("chatgpt, help") or merely a mention of the subject ("chatgpt was
+        wrong earlier") is not decided here and cannot be: this only says a `mentions_only` channel
+        may let the message through to the gate, which is what judges it."""
         if not text:
             return False
         import re
@@ -440,28 +447,13 @@ class SlackMessageEventsMixin:
             # Ordinary content: enqueue. Own messages are excluded (recursion guard).
             if self.is_own_message(event):
                 return
-            # Ambient images are admitted IMMEDIATELY. Nothing downstream waits on the gate any
-            # more (see _gate_will_see_images), so there is nothing to defer them for.
+            # Images are admitted IMMEDIATELY, exactly like links and files. The rich gate used to
+            # download a message's pictures for its verdict, so an image's ambient vision job was
+            # held back to let one look serve both; the binary gate never looks at a picture, so a
+            # hold would wait on a resolver that is never coming.
             svc.offer_event(event, facade)
         except Exception as e:  # noqa: BLE001
             self.log_debug(f"ambient ingest failed: {e}")
-
-    def _gate_will_see_images(self, event: Dict[str, Any]) -> bool:
-        """ALWAYS FALSE. Ambient images are never held for the gate any more.
-
-        The rich gate downloaded a message's pictures to judge it, so holding the ambient vision
-        job meant one look served both the verdict and the stored observation. The binary gate does
-        not look at images at all — it decides whether the responder RUNS, and a picture cannot
-        change that answer in a way its filename does not.
-
-        So there is nothing to wait for, and waiting was the risk: a hold is only safe while some
-        resolver is guaranteed to release it, and the resolver was the gate's own post-decision
-        callback. With no gate callback, a held image would sit until a bounded timeout expired —
-        analysis delayed for no benefit, on every image in every channel. The predicate stays as a
-        named False rather than vanishing into its call site, because it is what a reader looks for
-        when asking "does anything still block ambient vision".
-        """
-        return False
 
     # ------------------------------------------------------------- F52: edit-triggered replies
 
