@@ -177,7 +177,7 @@ mcp_config*.bak
 .channels_cache_v2.json
 .users_cache.json
 
-# Claude Code local settings (note: .claude/commands/** IS tracked)
+# Claude Code local settings (note: .claude/skills/** IS tracked)
 .claude/settings.local.json
 
 # Claude Image Paste screenshots
@@ -188,3 +188,11 @@ slack_app_manifest.yml
 
 # Company-branded loading messages stay local (like .env) — the generic set is the committed default
 status_messages/loading_messages.acmedata.txt
+
+# Relocated auto-memory notes (internal, never published)
+# This repo is PUBLIC: these files hold internal Slack channel names/IDs, employee
+# references, and operational detail that must not be committed.
+Docs/internal/
+
+# Playwright MCP browser-session artifacts
+.playwright-mcp/
