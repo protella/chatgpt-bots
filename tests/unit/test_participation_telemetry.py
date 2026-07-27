@@ -194,9 +194,10 @@ def test_an_ungated_message_produces_no_terminal_event(sink):
 def test_the_contract_version_says_the_event_set_changed():
     """v3 added the `queue_link` event; v4 turned `silence_reason` from prose into a declared
     enum and made `reaction_visible` unconditional; v5 dropped the ambiguous `placement` field
-    for `destination` + `destination_source`. Each is a change an analysis written against the
-    older contract must be able to refuse."""
-    assert pt.CONTRACT_VERSION == 5
+    for `destination` + `destination_source`; v6 added the `stale_suppressed` terminal kind and
+    the `stale_send` diagnostic. Each is a change an analysis written against the older contract
+    must be able to refuse."""
+    assert pt.CONTRACT_VERSION == 6
 
 
 def test_a_gated_successor_names_the_attempt_it_absorbed_them_into(sink):

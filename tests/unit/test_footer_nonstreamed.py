@@ -152,7 +152,8 @@ def _client():
 
     # Mirror the real send seam: report footer_attached via meta_out when blocks ride the
     # message (the composed section+actions path), so main.py sets its flag from reality.
-    async def _send(channel_id, thread_id, text, blocks=None, meta_out=None):
+    async def _send(channel_id, thread_id, text, blocks=None, meta_out=None,
+                    lease=None, surface=None):
         if meta_out is not None:
             meta_out["footer_attached"] = bool(blocks)
         return "posted.1"
@@ -232,7 +233,8 @@ async def test_main_suppresses_separate_footer_when_send_failed():
     bot = _make_bot()
     client = _client()
 
-    async def _send_fail(channel_id, thread_id, text, blocks=None, meta_out=None):
+    async def _send_fail(channel_id, thread_id, text, blocks=None, meta_out=None,
+                         lease=None, surface=None):
         return None  # send failed
     client.send_message = AsyncMock(side_effect=_send_fail)
     resp = Response(type="text", content="hello", metadata={"streamed": False, "model": "m"})

@@ -247,7 +247,7 @@ class _FakeSlack:
     def format_text(self, t):
         return t
 
-    async def send_message_get_ts(self, channel, thread, text):
+    async def send_message_get_ts(self, channel, thread, text, lease=None, surface=None):
         self.posted.append(text)
         return {"success": True, "ts": f"ts{len(self.posted)}"}
 
@@ -258,7 +258,7 @@ class _FakeSlack:
     async def update_message(self, channel, ts, text):
         return True
 
-    async def update_message_streaming(self, channel, ts, text):
+    async def update_message_streaming(self, channel, ts, text, lease=None, surface=None):
         return {"success": True}
 
     async def delete_message(self, channel, ts):

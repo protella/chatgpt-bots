@@ -24,7 +24,7 @@ class _FakeClient:
         self.sent = []  # (channel, thread, text, username)
         self.fail_username = fail_username
 
-    async def send_message(self, channel_id, thread_id, text, blocks=None,
+    async def send_message(self, channel_id, thread_id, text, blocks=None, lease=None, surface=None,
                            meta_out=None, username=None):
         if username and self.fail_username:
             return None  # simulate missing_scope → send_message returns None
@@ -444,7 +444,7 @@ async def test_failed_findings_post_posts_failure_note(monkeypatch):
     proc = _FakeProcessor(openai_client=openai, tm=AsyncThreadStateManager())
 
     class _FailingThenNoteClient(_FakeClient):
-        async def send_message(self, channel_id, thread_id, text, blocks=None,
+        async def send_message(self, channel_id, thread_id, text, blocks=None, lease=None, surface=None,
                                meta_out=None, username=None):
             if "hit a wall" not in text:
                 return None  # the findings post itself fails
@@ -1541,7 +1541,7 @@ async def test_a_published_chart_does_not_count_as_the_findings(monkeypatch):
     posts = {"n": 0}
 
     class _ReportFailsOnce(_CardClient):
-        async def send_message(self, channel_id, thread_id, text, blocks=None,
+        async def send_message(self, channel_id, thread_id, text, blocks=None, lease=None, surface=None,
                                meta_out=None, username=None):
             if "# Findings" in text:
                 posts["n"] += 1
@@ -1573,7 +1573,7 @@ async def test_a_cheerful_reply_cannot_mask_a_lost_report(monkeypatch):
     monkeypatch.setattr(config, "enable_research_label", False)
 
     class _ReportAlwaysFails(_CardClient):
-        async def send_message(self, channel_id, thread_id, text, blocks=None,
+        async def send_message(self, channel_id, thread_id, text, blocks=None, lease=None, surface=None,
                                meta_out=None, username=None):
             if "# Findings" in text:
                 return None

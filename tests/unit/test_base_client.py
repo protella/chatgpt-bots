@@ -410,7 +410,10 @@ class TestBaseClientContract:
             await client.handle_error("C123", "T456", "Something went wrong")
 
             # Verify send_message_async was called with formatted error
-            mock_send.assert_called_once_with("C123", "T456", "Error: Something went wrong")
+            # The stale-send lease rides every terminal notice; None here because this
+            # contract test has no turn behind it.
+            assert mock_send.await_args.args == ("C123", "T456", "Error: Something went wrong")
+            assert mock_send.await_args.kwargs == {"lease": None}
     
     def test_format_error_message_default(self):
         """Test default error message formatting"""

@@ -72,7 +72,10 @@ class TestFormatErrorMessage:
 # ------------------------------------------------- outer catch-all (findings 1+7)
 
 def _bot_and_client(process_error, delete_error=None):
-    bot = SimpleNamespace(processor=MagicMock())
+    from message_processor.stale_send_guard import ConversationWatermarks
+    # A real watermark owner: handle_message opens a lease on its first line, and a stand-in
+    # host without one would be testing a turn that skipped the guard entirely.
+    bot = SimpleNamespace(processor=MagicMock(), watermarks=ConversationWatermarks())
     bot.processor.process_message = AsyncMock(side_effect=process_error)
     bot.processor.thread_manager = None  # already_processing peek short-circuits
     client = MagicMock()

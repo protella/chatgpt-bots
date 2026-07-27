@@ -138,6 +138,16 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### ⏸️ Added - It won't answer a message that's already been overtaken
+
+If a newer message arrives in the same conversation while the bot is still composing, the
+outdated reply is dropped before it ever reaches Slack — the newer message owns the moment,
+exactly like a person abandoning a half-typed reply after the conversation moves on. Unprompted
+channel replies get the strongest form: nothing is posted until the answer is complete and
+still current. Direct mentions and DMs keep their live streaming and are checked at the moment
+the reply starts. Dropped replies are recorded in the participation ledger, never delivered
+late.
+
 ### 📍 Changed - It decides where to answer, as part of answering
 
 Whether a reply belongs in the thread or at the top level of the channel is now a choice the

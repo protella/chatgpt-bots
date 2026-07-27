@@ -36,7 +36,9 @@ class FakeNativeSession:
         self.active = False
         self._sent = ""
 
-    async def start(self, initial_text: str = "") -> bool:
+    async def start(self, initial_text: str = "", lease=None) -> bool:
+        if lease is not None:
+            lease.authorize("native_start")
         if not self.thread or self.slack.native_start_fails:
             self.active = False
             return False          # top-level (or a missing scope): Slack refuses to stream
@@ -110,7 +112,9 @@ class FakeSlack:
         return FakeNativeSession(self, channel, thread)
 
     # -- writes
-    async def send_message_get_ts(self, channel, thread, text):
+    async def send_message_get_ts(self, channel, thread, text, lease=None, surface=None):
+        if lease is not None:
+            lease.authorize(surface or "legacy_seed")
         if self.refuse_post:
             return {"success": False}
         ts = self._mint("seed")
@@ -121,17 +125,25 @@ class FakeSlack:
     MAX_MESSAGE_LENGTH = 3900
 
     async def send_message(self, channel, thread, text, blocks=None, meta_out=None,
-                           username=None):
+                           username=None, lease=None, surface=None):
         """Splits like the real client, and returns the FIRST chunk's ts (or None on failure —
-        the real one swallows SlackApiError, which is exactly the silent-loss hole)."""
+        the real one swallows SlackApiError, which is exactly the silent-loss hole).
+
+        The stale guard runs BEFORE the post and OUTSIDE the failure path, exactly as the real
+        one does: a suppression is not a failed send."""
+        if lease is not None:
+            lease.authorize(surface or "final_post")
         if self.refuse_post:
-            return None
+            return None   # a real failure leaves the lease PENDING, so a retry rechecks
         first = None
         for i in range(0, len(text), self.MAX_MESSAGE_LENGTH):
             ts = self._mint("post")
             self.calls.append(("postMessage", ts))
             self._write(ts, text[i:i + self.MAX_MESSAGE_LENGTH])
-            first = first or ts
+            if first is None:
+                first = ts
+                if lease is not None:
+                    lease.commit()   # mirrors the real client: commit on the FIRST landed chunk
         return first
 
     async def update_message(self, channel, ts, text):
@@ -141,7 +153,9 @@ class FakeSlack:
         self._write(ts, text)
         return True
 
-    async def update_message_streaming(self, channel, ts, text):
+    async def update_message_streaming(self, channel, ts, text, lease=None, surface=None):
+        if lease is not None:
+            lease.authorize(surface or "legacy_update")
         if ts not in self.live:
             return {"success": False, "error": "message_not_found"}
         self.calls.append(("update", ts))
@@ -552,10 +566,11 @@ class _FooterSlack(FakeSlack):
              "text": {"type": "plain_text", "text": f"⚙️ {model}"}}]}]
 
     async def send_message(self, channel, thread, text, blocks=None, meta_out=None,
-                           username=None):
+                           username=None, lease=None, surface=None):
         if meta_out is not None:
             meta_out["footer_attached"] = bool(blocks)
-        return await FakeSlack.send_message(self, channel, thread, text, blocks=blocks)
+        return await FakeSlack.send_message(self, channel, thread, text, blocks=blocks,
+                                            lease=lease, surface=surface)
 
 
 @pytest.mark.asyncio

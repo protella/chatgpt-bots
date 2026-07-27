@@ -209,7 +209,13 @@ class ToolRegistry:
         return bool(self.schemas(thread_config))
 
     async def dispatch(self, ctx: ToolContext, name: str, arguments: Any) -> Dict[str, Any]:
-        """Run one tool call. Never raises."""
+        """Run one tool call.
+
+        Returns a result for everything a tool can do wrong — an unknown name, bad arguments, a
+        timeout, a bug — so a broken tool never kills the response. The ONE exception it lets
+        through is `StaleSendSuppressed`: a guarded tool declining to post because the
+        conversation moved on is control flow, and reporting it as a tool error would have the
+        model retry the post the guard just refused."""
         tool = self._tools.get(name)
         if tool is None:
             return {"ok": False, "error": "unknown_tool", "message": f"No tool named '{name}'."}
@@ -233,6 +239,14 @@ class ToolRegistry:
             return {"ok": False, "error": "timeout",
                     "message": f"Tool '{name}' timed out after {timeout:.0f}s."}
         except Exception as e:  # noqa: BLE001 — a tool bug must not kill the response
+            # A guarded tool (post_to_thread) can decline to post because the conversation moved
+            # on. That is control flow, not a tool bug: reported as `execution_error` the model
+            # would read it as a broken tool and try again, which is the one thing a suppression
+            # must never cause. Imported lazily — this module sits UNDER message_processor in
+            # the import graph, so naming it at module scope is a cycle.
+            from message_processor.stale_send_guard import StaleSendSuppressed
+            if isinstance(e, StaleSendSuppressed):
+                raise
             return {"ok": False, "error": "execution_error", "message": str(e)[:500]}
 
     async def dispatch_all(self, ctx: ToolContext, calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
