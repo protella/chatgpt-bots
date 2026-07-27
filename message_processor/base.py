@@ -219,27 +219,28 @@ class MessageProcessor(ThreadManagementMixin,
             # Update thread state with current model for token limit calculations
             thread_state.current_model = thread_config["model"]
             
-            # Always regenerate system prompt to get current time
-            user_timezone = message.metadata.get("user_timezone", "UTC") if message.metadata else "UTC"
-            user_tz_label = message.metadata.get("user_tz_label", None) if message.metadata else None
+            # Ensure the current requester is in the @mention roster
             user_real_name = message.metadata.get("user_real_name", None) if message.metadata else None
-            user_email = message.metadata.get("user_email", None) if message.metadata else None
-            web_search_enabled = thread_config.get('enable_web_search', config.enable_web_search)
-            # Ensure the current requester is in the @mention roster, then build it
             if message.user_id:
                 thread_state.participants.setdefault(
                     message.user_id,
                     user_real_name or (message.metadata.get("username") if message.metadata else None) or message.user_id,
                 )
-            participant_roster = self._build_participant_roster(thread_state, client)
             # Phase 7: per-channel ground rules ride on the message metadata into the prompt
             thread_state.channel_directives = message.metadata.get("channel_directives") if message.metadata else None
-            # Phase 9: inject this channel's durable memory (None when disabled/empty → prompt unchanged)
+            # Phase 9: ONE channel-memory snapshot for this RESPONDER TURN, read here and passed
+            # down. The handlers build the real prompt themselves and every retry path re-enters
+            # them (context retry, streaming fallback, the timeout retry below), so a per-handler
+            # fetch would hit the DB several times for one turn and could hand two attempts of
+            # the SAME turn different memory. None when disabled/empty → prompt unchanged.
+            #
+            # Scope, precisely: the responder. The participation GATE still reads its own copy of
+            # channel memory before this code ever runs (main.py::_gate_verdict), so a message
+            # that came through the gate has had two reads and could in principle have been
+            # judged on facts the reply never sees. Making it one read for the gate AND the
+            # responder is the shared-memory-steering commit, not this one.
             channel_memory_text = await self._build_channel_memory_text(message.channel_id)
-            # Channel name/topic/purpose ride in the prompt by default (cached; None in DMs)
-            channel_info = await self._build_channel_info(client, message.channel_id)
-            thread_state.system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, thread_config["model"], web_search_enabled, thread_state.has_trimmed_messages, thread_config.get('custom_instructions'), participant_roster=participant_roster, channel_directives=thread_state.channel_directives, channel_memory=channel_memory_text, channel_info=channel_info)
-            
+
             # F32: ONE artifact sink for the whole turn. The timeout/MCP retries below re-enter
             # the text handler; a per-attempt sink would drop the container id of an attempt that
             # ran code interpreter and then failed, stranding the file it wrote in the sandbox.
@@ -513,7 +514,8 @@ class MessageProcessor(ThreadManagementMixin,
 
             response = await self._handle_text_response(
                 user_content, thread_state, client, message, thinking_id, retry_count=0,
-                artifacts_acc=turn_artifacts, turn=turn)
+                artifacts_acc=turn_artifacts, turn=turn,
+                channel_memory_text=channel_memory_text)
 
             # DEBUG: log conversation history after processing (with truncated content).
             # log_debug, not print — conversation content must not leak to stdout
@@ -601,7 +603,9 @@ class MessageProcessor(ThreadManagementMixin,
                         retry_content,
                         thread_state, client, message, thinking_id,
                         retry_count=1,
-                        artifacts_acc=turn_artifacts, turn=turn
+                        artifacts_acc=turn_artifacts, turn=turn,
+                        # Same snapshot as the attempt that timed out — one responder turn.
+                        channel_memory_text=channel_memory_text
                     )
                     self.log_info(f"Retry successful for {operation_type}")
                     return response
