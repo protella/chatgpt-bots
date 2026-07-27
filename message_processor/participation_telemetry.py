@@ -148,7 +148,14 @@ logger = setup_logger(name="slack_bot.ParticipationTelemetry")
 #     values (message_processor.terminal_actions), so v3 and v4 rows cannot be grouped together;
 #     and `reaction_visible` became explicit on every responder terminal rather than present
 #     only on replies, so its absence no longer means the same thing either.
-CONTRACT_VERSION = 4
+# v5: the ambiguous `placement` field is gone FROM THE TERMINAL EVENT, replaced there by
+#     `destination` + `destination_source`. It said "thread" for every turn that produced no
+#     words at all, so half the column described a decision nobody had made; the new pair is
+#     written only on terminals that delivered the responder's own reply, and says who decided
+#     as well as where it went. NOTE: `gate_decision` still carries its own `placement` — the
+#     gate's pre-answer verdict, which no longer routes anything and is removed with the rest of
+#     the rich verdict in the binary-gate commit.
+CONTRACT_VERSION = 5
 
 # WHICH gate produced these lines. The rich multi-signal classifier is "rich-v1"; a different
 # gate is a different population even at the same CONTRACT_VERSION, and the two must never be
@@ -793,6 +800,17 @@ def visible_action(channel_id: Optional[str], trigger_ts: Optional[str], *,
                           delivered outcome — Slack shows the reply, so the ledger must too —
                           and this says the turn was not clean.
       detached_started    a producer owned a surface AND the turn errored afterwards.
+      destination         WHERE the words went: thread | channel | dm. Present only on a
+                          terminal that delivered something — a silence has no destination, and
+                          the field it replaces (`placement`) claimed one anyway.
+      destination_source  WHO decided: `structural` (the route left no choice — a DM, a reply
+                          inside a thread, a channel that forbids top-level replies), `model`
+                          (it called set_reply_destination), or `default` (it was offered the
+                          choice and produced words without making one).
+      destination_contract_miss
+                          written ONLY when true: the model had the choice and skipped it. The
+                          answer was still delivered, in the default thread — this is a prompt
+                          problem worth counting, not a delivery failure.
       silence_reason      the model's own account of why it used no words: ONE of the eight
                           values in message_processor.terminal_actions, recorded verbatim, on
                           reaction_only and detached as well as silence. Never inferred from the

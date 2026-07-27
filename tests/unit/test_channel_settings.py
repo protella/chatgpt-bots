@@ -148,7 +148,7 @@ async def test_channel_message_surfaces_directives_and_reply_in_channel():
     assert bot.message_handler.await_count == 1
     msg = bot.message_handler.await_args.args[0]
     assert msg.metadata.get("channel_directives") == "only deploys"
-    assert msg.metadata.get("reply_in_channel") is True
+    assert msg.metadata.get("channel_post_allowed") is True
 
 
 def test_system_prompt_includes_channel_directives():

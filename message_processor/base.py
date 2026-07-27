@@ -207,11 +207,18 @@ class MessageProcessor(ThreadManagementMixin,
                 # back is a turn that might say nothing at all.
                 if not getattr(turn, "silence_capable", False):
                     timeout_msg = "⚠️ Heads up — my last answer in this thread never finished. Picking up from here."
-                    await client.send_message(
+                    notice_ts = await client.send_message(
                         channel_id=message.channel_id,
                         text=timeout_msg,
                         thread_id=message.thread_id
                     )
+                    # A notice that LANDED is a visible surface in the thread, so the answer
+                    # belongs with it — settle the destination there. Only on a confirmed send:
+                    # send_message swallows SlackApiError and returns None, and settling on a
+                    # notice nobody saw would silently withhold the destination choice and force
+                    # the reply into a thread for no reason the user could observe.
+                    if notice_ts and turn is not None:
+                        turn.settle_structural_thread()
                     self.log_info(f"Notified user about previous timeout in thread {thread_key}")
                 else:
                     self.log_debug(
@@ -304,11 +311,16 @@ class MessageProcessor(ThreadManagementMixin,
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                     message_ts = message.metadata.get("ts") if message.metadata else None
                     try:
-                        await client.send_message(
+                        notice_ts = await client.send_message(
                             channel_id=message.channel_id,
                             text=unsupported_msg,
                             thread_id=message.thread_id,
                         )
+                        # Same rule as the prior-timeout notice above, and the same reason for
+                        # waiting on the returned ts: only a notice that actually landed settles
+                        # where the answer goes.
+                        if notice_ts and turn is not None:
+                            turn.settle_structural_thread()
                     except Exception as notice_err:  # noqa: BLE001 — never fail the turn over the notice
                         self.log_warning(f"Failed to post mixed-path failed-files notice: {notice_err}")
                     # Add the unsupported files warning to conversation

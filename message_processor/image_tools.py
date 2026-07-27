@@ -346,7 +346,6 @@ async def execute_generate_image(ctx, args: Dict[str, Any]) -> Dict[str, Any]:
         # eye it has to take back. Best-effort: losing the emoji must never fail a reserved
         # generation.
         if turn is not None:
-            turn.mark_substantive_work()  # F46: real image generation ⇒ thread a top-level reply
             try:
                 await turn.claim_work(client, getattr(ctx, "message", None))
             except Exception as e:  # noqa: BLE001

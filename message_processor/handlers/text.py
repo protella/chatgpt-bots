@@ -8,7 +8,8 @@ from typing import Any, List, Optional
 from base_client import BaseClient, Message, Response
 from config import config, pipeline_status
 from message_processor.routing_facts import POSTURE_THREAD
-from prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX,
+from message_processor.destination_tools import SET_REPLY_DESTINATION
+from prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX, DESTINATION_CONTRACT_SUFFIX,
                      THREAD_ACTIVITY_NO_REPLY_SUFFIX)
 from message_markers import (
     CONTINUATION_HEAD,
@@ -69,28 +70,6 @@ def _legacy_fallback_target(overflow: Optional[str], native_current_ts: Optional
     return native_current_ts or current_message_id
 
 
-def native_stream_place_in_channel(message: Message) -> bool:
-    """Whether the native-stream coordinator should target the channel top level
-    (thread_ts None) instead of the thread — this must MATCH where main.py will
-    actually post the reply, or chat.startStream is created against the wrong target.
-
-    main.py stamps its final placement decision (which honors the participation
-    engine's per-message placement verdict) into metadata["place_in_channel"]; that
-    stamp WINS. Recomputing from the channel's reply_in_channel setting alone ignored
-    a "thread" verdict on a top-level trigger: the reply threaded, but the coordinator
-    was built with thread=None, so native streaming silently fell back to legacy (and
-    the F8 attached footer never rode — the reply grew a separate footer message).
-    The recompute survives only as a fallback for paths that bypass the stamp."""
-    meta = message.metadata or {}
-    if "place_in_channel" in meta:
-        return bool(meta.get("place_in_channel"))
-    is_top_level_trigger = meta.get("ts") == message.thread_id
-    return (
-        bool(meta.get("reply_in_channel")) and is_top_level_trigger
-        and bool(message.channel_id) and not message.channel_id.startswith("D")
-    )
-
-
 # F38: hosted tools whose "started" event means real, slow work is now under way — the point
 # at which a 👀 is honest. Everything else the callback fires for is deliberately absent:
 # `mcp` discovery (`discovering_tools`) is plumbing that runs before the model has decided to
@@ -131,19 +110,6 @@ def _claims_work(tool_type: str, status: str) -> bool:
     return status == "calling" and (tool_type == "mcp" or tool_type.startswith("mcp:"))
 
 
-def _hosted_or_mcp_used(tools_used) -> bool:
-    """F46: did this turn use a HOSTED, MCP, or code-interpreter tool — the thread-worthy ones?
-
-    The streaming path stakes substantive-work live via _claims_work on tool events; the
-    NON-streaming path resolves hosted/MCP/code tools server-side inside one response and emits
-    none, so it needs this end-of-turn check. Reuses the external-source filter (hosted + MCP;
-    it hides code_interpreter as plumbing) and adds an explicit code_interpreter check. Fast
-    LOCAL tools (memory/history/reactions) never count — the caller has already stripped them
-    from `tools_used` before this runs, so an empty list here means no thread-worthy work."""
-    tools = list(tools_used or [])
-    return bool(visible_attribution_tools(tools)) or "code_interpreter" in tools
-
-
 def _reaction_committed(local_tool_calls: Optional[List[dict]]) -> bool:
     """Did the model deliberately react as its response? A no_reply turn is allowed exactly
     one sibling: react_to_message. That reaction IS an answer, so a turn ending this way has
@@ -165,9 +131,9 @@ class TextHandlerMixin:
         return registry
 
     def _materialize_request_tools(self, client: BaseClient, thread_config: dict,
-                                   message: Message, tools_disabled: bool):
+                                   message: Message, tools_disabled: bool, turn: Any = None):
         """F2/F18: resolve this attempt's tool exposure ONCE, up front. Returns
-        (registry_or_None, request_config, no_reply_tool_available, no_reply_suffix).
+        (registry_or_None, request_config, no_reply_tool_available, contract_suffix).
 
         request_config is a COPY of the shared thread_config with `_silence_capable_turn` set on
         turns that get the silence option — the shared dict is never mutated. WHICH turns those
@@ -177,19 +143,33 @@ class TextHandlerMixin:
 
         no_reply_tool_available is derived from the resolved schema set (so it's False whenever
         the tool isn't actually exposed — timeout retries that drop the registry, config off,
-        addressed turns), and drives the tools array. no_reply_suffix is the matching volatile
+        addressed turns), and drives the tools array. contract_suffix carries the matching volatile
         contract paragraph or None — both key off the same exposure so instruction and tool can
         never disagree. WHICH paragraph is the `routing_posture` fact, not the gate: the
         paragraphs describe why this message is in front of the model, and thread activity has
         a rule channel activity does not (the addressee of a thread can move to someone else and
         STAY there). A thread message the gate judged and an untouched 1:1 continuation raise
-        exactly the same question, so they now read the same instruction."""
+        exactly the same question, so they now read the same instruction.
+
+        `set_reply_destination` rides the same one-place-decides rule: it is exposed only when
+        the TURN says both destinations are still open (a top-level trigger in a channel that
+        allows top-level replies, before the model has chosen), and its contract paragraph is
+        appended to the same volatile suffix slot. A turn with no choice to make — a DM, a
+        thread, a channel that forbids top-level replies — never sees the tool or the
+        paragraph."""
         meta = message.metadata or {}
         expose_no_reply = meta.get("silence_capable") is True
         thread_posture = meta.get("routing_posture") == POSTURE_THREAD
         request_config = dict(thread_config)
         if expose_no_reply:
             request_config["_silence_capable_turn"] = True
+        # Both destinations legal AND still unchosen. Read off the live turn, so a retry after
+        # the model has already chosen does not re-open a settled question.
+        destination_open = bool(turn is not None
+                                and not getattr(turn, "destination_selected", True)
+                                and not getattr(turn, "destination_locked", False))
+        if destination_open:
+            request_config["_destination_choice_open"] = True
         # Was the bot DIRECTLY addressed by a PERSON in THIS message? This authorizes the
         # irreversible canvas-delete tool (canvas_tools._delete_enabled), and it now earns the SAME
         # rigor as the structural tool below. The old signal keyed off the loose name-hit regex,
@@ -238,16 +218,24 @@ class TextHandlerMixin:
             return None, request_config, False, None
         registry = self._get_tool_registry(client, request_config)
         no_reply_available = False
-        no_reply_suffix = None
+        paragraphs = []
         if registry is not None and expose_no_reply and config.enable_no_reply_tool:
             no_reply_available = any(
                 s.get("name") == "no_response_needed"
                 for s in registry.schemas(request_config)
             )
             if no_reply_available:
-                no_reply_suffix = (THREAD_ACTIVITY_NO_REPLY_SUFFIX if thread_posture
-                                   else CHANNEL_ACTIVITY_NO_REPLY_SUFFIX)
-        return registry, request_config, no_reply_available, no_reply_suffix
+                paragraphs.append(THREAD_ACTIVITY_NO_REPLY_SUFFIX if thread_posture
+                                  else CHANNEL_ACTIVITY_NO_REPLY_SUFFIX)
+        # Same rule as above: the paragraph rides only when the tool is genuinely in the
+        # resolved schema set, so a timeout retry that drops the registry drops both together
+        # and the model is never told to call something it cannot see.
+        if registry is not None and destination_open and any(
+                s.get("name") == SET_REPLY_DESTINATION
+                for s in registry.schemas(request_config)):
+            paragraphs.append(DESTINATION_CONTRACT_SUFFIX)
+        return (registry, request_config, no_reply_available,
+                "\n\n".join(paragraphs) if paragraphs else None)
 
     @staticmethod
     def _current_image_urls(user_content: Any) -> List[str]:
@@ -512,9 +500,9 @@ class TextHandlerMixin:
         retry_timeout = 60.0 if retry_count > 0 else None
         # F2: resolve this attempt's tool exposure ONCE. The timeout-retry path runs the
         # loop-less API, so it disables the registry — and (Codex finding 19) that same
-        # flag must drop the suffix paragraph, which falls out of no_reply_suffix below.
-        registry, request_config, no_reply_available, no_reply_suffix = self._materialize_request_tools(
-            client, thread_config, message, tools_disabled=bool(retry_timeout))
+        # flag must drop the contract paragraphs, which falls out of contract_suffix below.
+        registry, request_config, no_reply_available, contract_suffix = self._materialize_request_tools(
+            client, thread_config, message, tools_disabled=bool(retry_timeout), turn=turn)
 
         # Prompt-cache hygiene: volatile context (minute-precision time + channel-activity
         # envelope + F1 in-flight note) rides at the SUFFIX (last message), never in the
@@ -525,8 +513,8 @@ class TextHandlerMixin:
                                             thread_state.thread_ts,
                                             user_timezone, user_tz_label,
                                             message=message, thread_state=thread_state)
-        if no_reply_suffix:
-            suffix = f"{suffix}\n\n{no_reply_suffix}"
+        if contract_suffix:
+            suffix = f"{suffix}\n\n{contract_suffix}"
         # Track 1 role authority: the persistent channel narrative is ambient, attacker-
         # influenceable content, so it rides its OWN untrusted role:user message placed BEFORE
         # the fresher pulse envelope (the developer suffix still comes LAST). Reads the PRIOR
@@ -620,6 +608,9 @@ class TextHandlerMixin:
                     registry=registry,
                     tool_context=tool_context,
                     prior_committed=visible_already_committed,
+                    # Same free-tool accounting the streaming loop gets: bookkeeping must not
+                    # spend the budget a real tool needs, on either path.
+                    free_tools=(SET_REPLY_DESTINATION,),
                     model=model,
                     temperature=thread_config["temperature"],
                     max_tokens=thread_config["max_tokens"],
@@ -861,22 +852,14 @@ class TextHandlerMixin:
         tools_actually_used = [t for t in tools_actually_used if t not in local_names]
         attribution_tools = visible_attribution_tools(tools_actually_used)
 
-        # F46: on the NON-streaming path a hosted web_search / MCP / code_interpreter call resolves
-        # server-side inside one response and emits no streaming tool events, so _claims_work never
-        # fires and the turn would wrongly stay top-level. Mark substantive work here from the
-        # already-local-filtered tool list (so fast local tools never count) BEFORE placement
-        # resolves. The streaming path still marks via _claims_work. Idempotent; fail-open.
-        if turn is not None and _hosted_or_mcp_used(tools_actually_used):
-            turn.mark_substantive_work()
-        # F46: resolve placement BEFORE reading place_in_channel. A top-level channel reply
-        # that did substantive work (e.g. a slow local tool on the non-streaming path) is
-        # threaded under the trigger; resolve_reply_target flips place_in_channel so attribution
-        # renders and main.py rebinds its send target. Idempotent; no-op otherwise; fail-open.
+        # The model may still owe a destination on this path (the non-streaming loop runs the
+        # same tools): settle it now, before anything reads where the reply is going. A no-op
+        # when the model already chose, or when the route settled it.
         if turn is not None:
-            turn.resolve_reply_target(message)
+            turn.settle_default_destination()
         # Top-level channel replies stay chrome-free; attribution rides only in
         # threads and DMs.
-        show_attribution = not bool((message.metadata or {}).get("place_in_channel"))
+        show_attribution = not (turn is not None and turn.final_post_only)
 
         # Use the actual tools that were invoked (from response metadata)
         if (attribution_tools or failed_mcp_server) and show_attribution:
@@ -1101,11 +1084,11 @@ class TextHandlerMixin:
         # F2: resolve this turn's tool exposure ONCE. Streaming retries fall back to the
         # non-streaming path, so tools are never disabled here (tools_disabled=False).
         # request_config carries the per-turn _silence_capable_turn flag that exposes
-        # no_response_needed; no_reply_suffix drives the contract paragraph — both mirror
+        # no_response_needed; contract_suffix carries the matching paragraphs — both mirror
         # the non-streaming path so unprompted/continuation streamed turns get the same
         # contract (F2 unprompted vs F18 continuation wording).
-        registry, request_config, no_reply_available, no_reply_suffix = self._materialize_request_tools(
-            client, thread_config, message, tools_disabled=False)
+        registry, request_config, no_reply_available, contract_suffix = self._materialize_request_tools(
+            client, thread_config, message, tools_disabled=False, turn=turn)
 
         # Prompt-cache hygiene: volatile context (minute-precision time + channel-activity
         # envelope) rides at the SUFFIX (last message), never in the system prompt, so the
@@ -1114,8 +1097,8 @@ class TextHandlerMixin:
                                             thread_state.thread_ts,
                                             user_timezone, user_tz_label,
                                             message=message, thread_state=thread_state)
-        if no_reply_suffix:
-            suffix = f"{suffix}\n\n{no_reply_suffix}"
+        if contract_suffix:
+            suffix = f"{suffix}\n\n{contract_suffix}"
         # Track 1 role authority: the persistent channel narrative rides its OWN untrusted
         # role:user message BEFORE the pulse envelope (see the non-streaming path for rationale);
         # the developer suffix still comes last. Reads the prior summary; refresh is detached.
@@ -1228,10 +1211,6 @@ class TextHandlerMixin:
             # pass. Fires BEFORE the native-stream guard below (which returns early once the
             # stream owns the message).
             if turn is not None and _claims_work(tool_type, status):
-                # F46: the same hosted/MCP work signal also forces a top-level channel reply
-                # into a thread at final-post time (resolve_reply_target). Recorded here rather
-                # than inside claim_work(), which early-returns when enable_ack_reaction is off.
-                turn.mark_substantive_work()
                 await turn.claim_work(client, message)
 
             # Time the inline sandbox (see sandbox_call_started). "interpreting" is a phase of the
@@ -1421,21 +1400,24 @@ class TextHandlerMixin:
         # buffer (Slack) and the returned canonical text agree.
         pending_segment_break = False
         overflow_buffer = ""
-        # F38: the ONE authoritative answer to "where does a reply this turn creates go?".
-        # None = top-level in the channel. Every message the streaming paths mint — the lazy
-        # seed, overflow parts, the zero-chunk final post — must use this and never
-        # `message.thread_id`, which is merely the thread the TRIGGER lives in. They got away
-        # with the latter only because a placeholder already existed in the right place.
-        reply_target = (turn.reply_thread_id if turn is not None
-                        else (None if native_stream_place_in_channel(message)
-                              else message.thread_id))
+        # WHERE a reply this turn creates goes — None means top-level in the channel. Every
+        # message the streaming paths mint (the lazy seed, overflow parts, the zero-chunk final
+        # post) uses this and never `message.thread_id`, which is merely the thread the TRIGGER
+        # lives in.
+        #
+        # On an ELIGIBLE turn (a top-level trigger in a channel that allows both) this is not
+        # known yet: the model has to call set_reply_destination first. Such a turn starts in
+        # the buffering posture — no surface, no coordinator, nothing anywhere — and binds at
+        # the first word of the answer, by which time the tool round has long since finished.
+        # Structurally-placed turns (DM, in-thread, channel-posting forbidden) bind immediately
+        # and behave exactly as they always have.
+        destination_bound = False
+        reply_target = None
         # F39: a top-level channel reply cannot stream (chat.startStream REQUIRES thread_ts) and
         # must not be faked with an edit loop, which brands the message "(edited)". Write
-        # nothing until the answer is whole, then post it once. See TurnRuntime.final_post_only.
-        final_post_only = bool(
-            turn.final_post_only if turn is not None
-            else (reply_target is None and bool(message.channel_id)
-                  and not str(message.channel_id).startswith("D")))
+        # nothing until the answer is whole, then post it once. An unbound turn buffers for the
+        # same reason: it cannot open a surface in a place the answer may not go.
+        final_post_only = True
         final_post_failed = False
         # A reply message this attempt created itself (no placeholder). An MCP retry inherits
         # it so the turn edits its existing answer instead of posting a second one.
@@ -1455,15 +1437,42 @@ class TextHandlerMixin:
         # Any start/append failure flips the coordinator inert and the legacy
         # update_message_streaming edit loop below takes over seamlessly.
         native_coord = None
-        if (not final_post_only
-                and hasattr(client, "supports_native_streaming") and client.supports_native_streaming()
-                and hasattr(client, "begin_native_stream")):
-            native_coord = NativeStreamCoordinator(
-                client, message.channel_id,
-                reply_target,
-                char_limit=message_char_limit, logger=self.log_debug,
-                user_id=message.user_id,
-            )
+
+        def _bind_destination() -> None:
+            """Fix this turn's reply target, once. Idempotent.
+
+            Called immediately for a turn whose destination the route already settled, and at
+            the FIRST word for one that was waiting on the model. Binding is also the moment
+            the destination stops being a preference: a surface is about to exist, and a later
+            change would strand it."""
+            nonlocal destination_bound, reply_target, final_post_only, native_coord
+            if destination_bound:
+                return
+            destination_bound = True
+            if turn is not None:
+                turn.settle_default_destination()   # no-op unless the model never chose
+                reply_target = turn.resolve_reply_target(message)
+                final_post_only = turn.final_post_only
+                turn.lock_destination()
+            else:
+                # No turn (exotic callers, older tests): the trigger's own thread, streaming as
+                # before. Never the channel top level — that is a decision, and nobody made it.
+                reply_target = getattr(message, "thread_id", None)
+                final_post_only = False
+            if (not final_post_only
+                    and hasattr(client, "supports_native_streaming")
+                    and client.supports_native_streaming()
+                    and hasattr(client, "begin_native_stream")):
+                native_coord = NativeStreamCoordinator(
+                    client, message.channel_id,
+                    reply_target,
+                    char_limit=message_char_limit, logger=self.log_debug,
+                    user_id=message.user_id,
+                )
+
+        # Structurally placed turns bind now, so nothing about their lifecycle changes.
+        if turn is None or turn.destination_selected:
+            _bind_destination()
 
         # Start progress updater task (will be cancelled when streaming starts)
         progress_task = None
@@ -1567,6 +1576,15 @@ class TextHandlerMixin:
                 sep = segment_separator(buffer.get_complete_text(), text_chunk)
                 if sep:
                     buffer.add_chunk(sep)
+
+            # ---- Bind the destination before ANY surface work ----
+            # The answer has started, so wherever it is going is now decided: either the model
+            # called set_reply_destination in an earlier round, or it never will and the default
+            # thread takes it. Runs before the branches below because each of them mints or
+            # edits a message, and one cannot be created until the target is known. A no-op for
+            # every turn whose route settled this before the loop began.
+            if text_chunk is not None and not destination_bound:
+                _bind_destination()
 
             # ---- F39: final-post-only (top-level channel reply) ----
             # Slack has no way to stream here, and the edit loop below would brand the answer
@@ -2002,6 +2020,9 @@ class TextHandlerMixin:
                     # to match what streamed to Slack. Deep research et al. keep the default
                     # (final-round-only) so intermediate preambles never leak into their output.
                     aggregate_segments=True,
+                    # set_reply_destination is BOOKKEEPING: it produces nothing and must never
+                    # take a round slot a real tool needs (F37 free-tool accounting).
+                    free_tools=(SET_REPLY_DESTINATION,),
                     prior_committed=visible_already_committed,
                     model=model,
                     temperature=thread_config["temperature"],
@@ -2173,16 +2194,12 @@ class TextHandlerMixin:
                 if name not in tools_used:
                     tools_used.append(name)
 
-            # F46: resolve placement BEFORE show_attribution reads place_in_channel. A
-            # top-level channel reply that did substantive work is threaded under the trigger,
-            # and resolve_reply_target flips message.metadata["place_in_channel"] to False — so
-            # a flipped reply's attribution/footer render as the threaded reply it now is.
-            # Idempotent and a no-op for in-thread/no-work turns; fail-open.
-            if turn is not None:
-                turn.resolve_reply_target(message)
-            # Top-level channel replies stay chrome-free; attribution rides only in
-            # threads and DMs.
-            show_attribution = not bool((message.metadata or {}).get("place_in_channel"))
+            # Top-level channel replies stay chrome-free; attribution rides only in threads and
+            # DMs. Binding is idempotent: it already happened at the first word of a streamed
+            # answer, and this covers the turn that produced text without ever streaming a chunk
+            # — which still has to land somewhere, and lands in the default thread.
+            _bind_destination()
+            show_attribution = not final_post_only
 
             # Add unified tools note at the END if any tools were used
             # This works for both paginated and non-paginated responses.
@@ -2271,12 +2288,11 @@ class TextHandlerMixin:
                 # placement yet. send_message splits it if it overflows.
                 self.log_info("No streaming message exists — posting final response directly")
                 try:
-                    # F46: the resolved target — a top-level channel reply that did substantive
-                    # work threads under the trigger (resolve_reply_target already flipped
-                    # place_in_channel above; this call is idempotent). No-op for in-thread/
-                    # no-work turns, where it returns reply_target unchanged.
-                    effective_target = (turn.resolve_reply_target(message)
-                                        if turn is not None else reply_target)
+                    # The destination bound at the first word of the answer; a turn that never
+                    # streamed one settled to the default just above. Either way this is where
+                    # the reply goes, and re-deriving it here is how the coordinator and the
+                    # final post used to end up in different places.
+                    effective_target = reply_target
                     # F52/F8: the settings footer must ride THIS message — the direct final-post
                     # path is the reply's only surface (an F39 top-level-then-threaded reply, a
                     # synthetic edit dispatch), so without attaching it here the "⚙️ <model>" row
@@ -2284,8 +2300,7 @@ class TextHandlerMixin:
                     # "gpt-5.6-sol" post). Same placement rule as the native stopStream finalize
                     # above: threaded replies only, never a top-level place-in-channel reply.
                     direct_footer_blocks = None
-                    if (not bool((message.metadata or {}).get("place_in_channel"))
-                            and hasattr(client, "attachable_footer_blocks")):
+                    if not final_post_only and hasattr(client, "attachable_footer_blocks"):
                         try:
                             direct_footer_blocks = client.attachable_footer_blocks(
                                 message.channel_id, thread_config.get("model"))

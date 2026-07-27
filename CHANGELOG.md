@@ -138,6 +138,15 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 📍 Changed - It decides where to answer, as part of answering
+
+Whether a reply belongs in the thread or at the top level of the channel is now a choice the
+answering model makes itself, message by message — not a separate mini-model guessing from the
+question, and not a heuristic that yanked long answers into a thread because a tool happened to
+run. Balanced calls default to the thread. Channels where top-level replies are switched off are
+unaffected: the choice is only offered where both destinations are allowed. The
+`ENABLE_MENTION_PLACEMENT_MODEL` setting is gone — remove it from your `.env` if you had set it.
+
 ### 🤐 Changed - When it stays quiet, it now says why (and finishes what it started)
 
 Choosing not to reply is now an explicit decision with a stated reason — one of eight

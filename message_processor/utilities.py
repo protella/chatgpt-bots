@@ -1702,10 +1702,13 @@ class MessageUtilitiesMixin:
         return str(source)  # app_mention | dm | thread_continuation | name_mention
 
     def _wake_sender_role(self, message, thread_state, md: dict) -> Optional[str]:
-        """'root author' vs 'participant' for the wake envelope, or None to omit the role
-        (top-level channel-placement replies, or an unknown root)."""
-        if md.get("place_in_channel"):
-            return None
+        """'root author' vs 'participant' for the wake envelope, or None when the root is unknown.
+
+        It used to also be omitted on a reply headed for the top level of a channel, on the
+        grounds that thread framing is irrelevant there. That suppression is gone, because the
+        destination is no longer known when this envelope is built — the model chooses it later,
+        with set_reply_destination — and a fact about the SENDER'S relationship to the
+        conversation was never really about where we were going to reply anyway."""
         root = getattr(thread_state, "root_author", None) if thread_state is not None else None
         if not root:
             return None

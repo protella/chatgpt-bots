@@ -702,21 +702,22 @@ class TestPlacement:
         return r
 
     @pytest.mark.asyncio
-    async def test_reply_in_channel_setting_posts_top_level_and_skips_footer(self):
-        """F39: a top-level channel reply gets NO placeholder — it is posted once, finished.
+    async def test_an_eligible_turn_shows_nothing_until_the_model_places_it(self):
+        """The allowance alone no longer sends a reply top-level: both destinations are legal,
+        so the MODEL chooses, and until it does the turn shows nothing anywhere — no
+        placeholder, in either location. Without a choice the answer takes the default thread.
 
-        It used to get one, and that was the "(edited)" bug: Slack can only stream into a
-        thread (chat.startStream REQUIRES thread_ts), so a top-level placeholder could only
-        become the answer by being chat.update-d — which brands the message "(edited)" forever.
-        A human teammate posts once; so do we.
+        (The "(edited)" rule is why a channel-destined turn still writes nothing until the end:
+        Slack can only stream into a thread, so a top-level placeholder could only become the
+        answer by being chat.update-d, which brands the message "(edited)" forever.)
         """
         app, client = self._app_with_processor(self._resp())
         msg = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
-                      metadata={"ts": "10.0", "reply_in_channel": True})
+                      metadata={"ts": "10.0", "channel_post_allowed": True})
         await app.handle_message(msg, client)
         client.send_thinking_indicator.assert_not_awaited()
-        assert client.send_message.await_args.args[1] is None  # top-level post
-        client.maybe_post_response_footer.assert_not_awaited()
+        assert client.send_message.await_args.args[1] == "10.0"   # default thread
+        client.maybe_post_response_footer.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_default_threads_and_footer_posts(self):
@@ -729,30 +730,21 @@ class TestPlacement:
         client.maybe_post_response_footer.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_engine_thread_verdict_overrides_reply_in_channel(self):
-        # reply_in_channel is an ALLOWANCE: when the engine judges the answer is
-        # worth a thread, the reply threads even with the setting on.
+    @pytest.mark.parametrize("gate_placement", ["thread", "channel"])
+    async def test_the_gate_placement_verdict_no_longer_routes_delivery(self, gate_placement):
+        """The gate forms its verdict BEFORE the answer exists, so it cannot know whether what
+        gets written belongs in the room or in a thread. Delivery now ignores it entirely — the
+        field survives only until the binary-gate commit removes it."""
         app, client = self._app_with_processor(self._resp())
         app.participation_engine = MagicMock()
-        verdict = ParticipationVerdict(action="respond", emoji="", placement="thread", reason="long answer")
+        verdict = ParticipationVerdict(action="respond", emoji="",
+                                       placement=gate_placement, reason="whatever")
         app._run_participation_gate = AsyncMock(return_value=verdict)
         msg = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
-                      metadata={"ts": "10.0", "reply_in_channel": True,
+                      metadata={"ts": "10.0", "channel_post_allowed": True,
                                 "gate_required": True, "silence_capable": True})
         await app.handle_message(msg, client)
-        assert client.send_message.await_args.args[1] == "10.0"  # threaded
-
-    @pytest.mark.asyncio
-    async def test_engine_channel_verdict_honored_with_setting_on(self):
-        app, client = self._app_with_processor(self._resp())
-        app.participation_engine = MagicMock()
-        verdict = ParticipationVerdict(action="respond", emoji="", placement="channel", reason="quick answer")
-        app._run_participation_gate = AsyncMock(return_value=verdict)
-        msg = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
-                      metadata={"ts": "10.0", "reply_in_channel": True,
-                                "gate_required": True, "silence_capable": True})
-        await app.handle_message(msg, client)
-        assert client.send_message.await_args.args[1] is None  # top-level
+        assert client.send_message.await_args.args[1] == "10.0"  # the default, either way
 
     @pytest.mark.asyncio
     async def test_thread_reply_never_moves_top_level_despite_setting(self):

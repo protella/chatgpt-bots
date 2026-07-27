@@ -543,16 +543,10 @@ class BotConfig:
     #   "off"          - never respond in channels.
     channel_response_mode: str = field(default_factory=lambda: os.getenv("CHANNEL_RESPONSE_MODE", "tag_only").strip().lower())
     # Default for channels with no explicit setting: may the bot answer a top-level
-    # message at channel level? (The engine still judges per message; a channel's
-    # saved setting overrides this.)
+    # message at channel level? This is an ALLOWANCE, not a decision: where both destinations
+    # are legal the MODEL chooses per reply (set_reply_destination). A channel's saved setting
+    # overrides this default.
     reply_in_channel_default: bool = field(default_factory=lambda: os.getenv("REPLY_IN_CHANNEL_DEFAULT", "true").lower() == "true")
-    # F46: judgment-call placement for MENTIONS/name-wakes (which run no participation gate and
-    # so carry no placement verdict). When on, a top-level public-channel mention that allows
-    # top-level replies gets one lean utility-model call deciding thread vs channel — so a
-    # deliberately-requested long-form deliverable ("write me a 3-paragraph story") threads even
-    # when no tool runs, like the Claude bot. DEFAULT OFF: inert until validated live on the dev
-    # bot; off ⇒ this block is skipped entirely (zero added latency/cost, zero behavior change).
-    enable_mention_placement_model: bool = field(default_factory=lambda: os.getenv("ENABLE_MENTION_PLACEMENT_MODEL", "false").lower() == "true")
     # Names the bot answers to without an @mention (case-insensitive whole-word match), so
     # "ChatGPT, can you…" wakes it. Keep in sync with the bot's display name(s).
     # Env: BOT_NAME_ALIASES (comma-separated) — SET THIS per environment (e.g. "ChatGPT-Dev" in dev).

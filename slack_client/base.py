@@ -24,6 +24,7 @@ from .channel_lookup_tool import (SlackChannelLookupToolMixin,
 from .search_tool import SlackSearchToolMixin
 from .channel_pulse import ChannelPulse
 from tool_registry import ToolRegistry
+from message_processor.destination_tools import register_destination_tools
 from message_processor.memory_tools import register_memory_tools
 from message_processor.participation_tools import register_participation_tools
 from message_processor.document_tools import register_document_tools
@@ -154,6 +155,10 @@ class SlackBot(SlackMessageEventsMixin,
         # traffic is judged; it has nothing to say about whether a person who addressed us may
         # adjust the settings. Authorization is the tool's own (human sender + a woken turn).
         register_participation_tools(registry)
+        # Where this reply goes, when there is genuinely a choice. The `enabled` predicate reads
+        # a per-request flag the text handler stamps from the live turn, so a DM, a thread, or a
+        # channel that forbids top-level replies never sees the tool at all.
+        register_destination_tools(registry)
         if config.enable_read_document_tool:
             register_document_tools(registry)  # summary+ref rows; content re-derived in memory
         # F51: fetch_url — the SAME hardened fetcher as ambient link capture, so a directly-asked
