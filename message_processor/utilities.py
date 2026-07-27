@@ -21,6 +21,18 @@ from prompts import (SLACK_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, LOCAL_TOOLS_GUIDANC
                      CODE_INTERPRETER_GUIDANCE, CANVAS_GUIDANCE)
 
 
+# How each participation level is DESCRIBED to the model. The wording tracks
+# set_channel_participation's schema deliberately: the model reads the setting here and changes it
+# there, and two descriptions of one setting is how "mentions-only" starts meaning two things.
+_PARTICIPATION_SETTING_LINES = {
+    "on": ("on — you see every ordinary message here and answer the ones worth answering, "
+           "whether or not you were addressed."),
+    "mentions_only": ("mentions-only — an explicit @-mention always reaches you, a bare use of "
+                      "your name is weighed first, and nothing else wakes you."),
+    "off": "off — you do not respond in this channel at all, not even to an explicit @-mention.",
+}
+
+
 def build_roster_text(participants, user_cache=None, bot_user_id=None):
     """Build a participant roster block mapping display name -> <@USER_ID> for the system prompt.
 
@@ -1245,6 +1257,28 @@ class MessageUtilitiesMixin:
                 ]
         except Exception:  # noqa: BLE001 — a canvas lookup must never cost the prompt
             pass
+
+        # This channel's participation settings — the ONLY place the model can learn them. The
+        # tool that CHANGES them has always been write-only, so asked "what's your setting in
+        # here?" the model had nothing to read and answered from what it could see: the chat
+        # history where somebody last said "switch to mentions only". Seen live, it reported a
+        # setting two changes stale and then invented a bug to explain the contradiction.
+        #
+        # Effective, not raw: an inheriting channel is told what it actually behaves as, which is
+        # the answer to the question being asked. Changes only when the settings change — the
+        # same prefix-cache profile as the topic and the steering block beside it.
+        try:
+            if self.db is not None:
+                from message_processor.participation import resolve_participation_level
+                cs = await self.db.get_channel_settings_async(channel_id) or {}
+                info = dict(info)
+                info["participation_level"] = resolve_participation_level(cs)
+                # NULL means inherit, and the global default allows the channel top level.
+                ric = cs.get("reply_in_channel")
+                info["reply_in_channel"] = bool(
+                    config.reply_in_channel_default if ric is None else ric)
+        except Exception:  # noqa: BLE001 — nor may a settings lookup
+            pass
         return info
 
     def _get_system_prompt(self, client: BaseClient, user_timezone: str = "UTC",
@@ -1371,7 +1405,8 @@ class MessageUtilitiesMixin:
         # None in DMs). Topics often carry load-bearing facts (links, owners, norms).
         channel_info_context = ""
         if channel_info and (channel_info.get("name") or channel_info.get("topic")
-                             or channel_info.get("purpose") or channel_info.get("canvases")):
+                             or channel_info.get("purpose") or channel_info.get("canvases")
+                             or channel_info.get("participation_level")):
             info_lines = []
             if channel_info.get("name"):
                 info_lines.append(f"This conversation is in the #{channel_info['name']} channel.")
@@ -1385,6 +1420,20 @@ class MessageUtilitiesMixin:
                 info_lines.append(
                     "Channel canvases (living documents you can read and edit):\n"
                     + "\n".join(f"- {t}" for t in channel_info["canvases"]))
+            # Your own settings HERE, so a question about them is answered by reading, not by
+            # reconstructing from history. What is stated is the CURRENT state; earlier messages
+            # in this channel asking for a different setting are history, not the setting.
+            participation_line = _PARTICIPATION_SETTING_LINES.get(
+                channel_info.get("participation_level") or "")
+            if participation_line:
+                info_lines.append(
+                    "Your participation setting in this channel: "
+                    f"{participation_line} "
+                    + ("Your replies may go to the channel's top level as well as into threads."
+                       if channel_info.get("reply_in_channel")
+                       else "Your replies stay inside a thread.")
+                    + " Only an explicit, direct instruction in someone's current message "
+                      "changes either of these, through set_channel_participation.")
             channel_info_context = "\n\n--- CHANNEL CONTEXT ---\n" + "\n".join(info_lines) + "\n--- END CHANNEL CONTEXT ---"
 
         # The channel's steering: its standing policy, the gate's recorded preferences, and the

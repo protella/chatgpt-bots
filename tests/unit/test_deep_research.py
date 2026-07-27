@@ -1895,3 +1895,90 @@ async def test_a_timeout_during_the_ack_cannot_orphan_a_live_job(monkeypatch):
     assert ctx.turn.visible_action_committed is True
     for coro in proc.scheduled:
         coro.close()
+
+
+# ---------------- the build worker's notes reach the delivering model ----------------
+#
+# A `build`-mode job has no research report, so before this the callback saw a filename list and
+# nothing else. Live symptom: "the callback didn't include a separate result summary, so I'm not
+# going to infer whether it resumed or remounted" — from a job that had just proved the answer.
+
+def _delivery_messages(stub):
+    return list((stub.delivery_kwargs or {}).get("messages") or [])
+
+
+def _wire_build_with_notes(monkeypatch, staged, notes):
+    async def _fake_build(**kw):
+        return {"ledger_key": "C1:100.0#job:j1", "container_ids": ["cntr_1"], "notes": notes,
+                "suppress_digests": set(), "expect_filenames": ["report.pdf"]}
+
+    async def _fake_stage(processor, *, job_id, build):
+        return list(staged)
+
+    async def _fake_release(processor, *, ledger_key):
+        return None
+
+    monkeypatch.setattr(rt, "_run_build_phase", _fake_build)
+    monkeypatch.setattr(rt, "_stage_build", _fake_stage)
+    monkeypatch.setattr(rt, "_release_build_container", _fake_release)
+
+
+async def _run_build_job(monkeypatch, stub, client):
+    proc = _FakeProcessor(openai_client=SimpleNamespace(
+        create_streaming_response_with_tool_loop=stub), tm=AsyncThreadStateManager())
+    await rt._run_background_job(
+        processor=proc, client=client, channel_id="C1", thread_root="100.0",
+        thread_key="C1:100.0", job_id="j1", task="t", mode="build",
+        snapshot=[], system_prompt="DEV", model="gpt-5.6-sol",
+        deliverables=[{"type": "pdf", "description": "d", "filename": "report.pdf"}])
+
+
+@pytest.mark.asyncio
+async def test_the_build_notes_reach_the_delivery_call(monkeypatch):
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    monkeypatch.setattr(config, "enable_research_label", False)
+    _wire_build_with_notes(monkeypatch, [_staged()], "The token matched round 1.")
+    _capture_publish(monkeypatch)
+    stub = _PlanStub(text="", plan={"reply": "Same token.", "publish": ["art_1"]})
+
+    await _run_build_job(monkeypatch, stub, _CardClient())
+
+    notes = [m for m in _delivery_messages(stub)
+             if "BUILD NOTES" in str(m.get("content") or "")]
+    assert len(notes) == 1
+    assert "The token matched round 1." in notes[0]["content"]
+    # USER role, for the same reason the report is: it may be quoting a mounted file.
+    assert notes[0]["role"] == "user"
+    # ...and the developer instruction still gets the last word.
+    assert _delivery_messages(stub)[-1]["role"] == "developer"
+
+
+@pytest.mark.asyncio
+async def test_build_notes_are_never_offered_as_a_postable_report(monkeypatch):
+    """Nobody asked to read a worker's log. `post_report` exists only when a real research
+    report does — notes must not resurrect it."""
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    monkeypatch.setattr(config, "enable_research_label", False)
+    _wire_build_with_notes(monkeypatch, [_staged()], "Wrote the file, verified the bytes.")
+    _capture_publish(monkeypatch)
+    stub = _PlanStub(text="", plan={"reply": "Done.", "publish": ["art_1"]})
+
+    await _run_build_job(monkeypatch, stub, _CardClient())
+
+    schemas = (stub.delivery_kwargs or {}).get("registry").schemas({})
+    deliver = next(s for s in schemas if s.get("name") == "deliver")
+    assert "post_report" not in deliver["parameters"]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_a_silent_build_adds_no_notes_block(monkeypatch):
+    monkeypatch.setattr(config, "enable_deep_research", True)
+    monkeypatch.setattr(config, "enable_research_label", False)
+    _wire_build_with_notes(monkeypatch, [_staged()], "   ")
+    _capture_publish(monkeypatch)
+    stub = _PlanStub(text="", plan={"reply": "Done.", "publish": ["art_1"]})
+
+    await _run_build_job(monkeypatch, stub, _CardClient())
+
+    assert not [m for m in _delivery_messages(stub)
+                if "BUILD NOTES" in str(m.get("content") or "")]
