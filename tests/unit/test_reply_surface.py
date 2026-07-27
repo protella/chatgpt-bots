@@ -267,6 +267,19 @@ def _processor(openai):
     return p
 
 
+def _thread_turn(message):
+    """A turn whose reply goes to the thread — the structural case (and the default)."""
+    return TurnRuntime.for_message(message, channel_post_allowed=False)
+
+
+def _channel_turn(message):
+    """An eligible turn on which the model chose the channel, exactly as production does it:
+    the choice is made by a tool call, never by constructing the state directly."""
+    turn = TurnRuntime.for_message(message, channel_post_allowed=True)
+    turn.select_destination("channel", message=message)
+    return turn
+
+
 async def _run(processor, slack, message, thread_state, turn, thinking_id=None):
     return await processor._handle_streaming_text_response(
         "hi", thread_state, slack, message, thinking_id, None, turn=turn)
@@ -301,7 +314,7 @@ async def test_native_mcp_retry_leaves_exactly_one_message(monkeypatch):
     openai = FakeOpenAI(["The answer ", "is 42."], error=MCP_ERROR)
     processor = _processor(openai)
     msg, ts = _message(), _thread_state()
-    turn = TurnRuntime.for_message(msg, "10.0")          # threaded -> native streams
+    turn = _thread_turn(msg)                             # threaded -> native streams
 
     resp = await _run(processor, slack, msg, ts, turn)
 
@@ -321,7 +334,7 @@ async def test_native_stands_down_when_it_cannot_clear_the_old_surface(monkeypat
     openai = FakeOpenAI(["hello"])
     processor = _processor(openai)
     msg, ts = _message(), _thread_state()
-    turn = TurnRuntime.for_message(msg, "10.0")
+    turn = _thread_turn(msg)
     placeholder = slack._mint("placeholder")
 
     resp = await _run(processor, slack, msg, ts, turn, thinking_id=placeholder)
@@ -341,7 +354,7 @@ async def test_a_multi_part_native_answer_is_fully_reconciled(monkeypatch):
     openai = FakeOpenAI(["x" * 2000, "y" * 2000], error=MCP_ERROR, retry_chunks=["done"])
     processor = _processor(openai)
     msg, ts = _message(), _thread_state()
-    turn = TurnRuntime.for_message(msg, "10.0")
+    turn = _thread_turn(msg)
 
     resp = await _run(processor, slack, msg, ts, turn)
 
@@ -362,7 +375,7 @@ async def test_a_legacy_seed_after_a_failed_native_start_is_still_reconciled(mon
     openai = FakeOpenAI(["partial answer"], error=ValueError("boom"))   # non-MCP -> fallback
     processor = _processor(openai)
     msg, ts = _message(), _thread_state()
-    turn = TurnRuntime.for_message(msg, "10.0")
+    turn = _thread_turn(msg)
 
     resp = await _run(processor, slack, msg, ts, turn)
 
@@ -383,7 +396,7 @@ async def test_when_deletes_fail_no_surface_is_left_holding_a_half_answer(monkey
     openai = FakeOpenAI(["x" * 2000, "y" * 2000], error=MCP_ERROR, retry_chunks=["done"])
     processor = _processor(openai)
     msg, ts = _message(), _thread_state()
-    turn = TurnRuntime.for_message(msg, "10.0")
+    turn = _thread_turn(msg)
 
     resp = await _run(processor, slack, msg, ts, turn)
 
@@ -405,7 +418,7 @@ async def test_a_long_top_level_answer_is_split_not_truncated(monkeypatch):
     long_answer = "para. " * 1200                      # ~7200 chars, well past Slack's limit
     processor = _processor(FakeOpenAI([long_answer]))
     msg, ts = _message(), _thread_state()
-    turn = TurnRuntime.for_message(msg, None)
+    turn = _channel_turn(msg)
 
     resp = await _run(processor, slack, msg, ts, turn)
 
@@ -430,7 +443,7 @@ async def test_the_cleanup_edit_counts_as_a_delivery(monkeypatch):
     openai = FakeOpenAI(["the partial answer"], error=ValueError("boom"))   # -> fallback
     processor = _processor(openai)
     msg, ts = _message(), _thread_state()
-    turn = TurnRuntime.for_message(msg, "10.0")
+    turn = _thread_turn(msg)
 
     resp = await _run(processor, slack, msg, ts, turn)
 
@@ -456,7 +469,7 @@ async def test_a_top_level_channel_reply_is_posted_once_never_edited(monkeypatch
     openai = FakeOpenAI(["Postgres defaults ", "to READ COMMITTED."])
     processor = _processor(openai)
     msg, ts = _message(), _thread_state()
-    turn = TurnRuntime.for_message(msg, None)            # main.py chose top-level placement
+    turn = _channel_turn(msg)                            # the model chose the channel
     assert turn.final_post_only
 
     resp = await _run(processor, slack, msg, ts, turn)
@@ -476,7 +489,7 @@ async def test_a_top_level_turn_shows_no_status_and_no_placeholder(monkeypatch):
     slack = FakeSlack(native=True)
     processor = _processor(FakeOpenAI(["hi"]))
     msg, ts = _message(), _thread_state()
-    turn = TurnRuntime.for_message(msg, None)
+    turn = _channel_turn(msg)
 
     await _run(processor, slack, msg, ts, turn)
 
@@ -492,7 +505,7 @@ async def test_a_threaded_reply_still_streams(monkeypatch):
     slack = FakeSlack(native=True)
     processor = _processor(FakeOpenAI(["still ", "streaming"]))
     msg, ts = _message(), _thread_state()
-    turn = TurnRuntime.for_message(msg, "10.0")
+    turn = _thread_turn(msg)
     assert not turn.final_post_only
 
     await _run(processor, slack, msg, ts, turn)
@@ -510,7 +523,7 @@ async def test_a_failed_final_post_hands_the_answer_back_instead_of_dropping_it(
     slack = FakeSlack(native=True, refuse_post=True)
     processor = _processor(FakeOpenAI(["the answer"]))
     msg, ts = _message(), _thread_state()
-    turn = TurnRuntime.for_message(msg, None)
+    turn = _channel_turn(msg)
 
     resp = await _run(processor, slack, msg, ts, turn)
 
@@ -546,25 +559,22 @@ class _FooterSlack(FakeSlack):
 
 
 @pytest.mark.asyncio
-async def test_direct_final_post_attaches_footer_to_the_reply(monkeypatch):
-    """Bug B: a top-level channel turn that did substantive work threads its answer via the
-    direct final-post path. The settings footer must ride THAT message, not arrive as a separate
-    standalone post (the bare "gpt-5.6-sol" message seen live 2026-07-16)."""
+async def test_a_thread_destined_answer_carries_its_footer_on_the_reply(monkeypatch):
+    """Bug B: the settings footer rides the reply itself, never a separate standalone post (the
+    bare "gpt-5.6-sol" message seen live 2026-07-16). Keyed on the DESTINATION now — a thread
+    gets the footer, the channel top level stays chrome-free (the test below)."""
     monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
     slack = _FooterSlack(native=True)
-    processor = _processor(FakeOpenAI(["Postgres defaults to READ COMMITTED."]))
-    msg = _message(thread=None, place_in_channel=True)   # top-level channel trigger
-    ts = _thread_state()
-    turn = TurnRuntime.for_message(msg, None)             # → final_post_only, direct-post path
-    turn.mark_substantive_work()                          # a tool ran → threads under the trigger
+    processor = _processor(FakeOpenAI([], error=MCP_ERROR,
+                                      retry_chunks=["Postgres defaults to READ COMMITTED."]))
+    msg, ts = _message(), _thread_state()
+    turn = _thread_turn(msg)
 
     resp = await _run(processor, slack, msg, ts, turn)
 
-    # place_in_channel flipped to a threaded reply, so the footer rode the message…
-    assert msg.metadata.get("place_in_channel") is False
     assert resp.metadata.get("footer_attached") is True
-    # …and there is exactly ONE message (no separate standalone footer post).
-    assert len([c for c in slack.calls if c[0] == "postMessage"]) == 1
+    assert _surfaces_on_screen(slack, resp) == 1, (
+        f"the footer arrived as its own message: {slack.calls}")
 
 
 @pytest.mark.asyncio
@@ -574,25 +584,31 @@ async def test_direct_final_post_top_level_suppresses_footer(monkeypatch):
     monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
     slack = _FooterSlack(native=True)
     processor = _processor(FakeOpenAI(["quick answer"]))
-    msg = _message(thread=None, place_in_channel=True)
-    ts = _thread_state()
-    turn = TurnRuntime.for_message(msg, None)             # no mark_substantive_work → stays top-level
+    msg, ts = _message(), _thread_state()
+    turn = _channel_turn(msg)                             # the model chose the channel
 
     resp = await _run(processor, slack, msg, ts, turn)
 
-    assert msg.metadata.get("place_in_channel") is True
     assert resp.metadata.get("footer_attached") is not True
 
 
 # ============================================================ 3. the placement rule
 
-def test_final_post_only_is_exactly_top_level_in_a_channel(monkeypatch):
+def test_final_post_only_is_exactly_a_channel_destination(monkeypatch):
+    """It is now derived from WHERE the reply is going, not re-guessed from the trigger."""
     monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
 
-    assert TurnRuntime.for_message(_message(channel="C1"), None).final_post_only
-    assert not TurnRuntime.for_message(_message(channel="C1"), "10.0").final_post_only, \
+    assert _channel_turn(_message(channel="C1")).final_post_only
+    assert not _thread_turn(_message(channel="C1")).final_post_only, \
         "a threaded reply can stream natively — leave it alone"
-    assert not TurnRuntime.for_message(_message(channel="D1"), None).final_post_only, \
+    # An eligible turn defaults to the thread until the model says otherwise, and a channel
+    # that forbids top-level replies never becomes eligible at all.
+    assert not TurnRuntime.for_message(
+        _message(channel="C1"), channel_post_allowed=True).final_post_only
+    assert not TurnRuntime.for_message(
+        _message(channel="C1"), channel_post_allowed=False).final_post_only
+    assert not TurnRuntime.for_message(
+        _message(channel="D1"), channel_post_allowed=True).final_post_only, \
         "a DM is a conversation, not a public channel; it keeps its live reveal"
 
 
@@ -680,7 +696,7 @@ async def test_a_pre_tool_preamble_reaches_slack_before_the_tool_runs(monkeypatc
     openai = FakeToolLoopOpenAI(slack, preamble, ["Fixed. Landed clean."], tool=tool)
     processor = _processor_tools(openai)
     msg, ts = _message(), _thread_state()
-    turn = TurnRuntime.for_message(msg, "10.0")            # threaded -> native streams
+    turn = _thread_turn(msg)            # threaded -> native streams
 
     await _run(processor, slack, msg, ts, turn)
 
@@ -707,7 +723,7 @@ async def test_start_background_jobs_ack_is_not_flushed_early(monkeypatch):
                                 ["Done."], tool="local:start_background_job")
     processor = _processor_tools(openai)
     msg, ts = _message(), _thread_state()
-    turn = TurnRuntime.for_message(msg, "10.0")
+    turn = _thread_turn(msg)
 
     await _run(processor, slack, msg, ts, turn)
 
@@ -732,7 +748,7 @@ async def test_the_seam_between_a_preamble_and_the_post_tool_text_is_not_jammed(
     openai = FakeToolLoopOpenAI(slack, ["Fixing the chopsticks under Super Heavy."], ["Fixed."])
     processor = _processor_tools(openai)
     msg, ts = _message(), _thread_state()
-    turn = TurnRuntime.for_message(msg, "10.0")
+    turn = _thread_turn(msg)
 
     await _run(processor, slack, msg, ts, turn)
 
@@ -769,7 +785,7 @@ async def test_a_slow_inline_sandbox_call_is_logged_as_a_routing_failure(
     processor.log_debug = lambda m, *a, **k: debugs.append(str(m))
     msg, ts = _message(), _thread_state()
 
-    await _run(processor, slack, msg, ts, TurnRuntime.for_message(msg, "10.0"))
+    await _run(processor, slack, msg, ts, _thread_turn(msg))
 
     slow = [m for m in warnings if "Inline sandbox call held the reply" in m]
     if warns:

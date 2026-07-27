@@ -107,12 +107,14 @@ def test_sender_bot_flag():
         assert "root author — bot" in env
 
 
-def test_top_level_channel_placement_omits_role():
+def test_the_role_no_longer_depends_on_where_the_reply_will_go():
+    """The role used to be suppressed for a reply headed top-level. Where the reply goes is now
+    the model's call, made later in the turn — so the envelope states the sender's relationship
+    to the conversation and leaves placement to the tool that owns it."""
     env = _WakeHost()._build_wake_envelope(
-        _msg(wake_source="app_mention", sender_type="human", place_in_channel=True), _state())
-    # No role token, but the sender line is still present.
+        _msg(wake_source="app_mention", sender_type="human"), _state())
     assert "sender: alice" in env
-    assert "root author" not in env and "participant" not in env
+    assert "root author" in env
 
 
 def test_unknown_root_omits_role():

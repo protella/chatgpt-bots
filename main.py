@@ -20,6 +20,18 @@ from message_processor.turn_runtime import TurnRuntime
 from message_processor import thread_files
 from base_client import BaseClient, Message
 
+# Terminals whose visible surface is the RESPONDER'S OWN reply, and which therefore have a
+# destination worth recording. `destination` means where that reply actually went (on
+# `delivery_failed`, where it was ATTEMPTED — the send is what failed, not the choice).
+#
+# `detached` is deliberately absent. A detached producer — generate_image, a background job's
+# status card — posts its own surface, targeting the trigger's thread directly rather than the
+# responder's destination, so reporting the turn's destination for it would describe a reply
+# that was never sent. `kind=detached` already records what happened; the destination column
+# stays honest by saying nothing. Silences, reactions, queued turns and contract failures went
+# nowhere at all.
+_DELIVERED_KINDS = frozenset({"reply", "delivery_failed", "interrupted"})
+
 
 class ChatBotV2:
     """Main application class for multi-platform chat bot"""
@@ -858,7 +870,6 @@ class ChatBotV2:
             # anything is posted. The reply outcomes fall through (respond, react_and_respond, and
             # a backoff requesting a settings change); a react_and_respond has already placed its
             # reaction in the gate, so only the words remain to send.
-            placement_verdict = None
             gate_required = message.metadata.get("gate_required") is True
             if gate_required:
                 try:
@@ -873,7 +884,6 @@ class ChatBotV2:
                     participation_telemetry.emit_queue_links(message, gate_required=True)
                 if verdict is None:
                     return
-                placement_verdict = verdict.placement
                 # Kept for logs and debugging ONLY — deliberately NOT rendered into the wake
                 # envelope any more (see utilities._wake_trigger_line): forwarding the gate's own
                 # justification pre-argued the turn and neutered the no_response_needed veto.
@@ -884,56 +894,15 @@ class ChatBotV2:
                 if isinstance(message.metadata, dict) and getattr(verdict, "burst_earlier", None):
                     message.metadata["participation_burst_earlier"] = verdict.burst_earlier
 
-            # F46: judgment-call placement for MENTIONS/name-wakes. These run NO participation gate
-            # (so placement_verdict is still None) and default to a top-level reply — but a
-            # deliberately-requested long-form deliverable ("write me a 3-paragraph story") reads
-            # better in a thread, and no tool fires for it so the did_substantive_work override can't
-            # catch it. One lean utility-model call decides thread vs channel, feeding the UNCHANGED
-            # place_in_channel logic below. Gated behind enable_mention_placement_model (DEFAULT OFF):
-            # flag off ⇒ skipped entirely, zero added latency/cost, zero behavior change. Only for a
-            # top-level PUBLIC-channel trigger where top-level replies are allowed and no gate verdict
-            # exists (never override the engine's verdict). Fail-open: classify_placement returns
-            # "channel" on any error, and a raised call must not break the reply.
-            if (getattr(config, "enable_mention_placement_model", False)
-                    and placement_verdict is None
-                    and message.metadata.get("ts") == message.thread_id
-                    and bool(message.metadata.get("reply_in_channel"))
-                    and message.channel_id and not message.channel_id.startswith("D")):
-                try:
-                    placement_verdict = await self.processor.openai_client.classify_placement(
-                        message.text)
-                    main_logger.debug(
-                        f"Mention placement: verdict={placement_verdict} for a top-level "
-                        f"public-channel mention")
-                except Exception as e:
-                    main_logger.debug(f"Mention placement call failed ({e}); staying top-level")
-                    placement_verdict = None
-
-            # Phase F placement (plan §4a, revised 2026-07-10): the channel's
-            # reply_in_channel setting is an ALLOWANCE, not a mandate — when it's ON and
-            # the trigger was top-level, the engine's per-message placement verdict
-            # decides ("channel" = quick top-level answer, "thread" = worth a thread).
-            # Mentions/name-wakes carry no verdict (no engine call) and reply top-level:
-            # the user summoned the bot at channel level. Setting OFF = everything
-            # threads. Images always thread (enforced in the image branch, which keys
-            # off message.thread_id regardless).
-            is_top_level_trigger = message.metadata.get("ts") == message.thread_id
-            place_in_channel = (
-                bool(message.metadata.get("reply_in_channel")) and is_top_level_trigger
-                and bool(message.channel_id) and not message.channel_id.startswith("D")
-                and placement_verdict != "thread"
-            )
-            if placement_verdict:
-                main_logger.debug(
-                    f"Placement: verdict={placement_verdict}, reply_in_channel_setting="
-                    f"{bool(message.metadata.get('reply_in_channel'))} → "
-                    f"{'channel' if place_in_channel else 'thread'}"
-                )
-            post_thread_id = None if place_in_channel else message.thread_id
-            # Handlers key presentation chrome off this (e.g. the Used Tools attribution
-            # line is suppressed on top-level channel replies).
-            if isinstance(message.metadata, dict):
-                message.metadata["place_in_channel"] = place_in_channel
+            # WHERE the reply goes is the turn's own state now, opened here and settled by the
+            # model on the one route where there is a choice (set_reply_destination). The gate's
+            # `placement` verdict is deliberately not consulted: it is formed before the answer
+            # exists, and only the writer knows whether what it just wrote belongs in the room or
+            # in a thread. See message_processor/destination_tools.py.
+            turn = TurnRuntime.for_message(
+                message,
+                channel_post_allowed=bool(message.metadata.get("channel_post_allowed")))
+            post_thread_id = turn.resolve_reply_target(message)
 
             # Phase Q: if this conversation is mid-processing, the message is about to be
             # queued (not answered now) — skip the thinking indicator so nothing flashes.
@@ -948,14 +917,11 @@ class ChatBotV2:
                 and thread_manager.is_thread_processing(message.thread_id, message.channel_id) is True
             )
 
-            # F38: what this turn is allowed to SHOW. A turn the model may end in silence gets no
-            # speculative chrome at all — no placeholder, no composer status (which would also
-            # auto-open the thread), no phase updates. The reply, if there is one, creates its own
-            # surface when the first words arrive; if there is none, nothing was ever posted.
-            turn = TurnRuntime.for_message(message, post_thread_id)
-
-            # Send initial thinking indicator (streamed replies grow inside this message,
-            # so placement is decided here).
+            # Send initial thinking indicator. A turn that may say nothing, one headed for the
+            # top level of a channel, and one still waiting for the model to choose where its
+            # reply goes all show NOTHING here — `turn.progress_enabled` is the single answer to
+            # "may this turn render speculative chrome", and each of those three would otherwise
+            # put a placeholder somewhere the answer might not arrive.
             thinking_id = None
             if not already_processing and turn.progress_enabled:
                 thinking_id = await client.send_thinking_indicator(
@@ -988,14 +954,11 @@ class ChatBotV2:
                 response = await self.processor.process_message(message, client, thinking_id,
                                                                 turn=turn)
 
-                # F46: the handler may have flipped a top-level channel reply into a thread (a turn
-                # that did substantive work — resolve_reply_target mutates message.metadata but NOT
-                # these locals). Rebind from the metadata so the fallback send, the footer guard, and
-                # channel_pulse below all agree with the placement text.py actually used. Fail-open:
-                # only rebind when metadata is a dict; a missing key leaves the original value.
-                if isinstance(message.metadata, dict):
-                    place_in_channel = bool(message.metadata.get("place_in_channel", place_in_channel))
-                    post_thread_id = None if place_in_channel else message.thread_id
+                # The model may have chosen the destination DURING the turn (an eligible
+                # top-level trigger starts unselected). Re-read it from the turn — the one place
+                # that knows — so the fallback send, the footer guard and the pulse below all
+                # agree with where the handler actually posted.
+                post_thread_id = turn.resolve_reply_target(message)
 
                 # Delete thinking indicator (but not if streaming was used — it's already the
                 # response — and not when a ProgressChecklist owns the thinking message, F4).
@@ -1029,7 +992,8 @@ class ChatBotV2:
                             # (same rule as the separate footer below) and when block-building is
                             # unavailable — those fall back to maybe_post_response_footer.
                             footer_blocks = None
-                            if not place_in_channel and hasattr(client, "attachable_footer_blocks"):
+                            if (post_thread_id is not None
+                                    and hasattr(client, "attachable_footer_blocks")):
                                 try:
                                     footer_blocks = client.attachable_footer_blocks(
                                         message.channel_id, response.metadata.get("model"))
@@ -1037,6 +1001,11 @@ class ChatBotV2:
                                     main_logger.debug(f"Footer block build failed: {e}")
                                     footer_blocks = None
                             send_meta = {}
+                            # The reply is going out NOW, in this place: the destination stops
+                            # being a preference and becomes a fact about Slack. The streaming
+                            # paths lock when they bind their surface; this is the same moment
+                            # for a non-streamed reply, which main.py posts itself.
+                            turn.lock_destination()
                             sent_ts = await client.send_message(
                                 message.channel_id,
                                 post_thread_id,
@@ -1071,7 +1040,8 @@ class ChatBotV2:
                         # no message for it to sit under.
                         # Also skip when the reply didn't actually post (posted is explicitly
                         # False) — a footer under a message that never landed reads as orphaned.
-                        if (hasattr(client, "maybe_post_response_footer") and not place_in_channel
+                        if (hasattr(client, "maybe_post_response_footer")
+                                and post_thread_id is not None
                                 and (response.content or "").strip()
                                 and (response.metadata or {}).get("posted") is not False):
                             try:
@@ -1171,6 +1141,11 @@ class ChatBotV2:
                 gate_reaction = bool((message.metadata or {}).get(
                     "participation_reaction_emoji"))
                 kind = self._classify_visible_action(response, turn, gate_reaction)
+                # A destination is reported only for a delivered reply on a turn that actually
+                # settled one. Computed once — three fields read it, and they must agree.
+                _records_destination = bool(
+                    turn is not None and kind in _DELIVERED_KINDS
+                    and getattr(turn, "destination_selected", False))
                 participation_telemetry.finish_attempt(
                     message, kind,
                     ended_by="responder",
@@ -1204,7 +1179,22 @@ class ChatBotV2:
                     # An `empty` with no Response object at all is a different contract failure
                     # from one that returned an empty Response, and only this tells them apart.
                     detail="no_response_object" if response is None else None,
-                    placement="channel" if place_in_channel else "thread",
+                    # WHERE the reply went and WHO decided. The old `placement` field said
+                    # "thread" for every turn that produced no words at all — a silence has no
+                    # placement — so half the column described a decision nobody made. Written
+                    # only on terminals that delivered the responder's own reply (see
+                    # _DELIVERED_KINDS) AND only when a destination was actually settled: an
+                    # unsettled turn has no answer to this question, and `default` is a real
+                    # answer meaning "the model was asked and did not choose".
+                    destination=(turn.reply_destination if _records_destination else None),
+                    destination_source=(turn.destination_source if _records_destination
+                                        else None),
+                    # Only when true: a column that is false on nearly every row costs bytes on
+                    # every line to say nothing. The miss is the event worth finding. It rides
+                    # with `source=default`, always — they are two halves of one fact.
+                    destination_contract_miss=(
+                        True if _records_destination
+                        and getattr(turn, "destination_contract_miss", False) else None),
                     chars=len(response.content or "") if kind == "reply" else None,
                 )
 
