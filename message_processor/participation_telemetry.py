@@ -54,6 +54,11 @@ EVENTS.
                   would report the gate as failing to decide when it decided fine and the
                   reaction (or the handoff) is what broke.
   gate_decision   the model's own verdict, INCLUDING `ignore` — a decision, not a decline.
+  stale_send      DIAGNOSTIC, never terminal. One per suppression: the guard refused to create
+                  a surface because a newer message had already arrived. Emitted for UNGATED
+                  turns too (a mention, a DM, a continuation), which carry no attempt_id —
+                  those rows are outside the gate population and must be excluded from any
+                  rate whose denominator is `gate_start`, exactly like the turns they describe.
   queue_link      DIAGNOSTIC, never terminal, and NEVER part of any denominator. One line per
                   queued attempt that a later catch-up turn absorbed: `attempt_id` is the
                   QUEUED source, and the `batched_into_*` fields name the successor turn that
@@ -155,7 +160,10 @@ logger = setup_logger(name="slack_bot.ParticipationTelemetry")
 #     as well as where it went. NOTE: `gate_decision` still carries its own `placement` — the
 #     gate's pre-answer verdict, which no longer routes anything and is removed with the rest of
 #     the rich verdict in the binary-gate commit.
-CONTRACT_VERSION = 5
+# v6: the `stale_suppressed` terminal kind and the `stale_send` diagnostic event — a turn can
+#     now end because the conversation moved past it, which is neither a silence nor a delivery
+#     failure and had no representation before.
+CONTRACT_VERSION = 6
 
 # WHICH gate produced these lines. The rich multi-signal classifier is "rich-v1"; a different
 # gate is a different population even at the same CONTRACT_VERSION, and the two must never be
@@ -187,6 +195,7 @@ BUILD_REVISION_TIMEOUT_S = 2.0
 KINDS = frozenset({
     "reply", "delivery_failed", "silence", "reaction_only", "detached", "queued",
     "interrupted", "error", "error_unhandled", "aborted", "empty", "none",
+    "stale_suppressed",
 })
 DECLINE_CAUSES = frozenset({
     "superseded", "edit_superseded", "classifier_error", "engine_off", "error", "action_error",
@@ -719,6 +728,25 @@ def gate_decision(channel_id: Optional[str], trigger_ts: Optional[str],
     )
 
 
+def stale_send(channel_id: Optional[str], trigger_ts: Optional[str], *,
+               attempt_id: Optional[str] = None, last_seen_ts: Any = None,
+               observed_latest_ts: Any = None, scope: Optional[str] = None,
+               surface: Optional[str] = None, guard_mode: Optional[str] = None) -> None:
+    """One suppression by the stale-send guard. DIAGNOSTIC, never terminal.
+
+    Emitted for every suppression, INCLUDING on turns the gate never judged — mentions, DMs and
+    thread continuations mint no attempt, so those rows carry no `attempt_id` and belong to no
+    gate population. Any rate computed against `gate_start` has to exclude them, for the same
+    reason the ledger excludes those turns everywhere else.
+
+    The terminal event says what the room saw; this says why, and with what evidence: the ts
+    this turn had accounted for, the newer one that overtook it, which scope noticed, which
+    surface was refused, and whether the turn was buffering to a single send or streaming."""
+    record("stale_send", channel_id=channel_id, trigger_ts=trigger_ts, attempt_id=attempt_id,
+           last_seen_ts=last_seen_ts, observed_latest_ts=observed_latest_ts,
+           scope=scope, surface=surface, guard_mode=guard_mode)
+
+
 def queue_link(source_attempt_id: str, *, batched_into_attempt_id: Optional[str],
                batched_into_channel_id: Optional[str],
                batched_into_trigger_ts: Optional[str],
@@ -781,8 +809,9 @@ def visible_action(channel_id: Optional[str], trigger_ts: Optional[str], *,
     """THE TERMINAL EVENT. Prefer `finish_attempt`, which is the only caller that can guarantee
     exactly one of these per attempt.
 
-    `ended_by` names the STAGE THAT CLOSED THE ATTEMPT — `gate` or `responder` — and nothing
-    more. It is not a claim that that stage made a judgment: engine-off, a classifier failure, a
+    `ended_by` names the STAGE THAT CLOSED THE ATTEMPT — `gate`, `responder`, or `stale_guard`
+    (the send guard refused the turn's first surface because a newer message had arrived) — and
+    nothing more. It is not a claim that that stage made a judgment: engine-off, a classifier failure, a
     gate action that raised, and a queued turn all close at a stage without anyone deciding
     anything. It was called `decided_by`, which read as "who decided", and every one of those
     rows was a lie in that reading. To ask who DECIDED, read `gate_decision` (a verdict exists
@@ -839,6 +868,13 @@ def visible_action(channel_id: Optional[str], trigger_ts: Optional[str], *,
                        (detail=no_response_object). A contract violation, and the single most
                        important thing here to keep apart from a chosen silence — they are
                        identical in the room and opposite in meaning
+      stale_suppressed the turn had an answer and the guard refused to create its first
+                       surface, because a newer message in the same conversation arrived while
+                       it was writing. NOT a silence: nobody chose it and there is no silence
+                       reason. NOT delivery_failed: Slack was never called, so nothing failed.
+                       Only when the suppression is the whole story — a turn that still shows a
+                       reaction or a detached surface takes that label and carries
+                       `reply_stale_suppressed` beside it
       none             the GATE ended the turn without any visible act at all. Kept apart from
                        `empty` on purpose: one is a decision path completing with nothing to
                        show, the other is the responder contract breaking

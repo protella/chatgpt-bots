@@ -204,6 +204,12 @@ class SlackMessageEventsMixin:
                 "action_token": event.get("action_token"),
                 # F3: human | self | other_bot — lets the wake envelope render "— bot".
                 "sender_type": event_sender_type,
+                # IMMUTABLE Slack identity, for the stale-send guard's per-sender top-level
+                # scope. A display name would be wrong twice over: people rename themselves,
+                # and two accounts can share one. Absent (an unattributed post) → the guard
+                # omits the top scope entirely rather than bucketing strangers together.
+                "sender_id": (event.get("user") or event.get("bot_id")
+                              or event.get("app_id")),
             }
         )
         return message

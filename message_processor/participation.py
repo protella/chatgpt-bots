@@ -33,6 +33,12 @@ from typing import Any, Dict, List, Optional
 from config import config, valid_emoji_name
 from message_processor import gate_vision, participation_telemetry
 
+# ONE comparator, shared with the stale-send guard. It lived here in a second copy, and two
+# definitions of "which message is newer" is one too many for a codebase where both the burst
+# collapse and the send guard turn on that question.
+from message_processor.stale_send_guard import primary_scope_key as _primary_scope_key
+from message_processor.stale_send_guard import ts_key as _ts_key
+
 logger = logging.getLogger(__name__)
 
 # F27: cap the number of distinct conversation streams the burst-carry map tracks, so a
@@ -40,16 +46,6 @@ logger = logging.getLogger(__name__)
 _MAX_PENDING_KEYS = 512
 # F27: how many earlier same-author messages a survivor may carry into one combined reply.
 _MAX_BURST_CARRY = 3
-
-
-def _ts_key(ts: Any) -> tuple:
-    """Numeric (seconds, microseconds) sort key for a Slack ts — never lexical, so
-    '9.0' sorts before '10.0' (F5 fix f)."""
-    try:
-        s, _, frac = str(ts).partition(".")
-        return (int(s or 0), int((frac + "000000")[:6]))
-    except (ValueError, TypeError):
-        return (0, 0)
 
 
 def _ts_seconds(ts: Any) -> float:
@@ -258,14 +254,15 @@ class ParticipationEngine:
     @staticmethod
     def _conv_key(channel_id: str, ts: str, thread_root: Optional[str],
                   sender_id: Optional[str] = None) -> str:
-        """Supersession scope. F21: thread replies key by their root (cross-author collapse
-        in a thread is safe — the reply lands in-thread with full history). F27: top-level
-        messages key per SENDER, so a same-author fast-follow supersedes (and gets carried
-        into one combined reply) while two DIFFERENT people's unrelated top-level questions
-        stay independent and are both answered."""
-        if thread_root and thread_root != ts:
-            return f"{channel_id}|{thread_root}"
-        return f"{channel_id}|top|{sender_id or 'unknown'}"
+        """Supersession scope, from the shared scope helper (stale_send_guard).
+
+        F21: thread replies key by their root — cross-author collapse in a thread is safe,
+        since the reply lands in-thread with full history. F27: top-level messages key per
+        SENDER, so a same-author fast-follow supersedes (and is carried into one combined
+        reply) while two DIFFERENT people's unrelated top-level questions stay independent and
+        are both answered. The send guard asks the same question about the same population, so
+        it reads from the same table rather than a copy that can drift."""
+        return _primary_scope_key(channel_id, ts, thread_root, sender_id)
 
     def note_arrival(self, channel_id: str, ts: Optional[str],
                      thread_root: Optional[str] = None,

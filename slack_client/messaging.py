@@ -14,6 +14,7 @@ from slack_sdk.errors import SlackApiError
 from base_client import HistoryFetchError, Message, Response
 from config import SUPPORTED_CHAT_MODELS, config, pipeline_status_markers, valid_emoji_name
 from message_processor import participation_telemetry
+from message_processor.stale_send_guard import StaleSendSuppressed
 from message_markers import (
     CONTINUATION_HEAD,
     continuation_trailer,
@@ -163,7 +164,12 @@ class NativeStreamSession:
         self.active: bool = False
         self._sent: str = ""
 
-    async def start(self, initial_text: str = "") -> bool:
+    async def start(self, initial_text: str = "", lease: Any = None) -> bool:
+        """`lease` (stale guard): chat.startStream MINTS the reply message, so this is a first
+        answer surface. Checked before the call, never after — once a stream is up, the rest of
+        the answer follows it."""
+        if lease is not None:
+            lease.authorize("native_start")
         if not self._thread:
             # chat.startStream REQUIRES thread_ts (Slack: "missing required field"),
             # so top-level channel replies can never stream natively. Skip the
@@ -183,7 +189,7 @@ class NativeStreamSession:
             self.active = False
             return False
         try:
-            resp = await self._client.chat_startStream(
+            resp = await self._client.chat_startStream(  # unleased-ok: inside NativeStreamSession.start, which authorized at its entry
                 channel=self._channel,
                 thread_ts=self._thread,
                 markdown_text=initial_text or None,
@@ -193,6 +199,8 @@ class NativeStreamSession:
             self.ts = resp.get("ts")
             self._sent = initial_text or ""
             self.active = bool(self.ts)
+            if self.active and lease is not None:
+                lease.commit()      # the reply message exists; the rest belongs with it
             return self.active
         except Exception as e:  # noqa: BLE001 - best-effort, never fatal
             if self._log:
@@ -654,7 +662,9 @@ class SlackMessagingMixin:
     async def send_message(self, channel_id: str, thread_id: str, text: str,
                            blocks: Optional[list] = None,
                            meta_out: Optional[dict] = None,
-                           username: Optional[str] = None) -> Optional[str]:
+                           username: Optional[str] = None,
+                           lease: Any = None,
+                           surface: str = "final_post") -> Optional[str]:
         """Send a text message to Slack, splitting if needed.
 
         Returns the posted message ts (the FIRST chunk's ts when split), or None on
@@ -674,6 +684,13 @@ class SlackMessagingMixin:
         def _set_attached(v: bool) -> None:
             if meta_out is not None:
                 meta_out["footer_attached"] = v
+        # STALE GUARD: the last thing before Slack. Raises StaleSendSuppressed rather than
+        # posting, so a superseded answer is never created — and deliberately OUTSIDE the try
+        # below, which turns exceptions into a None return the caller reads as "the send
+        # failed". Nothing failed here; the turn was overtaken. Unguarded callers (notices,
+        # welcome cards, a job's own status card) pass no lease and are unaffected.
+        if lease is not None:
+            lease.authorize(surface)
         try:
             # Strip MCP citations from text before sending to Slack
             text = strip_citations(text)
@@ -703,7 +720,7 @@ class SlackMessagingMixin:
                 # only ever READ in the ambiguous branch below.
                 attempt_start = time.time()
                 try:
-                    result = await self.app.client.chat_postMessage(**post_kwargs)
+                    result = await self.app.client.chat_postMessage(**post_kwargs)  # unleased-ok: inside send_message, which authorized before this try
                 except SlackApiError:
                     # Definitive API rejection — nothing landed. Let the outer handler return
                     # None so the caller's single retry is correct; no reconcile (there is no
@@ -731,6 +748,11 @@ class SlackMessagingMixin:
                 # landed hasn't attached anything, and the separate footer must still fire.
                 _set_attached(composed is not None and bool(posted_ts))
                 self._record_own_reply_pulse(channel_id, thread_id, posted_ts, text)
+                # The reply is IN the room. Committing here (not at some later bookkeeping
+                # step) is what stops a second visible piece of this same turn — a footer, an
+                # artifact, a post_to_thread — being refused after the answer is already up.
+                if lease is not None and posted_ts:
+                    lease.commit()
                 return posted_ts
             else:
                 _set_attached(False)  # split replies never attach the footer
@@ -758,9 +780,23 @@ class SlackMessagingMixin:
                     posted = False
                     for attempt in (1, 2):
                         try:
-                            result = await self.app.client.chat_postMessage(**chunk_kwargs)
+                            # REAUTHORIZE before every mutation while the lease is still
+                            # pending. The retry below waits a second or more, which is ample
+                            # time for a newer message to arrive — and the check that ran
+                            # before the FIRST attempt says nothing about the second. Once a
+                            # chunk lands the lease is committed and this short-circuits, so
+                            # the rest of a split reply is never re-examined.
+                            if lease is not None:
+                                lease.authorize(surface)
+                            result = await self.app.client.chat_postMessage(**chunk_kwargs)  # unleased-ok: reauthorized on the line above, every attempt
                             if first_ts is None:
                                 first_ts = result.get("ts")
+                                # The FIRST chunk landing is the moment the turn became
+                                # visible. Waiting until the loop finished meant a suppression
+                                # could still be raised against a reply already half in the
+                                # room — and a half answer is worse than a late one.
+                                if lease is not None and first_ts:
+                                    lease.commit()
                             posted = True
                             break
                         except SlackApiError as chunk_error:
@@ -784,8 +820,14 @@ class SlackMessagingMixin:
                             f"{missing} part(s) not delivered")
                         if meta_out is not None:
                             meta_out["split_truncated"] = True
+                        # With ZERO chunks landed this notice would be the turn's first and
+                        # only visible words, so it is guarded like any first surface. Once a
+                        # chunk HAS landed the lease is committed and this permits — the reader
+                        # is owed an explanation for the half message they can already see.
                         try:
-                            await self.app.client.chat_postMessage(
+                            if lease is not None:
+                                lease.authorize(surface)
+                            await self.app.client.chat_postMessage(  # unleased-ok: reauthorized on the line above
                                 channel=channel_id, thread_ts=thread_id,
                                 text=(f"⚠️ This message was cut off — the remaining {missing} "
                                       f"part(s) failed to post to Slack."))
@@ -903,8 +945,15 @@ class SlackMessagingMixin:
         """
         return fence_safe_chunks(text, self.MAX_MESSAGE_LENGTH - 150)
 
-    async def send_message_get_ts(self, channel_id: str, thread_id: str, text: str) -> Dict:
-        """Send a message and return the response including timestamp"""
+    async def send_message_get_ts(self, channel_id: str, thread_id: str, text: str,
+                                  lease: Any = None,
+                                  surface: str = "legacy_seed") -> Dict:
+        """Send a message and return the response including timestamp.
+
+        `lease` (stale guard): the legacy streaming path seeds its reply with this call, so it
+        is a first answer surface and is checked like one."""
+        if lease is not None:
+            lease.authorize(surface)
         try:
             # Strip MCP citations from text before sending to Slack
             text = strip_citations(text)
@@ -916,12 +965,14 @@ class SlackMessagingMixin:
             if len(formatted_text) > self.MAX_MESSAGE_LENGTH:
                 formatted_text = formatted_text[:self.MAX_MESSAGE_LENGTH - 80] + "\n\n*[Message exceeded Slack limit]*"
             
-            result = await self.app.client.chat_postMessage(
+            result = await self.app.client.chat_postMessage(  # unleased-ok: inside send_message_get_ts, which authorized at its entry
                 channel=channel_id,
                 thread_ts=thread_id,
                 text=formatted_text
             )
             
+            if lease is not None:
+                lease.commit()
             return {"success": True, "ts": result["ts"]}
         except SlackApiError as e:
             self.log_error(f"Error sending message: {e}")
@@ -1137,7 +1188,7 @@ class SlackMessagingMixin:
         if status_set:
             return None
         try:
-            result = await self.app.client.chat_postMessage(
+            result = await self.app.client.chat_postMessage(  # unleased-ok: send_thinking_indicator — a placeholder is chrome, never answer text
                 channel=channel_id,
                 thread_ts=thread_id,
                 text=f"{config.circle_loader_emoji} {config.random_loading_message()}"
@@ -1150,7 +1201,7 @@ class SlackMessagingMixin:
     async def delete_message(self, channel_id: str, message_id: str) -> bool:
         """Delete a message from Slack"""
         try:
-            await self.app.client.chat_delete(
+            await self.app.client.chat_delete(  # unleased-ok: teardown — removing a surface can never be a stale answer
                 channel=channel_id,
                 ts=message_id
             )
@@ -1159,17 +1210,34 @@ class SlackMessagingMixin:
             self.log_debug(f"Could not delete message: {e}")
             return False
 
-    async def update_message(self, channel_id: str, message_id: str, text: str) -> bool:
-        """Update a message in Slack"""
+    async def update_message(self, channel_id: str, message_id: str, text: str,
+                             lease: Any = None,
+                             surface: str = "error_notice") -> bool:
+        """Update a message in Slack.
+
+        `lease` (stale guard): passed by the callers whose edit publishes TERMINAL text — an
+        error or timeout notice written into the thinking placeholder. That notice is the turn's
+        answer as far as the room is concerned, so when the conversation has already moved on it
+        must not be written: the suppression terminal is the honest record, and "something went
+        wrong" would be a claim about a turn where nothing did. Chrome callers pass nothing and
+        are unaffected."""
+        if lease is not None:
+            lease.authorize(surface)
         try:
             # Strip MCP citations from text before sending to Slack
             text = strip_citations(text)
-            await self.app.client.chat_update(
+            await self.app.client.chat_update(  # unleased-ok: inside update_message, which authorizes at its entry when a caller supplies a lease
                 channel=channel_id,
                 ts=message_id,
                 text=text,
                 mrkdwn=True  # Enable markdown parsing for italics/bold
             )
+            # A terminal notice that LANDED is what the room saw, so this turn has spoken —
+            # exactly like every other transport. Without it a leased error notice stayed
+            # `pending`, and any later visible piece of the same turn could still be refused
+            # after the room had already read something.
+            if lease is not None:
+                lease.commit()
             return True
         except SlackApiError as e:
             self.log_error(f"Could not update message: {e}")
@@ -1187,7 +1255,7 @@ class SlackMessagingMixin:
                           unfurl_links=False, unfurl_media=False)
             if username:
                 kwargs["username"] = username
-            result = await self.app.client.chat_postMessage(**kwargs)
+            result = await self.app.client.chat_postMessage(**kwargs)  # unleased-ok: post_ephemeral-style helper for chrome/notices, not the turn's answer
             return result.get("ts")
         except SlackApiError as e:
             self.log_warning(f"Status card post failed: {e}")
@@ -1199,7 +1267,7 @@ class SlackMessagingMixin:
         updates (Slack badges '(edited)' only when the top-level text changes; blocks-only
         edits don't badge). Best-effort — returns False on failure, never raises."""
         try:
-            await self.app.client.chat_update(
+            await self.app.client.chat_update(  # unleased-ok: a background job's own status card — a detached surface the guard exempts
                 channel=channel_id, ts=ts, text=text, blocks=blocks)
             return True
         except SlackApiError as e:
@@ -2202,8 +2270,17 @@ class SlackMessagingMixin:
         if target == current or target == trigger:
             return {"ok": False, "error": "same_thread",
                     "message": "That's the current thread — just reply normally instead."}
+        turn = getattr(ctx, "turn", None)
+        lease = getattr(turn, "send_lease", None) if turn is not None else None
         try:
-            posted_ts = await self.send_message(channel_id, target, text)
+            posted_ts = await self.send_message(channel_id, target, text, lease=lease,
+                                                surface="post_to_thread")
+        except StaleSendSuppressed:
+            # The conversation moved on before this landed. NOT a post failure: nothing was
+            # attempted, so telling the model the send failed would invite a retry of something
+            # we deliberately did not do. Re-raised so the turn's own handler files it as the
+            # suppression it is.
+            raise
         except Exception as e:
             self.log_warning(f"post_to_thread: send failed for {channel_id}/{target}: {e}")
             return {"ok": False, "error": "post_failed", "message": "Could not post to that thread."}
@@ -2258,8 +2335,16 @@ class SlackMessagingMixin:
         turn and the handler surfaces the outcome; nothing is posted here."""
         return {"ok": True}
 
-    async def update_message_streaming(self, channel_id: str, message_id: str, text: str) -> Dict:
-        """Updates a message with rate limit awareness"""
+    async def update_message_streaming(self, channel_id: str, message_id: str, text: str,
+                                       lease: Any = None,
+                                       surface: str = "legacy_update") -> Dict:
+        """Updates a message with rate limit awareness.
+
+        `lease` (stale guard): the caller passes it only for the FIRST edit that turns a
+        thinking placeholder into answer text — that edit is when the room first reads an
+        answer. Subsequent edits grow a surface that already exists and are never guarded."""
+        if lease is not None:
+            lease.authorize(surface)
         try:
             # Strip MCP citations from text before sending to Slack
             # This is the single point of control for all streaming updates
@@ -2288,13 +2373,17 @@ class SlackMessagingMixin:
                 formatted_text = truncated + continuation_trailer()
             
             # Call Slack API's chat_update method
-            result = await self.app.client.chat_update(
+            result = await self.app.client.chat_update(  # unleased-ok: inside update_message_streaming, which already authorized at its entry
                 channel=channel_id,
                 ts=message_id,
                 text=formatted_text,
                 mrkdwn=True  # Enable markdown parsing for italics/bold
             )
             
+            # The placeholder now reads as an answer — a first surface for the guard's
+            # purposes, so the rest of this turn's edits proceed without rechecking.
+            if lease is not None:
+                lease.commit()
             # Return success status
             return {
                 "success": True,
@@ -2322,7 +2411,7 @@ class SlackMessagingMixin:
                     very_short += '\n```'
                 
                 try:
-                    result = await self.app.client.chat_update(
+                    result = await self.app.client.chat_update(  # unleased-ok: the retry of that same already-authorized edit
                         channel=channel_id,
                         ts=message_id,
                         text=very_short,
@@ -2458,7 +2547,7 @@ class SlackMessagingMixin:
                 if not should_offer_feedback(channel_id, thread_ts):
                     return
                 model = (getattr(response, "metadata", None) or {}).get("model")
-                await self.app.client.chat_postMessage(
+                await self.app.client.chat_postMessage(  # unleased-ok: the settings footer, which only ever follows an answer already posted
                     channel=channel_id,
                     thread_ts=thread_ts,
                     text="Rate this response",  # fallback text for notifications
@@ -2470,7 +2559,7 @@ class SlackMessagingMixin:
                 return
             model = (getattr(response, "metadata", None) or {}).get("model")
             blocks = self._build_response_footer_blocks(model)
-            await self.app.client.chat_postMessage(
+            await self.app.client.chat_postMessage(  # unleased-ok: the same footer on the fallback path
                 channel=channel_id,
                 thread_ts=getattr(message, "thread_id", None),
                 # Describes the footer's purpose instead of showing a bare model name (which reads
@@ -2484,7 +2573,7 @@ class SlackMessagingMixin:
     async def handle_response(self, channel_id: str, thread_id: str, response: Response):
         """Handle a Response object and send to Slack"""
         if response.type == "text":
-            await self.send_message(channel_id, thread_id, response.content)
+            await self.send_message(channel_id, thread_id, response.content)  # unleased-ok: platform-agnostic Response dispatcher; the Slack turn posts through main.py with the lease
         elif response.type == "image":
             # response.content should be ImageData
             image_data = response.content
@@ -2510,4 +2599,4 @@ class SlackMessagingMixin:
                 await self.react(channel_id, target_ts, emoji)
         elif response.type == "error":
             formatted_error = self.format_error_message(response.content)
-            await self.send_message(channel_id, thread_id, formatted_error)
+            await self.send_message(channel_id, thread_id, formatted_error)  # unleased-ok: same dispatcher — the Slack error path posts through main.py

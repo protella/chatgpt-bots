@@ -19,7 +19,9 @@ coordinator owns the differences:
 """
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
+
+from message_processor.stale_send_guard import StaleSendSuppressed
 
 from message_markers import (
     _fence_state,
@@ -89,10 +91,17 @@ class NativeStreamCoordinator:
             return 0
         return max(0, len(self.session._sent) - len(self.base))
 
-    async def start(self) -> bool:
+    async def start(self, lease: Any = None) -> bool:
+        """`lease` (stale guard): chat.startStream MINTS the reply message, so it is a first
+        answer surface and the session checks the lease before making the call."""
         try:
             self.session = self._client.begin_native_stream(self.channel, self.thread_ts, user_id=self.user_id)
-            ok = await self.session.start()
+            ok = await self.session.start(lease=lease)
+        except StaleSendSuppressed:
+            # Not a sink failure: the conversation moved on and the stream was deliberately
+            # never opened. Swallowed here it would look like Slack refusing us, and the caller
+            # would quietly fall back to the legacy edit loop and post the stale answer anyway.
+            raise
         except Exception as e:  # noqa: BLE001 - best-effort sink, never fatal
             self._log(f"native coordinator start error: {e}")
             ok = False

@@ -1,5 +1,5 @@
 """Slack Bot Client Implementation."""
-from typing import Optional, Callable, List
+from typing import Any, Optional, Callable, List
 
 from slack_bolt.async_app import AsyncApp
 
@@ -195,9 +195,13 @@ class SlackBot(SlackMessageEventsMixin,
     # Async versions required by BaseClient
     async def send_message_async(self, channel_id: str, thread_id: str, text: str,
                                  blocks: Optional[list] = None,
-                                 meta_out: Optional[dict] = None) -> Optional[str]:
-        """Send a text message (async version); forwards footer blocks + meta_out to send_message."""
-        return await self.send_message(channel_id, thread_id, text, blocks=blocks, meta_out=meta_out)
+                                 meta_out: Optional[dict] = None,
+                                 lease: Any = None,
+                                 surface: str = "error_notice") -> Optional[str]:
+        """Send a text message (async version); forwards footer blocks, meta_out and the
+        stale-send lease to send_message."""
+        return await self.send_message(channel_id, thread_id, text, blocks=blocks,
+                                       meta_out=meta_out, lease=lease, surface=surface)
 
     async def send_image_async(self, channel_id: str, thread_id: str, image_data: bytes, filename: str,
                                caption: str = "", meta_out: Optional[dict] = None) -> Optional[str]:

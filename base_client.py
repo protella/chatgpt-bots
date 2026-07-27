@@ -92,8 +92,10 @@ class BaseClient(ABC, LoggerMixin):
     @abstractmethod
     async def send_message_async(self, channel_id: str, thread_id: str, text: str,
                                  blocks: Optional[list] = None,
-                                 meta_out: Optional[dict] = None) -> Optional[str]:
-        """Send a text message (async version). See send_message for the blocks/meta_out contract."""
+                                 meta_out: Optional[dict] = None,
+                                 lease: Any = None) -> Optional[str]:
+        """Send a text message (async version). See send_message for the blocks/meta_out
+        contract and for `lease` (the stale-send guard)."""
         pass
 
     @abstractmethod
@@ -191,8 +193,15 @@ class BaseClient(ABC, LoggerMixin):
         """Format text for the specific platform (markdown conversion)"""
         pass
     
-    async def handle_error(self, channel_id: str, thread_id: str, error: str):
-        """Default error handler"""
+    async def handle_error(self, channel_id: str, thread_id: str, error: str,
+                           lease: Any = None):
+        """Default error handler.
+
+        `lease` (stale guard): an error notice is TERMINAL — on a turn with no thinking surface
+        (a silence-capable buffered turn has none by design) it is the room's first and only
+        word from us. If the conversation has moved on, the honest outcome is nothing at all:
+        the suppression terminal records what happened, and "something went wrong" would be a
+        claim about a turn where nothing did."""
         # Check if this is a handled case (documents too large, etc) vs an actual error
         if "Documents Too Large" in error or "Message Too Long" in error:
             self.log_warning(f"Handled limit exceeded in {self.name}: {error[:100]}...")
@@ -201,7 +210,7 @@ class BaseClient(ABC, LoggerMixin):
 
         # Format error message for better readability
         formatted_error = self.format_error_message(error)
-        await self.send_message_async(channel_id, thread_id, formatted_error)
+        await self.send_message_async(channel_id, thread_id, formatted_error, lease=lease)
     
     def format_error_message(self, error: str) -> str:
         """Format error messages for display (can be overridden by platform-specific clients)"""

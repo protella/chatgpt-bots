@@ -232,9 +232,11 @@ class TestChatBotV2MessageHandling:
 
         await bot.handle_message(message, client)
 
-        client.handle_error.assert_called_once_with(
-            "C123", "thread_123", "Something went wrong"
-        )
+        # The error notice now carries the stale-send lease: it is terminal text, and on a turn
+        # with no thinking surface it is the room's only word from us.
+        assert client.handle_error.await_args.args == (
+            "C123", "thread_123", "Something went wrong")
+        assert "lease" in client.handle_error.await_args.kwargs
     
     @pytest.mark.asyncio
     async def test_handle_message_exception(self, bot):

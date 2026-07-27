@@ -90,6 +90,19 @@ class TurnRuntime:
     # the field — so a reaction-only turn and a reply that also reacted both told the ledger
     # "no emoji" while the reaction event sat two lines above it in the same file.
     reaction_committed: bool = False
+    # The turn's stale-send lease (message_processor.stale_send_guard), attached in
+    # handle_message. Carried HERE because the turn is already threaded explicitly to every
+    # path that can post — including ToolContext.turn, which is how post_to_thread gets it.
+    # A global or a contextvar would attach itself to whatever coroutine happened to be
+    # running, which for a bot answering several conversations at once is the wrong turn.
+    send_lease: Any = field(default=None, repr=False)
+    # How the stale guard protected this turn, recorded by the streaming handler when it binds
+    # rather than re-derived at telemetry time. "buffered" — every word was held locally and one
+    # guarded send made at the end, so the check spans the whole model call. "start_only" — the
+    # answer streamed live, so only its first surface could be refused. Re-deriving it from
+    # `silence_capable` got it wrong for an addressed CHANNEL reply, which also buffers (it has
+    # no native path) and was being reported as start_only.
+    guard_mode: Optional[str] = None
     ack_lease: Optional[dict] = field(default=None, repr=False)
     ack_target_ts: Optional[str] = None
     # Where that claim was staked. Kept beside the ts purely so settle_ack can report a RETRACTED
