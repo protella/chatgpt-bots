@@ -112,7 +112,10 @@ class SettingsModal(LoggerMixin):
                                      global_default_mode: str,
                                      channel_memories: Optional[List[Dict]] = None,
                                      memory_textarea_value: Optional[str] = None,
-                                     mem_seed: Optional[List] = None) -> Dict:
+                                     mem_seed: Optional[List] = None,
+                                     channel_policy: Optional[Dict] = None,
+                                     policy_value: Optional[str] = None,
+                                     policy_seed: Optional[str] = None) -> Dict:
         """Build the per-channel settings modal (Phase 7).
 
         `current_settings` is the DB row (or None). A NULL/absent response_mode means the channel
@@ -127,13 +130,29 @@ class SettingsModal(LoggerMixin):
         edit survives and the seed stays anchored to the rows the user first saw. `mem_seed` rides in
         `private_metadata` so the submit handler can reconcile exactly those rows. All optional so
         pure builder tests can render without a DB.
+
+        `channel_policy` (from ``get_channel_policy_async``) backs the standing-policy box, and
+        its open-time content hash rides in `private_metadata` as `policy_seed` so the submit
+        handler can refuse to overwrite a policy someone else changed while this was open — the
+        same seed-and-hash bargain the memory textarea makes.
         """
+        from message_processor.channel_steering import POLICY_MAX_CHARS
         from message_processor.participation import MODE_TO_LEVEL, VALID_LEVELS
 
         from config import SUPPORTED_CHAT_MODELS, GPT56_EFFORTS, GPT55_EFFORTS
 
         cs = current_settings or {}
-        directives_value = cs.get("directives") or ""
+
+        # The standing channel policy lives in its own reserved row, NOT in the settings row —
+        # it is an operator instruction, and the memory tools, the fact cap and the fallback
+        # extractor must all be unable to reach it. On a FRESH open both the box's value and the
+        # open-time hash come from that row; on a RE-RENDER the caller hands both back, so an
+        # in-flight edit survives and the hash stays anchored to what the user first saw.
+        from database import memory_content_hash
+        stored_policy = ((channel_policy or {}).get("content") or "").strip()
+        if policy_value is None and policy_seed is None:
+            policy_value = stored_policy
+            policy_seed = memory_content_hash(stored_policy) if stored_policy else ""
 
         def _select(action_id, label_map, current, inherit_label):
             """Static select with an 'inherit' first option; initial = current or inherit."""
@@ -232,13 +251,13 @@ class SettingsModal(LoggerMixin):
              "label": {"type": "plain_text", "text": "Participation"},
              "hint": {"type": "plain_text",
                       "text": f"How proactively I join conversations. 'Inherit' uses the global default ({global_default_level})."}},
-            {"type": "input", "block_id": "directives_block", "optional": True,
-             "element": {"type": "plain_text_input", "action_id": "directives", "multiline": True,
-                         "initial_value": directives_value, "max_length": 1000,
+            {"type": "input", "block_id": "policy_block", "optional": True,
+             "element": {"type": "plain_text_input", "action_id": "standing_policy", "multiline": True,
+                         "initial_value": policy_value or "", "max_length": POLICY_MAX_CHARS,
                          "placeholder": {"type": "plain_text",
                                          "text": "e.g. Only jump in on deploy failures; otherwise stay quiet."}},
-             "label": {"type": "plain_text", "text": "Channel ground rules"},
-             "hint": {"type": "plain_text", "text": "Extra instructions for how I behave in this channel."}},
+             "label": {"type": "plain_text", "text": "Standing channel policy"},
+             "hint": {"type": "plain_text", "text": "Standing instructions for how I behave in this channel. Saving REPLACES the whole policy; empty it to clear."}},
             {"type": "input", "block_id": "reply_in_channel_block", "optional": True,
              "element": reply_element,
              "label": {"type": "plain_text", "text": "Reply placement"},
@@ -267,7 +286,12 @@ class SettingsModal(LoggerMixin):
         # back verbatim so an in-flight edit survives. The seed lists EXACTLY the rows shown in the box
         # and rides in private_metadata so submit reconciles only what the user could actually see.
         memories = channel_memories or []
-        channel_rows = [m for m in memories if m.get("scope") == "channel"]
+        # Recorded participation preferences are excluded: they are the gate's own steering, the
+        # box REPLACES what it shows, and a row the operator never saw must not be deletable by
+        # editing around it. The reserved policy row is not here at all — it has its own field.
+        from message_processor.channel_steering import is_ordinary_fact
+        channel_rows = [m for m in memories
+                        if m.get("scope") == "channel" and is_ordinary_fact(m)]
         workspace_rows = [m for m in memories if m.get("scope") != "channel"]
 
         if memory_textarea_value is None and mem_seed is None:
@@ -290,7 +314,8 @@ class SettingsModal(LoggerMixin):
             "title": {"type": "plain_text", "text": "Channel Settings"},
             "submit": {"type": "plain_text", "text": "Save"},
             "close": {"type": "plain_text", "text": "Cancel"},
-            "private_metadata": json.dumps({"channel_id": channel_id, "mem_seed": mem_seed}),
+            "private_metadata": json.dumps({"channel_id": channel_id, "mem_seed": mem_seed,
+                                            "policy_seed": policy_seed or ""}),
             "blocks": blocks,
         }
 

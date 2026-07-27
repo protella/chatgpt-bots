@@ -1148,8 +1148,6 @@ async def classify_wake(self, text: str, signals: Optional[Dict[str, Any]] = Non
     signal_lines = []
     if signals.get("is_thread_reply"):
         signal_lines.append("- This is a reply inside a thread the assistant is part of.")
-    if signals.get("directives"):
-        signal_lines.append(f"- Operator-set ground rules for this channel (honor them): {signals['directives']}")
     signal_note = ("\n\nSignals:\n" + "\n".join(signal_lines)) if signal_lines else ""
     # Phase E: peripheral channel context (deterministic envelope from ChannelPulse) so the
     # verdict can consider what the channel is talking about, not just one message.
@@ -1346,14 +1344,16 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
                 + ". Every standard Slack emoji is available too; pick whatever actually fits this "
                 "moment, and if none of these do, do not stretch one to fit."
             )
-    if signals.get("directives"):
-        lines.append(f"- Channel ground rules (honor them): {signals['directives']}")
-    facts = signals.get("memory_facts") or []
-    if facts:
-        rendered = "; ".join(
-            f"[#{f.get('id')}] {f.get('content')}" for f in sorted(facts, key=lambda f: f.get("id") or 0)
-        )
-        lines.append(f"- Channel memory (may be stale): {rendered}")
+    # The channel's steering, rendered ONCE for the whole turn and inserted here VERBATIM. If
+    # this gate wakes, the responder's prompt carries the identical string — that byte-for-byte
+    # identity is the point, so nothing here may reorder, re-render, or add to the block itself.
+    # The block labels its own parts (standing policy and recorded preferences are instructions;
+    # facts are background), which the two separate inputs this replaced never did.
+    steering = signals.get("channel_steering_text")
+    if steering:
+        lines.append(
+            "- What this channel has established (the block below is verbatim; instructions and "
+            "background are labelled, and facts may be stale):\n" + steering)
     # F27: same-author fast-follow/addendum. The sender posted these top-level message(s)
     # in the seconds just before the latest one; judge the burst as ONE combined request so
     # a respond verdict's reply is expected to cover all of it (don't dismiss just because

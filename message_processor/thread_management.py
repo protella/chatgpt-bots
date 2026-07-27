@@ -809,6 +809,12 @@ class ThreadManagementMixin:
             existing = await db.get_channel_memory_async(channel_id)
         except Exception:
             existing = []
+        # ORDINARY facts only, everywhere below. The reserved policy row never appears here (the
+        # getter does not return it); the gate's preference rows do, and this extractor must
+        # neither show them to the utility model, revise one on an "update", nor evict one to make
+        # room. They are steering — the one thing a background summarizer must not rewrite.
+        from message_processor.channel_steering import is_ordinary_fact
+        existing = [r for r in existing if is_ordinary_fact(r)]
         existing_min = [{"id": r["id"], "content": r["content"]} for r in existing]
 
         decision = await openai_client.extract_memory(exchange, existing_min)
@@ -825,8 +831,21 @@ class ThreadManagementMixin:
             await db.add_channel_memory_async(channel_id, decision["content"], scope="channel")
             self.log_info(f"Channel memory: recorded a durable fact for {channel_id}")
         elif action == "update" and decision.get("id") is not None and decision.get("content"):
-            await db.update_channel_memory_async(decision["id"], decision["content"])
-            self.log_info(f"Channel memory: updated fact {decision['id']} for {channel_id}")
+            # ONLY an id this call was actually shown. Checking "is it a known steering row" was
+            # not enough and was quietly worse than nothing: the reserved policy row is excluded
+            # from `all_rows` too, so its id is never KNOWN here — it fell through the steering
+            # check into an unrestricted update, and a utility model emitting that number by
+            # chance would have rewritten the channel's operator rules with a remembered fact.
+            # An id outside `existing_min` is a hallucination or a stale id either way.
+            if not any(r.get("id") == decision["id"] for r in existing):
+                self.log_debug(
+                    f"Channel memory: extractor named id {decision['id']}, which it was not "
+                    f"shown — ignored")
+                return
+            # The scope guard also lives in the UPDATE's WHERE clause (update_channel_fact_async),
+            # so steering is protected by the storage and not only by the check above.
+            if await db.update_channel_fact_async(decision["id"], decision["content"]):
+                self.log_info(f"Channel memory: updated fact {decision['id']} for {channel_id}")
 
     async def _async_post_response_cleanup(self, thread_state, thread_key: str):
         """Asynchronously clean up thread after response is sent

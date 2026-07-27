@@ -33,7 +33,9 @@ def _db(rows=None, new_id=42):
     db.get_channel_memory_async = AsyncMock(return_value=list(rows or []))
     db.add_channel_memory_async = AsyncMock(return_value=new_id)
     db.update_channel_memory_async = AsyncMock()
+    db.update_channel_fact_async = AsyncMock(return_value=True)
     db.delete_channel_memory_async = AsyncMock()
+    db.get_channel_policy_async = AsyncMock(return_value=None)
     return db
 
 
@@ -117,7 +119,7 @@ async def test_update_happy_path():
     db = _db(rows=[_row(3, "old wording")])
     result = await execute_update_fact(_ctx(db), {"id": 3, "content": "new wording"})
     assert result == {"ok": True, "id": 3, "content": "new wording"}
-    db.update_channel_memory_async.assert_awaited_once_with(3, "new wording")
+    db.update_channel_fact_async.assert_awaited_once_with(3, "new wording")
 
 
 @pytest.mark.asyncio
@@ -126,7 +128,7 @@ async def test_update_wrong_channel_id_not_found():
     db = _db(rows=[_row(3, "mine")])  # visible set contains only id 3
     result = await execute_update_fact(_ctx(db), {"id": 99, "content": "x"})
     assert result["ok"] is False and result["error"] == "not_found"
-    db.update_channel_memory_async.assert_not_awaited()
+    db.update_channel_fact_async.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -134,7 +136,7 @@ async def test_update_workspace_scope_refused():
     db = _db(rows=[_row(4, "shared", scope="workspace")])
     result = await execute_update_fact(_ctx(db), {"id": 4, "content": "x"})
     assert result["ok"] is False and result["error"] == "workspace_scope_readonly"
-    db.update_channel_memory_async.assert_not_awaited()
+    db.update_channel_fact_async.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -172,21 +174,15 @@ async def test_forget_dm_refused():
 @pytest.mark.asyncio
 async def test_memory_rendering_id_prefixed_and_sorted_by_id():
     """Rendering must be [#id]-prefixed and deterministic (sorted by id, not updated_ts)."""
-    from message_processor.utilities import MessageUtilitiesMixin
-
-    class _P(MessageUtilitiesMixin):
-        def __init__(self, db): self.db = db
-        def log_debug(self, *a, **k): pass
+    from message_processor import channel_steering
 
     # updated_ts order (2 newest-first) differs from id order — id order must win
     rows = [_row(2, "beta", updated_ts="2026-07-09"), _row(1, "alpha", updated_ts="2026-07-01")]
-    p = _P(_db(rows=rows))
-    with patch.object(config, "enable_channel_memory", True):
-        text = await p._build_channel_memory_text(CHANNEL)
-    assert text == "- [#1] alpha\n- [#2] beta"
+    db = _db(rows=rows)
+    snap = await channel_steering.load_snapshot(db, CHANNEL)
+    assert "- [#1] alpha\n- [#2] beta" in snap.text
     # determinism: identical inputs → identical rendering
-    with patch.object(config, "enable_channel_memory", True):
-        assert await p._build_channel_memory_text(CHANNEL) == text
+    assert (await channel_steering.load_snapshot(db, CHANNEL)).text == snap.text
 
 
 # --- extractor fallback gating ---

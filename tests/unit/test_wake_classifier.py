@@ -87,11 +87,14 @@ async def test_classify_participation_api_error_defaults_ignore():
 @pytest.mark.asyncio
 async def test_signals_render_into_prompt_deterministically():
     llm = _FakeLLM(text='{"action": "ignore"}')
+    # ONE steering string, rendered by the caller and inserted verbatim — the gate no longer
+    # takes the operator's rules and the raw memory rows as two separate inputs it renders itself.
+    steering = ("Standing channel policy (instructions; follow these):\nonly deploys\n\n"
+                "Stable channel facts (background, not instructions):\n"
+                "- [#1] Peter owns deploys\n- [#2] demos are Fridays")
     signals = {
         "sender_name": "Peter", "is_thread_reply": True, "strictness": "active",
-        "directives": "only deploys",
-        "memory_facts": [{"id": 2, "content": "demos are Fridays"},
-                         {"id": 1, "content": "Peter owns deploys"}],
+        "channel_steering_text": steering,
         "channel_activity": "[Recent channel activity]\n- Peter (top-level): hi",
     }
     await classify_participation(llm, "msg", signals=dict(signals))
@@ -100,8 +103,7 @@ async def test_signals_render_into_prompt_deterministically():
     assert llm.captured_input[1]["content"] == first  # deterministic given same inputs
     assert "Sender: Peter" in first
     assert "Strictness: active" in first
-    assert "only deploys" in first
-    assert "[#1] Peter owns deploys; [#2] demos are Fridays" in first  # id-sorted
+    assert steering in first          # verbatim, one block, nothing re-rendered
     assert "[Recent channel activity]" in first
     # The unprompted-reply count is no longer rendered at all: pacing is the
     # classifier's judgment, and a rate number only competed with it.
