@@ -130,7 +130,7 @@ async def test_standing_soft_pref_writes_memory_only(monkeypatch):
     app, client, db = _app()
     v = _verdict(dimension="reactions", durability="standing", scope="channel",
                  guidance="React less in this channel", memory_op="add")
-    fell_through = await app._apply_backoff(_msg(), client, v)
+    fell_through, _ack = await app._apply_backoff(_msg(), client, v)
     assert fell_through is False
     # ONE per-channel/per-dimension pref memory, written atomically via the marker upsert.
     call = db.upsert_channel_pref_memory.await_args
@@ -184,7 +184,7 @@ async def test_standing_pref_at_cap_declined_by_helper_is_handled(monkeypatch):
 async def test_momentary_persists_nothing():
     app, client, db = _app()
     v = _verdict(dimension="replies", durability="momentary", scope="channel", memory_op="none")
-    fell_through = await app._apply_backoff(_msg(), client, v)
+    fell_through, _ack = await app._apply_backoff(_msg(), client, v)
     assert fell_through is False
     db.add_channel_memory_async.assert_not_awaited()
     db.upsert_channel_pref_memory.assert_not_awaited()
@@ -199,7 +199,7 @@ async def test_thread_scope_standing_persists_nothing():
     app, client, db = _app()
     v = _verdict(dimension="thread_participation", durability="standing", scope="thread",
                  guidance="stay out of this thread", memory_op="add")
-    fell_through = await app._apply_backoff(_msg(ts="50.0"), client, v)
+    fell_through, _ack = await app._apply_backoff(_msg(ts="50.0"), client, v)
     assert fell_through is False
     db.upsert_channel_pref_memory.assert_not_awaited()
     db.add_channel_memory_async.assert_not_awaited()
@@ -213,7 +213,7 @@ async def test_thread_scope_reversal_persists_nothing():
     # undo now — it must not attempt any channel-memory delete or settings write.
     app, client, db = _app()
     v = _verdict(durability="standing", scope="thread", memory_op="delete")
-    fell_through = await app._apply_backoff(_msg(ts="50.0"), client, v)
+    fell_through, _ack = await app._apply_backoff(_msg(ts="50.0"), client, v)
     assert fell_through is False
     db.delete_channel_memory_async.assert_not_awaited()
     db.upsert_channel_pref_memory.assert_not_awaited()
@@ -236,7 +236,7 @@ async def test_channel_reversal_deletes_pref_memory(monkeypatch):
 async def test_structural_request_falls_through_without_writes():
     app, client, db = _app()
     v = _verdict(durability="standing", scope="channel", structural_request="participation")
-    fell_through = await app._apply_backoff(_msg(), client, v)
+    fell_through, _ack = await app._apply_backoff(_msg(), client, v)
     assert fell_through is True
     # nothing durable is written here — the model owns the settings change via the tool
     db.add_channel_memory_async.assert_not_awaited()
@@ -253,7 +253,7 @@ async def test_structural_request_stamps_gate_authorized_flag():
     app, client, db = _app()
     msg = _msg()
     v = _verdict(durability="standing", scope="channel", structural_request="placement")
-    assert await app._apply_backoff(msg, client, v) is True
+    assert (await app._apply_backoff(msg, client, v))[0] is True
     assert msg.metadata.get("gate_authorized_structural") is True
 
 
@@ -315,7 +315,7 @@ async def test_channel_negation_bare_delete_removes_marker_pref(monkeypatch):
          "content": "react less here", "scope": "channel"},
     ])
     v = _verdict(dimension="reactions", durability="standing", scope="channel", memory_op="delete")
-    fell_through = await app._apply_backoff(_msg(), client, v)
+    fell_through, _ack = await app._apply_backoff(_msg(), client, v)
     assert fell_through is False
     db.delete_channel_memory_async.assert_awaited_once_with(8)
     db.add_channel_memory_async.assert_not_awaited()
@@ -330,7 +330,7 @@ async def test_quoted_third_party_feedback_ignored_persists_nothing():
     # no taxonomy (durability/scope/structural all defaulted), the router still writes nothing.
     app, client, db = _app()
     v = _verdict()  # bare backoff: durability=None, scope=None, structural_request="none"
-    fell_through = await app._apply_backoff(_msg(), client, v)
+    fell_through, _ack = await app._apply_backoff(_msg(), client, v)
     assert fell_through is False
     db.add_channel_memory_async.assert_not_awaited()
     db.update_channel_memory_async.assert_not_awaited()
@@ -361,7 +361,7 @@ async def test_momentary_reactions_feedback_writes_nothing_and_never_acks():
     # reaction (acking "stop reacting" with a reaction is exactly wrong), even if an emoji leaked.
     app, client, db = _app()
     v = _verdict(dimension="reactions", durability="momentary", scope="channel", emoji="thumbsup")
-    fell_through = await app._apply_backoff(_msg(), client, v)
+    fell_through, _ack = await app._apply_backoff(_msg(), client, v)
     assert fell_through is False
     db.add_channel_memory_async.assert_not_awaited()
     db.upsert_channel_pref_memory.assert_not_awaited()

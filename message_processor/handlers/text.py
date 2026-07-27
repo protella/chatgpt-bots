@@ -273,6 +273,7 @@ class TextHandlerMixin:
             channel_id=channel_id,
             thread_ts=message.thread_id,
             trigger_ts=meta.get("ts"),
+            attempt_id=meta.get("participation_attempt_id"),
             action_token=meta.get("action_token"),
             user_id=message.user_id,
             client=client,

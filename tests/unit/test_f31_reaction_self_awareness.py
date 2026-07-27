@@ -13,6 +13,7 @@ import pytest
 
 from config import config
 from main import ChatBotV2
+from message_processor.participation import GateEvaluation
 from slack_client.channel_pulse import ChannelPulse
 from slack_client.messaging import SlackMessagingMixin
 
@@ -148,8 +149,8 @@ async def test_verdict_react_path_records_own_reaction(monkeypatch):
     bot.processor.mcp_manager = None
     engine = Mock()
     engine.note_arrival = Mock()
-    engine.evaluate = AsyncMock(
-        return_value=SimpleNamespace(action="react", emoji="tada", reason="fun"))
+    engine.evaluate = AsyncMock(return_value=GateEvaluation(
+        verdict=SimpleNamespace(action="react", emoji="tada", reason="fun")))
     bot.participation_engine = engine
 
     message = SimpleNamespace(

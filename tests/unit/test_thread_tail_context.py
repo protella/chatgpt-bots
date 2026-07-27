@@ -305,7 +305,8 @@ async def test_evaluate_superseded_by_newer_arrival(monkeypatch):
     monkeypatch.setattr(config, "participation_debounce_seconds", 0)
     eng = ParticipationEngine(MagicMock())
     eng.note_arrival("C1", "200.0")    # a newer message already registered at gate entry
-    verdict = await eng.evaluate(channel_id="C1", ts="100.0", text="stale event")
+    verdict = (await eng.evaluate(channel_id="C1", ts="100.0",
+                                  text="stale event")).verdict
     assert verdict is None             # the older event never classifies
 
 

@@ -13,6 +13,7 @@ from slack_sdk.errors import SlackApiError
 
 from base_client import HistoryFetchError, Message, Response
 from config import SUPPORTED_CHAT_MODELS, config, pipeline_status_markers, valid_emoji_name
+from message_processor import participation_telemetry
 from message_markers import (
     CONTINUATION_HEAD,
     continuation_trailer,
@@ -1742,19 +1743,62 @@ class SlackMessagingMixin:
         is the semantic backstop) + optional REACTION_EMOJIS allowlist + per-message cap
         (REACTION_MAX_PER_MESSAGE distinct emoji); never raises (returns
         {"ok": False, ...} on any refusal/failure)."""
-        if not (config.enable_reactions and config.enable_react_tool):
-            return {"ok": False, "error": "disabled", "message": "Reactions are disabled."}
+        channel_id = getattr(ctx, "channel_id", None)
+        # The message that CAUSED this turn, which is not necessarily the one being reacted to —
+        # the model may target an older message by ts. Both are recorded, separately.
+        trigger_ts = getattr(ctx, "trigger_ts", None)
+        # Scope guard: only a gate attempt has an id, and this ledger's population is gate
+        # attempts. A mention or a DM reacting is a real reaction and simply not ours to count.
+        attempt_id = getattr(ctx, "attempt_id", None)
+
+        def _record(result_name: str, *, target_ts=None, detail=None) -> None:
+            if not attempt_id:
+                return
+            # Recorded here rather than in _reserve_and_react, which is the shared choke point
+            # for every reaction path and so cannot say WHICH decision chose this emoji. Origin
+            # is the whole point: the gate picks from one blind prompt, the responder can search
+            # the catalog, and a diversity number that averages the two describes neither.
+            participation_telemetry.reaction(
+                channel_id, trigger_ts, operation="add", result=result_name,
+                origin="responder", emoji=emoji or None, target_ts=target_ts,
+                attempt_id=attempt_id, detail=detail)
+
         emoji = (args.get("emoji") or "").strip().strip(":")
+        # Resolved BEFORE the gauntlet, so a refusal can say what was aimed at. It used to be
+        # resolved after, which recorded every refusal as "nothing was aimed at" — including the
+        # ones that named an older message explicitly. A model repeatedly asking for a banned
+        # emoji ON ONE PARTICULAR MESSAGE is a different prompt problem from one flailing at the
+        # trigger, and the target is the only thing that tells them apart.
+        ts = (args.get("ts") or "").strip() or trigger_ts or getattr(ctx, "thread_ts", None)
+        # Every refusal below is an INTENT the room never saw. A model that keeps asking for a
+        # disallowed emoji, or keeps aiming at nothing, is a prompt problem — and before these
+        # were recorded the only refusal with any trace at all was the one that reached Slack.
+        if not (config.enable_reactions and config.enable_react_tool):
+            _record("refused", target_ts=ts, detail="disabled")
+            return {"ok": False, "error": "disabled", "message": "Reactions are disabled."}
         if not valid_emoji_name(emoji):
+            _record("refused", target_ts=ts, detail="invalid_emoji")
             return {"ok": False, "error": "invalid_emoji", "message": "Not a valid emoji shorthand name."}
         allowed = {e.strip().strip(":") for e in (config.reaction_emojis or []) if e and e.strip().strip(":")}
         if allowed and emoji not in allowed:
+            _record("refused", target_ts=ts, detail="emoji_not_allowed")
             return {"ok": False, "error": "emoji_not_allowed", "allowed": sorted(allowed)}
-        channel_id = getattr(ctx, "channel_id", None)
-        ts = (args.get("ts") or "").strip() or getattr(ctx, "trigger_ts", None) or getattr(ctx, "thread_ts", None)
         if not channel_id or not ts:
+            _record("refused", detail="no_target")
             return {"ok": False, "error": "no_target", "message": "No message to react to."}
-        return await self._reserve_and_react(channel_id, ts, emoji)
+        result = await self._reserve_and_react(channel_id, ts, emoji)
+        ok = bool(isinstance(result, dict) and result.get("ok") is True)
+        # `idempotent` means the emoji was already on the message — the reservation layer reports
+        # ok either way, and counting that as a placement would credit us with somebody else's
+        # reaction (see the ownership note above _reserve_and_react_owned).
+        if ok and isinstance(result, dict) and result.get("idempotent"):
+            _record("already_present", target_ts=ts)
+        elif ok:
+            _record("added", target_ts=ts)
+        else:
+            _record("failed", target_ts=ts,
+                    detail=(result.get("error") if isinstance(result, dict) else None))
+        return result
 
     # Reaction-guard eviction tuning. Entries touched within the recency window are PINNED
     # (never evicted) — this covers both the committed slots of an ACTIVE turn (so a burst

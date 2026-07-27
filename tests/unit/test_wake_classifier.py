@@ -73,14 +73,15 @@ async def test_classify_participation_json_parsing(raw, expected_action):
 @pytest.mark.parametrize("raw", ["", "banana", "respond", "{not json}", "[]"])
 async def test_classify_participation_garbage_defaults_ignore(raw):
     llm = _FakeLLM(text=raw)
-    verdict = await classify_participation(llm, "anything")
-    assert verdict == {"action": "ignore"}
+    # None, not a forged {"action": "ignore"}: both end in the same silence downstream, but only
+    # None lets the ledger tell an unparseable reply apart from a model that chose to stay quiet.
+    assert await classify_participation(llm, "anything") is None
 
 
 @pytest.mark.asyncio
 async def test_classify_participation_api_error_defaults_ignore():
     llm = _FakeLLM(exc=RuntimeError("api down"))
-    assert await classify_participation(llm, "anything") == {"action": "ignore"}
+    assert await classify_participation(llm, "anything") is None
 
 
 @pytest.mark.asyncio

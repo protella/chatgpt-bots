@@ -360,8 +360,9 @@ async def test_engine_folds_edit_block_into_classifier_prompt(monkeypatch):
         "already_replied": True,
     }
     engine = ParticipationEngine(client)
-    verdict = await engine.evaluate(
-        channel_id="C1", ts="100.1", text="please review the Q3 numbers", client=client)
+    verdict = (await engine.evaluate(
+        channel_id="C1", ts="100.1", text="please review the Q3 numbers",
+        client=client)).verdict
     assert verdict.action == "respond"
     assert client.calls == 1
     # The classifier saw the \"[EDIT]\" note block with the old text + already-replied note; the verdict's
@@ -382,8 +383,8 @@ async def test_typo_edit_one_eval_ignore_stays_silent(monkeypatch):
         "already_replied": False,
     }
     engine = ParticipationEngine(client)
-    verdict = await engine.evaluate(
-        channel_id="C1", ts="100.1", text="the weather is nice", client=client)
+    verdict = (await engine.evaluate(
+        channel_id="C1", ts="100.1", text="the weather is nice", client=client)).verdict
     assert client.calls == 1        # at most ONE engine evaluation
     assert verdict.action == "ignore"  # a typo fix stays silent
 
@@ -397,6 +398,27 @@ async def test_ordinary_message_untouched_by_edit_plumbing(monkeypatch):
     engine = ParticipationEngine(client)
     await engine.evaluate(channel_id="C1", ts="9.9", text="hello team", client=client)
     assert client.last_text == "hello team"
+
+
+@pytest.mark.asyncio
+async def test_a_mock_client_yields_no_edit_context_at_all(monkeypatch):
+    """A bare MagicMock answers every attribute with another truthy mock, so a truthiness test
+    on the store handed back a MOCK edit context: the classifier prompt silently grew an [EDIT]
+    block and edit supersession was suppressed. Whole suites then asserted things about a prompt
+    production never sends. The store has to be an actual mapping."""
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr(config, "participation_debounce_seconds", 0.0, raising=False)
+    mock_client = MagicMock()
+    assert ParticipationEngine._take_edit_context(mock_client, "C1", "9.9") is None
+
+    recorder = _RecordingClient({"action": "ignore"})
+    # The classifier lives on the openai_client; the FACADE is the mock, exactly as in the
+    # fixtures that carry one.
+    engine = ParticipationEngine(recorder)
+    await engine.evaluate(channel_id="C1", ts="9.9", text="hello team", client=mock_client)
+    assert recorder.last_text == "hello team"      # unpolluted
+    assert "[EDIT]" not in recorder.last_text
 
 
 # ----------------------------------------------------------------- prompt content
@@ -424,8 +446,9 @@ async def test_edit_supersedes_original_in_flight_evaluation(monkeypatch):
         sender_id="UHUMAN", client=client))
     await asyncio.sleep(0.005)
     engine.supersede("C1", "100.1", thread_root=None, sender_id="UHUMAN")
-    verdict = await task
-    assert verdict is None            # superseded — no second answer
+    evaluation = await task
+    assert evaluation.verdict is None            # superseded — no second answer
+    assert evaluation.decline_cause == "edit_superseded"
     assert client.calls == 0          # the classifier was never even consulted
 
 
@@ -439,9 +462,9 @@ async def test_edits_own_reevaluation_survives_supersession(monkeypatch):
         "old_text": "review", "new_text": "review the Q3 numbers", "already_replied": False}
     engine = ParticipationEngine(client)
     engine.supersede("C1", "100.1", thread_root=None, sender_id="UHUMAN")
-    verdict = await engine.evaluate(
+    verdict = (await engine.evaluate(
         channel_id="C1", ts="100.1", text="review the Q3 numbers",
-        sender_id="UHUMAN", client=client)
+        sender_id="UHUMAN", client=client)).verdict
     assert verdict.action == "respond"   # the edit's own eval answers
     assert client.calls == 1
 

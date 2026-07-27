@@ -106,7 +106,9 @@ Also new: per-server `"enabled": false`, and auth uses the `headers` object shap
 reinstall the app — the new scopes need re-consent, and a missing one degrades a feature
 silently. New since v2.5: the `agent_view` block; bot scopes
 `search:read.public/private/im/mpim/files/users`, `reactions:read`, `reactions:write`,
-`pins:read`, `users:read.email`, `chat:write.customize`, `assistant:write`, `emoji:read`; and
+`pins:read`, `users:read.email`, `chat:write.customize`, `assistant:write`, `emoji:read`,
+`users.profile:read` (custom profile fields + pronouns; nothing consumes it yet — harmless to
+skip until a feature does); and
 events `reaction_added`, `reaction_removed`, `app_home_opened`, `app_context_changed`, and
 `file_deleted` (ambient-memory cleanup). **Remove the legacy `assistant_thread_started` /
 `assistant_thread_context_changed` events** — Slack's manifest validator now rejects them
@@ -135,6 +137,37 @@ destructive step. Watch for these lines, in order:
 From then on the database backs itself up nightly (7-day retention) as part of the scheduled
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
+
+### 🎯 Fixed - It stops borrowing an answer from the message above yours
+
+Asked *"anyone know why the nightly job started taking 40 min? it was 12 last week"*, the bot
+replied *"You just called it a minute ago: replica warmup was the culprit."* Nobody had said that
+about the nightly job. Three minutes earlier someone had told a colleague *"kousha you were right
+about the replica warmup, that was it"* — a fragment of a different conversation, whose "that"
+pointed at something the bot never saw. It read two unrelated messages as one and stated the result
+as fact. Challenged, it folded immediately.
+
+A channel is several conversations interleaved, and the bot now treats it that way. Two messages
+count as being about the same thing only when something actually says so — the same incident named,
+an explicit reply, someone picking a thread back up — and never because the topics resemble each
+other or the messages happened to land near each other. Someone's "yeah that was it" is understood
+to point back into their own exchange, not at whatever the bot is being asked now. A claim also
+stays exactly as strong as its source: *"might be the cache"* no longer becomes *"the cache was the
+culprit"*, and a finding is credited to whoever actually made it instead of to whoever is asking.
+
+This is not a new habit of hedging. When the evidence is there it still answers plainly — asked the
+same question in a channel where a colleague *had* named the cause, it says so and credits them.
+What changed is only that it stops filling gaps with whatever was nearby.
+
+Two smaller repairs came out of the same investigation:
+
+- **Fetched channel history arrived newest-first, and said nothing about it.** Read top to bottom
+  it put the newest message first, so an older line sat *below* a question it could not possibly be
+  answering and read exactly like a reply to it. Thread fetches were already oldest-first, so the
+  two tools disagreed. Both now return oldest-first and say which order they're in.
+- **A trimmed thread claimed to be "the newest window"** when it actually returned the root plus
+  the newest replies with the middle missing — which invited reading the root as though it sat
+  directly above the replies printed under it.
 
 ### 🤔 Changed - A much better read on whether a message is even for it
 
@@ -173,8 +206,12 @@ It can also use **your workspace's custom emoji**, and now finds them by meaning
 something that fits "a deploy that went badly" and it can surface your `:dumpster-fire:`.
 Previously it was shown the first few dozen custom emoji *alphabetically*, which in a workspace
 with a thousand of them meant it only ever saw names like `000` and `1password_icon`. It now
-ranks them by what your workspace actually reacts with, learned from real usage and remembered
-across restarts.
+learns which custom emoji your workspace actually uses and offers those **as available choices**
+— pointedly not as favorites. An earlier build told it to *prefer* the team's most-used emoji,
+and side-by-side measurement showed what that does: the bot's reactions collapsed onto a handful
+of house jokes (one emoji took a quarter of all its reactions) while a bot picking purely by fit
+spread the same reactions across twice as many. Popularity now only decides which names it knows
+exist; the moment decides which one it picks.
 
 A reaction is held to a lower bar than words, because it doesn't take the floor — but only on
 whether it's *worth* it. Whose conversation it is still applies exactly as it does to a reply, so
@@ -182,6 +219,22 @@ this is not a back door into an exchange that isn't its own.
 
 Custom emoji need the `emoji:read` scope from step 4 above; without it standard emoji still work
 and nothing errors.
+
+### 🧠 Fixed - Channel memory now actually reaches the model
+
+The bot keeps durable facts per channel — who owns what, how this team deploys, "keep answers
+short here" — and it turned out **none of them were reaching the model**. The prompt block was
+built and then written to a field nothing ever read, on every turn including the first. Facts
+saved with `remember_fact` were stored faithfully, listed faithfully, and silently ignored in
+every reply. The memory block now rides in the real prompt, is fetched once per turn, and a
+retry mid-turn can no longer see different facts than the attempt it's retrying.
+
+### 📒 Added - A decision ledger for participation (operators)
+
+Every unprompted-message decision — woke or declined, reacted or stayed silent, and why — is now
+one JSON line in `logs/participation.jsonl`, including the declines that previously left no trace
+anywhere. Off switch: `ENABLE_PARTICIPATION_TELEMETRY=false`. It changes no behavior; it exists so
+"is it talking too much?" can be answered from data instead of vibes.
 
 ### 🔇 Fixed - It occasionally went silent for no reason
 

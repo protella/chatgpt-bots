@@ -40,6 +40,13 @@ def valid_emoji_name(name: str) -> bool:
     return bool(name) and bool(_EMOJI_NAME_RE.match(name))
 
 
+# How much of a model-authored justification we keep when storing one. Used by the participation
+# backoff's per-channel preference sentence (main.py) and by the telemetry ledger's `reason`
+# fields. ONE bound, shared: both are the classifier's own prose about a human's message, and a
+# second number here would be a second, quieter privacy policy.
+GUIDANCE_TRUNCATION_CHARS = 200
+
+
 def _resolve_repo_path(path: str) -> str:
     """Resolve a relative path against the repo root (this file's directory)."""
     if os.path.isabs(path):
@@ -636,6 +643,12 @@ class BotConfig:
     # without any model call (every channel behaves like mentions_only/tag_only);
     # @mentions, name-wakes, 1:1 threads, and DMs are unaffected either way.
     enable_participation_engine: bool = field(default_factory=lambda: os.getenv("ENABLE_PARTICIPATION_ENGINE", "true").lower() == "true")
+    # Append one JSON line per participation event to logs/participation.jsonl — gate entries,
+    # DECLINES, verdicts, reactions (with which decision placed them) and the final visible
+    # action. Default ON, unlike the feature-flag convention, because it changes no behaviour and
+    # its entire purpose is to make the decline population — the half that leaves no other trace —
+    # measurable. Off costs nothing but the record.
+    enable_participation_telemetry: bool = field(default_factory=lambda: os.getenv("ENABLE_PARTICIPATION_TELEMETRY", "true").lower() == "true")
     # Rapid-fire messages in the same channel within this window collapse into ONE engine
     # evaluation of the latest state (someone typing four short lines ≠ four verdicts).
     participation_debounce_seconds: float = field(default_factory=lambda: float(os.getenv("PARTICIPATION_DEBOUNCE_SECONDS", "3")))

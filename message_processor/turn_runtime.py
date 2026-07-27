@@ -38,6 +38,7 @@ from typing import Any, Optional
 
 from config import config
 from logger import setup_logger
+from message_processor import participation_telemetry
 
 logger = setup_logger(name="slack_bot.TurnRuntime")
 
@@ -57,6 +58,13 @@ class TurnRuntime:
     did_substantive_work: bool = False
     ack_lease: Optional[dict] = field(default=None, repr=False)
     ack_target_ts: Optional[str] = None
+    # Where that claim was staked. Kept beside the ts purely so settle_ack can report a RETRACTED
+    # 👀 against the right conversation — by then the Message that carried it is out of scope.
+    ack_channel_id: Optional[str] = None
+    # ...and which gate attempt it belonged to, read off the message in claim_work for the same
+    # reason. None when the turn was not a gate attempt at all, which is also the signal that
+    # neither the claim nor its retraction belongs in the participation ledger.
+    ack_attempt_id: Optional[str] = None
     visible_action_committed: bool = False
     _claiming: bool = field(default=False, repr=False)
 
@@ -140,6 +148,10 @@ class TurnRuntime:
             return
         if not hasattr(client, "_reserve_and_react_owned"):
             return
+        # Read the attempt id HERE, while the Message is still in scope — settle_ack runs at the
+        # end of the turn with nothing but this object, the same reason ack_channel_id is stashed.
+        attempt_id = participation_telemetry.attempt_id_for(message)
+        self.ack_attempt_id = attempt_id
         self._claiming = True  # before the await: concurrent tool calls must not double-add
         try:
             # BOUNDED. This runs inside the tool callback, so for a hosted tool the Responses
@@ -151,10 +163,42 @@ class TurnRuntime:
                 timeout=config.tool_call_timeout)
             self.ack_lease = lease
             self.ack_target_ts = react_ts
+            self.ack_channel_id = channel_id
+            # The work-claim 👀 never goes through execute_react_tool, so without this it is the
+            # one reaction the room can see that leaves no record. It also has to be TELLABLE
+            # from a chosen emoji: it is a fixed operational marker, and counting it as taste
+            # would flatten the diversity number every analysis is trying to read.
+            #
+            # A LEASE is the only proof we placed it. Without one the emoji was already up
+            # there — a previous turn's, or the model's own react tool — and `ok` says only
+            # that it is present, not that we put it there. Recording that as `added` would
+            # inflate the claim rate with reactions the bot never made.
+            if attempt_id:
+                if lease is not None:
+                    outcome, detail = "added", None
+                elif isinstance(_result, dict) and _result.get("ok") is True:
+                    outcome, detail = "already_present", None
+                else:
+                    outcome = "failed"
+                    detail = _result.get("error") if isinstance(_result, dict) else None
+                participation_telemetry.reaction(
+                    channel_id, react_ts, operation="add", result=outcome,
+                    origin="work_claim", emoji=config.ack_reaction_emoji,
+                    target_ts=react_ts, attempt_id=attempt_id, detail=detail)
         except asyncio.TimeoutError:
             logger.debug("Work-claim reaction timed out")
+            if attempt_id:
+                participation_telemetry.reaction(
+                    channel_id, react_ts, operation="add", result="failed",
+                    origin="work_claim", emoji=config.ack_reaction_emoji,
+                    target_ts=react_ts, attempt_id=attempt_id, detail="timeout")
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Work-claim reaction failed: {e}")
+            if attempt_id:
+                participation_telemetry.reaction(
+                    channel_id, react_ts, operation="add", result="failed",
+                    origin="work_claim", emoji=config.ack_reaction_emoji,
+                    target_ts=react_ts, attempt_id=attempt_id, detail=type(e).__name__)
         finally:
             self._claiming = False
 
@@ -173,6 +217,33 @@ class TurnRuntime:
                 if hasattr(client, "settle_reaction_lease"):
                     client.settle_reaction_lease(lease)
             elif hasattr(client, "remove_owned_reaction"):
-                await client.remove_owned_reaction(lease)
+                removed = await client.remove_owned_reaction(lease)
+                # A retracted claim was still visible in the room for the length of the turn.
+                # Recorded so "we promised work and delivered nothing" is countable — it is the
+                # single most annoying failure this system can produce, and it is invisible
+                # afterwards because the evidence deletes itself.
+                #
+                # The REAL return value, not an assumption: remove_owned_reaction refuses a
+                # stale lease and returns False, leaving the 👀 up. A row saying we took it
+                # back when it is still sitting there would describe the opposite of the room.
+                if self.ack_attempt_id:
+                    participation_telemetry.reaction(
+                        self.ack_channel_id, self.ack_target_ts, operation="remove",
+                        result="removed" if removed else "remove_failed",
+                        origin="work_claim", emoji=config.ack_reaction_emoji,
+                        target_ts=self.ack_target_ts, attempt_id=self.ack_attempt_id,
+                        detail="retracted")
         except Exception as e:  # noqa: BLE001
+            # The 👀 is still up there and we no longer hold the lease, so the claim is stranded.
+            # Recorded for the same reason the honest False above is: a lifecycle that ends with
+            # an add and no removal outcome reads as a claim that was HONORED, which is the exact
+            # opposite of a turn that promised work, produced none, and then failed to clean up.
+            # Only on the RETRACTION path: honoring a claim removes nothing, so a failure there
+            # is not a failed removal and must not be written as one.
+            if self.ack_attempt_id and not produced_output:
+                participation_telemetry.reaction(
+                    self.ack_channel_id, self.ack_target_ts, operation="remove",
+                    result="remove_failed", origin="work_claim",
+                    emoji=config.ack_reaction_emoji, target_ts=self.ack_target_ts,
+                    attempt_id=self.ack_attempt_id, detail=type(e).__name__)
             logger.debug(f"Ack settle failed: {e}")

@@ -424,8 +424,10 @@ class OpenAIClient(LoggerMixin):
         text: str,
         signals: Optional[Dict[str, Any]] = None,
         images: Optional[List[Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
-        """Phase F participation judgment: raw JSON verdict dict (fail-safe {'action':'ignore'}).
+    ) -> Optional[Dict[str, Any]]:
+        """Phase F participation judgment: the raw JSON verdict dict, or None when the call
+        failed or produced nothing parseable (the engine renders that as fail-safe silence and
+        records it as a classifier failure, not as a verdict of 'ignore').
 
         F40: `images` are sanitized `input_image` parts (gate_vision) so the gate can judge a
         picture on its content instead of its filename."""

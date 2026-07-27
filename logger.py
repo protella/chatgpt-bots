@@ -21,6 +21,12 @@ except ImportError:
 from config import config
 
 
+# THE log-retention policy for this process. One pair of numbers, shared by every rotating
+# handler the bot opens — app.log, error.log, and the participation ledger — so "how much
+# history do we keep?" has exactly one answer and changing it is one edit, not a grep.
+LOG_ROTATION_MAX_BYTES = 10 * 1024 * 1024  # 10MB per generation
+LOG_ROTATION_BACKUP_COUNT = 5
+
 # Thread-safe singleton for logger initialization
 _logger_lock = threading.Lock()
 _initialized_loggers: Dict[str, logging.Logger] = {}
@@ -122,8 +128,8 @@ def setup_logger(
             if USE_CONCURRENT_HANDLER:
                 app_handler = ConcurrentRotatingFileHandler(
                     app_log_file,
-                    maxBytes=10 * 1024 * 1024,  # 10MB
-                    backupCount=5
+                    maxBytes=LOG_ROTATION_MAX_BYTES,
+                    backupCount=LOG_ROTATION_BACKUP_COUNT
                 )
             else:
                 # Fallback to regular RotatingFileHandler with warning. Emitted via `warnings`
@@ -134,8 +140,8 @@ def setup_logger(
                               "RotatingFileHandler", RuntimeWarning, stacklevel=2)
                 app_handler = RotatingFileHandler(
                     app_log_file,
-                    maxBytes=10 * 1024 * 1024,  # 10MB
-                    backupCount=5
+                    maxBytes=LOG_ROTATION_MAX_BYTES,
+                    backupCount=LOG_ROTATION_BACKUP_COUNT
                 )
             app_handler.setFormatter(file_formatter)
             handlers.append(app_handler)
@@ -145,14 +151,14 @@ def setup_logger(
             if USE_CONCURRENT_HANDLER:
                 error_handler = ConcurrentRotatingFileHandler(
                     error_log_file,
-                    maxBytes=10 * 1024 * 1024,  # 10MB
-                    backupCount=5
+                    maxBytes=LOG_ROTATION_MAX_BYTES,
+                    backupCount=LOG_ROTATION_BACKUP_COUNT
                 )
             else:
                 error_handler = RotatingFileHandler(
                     error_log_file,
-                    maxBytes=10 * 1024 * 1024,  # 10MB
-                    backupCount=5
+                    maxBytes=LOG_ROTATION_MAX_BYTES,
+                    backupCount=LOG_ROTATION_BACKUP_COUNT
                 )
             error_handler.setLevel(logging.ERROR)
             error_handler.setFormatter(file_formatter)
@@ -183,14 +189,14 @@ def setup_logger(
             if USE_CONCURRENT_HANDLER:
                 app_handler = ConcurrentRotatingFileHandler(
                     app_log_file,
-                    maxBytes=10 * 1024 * 1024,  # 10MB
-                    backupCount=5
+                    maxBytes=LOG_ROTATION_MAX_BYTES,
+                    backupCount=LOG_ROTATION_BACKUP_COUNT
                 )
             else:
                 app_handler = RotatingFileHandler(
                     app_log_file,
-                    maxBytes=10 * 1024 * 1024,  # 10MB
-                    backupCount=5
+                    maxBytes=LOG_ROTATION_MAX_BYTES,
+                    backupCount=LOG_ROTATION_BACKUP_COUNT
                 )
             app_handler.setFormatter(file_formatter)
             logger.addHandler(app_handler)
@@ -200,14 +206,14 @@ def setup_logger(
             if USE_CONCURRENT_HANDLER:
                 error_handler = ConcurrentRotatingFileHandler(
                     error_log_file,
-                    maxBytes=10 * 1024 * 1024,  # 10MB
-                    backupCount=5
+                    maxBytes=LOG_ROTATION_MAX_BYTES,
+                    backupCount=LOG_ROTATION_BACKUP_COUNT
                 )
             else:
                 error_handler = RotatingFileHandler(
                     error_log_file,
-                    maxBytes=10 * 1024 * 1024,  # 10MB
-                    backupCount=5
+                    maxBytes=LOG_ROTATION_MAX_BYTES,
+                    backupCount=LOG_ROTATION_BACKUP_COUNT
                 )
             error_handler.setLevel(logging.ERROR)
             error_handler.setFormatter(file_formatter)
@@ -278,6 +284,16 @@ def log_session_end():
     main_logger.info("=" * 60)
     main_logger.info(f"Session ended at {datetime.now().isoformat()}")
     main_logger.info("=" * 60)
+
+    # The participation ledger owns a second listener thread with its own queue, and the events
+    # most worth keeping — the terminal one per attempt — are the last ones written. Drain it
+    # here, where every shutdown path already converges. Imported inside the function: the
+    # telemetry module imports this one for the rotation policy above.
+    try:
+        from message_processor import participation_telemetry
+        participation_telemetry.shutdown()
+    except Exception as e:  # noqa: BLE001 — a lost line is never worth a failed shutdown
+        main_logger.debug(f"Participation telemetry shutdown skipped: {e}")
 
     # Stop the queue listener if it exists
     global _queue_listener
