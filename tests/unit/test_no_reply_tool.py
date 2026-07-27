@@ -29,22 +29,22 @@ def _registry_with_no_reply():
     reg = ToolRegistry()
     reg.register(
         _no_reply_schema(), AsyncMock(return_value={"ok": True}),
-        enabled=lambda cfg: config.enable_no_reply_tool and bool(cfg.get("_unprompted_turn")))
+        enabled=lambda cfg: config.enable_no_reply_tool and bool(cfg.get("_silence_capable_turn")))
     return reg
 
 
 # --------------------------------------------------------------------- exposure gate
 
-def test_no_reply_hidden_without_unprompted_flag():
+def test_no_reply_hidden_without_silence_capable_flag():
     reg = _registry_with_no_reply()
     assert reg.schemas({}) == []
-    assert reg.schemas({"_unprompted_turn": True})[0]["name"] == "no_response_needed"
+    assert reg.schemas({"_silence_capable_turn": True})[0]["name"] == "no_response_needed"
 
 
 def test_no_reply_hidden_when_config_off(monkeypatch):
     monkeypatch.setattr(config, "enable_no_reply_tool", False)
     reg = _registry_with_no_reply()
-    assert reg.schemas({"_unprompted_turn": True}) == []
+    assert reg.schemas({"_silence_capable_turn": True}) == []
 
 
 # --------------------------------------------------- _materialize_request_tools
@@ -57,41 +57,42 @@ class _MatHost:
         self._client = SimpleNamespace(tool_registry=registry)
 
 
-def _msg(participation=False, wake_source=None):
-    md = {"ts": "1.1"}
-    if participation:
-        md["participation_check"] = True
+def _msg(gate_required=False, silence_capable=False, wake_source=None):
+    # The routing facts as a dispatcher stamps them: both present on every message, and both
+    # False on the addressed routes rather than absent.
+    md = {"ts": "1.1", "gate_required": gate_required, "silence_capable": silence_capable}
     if wake_source:
         md["wake_source"] = wake_source
     return SimpleNamespace(metadata=md, channel_id="C1")
 
 
-def test_materialize_unprompted_exposes_tool_without_mutating_shared(mock_env):
+def test_materialize_gated_turn_exposes_tool_without_mutating_shared(mock_env):
     from prompts import NO_REPLY_CONTRACT_SUFFIX
     host = _MatHost(_registry_with_no_reply())
     shared = {"model": "gpt-5"}
     registry, request_config, available, suffix = host._materialize_request_tools(
-        host._client, shared, _msg(participation=True), tools_disabled=False)
+        host._client, shared, _msg(gate_required=True, silence_capable=True), tools_disabled=False)
     assert available is True
-    assert suffix == NO_REPLY_CONTRACT_SUFFIX  # F2 unprompted wording
-    assert request_config["_unprompted_turn"] is True
-    assert "_unprompted_turn" not in shared  # copied, never mutated
+    assert suffix == NO_REPLY_CONTRACT_SUFFIX  # F2 gate-routed wording
+    assert request_config["_silence_capable_turn"] is True
+    assert "_silence_capable_turn" not in shared  # copied, never mutated
     assert registry is not None
 
 
 def test_materialize_prompted_turn_no_tool(mock_env):
     host = _MatHost(_registry_with_no_reply())
     registry, request_config, available, suffix = host._materialize_request_tools(
-        host._client, {"model": "gpt-5"}, _msg(participation=False), tools_disabled=False)
+        host._client, {"model": "gpt-5"}, _msg(), tools_disabled=False)
     assert available is False
     assert suffix is None
-    assert "_unprompted_turn" not in request_config
+    assert "_silence_capable_turn" not in request_config
 
 
 def test_materialize_timeout_retry_drops_tool_and_paragraph(mock_env):
     host = _MatHost(_registry_with_no_reply())
     registry, request_config, available, suffix = host._materialize_request_tools(
-        host._client, {"model": "gpt-5"}, _msg(participation=True), tools_disabled=True)
+        host._client, {"model": "gpt-5"}, _msg(gate_required=True, silence_capable=True),
+        tools_disabled=True)
     # Retry disables the registry — so the tool AND the suffix paragraph fall away.
     assert registry is None
     assert available is False
@@ -105,10 +106,11 @@ def test_materialize_continuation_exposes_tool_with_continuation_suffix(mock_env
     host = _MatHost(_registry_with_no_reply())
     shared = {"model": "gpt-5"}
     registry, request_config, available, suffix = host._materialize_request_tools(
-        host._client, shared, _msg(wake_source="thread_continuation"), tools_disabled=False)
+        host._client, shared, _msg(silence_capable=True, wake_source="thread_continuation"),
+        tools_disabled=False)
     assert available is True
-    assert request_config["_unprompted_turn"] is True  # drives the tool's enabled gate
-    assert "_unprompted_turn" not in shared  # copied, never mutated
+    assert request_config["_silence_capable_turn"] is True  # drives the tool's enabled gate
+    assert "_silence_capable_turn" not in shared  # copied, never mutated
     assert registry is not None
     # F18 wording on the continuation path — NOT the F2 unprompted paragraph.
     assert suffix == CONTINUATION_NO_REPLY_SUFFIX
@@ -119,8 +121,8 @@ def test_materialize_continuation_hidden_when_config_off(mock_env, monkeypatch):
     monkeypatch.setattr(config, "enable_no_reply_tool", False)
     host = _MatHost(_registry_with_no_reply())
     registry, request_config, available, suffix = host._materialize_request_tools(
-        host._client, {"model": "gpt-5"}, _msg(wake_source="thread_continuation"),
-        tools_disabled=False)
+        host._client, {"model": "gpt-5"},
+        _msg(silence_capable=True, wake_source="thread_continuation"), tools_disabled=False)
     assert available is False
     assert suffix is None
 
@@ -134,14 +136,14 @@ def test_materialize_mention_wake_no_tool(mock_env):
             host._client, {"model": "gpt-5"}, _msg(wake_source=src), tools_disabled=False)
         assert available is False, src
         assert suffix is None, src
-        assert "_unprompted_turn" not in request_config, src
+        assert "_silence_capable_turn" not in request_config, src
 
 
 def test_materialize_continuation_timeout_retry_drops_tool_and_paragraph(mock_env):
     host = _MatHost(_registry_with_no_reply())
     registry, request_config, available, suffix = host._materialize_request_tools(
-        host._client, {"model": "gpt-5"}, _msg(wake_source="thread_continuation"),
-        tools_disabled=True)
+        host._client, {"model": "gpt-5"},
+        _msg(silence_capable=True, wake_source="thread_continuation"), tools_disabled=True)
     assert registry is None
     assert available is False
     assert suffix is None

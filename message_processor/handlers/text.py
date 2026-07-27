@@ -167,26 +167,26 @@ class TextHandlerMixin:
         """F2/F18: resolve this attempt's tool exposure ONCE, up front. Returns
         (registry_or_None, request_config, no_reply_tool_available, no_reply_suffix).
 
-        request_config is a COPY of the shared thread_config with `_unprompted_turn` set on
-        turns that get the silence option — the shared dict is never mutated. Two paths
-        qualify: F2 participation-gated (unprompted) turns, and F18 thread-continuation
-        turns (wake_source == "thread_continuation"), a 1:1 reply routed straight to the
-        main model. DMs and real @mentions get neither. Engine-gated bare-name turns carry
-        participation_check=True and therefore receive the F2 tool and suffix; the suffix's
+        request_config is a COPY of the shared thread_config with `_silence_capable_turn` set on
+        turns that get the silence option — the shared dict is never mutated. WHICH turns those
+        are is the `silence_capable` routing fact, decided once at dispatch (routing_facts.py)
+        rather than re-derived here: the F2 participation-gated turns and the F18
+        thread-continuation turns qualify, DMs and real @mentions do not. Engine-gated bare-name
+        turns are gate-routed and therefore receive the F2 tool and suffix; the suffix's
         addressed-by-name exception prevents an honest direct answer from being suppressed.
         no_reply_tool_available is derived from the resolved schema set (so it's False
         whenever the tool isn't actually exposed — timeout retries that drop the registry,
         config off, prompted turns), and drives the tools array. no_reply_suffix is the
         matching volatile contract paragraph (F2 vs F18 wording) or None — both key off the
-        same exposure so instruction and tool can never disagree."""
+        same exposure so instruction and tool can never disagree, and the F2/F18 choice is the
+        gate_required fact: the gated wording for a turn a model let through, the continuation
+        wording for the 1:1 reply nobody judged."""
         meta = message.metadata or {}
-        unprompted = bool(meta.get("participation_check") is True)
-        continuation = (not unprompted
-                        and meta.get("wake_source") == "thread_continuation")
-        expose_no_reply = unprompted or continuation
+        expose_no_reply = meta.get("silence_capable") is True
+        continuation = expose_no_reply and meta.get("gate_required") is not True
         request_config = dict(thread_config)
         if expose_no_reply:
-            request_config["_unprompted_turn"] = True
+            request_config["_silence_capable_turn"] = True
         # Was the bot DIRECTLY addressed by a PERSON in THIS message? This authorizes the
         # irreversible canvas-delete tool (canvas_tools._delete_enabled), and it now earns the SAME
         # rigor as the structural tool below. The old signal keyed off the loose name-hit regex,
@@ -557,7 +557,7 @@ class TextHandlerMixin:
 
         # Build tools array (includes web_search and/or MCP tools based on config).
         # `registry` and `request_config` were resolved once above (F2) — request_config
-        # carries the per-turn _unprompted_turn flag so no_response_needed is exposed only
+        # carries the per-turn _silence_capable_turn flag so no_response_needed is exposed only
         # where it should be; the timeout-retry path already nulled the registry there.
         ci_container = await self._resolve_ci_container(request_config, thread_key)
         await self._prepare_sandbox_tools(request_config, thread_key, ci_container, client)
@@ -1069,7 +1069,7 @@ class TextHandlerMixin:
 
         # F2: resolve this turn's tool exposure ONCE. Streaming retries fall back to the
         # non-streaming path, so tools are never disabled here (tools_disabled=False).
-        # request_config carries the per-turn _unprompted_turn flag that exposes
+        # request_config carries the per-turn _silence_capable_turn flag that exposes
         # no_response_needed; no_reply_suffix drives the contract paragraph — both mirror
         # the non-streaming path so unprompted/continuation streamed turns get the same
         # contract (F2 unprompted vs F18 continuation wording).

@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 from config import GUIDANCE_TRUNCATION_CHARS, config
 from logger import log_session_start, log_session_end, main_logger
 from message_processor.base import MessageProcessor
-from message_processor import participation_telemetry
+from message_processor import participation_telemetry, routing_facts
 from message_processor.participation import (ParticipationEngine,
                                              render_capabilities_line)
 from message_processor.people_tools import format_people_summary
@@ -95,6 +95,14 @@ class ChatBotV2:
         a plain INSERT, so cataloguing here as well would just duplicate the row.
         """
         verdict = await self._gate_verdict(message, client)
+        # The ONE place that answers "did the gate hand this on" — for the routing fact and for
+        # the ledger alike. It used to be three separate marks inside the gate, one per
+        # fall-through branch, which is three chances for a new branch to forget. Written on
+        # every run (not only on a wake) so a queued redispatch's second gate cannot inherit the
+        # first gate's answer.
+        routing_facts.set_gate_woke(message, verdict is not None)
+        if verdict is not None:
+            participation_telemetry.mark_gate_woke(message)
         if verdict is None and (message.attachments or []):
             self.processor._schedule_async_call(
                 thread_files.catalog_unattended(self.processor, client, message))
@@ -131,6 +139,10 @@ class ChatBotV2:
                 channel_id, ts, attempt_id=attempt_id,
                 level=level,
                 thread_reply=bool(ts and message.thread_id and message.thread_id != ts),
+                # WHY this message is in scope at all, stamped at dispatch (addressing +
+                # topology only). `thread_reply` above is the raw topology; this is the
+                # routing system's own account of the same message.
+                routing_posture=message.metadata.get("routing_posture"),
                 name_hit=message.metadata.get("participation_name_hit") is True,
                 sender_is_bot=message.metadata.get("participation_sender_bot") is True,
                 sender_type=message.metadata.get("sender_type"),
@@ -354,7 +366,7 @@ class ChatBotV2:
                 await self._place_gate_reaction(
                     message, client, channel_id, react_ts, verdict.emoji)
                 # The responder owns the end of this turn, so it owns the terminal event too.
-                participation_telemetry.mark_gate_woke(message)
+                # (The wake itself is recorded once by the caller, for every fall-through.)
                 return verdict
             if verdict.action == "backoff":
                 # The taxonomy decides what "backoff" means: a durable per-channel preference,
@@ -363,7 +375,6 @@ class ChatBotV2:
                 # loop so the MAIN model applies it (with judgment) via set_channel_participation.
                 fall_through, ack_placed = await self._apply_backoff(message, client, verdict)
                 if fall_through:
-                    participation_telemetry.mark_gate_woke(message)
                     return verdict
                 # Fully handled here. An ack reaction that LANDED is what the room saw, so this
                 # is not a silent turn — the feedback was visibly acknowledged. Without a
@@ -381,7 +392,6 @@ class ChatBotV2:
                 # teammate who drops eyes and then does nothing is misleading. The 👀 is now
                 # a CLAIM ON WORK, staked by TurnRuntime.claim_work when a tool actually
                 # starts doing something slow, and taken back if that work produces nothing.
-                participation_telemetry.mark_gate_woke(message)
                 return verdict
             # ignore — the model was asked and chose to say nothing. A DECISION, and the only
             # gate-terminal outcome that deserves the `silence` label.
@@ -838,8 +848,18 @@ class ChatBotV2:
             # a backoff requesting a settings change); a react_and_respond has already placed its
             # reaction in the gate, so only the words remain to send.
             placement_verdict = None
-            if message.metadata.get("participation_check") is True:
-                verdict = await self._run_participation_gate(message, client)
+            gate_required = message.metadata.get("gate_required") is True
+            if gate_required:
+                try:
+                    verdict = await self._run_participation_gate(message, client)
+                finally:
+                    # AFTER the gate, and in a `finally`: the attempt is minted INSIDE that
+                    # await, so a cancellation or a raise on the way back out would otherwise
+                    # leave an attempt that absorbed queued messages and never said so. Emitting
+                    # here is safe in both directions — it writes nothing while the attempt does
+                    # not exist yet, and the ungated turn's links are written later still, at the
+                    # conversation lock (see MessageProcessor.process_message).
+                    participation_telemetry.emit_queue_links(message, gate_required=True)
                 if verdict is None:
                     return
                 placement_verdict = verdict.placement

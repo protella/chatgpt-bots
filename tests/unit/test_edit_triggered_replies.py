@@ -304,7 +304,7 @@ async def test_engine_dispatch_stashes_context_and_marks_check(flag_on):
         bot.app.client, synthetic, "C1", msg_ts, "please review", "please review the numbers")
     bot.message_handler.assert_awaited_once()
     msg = bot.message_handler.await_args.args[0]
-    assert msg.metadata["participation_check"] is True
+    assert msg.metadata["gate_required"] is True
     assert msg.metadata["participation_level"] == "judicious"
     # Edit context stashed on the facade for evaluate() to read, keyed by (channel, ts).
     ctx = bot._edit_reply_ctx_map[f"C1|{msg_ts}"]

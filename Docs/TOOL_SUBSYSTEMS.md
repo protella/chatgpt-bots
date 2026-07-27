@@ -342,9 +342,12 @@ back as plain bullets. Links come back as `<lnk>`, not `<a>`. A code block is `<
 not `<pre>`. Table cells hold `<p>`, so walking every `<p>` shreds a table into loose paragraphs.
 - Private channels report in `groups`, not `channels` (and `shares.private`). Checking only
   `channels` refuses every edit in a private channel.
-- `delete_canvas` exists but is withheld on turns nobody ADDRESSED the bot on (`_addressed_turn`,
-  not `_unprompted_turn` — a name-hit is prompted in spirit), and never offers the channel canvas.
-  A canvas the bot did not create refuses deletion anyway (`restricted_action`).
+- `delete_canvas` exists but is withheld on turns nobody ADDRESSED the bot on. The gate is
+  `_canvas_delete_authorized` (stamped in `text.py::_materialize_request_tools`): a HUMAN sender
+  AND a genuine address in THIS message — a real `<@bot>` mention or a DM. A bare name-hit does
+  NOT qualify, and the routing facts (`gate_required` / `silence_capable`) do not authorize
+  anything. Absent → fail closed. The channel canvas is never offered, and a canvas the bot did
+  not create refuses deletion anyway (`restricted_action`).
 
 ## Scanned / image-only PDF handling
 

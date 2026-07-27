@@ -333,6 +333,14 @@ Registered in `SlackBot._build_tool_registry` (`slack_client/base.py:76-93`):
 ```
 
 ### Gating — no system-prompt fork (Codex finding 15, blocker)
+
+> **Names as of 2026-07-10; the mechanism is unchanged, the identifiers have moved.**
+> `message.metadata["participation_check"]` became four explicit routing facts
+> (`message_processor/routing_facts.py`): exposure now keys off **`silence_capable`**, the
+> F2-vs-F18 suffix off **`gate_required`**, and the copied-config flag is
+> **`_silence_capable_turn`**. Read the rest of this section for the WHY; read
+> `routing_facts.py` for the current contract.
+
 The system prompt stays byte-identical. Per-request exposure:
 - The text handler materializes the request's tool exposure **once, up front** (round-2
   should-fix 6): build a copied config dict with `_unprompted_turn=True` when
@@ -1177,7 +1185,7 @@ entry; pulse line carries the attachment note; end-to-end: file_share event → 
 
 **Live failure:** in a 1:1 thread with the bot, "claude, what are your thoughts?"
 dispatched via the deterministic direct_continuation fast path
-(participation_check=False — Claude had never posted in that thread, so the other-bot
+(ungated — Claude had never posted in that thread, so the other-bot
 escape didn't fire) straight to the main model. The model RECOGNIZED it wasn't the
 addressee but had no way to stay silent — F2 exposes `no_response_needed` on
 UNPROMPTED turns only — so it posted "I'll let Claude take this one—rare bot

@@ -11,7 +11,7 @@ from thread_manager import AsyncThreadStateManager
 from openai_client import OpenAIClient
 from config import config, pipeline_status
 from logger import LoggerMixin
-from . import image_catalog
+from . import image_catalog, participation_telemetry
 from .containers import ContainerManager
 from .message_timestamps import stamp_content
 from .thread_management import ThreadManagementMixin
@@ -160,7 +160,19 @@ class MessageProcessor(ThreadManagementMixin,
             self.log_info("="*100)
             self.log_info("")
             return Response(type="queued", content="")
-        
+
+        # THE POINT OF NO RETURN for queued-batch lineage. The lock is held, so this turn is
+        # genuinely running and is what the messages it absorbed were folded into. An UNGATED
+        # turn has no attempt id, so if this were written any earlier — back when the turn was
+        # merely intended — a turn that reached the queue instead would have claimed messages it
+        # never answered, with nothing downstream able to correct it. A gated turn wrote its
+        # links at the gate (this is then a no-op); one whose attempt was never minted keeps its
+        # sources staged for whichever turn does run. Reads its OWN routing fact rather than
+        # trusting the caller: mislabeling the route here would misfile the lineage.
+        participation_telemetry.emit_queue_links(
+            message,
+            gate_required=(message.metadata or {}).get("gate_required") is True)
+
         try:
             # Get or rebuild thread state
             thread_state = await self._get_or_rebuild_thread_state(
@@ -885,10 +897,10 @@ class MessageProcessor(ThreadManagementMixin,
         # dispatch whose message was since edited and handled by the edit path. Such a dispatch
         # slipped into the busy queue before the engine supersession landed; carried forward it
         # RE-RUNS the gate on stale text and posts a duplicate (live 2026-07-16). It is identified
-        # by carrying participation_check for a ts the edit path registered, WITHOUT the surviving
-        # edit's marker (the edit's own engine re-dispatch carries it and is kept). Addressed
-        # (app_mention/DM) turns and ordinary different messages carry no participation_check and
-        # are never touched; a genuinely different queued message has a different ts.
+        # by being gate-routed for a ts the edit path registered, WITHOUT the surviving edit's
+        # marker (the edit's own engine re-dispatch carries it and is kept). Addressed
+        # (app_mention/DM) turns and ordinary different messages are not gate-routed and are
+        # never touched; a genuinely different queued message has a different ts.
         marker_getter = getattr(client, "edit_dispatch_marker", None)
         if callable(marker_getter):
             kept = []
@@ -896,7 +908,7 @@ class MessageProcessor(ThreadManagementMixin,
                 try:
                     meta = queued_msg.metadata or {}
                     ts = meta.get("ts")
-                    if meta.get("participation_check") and ts is not None:
+                    if meta.get("gate_required") and ts is not None:
                         surviving = marker_getter(queued_msg.channel_id, ts)
                         if surviving is not None and meta.get("edit_reply_marker") != surviving:
                             self.log_info(
@@ -919,6 +931,23 @@ class MessageProcessor(ThreadManagementMixin,
             return
 
         trigger = batch[-1]
+        # The batch members whose turns this one is about to absorb. Each closed its own gate
+        # attempt with `queued`, and until now nothing said WHICH later turn covered them — the
+        # trigger is linked by parent_attempt_id (it is re-gated as the same Message), the rest
+        # were simply folded in and lost. Staged here, where the sources are known, and written
+        # by the successor turn, which alone knows what it became.
+        #
+        # A member may ALSO be carrying sources it inherited from an earlier drain and never
+        # answered (it was queued again before its turn ran). Those travel with it: an ungated
+        # member mints no attempt, so if its inheritance stopped here nothing downstream could
+        # ever say who covered those messages.
+        absorbed = []
+        for absorbed_msg in batch[:-1]:
+            absorbed.extend(participation_telemetry.take_staged_links(absorbed_msg))
+            attempt_id = participation_telemetry.attempt_id_for(absorbed_msg)
+            if attempt_id:
+                absorbed.append(attempt_id)
+        participation_telemetry.stage_queue_links(trigger, absorbed)
         # T2-10: earlier messages' image parts + attachment failures are collected here and
         # carried to the trigger turn — images so the model can actually SEE them (not just
         # their catalogued description), failures so a dropped file is acknowledged.

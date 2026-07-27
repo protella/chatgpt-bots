@@ -160,7 +160,7 @@ async def test_supplementary_bot_message_reaches_gate(monkeypatch):
         bot.app.client)
     bot.message_handler.assert_called_once()
     msg = bot.message_handler.call_args[0][0]
-    assert msg.metadata.get("participation_check") is True
+    assert msg.metadata.get("gate_required") is True
     assert msg.metadata.get("participation_sender_bot") is True
 
 
@@ -320,7 +320,7 @@ async def test_file_share_sets_participation_attachments_signal(tag_only):
         bot.app.client)
     bot.message_handler.assert_called_once()
     msg = bot.message_handler.call_args[0][0]
-    assert msg.metadata.get("participation_check") is True
+    assert msg.metadata.get("gate_required") is True
     assert msg.metadata.get("participation_attachments") == "1 image (poster.png)"
 
 
@@ -390,7 +390,7 @@ async def test_tag_only_name_hit_routes_to_engine(tag_only):
     bot.message_handler.assert_called_once()
     msg = bot.message_handler.call_args[0][0]
     assert msg.metadata.get("channel_listen") is True
-    assert msg.metadata.get("participation_check") is True
+    assert msg.metadata.get("gate_required") is True
     assert msg.metadata.get("participation_name_hit") is True
 
 
@@ -402,7 +402,7 @@ async def test_tag_only_name_hit_engine_disabled_falls_back_deterministic(tag_on
     await bot._handle_channel_message(_evt(text="ChatGPT, what's the weather?"), bot.app.client)
     bot.message_handler.assert_called_once()
     msg = bot.message_handler.call_args[0][0]
-    assert msg.metadata.get("participation_check") is not True
+    assert msg.metadata.get("gate_required") is not True
 
 
 @pytest.mark.asyncio
@@ -414,7 +414,7 @@ async def test_explicit_mention_is_deduped(tag_only):
 
 
 @pytest.mark.asyncio
-async def test_auto_respond_sets_participation_check_for_unaddressed(monkeypatch):
+async def test_auto_respond_gate_routes_unaddressed(monkeypatch):
     monkeypatch.setattr(config, "channel_response_mode", "auto_respond", raising=False)
     monkeypatch.setattr(config, "bot_name_aliases", ["ChatGPT"], raising=False)
     monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
@@ -422,7 +422,7 @@ async def test_auto_respond_sets_participation_check_for_unaddressed(monkeypatch
     await bot._handle_channel_message(_evt(text="anyone know the q3 numbers?"), bot.app.client)
     bot.message_handler.assert_called_once()
     msg = bot.message_handler.call_args[0][0]
-    assert msg.metadata.get("participation_check") is True
+    assert msg.metadata.get("gate_required") is True
     assert msg.metadata.get("participation_level") == "judicious"  # auto_respond ≡ judicious
 
 
@@ -528,7 +528,7 @@ async def test_bot_sender_name_hit_routes_to_engine_with_signal(tag_only):
     await bot._handle_channel_message(evt, bot.app.client)
     bot.message_handler.assert_called_once()
     msg = bot.message_handler.call_args[0][0]
-    assert msg.metadata.get("participation_check") is True
+    assert msg.metadata.get("gate_required") is True
     assert msg.metadata.get("participation_sender_bot") is True
 
 

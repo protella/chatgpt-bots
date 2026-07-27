@@ -32,7 +32,7 @@ def _message(*, channel="C1", thread="10.0", ts="10.0", **meta):
 
 def test_ambient_channel_message_is_silence_capable(monkeypatch):
     monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
-    turn = TurnRuntime.for_message(_message(participation_check=True), "10.0")
+    turn = TurnRuntime.for_message(_message(silence_capable=True), "10.0")
     assert turn.silence_capable is True
     assert turn.progress_enabled is False       # show nothing until it commits
 
@@ -42,7 +42,7 @@ def test_thread_continuation_is_silence_capable(monkeypatch):
     model is the ONLY decider — and it can still bow out."""
     monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
     turn = TurnRuntime.for_message(
-        _message(wake_source="thread_continuation"), "10.0")
+        _message(silence_capable=True, wake_source="thread_continuation"), "10.0")
     assert turn.silence_capable is True
     assert turn.progress_enabled is False
 
@@ -58,7 +58,7 @@ def test_an_addressed_turn_still_shows_progress(monkeypatch):
 def test_no_reply_tool_disabled_means_the_turn_always_answers(monkeypatch):
     """With the tool off the model CANNOT stay silent, so there is nothing to defer for."""
     monkeypatch.setattr(config, "enable_no_reply_tool", False, raising=False)
-    turn = TurnRuntime.for_message(_message(participation_check=True), "10.0")
+    turn = TurnRuntime.for_message(_message(silence_capable=True), "10.0")
     assert turn.silence_capable is False
     assert turn.progress_enabled is True
 
@@ -93,7 +93,7 @@ async def test_a_silent_ambient_turn_posts_nothing_at_all(monkeypatch):
     client.channel_pulse = None
 
     await handler.handle_message(
-        _message(participation_check=True, wake_source="ambient"), client)
+        _message(gate_required=True, silence_capable=True, wake_source="ambient"), client)
 
     client.send_thinking_indicator.assert_not_awaited()
     client.set_assistant_status.assert_not_awaited()
@@ -112,7 +112,6 @@ async def test_an_addressed_turn_still_gets_its_indicator(monkeypatch):
     handler.processor = SimpleNamespace(thread_manager=None)
     handler.processor.process_message = AsyncMock(return_value=Response(
         type="text", content="Revenue came in at 4.2M.", metadata={"posted": True}))
-    handler._is_unprompted_turn = MagicMock(return_value=False)
 
     client = MagicMock()
     client.send_thinking_indicator = AsyncMock(return_value="T1")
@@ -206,7 +205,7 @@ async def test_a_deferred_non_streaming_turn_sets_no_status(monkeypatch):
 
     client = MagicMock()
     client.supports_streaming = MagicMock(return_value=False)   # streaming OFF
-    msg = _message(participation_check=True)
+    msg = _message(silence_capable=True)
 
     async def fake_config(**kw):
         return {"enable_streaming": False, "model": "gpt-5.6-sol"}
@@ -282,11 +281,11 @@ def test_the_reply_target_is_the_turns_chosen_destination(monkeypatch):
     """None means top-level in the channel — not "the thread the trigger was in"."""
     monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
     top_level = TurnRuntime.for_message(
-        _message(participation_check=True), None)   # main.py chose channel placement
+        _message(silence_capable=True), None)   # main.py chose channel placement
     assert top_level.reply_thread_id is None
 
     threaded = TurnRuntime.for_message(
-        _message(participation_check=True), "10.0")
+        _message(silence_capable=True), "10.0")
     assert threaded.reply_thread_id == "10.0"
 
 
@@ -360,7 +359,7 @@ async def _timeout_notice_shown_for(turn, monkeypatch):
     client.send_message = AsyncMock()
 
     try:
-        await p.process_message(_message(participation_check=True), client, None, turn=turn)
+        await p.process_message(_message(silence_capable=True), client, None, turn=turn)
     except Exception:
         pass   # anything downstream of the notice is not this test's business
 

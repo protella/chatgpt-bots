@@ -232,11 +232,11 @@ class TestDrainDispatch:
         assert trigger.text == "solo" and trigger.metadata["queued_batch_size"] == 1
 
 
-def _edit_msg(text, ts, *, participation_check=False, edit_marker=None, channel="C123",
+def _edit_msg(text, ts, *, gate_required=False, edit_marker=None, channel="C123",
               thread="111.0"):
     md = {"ts": ts, "username": "u"}
-    if participation_check:
-        md["participation_check"] = True
+    if gate_required:
+        md["gate_required"] = True
     if edit_marker is not None:
         md["edit_reply_marker"] = edit_marker
     return Message(text=text, user_id="U1", channel_id=channel, thread_id=thread,
@@ -259,12 +259,12 @@ class TestEditStaleDrop:
         key = "C123:111.0"
         # ts 200 was edited and handled; the edit's own dispatch carries marker "M".
         registry = {"C123|200.0": "M"}
-        # Stale pre-edit engine respond (participation_check, no marker) for the SAME ts.
+        # Stale pre-edit engine respond (gate-routed, no marker) for the SAME ts.
         manager.enqueue_pending(key, _edit_msg("does anyone remember?", "200.0",
-                                               participation_check=True))
+                                               gate_required=True))
         # A genuinely different queued message (different ts) — must survive.
         manager.enqueue_pending(key, _edit_msg("unrelated question", "201.0",
-                                               participation_check=True))
+                                               gate_required=True))
         manager.get_thread_async = AsyncMock(return_value=Mock())
         proc = _drain_proc(manager)
         client = self._client(registry)
@@ -282,7 +282,7 @@ class TestEditStaleDrop:
         registry = {"C123|200.0": "M"}
         # The edit's OWN engine re-dispatch: same ts, carries the matching marker → kept.
         manager.enqueue_pending(key, _edit_msg("review the Q3 numbers", "200.0",
-                                               participation_check=True, edit_marker="M"))
+                                               gate_required=True, edit_marker="M"))
         manager.get_thread_async = AsyncMock(return_value=Mock())
         proc = _drain_proc(manager)
         client = self._client(registry)
@@ -293,12 +293,12 @@ class TestEditStaleDrop:
 
     @pytest.mark.asyncio
     async def test_addressed_turn_never_dropped(self, manager):
-        """An addressed (app_mention/DM) queued turn carries no participation_check — even for a
+        """An addressed (app_mention/DM) queued turn is not gate-routed — even for a
         registered edit ts it is never dropped."""
         key = "C123:111.0"
         registry = {"C123|200.0": "M"}
         manager.enqueue_pending(key, _edit_msg("<@UBOT> what's up", "200.0",
-                                               participation_check=False))
+                                               gate_required=False))
         manager.get_thread_async = AsyncMock(return_value=Mock())
         proc = _drain_proc(manager)
         client = self._client(registry)
@@ -306,6 +306,112 @@ class TestEditStaleDrop:
             await proc._dispatch_pending_batch(_msg("done"), client, key)
         proc._schedule_async_call.assert_called_once()
         assert client.message_handler.call_args.args[0].text == "<@UBOT> what's up"
+
+
+# --- Queued-batch linkage: which later turn covered a queued message ---
+
+class TestQueueLinkStaging:
+    """A batch member that is not the trigger never gets a turn of its own — its work happens
+    inside the successor's. Before this, that message's gate attempt ended in `queued` and
+    nothing anywhere said which reply eventually covered it."""
+
+    @pytest.mark.asyncio
+    async def test_drain_stages_the_absorbed_attempt_ids_on_the_trigger(self, manager):
+        from message_processor import participation_telemetry as pt
+        key = "C123:111.0"
+        manager.get_thread_async = AsyncMock(return_value=Mock())
+        earlier, later = _msg("what's the ETA?", ts="1.0"), _msg("and the budget?", ts="2.0")
+        first_id = pt.begin_attempt(earlier)
+        second_id = pt.begin_attempt(later)
+        manager.enqueue_pending(key, earlier)
+        manager.enqueue_pending(key, later)
+        manager.enqueue_pending(key, _msg("thoughts?", ts="3.0"))   # the trigger, ungated
+
+        proc = _drain_proc(manager)
+        client = Mock()
+        client.message_handler = Mock()
+        with patch("message_processor.base.asyncio.sleep", new=AsyncMock()):
+            await proc._dispatch_pending_batch(_msg("done"), client, key)
+
+        trigger = client.message_handler.call_args.args[0]
+        assert trigger.metadata[pt.BATCHED_SOURCES_KEY] == [first_id, second_id]
+
+    @pytest.mark.asyncio
+    async def test_a_requeued_successor_carries_its_inheritance_to_the_next_drain(self, manager):
+        """THE RACE this staging exists to survive. An ungated successor absorbs a queued
+        attempt, then hits a busy conversation and queues itself. It mints no attempt id, so if
+        its inheritance stopped there, nothing downstream could ever say which turn covered
+        those messages — the ledger would simply lose them."""
+        from message_processor import participation_telemetry as pt
+        key = "C123:111.0"
+        successor = _msg("<@UBOT> and the budget?", ts="2.0")
+        pt.stage_queue_links(successor, ["src-a"])       # handed to it by an earlier drain
+
+        # It never runs: the conversation is busy, so it queues instead of answering.
+        assert await manager.acquire_thread_lock("111.0", "C123") is True
+        try:
+            queued = await _StubProcessor(manager).process_message(
+                successor, client=Mock(), thinking_id=None)
+        finally:
+            await manager.release_thread_lock("111.0", "C123")
+        assert queued.type == "queued"
+        assert successor.metadata[pt.BATCHED_SOURCES_KEY] == ["src-a"]   # claimed nothing
+
+        # The next drain absorbs it — and the inheritance travels with it, onto the new trigger.
+        manager.get_thread_async = AsyncMock(return_value=Mock())
+        manager.enqueue_pending(key, _msg("thoughts?", ts="3.0"))
+        proc = _drain_proc(manager)
+        client = Mock()
+        client.message_handler = Mock()
+        with patch("message_processor.base.asyncio.sleep", new=AsyncMock()):
+            await proc._dispatch_pending_batch(_msg("done"), client, key)
+
+        trigger = client.message_handler.call_args.args[0]
+        assert trigger.text == "thoughts?"
+        assert trigger.metadata[pt.BATCHED_SOURCES_KEY] == ["src-a"]
+        assert pt.BATCHED_SOURCES_KEY not in successor.metadata   # handed over, not duplicated
+
+    @pytest.mark.asyncio
+    async def test_a_trigger_keeps_its_own_inheritance_when_it_absorbs_more(self, manager):
+        """Staging MERGES. A trigger can already be carrying sources it never answered, and
+        overwriting that list would drop exactly the messages hardest to recover."""
+        from message_processor import participation_telemetry as pt
+        key = "C123:111.0"
+        manager.get_thread_async = AsyncMock(return_value=Mock())
+        absorbed = _msg("what's the ETA?", ts="1.0")
+        absorbed_id = pt.begin_attempt(absorbed)
+        manager.enqueue_pending(key, absorbed)
+        trigger_msg = _msg("thoughts?", ts="2.0")
+        pt.stage_queue_links(trigger_msg, ["src-old"])   # inherited from an earlier drain
+        manager.enqueue_pending(key, trigger_msg)
+
+        proc = _drain_proc(manager)
+        client = Mock()
+        client.message_handler = Mock()
+        with patch("message_processor.base.asyncio.sleep", new=AsyncMock()):
+            await proc._dispatch_pending_batch(_msg("done"), client, key)
+
+        trigger = client.message_handler.call_args.args[0]
+        assert trigger.metadata[pt.BATCHED_SOURCES_KEY] == ["src-old", absorbed_id]
+
+    @pytest.mark.asyncio
+    async def test_ungated_batch_members_stage_nothing(self, manager):
+        """Mentions and DMs mint no attempt, so there is nothing to link — and no empty key
+        left behind for the successor to emit from."""
+        from message_processor import participation_telemetry as pt
+        key = "C123:111.0"
+        manager.get_thread_async = AsyncMock(return_value=Mock())
+        manager.enqueue_pending(key, _msg("<@UBOT> ping", ts="1.0"))
+        manager.enqueue_pending(key, _msg("thoughts?", ts="2.0"))
+
+        proc = _drain_proc(manager)
+        client = Mock()
+        client.message_handler = Mock()
+        with patch("message_processor.base.asyncio.sleep", new=AsyncMock()):
+            await proc._dispatch_pending_batch(_msg("done"), client, key)
+
+        trigger = client.message_handler.call_args.args[0]
+        assert pt.BATCHED_SOURCES_KEY not in trigger.metadata
 
 
 # --- Gate order: participation-ignored messages never reach the queue ---
@@ -320,7 +426,8 @@ class TestGateOrder:
         bot._run_participation_gate = AsyncMock(return_value=None)  # engine said ignore
 
         message = Mock(channel_id="C123", thread_id="111.0")
-        message.metadata = {"participation_check": True, "ts": "111.0"}
+        message.metadata = {"gate_required": True, "silence_capable": True,
+                            "ts": "111.0"}
         await bot.handle_message(message, Mock())
 
         bot.processor.process_message.assert_not_called()  # → nothing could enqueue

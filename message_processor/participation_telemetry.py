@@ -19,8 +19,12 @@ exceptions and returns None: a telemetry failure must never cost a verdict, a re
 reaction. Nothing here is read back by the bot at runtime — the file is for us.
 
 THE POPULATION IS GATE ATTEMPTS, and only those. An attempt begins when `_run_participation_gate`
-mints an `attempt_id`; mentions, DMs and direct thread continuations mint none and appear NOWHERE
-in this ledger — not their reactions, not their work claims, not their outcomes. Neither do the
+mints an `attempt_id`; mentions, DMs and direct thread continuations mint none and are NOT IN THIS
+POPULATION — no gate_start, no decision, no terminal, no reactions, no work claims. The one place
+an ungated turn is named at all is `queue_link`, and only ever as the DESTINATION of somebody
+else's queued work (`batched_into_channel_id` / `batched_into_trigger_ts`, with
+`batched_into_gate_required=false` and no attempt id, because there is none). That names a turn;
+it does not enrol it. Every count here still has gated attempts as its denominator. Neither do the
 messages dropped BEFORE dispatch (level=off, own message, non-semantic subtype, and the
 engine-off short-circuit in message_events) — they never reach the gate, so any rate computed
 here has "messages that entered the gate" as its denominator and nothing wider. The
@@ -50,6 +54,10 @@ EVENTS.
                   would report the gate as failing to decide when it decided fine and the
                   reaction (or the handoff) is what broke.
   gate_decision   the model's own verdict, INCLUDING `ignore` — a decision, not a decline.
+  queue_link      DIAGNOSTIC, never terminal, and NEVER part of any denominator. One line per
+                  queued attempt that a later catch-up turn absorbed: `attempt_id` is the
+                  QUEUED source, and the `batched_into_*` fields name the successor turn that
+                  answered on its behalf. See the linkage rule below.
   reaction        one attempt at one emoji: operation (add/remove) x result (added /
                   already_present / refused / failed / removed / remove_failed).
   visible_action  THE SOLE TERMINAL EVENT. Exactly one per attempt in a HEALTHY EMITTED LEDGER,
@@ -68,14 +76,27 @@ ANALYSIS RULE FOR `queued`. A terminal of `kind=queued` is NOT an outcome — it
 turn already owned the conversation and this message's work continues inside a LATER attempt
 (the catch-up turn, which carries its own attempt_id). Counting it in a react / talk / silence
 denominator scores one message's judgment as a silence and then scores it again under the turn
-that actually answered. EXCLUDE it. Note that only the reused trigger message is linked (via
-`parent_attempt_id`); the other members of a drained batch currently have no link to the reply
-that eventually covered them — `batched_into_attempt_id` is deferred to the routing commit, so
-until then a batch member's fate is not mechanically recoverable at all.
+that actually answered. EXCLUDE it — that rule is unchanged and still binding.
+
+LINKAGE. Which later attempt covered a queued one is now on the record. The message the drain
+REUSES as its trigger is linked by `parent_attempt_id` (same Message, re-gated, so the second
+attempt names the first). Every OTHER member of the drained batch is folded into that trigger's
+turn and never gets a turn of its own, so it is linked by a `queue_link` line: join a queued
+terminal to its successor by `attempt_id`, then read `batched_into_attempt_id`. When the
+successor is an ungated turn — a mention, a DM, a thread continuation — there IS no successor
+attempt, and the line carries `batched_into_gate_required=false` with the successor's
+channel/trigger key instead: the fate is recoverable, just not as an attempt id. No successor
+attempt is ever minted early to make the link prettier.
 
 SHAPE. One JSON object per line, in `logs/participation.jsonl`. Events are NOT assembled into a
 turn record in memory; each line stands alone and carries `attempt_id` (plus `channel_id` +
-`trigger_ts`), so a turn is reconstructed by joining on that key at analysis time. That means no
+`trigger_ts`), so a turn is reconstructed by joining on that key at analysis time. `queue_link`
+is the ONE deliberate exception: it carries its source's `attempt_id` but not that source's
+coordinates, because the coordinates are already on every other line the source produced and the
+join answers the question this event exists for. Its `channel_id`/`trigger_ts`-shaped fields are
+prefixed `batched_into_` and describe the SUCCESSOR, not the subject of the line — an analysis
+that treats them as the line's own coordinates would file each queued message under the turn
+that absorbed it. That means no
 in-flight state to leak, no unbounded dict keyed by messages that may never come back, and no
 ordering assumption — a crash mid-turn loses nothing that was already written. A redispatch of
 the same Message gets a FRESH attempt_id and carries `parent_attempt_id` pointing at the one it
@@ -121,7 +142,9 @@ logger = setup_logger(name="slack_bot.ParticipationTelemetry")
 # an older reader ignores it, and a newer reader sees it missing on old lines.
 # v2: one mandatory terminal visible_action per attempt; attempt_id/session identity; the
 #     reaction event's placed-bool replaced by operation + result.
-CONTRACT_VERSION = 2
+# v3: the `queue_link` event — an attempt may now produce a line that is neither a decision nor
+#     an outcome, so event cardinality per attempt changed.
+CONTRACT_VERSION = 3
 
 # WHICH gate produced these lines. The rich multi-signal classifier is "rich-v1"; a different
 # gate is a different population even at the same CONTRACT_VERSION, and the two must never be
@@ -182,6 +205,10 @@ PARENT_KEY = "_pt_parent_attempt_id"
 CLOSED_KEY = "_pt_attempt_closed"
 GATE_WOKE_KEY = "_pt_gate_woke"
 RESPONDER_STARTED_KEY = "_pt_responder_started"
+# The queued attempts a drained batch folded into the message carrying this key. Staged by the
+# drain (which knows the sources) and emitted by the successor turn (which alone knows what it
+# became), so nothing has to pre-mint an attempt id to have something to point at.
+BATCHED_SOURCES_KEY = "_pt_batched_source_attempt_ids"
 
 _lock = threading.Lock()
 _sink: Optional[logging.Logger] = None
@@ -524,6 +551,77 @@ def finish_attempt(message: Any, kind: str, **fields: Any) -> bool:
         return False
 
 
+def stage_queue_links(trigger: Any, source_attempt_ids: Any) -> None:
+    """Remember, on the message a drain chose as its trigger, which queued attempts it is
+    absorbing. Nothing is written here: at drain time the successor turn does not exist yet, and
+    minting its attempt id early to have something to write would put a start in the ledger for
+    a turn that may never run.
+
+    MERGES rather than overwrites. A trigger can arrive already carrying sources it inherited
+    from an earlier drain and never got to answer (it was queued again before it ran), and
+    replacing that list would drop exactly the messages whose lineage is hardest to recover."""
+    try:
+        meta = getattr(trigger, "metadata", None)
+        if not isinstance(meta, dict):
+            return
+        merged = list(meta.get(BATCHED_SOURCES_KEY) or [])
+        for source_id in (source_attempt_ids or []):
+            if source_id and str(source_id) not in merged:
+                merged.append(str(source_id))
+        if merged:
+            meta[BATCHED_SOURCES_KEY] = merged
+    except Exception as e:  # noqa: BLE001 — a lost link is never worth a lost turn
+        logger.debug(f"Participation queue links not staged: {e}")
+
+
+def take_staged_links(message: Any) -> list:
+    """The sources staged on a message that it never got to answer, removed as they are handed
+    over. A queued successor is absorbed into a LATER trigger, and its unanswered inheritance
+    has to travel with it — otherwise the chain ends at a turn that never ran."""
+    try:
+        meta = getattr(message, "metadata", None)
+        if not isinstance(meta, dict):
+            return []
+        return list(meta.pop(BATCHED_SOURCES_KEY, None) or [])
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"Participation queue links not forwarded: {e}")
+        return []
+
+
+def emit_queue_links(message: Any, *, gate_required: bool) -> None:
+    """Write the staged links now that this turn is genuinely running, and clear them so a turn
+    that is itself queued and drained again links its next batch, not this one.
+
+    CALLED AT THE POINT OF NO RETURN, not at the point of intent. A gated turn calls it once the
+    gate has minted its attempt; an ungated one once it holds the conversation lock. Anything
+    earlier can claim that a turn absorbed messages it then queued without answering — and an
+    ungated turn has no attempt id, so nothing downstream could correct the record.
+
+    Leaves the links STAGED (and writes nothing) when a gated turn has no attempt id yet: the
+    attempt was never minted, so there is no successor to name, and the sources are still owed
+    to whichever turn eventually runs."""
+    try:
+        meta = getattr(message, "metadata", None)
+        if not isinstance(meta, dict):
+            return
+        sources = meta.get(BATCHED_SOURCES_KEY)
+        if not sources:
+            return
+        successor_id = meta.get(ATTEMPT_KEY) if gate_required else None
+        if gate_required and not successor_id:
+            return   # cancelled/raised before the attempt existed — keep them for a later turn
+        meta.pop(BATCHED_SOURCES_KEY, None)
+        for source_attempt_id in sources:
+            queue_link(source_attempt_id,
+                       batched_into_attempt_id=successor_id,
+                       batched_into_channel_id=getattr(message, "channel_id", None),
+                       batched_into_trigger_ts=(meta.get("ts")
+                                                or getattr(message, "thread_id", None)),
+                       batched_into_gate_required=bool(gate_required))
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"Participation queue links not written: {e}")
+
+
 def abort_attempt(message: Any) -> bool:
     """The turn left without closing its attempt: a cancellation, an early raise on the way to
     the gate, a thinking-indicator failure. Runs from a `finally` that wraps everything from
@@ -608,6 +706,29 @@ def gate_decision(channel_id: Optional[str], trigger_ts: Optional[str],
         gate_ms=gate_ms,
         classifier_ms=classifier_ms,
     )
+
+
+def queue_link(source_attempt_id: str, *, batched_into_attempt_id: Optional[str],
+               batched_into_channel_id: Optional[str],
+               batched_into_trigger_ts: Optional[str],
+               batched_into_gate_required: bool) -> None:
+    """One queued attempt, and the later turn that answered on its behalf.
+
+    DIAGNOSTIC and never terminal: the queued attempt already closed itself with `kind=queued`,
+    and this adds no second outcome to it. It must stay out of every denominator — counting it
+    would put one message in the population twice, which is the exact mistake the `queued`
+    exclusion rule exists to prevent.
+
+    `attempt_id` is the SOURCE (the queued message), not the successor, so the join from a
+    queued terminal is a lookup on the key it already carries. The successor is described by the
+    `batched_into_*` fields, and `batched_into_attempt_id` is absent whenever the successor was
+    an ungated turn — there is no attempt to name, and inventing one would put a mention or a DM
+    into a ledger documented as excluding them."""
+    record("queue_link", attempt_id=source_attempt_id,
+           batched_into_attempt_id=batched_into_attempt_id,
+           batched_into_channel_id=batched_into_channel_id,
+           batched_into_trigger_ts=batched_into_trigger_ts,
+           batched_into_gate_required=batched_into_gate_required)
 
 
 def reaction(channel_id: Optional[str], trigger_ts: Optional[str], *,

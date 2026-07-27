@@ -288,7 +288,8 @@ def _gate_app(monkeypatch, customs):
     client.get_channel_context = AsyncMock(return_value={})
     client.workspace_emojis = _MutableCache(customs)
     msg = Message(text="x", user_id="U1", channel_id="C1", thread_id="10.0",
-                  metadata={"ts": "10.0", "participation_check": True,
+                  metadata={"ts": "10.0", "gate_required": True,
+                            "silence_capable": True,
                             "participation_level": "judicious"})
     return app, client, msg, captured, declines
 
