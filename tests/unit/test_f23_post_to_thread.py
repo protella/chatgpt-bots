@@ -117,7 +117,9 @@ async def test_routes_through_send_message(monkeypatch):
         _ctx(), {"thread_ts": "OTHER.9", "text": "hello"}
     )
     assert out["ok"] is True
-    host.send_message.assert_awaited_once_with("C1", "OTHER.9", "hello")
+    # The lease rides every guarded send now; the destination and text are what this
+    # test is about.
+    assert host.send_message.await_args.args == ("C1", "OTHER.9", "hello")
 
 
 # ------------------------------------------------------------------- refusals
@@ -134,7 +136,9 @@ async def test_posts_with_no_mute_lookup(monkeypatch):
     )
     assert out["ok"] is True and out["posted_ts"] == "900.0"
     ctx.db.is_thread_muted_async.assert_not_awaited()
-    host.send_message.assert_awaited_once_with("C1", "OTHER.9", "hello")
+    # The lease rides every guarded send now; the destination and text are what this
+    # test is about.
+    assert host.send_message.await_args.args == ("C1", "OTHER.9", "hello")
 
 
 @pytest.mark.asyncio

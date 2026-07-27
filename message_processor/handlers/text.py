@@ -8,6 +8,7 @@ from typing import Any, List, Optional
 from base_client import BaseClient, Message, Response
 from config import config, pipeline_status
 from message_processor.routing_facts import POSTURE_THREAD
+from message_processor.stale_send_guard import StaleSendSuppressed
 from message_processor.destination_tools import SET_REPLY_DESTINATION
 from prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX, DESTINATION_CONTRACT_SUFFIX,
                      THREAD_ACTIVITY_NO_REPLY_SUFFIX)
@@ -118,6 +119,41 @@ def _reaction_committed(local_tool_calls: Optional[List[dict]]) -> bool:
         c.get("name") == "react_to_message" and c.get("ok")
         for c in (local_tool_calls or [])
     )
+
+
+def advance_lease_to_request(turn, messages_for_api, message) -> None:
+    """Tell this turn's stale-send lease the newest inbound message its request actually
+    carries — the mark the guard compares a later arrival against.
+
+    Counted: role-`user` history entries that carry a `metadata.ts`, plus the CURRENT trigger
+    EXPLICITLY. The trigger has to be named rather than found, because a multipart turn (images,
+    documents) replaces its content with a parts list and loses the metadata that would have
+    identified it — and a turn that failed to account for its own trigger would suppress its own
+    answer the moment anything else looked newer.
+
+    NOT counted, deliberately: assistant turns (our own words are not inbound), channel memory
+    and summaries, the pulse envelope, the developer suffix and tool results. None of those is a
+    message this turn is answering, and treating one as such would let awareness content — or
+    our own reply — silence a real question. Nothing is parsed out of rendered prompt strings.
+
+    Monotonic and idempotent: retries and fallbacks rebuild the request and call this again, and
+    the mark must never slide backwards."""
+    lease = getattr(turn, "send_lease", None) if turn is not None else None
+    if lease is None:
+        return
+    trigger_ts = (getattr(message, "metadata", None) or {}).get("ts")
+    if trigger_ts is not None and lease.owns(trigger_ts):
+        lease.advance_last_seen(trigger_ts)
+    for entry in (messages_for_api or []):
+        if not isinstance(entry, dict) or entry.get("role") != "user":
+            continue
+        meta = entry.get("metadata")
+        ts = meta.get("ts") if isinstance(meta, dict) else None
+        # The ownership ceiling: a source NEWER than this turn's own trigger belongs to a later
+        # turn that is already answering it. Absorbing it here would have both turns answer the
+        # same message — and would quietly lift this turn above the watermark meant to stop it.
+        if ts is not None and lease.owns(ts):
+            lease.advance_last_seen(ts)
 
 
 class TextHandlerMixin:
@@ -473,6 +509,9 @@ class TextHandlerMixin:
 
         # Pre-trim messages to fit within context window
         messages_for_api = await self._pre_trim_messages_for_api(messages_for_api, model=thread_state.current_model)
+        # The request is settled: record the newest inbound source it carries, so the
+        # stale guard compares any later arrival against what this turn answered.
+        advance_lease_to_request(turn, messages_for_api, message)
         
         # Get thread config (with user preferences)
         thread_config = await config.get_thread_config_async(
@@ -935,7 +974,7 @@ class TextHandlerMixin:
                 self.log_warning(f"Native stream abandon failed during {context} cleanup")
         for ts in {t for t in (message_id, current_message_id) if t}:
             try:
-                if not await client.delete_message(channel_id, ts):
+                if not await client.delete_message(channel_id, ts):  # unleased-ok: teardown — removing a surface can never be a stale answer
                     self.log_debug(f"Could not delete message {ts} during {context} cleanup")
             except Exception as e:
                 self.log_debug(f"Error deleting message {ts} during {context} cleanup: {e}")
@@ -948,12 +987,12 @@ class TextHandlerMixin:
         means "could not create the continuation" — the caller must NEVER fall back to editing
         the PRIOR part's message id with the overflow text, because that overwrites the
         already-delivered first part."""
-        result = await client.send_message_get_ts(channel_id, reply_target, continuation_text)
+        result = await client.send_message_get_ts(channel_id, reply_target, continuation_text)  # unleased-ok: an overflow PART only exists after part 1 landed, so the lease is already committed
         if result and result.get("success") and "ts" in result:
             return result["ts"]
         self.log_warning("Overflow continuation post failed - retrying once")
         await asyncio.sleep(1.0)
-        result = await client.send_message_get_ts(channel_id, reply_target, continuation_text)
+        result = await client.send_message_get_ts(channel_id, reply_target, continuation_text)  # unleased-ok: the retry of that same already-committed overflow part
         if result and result.get("success") and "ts" in result:
             return result["ts"]
         return None
@@ -1058,6 +1097,9 @@ class TextHandlerMixin:
 
         # Pre-trim messages to fit within context window
         messages_for_api = await self._pre_trim_messages_for_api(messages_for_api, model=thread_state.current_model)
+        # The request is settled: record the newest inbound source it carries, so the
+        # stale guard compares any later arrival against what this turn answered.
+        advance_lease_to_request(turn, messages_for_api, message)
         
         # Get thread config (with user preferences)
         thread_config = await config.get_thread_config_async(
@@ -1140,13 +1182,13 @@ class TextHandlerMixin:
             # the retry's answer.
             message_id = lazy_surface_ts
             try:
-                await client.update_message(message.channel_id, message_id, initial_message)
+                await client.update_message(message.channel_id, message_id, initial_message)  # unleased-ok: chrome — a placeholder/status write, never answer text
             except Exception as e:  # noqa: BLE001
                 self.log_debug(f"Could not reset the lazy surface for retry: {e}")
         elif thinking_id:
             # Update existing thinking message
             message_id = thinking_id
-            await client.update_message(message.channel_id, message_id, initial_message)
+            await client.update_message(message.channel_id, message_id, initial_message)  # unleased-ok: chrome — a placeholder/status write, never answer text
         else:
             message_id = None  # created lazily: native on startStream, legacy on first chunk
         
@@ -1162,7 +1204,7 @@ class TextHandlerMixin:
             surface = current_message_id or message_id
             if surface:
                 # Original pre-status-only path: rate-limited streaming edit.
-                return await client.update_message_streaming(message.channel_id, surface, status_msg)
+                return await client.update_message_streaming(message.channel_id, surface, status_msg)  # unleased-ok: tool/phase STATUS chrome, never answer text
             if turn is not None and not turn.progress_enabled:
                 return {"success": True}   # deferred: no surface may be conjured to say this
             if hasattr(client, "set_assistant_status"):
@@ -1452,7 +1494,19 @@ class TextHandlerMixin:
             if turn is not None:
                 turn.settle_default_destination()   # no-op unless the model never chose
                 reply_target = turn.resolve_reply_target(message)
-                final_post_only = turn.final_post_only
+                # STALE GUARD, exact protection for the turns that can afford it. A
+                # silence-capable turn — a gate-routed wake or a 1:1 continuation — is one
+                # nobody asked for, so nothing is owed until the answer is whole: buffer every
+                # word locally (the model still streams internally, tools and all) and make ONE
+                # guarded send at the end, to the destination commit 4 chose. That send is the
+                # first surface, so the check covers the entire model call rather than just its
+                # opening instant. An ADDRESSED turn keeps its live reveal and settles for
+                # start-only protection: a person is waiting and watching, and taking that away
+                # to close a rare window would be a bad trade.
+                final_post_only = turn.final_post_only or bool(turn.silence_capable)
+                # Recorded where the decision is MADE, so the ledger reports what the turn did
+                # rather than a second guess at it.
+                turn.guard_mode = "buffered" if final_post_only else "start_only"
                 turn.lock_destination()
             else:
                 # No turn (exotic callers, older tests): the trigger's own thread, streaming as
@@ -1544,6 +1598,24 @@ class TextHandlerMixin:
                     self.log_warning("Native stream went inert — continuing with legacy updates")
 
         # Define the streaming callback
+        async def _drop_surface(surface_ts) -> None:
+            """Take a surface down when the guard refuses to write into it. Leaving a loading
+            indicator — or a half-written partial — over an answer that will never arrive is the
+            worse of the two outcomes, and deleting is the only cleanup left once writing is
+            forbidden. Best-effort: a failed delete must not replace the suppression."""
+            if not surface_ts:
+                return
+            try:
+                await client.delete_message(message.channel_id, surface_ts)  # unleased-ok: taking a surface DOWN is never a visible answer
+            except Exception as drop_error:  # noqa: BLE001
+                self.log_debug(f"Stale-suppression surface cleanup failed: {drop_error}")
+
+        def _send_lease():
+            """This turn's stale-send lease, or None when there is no turn (exotic callers and
+            older tests). Read at the call site rather than captured once, so a lease that
+            became `committed` mid-turn is seen as committed by everything after it."""
+            return getattr(turn, "send_lease", None) if turn is not None else None
+
         async def stream_callback(text_chunk: str):
             """Callback function called with each text chunk from OpenAI"""
             nonlocal current_message_id, current_part, overflow_buffer, progress_task, first_chunk_received, streaming_aborted, visible_content_delivered, first_delivered_ts, lazy_surface_owned, message_id, pending_segment_break
@@ -1613,7 +1685,7 @@ class TextHandlerMixin:
                     if message_id:
                         removed = False
                         try:
-                            removed = bool(await client.delete_message(message.channel_id, message_id))
+                            removed = bool(await client.delete_message(message.channel_id, message_id))  # unleased-ok: teardown — removing a surface can never be a stale answer
                         except Exception as e:  # noqa: BLE001
                             self.log_debug(f"Could not remove the old surface for native streaming: {e}")
                         if removed:
@@ -1628,7 +1700,7 @@ class TextHandlerMixin:
                                 "Could not clear the existing surface — native streaming stood "
                                 "down rather than leave a second message behind")
                     if not stand_down:
-                        if await native_coord.start():
+                        if await native_coord.start(lease=_send_lease()):
                             # `native_coord.part_ts` is now this attempt's ledger of owned
                             # messages (one per part) — the error path reconciles it, so an MCP
                             # retry inherits the stream instead of minting a second one.
@@ -1652,7 +1724,8 @@ class TextHandlerMixin:
                 if text_chunk is None and not buffer.has_pending_update():
                     return
                 seed = await client.send_message_get_ts(
-                    message.channel_id, reply_target, initial_message)
+                    message.channel_id, reply_target, initial_message,
+                    lease=_send_lease())
                 if seed and seed.get("success") and seed.get("ts"):
                     current_message_id = seed["ts"]
                     lazy_surface_owned = seed["ts"]  # ours: an MCP retry must reuse it
@@ -1676,12 +1749,18 @@ class TextHandlerMixin:
                         final_text = f"{part_prefix(current_part)}{final_text}"
 
                     try:
-                        result = await client.update_message_streaming(message.channel_id, current_message_id, final_text)
+                        result = await client.update_message_streaming(
+                            message.channel_id, current_message_id, final_text,
+                            lease=_send_lease())
                         if result["success"]:
                             rate_limiter.record_success()
                             buffer.mark_updated()
                             if final_text.strip():
                                 visible_content_delivered = True
+                    except StaleSendSuppressed:
+                        # Control flow, not a failure: re-raised so the turn's own handler records
+                        # the suppression instead of this branch reporting a broken send.
+                        raise
                     except Exception as e:
                         self.log_error(f"Error flushing final text: {e}")
                 return
@@ -1744,12 +1823,16 @@ class TextHandlerMixin:
                     # Update current message with continuation indicator
                     final_first_part = f"{first_part_display}{continuation_msg}"
                     try:
-                        result = await client.update_message_streaming(message.channel_id, current_message_id, final_first_part)
+                        result = await client.update_message_streaming(
+                            message.channel_id, current_message_id, final_first_part,
+                            lease=_send_lease())
                         if not result["success"]:
                             # CRITICAL: Overflow update failed - retry immediately
                             self.log_warning(f"Overflow update failed: {result.get('error', 'Unknown')} - retrying")
                             await asyncio.sleep(1.0)  # Brief pause
-                            result = await client.update_message_streaming(message.channel_id, current_message_id, final_first_part)
+                            result = await client.update_message_streaming(
+                            message.channel_id, current_message_id, final_first_part,
+                            lease=_send_lease())
                             if not result["success"]:
                                 self.log_error(f"Overflow retry failed: {result.get('error', 'Unknown')} - stopping stream")
                                 # Cannot continue safely without losing data
@@ -1757,7 +1840,16 @@ class TextHandlerMixin:
                                 # Show what we have with error notice
                                 error_msg = f"{final_first_part}\n\n{config.error_emoji} *Streaming interrupted at message overflow. Partial response shown above.*"
                                 try:
-                                    await client.update_message_streaming(message.channel_id, current_message_id, error_msg)
+                                    # GUARDED. "Edits an existing surface" is not the same as
+                                    # "the turn already spoke": if every mid-stream write failed
+                                    # transiently, this notice — carrying the partial answer —
+                                    # is the turn's FIRST visible content.
+                                    await client.update_message_streaming(
+                                        message.channel_id, current_message_id, error_msg,
+                                        lease=_send_lease(), surface="interrupted_notice")
+                                except StaleSendSuppressed:
+                                    await _drop_surface(current_message_id)
+                                    raise
                                 except Exception:
                                     pass
                                 return  # Exit callback
@@ -1811,10 +1903,23 @@ class TextHandlerMixin:
                                 streaming_aborted = True
                                 error_msg = f"{final_first_part}\n\n{config.error_emoji} *Streaming interrupted at message overflow. Partial response shown above.*"
                                 try:
-                                    await client.update_message_streaming(message.channel_id, current_message_id, error_msg)
+                                    # Guarded for the same reason as its twin above: with the
+                                    # overflow post failed, this notice carries the partial
+                                    # answer and can be the turn's first visible content.
+                                    await client.update_message_streaming(
+                                        message.channel_id, current_message_id, error_msg,
+                                        lease=_send_lease(), surface="interrupted_notice")
+                                except StaleSendSuppressed:
+                                    await _drop_surface(current_message_id)
+                                    raise
                                 except Exception:
                                     pass
                                 return
+                    except StaleSendSuppressed:
+                        # The overflow update is a guarded mutation. Swallowed here the callback
+                        # returns normally, the stream "completes", and finalization publishes
+                        # the stale answer — the outer rethrow never gets to see it.
+                        raise
                     except Exception as e:
                         self.log_error(f"Error handling message overflow: {e}")
                 else:
@@ -1829,7 +1934,9 @@ class TextHandlerMixin:
 
                     # Call client.update_message_streaming with indicator
                     try:
-                        result = await client.update_message_streaming(message.channel_id, current_message_id, display_text_with_indicator)
+                        result = await client.update_message_streaming(
+                            message.channel_id, current_message_id,
+                            display_text_with_indicator, lease=_send_lease())
 
                         if result["success"]:
                             rate_limiter.record_success()
@@ -1854,7 +1961,9 @@ class TextHandlerMixin:
 
                                 # Retry the update with the same text
                                 try:
-                                    retry_result = await client.update_message_streaming(message.channel_id, current_message_id, display_text_with_indicator)
+                                    retry_result = await client.update_message_streaming(
+                                        message.channel_id, current_message_id,
+                                        display_text_with_indicator, lease=_send_lease())
                                     if retry_result["success"]:
                                         self.log_info("Retry successful after rate limit")
                                         buffer.mark_updated()
@@ -1867,11 +1976,17 @@ class TextHandlerMixin:
                                             self.log_warning(f"Retry {retry_count} failed - waiting {wait_time}s before next attempt")
                                             await asyncio.sleep(wait_time)
                                             try:
-                                                retry_result = await client.update_message_streaming(message.channel_id, current_message_id, display_text_with_indicator)
+                                                retry_result = await client.update_message_streaming(
+                                                    message.channel_id, current_message_id,
+                                                    display_text_with_indicator, lease=_send_lease())
                                                 if retry_result["success"]:
                                                     self.log_info(f"Retry {retry_count} successful")
                                                     buffer.mark_updated()
                                                     break
+                                            except StaleSendSuppressed:
+                                                # Control flow, not a failure: re-raised so the turn's own handler records
+                                                # the suppression instead of this branch reporting a broken send.
+                                                raise
                                             except Exception as e:
                                                 self.log_error(f"Retry {retry_count} exception: {e}")
                                             retry_count += 1
@@ -1881,6 +1996,12 @@ class TextHandlerMixin:
                                             self.log_error("CRITICAL: Unable to update after 5 attempts - stopping stream")
                                             streaming_aborted = True
                                             return
+                                except StaleSendSuppressed:
+                                    # Escapes IMMEDIATELY. This wrapper's whole job is to wait
+                                    # and try again, which is the one response a suppression
+                                    # must never get: the conversation moved on, so retrying is
+                                    # just a slower way of posting the stale answer.
+                                    raise
                                 except Exception as retry_error:
                                     self.log_error(f"Retry exception: {retry_error}")
                                     # Try a few more times with backoff
@@ -1889,11 +2010,17 @@ class TextHandlerMixin:
                                         wait_time = 2.0 * retry_count
                                         await asyncio.sleep(wait_time)
                                         try:
-                                            retry_result = await client.update_message_streaming(message.channel_id, current_message_id, display_text_with_indicator)
+                                            retry_result = await client.update_message_streaming(
+                                                message.channel_id, current_message_id,
+                                                display_text_with_indicator, lease=_send_lease())
                                             if retry_result["success"]:
                                                 self.log_info(f"Retry {retry_count} successful after exception")
                                                 buffer.mark_updated()
                                                 break
+                                        except StaleSendSuppressed:
+                                            # Control flow, not a failure: re-raised so the turn's own handler records
+                                            # the suppression instead of this branch reporting a broken send.
+                                            raise
                                         except Exception:
                                             pass
                                         retry_count += 1
@@ -1904,7 +2031,9 @@ class TextHandlerMixin:
 
                                 # Immediate retry
                                 try:
-                                    retry_result = await client.update_message_streaming(message.channel_id, current_message_id, display_text_with_indicator)
+                                    retry_result = await client.update_message_streaming(
+                                        message.channel_id, current_message_id,
+                                        display_text_with_indicator, lease=_send_lease())
                                     if retry_result["success"]:
                                         self.log_info("Immediate retry successful")
                                         buffer.mark_updated()
@@ -1918,11 +2047,17 @@ class TextHandlerMixin:
                                             self.log_warning(f"Retry {retry_count} - waiting {wait_time}s")
                                             await asyncio.sleep(wait_time)
                                             try:
-                                                retry_result = await client.update_message_streaming(message.channel_id, current_message_id, display_text_with_indicator)
+                                                retry_result = await client.update_message_streaming(
+                                                    message.channel_id, current_message_id,
+                                                    display_text_with_indicator, lease=_send_lease())
                                                 if retry_result["success"]:
                                                     self.log_info(f"Retry {retry_count} successful")
                                                     buffer.mark_updated()
                                                     break
+                                            except StaleSendSuppressed:
+                                                # Control flow, not a failure: re-raised so the turn's own handler records
+                                                # the suppression instead of this branch reporting a broken send.
+                                                raise
                                             except Exception as e:
                                                 self.log_error(f"Retry {retry_count} exception: {e}")
                                             retry_count += 1
@@ -1933,10 +2068,26 @@ class TextHandlerMixin:
                                             streaming_aborted = True
                                             error_msg = f"{buffer.get_complete_text()}\n\n{config.error_emoji} *Streaming interrupted after multiple failures.*"
                                             try:
-                                                await client.update_message_streaming(message.channel_id, current_message_id, error_msg)
+                                                # Same reasoning as the overflow notice above:
+                                                # with every earlier write failed, this one
+                                                # carries the answer and is the first thing the
+                                                # room would see.
+                                                await client.update_message_streaming(
+                                                    message.channel_id, current_message_id,
+                                                    error_msg, lease=_send_lease(),
+                                                    surface="interrupted_notice")
+                                            except StaleSendSuppressed:
+                                                await _drop_surface(current_message_id)
+                                                raise
                                             except Exception:
                                                 pass
                                             return
+                                except StaleSendSuppressed:
+                                    # Escapes IMMEDIATELY. This wrapper's whole job is to wait
+                                    # and try again, which is the one response a suppression
+                                    # must never get: the conversation moved on, so retrying is
+                                    # just a slower way of posting the stale answer.
+                                    raise
                                 except Exception as retry_error:
                                     self.log_error(f"Retry exception: {retry_error}")
                                     # Try a few more times
@@ -1945,11 +2096,17 @@ class TextHandlerMixin:
                                         wait_time = 1.0 * retry_count
                                         await asyncio.sleep(wait_time)
                                         try:
-                                            retry_result = await client.update_message_streaming(message.channel_id, current_message_id, display_text_with_indicator)
+                                            retry_result = await client.update_message_streaming(
+                                                message.channel_id, current_message_id,
+                                                display_text_with_indicator, lease=_send_lease())
                                             if retry_result["success"]:
                                                 self.log_info(f"Retry {retry_count} successful after exception")
                                                 buffer.mark_updated()
                                                 break
+                                        except StaleSendSuppressed:
+                                            # Control flow, not a failure: re-raised so the turn's own handler records
+                                            # the suppression instead of this branch reporting a broken send.
+                                            raise
                                         except Exception:
                                             pass
                                         retry_count += 1
@@ -1958,6 +2115,10 @@ class TextHandlerMixin:
                                         streaming_aborted = True
                                         return
                             
+                    except StaleSendSuppressed:
+                        # Control flow, not a failure. Filed as a rate-limit-adjacent transport
+                        # error it would poison the limiter AND look like Slack refusing us.
+                        raise
                     except Exception as e:
                         rate_limiter.record_failure(is_rate_limit=False)
                         self.log_error(f"Error updating streaming message: {e}")
@@ -2311,9 +2472,14 @@ class TextHandlerMixin:
                     # (send_message already records the own-reply pulse for this ts;
                     # record_own_reply is idempotent by (channel, ts) so a repeat is a no-op).
                     direct_send_meta: dict = {}
+                    # THE buffered path's only delivery — and therefore the one send the guard
+                    # most has to cover. A silence-capable turn buffers its whole answer here
+                    # precisely so this single check spans the entire model call; without the
+                    # lease that promise was empty and a superseded answer still posted.
                     posted_ts = await client.send_message(
                         message.channel_id, effective_target, response_text,
-                        blocks=direct_footer_blocks, meta_out=direct_send_meta)
+                        blocks=direct_footer_blocks, meta_out=direct_send_meta,
+                        lease=_send_lease())
                     if posted_ts:
                         current_message_id = posted_ts
                         visible_content_delivered = True
@@ -2328,6 +2494,11 @@ class TextHandlerMixin:
                         final_post_failed = True
                         self.log_error("Final response post failed — handing the answer back to "
                                        "the caller to deliver")
+                except StaleSendSuppressed:
+                    # Not a failed post: nothing was sent, deliberately. `final_post_failed`
+                    # would hand the text back to main.py, which would then post the very answer
+                    # the guard just refused.
+                    raise
                 except Exception as e:
                     final_post_failed = True
                     self.log_error(f"Error posting final response directly: {e}")
@@ -2367,17 +2538,23 @@ class TextHandlerMixin:
                                 truncated += '\n```'
                             truncated += continuation_msg
                             final_result = await client.update_message_streaming(
-                                message.channel_id, current_message_id, truncated)
+                                message.channel_id, current_message_id, truncated,
+                                lease=_send_lease())
                             overflow_text = final_part_text[cut:].lstrip()
                             await client.send_message(
                                 message.channel_id, reply_target,
-                                f"{CONTINUATION_HEAD}\n\n{overflow_text}")
+                                f"{CONTINUATION_HEAD}\n\n{overflow_text}",
+                                lease=_send_lease(), surface="legacy_update")
                         else:
-                            final_result = await client.update_message_streaming(message.channel_id, current_message_id, final_part_text)
+                            final_result = await client.update_message_streaming(
+                                message.channel_id, current_message_id, final_part_text,
+                                lease=_send_lease())
                         if final_result["success"]:
                             visible_content_delivered = True
                         else:
                             self.log_error(f"Failed to remove indicator from part {current_part}: {final_result.get('error', 'Unknown error')}")
+                except StaleSendSuppressed:
+                    raise      # a guarded write; the suppression belongs to handle_message
                 except Exception as e:
                     self.log_error(f"Error removing indicator from overflow message: {e}")
             else:
@@ -2419,22 +2596,31 @@ class TextHandlerMixin:
                             if truncated_text.count('```') % 2 == 1:
                                 truncated_text += '\n```'
                             truncated_text += continuation_msg
-                            final_result = await client.update_message_streaming(message.channel_id, current_message_id, truncated_text)
+                            final_result = await client.update_message_streaming(
+                                message.channel_id, current_message_id, truncated_text,
+                                lease=_send_lease())
 
                             # Send the rest as new messages
                             overflow_text = response_text[cut:].lstrip()
-                            await client.send_message(message.channel_id, reply_target, f"{CONTINUATION_HEAD}\n\n{overflow_text}")
+                            await client.send_message(
+                                message.channel_id, reply_target,
+                                f"{CONTINUATION_HEAD}\n\n{overflow_text}",
+                                lease=_send_lease(), surface="legacy_update")
 
                             if final_result["success"]:
                                 visible_content_delivered = True
                             else:
                                 self.log_error(f"Final truncated update failed: {final_result.get('error', 'Unknown error')}")
                         else:
-                            final_result = await client.update_message_streaming(message.channel_id, current_message_id, response_text)
+                            final_result = await client.update_message_streaming(
+                                message.channel_id, current_message_id, response_text,
+                                lease=_send_lease())
                             if final_result["success"]:
                                 visible_content_delivered = True
                             else:
                                 self.log_error(f"Final correction update failed: {final_result.get('error', 'Unknown error')}")
+                    except StaleSendSuppressed:
+                        raise  # a guarded write; the suppression belongs to handle_message
                     except Exception as e:
                         self.log_error(f"Error in final correction update: {e}")
             
@@ -2536,6 +2722,14 @@ class TextHandlerMixin:
                 stream_meta["tool_provenance"] = tool_provenance
             return Response(type="text", content=response_text, metadata=stream_meta)
 
+        except StaleSendSuppressed:
+            # THE outer streaming boundary. Everything below it treats an exception as a
+            # transport or model failure and RETRIES — a retry here would rebuild the request
+            # and try to post the very answer the guard refused, and the interruption cleanup
+            # further down would write either that answer or a "Stream Interrupted" notice into
+            # a conversation that has already moved on. Straight back out to handle_message,
+            # which is the only place that knows this is not a failure.
+            raise
         except Exception as e:
             # Usage-estimator backstop: on a context-window rejection, compact the
             # thread before the standard non-streaming fallback retries below.
@@ -2614,8 +2808,12 @@ class TextHandlerMixin:
                             error_text = f"{config.error_emoji} *MCP Connection Failed*\n\nCouldn't connect to MCP server '{failed_mcp_server}'. Retrying with other tools..."
                         else:
                             error_text = f"{config.error_emoji} *OpenAI Stream Interrupted*\n\nOpenAI's streaming response was interrupted. I'll try again without streaming..."
+                    # GUARDED, because of the very thing the comment below says: this edit can
+                    # be the turn's FIRST successful delivery. Unguarded it publishes the
+                    # partial answer — or an "interrupted" notice — into a conversation that has
+                    # already moved on.
                     cleaned = await client.update_message_streaming(
-                        message.channel_id, cleanup_ts, error_text)
+                        message.channel_id, cleanup_ts, error_text, lease=_send_lease())
                     # THIS EDIT CAN BE THE FIRST SUCCESSFUL DELIVERY. If every mid-stream write
                     # failed transiently, `visible_content_delivered` is still False while this
                     # write has just put the partial ANSWER on screen. Reconciliation below asks
@@ -2624,6 +2822,15 @@ class TextHandlerMixin:
                     # posted twice.
                     if holds_answer and (cleaned or {}).get("success") and error_text.strip():
                         visible_content_delivered = True
+                except StaleSendSuppressed:
+                    # Nothing of this turn may be written. Take the surface DOWN rather than
+                    # leaving a loading indicator spinning over an answer that will never
+                    # arrive — then re-raise so the turn is recorded as suppressed.
+                    try:
+                        await client.delete_message(message.channel_id, cleanup_ts)  # unleased-ok: teardown — removing a surface can never be a stale answer
+                    except Exception as delete_error:  # noqa: BLE001
+                        self.log_debug(f"Stale cleanup delete failed: {delete_error}")
+                    raise
                 except Exception as cleanup_error:
                     self.log_debug(f"Could not remove loading indicator: {cleanup_error}")
 
@@ -2665,7 +2872,7 @@ class TextHandlerMixin:
 
             async def _drop_surface(ts: str) -> bool:
                 try:
-                    return bool(await client.delete_message(message.channel_id, ts))
+                    return bool(await client.delete_message(message.channel_id, ts))  # unleased-ok: teardown — removing a surface can never be a stale answer
                 except Exception as e:  # noqa: BLE001
                     self.log_warning(f"Could not delete the abandoned partial {ts}: {e}")
                     return False
@@ -2680,7 +2887,7 @@ class TextHandlerMixin:
                 retry_display = ", ".join(sorted(self._as_mcp_exclusion_set(failed_mcp_servers)))
                 reset_ok = False
                 try:
-                    reset_ok = bool(await client.update_message(
+                    reset_ok = bool(await client.update_message(  # unleased-ok: neutralizes a surface THIS attempt created; suppressing it would leave the misleading partial standing
                         message.channel_id, keeper,
                         f"{config.circle_loader_emoji} Retrying without '{retry_display}'..."))
                 except Exception as e:  # noqa: BLE001
@@ -2705,14 +2912,14 @@ class TextHandlerMixin:
                 # what already failed, so overwriting is all we have left.
                 voice, *rest = ([keeper] if keeper else []) + survivors
                 try:
-                    await client.update_message(
+                    await client.update_message(  # unleased-ok: neutralizes a surface THIS attempt created; suppressing it would leave the misleading partial standing
                         message.channel_id, voice,
                         "⚠️ I got cut off partway through that answer. Please ask again.")
                 except Exception as e:  # noqa: BLE001
                     self.log_error(f"Could not surface the interruption: {e}")
                 for stray in rest:
                     try:
-                        await client.update_message(
+                        await client.update_message(  # unleased-ok: neutralizes a surface THIS attempt created; suppressing it would leave the misleading partial standing
                             message.channel_id, stray, "⚠️ _(discarded — that reply was cut off)_")
                     except Exception as e:  # noqa: BLE001
                         self.log_error(f"Could not neutralize a stray partial: {e}")

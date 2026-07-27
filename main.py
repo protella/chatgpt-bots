@@ -16,6 +16,8 @@ from message_processor import participation_telemetry, routing_facts
 from message_processor.participation import (ParticipationEngine,
                                              render_capabilities_line)
 from message_processor.people_tools import format_people_summary
+from message_processor.stale_send_guard import (ConversationWatermarks,
+                                                StaleSendSuppressed)
 from message_processor.turn_runtime import TurnRuntime
 from message_processor import thread_files
 from base_client import BaseClient, Message
@@ -41,6 +43,7 @@ class ChatBotV2:
         self.client: Optional[BaseClient] = None
         self.processor = None  # Will be initialized after client
         self.participation_engine = None  # Phase F; set in initialize()
+        self._watermarks = ConversationWatermarks()
         self.cleanup_task = None
         self.running = False
         self.sigint_count = 0  # Track number of SIGINT received
@@ -86,6 +89,19 @@ class ChatBotV2:
         
         main_logger.info("Initialization complete")
     
+    @property
+    def watermarks(self) -> ConversationWatermarks:
+        """THE process-wide owner of "what is the newest message this conversation has seen".
+
+        Lazy so that an instance built without __init__ still has a real one. Every entry point
+        into handle_message opens a lease against it, and a None here would mean a turn that
+        silently opted out of the guard — the failure mode being a duplicate answer, which is
+        exactly what this exists to prevent."""
+        existing = self.__dict__.get("_watermarks")
+        if existing is None:
+            existing = self.__dict__["_watermarks"] = ConversationWatermarks()
+        return existing
+
     async def _run_participation_gate(self, message: Message, client: BaseClient):
         """The gate, plus the one thing that must happen whether or not we speak.
 
@@ -736,6 +752,29 @@ class ChatBotV2:
         return bool(posted)
 
     @staticmethod
+    def _stale_terminal_kind(response, turn, message) -> str:
+        """What the room saw on a turn the stale guard refused.
+
+        `stale_suppressed` only when the refusal is the WHOLE story — the model produced or
+        intended words, the guard declined to create their first surface, and nothing else of
+        this turn is visible. It is deliberately not `silence` (nobody chose it, and there is no
+        silence reason to give) and never `delivery_failed` (Slack was intentionally not called,
+        so nothing failed).
+
+        When something else IS visible the louder fact wins the label and the suppression rides
+        beside it as `reply_stale_suppressed`: a detached producer owns a surface, or a reaction
+        is on the message — from the gate or from this turn."""
+        meta = (response.metadata or {}) if response is not None else {}
+        if (turn is not None and getattr(turn, "visible_action_committed", False)) \
+                or meta.get("background_job_started"):
+            return "detached"
+        if (meta.get("response_reaction_committed") is True
+                or (turn is not None and getattr(turn, "reaction_committed", False))
+                or bool((message.metadata or {}).get("participation_reaction_emoji"))):
+            return "reaction_only"
+        return "stale_suppressed"
+
+    @staticmethod
     def _classify_visible_action(response, turn, gate_reaction_visible: bool = False) -> str:
         """The ONE outcome the room saw, as a single label for the telemetry ledger.
 
@@ -863,7 +902,16 @@ class ChatBotV2:
         `gate_start` and no ending, which in the ledger is indistinguishable from a decision
         that has not been written yet. `abort_attempt` closes any attempt that got this far
         without a terminal event; it is a no-op for the overwhelming majority that did.
+
+        The stale-send lease opens on the FIRST executable line — before the gate, before any
+        await. That placement is the definition of an "admitted" message: taking it later would
+        leave a window where this turn is already running and the conversation's watermark does
+        not know it. It is released in the same finally.
         """
+        # Also records this message as its conversation's newest inbound (message_processor.
+        # stale_send_guard). Nothing is dropped after this point, so the watermark and the set
+        # of turns that exist stay in step.
+        lease = self.watermarks.begin_turn(message)
         try:
             # Phase F participation gate: for UNPROMPTED channel messages (judicious/active
             # levels) the engine decides respond/react/react_and_respond/ignore/backoff BEFORE
@@ -902,6 +950,9 @@ class ChatBotV2:
             turn = TurnRuntime.for_message(
                 message,
                 channel_post_allowed=bool(message.metadata.get("channel_post_allowed")))
+            # The turn carries the lease from here on: it is already threaded to every path
+            # that can post, including ToolContext.turn.
+            turn.send_lease = lease
             post_thread_id = turn.resolve_reply_target(message)
 
             # Phase Q: if this conversation is mid-processing, the message is about to be
@@ -934,7 +985,7 @@ class ChatBotV2:
                     catch_up = f"Catching up on {batch_size} messages..."
                     try:
                         if thinking_id and hasattr(client, "update_message"):
-                            await client.update_message(
+                            await client.update_message(  # unleased-ok: chrome — a placeholder/status write, never answer text
                                 message.channel_id, thinking_id,
                                 f"{config.circle_loader_emoji} {catch_up}"
                             )
@@ -965,9 +1016,9 @@ class ChatBotV2:
                 if (thinking_id and response
                         and not response.metadata.get("streamed")
                         and response.metadata.get("checklist") is None):
-                    await client.delete_message(message.channel_id, thinking_id)
+                    await client.delete_message(message.channel_id, thinking_id)  # unleased-ok: teardown — removing a surface can never be a stale answer
                 elif thinking_id and not response:
-                    await client.delete_message(message.channel_id, thinking_id)
+                    await client.delete_message(message.channel_id, thinking_id)  # unleased-ok: teardown — removing a surface can never be a stale answer
 
                 # Handle the response
                 if response:
@@ -1006,12 +1057,16 @@ class ChatBotV2:
                             # paths lock when they bind their surface; this is the same moment
                             # for a non-streamed reply, which main.py posts itself.
                             turn.lock_destination()
+                            # The stale guard's last chance on this path: the lease refuses
+                            # rather than posting if the conversation moved on while the model
+                            # was writing. Raises StaleSendSuppressed, caught below.
                             sent_ts = await client.send_message(
                                 message.channel_id,
                                 post_thread_id,
                                 response.content,
                                 blocks=footer_blocks,
                                 meta_out=send_meta,
+                                lease=lease,
                             )
                             # Honest accounting: the ACTUAL send result decides `posted` (a
                             # failed send must not burn the hourly unprompted quota).
@@ -1122,10 +1177,15 @@ class ChatBotV2:
                                 turn.visible_action_committed = True  # F38: an image did land
                     elif response.type == "error":
                         # Send error message
+                        # An error notice is terminal, and on a turn with no thinking surface
+                        # it is the room's only word from us — so it is guarded like any first
+                        # surface. Refusal raises, and the handler below records the
+                        # suppression instead of the error.
                         await client.handle_error(
                             message.channel_id,
                             message.thread_id,
-                            response.content
+                            response.content,
+                            lease=lease
                         )
 
                 # Close the attempt with what the room actually SAW. Deliberately not folded into
@@ -1225,6 +1285,50 @@ class ChatBotV2:
                             main_logger.warning(
                                 "Empty text response without a terminal action — posting nothing")
 
+            except StaleSendSuppressed as stale:
+                # NOT an error, and it must never reach the handler below — that one logs an
+                # exception, files `error_unhandled`, and posts an apology. Nothing went wrong
+                # here: a newer message arrived while this turn was writing, so its answer was
+                # deliberately not created. The room sees nothing, which is the point.
+                main_logger.info(
+                    f"Stale send suppressed on {message.channel_id}: {stale}")
+                participation_telemetry.stale_send(
+                    message.channel_id, (message.metadata or {}).get("ts"),
+                    attempt_id=participation_telemetry.attempt_id_for(message),
+                    last_seen_ts=stale.last_seen_ts,
+                    observed_latest_ts=stale.observed_latest_ts,
+                    scope=stale.scope[0] if stale.scope else None,
+                    surface=stale.surface,
+                    guard_mode=getattr(turn, "guard_mode", None) if turn is not None else None)
+                # Any speculative chrome this turn put up has to come down with it — a
+                # "Thinking…" bubble left over a reply that will never arrive is worse than
+                # either outcome on its own.
+                if thinking_id:
+                    try:
+                        await client.delete_message(message.channel_id, thinking_id)  # unleased-ok: teardown — removing a surface can never be a stale answer
+                    except Exception as cleanup_error:  # noqa: BLE001
+                        main_logger.debug(f"Stale-suppression cleanup failed: {cleanup_error}")
+                if hasattr(client, "clear_assistant_status"):
+                    try:
+                        await client.clear_assistant_status(message.channel_id, post_thread_id)
+                    except Exception as cleanup_error:  # noqa: BLE001
+                        main_logger.debug(f"Stale-suppression status clear failed: {cleanup_error}")
+                participation_telemetry.finish_attempt(
+                    message,
+                    # Something else may still be visible: a reaction the gate or the responder
+                    # placed, or a detached producer's own surface. Those turns are not silent,
+                    # and the suppression rides as a separate fact rather than overwriting the
+                    # louder one.
+                    self._stale_terminal_kind(response, turn, message),
+                    ended_by="stale_guard",
+                    last_seen_ts=stale.last_seen_ts,
+                    observed_latest_ts=stale.observed_latest_ts,
+                    scope=stale.scope[0] if stale.scope else None,
+                    surface=stale.surface,
+                    guard_mode=getattr(turn, "guard_mode", None) if turn is not None else None,
+                    reply_stale_suppressed=True,
+                    model=(response.metadata or {}).get("model") if response is not None else None,
+                )
             except Exception as e:
                 main_logger.error(f"Error handling message: {e}", exc_info=True)
                 # Closed FIRST, before the two best-effort awaits below: either of them can fail
@@ -1254,7 +1358,7 @@ class ChatBotV2:
                 # must never swallow the user-facing notice below.
                 if thinking_id:
                     try:
-                        await client.delete_message(message.channel_id, thinking_id)
+                        await client.delete_message(message.channel_id, thinking_id)  # unleased-ok: teardown — removing a surface can never be a stale answer
                     except Exception as delete_error:
                         main_logger.error(f"Failed to delete thinking indicator: {delete_error}")
 
@@ -1264,8 +1368,24 @@ class ChatBotV2:
                         message.channel_id,
                         message.thread_id,
                         "⚠️ **Something Went Wrong**\n\n"
-                        "I hit a snag finishing that response. Please try again in a moment."
+                        "I hit a snag finishing that response. Please try again in a moment.",
+                        lease=lease
                     )
+                except StaleSendSuppressed as stale:
+                    # Nothing goes out. The turn already failed; posting an apology into a
+                    # conversation that has moved on would be a second wrong thing. This is the
+                    # one place a suppression is neither re-raised nor terminal: the turn's
+                    # outcome is already recorded as an error just above, so the refusal of the
+                    # NOTICE is a separate fact and is written down as one.
+                    main_logger.info("Error notice suppressed — the conversation moved on")
+                    participation_telemetry.stale_send(
+                        message.channel_id, (message.metadata or {}).get("ts"),
+                        attempt_id=participation_telemetry.attempt_id_for(message),
+                        last_seen_ts=stale.last_seen_ts,
+                        observed_latest_ts=stale.observed_latest_ts,
+                        scope=stale.scope[0] if stale.scope else None,
+                        surface=stale.surface,
+                        guard_mode=getattr(turn, "guard_mode", None) if turn is not None else None)
                 except Exception as notify_error:
                     main_logger.error(f"Failed to send error notice: {notify_error}")
             finally:
@@ -1298,6 +1418,10 @@ class ChatBotV2:
                         main_logger.debug(f"Assistant status clear failed: {clear_error}")
         finally:
             participation_telemetry.abort_attempt(message)
+            # Release the scope hold LAST. An entry survives while any lease in its scope is
+            # open, so a newer turn that finishes early cannot erase the watermark an older,
+            # still-running turn is about to read.
+            lease.close()
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals - double Ctrl-C for force exit"""

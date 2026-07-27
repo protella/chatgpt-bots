@@ -15,6 +15,7 @@ from . import image_catalog, participation_telemetry
 from .containers import ContainerManager
 from .message_timestamps import stamp_content
 from .thread_management import ThreadManagementMixin
+from .stale_send_guard import StaleSendSuppressed
 from .turn_runtime import TurnRuntime
 from .handlers.text import TextHandlerMixin
 from .handlers.image_gen import ImageJobMixin
@@ -207,10 +208,17 @@ class MessageProcessor(ThreadManagementMixin,
                 # back is a turn that might say nothing at all.
                 if not getattr(turn, "silence_capable", False):
                     timeout_msg = "⚠️ Heads up — my last answer in this thread never finished. Picking up from here."
+                    # GUARDED like any first surface. This notice is the turn's first visible
+                    # words, and attachment work can run for a while afterwards — so without the
+                    # lease a newer message could leave "picking up from here" sitting alone in
+                    # the thread with no answer behind it. Notices were never exempt: the
+                    # exemption is for CHROME (a thinking bubble), and this is prose.
                     notice_ts = await client.send_message(
                         channel_id=message.channel_id,
                         text=timeout_msg,
-                        thread_id=message.thread_id
+                        thread_id=message.thread_id,
+                        lease=getattr(turn, "send_lease", None),
+                        surface="prior_timeout_notice",
                     )
                     # A notice that LANDED is a visible surface in the thread, so the answer
                     # belongs with it — settle the destination there. Only on a confirmed send:
@@ -311,16 +319,28 @@ class MessageProcessor(ThreadManagementMixin,
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                     message_ts = message.metadata.get("ts") if message.metadata else None
                     try:
+                        # Guarded for the same reason as the prior-timeout notice above: this
+                        # promises "I'll process your text/image/document request now", and the
+                        # processing it promises takes time. A newer message during that window
+                        # must not leave the promise standing on its own.
                         notice_ts = await client.send_message(
                             channel_id=message.channel_id,
                             text=unsupported_msg,
                             thread_id=message.thread_id,
+                            lease=getattr(turn, "send_lease", None),
+                            surface="failed_files_notice",
                         )
                         # Same rule as the prior-timeout notice above, and the same reason for
                         # waiting on the returned ts: only a notice that actually landed settles
                         # where the answer goes.
                         if notice_ts and turn is not None:
                             turn.settle_structural_thread()
+                    except StaleSendSuppressed:
+                        # Not a notice failure: the guard declined to post it. Swallowed here
+                        # the turn carries on, and if the responder then ends silently the
+                        # suppression is never recorded anywhere — the one outcome that leaves
+                        # us unable to tell a working guard from a broken one.
+                        raise
                     except Exception as notice_err:  # noqa: BLE001 — never fail the turn over the notice
                         self.log_warning(f"Failed to post mixed-path failed-files notice: {notice_err}")
                     # Add the unsupported files warning to conversation
@@ -637,6 +657,11 @@ class MessageProcessor(ThreadManagementMixin,
                 except TimeoutError as retry_error:
                     self.log_warning(f"Retry also failed for {operation_type}: {retry_error}")
                     # Continue to error handling below
+                except StaleSendSuppressed:
+                    # The retry declined to post because the conversation moved on. Falling
+                    # through to the timeout notice below would answer with an apology for a
+                    # turn that had nothing to apologize for.
+                    raise
                 except Exception as retry_error:
                     self.log_error(f"Retry failed with unexpected error for {operation_type}: {retry_error}")
                     # Continue to error handling below
@@ -649,10 +674,21 @@ class MessageProcessor(ThreadManagementMixin,
 
             # Update thinking message to show final timeout
             if thinking_id and hasattr(client, 'update_message'):
-                timeout_msg = TIMEOUT_STATUS
                 try:
-                    self._update_status(client, message.channel_id, thinking_id, timeout_msg, emoji=config.error_emoji, thread_id=message.thread_id)
+                    # Deliberately NOT routed through _update_status. That helper SCHEDULES the
+                    # edit as a detached task, and a suppression raised inside one cannot reach
+                    # this turn — it would be swallowed wherever stray task exceptions go. This
+                    # notice is terminal ("stopped waiting"), so it is awaited directly with the
+                    # lease, like the other terminal notices. The rendering matches what
+                    # _update_status would have produced for these arguments.
+                    await client.update_message(
+                        message.channel_id, thinking_id,
+                        f"{config.error_emoji} {TIMEOUT_STATUS}",
+                        lease=getattr(turn, "send_lease", None),
+                        surface="timeout_notice")
                     self.log_debug("Updated thinking message to show timeout")
+                except StaleSendSuppressed:
+                    raise  # the conversation moved on; a "stopped waiting" notice is noise now
                 except Exception as update_error:
                     self.log_error(f"Failed to update thinking message: {update_error}")
 
@@ -682,8 +718,12 @@ class MessageProcessor(ThreadManagementMixin,
                 try:
                     await client.update_message(
                         message.channel_id, thinking_id,
-                        f"{config.error_emoji} Couldn't load this conversation's history from Slack."
+                        f"{config.error_emoji} Couldn't load this conversation's history from Slack.",
+                        lease=getattr(turn, "send_lease", None),
+                        surface="history_error_notice",
                     )
+                except StaleSendSuppressed:
+                    raise      # no notice, and the suppression is the record — see update_message
                 except Exception:
                     pass
 
@@ -695,6 +735,12 @@ class MessageProcessor(ThreadManagementMixin,
                     "rate-limiting). Your message wasn't processed — please try again in a moment."
                 )
             )
+        except StaleSendSuppressed:
+            # A suppression that reached process_message's boundary is still control flow.
+            # Converting it into an error Response here would put "something went wrong" in a
+            # channel where nothing did — and would do it INSTEAD of the answer the guard
+            # correctly withheld, which is the worst of both outcomes.
+            raise
         except Exception as e:
             # Log full error details for non-timeout exceptions
             self.log_error(f"Error processing message: {e}", exc_info=True)
@@ -723,7 +769,12 @@ class MessageProcessor(ThreadManagementMixin,
                 if thinking_id and hasattr(client, 'update_message'):
                     timeout_msg = f"{config.error_emoji} {TIMEOUT_STATUS}"
                     try:
-                        await client.update_message(message.channel_id, thinking_id, timeout_msg)
+                        await client.update_message(
+                            message.channel_id, thinking_id, timeout_msg,
+                            lease=getattr(turn, "send_lease", None),
+                            surface="timeout_notice")
+                    except StaleSendSuppressed:
+                        raise  # the conversation moved on; a timeout notice would be noise
                     except Exception:
                         pass  # Don't let update failure affect error handling
 
@@ -739,7 +790,12 @@ class MessageProcessor(ThreadManagementMixin,
                 if thinking_id and hasattr(client, 'update_message'):
                     error_msg = f"{config.error_emoji} Something went wrong. Try again."
                     try:
-                        await client.update_message(message.channel_id, thinking_id, error_msg)
+                        await client.update_message(
+                            message.channel_id, thinking_id, error_msg,
+                            lease=getattr(turn, "send_lease", None),
+                            surface="error_notice")
+                    except StaleSendSuppressed:
+                        raise  # "something went wrong" about a turn where nothing did
                     except Exception:
                         pass  # Don't let update failure affect error handling
 
