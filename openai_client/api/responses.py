@@ -1166,8 +1166,16 @@ async def classify_wake(self, *, sources: Any,
         # Verbatim, as its own labelled section. Nothing may re-render or reorder this block: the
         # responder inserts the identical string, and a difference here would mean the two halves
         # of one turn obeyed different rules while each looked correct.
-        prompt += ("\n\nWhat this channel has established (verbatim; instructions and background "
-                   "are labelled):\n" + steering)
+        #
+        # The FRAMING around it is evidence-not-proof, matching the responder's wrapper. "What this
+        # channel has established" read as a settled account, which is the wrong thing to hand a
+        # gate: an empty facts section then says "nothing relevant here" rather than "nothing was
+        # recorded", and the cheapest way to act on that is to stay asleep. Instructions are still
+        # instructions — a standing policy is something to obey, not evidence to weigh.
+        prompt += ("\n\nRecorded channel steering (verbatim). Sections labelled as instructions are "
+                   "rules to follow. Sections labelled as background are partial evidence, not a "
+                   "complete record of this channel — an omission is not proof that something did "
+                   "not happen:\n" + steering)
 
     request_params = {
         "model": config.utility_model,

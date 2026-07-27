@@ -138,6 +138,14 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 🔍 Changed - It treats what it read as evidence, not the whole truth
+
+The prompts used to tell the model its view of the channel was authoritative, which made it
+answer "nobody discussed that" when the honest answer was "I didn't see it discussed." Both
+the wake-up check and the answering model are now told the record is partial evidence: what
+was read is real, but absence from it proves nothing. Expect fewer confidently-wrong denials
+and more "I don't see it in what I have — want me to search?"
+
 ### 🚪 Changed - The wake-up call is now a simple yes or no
 
 The model that watches the channel now answers exactly one question — "should the bot look at
