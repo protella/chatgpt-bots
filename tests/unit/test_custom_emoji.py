@@ -9,16 +9,17 @@ Covers the whole C surface:
   name list), appearing only when the workspace has customs and tracking the live cache;
   REACTION_EMOJIS set → enum allowlist, customs suppressed, search tool not registered at all.
 - WorkspaceEmojiCache.search(): lexical ranking over the full catalog, single-char tokens dropped.
-- The observed-usage TALLY (ChannelPulse.top_custom_reactions): ranked by count, workspace-wide,
-  DMs excluded, decremented on removal, and dropping names deleted since they were seen.
 - reactions.add uses the bare name; unknown fails soft. Config defaults + .env.example docs.
 
 THE GATE IS NO LONGER A CONSUMER OF ANY OF THIS. The emoji shortlist and the `_coerce_emoji`
 repair step existed because the rich gate PICKED an emoji and placed it itself, before the
 responder ran. It picks nothing now — it returns one bit — so the palette has no gate to feed and
-a coerced emoji has no placer. Those tests are inverted into tripwires below; the tally and the
-cache keep their own unit coverage, because the RESPONDER still reacts and
-`search_workspace_emoji` still answers from the same catalog.
+a coerced emoji has no placer. Those tests are inverted into tripwires below; the CACHE keeps its
+own unit coverage, because the RESPONDER still reacts and `search_workspace_emoji` still answers
+from the same catalog by NAME.
+
+The observed-usage TALLY that ranked the shortlist (and its DB persistence) is gone outright —
+ranking only ever served the gate prompt. See the tripwire at the foot of this file.
 
 (Both name lists used to be an ALPHABETICAL prefix of ~1,400 names, so the model only ever saw
 "000, 1password_icon, 2605732e-82a0-46b9-b1e0-ecc4f250eb35, 4cats_q, alabama…" — prompt noise it
@@ -29,6 +30,7 @@ All in-memory; no network/DB.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import pathlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -219,9 +221,9 @@ async def test_the_gate_cannot_be_handed_a_palette(monkeypatch):
 
 def test_nothing_builds_a_palette_for_the_gate_any_more(monkeypatch):
     """The producer side. main.py used to rank the tally and cap it on the gate's hot path, and the
-    classifier rendered it as an emoji shortlist. Both are gone; the tally itself is untouched (see
-    the top_custom_reactions tests below), because the responder's react tool and
-    search_workspace_emoji still work from the same data."""
+    classifier rendered it as an emoji shortlist. Both are gone — and so, now, is the tally behind
+    them (see the tripwire at the foot of this file); what survives is the CATALOG, which the
+    responder's react tool and search_workspace_emoji answer from by name."""
     import inspect
     import main
     from openai_client.api import responses
@@ -329,17 +331,22 @@ async def test_react_add_unknown_emoji_fails_soft(monkeypatch):
 
 def test_config_custom_emoji_defaults_and_documented():
     assert config.workspace_emoji_ttl_seconds == 3600
-    assert config.participation_custom_emoji_cap == 32
-    assert config.emoji_usage_flush_seconds == 300
     example = pathlib.Path(".env.example").read_text()
-    for key in ("WORKSPACE_EMOJI_TTL_SECONDS", "PARTICIPATION_CUSTOM_EMOJI_CAP",
-                "EMOJI_USAGE_FLUSH_SECONDS"):
-        assert key in example
+    assert "WORKSPACE_EMOJI_TTL_SECONDS" in example
     # REACT_TOOL_CUSTOM_EMOJI_CAP is gone: it only ever capped an ALPHABETICAL slice of the
     # custom names for the react schema, and keeping a deliberately off-path selector around
     # "for future callers" just invites its accidental return.
-    assert not hasattr(config, "react_tool_custom_emoji_cap")
-    assert "REACT_TOOL_CUSTOM_EMOJI_CAP" not in example
+    #
+    # PARTICIPATION_CUSTOM_EMOJI_CAP and EMOJI_USAGE_FLUSH_SECONDS join it for the same reason:
+    # one sized the ranked shortlist the rich gate was handed, the other paced the tally behind
+    # that ranking. Neither has a consumer now, and an orphaned knob reads like a live one.
+    for gone_attr, gone_key in (
+        ("react_tool_custom_emoji_cap", "REACT_TOOL_CUSTOM_EMOJI_CAP"),
+        ("participation_custom_emoji_cap", "PARTICIPATION_CUSTOM_EMOJI_CAP"),
+        ("emoji_usage_flush_seconds", "EMOJI_USAGE_FLUSH_SECONDS"),
+    ):
+        assert not hasattr(config, gone_attr)
+        assert gone_key not in example
 
 
 def test_local_tools_guidance_mentions_workspace_custom_emoji():
@@ -471,59 +478,41 @@ def test_search_tool_not_registered_under_an_allowlist():
     assert "if not (config.reaction_emojis or [])" in src
 
 
-# =============================================================== observed-usage palette
+# =============================================================== the shortlist is gone
 
-def test_top_custom_reactions_ranks_by_count_and_filters_to_customs():
-    pulse = ChannelPulse()
-    for _ in range(4):
-        pulse.add_reaction("C1", "1.0", "shipit")
-    pulse.add_reaction("C1", "2.0", "party_parrot")
-    pulse.add_reaction("C1", "3.0", "thumbsup")            # standard, not in `allowed`
-    got = pulse.top_custom_reactions(allowed=["shipit", "party_parrot"], limit=10)
-    assert got == ["shipit", "party_parrot"]
+def test_no_ranked_custom_emoji_shortlist_survives():
+    """DELETED, and the deletion is the contract.
 
+    Roughly twenty tests lived here for an observed-usage TALLY and its DB persistence: ranked
+    by count, workspace-wide, DM-excluded, decremented on removal, hydrated at startup, flushed
+    on a timer and once at shutdown, protected against double-counting history on restart. All
+    of it fed ONE consumer — the ranked custom-emoji shortlist rendered into the old rich gate
+    prompt. The binary gate returns one bit and renders no palette, so the ranking has no reader
+    and the persistence has nothing worth persisting.
 
-def test_top_custom_reactions_aggregates_across_channels():
-    # WORKSPACE-wide on purpose. Scoped per-channel, a quiet or freshly-joined channel got an
-    # empty palette — which is most channels most of the time, and after every restart.
-    pulse = ChannelPulse()
-    for _ in range(3):
-        pulse.add_reaction("C1", "1.0", "shipit")
-    pulse.add_reaction("C2", "2.0", "party_parrot")        # a DIFFERENT channel still counts
-    assert pulse.top_custom_reactions(allowed=["shipit", "party_parrot"]) == [
-        "shipit", "party_parrot"]
+    The CATALOG and search survive and keep their own coverage above: the responder still reaches
+    for a custom emoji and still finds it by NAME, which never needed a popularity ranking.
 
+    No destructive migration goes with this. The `emoji_usage` table is no longer CREATED on a
+    fresh schema; an existing installation keeps its orphaned copy, because dropping it would
+    destroy data on upgrade to save a few kilobytes."""
+    from database import DatabaseManager
 
-def test_top_custom_reactions_empty_before_anything_is_observed():
-    assert ChannelPulse().top_custom_reactions(allowed=["shipit"]) == []
-
-
-def test_top_custom_reactions_ignores_dm_reactions():
-    # DMs are excluded from the tally, same guard as the social-proof store.
-    pulse = ChannelPulse()
-    pulse.add_reaction("D123", "1.0", "shipit")
-    assert pulse.top_custom_reactions(allowed=["shipit"]) == []
-
-
-def test_top_custom_reactions_decrements_on_removal():
-    pulse = ChannelPulse()
-    pulse.add_reaction("C1", "1.0", "shipit")
-    pulse.add_reaction("C1", "2.0", "party_parrot")
-    pulse.remove_reaction("C1", "1.0", "shipit")
-    assert pulse.top_custom_reactions(allowed=["shipit", "party_parrot"]) == ["party_parrot"]
-
-
-def test_top_custom_reactions_drops_emoji_deleted_since_they_were_observed():
-    pulse = ChannelPulse()
-    pulse.add_reaction("C1", "1.0", "since_deleted")
-    assert pulse.top_custom_reactions(allowed=["shipit"]) == []
+    for gone in ("top_custom_reactions", "reaction_vocab_snapshot", "hydrate_reaction_vocab"):
+        assert not hasattr(ChannelPulse, gone)
+    for gone in ("load_emoji_usage_async", "save_emoji_usage_async"):
+        assert not hasattr(DatabaseManager, gone)
+    # The fresh-schema CREATE is gone; the absence of a DROP is the load-bearing half.
+    src = inspect.getsource(DatabaseManager.init_schema)
+    assert "CREATE TABLE IF NOT EXISTS emoji_usage" not in src
+    assert "DROP TABLE" not in src.upper()
 
 
 @pytest.mark.asyncio
-async def test_backfill_seeds_reactions_from_history():
-    # conversations.history already carries reactions; without seeding them a FIRST-EVER run has
-    # an empty palette until someone reacts live. Exercised for real rather than by reading the
-    # source, because the interesting behaviour is the interaction with hydration below.
+async def test_backfill_still_seeds_per_message_social_proof():
+    # What the backfill's reaction seeding was ALSO doing, and the half that survives: a cold
+    # ring must show what the room already reacted to on a message, not just what it reacts to
+    # after the next live event.
     client = SimpleNamespace(conversations_history=AsyncMock(return_value={"messages": [
         {"ts": "1.0", "user": "U1", "text": "deploy is green",
          "reactions": [{"name": "shipit", "count": 3}, {"name": "tada", "count": 1}]},
@@ -532,110 +521,5 @@ async def test_backfill_seeds_reactions_from_history():
     bot = SimpleNamespace(classify_sender=lambda m: "human", user_cache={})
     pulse = ChannelPulse()
     await pulse.ensure_backfill("C1", client, bot)
-    assert pulse.reaction_vocab_snapshot() == {"shipit": 3, "tada": 1}
-
-
-@pytest.mark.asyncio
-async def test_backfill_does_not_double_count_a_persisted_tally():
-    # THE RESTART BUG. Hydration happens in start() before the socket opens; each channel's
-    # backfill then re-reads the same historical reactions. Counting them again inflated every
-    # emoji in recent history by its whole count on EVERY restart (measured 100 -> 104).
-    client = SimpleNamespace(conversations_history=AsyncMock(return_value={"messages": [
-        {"ts": "1.0", "user": "U1", "text": "deploy is green",
-         "reactions": [{"name": "shipit", "count": 4}]},
-    ]}))
-    bot = SimpleNamespace(classify_sender=lambda m: "human", user_cache={})
-    pulse = ChannelPulse()
-    pulse.hydrate_reaction_vocab({"shipit": 100})        # what the last run persisted
-    await pulse.ensure_backfill("C1", client, bot)
-    assert pulse.reaction_vocab_snapshot() == {"shipit": 100}
-    # a LIVE reaction still counts — only history replays are suppressed
-    pulse.add_reaction("C1", "9.0", "shipit")
-    assert pulse.reaction_vocab_snapshot() == {"shipit": 101}
-
-
-# =============================================================== persistence of the tally
-
-def test_hydrate_merges_and_never_shrinks_observed_counts():
-    # The backfill fires on a channel's first message and can beat the DB load. Rehydrating
-    # must not roll the tally BACKWARDS to whatever the last flush happened to catch.
-    pulse = ChannelPulse()
-    for _ in range(4):
-        pulse.add_reaction("C1", "1.0", "shipit")            # observed live: 4
-    pulse.hydrate_reaction_vocab({"shipit": 2, "party_parrot": 9})
-    snap = pulse.reaction_vocab_snapshot()
-    assert snap["shipit"] == 4                               # kept the larger, not the persisted 2
-    assert snap["party_parrot"] == 9                         # and gained what it had not seen
-
-
-def test_hydrate_tolerates_junk():
-    pulse = ChannelPulse()
-    pulse.hydrate_reaction_vocab({"": 5, "ok": "not-a-number", ":fine:": 3, "neg": -2, "z": 0})
-    assert pulse.reaction_vocab_snapshot() == {"fine": 3}     # colons stripped, junk dropped
-    pulse.hydrate_reaction_vocab(None)                        # no-op, must not raise
-    assert pulse.reaction_vocab_snapshot() == {"fine": 3}
-
-
-def test_snapshot_is_a_copy_and_content_free():
-    pulse = ChannelPulse()
-    pulse.add_reaction("C1", "1.0", "shipit")
-    snap = pulse.reaction_vocab_snapshot()
-    snap["shipit"] = 999                                      # mutating the copy must not leak
-    assert pulse.reaction_vocab_snapshot()["shipit"] == 1
-    # name -> count only: no channel, ts, author or text can be reconstructed from it
-    assert all(isinstance(k, str) and isinstance(v, int) for k, v in
-               pulse.reaction_vocab_snapshot().items())
-
-
-@pytest.mark.asyncio
-async def test_emoji_usage_round_trips_through_the_db(tmp_path):
-    import sqlite3
-    from database import DatabaseManager
-    db = DatabaseManager("test")
-    db.db_path = str(tmp_path / "t.db")          # same repoint the DB suite's fixture uses
-    db.conn = sqlite3.connect(db.db_path, check_same_thread=False, isolation_level=None)
-    db.init_schema()
-    await db.save_emoji_usage_async({"shipit": 4, "party_parrot": 1, "gone": 0})
-    assert await db.load_emoji_usage_async() == {"shipit": 4, "party_parrot": 1}  # zero pruned
-    # absolute counts: a later save REPLACES rather than accumulating, and drops missing names
-    await db.save_emoji_usage_async({"shipit": 6})
-    assert await db.load_emoji_usage_async() == {"shipit": 6}
-    await db.save_emoji_usage_async({})
-    assert await db.load_emoji_usage_async() == {}
-
-
-@pytest.mark.asyncio
-async def test_flush_and_load_never_raise_without_db_or_pulse():
-    host = MagicMock()
-    host.log_debug = lambda *a, **k: None
-    host.channel_pulse = None
-    host.db = None
-    host._load_emoji_usage = SlackMessagingMixin._load_emoji_usage.__get__(host)
-    host.flush_emoji_usage = SlackMessagingMixin.flush_emoji_usage.__get__(host)
-    await host._load_emoji_usage()
-    await host.flush_emoji_usage()
-
-
-@pytest.mark.asyncio
-async def test_flush_survives_a_failing_db():
-    host = MagicMock()
-    host.log_debug = lambda *a, **k: None
-    host.channel_pulse = ChannelPulse()
-    host.channel_pulse.add_reaction("C1", "1.0", "shipit")
-    host.db = MagicMock()
-    host.db.save_emoji_usage_async = AsyncMock(side_effect=RuntimeError("locked"))
-    host.flush_emoji_usage = SlackMessagingMixin.flush_emoji_usage.__get__(host)
-    await host.flush_emoji_usage()          # must not propagate
-
-
-def test_shutdown_flushes_the_tally_after_ingress_stops():
-    # A wiring guard, deliberately by inspection: stop() tears down sockets and sessions that are
-    # impractical to stand up here. What it pins is the ORDER — the final snapshot must come
-    # after the handler teardown, or a reaction arriving late in shutdown is observed and never
-    # persisted. It also pins that the periodic task is cancelled rather than left running.
-    import inspect
-    src = inspect.getsource(SlackMessagingMixin.stop)
-    assert "_emoji_flush_task" in src and "task.cancel()" in src
-    assert src.count("flush_emoji_usage") == 1, "the final flush should happen exactly once"
-    assert src.index("_emoji_flush_task") < src.index("await self.flush_emoji_usage()")
-    assert src.index("self.handler") < src.index("await self.flush_emoji_usage()")
+    assert pulse.render_reactions("C1", "1.0") == "[reactions: 3\u00d7 shipit, 1\u00d7 tada]"
+    assert pulse.render_reactions("C1", "2.0") == ""

@@ -482,21 +482,34 @@ class TestFailedFilesNotice:
         assert "Couldn't Read Image" not in out
 
 
-# ------------------------------------------------------------------------- the wake gate
+# ------------------------------------------------------- the answering path's image fidelity
+#
+# These two moved here when the wake gate's own vision module was deleted. They were never about
+# the gate: they pin what the ANSWERING turn sends, which is the path that actually reads a
+# picture and the only one whose detail setting can cost a misread.
 
-class TestGateVisionStaysNarrow:
-    def test_gate_still_refuses_gif_on_the_hot_path(self):
-        # Deliberate, not an oversight: telling static from animated costs a parse, and the gate
-        # runs in front of every ambient message. Unifying this away would be a regression.
-        from message_processor import gate_vision
+def test_api_part_now_stamps_the_configured_detail():
+    """Regression: DEFAULT_DETAIL_LEVEL existed but never reached the main turn's image parts —
+    the builders set no `detail`, so every attached image rode at the API default (`auto`, which
+    downsamples) regardless of the setting. That is how a rollback token got transcribed with the
+    wrong last character and then repeated as fact. api_part is the one choke point every content
+    part crosses, so the default is stamped there; an explicit detail still wins."""
+    from config import config
+    from message_processor.utilities import api_part
+    part = api_part({"type": "input_image", "image_url": "data:x",
+                     "source": "attachment", "url": "u", "file_id": "F1"})
+    assert part["detail"] == config.default_detail_level
+    assert "source" not in part and "file_id" not in part      # whitelist still enforced
+    assert api_part({"type": "input_image", "image_url": "d", "detail": "low"})["detail"] == "low"
 
-        assert "image/gif" not in gate_vision._SAFE_MIMETYPES
-        assert gate_vision._sniff(_static_gif()) is None
 
-    def test_gate_shows_what_the_api_accepts_otherwise(self):
-        from message_processor import gate_vision
+def test_the_answering_path_defaults_to_full_fidelity():
+    """`auto` on the 5.6 family means ORIGINAL dimensions with no resize — the maximum. Pinning it
+    to `high` would cap large screenshots, not sharpen them."""
+    import os
+    from unittest.mock import patch
 
-        assert gate_vision._sniff(_png()) == "image/png"
-        assert gate_vision._sniff(_jpeg()) == "image/jpeg"
-        assert gate_vision._sniff(_webp()) == "image/webp"
-        assert gate_vision._sniff(b"<html>login</html>") is None
+    from config import BotConfig
+    with patch.dict(os.environ, {}, clear=True):
+        fresh = BotConfig()
+    assert fresh.default_detail_level == "auto"

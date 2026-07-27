@@ -10,132 +10,18 @@ It decides whether the responder runs, and the responder knows its own tools by 
 `capabilities=` parameter, the signals key, and the prompt's "The assistant's own tools/data
 sources" line are all deleted, and the tests that asserted the hop are inverted into tripwires.
 
-The function itself has zero callers now and is scheduled for deletion in the cleanup commit
-(spec §8). Until then its unit tests are the only thing keeping it honest, so they stay.
+The function itself is GONE (cleanup commit): it built an inventory of the assistant's own tools
+so the rich gate could weigh whether an answer was available, and the binary gate does not ask
+that question. What remains here asserts the absence, and covers the attachment descriptors that
+DID survive the rewrite — the gate still learns that something was attached and what it is called.
 """
 from __future__ import annotations
 
 import pytest
 
 from config import config
-from message_processor.participation import (ParticipationEngine,
-                                             render_capabilities_line)
+from message_processor.participation import ParticipationEngine
 
-
-class _FakeMCP:
-    """Minimal stand-in for MCPManager: an insertion-ordered `servers` dict and
-    `has_mcp_servers()`."""
-
-    def __init__(self, servers):
-        self.servers = servers
-
-    def has_mcp_servers(self):
-        return len(self.servers) > 0
-
-
-# ------------------------------------------------------------ render_capabilities_line
-
-class TestRenderCapabilitiesLine:
-    def test_web_search_flag_on(self, monkeypatch):
-        monkeypatch.setattr(config, "enable_web_search", True, raising=False)
-        monkeypatch.setattr(config, "mcp_enabled_default", False, raising=False)
-        line = render_capabilities_line(None)
-        assert "web search" in line
-        assert "image generation and editing" in line
-
-    def test_web_search_flag_off(self, monkeypatch):
-        monkeypatch.setattr(config, "enable_web_search", False, raising=False)
-        monkeypatch.setattr(config, "mcp_enabled_default", False, raising=False)
-        line = render_capabilities_line(None)
-        assert "web search" not in line
-        assert line == ("image generation and editing; "
-                        "analyzing images and documents shared in chat")
-
-    def test_mcp_servers_present_render_descriptions(self, monkeypatch):
-        monkeypatch.setattr(config, "enable_web_search", True, raising=False)
-        monkeypatch.setattr(config, "mcp_enabled_default", True, raising=False)
-        mcp = _FakeMCP({
-            "acmedata": {"server_description": "Food & beverage market data"},
-            "weather": {"server_description": "Live weather lookups"},
-        })
-        line = render_capabilities_line(mcp)
-        assert "Food & beverage market data" in line
-        assert "Live weather lookups" in line
-        # semicolon-joined
-        assert "; " in line
-
-    def test_mcp_absent_when_manager_none(self, monkeypatch):
-        monkeypatch.setattr(config, "enable_web_search", True, raising=False)
-        monkeypatch.setattr(config, "mcp_enabled_default", True, raising=False)
-        line = render_capabilities_line(None)
-        assert line == ("web search; image generation and editing; "
-                        "analyzing images and documents shared in chat")
-
-    def test_mcp_omitted_when_default_off(self, monkeypatch):
-        monkeypatch.setattr(config, "enable_web_search", False, raising=False)
-        monkeypatch.setattr(config, "mcp_enabled_default", False, raising=False)
-        mcp = _FakeMCP({"acmedata": {"server_description": "Food & bev data"}})
-        line = render_capabilities_line(mcp)
-        assert "Food & bev data" not in line
-        assert line == ("image generation and editing; "
-                        "analyzing images and documents shared in chat")
-
-    def test_mcp_omitted_when_no_servers(self, monkeypatch):
-        monkeypatch.setattr(config, "enable_web_search", False, raising=False)
-        monkeypatch.setattr(config, "mcp_enabled_default", True, raising=False)
-        line = render_capabilities_line(_FakeMCP({}))
-        assert line == ("image generation and editing; "
-                        "analyzing images and documents shared in chat")
-
-    def test_description_falls_back_to_label(self, monkeypatch):
-        monkeypatch.setattr(config, "enable_web_search", False, raising=False)
-        monkeypatch.setattr(config, "mcp_enabled_default", True, raising=False)
-        # No server_description → the label is used.
-        mcp = _FakeMCP({"my_server": {"server_url": "https://x"}})
-        line = render_capabilities_line(mcp)
-        assert "my_server" in line
-
-    def test_insertion_order_preserved(self, monkeypatch):
-        monkeypatch.setattr(config, "enable_web_search", False, raising=False)
-        monkeypatch.setattr(config, "mcp_enabled_default", True, raising=False)
-        mcp = _FakeMCP({"alpha": {}, "beta": {}, "gamma": {}})
-        line = render_capabilities_line(mcp)
-        assert line.index("alpha") < line.index("beta") < line.index("gamma")
-
-    def test_deterministic_across_calls(self, monkeypatch):
-        monkeypatch.setattr(config, "enable_web_search", True, raising=False)
-        monkeypatch.setattr(config, "mcp_enabled_default", True, raising=False)
-        mcp = _FakeMCP({"a": {"server_description": "aaa"}, "b": {"server_description": "bbb"}})
-        assert render_capabilities_line(mcp) == render_capabilities_line(mcp)
-
-    def test_never_empty_string_image_gen_unconditional(self, monkeypatch):
-        # Everything off, no MCP → still non-None because image gen is unconditional;
-        # the None-when-empty guard is defensive (the list is never actually empty).
-        monkeypatch.setattr(config, "enable_web_search", False, raising=False)
-        monkeypatch.setattr(config, "mcp_enabled_default", False, raising=False)
-        line = render_capabilities_line(None)
-        assert line and isinstance(line, str)
-
-    def test_none_when_caps_empty_guard(self, monkeypatch):
-        # Directly exercise the guard: an mcp_manager whose has_mcp_servers raises is
-        # treated as absent, and with everything else off only image gen remains — the
-        # guard's None branch is unreachable while image gen is unconditional, so this
-        # asserts the guard never yields an empty string.
-        monkeypatch.setattr(config, "enable_web_search", False, raising=False)
-        monkeypatch.setattr(config, "mcp_enabled_default", True, raising=False)
-
-        class _Boom:
-            servers = {"x": {}}
-
-            def has_mcp_servers(self):
-                raise RuntimeError("boom")
-
-        line = render_capabilities_line(_Boom())
-        assert line == ("image generation and editing; "
-                        "analyzing images and documents shared in chat")
-
-
-# ------------------------------------------- the inventory no longer reaches the gate
 
 class _CapturingClient:
     """Records the cohort and steering the gate actually sends."""
@@ -162,7 +48,7 @@ class TestTheInventoryIsNotAGateInput:
         engine = ParticipationEngine(_CapturingClient())
         with pytest.raises(TypeError):
             await engine.evaluate(channel_id="C1", ts="1.0", text="hi",
-                                  capabilities=render_capabilities_line(None))
+                                  capabilities="web search; image generation and editing")
 
     @pytest.mark.asyncio
     async def test_the_classifier_gets_the_message_and_the_steering_and_nothing_else(
@@ -176,18 +62,18 @@ class TestTheInventoryIsNotAGateInput:
         assert [s.text for s in client.sources] == ["anyone know gen z ice cream trends?"]
         assert client.steering is None
 
-    def test_the_inventory_has_no_runtime_caller_left(self):
-        """The other half of the deletion: nothing builds the line for the gate any more.
-
-        `render_capabilities_line` survives as a function with no callers (cleanup commit 7), so the
-        check is over the modules that used to call it — main.py built it on the gate's hot path,
-        which is where half a dozen API reads and cache lookups went to support a judgment the gate
-        stopped making."""
+    def test_the_inventory_is_gone_entirely(self):
+        """The other half of the deletion, now complete: the function itself is gone, not merely
+        uncalled. It built an inventory of the assistant's own tools so the rich gate could weigh
+        whether an answer was AVAILABLE — a judgment the binary gate does not make, and the cost of
+        making it was half a dozen API reads and cache lookups on the hot path of a decision the
+        whole turn waits for."""
         import inspect
         import main
         from message_processor import participation
         from openai_client.api import responses
 
+        assert not hasattr(participation, "render_capabilities_line")
         assert "render_capabilities_line" not in inspect.getsource(main)
         assert "capabilities" not in inspect.getsource(participation.ParticipationEngine.evaluate)
         assert "capabilities" not in inspect.getsource(responses.classify_wake)
@@ -211,14 +97,6 @@ class TestPromptRule:
 
 
 # ------------------------------------------------------ F14b attachment signals
-
-class TestF14bCapabilityEntry:
-    def test_analyzing_entry_unconditional(self, monkeypatch):
-        # Present regardless of web-search / MCP config — vision & document flows are core.
-        monkeypatch.setattr(config, "enable_web_search", False, raising=False)
-        monkeypatch.setattr(config, "mcp_enabled_default", False, raising=False)
-        assert "analyzing images and documents shared in chat" in render_capabilities_line(None)
-
 
 class TestF14bAttachmentsAreDescriptorsOnTheSourceRecord:
     @pytest.mark.asyncio

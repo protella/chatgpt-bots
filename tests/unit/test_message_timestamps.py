@@ -240,36 +240,22 @@ async def test_flag_off_is_byte_identical_everywhere(temp_db, monkeypatch):
     assert next(m for m in state.messages if m["role"] == "user")["content"] == "Peter: q"
     assert next(m for m in state.messages if m["role"] == "assistant")["content"] == "a"
 
-    # classifier tail + channel-activity envelope — no stamp
+    # channel-activity envelope — no stamp
     p = ChannelPulse()
     p.record("C1", ts="100.0", thread_ts=None, user_id="U1", display_name="Alice",
              sender_type="human", text="root question", is_bot=False)
     p.record("C1", ts="101.0", thread_ts="100.0", user_id="U2", display_name="Bob",
              sender_type="human", text="a reply", is_bot=False)
-    tail = p.render_thread_tail("C1", "100.0", before_ts="200.0")
     env = p.render_envelope("C1")
     # No line carries a leading stamp (the "- " bullet is followed straight by the name).
-    assert not any(_STAMP_RE.match(ln[2:]) for ln in tail.splitlines() if ln.startswith("- "))
-    assert not any(_STAMP_RE.match(ln.lstrip("- ")) for ln in tail.splitlines())
     assert not any(_STAMP_RE.match(ln.lstrip("- ")) for ln in env.splitlines())
 
 
-# ----------------------------------------------------------- classifier stamping
-
-def test_classifier_thread_tail_lines_are_stamped():
-    p = ChannelPulse()
-    p.record("C1", ts="100.0", thread_ts=None, user_id="U1", display_name="Alice",
-             sender_type="human", text="root question", is_bot=False)
-    p.record("C1", ts="101.0", thread_ts="100.0", user_id="U2", display_name="Bob",
-             sender_type="human", text="a reply", is_bot=False)
-    out = p.render_thread_tail("C1", "100.0", before_ts="200.0")
-    # Each speaker line is "- [stamp] Name [human/bot]: ..." (UTC — the ring holds no tz).
-    speaker_lines = [ln for ln in out.splitlines() if ln.startswith("- ")]
-    assert speaker_lines
-    for ln in speaker_lines:
-        assert _STAMP_RE.match(ln[2:])       # stamp right after the "- " bullet
-    assert "[Thu 1970-01-01 12:01 AM UTC] Alice [human]" in out
-
+# ------------------------------------------------------------------ pulse stamping
+#
+# The thread-tail half of this section went with the rich gate's prose tails: the per-thread ring
+# now holds actor state (ts / is_bot / sender_type) and no text, so there is no line to stamp.
+# The envelope is the surviving stamped surface, and it feeds the responder.
 
 def test_channel_activity_envelope_lines_are_stamped():
     p = ChannelPulse()

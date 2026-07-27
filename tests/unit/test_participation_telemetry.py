@@ -135,24 +135,24 @@ def test_record_never_raises_and_never_writes_before_initialization():
         pt.record("gate_start", channel_id="C1", trigger_ts="1.0")   # must not raise
 
 
-def test_the_bound_on_model_authored_prose_still_exists_for_the_rows_that_carry_it(sink):
-    """RE-BASELINED. This used to bound the GATE's `reason` — prose the classifier wrote about a
-    human's message, which is why it was capped in the first place. The gate writes no reason
-    anywhere now (spec §2: "Deleted; never forwarded or logged"), so the cap has one fewer caller
-    and the honest test is of the helper plus the absence.
+def test_no_model_authored_prose_can_reach_the_ledger_at_all(sink):
+    """RE-BASELINED TWICE, and the second time is the interesting one.
 
-    The privacy policy is one policy, not two, so the bound is asserted where it still applies."""
-    long_reason = "x" * (pt.GUIDANCE_TRUNCATION_CHARS + 50)
-    written = pt.truncate_reason(long_reason)
-    assert len(written) == pt.GUIDANCE_TRUNCATION_CHARS + 1   # + the ellipsis
-    assert written.endswith("…")
-    assert pt.truncate_reason("") is None and pt.truncate_reason("   ") is None
+    This began as a test of the cap on the GATE's `reason` — prose the classifier wrote about a
+    human's message, bounded because truncation lowers exposure. When the gate stopped writing a
+    reason, the test was rewritten to assert the helper plus the absence. Now the HELPER is gone
+    too, and that is the stronger position: a bound with no field to bound is an invitation to add
+    one back without thinking about what it would carry. The exposure is removed rather than
+    limited.
 
-    # ...and gate_decision has nowhere to put one: the signature is keyword-only and closed.
+    So what is asserted is the shape of the door, not the size of the gap: `gate_decision` is
+    keyword-only and closed, and there is nowhere to put prose even if somebody wanted to."""
+    assert not hasattr(pt, "truncate_reason")
+
     pt.gate_decision("C1", "1.0", wake=False)
     assert "reason" not in sink("gate_decision")[0]
     with pytest.raises(TypeError):
-        pt.gate_decision("C1", "1.0", wake=False, reason=long_reason)
+        pt.gate_decision("C1", "1.0", wake=False, reason="x" * 250)
 
 
 # ---------------------------------------------------------------- the attempt lifecycle helper

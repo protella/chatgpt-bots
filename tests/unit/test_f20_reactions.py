@@ -4,7 +4,7 @@ Covers what remains of the five design points: the main model's react etiquette
 (LOCAL_TOOLS_GUIDANCE), unrestricted standard-emoji judgment at the two enforcement points that
 still exist (schema enum, executor) with the optional REACTION_EMOJIS allowlist still honored, tool
 registration, and the pulse-ring social-proof signal (reaction_added/removed accumulation +
-envelope/tail summary rendering).
+envelope summary rendering).
 
 TWO OF THE FOUR ENFORCEMENT POINTS ARE GONE, along with the prompt they served. The gate used to
 CHOOSE the emoji and place it — hence a react verdict, `validate_verdict`'s emoji coercion, and a
@@ -298,16 +298,6 @@ def test_envelope_appends_reaction_summary_and_omits_when_none():
     assert "quiet message" in env and "quiet message [reactions" not in env
 
 
-def test_thread_tail_appends_reaction_summary():
-    p = ChannelPulse(size=5)
-    root = "10.0"
-    p.record("C1", **_entry(root, text="root msg"))
-    p.record("C1", **_entry("11.0", text="reply one", thread_ts=root))
-    p.add_reaction("C1", "11.0", "fire")
-    tail = p.render_thread_tail("C1", root, before_ts="99.0")
-    assert '[reactions: 1× fire]' in tail
-
-
 # ------------------------------------------------------- point 3: own-message feedback intact
 
 class _Host:
@@ -348,32 +338,28 @@ def test_note_reaction_pulse_removed_decrements():
     assert p.render_reactions("C1", "9.9") == ""
 
 
-# --- the palette must learn from the ROOM, not from the bot (2026-07-26) ---
+# --- the workspace popularity tally is gone (2026-07-27) ---
 
-def test_own_reactions_never_teach_the_emoji_palette():
-    """Slack emits reaction_added for the bot's OWN reactions, so without a filter the usage
-    tally learns from the bot: an emoji it picked once outranks the rest next turn, gets picked
-    again, and climbs. Observed live — :dumpster-fire: went 0 -> 2 on the bot's own two uses and
-    was then the top custom emoji offered for anything negative, in a workspace with 1,397 custom
-    emoji. The tally answers "what does THIS WORKSPACE react with"; the bot is not the workspace."""
+def test_no_workspace_emoji_tally_survives():
+    """DELETED, and the deletion is the contract.
+
+    Two tests here defended a workspace-wide emoji-popularity tally against learning from the bot
+    itself (`from_self`) and against re-counting history on every restart (`from_history`). The
+    tally existed for ONE consumer: the ranked custom-emoji shortlist rendered into the old rich
+    gate prompt. The binary gate reads no shortlist, so the tally, its persistence, and the two
+    flags that protected it all went with it — there is nothing left to bias.
+
+    What survives is per-message social proof, which was always a different thing: it is a fact
+    about a specific message, where the bot's own reaction genuinely IS on screen and belongs in
+    the count. Asserted at the signature, so re-adding the tally cannot pass quietly."""
+    import inspect
+
     from slack_client.channel_pulse import ChannelPulse
+    for gone in ("top_custom_reactions", "reaction_vocab_snapshot", "hydrate_reaction_vocab"):
+        assert not hasattr(ChannelPulse, gone)
+    params = inspect.signature(ChannelPulse.add_reaction).parameters
+    assert "from_self" not in params and "from_history" not in params
+
     pulse = ChannelPulse(size=10)
-    pulse.add_reaction("C1", "1.0", "dumpster-fire", from_self=True)
-    pulse.add_reaction("C1", "1.0", "tada")                       # a human's
-    vocab = pulse.reaction_vocab_snapshot()
-    assert "dumpster-fire" not in vocab, "the bot taught itself its own preference"
-    assert vocab.get("tada") == 1
-    # Social proof on the specific message is different: our reaction really IS on it.
+    pulse.add_reaction("C1", "1.0", "dumpster-fire")
     assert "dumpster-fire" in pulse.render_reactions("C1", "1.0")
-
-
-def test_removing_our_own_reaction_does_not_dock_the_room_s_tally():
-    """Ours never incremented the tally, so un-reacting must not decrement it — otherwise the bot
-    reacting then removing would push a genuinely popular emoji BELOW what the room earned it."""
-    from slack_client.channel_pulse import ChannelPulse
-    pulse = ChannelPulse(size=10)
-    for _ in range(3):
-        pulse.add_reaction("C1", "1.0", "tada")                   # the room's three
-    pulse.add_reaction("C1", "1.0", "tada", from_self=True)       # ours on top
-    pulse.remove_reaction("C1", "1.0", "tada", from_self=True)    # ours taken back
-    assert pulse.reaction_vocab_snapshot().get("tada") == 3

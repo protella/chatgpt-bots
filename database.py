@@ -748,23 +748,12 @@ class DatabaseManager(LoggerMixin):
             "CREATE INDEX IF NOT EXISTS idx_channel_memory_lookup ON channel_memory (scope, channel_id)"
         )
 
-        # Emoji vocabulary: a flat workspace-wide tally of how often each emoji has been used
-        # as a reaction, used to rank the custom-emoji palette offered to the participation
-        # gate. Slack exposes no popularity endpoint, so observed usage is the only ranking
-        # signal there is; without persistence it was rebuilt from scratch on every restart and
-        # only covered channels that happened to wake up afterwards.
-        #
-        # Deliberately content-free: a name and a count. No channel, no ts, no author, no
-        # message. Nothing here can reconstruct who reacted to what, which is what keeps it
-        # clear of the "Slack is the only transcript" rule — this is a derived artifact, not
-        # conversation history.
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS emoji_usage (
-                name TEXT PRIMARY KEY,
-                count INTEGER NOT NULL DEFAULT 0,
-                updated_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+        # NOTE: there was an `emoji_usage` table here — a workspace-wide reaction tally that
+        # ranked the custom-emoji shortlist injected into the old rich participation gate. The
+        # gate is now one bit and reads no shortlist, so nothing writes or reads it. We stop
+        # CREATING it and deliberately do NOT drop it: an existing installation keeps an
+        # orphaned, content-free table (name + count, no channel/ts/author), and a DROP would
+        # be a destructive migration bought for a few kilobytes.
 
         # Response feedback (Phase H): thumbs signal from native feedback buttons and
         # from +1/-1 reactions on the bot's own messages. One row per
@@ -3550,51 +3539,6 @@ class DatabaseManager(LoggerMixin):
         logger.debug(f"Saved channel_settings + policy for {channel_id} (async)")
 
     # --- Per-channel memory (Phase 9), async variants ---
-    async def load_emoji_usage_async(self) -> Optional[Dict[str, int]]:
-        """The persisted workspace emoji tally as {name: count}.
-
-        Returns None on FAILURE and {} when the table is legitimately empty. The distinction
-        matters: the caller writes absolute counts, so treating a transient read error as "the
-        tally is empty" let the very next flush DELETE the whole accumulated history. A None
-        here must disable destructive writes until a load succeeds."""
-        try:
-            async with aiosqlite.connect(self.db_path) as db:
-                await db.execute("PRAGMA journal_mode=WAL")
-                async with db.execute("SELECT name, count FROM emoji_usage") as cursor:
-                    return {r[0]: int(r[1] or 0) for r in await cursor.fetchall() if r[0]}
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"emoji usage load failed: {e}")
-            return None
-
-    async def save_emoji_usage_async(self, counts: Dict[str, int]) -> None:
-        """Upsert the whole tally in one transaction.
-
-        Writes ABSOLUTE counts rather than deltas: the in-memory tally is the authority and is
-        itself seeded from this table at startup, so a lost flush costs at most the reactions
-        since the last one — and two processes cannot double-count each other's increments.
-        Rows that fall to zero are deleted. Never raises."""
-        if counts is None:
-            return
-        try:
-            async with aiosqlite.connect(self.db_path) as db:
-                await db.execute("PRAGMA journal_mode=WAL")
-                keep = [(n, int(c)) for n, c in counts.items() if n and int(c or 0) > 0]
-                if keep:
-                    await db.executemany(
-                        "INSERT INTO emoji_usage (name, count, updated_ts) "
-                        "VALUES (?, ?, CURRENT_TIMESTAMP) "
-                        "ON CONFLICT(name) DO UPDATE SET count = excluded.count, "
-                        "updated_ts = CURRENT_TIMESTAMP",
-                        keep)
-                    await db.execute(
-                        "DELETE FROM emoji_usage WHERE name NOT IN (%s)"
-                        % ",".join("?" * len(keep)), [n for n, _ in keep])
-                else:
-                    await db.execute("DELETE FROM emoji_usage")
-                await db.commit()
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"emoji usage save failed: {e}")
-
     async def get_channel_memory_async(self, channel_id: str) -> List[Dict]:
         """Async version of get_channel_memory (channel-scope for this channel + shared workspace)."""
         async with aiosqlite.connect(self.db_path) as db:

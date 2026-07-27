@@ -557,16 +557,15 @@ def test_attachment_note_sanitizes_and_caps_filenames():
     assert note == "[+5 files: f0.csv, f1.csv, f2.csv, +2 more]"
 
 
-def test_record_appends_attachment_note_to_envelope_and_tail():
-    # F14b/F25: a message carrying files surfaces a bracketed note (with filename) that
-    # both the envelope line and the thread-tail entry inherit (folded in at record level).
+def test_record_appends_attachment_note_to_envelope():
+    # F14b/F25: a message carrying files surfaces a bracketed note (with filename) on the
+    # envelope line, folded into the text at record level. The thread-tail half of this
+    # assertion went with the gate's prose tails — that ring carries no text to fold into.
     p = ChannelPulse(size=10)
     p.record("C1", **_entry("100.0", text="what do we think?"),
              files=[{"mimetype": "image/png", "name": "food.png"}])
     env = p.render_envelope("C1")
     assert "what do we think? [+1 image: food.png]" in env
-    tail = p.render_thread_tail("C1", "100.0", before_ts="200.0")
-    assert "[+1 image: food.png]" in tail
 
 
 def test_record_without_files_leaves_text_untouched():

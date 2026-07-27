@@ -564,6 +564,11 @@ async def test_reply_placed_in_thread(tag_only):
 
 
 def test_text_mentions_bot_name_whole_word(tag_only):
+    """The prefilter's ONE job: does configured name-addressing make this message eligible for
+    dispatch. It decides nothing semantic — not relevance, wake, reply, silence, placement or
+    settings — which is why "the chatgptithon event" only needs to be a non-match here rather than
+    understood. The routing it gates is pinned above: unaddressed traffic in a mentions_only
+    (tag_only) channel never dispatches, a name hit reaches the gate."""
     bot = _make_bot()
     assert bot._text_mentions_bot_name("hey ChatGPT can you help")
     assert bot._text_mentions_bot_name("CHATGPT-DEV go")

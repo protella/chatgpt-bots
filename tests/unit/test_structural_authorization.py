@@ -77,7 +77,7 @@ async def _run(meta, db):
 async def test_a_gated_turn_that_never_woke_is_refused():
     """The shape that should be impossible: a message that REQUIRED the participation gate and
     never woke it has no business writing settings, whatever else it carries. Fails closed."""
-    db = _writable_db(before={"participation_level": "judicious"})
+    db = _writable_db(before={"participation_level": "on"})
     ctx, res = await _run(
         {"sender_type": "human", "mentioned_self": False,
          "gate_required": True, "gate_woke": False, "silence_capable": True,
@@ -91,7 +91,7 @@ async def test_a_gated_turn_that_never_woke_is_refused():
 async def test_bot_authored_mention_is_refused():
     # Bypass (b): a REAL @mention, but the author is another bot (dispatched un-gated). The old
     # `not unprompted` authorized the non-human sender; the human-sender requirement refuses it.
-    db = _writable_db(before={"participation_level": "judicious"})
+    db = _writable_db(before={"participation_level": "on"})
     ctx, res = await _run({"sender_type": "other_bot", "mentioned_self": True}, db)
     assert ctx.structural_change_authorized is False
     assert res["ok"] is False and res["error"] == "not_addressed"
@@ -102,7 +102,7 @@ async def test_bot_authored_mention_is_refused():
 async def test_an_unclassified_sender_is_refused():
     """Absent sender classification fails CLOSED — a settings write withheld is the safe
     default, and `None` is not a person."""
-    db = _writable_db(before={"participation_level": "judicious"})
+    db = _writable_db(before={"participation_level": "on"})
     ctx, res = await _run({"mentioned_self": True}, db)
     assert ctx.structural_change_authorized is False
     assert res["ok"] is False and res["error"] == "not_addressed"
@@ -111,7 +111,7 @@ async def test_an_unclassified_sender_is_refused():
 
 @pytest.mark.asyncio
 async def test_a_self_authored_turn_is_refused():
-    db = _writable_db(before={"participation_level": "judicious"})
+    db = _writable_db(before={"participation_level": "on"})
     ctx, res = await _run({"sender_type": "self", "mentioned_self": True}, db)
     assert ctx.structural_change_authorized is False
     assert res["ok"] is False and res["error"] == "not_addressed"
@@ -180,7 +180,7 @@ def test_no_gate_authorized_structural_producers_or_consumers_remain():
 async def test_executor_refuses_non_human_sender_even_if_flag_set():
     # Belt-and-suspenders: even if the authorization flag were somehow True, the executor reads the
     # raw sender classification off ctx.message and refuses a non-human author outright.
-    db = _writable_db(before={"participation_level": "judicious"})
+    db = _writable_db(before={"participation_level": "on"})
     msg = Message(text="x", user_id="B1", channel_id=CHANNEL, thread_id="100.0",
                   metadata={"sender_type": "other_bot"})
     ctx = ToolContext(channel_id=CHANNEL, user_id="B1", db=db, is_dm=False,

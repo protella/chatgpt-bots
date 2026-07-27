@@ -220,15 +220,13 @@ def note_reaction_pulse(client_self, event, *, added: bool) -> None:
         emoji = event.get("reaction", "")
         if not (channel_id and ts and emoji):
             return
-        # Whose reaction this is decides whether it teaches the emoji palette. Slack emits
-        # reaction_added for the bot's OWN reactions, and counting those made the tally learn
-        # from the bot rather than from the room (see ChannelPulse.add_reaction).
-        bot_user_id = getattr(client_self, "bot_user_id", None)
-        reactor = event.get("user")
-        from_self = bool(bot_user_id and reactor and reactor == bot_user_id)
+        # No from_self/from_history distinction any more: those existed only to keep the bot's
+        # own reactions out of the workspace emoji-popularity tally, and that tally is gone with
+        # the rich gate. Per-message social proof is about a specific message, where our own
+        # reaction genuinely is on screen and belongs in the count.
         if added:
-            pulse.add_reaction(channel_id, ts, emoji, from_self=from_self)
+            pulse.add_reaction(channel_id, ts, emoji)
         else:
-            pulse.remove_reaction(channel_id, ts, emoji, from_self=from_self)
+            pulse.remove_reaction(channel_id, ts, emoji)
     except Exception as e:  # noqa: BLE001
         client_self.log_debug(f"reaction pulse update failed: {e}")

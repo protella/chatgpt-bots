@@ -155,6 +155,9 @@ always come from the answering model). Consequences you'll notice:
 - **A provider outage is no longer scored as restraint.** If the wake-up check fails, the
   ledger records a failure — the bot stays silent, but never pretends it chose to.
 - Old recorded participation preferences fold into the standing channel policy at first start.
+- Settings that belonged to the old gate are gone and can be removed from your `.env`:
+  `GATE_VISION_*`, `ENABLE_MULTIMODAL_GATE`, `SNOOZE_ACK_EMOJI`, `PARTICIPATION_CUSTOM_EMOJI_CAP`,
+  `EMOJI_USAGE_FLUSH_SECONDS`, `PULSE_TAIL_TEXT_TRUNCATE`, `PARTICIPATION_ADDRESSEE_TAIL`.
 
 ### 📜 Changed - One standing channel policy, and both halves of the bot read it
 
