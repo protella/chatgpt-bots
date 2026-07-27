@@ -138,6 +138,23 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### ⚙️ Fixed - It knows its own channel settings instead of guessing them
+
+Ask it "what's your participation setting in here?" and it used to answer from the chat
+history — whatever someone last *asked* for, which could be two changes stale — and then
+invent an explanation for why its behaviour didn't match. It could always change the setting
+but was never told what the setting was. It now reads its actual participation level and reply
+placement, so it can answer the question, and it says "on" for a channel that inherits the
+default rather than "inherit". Changing it still takes a direct instruction, as before.
+
+### 🧪 Fixed - A background job that builds a file can now tell you what it found
+
+When a job only builds (no research phase), the worker's own account of what it did was thrown
+away, and the reply you got could name the files it was posting but not say what they showed —
+so a job that had just proved something would decline to state the result. Those notes now
+reach the model that writes the reply. They're used to describe the outcome, never pasted into
+the thread.
+
 ### 🔍 Changed - It treats what it read as evidence, not the whole truth
 
 The prompts used to tell the model its view of the channel was authoritative, which made it
