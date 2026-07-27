@@ -809,7 +809,7 @@ class TestDBAndModal:
         assert row["participation_level"] == "active"
         assert row["snoozed_until"] == "2026-07-09T20:00:00+00:00"
         # omitted fields preserved
-        temp_db.set_channel_settings("C1", directives="rule")
+        temp_db.set_channel_settings("C1", verbosity="low")
         row = temp_db.get_channel_settings("C1")
         assert row["participation_level"] == "active"
         assert row["snoozed_until"] == "2026-07-09T20:00:00+00:00"
@@ -824,7 +824,7 @@ class TestDBAndModal:
         # when omitted, and clears on None/[].
         temp_db.set_channel_settings("C1", muted_threads=["10.0", "20.5"])
         assert temp_db.get_channel_settings("C1")["muted_threads"] == ["10.0", "20.5"]
-        temp_db.set_channel_settings("C1", directives="rule")  # omitted → preserved
+        temp_db.set_channel_settings("C1", verbosity="low")  # omitted → preserved
         assert temp_db.get_channel_settings("C1")["muted_threads"] == ["10.0", "20.5"]
         temp_db.set_channel_settings("C1", muted_threads=None)  # cleared
         assert temp_db.get_channel_settings("C1")["muted_threads"] == []

@@ -806,8 +806,6 @@ class SlackMessageEventsMixin:
                        if (a or {}).get("type") == "image" and (a or {}).get("url")]
         if gate_images:
             message.metadata["participation_images"] = gate_images
-        if cs and cs.get("directives"):
-            message.metadata["channel_directives"] = cs["directives"]
         message.metadata["channel_post_allowed"] = _channel_post_allowed(cs)
 
         self.log_debug(
@@ -1026,9 +1024,6 @@ class SlackMessageEventsMixin:
                            if (a or {}).get("type") == "image" and (a or {}).get("url")]
             if gate_images:
                 message.metadata["participation_images"] = gate_images
-        # Phase 7: carry per-channel ground rules + placement into the response pipeline.
-        if cs and cs.get("directives"):
-            message.metadata["channel_directives"] = cs["directives"]
         # Whether a top-level reply is ALLOWED here (redesign Layer 1). An allowance, not a
         # mandate: where both destinations are legal the model chooses per reply
         # (set_reply_destination). Always stamped, true or false.
@@ -1135,8 +1130,6 @@ class SlackMessageEventsMixin:
                         f"Participation OFF for {message.channel_id} — dropping @mention "
                         f"(ts={event.get('ts')})")
                     return
-            if cs and cs.get("directives"):
-                message.metadata["channel_directives"] = cs["directives"]
             # B1: the mention path resolves the allowance too — without it an @mention could
             # never reply at channel level, whatever the channel's settings say. Same rule as
             # the channel-dispatch path: a row's EXPLICIT True/False wins, None/absent falls

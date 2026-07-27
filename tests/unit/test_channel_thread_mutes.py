@@ -42,12 +42,12 @@ def temp_db():
 class TestAtomicSetter:
     def test_partial_update_preserves_untouched_fields(self, temp_db):
         temp_db.set_channel_settings("C1", response_mode="auto_respond",
-                                     directives="rule A", participation_level="active")
-        temp_db.set_channel_settings("C1", directives="rule B")  # only directives
+                                     verbosity="low", participation_level="active")
+        temp_db.set_channel_settings("C1", verbosity="high")  # only verbosity
         row = temp_db.get_channel_settings("C1")
         assert row["response_mode"] == "auto_respond"
         assert row["participation_level"] == "active"
-        assert row["directives"] == "rule B"
+        assert row["verbosity"] == "high"
 
     def test_non_structural_write_does_not_bump_authorship(self, temp_db):
         temp_db.set_channel_settings("C1", response_mode="auto_respond", updated_by="alice")
@@ -66,18 +66,18 @@ class TestAtomicSetter:
         temp_db.set_channel_settings("C1", response_mode="auto_respond", updated_by="alice")
         temp_db.conn.execute(
             "UPDATE channel_settings SET updated_ts = '2000-01-01 00:00:00' WHERE channel_id = 'C1'")
-        temp_db.set_channel_settings("C1", directives="new rule", updated_by="bob")
+        temp_db.set_channel_settings("C1", verbosity="high", updated_by="bob")
         row = temp_db.get_channel_settings("C1")
         assert row["updated_by"] == "bob"
         assert row["updated_ts"] != "2000-01-01 00:00:00"
 
     async def test_async_setter_matches_sync(self, temp_db):
-        await temp_db.set_channel_settings_async("C1", response_mode="off", directives="quiet",
+        await temp_db.set_channel_settings_async("C1", response_mode="off", verbosity="low",
                                                  updated_by="alice")
-        await temp_db.set_channel_settings_async("C1", directives="quieter")
+        await temp_db.set_channel_settings_async("C1", verbosity="high")
         row = await temp_db.get_channel_settings_async("C1")
         assert row["response_mode"] == "off"
-        assert row["directives"] == "quieter"
+        assert row["verbosity"] == "high"
         assert row["updated_by"] == "alice"
 
     def test_no_fields_is_noop(self, temp_db):
@@ -128,7 +128,7 @@ class TestNullInheritance:
     def test_unset_reply_in_channel_is_none_not_false(self, temp_db):
         # A partial insert that never mentions reply_in_channel must leave it NULL (inherit),
         # not materialize an explicit False that would override the global default.
-        temp_db.set_channel_settings("C1", directives="x")
+        temp_db.set_channel_settings("C1", verbosity="low")
         row = temp_db.get_channel_settings("C1")
         assert row["reply_in_channel"] is None
         assert row["response_mode"] is None          # inherit, not 'tag_only'
@@ -144,7 +144,7 @@ class TestNullInheritance:
 
     def test_resolve_participation_level_with_nulls(self, temp_db, monkeypatch):
         monkeypatch.setattr(config, "channel_response_mode", "auto_respond", raising=False)
-        temp_db.set_channel_settings("C1", directives="x")  # response_mode + level both NULL
+        temp_db.set_channel_settings("C1", verbosity="low")  # response_mode + level both NULL
         cs = temp_db.get_channel_settings("C1")
         # NULL participation_level + NULL response_mode → falls back to the global default mode.
         assert resolve_participation_level(cs) == "judicious"
@@ -164,7 +164,7 @@ class TestBuilderNoOp:
         assert _build_channel_settings_write("C1", updated_by="x") is None
 
     def test_builder_pins_inheritance_cols_null_on_partial_insert(self):
-        sql, params = _build_channel_settings_write("C1", directives="x", updated_by="u")
+        sql, params = _build_channel_settings_write("C1", verbosity="low", updated_by="u")
         # response_mode + reply_in_channel are explicitly present (pinned NULL), so a fresh insert
         # cannot pick up the table's 'tag_only'/0 defaults.
         assert "response_mode" in sql and "reply_in_channel" in sql

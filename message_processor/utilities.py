@@ -1211,24 +1211,6 @@ class MessageUtilitiesMixin:
             bot_user_id=getattr(client, "bot_user_id", None),
         )
 
-    async def _build_channel_memory_text(self, channel_id: Optional[str]) -> Optional[str]:
-        """Build the CHANNEL MEMORY block from stored durable facts for this channel (Phase 9).
-        Returns None when disabled, no db, or no rows — so the system prompt is unchanged."""
-        if not config.enable_channel_memory or not channel_id:
-            return None
-        db = getattr(self, "db", None)
-        if not db:
-            return None
-        try:
-            rows = await db.get_channel_memory_async(channel_id)
-        except Exception:
-            return None
-        if not rows:
-            return None
-        # [#id] prefixes let the model target update_fact/forget_fact; sorted by id
-        # (not updated_ts) so the rendering is deterministic for prompt-cache hygiene.
-        return "\n".join(f"- [#{r['id']}] {r['content']}" for r in sorted(rows, key=lambda r: r["id"]))
-
     async def _build_channel_info(self, client, channel_id: Optional[str]) -> Optional[dict]:
         """Fetch this channel's name/topic/purpose (and its canvases) via cached lookups.
         Returns None for DMs, non-Slack clients, or on any failure — prompt unchanged."""
@@ -1271,8 +1253,7 @@ class MessageUtilitiesMixin:
                           web_search_enabled: bool = True, has_trimmed_messages: bool = False,
                           custom_instructions: Optional[str] = None,
                           participant_roster: Optional[str] = None,
-                          channel_directives: Optional[str] = None,
-                          channel_memory: Optional[str] = None,
+                          channel_steering: Optional[str] = None,
                           channel_info: Optional[dict] = None,
                           code_interpreter_enabled: Optional[bool] = None) -> str:
         """Get the appropriate system prompt based on the client platform with user's timezone, name, email, model, web search capability, trimming status, and custom instructions"""
@@ -1406,15 +1387,15 @@ class MessageUtilitiesMixin:
                     + "\n".join(f"- {t}" for t in channel_info["canvases"]))
             channel_info_context = "\n\n--- CHANNEL CONTEXT ---\n" + "\n".join(info_lines) + "\n--- END CHANNEL CONTEXT ---"
 
-        # Phase 7: per-channel ground rules set by an operator (applied when present)
-        channel_directives_context = ""
-        if channel_directives:
-            channel_directives_context = f"\n\n--- CHANNEL GROUND RULES ---\nAn operator has set ground rules for how you should behave in this channel. Follow them:\n\n{channel_directives}\n\n--- END CHANNEL GROUND RULES ---"
-
-        # Phase 9: durable per-channel memory (facts the bot noted in earlier conversations)
-        channel_memory_context = ""
-        if channel_memory:
-            channel_memory_context = f"\n\n--- CHANNEL MEMORY ---\nDurable facts you've noted for this channel in earlier conversations. Use them as background when relevant; do not recite them unprompted:\n\n{channel_memory}\n\n--- END CHANNEL MEMORY ---"
+        # The channel's steering: its standing policy, the gate's recorded preferences, and the
+        # durable facts noted here — ONE block, rendered once for this whole turn and inserted
+        # VERBATIM. The participation gate that judged this message (when there was one) carried
+        # the identical string; that byte-for-byte identity is the invariant, so nothing here may
+        # re-render, reorder or supplement the block. The block labels its own sections, which is
+        # why this framing says nothing about which parts are instructions.
+        channel_steering_context = ""
+        if channel_steering:
+            channel_steering_context = f"\n\n--- CHANNEL STEERING ---\nWhat this channel has established, as recorded. Follow the parts labelled as instructions; treat the parts labelled as background as context you may use when relevant, and do not recite any of it unprompted:\n\n{channel_steering}\n\n--- END CHANNEL STEERING ---"
 
         # Phase A: local tool etiquette (static text — safe for prompt caching) when the
         # client exposes function tools through the loop
@@ -1445,10 +1426,10 @@ class MessageUtilitiesMixin:
         # so anything volatile here busts the OpenAI prefix cache for the whole thread.
         # Only the DATE lives here (one bust per day). The minute-precision time is
         # injected at the message SUFFIX instead (see _build_time_suffix_context).
-        # channel_memory / roster / directives change rarely — acceptable in the prefix.
+        # channel steering / roster change rarely — acceptable in the prefix.
         time_context = f"\n\nToday's date: {current_time.strftime('%A, %B %d, %Y')} ({timezone_display})\nThe precise current time is provided at the end of the conversation."
 
-        return base_prompt + user_context + model_context + web_search_context + local_tools_context + code_interpreter_context + canvas_context + trimming_context + custom_instructions_context + channel_info_context + channel_directives_context + channel_memory_context + (participant_roster or "") + time_context
+        return base_prompt + user_context + model_context + web_search_context + local_tools_context + code_interpreter_context + canvas_context + trimming_context + custom_instructions_context + channel_info_context + channel_steering_context + (participant_roster or "") + time_context
 
     def _build_time_suffix_context(self, user_timezone: str = "UTC",
                                    user_tz_label: Optional[str] = None) -> str:
