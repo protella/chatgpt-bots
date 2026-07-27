@@ -1609,7 +1609,7 @@ lookup_user by NAME ok (Pacific Daylight Time), threaded native-streamed reply, 
 
 1. `make test` green after each change set (F4 → F1 → F2 → F3); `make lint` clean.
 2. Four independently reviewable change sets; commits/releases only on user request.
-3. Live dev-bot pass in #chatgpt-bot-test (C04QDHE8W8M, authorized): generate an image
+3. Live dev-bot pass in #chatgpt-bot-test (C0BKX77NU66, authorized): generate an image
    and chat mid-generation (F1+F4 visible); unprompted message the bot should skip (F2
    logs a no_reply reason); @-mention vs ambient wake visible in request logs (F3).
 
