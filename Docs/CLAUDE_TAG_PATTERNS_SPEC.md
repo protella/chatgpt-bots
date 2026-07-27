@@ -321,13 +321,16 @@ Registered in `SlackBot._build_tool_registry` (`slack_client/base.py:76-93`):
 {
   "type": "function",
   "name": "no_response_needed",
-  "description": "End this turn without posting anything. Call this when, after seeing the full conversation, you have nothing useful to add — the message wasn't really for you, someone else already answered, or silence is the socially right move. You may add an emoji reaction (react_to_message) in the same round; call this instead of replying, never after writing a reply.",
+  "description": "End this turn without posting a normal text reply in the current conversation. This is TERMINAL: it ends the turn, so call it instead of replying, never after writing one. It does not cancel other tools you call in the same round — a reaction, a memory write or another surface still happens; it only means you add no words here. Never use it to wait for work you dispatched yourself: finish that work and report it.",
   "parameters": {
     "type": "object",
     "properties": {
-      "reason": {"type": "string", "description": "One short sentence: why silence is right."}
+      "reason": {"type": "string", "enum": ["addressed_to_other", "reacted_instead",
+        "nothing_to_add", "not_relevant", "duplicate", "user_requested_silence",
+        "awaiting_context", "other"], "description": "see message_processor/terminal_actions.py"}
     },
-    "required": ["reason"]
+    "required": ["reason"],
+    "additionalProperties": false
   }
 }
 ```
@@ -336,10 +339,13 @@ Registered in `SlackBot._build_tool_registry` (`slack_client/base.py:76-93`):
 
 > **Names as of 2026-07-10; the mechanism is unchanged, the identifiers have moved.**
 > `message.metadata["participation_check"]` became four explicit routing facts
-> (`message_processor/routing_facts.py`): exposure now keys off **`silence_capable`**, the
-> F2-vs-F18 suffix off **`gate_required`**, and the copied-config flag is
-> **`_silence_capable_turn`**. Read the rest of this section for the WHY; read
-> `routing_facts.py` for the current contract.
+> (`message_processor/routing_facts.py`): exposure now keys off **`silence_capable`** and the
+> copied-config flag is **`_silence_capable_turn`**. WHICH contract paragraph is chosen keys
+> off **`routing_posture`**, not the gate — the two variants are now channel-activity and
+> thread-activity wording, because the paragraphs describe why the message is in front of the
+> model, and a thread has a rule a channel does not (the addressee can move to someone else and
+> stay there). Read the rest of this section for the WHY; read `routing_facts.py` and
+> `prompts.py` for the current contract.
 
 The system prompt stays byte-identical. Per-request exposure:
 - The text handler materializes the request's tool exposure **once, up front** (round-2
@@ -367,12 +373,17 @@ The system prompt stays byte-identical. Per-request exposure:
 ### Loop semantics
 In the tool loop (`openai_client/api/tool_loop.py`), `no_response_needed` is terminal:
 - Executor returns `{"ok": true}`; the loop stops — no feedback round.
-- In the same round, **only sibling `react_to_message` calls execute**; other side-effect
-  calls (memory writes etc.) are suppressed with a logged skip — `dispatch_all` runs
-  rounds concurrently today (`tool_registry.py:97-101`), so the loop filters the round's
-  call list *before* dispatch when it contains `no_response_needed` (Codex finding 17).
-- Handler surfaces `terminal_action="no_reply"` + reason in response metadata and
-  returns `Response(type="text", content="", metadata={..., "posted": False})`.
+- In the same round, **every sibling call executes** through the ordinary parallel dispatch,
+  and silence is honored once they finish, whatever they returned. There is no allowlist: the
+  tool ends the turn's WORDS, not its effects, and a memory write or a cross-thread post the
+  model chose is its decision to make. (This originally suppressed everything but
+  `react_to_message`, which read the tool as "abort the turn" and silently discarded work the
+  model had already decided on.)
+- A `reason` outside the enum is a REJECTED call, never coerced to `other`: the siblings still
+  run, the model is told the vocabulary, and it gets another round.
+- Handler surfaces `terminal_action="no_reply"` + `silence_reason` in response metadata and
+  returns `Response(type="text", content="", metadata={..., "posted": False})`, carrying the
+  turn's artifacts / sandbox assets / background-job facts so delivery still happens.
 
 ### ~~Buffered output on unprompted turns~~ SUPERSEDED 2026-07-10 (user decision)
 The route-to-non-streaming design below shipped in 3f7a4ff but was reverted by user
@@ -424,15 +435,16 @@ This also fixes the pre-existing streamed-reaction-only quota burn.
 **Config:** `ENABLE_NO_REPLY_TOOL` (default `true`). Off → tool hidden, suffix paragraph
 absent, behavior as today (minus the accounting fix, which is unconditional).
 
-**Tests** (`tests/unit/test_no_reply_tool.py`): tool exposed only on unprompted turns
-(copied config, shared dict unmutated); no_response_needed ends loop, nothing posted,
-reason logged; react+no_reply combo executes the react and suppresses other siblings;
-buffered unprompted turn posts once/complete on reply outcome and nothing on no_reply
-(native, legacy-streamed, and non-streaming variants); partial text never posts;
-timeout-retry attempt hides tool AND paragraph; hourly quota unchanged on no_reply and
-on reaction-only streamed turns; cleanup: placeholder deleted, status cleared, no
-footer, no empty assistant turn, no memory extraction; reason length/sanitization;
-config off hides everything; prompted turns see neither tool nor paragraph.
+**Tests** (`tests/unit/test_no_reply_tool.py`, plus `test_terminal_actions.py` for the enum
+and sibling contract): tool exposed only on silence-capable routes (copied config, shared dict
+unmutated); no_response_needed ends the turn's words, nothing posted, reason recorded;
+no_reply + siblings runs EVERY sibling and still honors the silence; buffered turn posts
+once/complete on a reply outcome and nothing on no_reply (native, legacy-streamed, and
+non-streaming variants); partial text never posts; timeout-retry attempt hides tool AND
+paragraph; cleanup: placeholder deleted, status cleared, no footer, no empty assistant turn,
+no memory extraction; an unrecognized reason is rejected (never coerced to `other`) and the
+model gets another round; config off hides everything; addressed turns see neither tool nor
+paragraph.
 
 ---
 
@@ -630,8 +642,9 @@ anyway.
    flat never-twice rule; "Most messages deserve NO reaction" stays). Tool description
    gains "call once per emoji when asked for multiple."
 4. Allowlist unchanged (REACTION_EMOJIS env already user-expandable).
-5. F2 interaction: in a `no_response_needed` round, ALL react siblings execute (up to
-   the cap); non-react siblings stay suppressed.
+5. F2 interaction: in a `no_response_needed` round, ALL siblings execute (up to the cap) —
+   react and everything else. The tool ends the turn's WORDS, not its effects; see the
+   "Loop semantics" section above, which supersedes the react-only rule this line described.
 
 **Round-2 review fixes (required):**
 a. **Pending vs committed reservations.** A plain emoji set lets call B see call A's

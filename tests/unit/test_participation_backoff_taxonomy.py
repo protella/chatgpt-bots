@@ -245,28 +245,20 @@ async def test_structural_request_falls_through_without_writes():
 
 
 @pytest.mark.asyncio
-async def test_structural_request_stamps_gate_authorized_flag():
-    # BLOCKER #3: routing a structural request into the response loop STAMPS the turn
-    # (gate_authorized_structural) so the gated set_channel_participation tool is authorized there
-    # — even with no literal <@bot> mention ("only reply when I tag you" carries none). The
-    # classifier's semantic judgment, not the raw name regex, is what authorizes.
+async def test_structural_request_falls_through_and_stamps_nothing():
+    """Routing a structural request into the response loop writes NOTHING on the message.
+
+    It used to stamp an authorization flag, because authorization needed the classifier's
+    semantic judgment that this message was "a settings request". It no longer does: a human on
+    a turn that reached the responder may adjust the settings, and the gate's opinion about what
+    the message was ABOUT is not a permission. Fall-through behavior itself is unchanged."""
     app, client, db = _app()
     msg = _msg()
+    before = dict(msg.metadata)
     v = _verdict(durability="standing", scope="channel", structural_request="placement")
     assert (await app._apply_backoff(msg, client, v))[0] is True
-    assert msg.metadata.get("gate_authorized_structural") is True
-
-
-@pytest.mark.asyncio
-async def test_non_structural_backoff_does_not_stamp_gate_flag(monkeypatch):
-    # A non-structural backoff (a soft per-channel preference) is NOT a settings request and must
-    # NOT stamp the authorization flag — otherwise "you're a bit chatty" would authorize the tool.
-    monkeypatch.setattr(config, "enable_channel_memory", True, raising=False)
-    app, client, db = _app()
-    msg = _msg()
-    v = _verdict(dimension="reactions", durability="standing", scope="channel", memory_op="add")
-    await app._apply_backoff(msg, client, v)
-    assert msg.metadata.get("gate_authorized_structural") is not True
+    assert msg.metadata == before      # the gate authorizes nothing here
+    db.set_channel_settings_async.assert_not_awaited()
 
 
 # ----------------------------------------------------------------- conditional ack

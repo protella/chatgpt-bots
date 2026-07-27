@@ -1788,6 +1788,17 @@ class SlackMessagingMixin:
             return {"ok": False, "error": "no_target", "message": "No message to react to."}
         result = await self._reserve_and_react(channel_id, ts, emoji)
         ok = bool(isinstance(result, dict) and result.get("ok") is True)
+        # The turn now carries the fact, recorded where the emoji actually landed. Every path
+        # that ends a turn reads it from here — a reaction-only turn, a reply that also reacted,
+        # and a turn that ended in silence are all the same question ("is one of our emoji on
+        # this message?"), and answering it per-branch is how three of the four branches came to
+        # answer it wrong.
+        turn = getattr(ctx, "turn", None)
+        if ok and turn is not None:
+            try:
+                turn.reaction_committed = True
+            except Exception as e:  # noqa: BLE001 — bookkeeping never fails a placed reaction
+                self.log_debug(f"react tool: could not mark the turn's reaction: {e}")
         # `idempotent` means the emoji was already on the message — the reservation layer reports
         # ok either way, and counting that as a placement would credit us with somebody else's
         # reaction (see the ownership note above _reserve_and_react_owned).
@@ -2198,27 +2209,47 @@ class SlackMessagingMixin:
             return {"ok": False, "error": "post_failed", "message": "Could not post to that thread."}
         if not posted_ts:
             return {"ok": False, "error": "post_failed", "message": "Could not post to that thread."}
+        # Words went into the workspace, just not into this thread. The turn may still end with
+        # no_response_needed — that is now a legitimate pairing ("I answered over there") — and
+        # without this the ledger would file a turn that visibly posted as a silence.
+        turn = getattr(ctx, "turn", None)
+        if turn is not None:
+            try:
+                turn.visible_action_committed = True
+            except Exception as e:  # noqa: BLE001 — bookkeeping must never fail a delivered post
+                self.log_debug(f"post_to_thread: could not mark visible action: {e}")
         return {"ok": True, "thread_ts": target, "posted_ts": posted_ts}
 
     def get_no_reply_tool_schema(self) -> dict:
-        """Function-tool schema for the F2 terminal no-reply action (unprompted turns only)."""
+        """Function-tool schema for the F2 terminal no-reply action (silence-capable turns only).
+
+        The reason is a CLOSED enum (message_processor.terminal_actions), not prose: it is the
+        one column that says why this bot stays quiet, and free text cannot be counted. An
+        unrecognized value is a rejected call, never a silent rewrite to `other`."""
+        from message_processor.terminal_actions import (SILENCE_REASONS,
+                                                        render_reason_guide)
         return {
             "type": "function",
             "name": "no_response_needed",
             "description": (
-                "End this turn without posting anything. Call this when, after seeing the "
-                "full conversation, you have nothing useful to add — the message wasn't "
-                "really for you, someone else already answered, or silence is the socially "
-                "right move. You may add an emoji reaction (react_to_message) in the same "
-                "round; call this instead of replying, never after writing a reply."
+                "End this turn without posting a normal text reply in the current "
+                "conversation. This is TERMINAL: it ends the turn, so call it instead of "
+                "replying, never after writing one. It does not cancel other tools you call "
+                "in the same round — a reaction, a memory write or another surface still "
+                "happens; it only means you add no words here. Never use it to wait for work "
+                "you dispatched yourself: finish that work and report it."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "reason": {"type": "string",
-                               "description": "One short sentence: why silence is right."},
+                    "reason": {
+                        "type": "string",
+                        "enum": list(SILENCE_REASONS),
+                        "description": render_reason_guide(),
+                    },
                 },
                 "required": ["reason"],
+                "additionalProperties": False,
             },
         }
 

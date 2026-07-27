@@ -117,14 +117,14 @@ async def execute_set_channel_participation(ctx: ToolContext, args: Dict[str, An
     if ctx.db is None:
         return {"ok": False, "error": "settings_unavailable",
                 "message": "Settings storage is not available."}
-    # BLOCKER #3: a structural change may fire ONLY when a HUMAN directly addressed the bot for it
-    # — a real <@bot> mention, or a current message the participation classifier judged an explicit
-    # structural request (handlers.text computes `structural_change_authorized` from those signals;
-    # a bare name-drop or a bot sender no longer qualifies). The description already binds the model
-    # to explicit intent, but that is advisory; this is the hard, in-code gate. An unaddressed
-    # channel turn — the injection / hallucination / "being talked about ≠ talked to" vector — is
-    # refused here even if the model emits the call, so quoted or third-party text can never flip
-    # settings.
+    # A structural change may fire ONLY when a HUMAN wrote the message and this turn genuinely
+    # reached the responder (handlers.text computes `structural_change_authorized` from
+    # sender_type + the gate_required/gate_woke routing facts; a bot sender or an unclassified
+    # one never qualifies, and a message that needed the gate and never woke it is refused).
+    # The description already binds the model to an explicit instruction in the current human
+    # message, but that is advisory; this is the hard, in-code gate — the injection /
+    # hallucination / "being talked about ≠ talked to" vector is refused here even if the model
+    # emits the call, so quoted or third-party text can never flip settings.
     if not getattr(ctx, "structural_change_authorized", False):
         return {"ok": False, "error": "not_addressed",
                 "message": ("Channel participation can only be changed when someone directly "

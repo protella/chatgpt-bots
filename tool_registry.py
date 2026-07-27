@@ -88,15 +88,14 @@ class ToolContext:
     # publisher can refuse to post a user's own file back at them, even byte-copied.
     thread_files: Optional[List[Dict[str, Any]]] = None
     mounted_files: Optional[List[Dict[str, Any]]] = None
-    # Participation redesign (BLOCKER #3): True only when a HUMAN directly addressed the bot for a
-    # structural change — a real <@bot> mention, OR a current message the participation classifier
-    # judged an explicit structural request (handlers.text `_structural_change_authorized`, from
-    # message.metadata sender_type/mentioned_self/gate_authorized_structural — NOT the loose
-    # name-hit regex). It gates the structural set_channel_participation tool; the canvas-delete
-    # tool has its own parallel strict signal, `_canvas_delete_authorized`. Left False
-    # (fail-closed), so an unaddressed channel turn, a quoted/ambient name-drop,
-    # or a non-human sender — the injection / hallucination / "being talked about ≠ talked to"
-    # vector — can never flip channel settings even if the model emits the call.
+    # Participation redesign: True only when a HUMAN authored the message AND this turn genuinely
+    # reached the responder (handlers.text `_structural_change_authorized`, from the routing facts
+    # sender_type / gate_required / gate_woke — never the loose name-hit regex). It gates the
+    # structural set_channel_participation tool; the canvas-delete tool has its own parallel,
+    # stricter signal, `_canvas_delete_authorized`. Left False (fail-closed), so a non-human
+    # sender, an unclassified sender, or a message that needed the gate and never woke it — the
+    # injection / hallucination / "being talked about ≠ talked to" vector — can never flip
+    # channel settings even if the model emits the call.
     structural_change_authorized: bool = False
     # F38: the turn's presentation + work-claim state (message_processor.turn_runtime).
     # A slow local tool calls `await ctx.turn.claim_work(ctx.client, ctx.message)` once its

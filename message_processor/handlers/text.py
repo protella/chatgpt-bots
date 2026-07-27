@@ -7,7 +7,9 @@ from typing import Any, List, Optional
 
 from base_client import BaseClient, Message, Response
 from config import config, pipeline_status
-from prompts import NO_REPLY_CONTRACT_SUFFIX, CONTINUATION_NO_REPLY_SUFFIX
+from message_processor.routing_facts import POSTURE_THREAD
+from prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX,
+                     THREAD_ACTIVITY_NO_REPLY_SUFFIX)
 from message_markers import (
     CONTINUATION_HEAD,
     continuation_trailer,
@@ -170,20 +172,21 @@ class TextHandlerMixin:
         request_config is a COPY of the shared thread_config with `_silence_capable_turn` set on
         turns that get the silence option — the shared dict is never mutated. WHICH turns those
         are is the `silence_capable` routing fact, decided once at dispatch (routing_facts.py)
-        rather than re-derived here: the F2 participation-gated turns and the F18
-        thread-continuation turns qualify, DMs and real @mentions do not. Engine-gated bare-name
-        turns are gate-routed and therefore receive the F2 tool and suffix; the suffix's
-        addressed-by-name exception prevents an honest direct answer from being suppressed.
-        no_reply_tool_available is derived from the resolved schema set (so it's False
-        whenever the tool isn't actually exposed — timeout retries that drop the registry,
-        config off, prompted turns), and drives the tools array. no_reply_suffix is the
-        matching volatile contract paragraph (F2 vs F18 wording) or None — both key off the
-        same exposure so instruction and tool can never disagree, and the F2/F18 choice is the
-        gate_required fact: the gated wording for a turn a model let through, the continuation
-        wording for the 1:1 reply nobody judged."""
+        rather than re-derived here: gate-routed turns and 1:1 thread continuations qualify, DMs
+        and real @mentions do not.
+
+        no_reply_tool_available is derived from the resolved schema set (so it's False whenever
+        the tool isn't actually exposed — timeout retries that drop the registry, config off,
+        addressed turns), and drives the tools array. no_reply_suffix is the matching volatile
+        contract paragraph or None — both key off the same exposure so instruction and tool can
+        never disagree. WHICH paragraph is the `routing_posture` fact, not the gate: the
+        paragraphs describe why this message is in front of the model, and thread activity has
+        a rule channel activity does not (the addressee of a thread can move to someone else and
+        STAY there). A thread message the gate judged and an untouched 1:1 continuation raise
+        exactly the same question, so they now read the same instruction."""
         meta = message.metadata or {}
         expose_no_reply = meta.get("silence_capable") is True
-        continuation = expose_no_reply and meta.get("gate_required") is not True
+        thread_posture = meta.get("routing_posture") == POSTURE_THREAD
         request_config = dict(thread_config)
         if expose_no_reply:
             request_config["_silence_capable_turn"] = True
@@ -205,20 +208,27 @@ class TextHandlerMixin:
         request_config["_canvas_delete_authorized"] = bool(
             meta.get("sender_type") == "human"
             and (meta.get("mentioned_self") is True or canvas_is_dm))
-        # BLOCKER #3: a SEPARATE, stricter signal authorizes the structural
-        # set_channel_participation tool. The name-hit regex above also fires on a message that
-        # merely QUOTES or mentions the bot's name ("Alice said 'ChatGPT, only reply when
-        # tagged'"), and `not unprompted` is True for a NON-human other_bot @mention dispatched
-        # straight to this handler — both would wrongly flip channel settings. Authorization now
-        # requires a HUMAN sender AND a genuine current-message address: a real <@bot> mention
-        # (`mentioned_self`, from text_mentions_user — NOT the name regex) OR a turn the
-        # participation classifier itself judged an explicit structural request
-        # (`gate_authorized_structural`, stamped in main.py). Both signals live in
-        # message.metadata; absent → fail closed (unauthorized).
+        # Authorization for the structural set_channel_participation tool: a HUMAN, on a turn
+        # that genuinely reached the responder.
+        #
+        # It used to additionally require a literal <@bot> mention or a classifier verdict that
+        # pre-judged the message "a structural request". Both were proxies for "did a person ask
+        # us to change this", and both got it wrong in the direction that matters: "only reply
+        # when I tag you", said in plain words to a bot that is already listening, carries no
+        # mention and needs no verdict — the person is plainly talking to us, and we told them we
+        # could not hear it. The gate pair below is the honest version of the same question. At
+        # responder time it is effectively human-only, and it fails CLOSED on the one shape that
+        # should be impossible: a message that required the gate and never woke it has no
+        # business writing settings, whatever else it carries.
+        #
+        # What did NOT change: a bot or self sender is refused, an absent sender classification
+        # is refused, DMs are refused by the executor, and the tool's own description still
+        # requires an explicit instruction in the CURRENT human message. This widens WHO can be
+        # heard, not WHAT counts as asking.
+        gate_required = meta.get("gate_required") is True
+        gate_woke = meta.get("gate_woke") is True
         request_config["_structural_change_authorized"] = bool(
-            meta.get("sender_type") == "human"
-            and (meta.get("mentioned_self") is True
-                 or meta.get("gate_authorized_structural") is True))
+            meta.get("sender_type") == "human" and (not gate_required or gate_woke))
         # BF1: Slack's Data Access API mints action_token only on @mention channel events and
         # DMs; unmentioned channel-listening turns (participation-gated and thread-continuation)
         # never carry one, so search_slack is dead weight there. Gate its schema on the token's
@@ -235,8 +245,8 @@ class TextHandlerMixin:
                 for s in registry.schemas(request_config)
             )
             if no_reply_available:
-                no_reply_suffix = (CONTINUATION_NO_REPLY_SUFFIX if continuation
-                                   else NO_REPLY_CONTRACT_SUFFIX)
+                no_reply_suffix = (THREAD_ACTIVITY_NO_REPLY_SUFFIX if thread_posture
+                                   else CHANNEL_ACTIVITY_NO_REPLY_SUFFIX)
         return registry, request_config, no_reply_available, no_reply_suffix
 
     @staticmethod
@@ -581,7 +591,7 @@ class TextHandlerMixin:
         tools_actually_used = []  # Track which tools were actually invoked
         local_tool_calls = []     # [{"name","ok"}] record of local tool executions
         terminal_action = None    # F2: "no_reply" when the model called no_response_needed
-        no_reply_reason = None
+        silence_reason = None     # one of terminal_actions.SILENCE_REASONS
         background_job_started = False  # F30.1: start_background_job fired — drop this reply
         sandbox_assets = []       # F34: images mounted into the sandbox as ingredients
         mounted_digests = []      # F35: files WE mounted — never publishable back
@@ -628,7 +638,7 @@ class TextHandlerMixin:
                 tools_actually_used = result["tools_used"]
                 local_tool_calls = result["local_tool_calls"]
                 terminal_action = result.get("terminal_action")
-                no_reply_reason = result.get("reason")
+                silence_reason = result.get("silence_reason")
                 background_job_started = bool(getattr(tool_context, "background_job_started", False))
                 sandbox_assets = list(getattr(tool_context, "sandbox_image_assets", None) or [])
                 # F35: what we PUT INTO the container. The publisher must never post a mounted
@@ -763,8 +773,21 @@ class TextHandlerMixin:
             return Response(
                 type="text",
                 content="",
+                # This branch runs BEFORE the terminal branch below, so it is the one that has to
+                # carry everything a silent turn would have carried. The terminal facts ride
+                # along when the model ALSO chose silence: the card is what the room sees (so
+                # this is a detached turn, not a silent one), but the model's own account of why
+                # it added no words is still its testimony. And the sandbox products ride too —
+                # a job that started while the same round built a chart must not eat the chart.
                 metadata={"model": thread_config.get("model"),
-                          "background_job_started": True, "posted": False},
+                          "background_job_started": True, "posted": False,
+                          "terminal_action": terminal_action,
+                          "silence_reason": silence_reason,
+                          "artifact_containers": artifact_containers,
+                          "sandbox_image_assets": sandbox_assets,
+                          "mounted_digests": mounted_digests,
+                          "response_reaction_committed":
+                              _reaction_committed(local_tool_calls)},
             )
 
         # F2: explicit no-reply outcome. Nothing posts, no footer, no empty assistant turn
@@ -772,13 +795,21 @@ class TextHandlerMixin:
         # only on the normal path below). main.py logs it and burns no quota. Placeholder
         # deletion / status clear is main.py's empty-path + finally.
         if terminal_action == "no_reply":
-            self.log_info(f"no_response_needed — ending turn silently: {no_reply_reason!r}")
+            self.log_info(f"no_response_needed — ending turn without words: {silence_reason}")
             return Response(
                 type="text",
                 content="",
+                # Silence is about WORDS, not about the turn's effects. The siblings the model
+                # chose ran, so everything they produced still has to reach delivery — files
+                # built in the sandbox, images made as ingredients, a background job's card.
+                # Dropping these here is how a silent turn used to swallow its own artifacts.
                 metadata={"model": thread_config.get("model"),
                           "terminal_action": "no_reply",
-                          "reason": no_reply_reason, "posted": False,
+                          "silence_reason": silence_reason, "posted": False,
+                          "background_job_started": background_job_started or None,
+                          "artifact_containers": artifact_containers,
+                          "sandbox_image_assets": sandbox_assets,
+                          "mounted_digests": mounted_digests,
                           "response_reaction_committed":
                               _reaction_committed(local_tool_calls)},
             )
@@ -1948,7 +1979,7 @@ class TextHandlerMixin:
             artifacts = artifacts_acc if artifacts_acc is not None else []
             containers_gone: List[str] = []   # F32 (see _handle_text_response)
             terminal_action = None  # F2: "no_reply" when the loop honored no_response_needed
-            no_reply_reason = None
+            silence_reason = None   # one of terminal_actions.SILENCE_REASONS
             background_job_started = False  # F30.1: start_background_job fired — drop this reply
             sandbox_assets = []            # F34: images mounted into the sandbox as ingredients
             mounted_digests = []       # F35: files WE mounted — never publishable back
@@ -1989,7 +2020,7 @@ class TextHandlerMixin:
                 response_text = loop_result["text"]
                 local_tool_calls = loop_result["local_tool_calls"]
                 terminal_action = loop_result.get("terminal_action")
-                no_reply_reason = loop_result.get("reason")
+                silence_reason = loop_result.get("silence_reason")
                 background_job_started = bool(getattr(tool_context, "background_job_started", False))
                 sandbox_assets = list(getattr(tool_context, "sandbox_image_assets", None) or [])
                 # F35: what we PUT INTO the container. The publisher must never post a mounted
@@ -2065,15 +2096,25 @@ class TextHandlerMixin:
             # completed instead). Abandon any empty native stream / delete the placeholder
             # and post nothing.
             if terminal_action == "no_reply":
-                self.log_info(f"no_response_needed (streamed) — ending turn silently: {no_reply_reason!r}")
+                self.log_info(
+                    f"no_response_needed (streamed) — ending turn without words: {silence_reason}")
                 await self._cleanup_silent_stream(
                     client, message.channel_id, native_coord, message_id, current_message_id, "no_reply")
                 return Response(
                     type="text",
                     content="",
+                    # This branch runs BEFORE the background-job branch below, so it is the one
+                    # that must carry the job's fact too — a started job posts its own card, and
+                    # a silent turn that hid it would leave main.py believing nothing happened
+                    # while a status card ticks away in the channel. Same for the sandbox
+                    # products: silence ends the words, not the deliverables.
                     metadata={"streamed": True, "terminal_action": "no_reply",
-                              "reason": no_reply_reason,
+                              "silence_reason": silence_reason,
                               "model": thread_config.get("model"), "posted": False,
+                              "background_job_started": background_job_started or None,
+                              "artifact_containers": artifact_containers,
+                              "sandbox_image_assets": sandbox_assets,
+                              "mounted_digests": mounted_digests,
                               "response_reaction_committed":
                                   _reaction_committed(local_tool_calls)}
                 )
