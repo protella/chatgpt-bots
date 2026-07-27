@@ -1,7 +1,7 @@
 """One source of truth for what the OpenAI API will accept as an image.
 
 Three lists used to disagree: `image_url_handler.SUPPORTED_IMAGE_MIMETYPES` (consulted only on
-the URL path), `gate_vision._SAFE_MIMETYPES` (narrower still), and — on the attachment path —
+the URL path), the wake gate's own narrower allowlist, and — on the attachment path —
 nothing at all. So an `image/heic` dragged into Slack was base64'd straight into the request and
 took the WHOLE turn down with a 400: the user's message just failed, with no notice explaining
 why. Anything that decides "can this picture ride an API call?" asks this module now.
@@ -33,7 +33,7 @@ from io import BytesIO
 from typing import Optional, Tuple
 
 # The mimetypes the API accepts, as DECLARED labels — for cheap pre-download screening only
-# (`gate_vision.eligible`, URL content-type checks). `image/jpg` is not a real mimetype, but
+# (URL content-type checks and the like). `image/jpg` is not a real mimetype, but
 # Slack and half the web send it anyway, so it earns its place as an alias here. Never treat
 # membership as proof of anything; only `validate_image_bytes` proves.
 API_IMAGE_MIMETYPES = {

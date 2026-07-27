@@ -22,7 +22,6 @@ class ThreadState:
     channel_id: str
     messages: List[Dict[str, Any]] = field(default_factory=list)
     config_overrides: Dict[str, Any] = field(default_factory=dict)
-    system_prompt: Optional[str] = None
     last_activity: float = field(default_factory=time.time)
     is_processing: bool = False
     had_timeout: bool = False  # Track if this thread had a timeout for user notification

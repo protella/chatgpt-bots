@@ -739,15 +739,38 @@ class TestQueueBatchAndCohortInterop:
         assert proc._merge_gate_cohort(msg, state) == 0
 
 
-def test_ambient_images_are_admitted_immediately():
+async def test_ambient_images_are_admitted_immediately():
     """The hold existed so ONE vision look served both the gate's verdict and the stored
     observation. The gate does not look at images now, so a hold would only delay analysis — and
-    worse, its resolver was the gate's own post-verdict callback, which no longer fires."""
+    worse, its resolver was the gate's own post-verdict callback, which no longer fires.
+
+    The always-False predicate that stood in for the hold is gone with it, so this now drives the
+    real ingest seam and asserts what it hands the service: the event, the facade, and no third
+    thing that could ask for a hold."""
     from slack_client.event_handlers.message_events import SlackMessageEventsMixin
 
+    class _Svc:
+        def __init__(self):
+            self.offers = []
+
+        def offer_event(self, event, client, **kw):
+            self.offers.append((event, client, kw))
+
+    svc = _Svc()
     mixin = SlackMessageEventsMixin.__new__(SlackMessageEventsMixin)
-    for event in ({}, {"channel": "C1", "files": [{"name": "x.png", "mimetype": "image/png"}]}):
-        assert mixin._gate_will_see_images(event) is False
+    mixin.processor = SimpleNamespace(ambient_service=svc)
+    mixin.is_own_message = lambda _m: False
+    mixin.log_debug = lambda *_a, **_k: None
+    assert not hasattr(SlackMessageEventsMixin, "_gate_will_see_images")
+
+    event = {"channel": "C1", "ts": "1.1", "subtype": "file_share",
+             "files": [{"id": "F1", "name": "x.png", "mimetype": "image/png"}]}
+    await mixin._ambient_ingest(event, MagicMock())
+
+    assert len(svc.offers) == 1
+    offered, client, kw = svc.offers[0]
+    assert offered is event and client is mixin      # the facade, never the raw Bolt client
+    assert kw == {}                                  # nothing asks for a hold
 
 
 def test_attachment_descriptors_are_names_and_types_only():

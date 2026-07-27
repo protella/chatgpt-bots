@@ -124,49 +124,6 @@ def resolve_participation_level(channel_settings: Optional[Dict[str, Any]]) -> s
     return MODE_TO_LEVEL.get(mode, "mentions_only")
 
 
-def render_capabilities_line(mcp_manager: Any = None) -> Optional[str]:
-    """Semicolon-joined inventory of the assistant's own tools/data sources.
-
-    NO RUNTIME CALLERS. It existed so the rich gate could weigh whether the assistant was
-    well-suited to answer an open question — an answerability judgment the binary gate does not
-    make, because it decides only whether the responder RUNS and the responder knows its own tools.
-    Kept for one release (it dies in the cleanup commit) so nothing else that might want an honest
-    capability inventory has to reinvent it.
-
-    Pure function of already-loaded config + mcp_manager.servers — zero I/O, deterministic per
-    process.
-
-    - "web search" when config.enable_web_search;
-    - "image generation and editing" (always true for this bot);
-    - "analyzing images and documents shared in chat" (F14b — vision/document flows
-      are core, so the classifier weighs "what do we think?" about an attached artifact);
-    - one entry per MCP server when config.mcp_enabled_default AND mcp_manager is
-      present AND has servers: each server's `server_description` (from
-      mcp_config.json) falling back to its label. Servers iterate in insertion
-      order (stable per process → cache-friendly).
-
-    Nothing is hardcoded for any specific server. Returns None when the list would
-    be empty (never happens in practice — image gen is unconditional — but guard)."""
-    caps: List[str] = []
-    if getattr(config, "enable_web_search", False):
-        caps.append("web search")
-    caps.append("image generation and editing")
-    caps.append("analyzing images and documents shared in chat")
-    if (getattr(config, "mcp_enabled_default", False)
-            and mcp_manager is not None):
-        try:
-            has_servers = mcp_manager.has_mcp_servers()
-        except Exception:
-            has_servers = False
-        if has_servers:
-            for label, server_config in mcp_manager.servers.items():
-                desc = (server_config or {}).get("server_description") or label
-                caps.append(str(desc))
-    if not caps:
-        return None
-    return "; ".join(caps)
-
-
 # How many distinct edit-supersession MARKS to remember. Marks are bookkeeping about messages
 # that have already been handled elsewhere, not enrolled messages, so bounding them can never
 # discard something waiting for a turn. (The cohort map below is deliberately NOT bounded — see

@@ -40,13 +40,6 @@ def valid_emoji_name(name: str) -> bool:
     return bool(name) and bool(_EMOJI_NAME_RE.match(name))
 
 
-# How much of a model-authored justification we keep when storing one. The binary gate authors no
-# prose at all — no reason, no guidance — so nothing on the gate path uses this today; it stays as
-# the ONE bound any future model-authored field must share, because a second number here would be
-# a second, quieter privacy policy.
-GUIDANCE_TRUNCATION_CHARS = 200
-
-
 def _resolve_repo_path(path: str) -> str:
     """Resolve a relative path against the repo root (this file's directory)."""
     if os.path.isabs(path):
@@ -208,31 +201,6 @@ class BotConfig:
     # scores worse than `low`, so do not raise this.
     participation_reasoning_effort: str = field(default_factory=lambda: os.getenv("PARTICIPATION_REASONING_EFFORT", "medium"))
 
-    # F40 — the wake gate SEES attached images (user report 2026-07-13: a meme captioned only
-    # ":dogkek:" earned a :joy: reaction the gate had inferred from the emoji in the caption,
-    # never having looked at the picture). All the context can live in the image, so the gate
-    # gets the pixels, not a filename. Deliberately NOT gated on "thin text": a long caption
-    # ("this is exactly what prod does every Friday") is just as meaningless without the image,
-    # and a text-only first pass would keep the reported bug — that pass answered confidently.
-    #
-    # Cost control is by CAPS, not by guessing: low detail, few images, hard byte ceiling.
-    # Raising reasoning effort would NOT buy visual resolution — that's what `detail` is for.
-    enable_multimodal_gate: bool = field(default_factory=lambda: os.getenv("ENABLE_MULTIMODAL_GATE", "true").lower() == "true")
-    gate_vision_max_images: int = field(default_factory=lambda: int(os.getenv("GATE_VISION_MAX_IMAGES", "2")))
-    gate_vision_max_bytes: int = field(default_factory=lambda: int(os.getenv("GATE_VISION_MAX_BYTES", str(5 * 1024 * 1024))))
-    # HIGH, not low — and this one is not just about the wake decision. The gate's verdict also
-    # carries `image_observations`, and THOSE become the image's stored description: the durable
-    # record every later turn reads and answers from. At `low` the API hands the model a 512px
-    # thumbnail; the gate transcribed a rollback token as `RB-7C10-Q9` when the pixels read
-    # `RB-7C10-QQ`, and the bot then repeated it as fact days later. A cheap wake decision is not
-    # worth a permanently wrong record of what was shared.
-    #
-    # HIGH rather than auto/original on purpose: `high` resizes under a finite limit, so a huge
-    # image has a bounded cost here. This is the highest-VOLUME vision call in the system (every
-    # channel image while listening is on) and it runs on the debounce hot path — it is the one
-    # place an uncapped `original` would hurt. Set GATE_VISION_DETAIL=low to trade transcription
-    # accuracy back for spend.
-    gate_vision_detail: str = field(default_factory=lambda: os.getenv("GATE_VISION_DETAIL", "high"))
 
     # F51 — Ambient memory. Images/links/files posted in a channel or thread are looked at,
     # summarized, and kept as derived artifacts in the running context even when the bot does
@@ -292,8 +260,9 @@ class BotConfig:
     # CAP large screenshots, not sharpen them. (This was set to "high" on the belief that `auto`
     # downsampled; it doesn't, on these models.)
     #
-    # The transcription bug that started all this was never on this path — it was the participation
-    # gate at its own explicit `low` (a 512px thumbnail). See gate_vision_detail above.
+    # The transcription bug that started all this was never on this path — it was the old
+    # participation gate looking at a 512px thumbnail of its own. That gate is gone: the binary
+    # wake gate never looks at an image at all, so this is now the only detail setting there is.
     #
     # Set this to `high` only as a deliberate cost cap on very large images.
     default_detail_level: str = field(default_factory=lambda: os.getenv("DEFAULT_DETAIL_LEVEL", "auto"))
@@ -498,23 +467,19 @@ class BotConfig:
     enable_reactions: bool = field(default_factory=lambda: os.getenv("ENABLE_REACTIONS", "true").lower() == "true")
     # F20: OPTIONAL reaction allowlist (names, no colons). Default EMPTY = unrestricted —
     # the bot may pick any standard Slack emoji (picking the right one is the judgment).
-    # When set via REACTION_EMOJIS, it is honored everywhere as an allowlist (tool-schema
-    # enum, executor, classifier verdict) for workspaces wanting brand control.
+    # When set via REACTION_EMOJIS, it is honored in both places a reaction can come from
+    # (the react tool's schema enum and its executor) for workspaces wanting brand control.
     reaction_emojis: list = field(default_factory=lambda: _env_list("REACTION_EMOJIS", []))
     # F6: max distinct emoji the bot may place on a single message. Guards against
     # over-reaction while still letting a user who asks for several get several.
     reaction_max_per_message: int = field(default_factory=lambda: int(os.getenv("REACTION_MAX_PER_MESSAGE", "4")))
     # C1/C6: workspace CUSTOM-emoji surfacing. The bot fetches emoji.list once at startup and
-    # refreshes lazily; the names become extra choices for the classifier and the react tool
-    # (only when REACTION_EMOJIS is empty — a set allowlist is the exact hard constraint and
-    # customs are never injected over it). No explicit off-switch: absent the emoji:read scope
-    # the fetch fails soft and the name set simply stays empty.
+    # refreshes lazily; the names are choices for the REACT TOOL — the answering model looks one
+    # up by name when it wants one (only when REACTION_EMOJIS is empty: a set allowlist is the
+    # exact hard constraint and customs are never injected over it). Nothing pre-selects a
+    # shortlist any more; that existed to paste names into the retired gate prompt. No explicit
+    # off-switch: absent the emoji:read scope the fetch fails soft and the name set stays empty.
     workspace_emoji_ttl_seconds: int = field(default_factory=lambda: int(os.getenv("WORKSPACE_EMOJI_TTL_SECONDS", "3600")))
-    # How often the observed emoji-usage tally is written to the DB (floor 30s). Absolute
-    # counts, so a missed flush costs only the reactions since the last one.
-    emoji_usage_flush_seconds: int = field(default_factory=lambda: int(os.getenv("EMOJI_USAGE_FLUSH_SECONDS", "300")))
-    # Deterministic sorted cap of custom names fed to the participation classifier as signals.
-    participation_custom_emoji_cap: int = field(default_factory=lambda: int(os.getenv("PARTICIPATION_CUSTOM_EMOJI_CAP", "32")))
     # Cap of custom names listed in the react_to_message tool-schema description (also budgeted
     # by a per-request char budget so surfacing customs never bloats every main-model request).
 
@@ -562,24 +527,19 @@ class BotConfig:
     channel_pulse_size: int = field(default_factory=lambda: int(os.getenv("CHANNEL_PULSE_SIZE", "60")))
     # Head-first char cap for the channel-activity envelope + thread labels (F14).
     pulse_text_truncate: int = field(default_factory=lambda: int(os.getenv("PULSE_TEXT_TRUNCATE", "500")))
-    # Tail-first char cap for the F5 per-thread participation-classifier context (F14).
-    pulse_tail_text_truncate: int = field(default_factory=lambda: int(os.getenv("PULSE_TAIL_TEXT_TRUNCATE", "500")))
     # Max "[Recent channel activity]" lines injected (at the SUFFIX — volatile, cache hygiene)
     # when responding in a channel. 0 disables the envelope without disabling the buffer.
     channel_pulse_envelope_max: int = field(default_factory=lambda: int(os.getenv("CHANNEL_PULSE_ENVELOPE_MAX", "15")))
-    # F5: per-thread tail ring for the participation classifier. The pulse keeps the last
-    # N messages of each active thread (their last N chars, sender-typed) so the wake
-    # judge can resolve who "you" addresses. 0 disables recording + the signal. F17: 15
-    # (busy threads out-chatter 6 lines — match the envelope).
+    # Per-thread actor ring. It was built so the old gate could read a rendered thread tail and
+    # work out who "you" addressed; the binary gate reads no tail and makes no such judgment. What
+    # the ring still does is STRUCTURAL and load-bearing: it is how `thread_has_other_bot` knows a
+    # second agent is in a thread, which is the one thing that can cancel the deterministic 1:1
+    # continuation fast path — the route that answers with no gate involved at all. It also backs
+    # per-message dedup and reaction state. 0 disables recording.
     participation_thread_tail: int = field(default_factory=lambda: int(os.getenv("PARTICIPATION_THREAD_TAIL", "15")))
-    # F47: a classifier-only "channel addressee tail" for TOP-LEVEL triggers, which have an
-    # empty thread tail and so no authoritative record of who was being addressed. Renders the
-    # last N channel-ring messages (top-level AND threaded), sender-typed, so the wake judge can
-    # resolve who a bare "you" continues an exchange with. 0 disables the signal.
-    participation_addressee_tail: int = field(default_factory=lambda: int(os.getenv("PARTICIPATION_ADDRESSEE_TAIL", "8")))
-    # Max distinct threads whose tails are retained per channel (whole-thread LRU eviction).
+    # Max distinct threads whose actor rings are retained per channel (whole-thread LRU eviction).
     pulse_thread_tails_max: int = field(default_factory=lambda: int(os.getenv("PULSE_THREAD_TAILS_MAX", "50")))
-    # Global bound on how many channels retain thread-tail rings (outer-map LRU).
+    # Global bound on how many channels retain thread actor rings (outer-map LRU).
     pulse_thread_tail_channels_max: int = field(default_factory=lambda: int(os.getenv("PULSE_THREAD_TAIL_CHANNELS_MAX", "30")))
 
     # --- Track 1: persistent per-channel "recent channel narrative" summary ---
@@ -664,18 +624,13 @@ class BotConfig:
     # tools or applies it with set_channel_participation under the commit-3 authorization gate —
     # judgment made by the model that can see the conversation, not by a classifier that saw one
     # message and wrote to the database on the strength of it.
-    # The backoff acknowledgement emoji. DEAD in this build: the gate placed it when it handled
-    # participation feedback itself, and it handles none. Kept for one release so a rollback finds
-    # its setting intact; it has no reader (see the cleanup commit).
-    snooze_ack_emoji: str = field(default_factory=lambda: os.getenv("SNOOZE_ACK_EMOJI", "zipper_mouth_face").strip().strip(":"))
-
-    # F19: "I'm looking at it" acknowledgment reaction. When a reply will take real work
-    # (attachments, data/MCP lookups, multi-step tools, long-form output), the fast models
-    # that already look at every message — the participation classifier (unprompted turns)
-    # and the intent classifier (addressed turns) — flag it, and the bot drops this emoji
-    # on the triggering message BEFORE the slow work, Claude-Tag style. No timers/thresholds;
-    # purely additive (never the turn's response, no accounting); routed through the F6
-    # reservation guard; stays after the reply; fails silent.
+    # F19: "I'm looking at it" acknowledgment reaction, staked by the WORK rather than predicted.
+    # It used to be flagged by whichever fast classifier had already read the message, which meant
+    # the emoji was a guess that a reply would be slow — and it acked passing comments. It is now a
+    # CLAIM ON WORK (TurnRuntime.claim_work): placed when a genuinely slow tool starts, and taken
+    # back when that work produces nothing. No timers/thresholds; purely additive (never the turn's
+    # response, no accounting); routed through the F6 reservation guard; stays after the reply;
+    # fails silent.
     enable_ack_reaction: bool = field(default_factory=lambda: os.getenv("ENABLE_ACK_REACTION", "true").lower() == "true")
     ack_reaction_emoji: str = field(default_factory=lambda: os.getenv("ACK_REACTION_EMOJI", "eyes").strip().strip(":"))
 
@@ -780,9 +735,11 @@ class BotConfig:
     # Prefix every message in model-visible thread context with a deterministic local
     # timestamp ("[Fri 2026-07-10 9:17 PM EDT]") rendered from the message's Slack ts in
     # the sender's profile timezone (UTC fallback), so the model can reason about time
-    # gaps between messages. Applied on warm append + rebuild (self turns on rebuild only)
-    # and to the participation classifier's thread-tail / channel-activity lines. Off →
-    # content is byte-identical to pre-F10 (helper returns "" at every guarded call site).
+    # gaps between messages. Applied on warm append + rebuild (self turns on rebuild only), and
+    # to each source message the wake gate is shown — the gate coalesces a burst and has no
+    # freshness window, so without the stamps it cannot tell one thought split across three
+    # seconds from a straggler that has sat for twenty minutes. Off → content is byte-identical
+    # to pre-F10 (helper returns "" at every guarded call site).
     enable_message_timestamps: bool = field(default_factory=lambda: os.getenv("ENABLE_MESSAGE_TIMESTAMPS", "true").lower() == "true")
 
     # --- Slack search tool (redesign Phase B) — assistant.search.context ---

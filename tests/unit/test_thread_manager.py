@@ -16,7 +16,6 @@ class TestThreadState:
         assert thread.channel_id == "C123"
         assert thread.messages == []
         assert thread.config_overrides == {}
-        assert thread.system_prompt is None
         assert thread.is_processing is False
         assert thread.had_timeout is False
     

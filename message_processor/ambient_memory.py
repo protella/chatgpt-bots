@@ -41,15 +41,6 @@ KIND_LINK = "link"
 KIND_FILE = "file"
 _KINDS = (KIND_LINK, KIND_IMAGE, KIND_FILE)
 
-# F51b — gate/ambient vision piggyback. When an ambient image rides a message that is about to go
-# through the participation WAKE GATE, the gate already downloads it and shows it to the utility
-# model. Rather than spend a SECOND vision call, that image's ambient vision job is HELD here and
-# resolved by the gate outcome: an observation stores it (gate provenance) and drops the held job;
-# no observation (blind gate, message not gated, superseded) admits the held job to the vision
-# worker as normal. The hold is BOUNDED — if the gate never reports back within this window, the
-# worker runs anyway, so a picture is never stranded unanalyzed.
-_GATE_HOLD_SECONDS = 45.0
-
 # Slack wraps URLs in mrkdwn as <url> or <url|label>. Also catch bare http(s) URLs.
 _SLACK_LINK_RE = re.compile(r"<(https?://[^>|]+)(?:\|[^>]*)?>")
 _BARE_URL_RE = re.compile(r"(?<![<\"'])\bhttps?://[^\s<>|)\]]+")
@@ -205,11 +196,6 @@ class AmbientArtifactService:
         self._queues: Dict[str, asyncio.Queue] = {}
         self._workers: List[asyncio.Task] = []
         self._inflight: set = set()
-        # F51b: image jobs HELD for the participation gate to resolve. Keyed by _Job.key()
-        # (channel_id, source_ts, kind, ref) -> {"job": _Job, "timer": Task}. A held key also sits
-        # in _inflight (singleflight), so a duplicate offer of the same upload — the parallel
-        # app_mention + message events — never double-holds or double-admits it.
-        self._deferred: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
         # Fire-and-forget persistence tasks (durable claims, overflow rows). TRACKED so shutdown
         # can drain them — an untracked create_task can be GC'd or lost on shutdown, dropping the
         # very honest omitted/queue_overload row it was supposed to persist.
@@ -278,56 +264,9 @@ class AmbientArtifactService:
     async def shutdown(self, *, timeout: float = 5.0) -> None:
         """Drain then cancel workers. MUST run before the OpenAI client closes (workers call it)."""
         self._closing = True
-        # F51b: a job HELD for the gate at shutdown has no durable row yet (nothing is persisted
-        # while held). Left as-is it vanishes with no record — recover_pending has nothing to find,
-        # so a picture held during the 45s window is permanently absent after restart. Persist a
-        # durable pending CLAIM for each held job BEFORE draining so recover_pending finds it after
-        # restart (links resume; image claims become honest failed/interrupted rows — a visible,
-        # recoverable state, never a silent drop). Pop the entry FIRST so a hold timer that fires
-        # during the claim's await sees an empty _deferred and returns without admitting; cancel the
-        # timer only AFTER the claim commits so the two paths can never both act on one key.
-        for key in list(self._deferred):
-            entry = self._deferred.pop(key, None)
-            if entry is None:
-                continue
-            job = entry.get("job")
-            if job is not None:
-                # F51e: a locked/slow DB (or many held jobs) must not blow past `timeout` — bound
-                # each persist to 2s; a timeout counts as a persist-failure. And `_persist_claim`
-                # returns False on any persistence error: honoring that bool is the whole point.
-                persisted = False
-                try:
-                    persisted = await asyncio.wait_for(self._persist_claim(job), timeout=2.0)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        f"ambient shutdown: claim persist timed out for "
-                        f"{job.channel_id}:{job.source_ts} ({job.kind} {job.ref})")
-                except Exception:  # noqa: BLE001 — shutdown must drain regardless
-                    pass
-                if not persisted:
-                    # No durable row committed. Hand the held job to its worker queue so the drain
-                    # below may still process it before workers are cancelled; log either way so a
-                    # loss is never silent.
-                    q = self._queues.get(job.kind)
-                    try:
-                        if q is not None:
-                            q.put_nowait(job)
-                            logger.warning(
-                                f"ambient shutdown: claim not durable for "
-                                f"{job.channel_id}:{job.source_ts} ({job.kind} {job.ref}); "
-                                f"enqueued for drain")
-                        else:
-                            logger.warning(
-                                f"ambient shutdown: claim not durable and no queue for "
-                                f"{job.channel_id}:{job.source_ts} ({job.kind} {job.ref}); LOST")
-                    except asyncio.QueueFull:
-                        logger.warning(
-                            f"ambient shutdown: claim not durable and queue full for "
-                            f"{job.channel_id}:{job.source_ts} ({job.kind} {job.ref}); LOST")
-            timer = entry.get("timer")
-            if timer is not None and not timer.done():
-                timer.cancel()
-            self._inflight.discard(key)
+        # Nothing is held back any more, so shutdown has only queued work to drain: every job on a
+        # queue already committed its durable claim in _admit_async, which is what recover_pending
+        # reads after a restart.
         if not self._workers and not self._bg_tasks:
             return
         try:
@@ -352,18 +291,16 @@ class AmbientArtifactService:
 
     # -- ingest --------------------------------------------------------------
 
-    def offer_event(self, event: Dict[str, Any], client: Any, *,
-                    defer_images: bool = False) -> None:
+    def offer_event(self, event: Dict[str, Any], client: Any) -> None:
         """Non-blocking: parse the event into jobs and admit them. Never awaits, never raises.
 
         Admission (per-channel opt-out check + durable claim + enqueue) runs OFF the wake path in
         a scheduled task — the wake path only reserves the singleflight slot and returns.
 
-        F51b: when `defer_images` is set (the ingest seam judged this message headed into the
-        participation gate), IMAGE jobs are HELD for the gate to resolve instead of admitted
-        straight to the vision worker — see `_defer_image` / `resolve_gate`. Links and files are
-        unaffected; a held image is never dropped (a bounded timer admits it if the gate is
-        silent)."""
+        Every kind — links, files, images alike — is admitted straight away. Images used to be held
+        back while the rich gate downloaded them for its verdict, so one look could serve both the
+        verdict and the stored description; the binary gate never looks at a picture, so there is no
+        second look to save and nothing that would ever release the hold."""
         try:
             if not self.config.enable_ambient_memory:
                 return
@@ -376,10 +313,7 @@ class AmbientArtifactService:
                     return
             jobs = self._jobs_from_event(event)
             for job in jobs:
-                if defer_images and job.kind == KIND_IMAGE:
-                    self._defer_image(job)
-                else:
-                    self._admit(job)
+                self._admit(job)
         except Exception as e:  # noqa: BLE001 — ingestion must never break the wake path
             logger.debug(f"ambient offer_event failed: {e}")
 
@@ -506,128 +440,16 @@ class AmbientArtifactService:
             logger.debug(f"ambient overflow persist failed: {e}")
 
     def _schedule(self, coro) -> None:
-        self._spawn(coro)
-
-    def _spawn(self, coro) -> Optional["asyncio.Task"]:
-        """Schedule a tracked background task, or None outside a running loop (sync/test context —
-        the coroutine is closed so it doesn't leak un-awaited). Returns the task so a caller that
-        must later cancel it (the gate-hold timer) can hold the handle."""
+        """Schedule a tracked background task; a no-op outside a running loop (sync/test context —
+        the coroutine is closed so it doesn't leak un-awaited)."""
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             coro.close()
-            return None
+            return
         task = asyncio.ensure_future(coro)
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
-        return task
-
-    # -- gate/ambient piggyback (F51b) ---------------------------------------
-
-    def _defer_image(self, job: _Job) -> None:
-        """Hold an ambient IMAGE job while its message goes through the participation gate.
-
-        Reserves the singleflight slot SYNCHRONOUSLY (like _admit) so a duplicate offer of the same
-        upload doesn't double-hold or double-admit, and starts a bounded timer that admits the job
-        if the gate never reports back. Nothing durable is persisted while held — a held-but-
-        unresolved job that a crash/shutdown loses was never accepted (the same honest boundary as
-        the pre-claim window); the gate resolves the common case in a few seconds."""
-        key = job.key()
-        if key in self._inflight or key in self._deferred:
-            return
-        self._inflight.add(key)
-        timer = self._spawn(self._gate_hold_timeout(key))
-        if timer is None:
-            # No running loop to hold or time out the job (sync/test context) — admit normally
-            # rather than strand it held forever.
-            self._inflight.discard(key)
-            self._admit(job)
-            return
-        self._deferred[key] = {"job": job, "timer": timer}
-
-    async def _gate_hold_timeout(self, key: Tuple[str, str, str, str]) -> None:
-        """The gate never reported back within the hold window → admit the held job so the vision
-        worker analyzes it as normal. Cancelled cleanly when resolve_gate gets there first."""
-        try:
-            await asyncio.sleep(_GATE_HOLD_SECONDS)
-        except asyncio.CancelledError:
-            return  # resolved/released before the window closed
-        entry = self._deferred.pop(key, None)
-        if entry is None:
-            return
-        self._inflight.discard(key)
-        self._admit(entry["job"])
-
-    def resolve_gate(self, channel_id: str, source_ts: str,
-                     observations: Dict[str, str]) -> None:
-        """The participation gate has classified `source_ts` — resolve its held image jobs.
-
-        For each IMAGE held for this message: a matching observation STORES it as the ambient
-        artifact (gate provenance, no second vision call) and drops the held job; no observation
-        ADMITS the held job to the vision worker so the image is still analyzed exactly once.
-        Non-blocking and never raises — the caller returns the verdict without waiting on this."""
-        try:
-            keys = [k for k in list(self._deferred)
-                    if k[0] == channel_id and k[1] == source_ts and k[2] == KIND_IMAGE]
-            for key in keys:
-                entry = self._deferred.pop(key, None)
-                if entry is None:
-                    continue
-                timer = entry.get("timer")
-                if timer is not None and not timer.done():
-                    timer.cancel()
-                job = entry["job"]
-                text = (observations or {}).get(job.ref)
-                if text and text.strip():
-                    # Keep the singleflight slot reserved across the async store (released in its
-                    # finally) so a late duplicate offer can't admit a second copy meanwhile.
-                    if self._spawn(self._store_gate_observation(job, text.strip())) is None:
-                        self._inflight.discard(key)  # no loop to run the store's finally
-                else:
-                    self._inflight.discard(key)
-                    self._admit(job)
-        except Exception as e:  # noqa: BLE001 — piggyback must never break the gate
-            logger.debug(f"resolve_gate failed: {e}")
-
-    async def _store_gate_observation(self, job: _Job, observation: str) -> None:
-        """Persist a gate-produced image observation as the ambient artifact — the SAME shape the
-        vision worker writes (ready row + image-ledger dual-write + pulse note), differing only in
-        `derivation_source='gate_vision'` and the model that produced it, and in that no second
-        vision call was spent. Obeys the per-channel opt-out exactly like the worker; a row another
-        writer already made `ready` (the worker won a race) is left untouched — the gate result is
-        simply discarded.
-
-        On ANY storage failure (e.g. a transient SQLite lock in the insert or in `_ready`) the held
-        image would otherwise be dropped entirely: resolve_gate already cancelled its hold timer, so
-        no worker job is queued. Instead the job is RELEASED to the ordinary vision-worker admission
-        path — the same release resolve_gate uses for a no-observation message — so the picture is
-        still analyzed exactly once. Re-admission is idempotent: if `_ready` had already committed
-        the ready row before failing, the worker sees `status == 'ready'` and skips a second call."""
-        key = job.key()
-        released = False
-        try:
-            if await self._channel_opted_out(job.channel_id):
-                return  # opted-out channel persists nothing (parity with the worker)
-            row = await self.db.insert_pending_ambient_artifact(
-                channel_id=job.channel_id, source_ts=job.source_ts,
-                conversation_ts=job.conversation_ts, kind=KIND_IMAGE, ref=job.ref,
-                content_type=job.mimetype, derivation_source="gate_vision",
-                expires_at=_expiry(int(self.config.ambient_artifact_retention_days)))
-            if row and row.get("status") == "ready":
-                return  # worker (or a prior store) already won — discard the gate result
-            await self._ready(job, KIND_IMAGE, title=job.filename, summary=observation,
-                              model=self.config.utility_model, derivation_source="gate_vision",
-                              content_type=job.mimetype)
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"gate observation store failed for {job.ref}: {e}")
-            # Release the held job to the normal worker path instead of dropping it. Discard the
-            # singleflight slot FIRST so _admit re-reserves cleanly (release once, no double-drop).
-            self._inflight.discard(key)
-            released = True
-            self._admit(job)
-        finally:
-            if not released:
-                self._inflight.discard(key)
 
     async def _persist_claim(self, job: _Job) -> bool:
         """Persist a pending row the moment a job is durably accepted onto a queue, so a crash

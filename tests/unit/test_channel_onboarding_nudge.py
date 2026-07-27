@@ -120,8 +120,9 @@ def _evt(**kw):
 
 
 @pytest.fixture(autouse=True)
-def _judicious(monkeypatch):
-    # Keep the app_mention path off the "off" rail (off drops @mentions outright).
+def _listening(monkeypatch):
+    # Keep the app_mention path off the "off" rail (off drops @mentions outright). Named for the
+    # level it actually sets: `auto_respond` resolves to `on` now, and `judicious` is not a level.
     monkeypatch.setattr(config, "channel_response_mode", "auto_respond", raising=False)
     monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
     monkeypatch.setattr(config, "enable_channel_listening", False, raising=False)

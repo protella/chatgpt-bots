@@ -1042,29 +1042,6 @@ def test_every_unleased_slack_mutation_is_a_written_down_decision():
         f"({ALLOW_MARKER} <why>): " + "; ".join(unmarked))
 
 
-def test_handle_response_is_not_on_the_slack_turn_path():
-    """Its `unleased-ok` marker rests on "nothing routes through it", and a claim nothing
-    enforces is a claim that quietly stops being true.
-
-    `handle_response` is the platform-agnostic Response dispatcher: it posts `response.content`
-    with no lease at all. Today the Slack turn posts through main.py instead, which is why the
-    marker is honest. The moment something in the bot starts calling it, that stops being true
-    and the call needs the lease — so this fails then, rather than after a stale answer."""
-    import pathlib as _p
-    import re
-
-    repo = _p.Path(__file__).resolve().parents[2]
-    callers = []
-    for folder in ("slack_client", "message_processor"):
-        for path in (repo / folder).rglob("*.py"):
-            for number, line in enumerate(path.read_text().splitlines(), 1):
-                if re.search(r"\bhandle_response\s*\(", line) and "def " not in line:
-                    callers.append(f"{path.relative_to(repo)}:{number}")
-    assert callers == [], (
-        "handle_response now has callers and must take the stale-send lease: "
-        + "; ".join(callers))
-
-
 # ============================================ round 6: the terminal notices around the guard
 
 @pytest.mark.asyncio

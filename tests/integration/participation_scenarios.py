@@ -1,19 +1,32 @@
-"""Scenario corpus for the participation gate — the decision that owns whether the bot speaks
-at all in a channel.
+"""ARCHIVAL. Scenario corpus for the RICH participation gate, which no longer exists.
 
-Pure data, no API calls, no pytest: importable by the live eval
-(`tests/integration/test_participation_gate_eval.py`) and by unit tests that only need the
-payloads. Names are workspace-realistic but the content is synthetic except where marked
-`real=True` — those are verbatim messages from the 2026-07-25 #tech-coding-with-ai incident, in
-which the bot answered a message aimed at the humans in the room, agreed with a correction of
-itself, and spoke again 52 seconds after being told to hush.
+NOTHING COLLECTS THIS FILE and nothing imports it. It is kept as data, not as a test.
 
-Each scenario carries `must_be`: the set of verdicts that are ACCEPTABLE, not a single expected
-label. Several of these are genuinely judgment calls where either silence or a reaction is fine,
-and pinning one label would measure conformity rather than correctness.
+What it was: the corpus a live evaluator replayed through `classify_participation`, scoring the
+returned respond / react / react_and_respond / ignore / backoff action against each scenario's
+`must_be` set. That evaluator (`participation_eval.py`) was deleted with the gate it graded.
 
-Roughly half the corpus is controls — messages the bot SHOULD answer. A change that wins by
-muting the gate has to show up as a loss here, not as a win.
+What replaced it: a one-bit wake gate. It answers "does the responder run", and every judgment the
+labels below encode — who a message is for, whether an answer is available, whether an emoji fits,
+where a reply lands — belongs to the responder now, which has the whole conversation rather than
+one moment of it.
+
+Why the wording below is NOT ported: mapping the old labels onto wake/no-wake is mechanical
+(anything that spoke or reacted → wake, `ignore` → no wake), but the result would grade the new
+gate against the old gate's standard, and that standard is exactly what the binary design changes.
+The gate is now deliberately GENEROUS — a false wake costs one utility call and can end in the
+responder's own declared silence, while a false sleep loses the answer entirely — so a number of
+scenarios whose `must_be` is `{"ignore"}` are legitimately wakes today. Re-baselining the corpus is
+a judgment call about the quality bar, not a rename, and doing it silently inside a cleanup commit
+would have buried that decision.
+
+Why it survives at all: the content is still good evidence. The entries marked `real=True` are
+verbatim messages from the 2026-07-25 #tech-coding-with-ai incident — the bot answered a message
+aimed at the humans in the room, agreed with a correction of itself, and spoke again 52 seconds
+after being told to hush. That incident is why the gate was rebuilt, and throwing away the record
+of it to tidy up a directory would cost more than the directory is worth.
+
+Read everything below as a description of the retired contract.
 """
 
 # --------------------------------------------------------------------------- tails
