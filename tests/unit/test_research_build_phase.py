@@ -183,6 +183,46 @@ class TestBuildPhase:
         assert captured["ctx"].thread_config["image_model"] == "gpt-image-1"
         assert captured["ctx"].container_id == "cntr_job1"
 
+    async def test_the_workers_own_account_of_the_build_comes_back(self, monkeypatch):
+        # In `build` mode there is no research report, so these notes are the ONLY narrative the
+        # delivering model gets. Dropped, it can name the files it is posting and nothing more —
+        # seen live as a job that ran a test and then declined to state the result.
+        processor = _processor()
+
+        async def fake_stream(_proc, **kw):
+            return {"text": "Mounted the marker; the token matched round 1.", "tools_used": []}
+
+        monkeypatch.setattr(rt, "_consume_research_stream", fake_stream)
+
+        build = await rt._run_build_phase(
+            processor=processor, client=MagicMock(), channel_id="C1", thread_root="1.0",
+            thread_key="C1:1.0", job_id="j", task="t", findings="f",
+            deliverables=[{"type": "txt", "description": "d", "filename": "d.txt"}],
+            snapshot=[], thread_config={}, system_prompt=None, model="gpt-5.6-sol",
+            card=_card())
+
+        assert build["notes"] == "Mounted the marker; the token matched round 1."
+
+    async def test_a_timed_out_build_still_reports_empty_notes_not_a_missing_key(self, monkeypatch):
+        # The timeout path never assigns the stream's return value. A missing key here would
+        # KeyError the delivery hand-off on exactly the job that already went wrong.
+        import asyncio
+        processor = _processor()
+
+        async def timing_out(_proc, **kw):
+            raise asyncio.TimeoutError()
+
+        monkeypatch.setattr(rt, "_consume_research_stream", timing_out)
+
+        build = await rt._run_build_phase(
+            processor=processor, client=MagicMock(), channel_id="C1", thread_root="1.0",
+            thread_key="C1:1.0", job_id="j", task="t", findings="f",
+            deliverables=[{"type": "pdf", "description": "d", "filename": "d.pdf"}],
+            snapshot=[], thread_config={}, system_prompt=None, model="gpt-5.6-sol",
+            card=_card())
+
+        assert build["notes"] == ""
+
 
 @pytest.mark.unit
 class TestResearchInstruction:

@@ -168,3 +168,93 @@ async def test_build_channel_info_client_without_support(message_processor):
 async def test_build_channel_info_swallows_errors(message_processor):
     client = SimpleNamespace(get_channel_context=AsyncMock(side_effect=RuntimeError("api down")))
     assert await message_processor._build_channel_info(client, "C1") is None
+
+
+# ---------------- the channel's own participation settings ----------------
+#
+# The model could always CHANGE these and never read them, so asked what its setting was it
+# answered from chat history — reporting a stale setting and inventing a bug to explain the
+# mismatch. These pin the read path.
+
+def _settings_client():
+    return SimpleNamespace(get_channel_context=AsyncMock(
+        return_value={"name": "eng-data", "topic": "", "purpose": ""}))
+
+
+@pytest.mark.asyncio
+async def test_build_channel_info_carries_the_effective_participation_setting(message_processor):
+    message_processor.db = SimpleNamespace(get_channel_settings_async=AsyncMock(
+        return_value={"participation_level": "mentions_only", "reply_in_channel": 0}))
+    info = await message_processor._build_channel_info(_settings_client(), "C1")
+    assert info["participation_level"] == "mentions_only"
+    assert info["reply_in_channel"] is False
+
+
+@pytest.mark.asyncio
+async def test_build_channel_info_reports_what_an_inheriting_channel_actually_does(
+        message_processor, monkeypatch):
+    # A row that chose nothing is told what it BEHAVES as, not "inherit" — that is the answer to
+    # the question being asked. This is the ai-tooling shape: NULL level, NULL mode.
+    from config import config as cfg
+    monkeypatch.setattr(cfg, "channel_response_mode", "auto_respond", raising=False)
+    monkeypatch.setattr(cfg, "reply_in_channel_default", True, raising=False)
+    message_processor.db = SimpleNamespace(get_channel_settings_async=AsyncMock(
+        return_value={"participation_level": None, "response_mode": None,
+                      "reply_in_channel": None}))
+    info = await message_processor._build_channel_info(_settings_client(), "C1")
+    assert info["participation_level"] == "on"
+    assert info["reply_in_channel"] is True
+
+
+@pytest.mark.asyncio
+async def test_build_channel_info_does_not_mutate_the_cached_lookup(message_processor):
+    cached = {"name": "eng-data", "topic": "", "purpose": ""}
+    client = SimpleNamespace(get_channel_context=AsyncMock(return_value=cached))
+    message_processor.db = SimpleNamespace(get_channel_settings_async=AsyncMock(
+        return_value={"participation_level": "on", "reply_in_channel": 1}))
+    await message_processor._build_channel_info(client, "C1")
+    assert cached == {"name": "eng-data", "topic": "", "purpose": ""}
+
+
+@pytest.mark.asyncio
+async def test_build_channel_info_survives_a_settings_lookup_failure(message_processor):
+    message_processor.db = SimpleNamespace(get_channel_settings_async=AsyncMock(
+        side_effect=RuntimeError("db locked")))
+    info = await message_processor._build_channel_info(_settings_client(), "C1")
+    assert info["name"] == "eng-data"                 # the rest of the context survives
+    assert "participation_level" not in info
+
+
+class TestParticipationSettingPromptLine:
+    def _prompt(self, processor, level, reply_in_channel=True):
+        return processor._get_system_prompt(
+            _slack_client_stub(),
+            channel_info={"name": "eng-data", "topic": "", "purpose": "",
+                          "participation_level": level,
+                          "reply_in_channel": reply_in_channel})
+
+    def test_each_level_is_described(self, message_processor):
+        assert "mentions-only" in self._prompt(message_processor, "mentions_only")
+        assert "answer the ones worth answering" in self._prompt(message_processor, "on")
+        assert "not even to an explicit @-mention" in self._prompt(message_processor, "off")
+
+    def test_placement_is_stated_both_ways(self, message_processor):
+        assert "top level" in self._prompt(message_processor, "on", True)
+        assert "stay inside a thread" in self._prompt(message_processor, "on", False)
+
+    def test_changing_it_still_needs_a_direct_instruction(self, message_processor):
+        # The line is a READ. Without this the model has a fresh reason to reach for the writer.
+        assert "set_channel_participation" in self._prompt(message_processor, "on")
+        assert "explicit, direct instruction" in self._prompt(message_processor, "on")
+
+    def test_a_channel_with_only_a_setting_still_gets_the_section(self, message_processor):
+        prompt = message_processor._get_system_prompt(
+            _slack_client_stub(),
+            channel_info={"name": "", "topic": "", "purpose": "",
+                          "participation_level": "on", "reply_in_channel": True})
+        assert "--- CHANNEL CONTEXT ---" in prompt
+
+    def test_no_setting_no_line(self, message_processor):
+        prompt = message_processor._get_system_prompt(
+            _slack_client_stub(), channel_info={"name": "eng-data", "topic": "", "purpose": ""})
+        assert "participation setting" not in prompt
