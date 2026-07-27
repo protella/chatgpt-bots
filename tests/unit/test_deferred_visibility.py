@@ -182,11 +182,25 @@ async def test_a_deferred_non_streaming_turn_sets_no_status(monkeypatch):
 
     calls = []
 
+    class _StopAtStatus(Exception):
+        """Deliberate stop signal. The handler is driven against mocks, so it has to be cut
+        short somewhere — but a bare `except Exception` here once hid the real ending: an
+        un-stubbed async helper raised long BEFORE any status update, the assertion below saw
+        an empty `calls` list, and the test failed for a reason it could not name. Stopping on
+        our own sentinel means anything else — a missing AsyncMock, a real bug — escapes."""
+
+    def _record_then_stop(*a, **kw):
+        calls.append((a, kw))
+        raise _StopAtStatus
+
     host = MagicMock()
-    host._update_status = MagicMock(side_effect=lambda *a, **kw: calls.append((a, kw)))
+    host._update_status = MagicMock(side_effect=_record_then_stop)
     host._inject_image_analyses = AsyncMock(side_effect=lambda m, _ts: m)
     host._pre_trim_messages_for_api = AsyncMock(side_effect=lambda m, **kw: m)
     host._build_channel_info = AsyncMock(return_value=None)
+    # Awaited between the prompt build and the first status update. Channel memory is NOT
+    # fetched here any more — base.py reads it once and passes it in.
+    host._build_channel_summary_block = AsyncMock(return_value=None)
     host._materialize_request_tools = MagicMock(return_value=(None, {}, False, None))
     host.log_debug = host.log_info = host.log_warning = host.log_error = MagicMock()
 
@@ -203,10 +217,8 @@ async def test_a_deferred_non_streaming_turn_sets_no_status(monkeypatch):
 
     with patch.object(config, "get_thread_config_async", side_effect=fake_config):
         bound = types.MethodType(TextHandlerMixin._handle_text_response, host)
-        try:
+        with pytest.raises(_StopAtStatus):
             await bound("hello", thread_state, client, msg, thinking_id=None, turn=deferred)
-        except Exception:
-            pass   # the non-streaming path runs into the mocks; we only care how far it got
 
     assert calls, "expected the non-streaming path to attempt a status update"
     for _args, kwargs in calls:
