@@ -7,10 +7,12 @@ import sys
 import signal
 import asyncio
 import argparse
+import time
 from typing import Any, Dict, Optional
-from config import config
+from config import GUIDANCE_TRUNCATION_CHARS, config
 from logger import log_session_start, log_session_end, main_logger
 from message_processor.base import MessageProcessor
+from message_processor import participation_telemetry
 from message_processor.participation import (ParticipationEngine,
                                              render_capabilities_line)
 from message_processor.people_tools import format_people_summary
@@ -35,7 +37,12 @@ class ChatBotV2:
     async def initialize(self):
         """Initialize the bot components"""
         main_logger.info(f"Initializing Chat Bot V2 for {self.platform}...")
-        
+
+        # Open the participation ledger HERE, before any Slack traffic. Built lazily it would
+        # have put a mkdir and a file open inside the first gate call — on the hot path of the
+        # decision the whole turn is waiting for — and retried it after every failure.
+        participation_telemetry.initialize()
+
         # Validate configuration
         try:
             config.validate()
@@ -101,13 +108,58 @@ class ChatBotV2:
         react_and_respond has ALREADY placed its gate reaction here). Every
         terminal outcome (ignore / react / a fully-handled backoff / superseded /
         any failure) is handled here and returns None so the caller stays silent."""
-        engine = self.participation_engine
-        if engine is None or not getattr(config, "enable_participation_engine", True):
-            return None  # engine off → unaddressed messages stay unanswered (mentions_only behavior)
+        # Mint this attempt's id FIRST — before the engine check below, so even an engine-off
+        # decline is a countable attempt with a start AND a terminal event, and so a redispatch
+        # of this same Message object is recorded as a linked second attempt rather than
+        # overwriting the first.
+        attempt_id = participation_telemetry.begin_attempt(message)
+        # True once a verdict has been recorded, so the except-clause below can tell a gate that
+        # failed to DECIDE from a gate that decided and then failed to ACT.
+        verdict_recorded = False
         try:
             channel_id = message.channel_id
             ts = message.metadata.get("ts") or message.thread_id
             level = message.metadata.get("participation_level") or "judicious"
+            # The denominator. Logged BEFORE any of the context-building I/O below, so a message
+            # that dies to an exception on the way to the model is still counted as gated.
+            #
+            # `is_dm` is gone: a DM never reaches the gate, so the field was constant-false and
+            # invited exactly the wrong reading — that DMs are in this population and never
+            # judged. What replaced it is the posture that actually varies.
+            gate_started_at = time.monotonic()
+            participation_telemetry.gate_start(
+                channel_id, ts, attempt_id=attempt_id,
+                level=level,
+                thread_reply=bool(ts and message.thread_id and message.thread_id != ts),
+                name_hit=message.metadata.get("participation_name_hit") is True,
+                sender_is_bot=message.metadata.get("participation_sender_bot") is True,
+                sender_type=message.metadata.get("sender_type"),
+                wake_source=message.metadata.get("wake_source"),
+                has_images=bool(message.metadata.get("participation_images")),
+                has_attachments=bool(message.attachments or []),
+                # A re-gate of the SAME message, behind the Phase Q queue. Its verdict may differ
+                # from the first attempt's, and averaging the two as independent decisions would
+                # count one message's judgment twice.
+                redispatch=bool((message.metadata or {}).get(
+                    participation_telemetry.PARENT_KEY)),
+                # F52: the edit path stamps its own marker on the dispatched message, so an
+                # edit-driven judgment is separable from a fresh one. (The edit CONTEXT itself
+                # lives on the Slack facade, not the metadata — this marker is the only edit
+                # fact that rides the message.)
+                edit=bool((message.metadata or {}).get("edit_reply_marker")))
+
+            # AFTER gate_start, deliberately. An engine-off attempt is a minted attempt with a
+            # terminal event, and leaving it without a start made it a decline and an outcome
+            # with nothing to divide by — in a ledger whose gate_start IS the denominator.
+            engine = self.participation_engine
+            if engine is None or not getattr(config, "enable_participation_engine", True):
+                participation_telemetry.gate_declined(
+                    channel_id, ts, cause="engine_off", attempt_id=attempt_id)
+                participation_telemetry.finish_attempt(
+                    message, "none", ended_by="gate", cause="engine_off")
+                # engine off → unaddressed messages stay unanswered (mentions_only behavior)
+                return None
+
             pulse = getattr(client, "channel_pulse", None)
 
             # F5 fix (b): register this message's ts as its conversation's newest BEFORE
@@ -217,7 +269,7 @@ class ChatBotV2:
                 except Exception:
                     pass
 
-            verdict = await engine.evaluate(
+            evaluation = await engine.evaluate(
                 channel_id=channel_id, ts=ts, text=message.text,
                 sender_id=message.user_id,
                 sender_name=message.metadata.get("user_real_name") or message.metadata.get("username"),
@@ -239,10 +291,29 @@ class ChatBotV2:
                 images=message.metadata.get("participation_images"),
                 client=client,
                 pulse=pulse, thread_root_ts=message.thread_id,
+                attempt_id=attempt_id,
             )
-            if verdict is None:  # superseded by a newer message during debounce
-                main_logger.debug("Participation gate: superseded during debounce — silent")
+            gate_latency_ms = int((time.monotonic() - gate_started_at) * 1000)
+            verdict = evaluation.verdict
+            # A decline is TERMINAL and its detail was already recorded by the engine (which
+            # alone knows the survivor ts / the exception type). The outer backstop that used to
+            # log a second `no_verdict` decline here is gone: it double-counted every
+            # supersession, and a ledger whose declines outnumber its attempts measures nothing.
+            # `classifier_error` arrives WITH a manufactured fail-safe `ignore` verdict — the
+            # silence is byte-identical to before, but it is not scored as the model's judgment
+            # and it produces no gate_decision.
+            if evaluation.decline_cause or verdict is None:
+                main_logger.debug(
+                    f"Participation gate: no verdict to act on "
+                    f"({evaluation.decline_cause or 'superseded'}) — silent")
+                participation_telemetry.finish_attempt(
+                    message, "none", ended_by="gate", cause=evaluation.decline_cause,
+                    gate_ms=gate_latency_ms, classifier_ms=evaluation.classifier_ms)
                 return None
+            participation_telemetry.gate_decision(
+                channel_id, ts, verdict, attempt_id=attempt_id,
+                gate_ms=gate_latency_ms, classifier_ms=evaluation.classifier_ms)
+            verdict_recorded = True
             main_logger.debug(f"Participation verdict: {verdict.action} ({verdict.reason})")
             # An overrule means the model's chosen action contradicted its OWN staged findings.
             # Logged at INFO because a rising rate is a signal about the prompt, not the code: the
@@ -264,8 +335,14 @@ class ChatBotV2:
                 react_ts = message.metadata.get("ts") or message.thread_id
                 # Route through the shared gate-reaction helper (reservation guard + timeout +
                 # once-per-message stamp). A reaction is this verdict's whole response — stay silent.
-                await self._place_gate_reaction(
+                placed = await self._place_gate_reaction(
                     message, client, channel_id, react_ts, verdict.emoji)
+                # The emoji IS the turn, so whether it landed decides what the room saw. A
+                # react verdict whose reaction was refused or timed out showed nothing at all,
+                # and filing it as reaction_only would report a reaction that is not there.
+                participation_telemetry.finish_attempt(
+                    message, "reaction_only" if placed else "none",
+                    ended_by="gate", action=verdict.action)
                 return None
             if verdict.action == "react_and_respond":
                 # BOTH react and reply in one turn: place the gate reaction (same path as `react`),
@@ -276,15 +353,25 @@ class ChatBotV2:
                 react_ts = message.metadata.get("ts") or message.thread_id
                 await self._place_gate_reaction(
                     message, client, channel_id, react_ts, verdict.emoji)
+                # The responder owns the end of this turn, so it owns the terminal event too.
+                participation_telemetry.mark_gate_woke(message)
                 return verdict
             if verdict.action == "backoff":
                 # The taxonomy decides what "backoff" means: a durable per-channel preference,
                 # a real thread mute/unmute, a momentary aside (nothing persisted), or an
                 # explicit channel-settings change — the last one falls through to the response
                 # loop so the MAIN model applies it (with judgment) via set_channel_participation.
-                fall_through = await self._apply_backoff(message, client, verdict)
+                fall_through, ack_placed = await self._apply_backoff(message, client, verdict)
                 if fall_through:
+                    participation_telemetry.mark_gate_woke(message)
                     return verdict
+                # Fully handled here. An ack reaction that LANDED is what the room saw, so this
+                # is not a silent turn — the feedback was visibly acknowledged. Without a
+                # reaction (feedback about reactions never gets one, and a failed add is not
+                # one) nothing was shown and it is a silence.
+                participation_telemetry.finish_attempt(
+                    message, "reaction_only" if ack_placed else "silence",
+                    ended_by="gate", action=verdict.action, detail="backoff")
                 return None
             if verdict.action == "respond":
                 # F38: the gate no longer acks. It used to drop a 👀 here on a respond+ack
@@ -294,29 +381,80 @@ class ChatBotV2:
                 # teammate who drops eyes and then does nothing is misleading. The 👀 is now
                 # a CLAIM ON WORK, staked by TurnRuntime.claim_work when a tool actually
                 # starts doing something slow, and taken back if that work produces nothing.
+                participation_telemetry.mark_gate_woke(message)
                 return verdict
-            return None  # ignore
+            # ignore — the model was asked and chose to say nothing. A DECISION, and the only
+            # gate-terminal outcome that deserves the `silence` label.
+            participation_telemetry.finish_attempt(
+                message, "silence", ended_by="gate", action=verdict.action)
+            return None
         except Exception as e:
             # Fail-safe stays silence: worst failure mode is a missed reply, never spam.
             main_logger.warning(f"Participation gate error: {e}; staying silent")
+            # A crash is silence the user cannot distinguish from judgment, which is exactly why
+            # it has to be countable: a rising error rate would otherwise look like a bot that
+            # has simply decided to talk less.
+            #
+            # WHICH failure, though, is not the same question. Before the verdict exists the gate
+            # failed to decide — a decline. After it exists the gate decided and the ACTION blew
+            # up (a reaction, a backoff write, the handoff), and filing that as a classifier
+            # decline would report the model as unable to judge when its judgment is on record
+            # two lines above.
+            cause = "action_error" if verdict_recorded else "error"
+            participation_telemetry.gate_declined(
+                message.channel_id, (message.metadata or {}).get("ts") or message.thread_id,
+                cause=cause, attempt_id=attempt_id, detail=type(e).__name__)
+            participation_telemetry.finish_attempt(
+                message, "none", ended_by="gate", cause=cause,
+                detail=type(e).__name__)
             return None
 
     async def _place_gate_reaction(self, message: Message, client: BaseClient,
-                                   channel_id: str, react_ts: str, emoji: Optional[str]) -> None:
+                                   channel_id: str, react_ts: str, emoji: Optional[str],
+                                   origin: str = "gate") -> bool:
         """Place a participation-gate reaction ONCE per message, via the reservation guard so a
         later turn sees the slot consumed. Idempotent across queued redispatch: the SAME Message
         object is re-run through the gate (Phase Q) and a fresh pass may pick a different emoji or a
         different reaction-bearing verdict — so every gate-reaction branch (react, react_and_respond,
         backoff ack) checks the stamp first and no-ops if a gate reaction was already placed. On a
         genuine placement, stamps message.metadata['participation_reaction_emoji'] so the response
-        turn's developer suffix can tell the model it already reacted."""
+        turn's developer suffix can tell the model it already reacted.
+
+        Returns True when the gate's emoji IS on the message when this returns — a genuine
+        placement now, or one this same message already made on an earlier pass. The caller uses
+        it to say what the room saw, and a refused or failed add showed nothing. `origin`
+        separates a social gate reaction from a backoff acknowledgment: the second is a fixed
+        protocol move, not taste, and pooling them would make the gate's emoji diversity look
+        better than it is."""
+        attempt_id = participation_telemetry.attempt_id_for(message)
+
+        def _record(result_name: str, *, detail=None) -> None:
+            if not attempt_id:
+                return
+            participation_telemetry.reaction(
+                channel_id, react_ts, operation="add", result=result_name, origin=origin,
+                emoji=emoji, target_ts=react_ts, attempt_id=attempt_id, detail=detail)
+
+        # Each early return below is an intent that never reached Slack. They were invisible
+        # before, which made "the gate stopped reacting" impossible to distinguish from "the
+        # gate stopped choosing emoji".
         if not emoji or not react_ts or not channel_id:
-            return
+            _record("refused", detail="invalid_target")
+            return False
         md = message.metadata if isinstance(message.metadata, dict) else None
         # Dedup: a redispatch re-runs this same object through the gate, and a fresh pass can flip
         # react_and_respond→react (or pick a new emoji) — honor the first placement, never stack.
+        #
+        # TRUE, not False: the stamp is only ever written on a genuine placement, so reaching it
+        # means OUR emoji is on that message right now. The caller asks "what did the room see",
+        # and the room sees an emoji — returning False here filed a redispatched `react` as
+        # `none` and a stamped backoff ack as `silence`, both describing an empty message that
+        # visibly has a reaction on it. (The reaction row stays `already_present`: we did not
+        # place one on THIS pass, and counting it as a placement would double the gate's
+        # reaction rate on every redispatch.)
         if md is not None and md.get("participation_reaction_emoji"):
-            return
+            _record("already_present", detail="already_stamped")
+            return True
         result = None
         try:
             # Bound the gate's own react by the configured tool-call timeout so a wedged Slack call
@@ -332,16 +470,30 @@ class ChatBotV2:
                     timeout=config.tool_call_timeout)
         except asyncio.TimeoutError:
             main_logger.debug("Participation gate react timed out")
-            return
+            _record("failed", detail="timeout")
+            return False
         except Exception as e:
             main_logger.debug(f"Participation gate react failed: {e}")
-            return
+            _record("failed", detail=type(e).__name__)
+            return False
         # Stamp ONLY on a genuine placement (_reserve_and_react → {"ok": True}; react → True). On a
         # cap/busy/timeout failure the slot wasn't taken, so leave the stamp unset: a later attempt
         # can still try, and the model must never be told it reacted when it didn't.
         placed = result is True or (isinstance(result, dict) and result.get("ok") is True)
+        # Recorded either way: a verdict that CHOSE an emoji and lost it to the per-message cap is
+        # a different story from one that never wanted to react, and only this line tells them
+        # apart afterwards. `idempotent` from the reservation layer means somebody else's emoji
+        # was already there — present, but not placed by us.
+        if placed and isinstance(result, dict) and result.get("idempotent"):
+            _record("already_present")
+        elif placed:
+            _record("added")
+        else:
+            _record("failed",
+                    detail=(result.get("error") if isinstance(result, dict) else None))
         if placed and md is not None:
             md["participation_reaction_emoji"] = emoji
+        return placed
 
     # ---- participation-feedback backoff taxonomy (redesign Layer 2) ----
     # Default guidance text per dimension, used to write a readable preference memory when the
@@ -353,14 +505,17 @@ class ChatBotV2:
         "thread_participation": "participate more sparingly in this channel",
     }
 
-    async def _apply_backoff(self, message: Message, client: BaseClient, verdict) -> bool:
+    async def _apply_backoff(self, message: Message, client: BaseClient,
+                             verdict) -> tuple[bool, bool]:
         """Route a participation-feedback ('backoff') verdict through the redesign taxonomy.
 
-        Returns True when the message should fall through to the MAIN response loop — an
-        explicit channel-settings change the model applies with judgment via the gated
-        set_channel_participation tool. Returns False when the feedback was fully handled
-        here: a durable per-channel preference (memory), or a momentary/thread-scoped aside
-        that persists nothing.
+        Returns (fall_through, ack_placed). `fall_through` is True when the message should go
+        to the MAIN response loop — an explicit channel-settings change the model applies with
+        judgment via the gated set_channel_participation tool — and False when the feedback was
+        fully handled here: a durable per-channel preference (memory), or a momentary/
+        thread-scoped aside that persists nothing. `ack_placed` says whether the optional
+        acknowledgment reaction actually landed, which is the only thing that makes a handled
+        backoff visible in the room at all.
 
         Structural settings (participation level / placement) are NEVER written here. This
         routine only ever touches per-channel preference MEMORY, so a "react less" can no
@@ -385,7 +540,7 @@ class ChatBotV2:
             # handlers.text where the tool context is built.
             if isinstance(message.metadata, dict):
                 message.metadata["gate_authorized_structural"] = True
-            return True
+            return True, False
 
         standing = verdict.durability == "standing"
         db = getattr(self.processor, "db", None)
@@ -406,10 +561,12 @@ class ChatBotV2:
         # 4. Conditional ack. Routed through the reservation/timeout path (like the gate's own
         #    react) so a later main-model turn honestly sees the slot consumed. NEVER react when
         #    the feedback is ABOUT reactions — acking "stop reacting" with a reaction is absurd.
+        ack_placed = False
         if verdict.emoji and verdict.dimension != "reactions":
-            await self._backoff_ack(message, client, channel_id, react_ts, verdict.emoji)
+            ack_placed = await self._backoff_ack(
+                message, client, channel_id, react_ts, verdict.emoji)
 
-        return False
+        return False, ack_placed
 
     # Reserved author prefix for the engine's own per-dimension preference markers. The backoff
     # memory CRUD may ONLY ever touch rows under this prefix — never a human's fact and never a
@@ -507,17 +664,22 @@ class ChatBotV2:
         if not guidance:
             guidance = self._PREF_DEFAULT_GUIDANCE.get(
                 dimension, "participate more sparingly in this channel")
-        elif len(guidance) > 200:
-            guidance = guidance[:200] + "…"
+        elif len(guidance) > GUIDANCE_TRUNCATION_CHARS:
+            guidance = guidance[:GUIDANCE_TRUNCATION_CHARS] + "…"
         return f"Channel participation preference ({dimension}): {guidance}"
 
     async def _backoff_ack(self, message: Message, client: BaseClient, channel_id: str,
-                           react_ts: str, emoji: str) -> None:
+                           react_ts: str, emoji: str) -> bool:
         """Drop the optional acknowledgment reaction, routed through the shared gate-reaction
         helper so it goes through the same reservation guard the gate's own react uses (a later
         turn sees the slot consumed and never double-adds) AND honors the once-per-message stamp —
-        a react_and_respond→backoff redispatch can't stack a second reaction onto this message."""
-        await self._place_gate_reaction(message, client, channel_id, react_ts, emoji)
+        a react_and_respond→backoff redispatch can't stack a second reaction onto this message.
+
+        Recorded under its own origin. This emoji is a protocol acknowledgment of feedback, not
+        a social reaction the classifier chose for its own sake, and counting it as one would
+        quietly improve every "is its emoji use varied?" number with a fixed move."""
+        return await self._place_gate_reaction(message, client, channel_id, react_ts, emoji,
+                                               origin="backoff_ack")
 
     @staticmethod
     def _produced_visible_output(response, turn) -> bool:
@@ -548,6 +710,74 @@ class ChatBotV2:
             posted = bool(response.type == "text"
                           and (meta.get("streamed") or (response.content or "").strip()))
         return bool(posted)
+
+    @staticmethod
+    def _classify_visible_action(response, turn, gate_reaction_visible: bool = False) -> str:
+        """The ONE outcome the room saw, as a single label for the telemetry ledger.
+
+        Deliberately a pure function rather than an expression inside handle_message: what
+        counts as "the bot said something" is genuinely subtle — a detached image posts itself
+        and returns an empty Response, an interrupted turn posts nothing but an apology, a queued
+        turn was never run — and every one of those looks like "posted nothing" if read literally.
+        Filing them that way would put the bot's most visible turns in the same bucket as its
+        broken ones, which is the reverse of the truth.
+
+        Shares its judgment with _produced_visible_output (which answers the narrower F38
+        question: was the 👀 honored?) but does not collapse to a boolean: `silence` and `empty`
+        are identical in the room and opposite in meaning — one is the model choosing, the other
+        is the contract failing — so the ledger has to keep them apart.
+
+        `gate_reaction_visible` is the one fact this function cannot see for itself: on a
+        `react_and_respond` the GATE already put an emoji on the message before the responder
+        ran, so a responder that then vetoes with no_response_needed did not leave the room
+        silent. The caller reads it off the message stamp and passes it in — the function stays
+        pure, which is why every one of these labels is testable as a table.
+        """
+        if response is None:
+            # The responder handed back nothing at all. Not the gate's `none` (which means a
+            # decision path ended with nothing to show) — this is the responder contract
+            # breaking, and the caller adds detail=no_response_object to say which way.
+            return "empty"
+        meta = response.metadata or {}
+        if response.type == "queued":
+            return "queued"      # never ran; another turn owns this conversation
+        if response.type == "error":
+            return "error"
+        if meta.get("interrupted"):
+            return "interrupted"  # died partway; the thread got an apology, not an answer
+        if meta.get("terminal_action") == "no_reply":
+            # A no-reply turn that committed a reaction did not stay silent — the emoji WAS the
+            # answer, and the room saw one. Filing it as silence understated how often the bot
+            # participates without words, which is the very rate this ledger exists to measure.
+            # The model's stated reason still rides the event, separately.
+            #
+            # The gate's own emoji counts for exactly the same reason: on react_and_respond the
+            # reaction is already up when the responder decides to use no words, and calling
+            # that turn a silence describes an empty message that is visibly reacted to.
+            if meta.get("response_reaction_committed") is True or gate_reaction_visible:
+                return "reaction_only"
+            return "silence"     # the model chose it, via the terminal tool
+        if meta.get("reaction_only"):
+            return "reaction_only"
+        posted = meta.get("posted")
+        if posted is None:  # non-streaming handlers can't know; derive from the outcome
+            posted = bool(response.type == "text"
+                          and (meta.get("streamed") or (response.content or "").strip()))
+        elif posted is False and (response.content or "").strip():
+            # The model wrote an answer and Slack did not take it. That is the OPPOSITE of
+            # silence and it used to be filed as `reply`, because the content was non-empty —
+            # so every delivery outage read as the bot talking normally.
+            return "delivery_failed"
+        if posted:
+            return "reply"
+        if (turn is not None and getattr(turn, "visible_action_committed", False)) \
+                or meta.get("background_job_started"):
+            # A producer that owns its own surface — generate_image posts the picture, a
+            # background job posts its status card — so the Response is empty BY DESIGN.
+            return "detached"
+        # Posted nothing and never called the terminal tool: a contract violation, and the
+        # single most important thing in this ledger to keep apart from a chosen silence.
+        return "empty"
 
     async def _rescue_sandbox_images(self, response, client: BaseClient, message: Message,
                                      post_thread_id: str) -> int:
@@ -592,375 +822,455 @@ class ChatBotV2:
         return posted
 
     async def handle_message(self, message: Message, client: BaseClient):
-        """Handle incoming message from any platform"""
-        # Phase F participation gate: for UNPROMPTED channel messages (judicious/active
-        # levels) the engine decides respond/react/react_and_respond/ignore/backoff BEFORE
-        # anything is posted. The reply outcomes fall through (respond, react_and_respond, and
-        # a backoff requesting a settings change); a react_and_respond has already placed its
-        # reaction in the gate, so only the words remain to send.
-        placement_verdict = None
-        if message.metadata.get("participation_check") is True:
-            verdict = await self._run_participation_gate(message, client)
-            if verdict is None:
-                return
-            placement_verdict = verdict.placement
-            # Kept for logs and debugging ONLY — deliberately NOT rendered into the wake
-            # envelope any more (see utilities._wake_trigger_line): forwarding the gate's own
-            # justification pre-argued the turn and neutered the no_response_needed veto.
-            if isinstance(message.metadata, dict) and getattr(verdict, "reason", None):
-                message.metadata["participation_reason"] = verdict.reason
-            # F27: earlier same-author burst messages ride the wake envelope too, so the
-            # reply is told to cover the whole burst, not just the triggering fragment.
-            if isinstance(message.metadata, dict) and getattr(verdict, "burst_earlier", None):
-                message.metadata["participation_burst_earlier"] = verdict.burst_earlier
+        """Handle incoming message from any platform.
 
-        # F46: judgment-call placement for MENTIONS/name-wakes. These run NO participation gate
-        # (so placement_verdict is still None) and default to a top-level reply — but a
-        # deliberately-requested long-form deliverable ("write me a 3-paragraph story") reads
-        # better in a thread, and no tool fires for it so the did_substantive_work override can't
-        # catch it. One lean utility-model call decides thread vs channel, feeding the UNCHANGED
-        # place_in_channel logic below. Gated behind enable_mention_placement_model (DEFAULT OFF):
-        # flag off ⇒ skipped entirely, zero added latency/cost, zero behavior change. Only for a
-        # top-level PUBLIC-channel trigger where top-level replies are allowed and no gate verdict
-        # exists (never override the engine's verdict). Fail-open: classify_placement returns
-        # "channel" on any error, and a raised call must not break the reply.
-        if (getattr(config, "enable_mention_placement_model", False)
-                and placement_verdict is None
-                and message.metadata.get("ts") == message.thread_id
-                and bool(message.metadata.get("reply_in_channel"))
-                and message.channel_id and not message.channel_id.startswith("D")):
-            try:
-                placement_verdict = await self.processor.openai_client.classify_placement(
-                    message.text)
-                main_logger.debug(
-                    f"Mention placement: verdict={placement_verdict} for a top-level "
-                    f"public-channel mention")
-            except Exception as e:
-                main_logger.debug(f"Mention placement call failed ({e}); staying top-level")
-                placement_verdict = None
-
-        # Phase F placement (plan §4a, revised 2026-07-10): the channel's
-        # reply_in_channel setting is an ALLOWANCE, not a mandate — when it's ON and
-        # the trigger was top-level, the engine's per-message placement verdict
-        # decides ("channel" = quick top-level answer, "thread" = worth a thread).
-        # Mentions/name-wakes carry no verdict (no engine call) and reply top-level:
-        # the user summoned the bot at channel level. Setting OFF = everything
-        # threads. Images always thread (enforced in the image branch, which keys
-        # off message.thread_id regardless).
-        is_top_level_trigger = message.metadata.get("ts") == message.thread_id
-        place_in_channel = (
-            bool(message.metadata.get("reply_in_channel")) and is_top_level_trigger
-            and bool(message.channel_id) and not message.channel_id.startswith("D")
-            and placement_verdict != "thread"
-        )
-        if placement_verdict:
-            main_logger.debug(
-                f"Placement: verdict={placement_verdict}, reply_in_channel_setting="
-                f"{bool(message.metadata.get('reply_in_channel'))} → "
-                f"{'channel' if place_in_channel else 'thread'}"
-            )
-        post_thread_id = None if place_in_channel else message.thread_id
-        # Handlers key presentation chrome off this (e.g. the Used Tools attribution
-        # line is suppressed on top-level channel replies).
-        if isinstance(message.metadata, dict):
-            message.metadata["place_in_channel"] = place_in_channel
-
-        # Phase Q: if this conversation is mid-processing, the message is about to be
-        # queued (not answered now) — skip the thinking indicator so nothing flashes.
-        # Advisory peek only: losing the race just means a briefly-posted indicator
-        # that the queued short-circuit below deletes.
-        # `is True` (not truthiness): same hardening as the wake gate — mocked or
-        # malformed managers must never silently suppress the indicator.
-        thread_manager = getattr(self.processor, "thread_manager", None)
-        already_processing = (
-            thread_manager is not None
-            and hasattr(thread_manager, "is_thread_processing")
-            and thread_manager.is_thread_processing(message.thread_id, message.channel_id) is True
-        )
-
-        # F38: what this turn is allowed to SHOW. A turn the model may end in silence gets no
-        # speculative chrome at all — no placeholder, no composer status (which would also
-        # auto-open the thread), no phase updates. The reply, if there is one, creates its own
-        # surface when the first words arrive; if there is none, nothing was ever posted.
-        turn = TurnRuntime.for_message(message, post_thread_id)
-
-        # Send initial thinking indicator (streamed replies grow inside this message,
-        # so placement is decided here).
-        thinking_id = None
-        if not already_processing and turn.progress_enabled:
-            thinking_id = await client.send_thinking_indicator(
-                message.channel_id,
-                post_thread_id
-            )
-            # Batched catch-up turn (drained queue): make the status say so.
-            batch_size = message.metadata.get("queued_batch_size", 0)
-            if isinstance(batch_size, int) and batch_size > 1:
-                catch_up = f"Catching up on {batch_size} messages..."
-                try:
-                    if thinking_id and hasattr(client, "update_message"):
-                        await client.update_message(
-                            message.channel_id, thinking_id,
-                            f"{config.circle_loader_emoji} {catch_up}"
-                        )
-                    elif thinking_id is None and hasattr(client, "set_assistant_status"):
-                        # Status-only DM indicator: the composer status carries it.
-                        await client.set_assistant_status(
-                            message.channel_id, post_thread_id, status=catch_up
-                        )
-                except Exception as e:
-                    main_logger.debug(f"Catch-up status update failed: {e}")
-
-        response = None
+        The whole flow sits in one `try/finally` that starts BEFORE the participation gate.
+        The gate itself can raise, the thinking indicator can raise, and the turn can be
+        cancelled outright — and each of those used to leave a gate attempt with a
+        `gate_start` and no ending, which in the ledger is indistinguishable from a decision
+        that has not been written yet. `abort_attempt` closes any attempt that got this far
+        without a terminal event; it is a no-op for the overwhelming majority that did.
+        """
         try:
-            response = await self.processor.process_message(message, client, thinking_id,
-                                                            turn=turn)
+            # Phase F participation gate: for UNPROMPTED channel messages (judicious/active
+            # levels) the engine decides respond/react/react_and_respond/ignore/backoff BEFORE
+            # anything is posted. The reply outcomes fall through (respond, react_and_respond, and
+            # a backoff requesting a settings change); a react_and_respond has already placed its
+            # reaction in the gate, so only the words remain to send.
+            placement_verdict = None
+            if message.metadata.get("participation_check") is True:
+                verdict = await self._run_participation_gate(message, client)
+                if verdict is None:
+                    return
+                placement_verdict = verdict.placement
+                # Kept for logs and debugging ONLY — deliberately NOT rendered into the wake
+                # envelope any more (see utilities._wake_trigger_line): forwarding the gate's own
+                # justification pre-argued the turn and neutered the no_response_needed veto.
+                if isinstance(message.metadata, dict) and getattr(verdict, "reason", None):
+                    message.metadata["participation_reason"] = verdict.reason
+                # F27: earlier same-author burst messages ride the wake envelope too, so the
+                # reply is told to cover the whole burst, not just the triggering fragment.
+                if isinstance(message.metadata, dict) and getattr(verdict, "burst_earlier", None):
+                    message.metadata["participation_burst_earlier"] = verdict.burst_earlier
 
-            # F46: the handler may have flipped a top-level channel reply into a thread (a turn
-            # that did substantive work — resolve_reply_target mutates message.metadata but NOT
-            # these locals). Rebind from the metadata so the fallback send, the footer guard, and
-            # channel_pulse below all agree with the placement text.py actually used. Fail-open:
-            # only rebind when metadata is a dict; a missing key leaves the original value.
+            # F46: judgment-call placement for MENTIONS/name-wakes. These run NO participation gate
+            # (so placement_verdict is still None) and default to a top-level reply — but a
+            # deliberately-requested long-form deliverable ("write me a 3-paragraph story") reads
+            # better in a thread, and no tool fires for it so the did_substantive_work override can't
+            # catch it. One lean utility-model call decides thread vs channel, feeding the UNCHANGED
+            # place_in_channel logic below. Gated behind enable_mention_placement_model (DEFAULT OFF):
+            # flag off ⇒ skipped entirely, zero added latency/cost, zero behavior change. Only for a
+            # top-level PUBLIC-channel trigger where top-level replies are allowed and no gate verdict
+            # exists (never override the engine's verdict). Fail-open: classify_placement returns
+            # "channel" on any error, and a raised call must not break the reply.
+            if (getattr(config, "enable_mention_placement_model", False)
+                    and placement_verdict is None
+                    and message.metadata.get("ts") == message.thread_id
+                    and bool(message.metadata.get("reply_in_channel"))
+                    and message.channel_id and not message.channel_id.startswith("D")):
+                try:
+                    placement_verdict = await self.processor.openai_client.classify_placement(
+                        message.text)
+                    main_logger.debug(
+                        f"Mention placement: verdict={placement_verdict} for a top-level "
+                        f"public-channel mention")
+                except Exception as e:
+                    main_logger.debug(f"Mention placement call failed ({e}); staying top-level")
+                    placement_verdict = None
+
+            # Phase F placement (plan §4a, revised 2026-07-10): the channel's
+            # reply_in_channel setting is an ALLOWANCE, not a mandate — when it's ON and
+            # the trigger was top-level, the engine's per-message placement verdict
+            # decides ("channel" = quick top-level answer, "thread" = worth a thread).
+            # Mentions/name-wakes carry no verdict (no engine call) and reply top-level:
+            # the user summoned the bot at channel level. Setting OFF = everything
+            # threads. Images always thread (enforced in the image branch, which keys
+            # off message.thread_id regardless).
+            is_top_level_trigger = message.metadata.get("ts") == message.thread_id
+            place_in_channel = (
+                bool(message.metadata.get("reply_in_channel")) and is_top_level_trigger
+                and bool(message.channel_id) and not message.channel_id.startswith("D")
+                and placement_verdict != "thread"
+            )
+            if placement_verdict:
+                main_logger.debug(
+                    f"Placement: verdict={placement_verdict}, reply_in_channel_setting="
+                    f"{bool(message.metadata.get('reply_in_channel'))} → "
+                    f"{'channel' if place_in_channel else 'thread'}"
+                )
+            post_thread_id = None if place_in_channel else message.thread_id
+            # Handlers key presentation chrome off this (e.g. the Used Tools attribution
+            # line is suppressed on top-level channel replies).
             if isinstance(message.metadata, dict):
-                place_in_channel = bool(message.metadata.get("place_in_channel", place_in_channel))
-                post_thread_id = None if place_in_channel else message.thread_id
+                message.metadata["place_in_channel"] = place_in_channel
 
-            # Delete thinking indicator (but not if streaming was used — it's already the
-            # response — and not when a ProgressChecklist owns the thinking message, F4).
-            if (thinking_id and response
-                    and not response.metadata.get("streamed")
-                    and response.metadata.get("checklist") is None):
-                await client.delete_message(message.channel_id, thinking_id)
-            elif thinking_id and not response:
-                await client.delete_message(message.channel_id, thinking_id)
+            # Phase Q: if this conversation is mid-processing, the message is about to be
+            # queued (not answered now) — skip the thinking indicator so nothing flashes.
+            # Advisory peek only: losing the race just means a briefly-posted indicator
+            # that the queued short-circuit below deletes.
+            # `is True` (not truthiness): same hardening as the wake gate — mocked or
+            # malformed managers must never silently suppress the indicator.
+            thread_manager = getattr(self.processor, "thread_manager", None)
+            already_processing = (
+                thread_manager is not None
+                and hasattr(thread_manager, "is_thread_processing")
+                and thread_manager.is_thread_processing(message.thread_id, message.channel_id) is True
+            )
 
-            # Handle the response
-            if response:
-                if response.type == "queued":
-                    # Phase Q: the message joined its conversation's pending queue and
-                    # will be answered by the in-flight turn's batched catch-up. Nothing
-                    # to post (the indicator, if any, was already deleted above).
-                    main_logger.debug(f"Message queued behind in-flight turn for {message.channel_id}:{message.thread_id}")
-                elif response.type == "text":
-                    # Reaction-only turns (react tool, empty text) post no message at all
-                    if not (response.content or "").strip():
-                        main_logger.debug("Empty text response (reaction-only) — nothing to post")
-                    # If streaming was used, the message is already displayed
-                    elif not response.metadata.get("streamed"):
-                        # Send raw content: send_message formats for the platform itself
-                        # (messaging.py). Pre-formatting here double-ran the converter, and
-                        # format_text is NOT idempotent (italic runs before bold, so a second
-                        # pass turns **bold** → *bold* → _bold_ and renders as italic).
-                        # F8: attach the settings-footer chrome to the message itself (same
-                        # as the native-streaming path's stopStream blocks) instead of a
-                        # separate trailing post. Suppressed for top-level channel placement
-                        # (same rule as the separate footer below) and when block-building is
-                        # unavailable — those fall back to maybe_post_response_footer.
-                        footer_blocks = None
-                        if not place_in_channel and hasattr(client, "attachable_footer_blocks"):
-                            try:
-                                footer_blocks = client.attachable_footer_blocks(
-                                    message.channel_id, response.metadata.get("model"))
-                            except Exception as e:
-                                main_logger.debug(f"Footer block build failed: {e}")
-                                footer_blocks = None
-                        send_meta = {}
-                        sent_ts = await client.send_message(
-                            message.channel_id,
-                            post_thread_id,
-                            response.content,
-                            blocks=footer_blocks,
-                            meta_out=send_meta,
-                        )
-                        # Honest accounting: the ACTUAL send result decides `posted` (a
-                        # failed send must not burn the hourly unprompted quota).
-                        if isinstance(response.metadata, dict):
-                            response.metadata["posted"] = bool(sent_ts)
-                            # Only stand the separate footer down when the chrome ACTUALLY
-                            # rode the message (a split/too-long reply doesn't attach it, so
-                            # the separate footer post must still happen).
-                            if sent_ts and send_meta.get("footer_attached"):
-                                response.metadata["footer_attached"] = True
-                        # F7: persist tool-use provenance keyed on the reply's real ts.
-                        if sent_ts:
-                            self.processor._persist_tool_provenance(
-                                message.channel_id, sent_ts,
-                                f"{message.channel_id}:{message.thread_id}",
-                                (response.metadata or {}).get("tool_provenance"))
-                    # Phase 7: Configure footer under the response (channels only, any
-                    # member can open settings). Native-streamed responses attach the
-                    # chrome to the message itself on stopStream (footer_attached
-                    # metadata makes this call a no-op); everything else falls back to
-                    # this separate trailing message.
-                    # Best-effort: a cosmetic footer must never break message handling.
-                    # Skipped for top-level placement — it would land as ANOTHER top-level
-                    # message and read as spam.
-                    # No footer under an empty turn (F2 no_reply / reaction-only) — there is
-                    # no message for it to sit under.
-                    # Also skip when the reply didn't actually post (posted is explicitly
-                    # False) — a footer under a message that never landed reads as orphaned.
-                    if (hasattr(client, "maybe_post_response_footer") and not place_in_channel
-                            and (response.content or "").strip()
-                            and (response.metadata or {}).get("posted") is not False):
-                        try:
-                            await client.maybe_post_response_footer(message, response)
-                        except Exception as e:
-                            main_logger.debug(f"Response footer skipped: {e}")
+            # F38: what this turn is allowed to SHOW. A turn the model may end in silence gets no
+            # speculative chrome at all — no placeholder, no composer status (which would also
+            # auto-open the thread), no phase updates. The reply, if there is one, creates its own
+            # surface when the first words arrive; if there is none, nothing was ever posted.
+            turn = TurnRuntime.for_message(message, post_thread_id)
 
-                    # F32: upload any code-interpreter artifacts AFTER the answer lands, so the
-                    # thread reads "explanation, then the chart" rather than the reverse. Runs
-                    # even for an empty-text turn (a chart that speaks for itself). Strictly
-                    # best-effort: the reply is already posted and an upload failure must never
-                    # turn a delivered answer into an error.
-                    artifact_containers = (response.metadata or {}).get("artifact_containers") or []
-                    # Only hang files under an answer that actually landed. If a non-empty reply
-                    # failed to post, a chart arriving alone with no explanation is worse than
-                    # no chart. (A files-only turn has empty content by design — still publish.)
-                    reply_landed = (response.metadata or {}).get("posted") is not False
-                    files_only = not (response.content or "").strip()
-                    published = []
-                    if artifact_containers and (reply_landed or files_only):
-                        try:
-                            from message_processor.artifacts import publish_artifacts
-                            # Whole-phase bound: the answer is already visible, but this still
-                            # holds the turn open, and a wedged upload must not stall the next
-                            # message in the thread.
-                            published = await asyncio.wait_for(
-                                publish_artifacts(
-                                    openai_client=self.processor.openai_client,
-                                    client=client,
-                                    channel_id=message.channel_id,
-                                    # B2: artifacts always thread. post_thread_id is None on a
-                                    # top-level channel reply, so thread off message.thread_id
-                                    # instead — the chart hangs under the answer, never top-level.
-                                    thread_id=message.thread_id,
-                                    thread_key=f"{message.channel_id}:{message.thread_id}",
-                                    container_ids=artifact_containers,
-                                    db=getattr(self.processor, "db", None),
-                                    message_ts=(message.metadata or {}).get("ts"),
-                                    container_manager=getattr(
-                                        self.processor, "container_manager", None),
-                                    # F35: files the model MOUNTED are ingredients the user
-                                    # already owns — never publish them back, even byte-copied.
-                                    suppress_digests=(response.metadata or {}).get(
-                                        "mounted_digests") or [],
-                                ),
-                                timeout=config.artifact_publish_timeout,
+            # Send initial thinking indicator (streamed replies grow inside this message,
+            # so placement is decided here).
+            thinking_id = None
+            if not already_processing and turn.progress_enabled:
+                thinking_id = await client.send_thinking_indicator(
+                    message.channel_id,
+                    post_thread_id
+                )
+                # Batched catch-up turn (drained queue): make the status say so.
+                batch_size = message.metadata.get("queued_batch_size", 0)
+                if isinstance(batch_size, int) and batch_size > 1:
+                    catch_up = f"Catching up on {batch_size} messages..."
+                    try:
+                        if thinking_id and hasattr(client, "update_message"):
+                            await client.update_message(
+                                message.channel_id, thinking_id,
+                                f"{config.circle_loader_emoji} {catch_up}"
                             )
-                            if published:
-                                main_logger.info(
-                                    f"Published {len(published)} artifact(s) to the thread")
-                                # F38: a chart or a deck visibly landed. On an empty-text turn
-                                # (code interpreter answering with the file itself) the Response
-                                # says posted=False, and without this the end-of-turn settle
-                                # would read that as silence and retract the 👀 from a turn that
-                                # plainly delivered.
-                                turn.visible_action_committed = True
-                        except asyncio.TimeoutError:
-                            main_logger.error("Artifact publishing timed out — reply already posted")
-                        except Exception as e:
-                            main_logger.error(f"Artifact publishing failed: {e}", exc_info=True)
-                    elif artifact_containers:
-                        main_logger.warning(
-                            "Reply did not post — suppressing its artifacts (a file with no "
-                            "answer above it reads as a bug)")
+                        elif thinking_id is None and hasattr(client, "set_assistant_status"):
+                            # Status-only DM indicator: the composer status carries it.
+                            await client.set_assistant_status(
+                                message.channel_id, post_thread_id, status=catch_up
+                            )
+                    except Exception as e:
+                        main_logger.debug(f"Catch-up status update failed: {e}")
 
-                    # F34: create_image_asset mounts an image into the sandbox as an
-                    # INGREDIENT, so it is deliberately not published — the deck or composite
-                    # built from it is. But if the turn ended having published nothing at all,
-                    # the model made images and then failed to use them, and they would die
-                    # with the container. A silent no-output turn is the worst failure mode
-                    # here, so hand them over rather than lose them.
-                    if not published:
-                        # B2: rescued sandbox images always thread — pass message.thread_id, not
-                        # post_thread_id (None on a top-level channel reply).
-                        rescued = await self._rescue_sandbox_images(response, client, message,
-                                                                    message.thread_id)
-                        if rescued:
-                            turn.visible_action_committed = True  # F38: an image did land
-                elif response.type == "error":
-                    # Send error message
+            response = None
+            try:
+                # Immediately before the call, never earlier: a turn that died on the way here
+                # (indicator, queue peek) has to stay distinguishable from one the model ran.
+                participation_telemetry.mark_responder_started(message)
+                response = await self.processor.process_message(message, client, thinking_id,
+                                                                turn=turn)
+
+                # F46: the handler may have flipped a top-level channel reply into a thread (a turn
+                # that did substantive work — resolve_reply_target mutates message.metadata but NOT
+                # these locals). Rebind from the metadata so the fallback send, the footer guard, and
+                # channel_pulse below all agree with the placement text.py actually used. Fail-open:
+                # only rebind when metadata is a dict; a missing key leaves the original value.
+                if isinstance(message.metadata, dict):
+                    place_in_channel = bool(message.metadata.get("place_in_channel", place_in_channel))
+                    post_thread_id = None if place_in_channel else message.thread_id
+
+                # Delete thinking indicator (but not if streaming was used — it's already the
+                # response — and not when a ProgressChecklist owns the thinking message, F4).
+                if (thinking_id and response
+                        and not response.metadata.get("streamed")
+                        and response.metadata.get("checklist") is None):
+                    await client.delete_message(message.channel_id, thinking_id)
+                elif thinking_id and not response:
+                    await client.delete_message(message.channel_id, thinking_id)
+
+                # Handle the response
+                if response:
+                    if response.type == "queued":
+                        # Phase Q: the message joined its conversation's pending queue and
+                        # will be answered by the in-flight turn's batched catch-up. Nothing
+                        # to post (the indicator, if any, was already deleted above).
+                        main_logger.debug(f"Message queued behind in-flight turn for {message.channel_id}:{message.thread_id}")
+                    elif response.type == "text":
+                        # Reaction-only turns (react tool, empty text) post no message at all
+                        if not (response.content or "").strip():
+                            main_logger.debug("Empty text response (reaction-only) — nothing to post")
+                        # If streaming was used, the message is already displayed
+                        elif not response.metadata.get("streamed"):
+                            # Send raw content: send_message formats for the platform itself
+                            # (messaging.py). Pre-formatting here double-ran the converter, and
+                            # format_text is NOT idempotent (italic runs before bold, so a second
+                            # pass turns **bold** → *bold* → _bold_ and renders as italic).
+                            # F8: attach the settings-footer chrome to the message itself (same
+                            # as the native-streaming path's stopStream blocks) instead of a
+                            # separate trailing post. Suppressed for top-level channel placement
+                            # (same rule as the separate footer below) and when block-building is
+                            # unavailable — those fall back to maybe_post_response_footer.
+                            footer_blocks = None
+                            if not place_in_channel and hasattr(client, "attachable_footer_blocks"):
+                                try:
+                                    footer_blocks = client.attachable_footer_blocks(
+                                        message.channel_id, response.metadata.get("model"))
+                                except Exception as e:
+                                    main_logger.debug(f"Footer block build failed: {e}")
+                                    footer_blocks = None
+                            send_meta = {}
+                            sent_ts = await client.send_message(
+                                message.channel_id,
+                                post_thread_id,
+                                response.content,
+                                blocks=footer_blocks,
+                                meta_out=send_meta,
+                            )
+                            # Honest accounting: the ACTUAL send result decides `posted` (a
+                            # failed send must not burn the hourly unprompted quota).
+                            if isinstance(response.metadata, dict):
+                                response.metadata["posted"] = bool(sent_ts)
+                                # Only stand the separate footer down when the chrome ACTUALLY
+                                # rode the message (a split/too-long reply doesn't attach it, so
+                                # the separate footer post must still happen).
+                                if sent_ts and send_meta.get("footer_attached"):
+                                    response.metadata["footer_attached"] = True
+                            # F7: persist tool-use provenance keyed on the reply's real ts.
+                            if sent_ts:
+                                self.processor._persist_tool_provenance(
+                                    message.channel_id, sent_ts,
+                                    f"{message.channel_id}:{message.thread_id}",
+                                    (response.metadata or {}).get("tool_provenance"))
+                        # Phase 7: Configure footer under the response (channels only, any
+                        # member can open settings). Native-streamed responses attach the
+                        # chrome to the message itself on stopStream (footer_attached
+                        # metadata makes this call a no-op); everything else falls back to
+                        # this separate trailing message.
+                        # Best-effort: a cosmetic footer must never break message handling.
+                        # Skipped for top-level placement — it would land as ANOTHER top-level
+                        # message and read as spam.
+                        # No footer under an empty turn (F2 no_reply / reaction-only) — there is
+                        # no message for it to sit under.
+                        # Also skip when the reply didn't actually post (posted is explicitly
+                        # False) — a footer under a message that never landed reads as orphaned.
+                        if (hasattr(client, "maybe_post_response_footer") and not place_in_channel
+                                and (response.content or "").strip()
+                                and (response.metadata or {}).get("posted") is not False):
+                            try:
+                                await client.maybe_post_response_footer(message, response)
+                            except Exception as e:
+                                main_logger.debug(f"Response footer skipped: {e}")
+
+                        # F32: upload any code-interpreter artifacts AFTER the answer lands, so the
+                        # thread reads "explanation, then the chart" rather than the reverse. Runs
+                        # even for an empty-text turn (a chart that speaks for itself). Strictly
+                        # best-effort: the reply is already posted and an upload failure must never
+                        # turn a delivered answer into an error.
+                        artifact_containers = (response.metadata or {}).get("artifact_containers") or []
+                        # Only hang files under an answer that actually landed. If a non-empty reply
+                        # failed to post, a chart arriving alone with no explanation is worse than
+                        # no chart. (A files-only turn has empty content by design — still publish.)
+                        reply_landed = (response.metadata or {}).get("posted") is not False
+                        files_only = not (response.content or "").strip()
+                        published = []
+                        if artifact_containers and (reply_landed or files_only):
+                            try:
+                                from message_processor.artifacts import publish_artifacts
+                                # Whole-phase bound: the answer is already visible, but this still
+                                # holds the turn open, and a wedged upload must not stall the next
+                                # message in the thread.
+                                published = await asyncio.wait_for(
+                                    publish_artifacts(
+                                        openai_client=self.processor.openai_client,
+                                        client=client,
+                                        channel_id=message.channel_id,
+                                        # B2: artifacts always thread. post_thread_id is None on a
+                                        # top-level channel reply, so thread off message.thread_id
+                                        # instead — the chart hangs under the answer, never top-level.
+                                        thread_id=message.thread_id,
+                                        thread_key=f"{message.channel_id}:{message.thread_id}",
+                                        container_ids=artifact_containers,
+                                        db=getattr(self.processor, "db", None),
+                                        message_ts=(message.metadata or {}).get("ts"),
+                                        container_manager=getattr(
+                                            self.processor, "container_manager", None),
+                                        # F35: files the model MOUNTED are ingredients the user
+                                        # already owns — never publish them back, even byte-copied.
+                                        suppress_digests=(response.metadata or {}).get(
+                                            "mounted_digests") or [],
+                                    ),
+                                    timeout=config.artifact_publish_timeout,
+                                )
+                                if published:
+                                    main_logger.info(
+                                        f"Published {len(published)} artifact(s) to the thread")
+                                    # F38: a chart or a deck visibly landed. On an empty-text turn
+                                    # (code interpreter answering with the file itself) the Response
+                                    # says posted=False, and without this the end-of-turn settle
+                                    # would read that as silence and retract the 👀 from a turn that
+                                    # plainly delivered.
+                                    turn.visible_action_committed = True
+                            except asyncio.TimeoutError:
+                                main_logger.error("Artifact publishing timed out — reply already posted")
+                            except Exception as e:
+                                main_logger.error(f"Artifact publishing failed: {e}", exc_info=True)
+                        elif artifact_containers:
+                            main_logger.warning(
+                                "Reply did not post — suppressing its artifacts (a file with no "
+                                "answer above it reads as a bug)")
+
+                        # F34: create_image_asset mounts an image into the sandbox as an
+                        # INGREDIENT, so it is deliberately not published — the deck or composite
+                        # built from it is. But if the turn ended having published nothing at all,
+                        # the model made images and then failed to use them, and they would die
+                        # with the container. A silent no-output turn is the worst failure mode
+                        # here, so hand them over rather than lose them.
+                        if not published:
+                            # B2: rescued sandbox images always thread — pass message.thread_id, not
+                            # post_thread_id (None on a top-level channel reply).
+                            rescued = await self._rescue_sandbox_images(response, client, message,
+                                                                        message.thread_id)
+                            if rescued:
+                                turn.visible_action_committed = True  # F38: an image did land
+                    elif response.type == "error":
+                        # Send error message
+                        await client.handle_error(
+                            message.channel_id,
+                            message.thread_id,
+                            response.content
+                        )
+
+                # Close the attempt with what the room actually SAW. Deliberately not folded into
+                # the contract check below, which is additionally gated on a live pulse — a
+                # delivery-side condition that has nothing to do with whether the outcome is worth
+                # counting. `finish_attempt` is a no-op unless this turn came from the gate and is
+                # still open, which is what keeps mentions, DMs and direct continuations out of a
+                # ledger documented as gate attempts — and what keeps a turn the gate already
+                # closed (a react verdict that fell through to nothing) from closing twice.
+                meta = (response.metadata or {}) if response is not None else {}
+                # What the GATE put in the room before the responder ran. The stamp is written
+                # only on a genuine placement, so it is a fact about Slack, not an intention.
+                gate_reaction = bool((message.metadata or {}).get(
+                    "participation_reaction_emoji"))
+                kind = self._classify_visible_action(response, turn, gate_reaction)
+                participation_telemetry.finish_attempt(
+                    message, kind,
+                    ended_by="responder",
+                    # The reason rides even when the reaction made this a reaction_only: WHY the
+                    # model declined to use words is the same question either way.
+                    silence_reason=participation_telemetry.truncate_reason(
+                        meta.get("reason") if meta.get("terminal_action") == "no_reply" else None),
+                    # A detached producer that owns a surface AND an error afterwards is one turn
+                    # with two outcomes. `kind` keeps the error (it is the more actionable half),
+                    # so the surface has to be recorded beside it or it vanishes from the analysis.
+                    detached_started=(True if kind == "error" and turn is not None
+                                      and getattr(turn, "visible_action_committed", False)
+                                      else None),
+                    # Words AND an emoji is one turn with two visible halves. `kind` names the
+                    # words because they are the louder half, so without this the reaction on a
+                    # react_and_respond exists only in the reaction rows and never in the
+                    # terminal that claims to say what the room saw.
+                    reaction_visible=(True if kind == "reply" and (
+                        gate_reaction or meta.get("response_reaction_committed") is True)
+                        else None),
+                    # WHICH model wrote it. Per-user and per-thread overrides mean two rows in
+                    # this ledger can come from different models, and a reply-quality comparison
+                    # that pools them describes neither. The footer path reads the same key.
+                    model=meta.get("model"),
+                    # An `empty` with no Response object at all is a different contract failure
+                    # from one that returned an empty Response, and only this tells them apart.
+                    detail="no_response_object" if response is None else None,
+                    placement="channel" if place_in_channel else "thread",
+                    chars=len(response.content or "") if kind == "reply" else None,
+                )
+
+                # Post-delivery bookkeeping (F2: accounted AFTER delivery, honest posted). The
+                # reply TALLY that used to live here is gone with the unprompted counter; what
+                # remains is the contract check — a turn that posted nothing and did not call the
+                # terminal no-reply tool is a violation worth catching.
+                if (response and message.channel_id and not message.channel_id.startswith("D")
+                        and getattr(client, "channel_pulse", None) is not None):
+                    terminal = (response.metadata or {}).get("terminal_action")
+                    if terminal == "no_reply":
+                        main_logger.info(
+                            f"no_response_needed — no reply posted "
+                            f"(reason: {response.metadata.get('reason')!r})")
+                    else:
+                        posted = response.metadata.get("posted")
+                        if posted is None:
+                            # Non-streaming handlers can't know; derive from the outcome.
+                            posted = bool(
+                                response.type == "text"
+                                and (response.metadata.get("streamed")
+                                     or (response.content or "").strip()))
+                        if (not posted and response.type == "text"
+                                and not (response.content or "").strip()
+                                and not response.metadata.get("reaction_only")):
+                            # Bare empty text without the terminal tool: contract violation.
+                            # Fail-safe silence, no re-prompt this phase.
+                            main_logger.warning(
+                                "Empty text response without a terminal action — posting nothing")
+
+            except Exception as e:
+                main_logger.error(f"Error handling message: {e}", exc_info=True)
+                # Closed FIRST, before the two best-effort awaits below: either of them can fail
+                # too, and the terminal event must not depend on our apology getting out.
+                #
+                # DELIVERY WINS. Everything between the send and the close above is bookkeeping —
+                # provenance persistence, artifact publishing, the footer — and any of it can
+                # raise long after Slack has the reply. Filing that as `error_unhandled` deletes
+                # a delivered answer from the talk rate and files it under failures, so a bad
+                # afternoon in the artifact path would read as a bot that stopped answering. The
+                # room saw the reply; the ledger says so, and says the turn was not clean.
+                delivered = response is not None and (response.metadata or {}).get("posted")
+                if delivered:
+                    participation_telemetry.finish_attempt(
+                        message,
+                        self._classify_visible_action(
+                            response, turn,
+                            bool((message.metadata or {}).get(
+                                "participation_reaction_emoji"))),
+                        ended_by="responder", post_delivery_error=type(e).__name__)
+                else:
+                    participation_telemetry.finish_attempt(
+                        message, "error_unhandled", ended_by="responder",
+                        detail=type(e).__name__)
+
+                # Delete thinking indicator on error — best-effort; a failed delete
+                # must never swallow the user-facing notice below.
+                if thinking_id:
+                    try:
+                        await client.delete_message(message.channel_id, thinking_id)
+                    except Exception as delete_error:
+                        main_logger.error(f"Failed to delete thinking indicator: {delete_error}")
+
+                # Fixed, friendly notice — the raw exception stays in the logs only.
+                try:
                     await client.handle_error(
                         message.channel_id,
                         message.thread_id,
-                        response.content
+                        "⚠️ **Something Went Wrong**\n\n"
+                        "I hit a snag finishing that response. Please try again in a moment."
                     )
-
-            # Post-delivery bookkeeping (F2: accounted AFTER delivery, honest posted). The
-            # reply TALLY that used to live here is gone with the unprompted counter; what
-            # remains is the contract check — a turn that posted nothing and did not call the
-            # terminal no-reply tool is a violation worth catching.
-            if (response and message.channel_id and not message.channel_id.startswith("D")
-                    and getattr(client, "channel_pulse", None) is not None):
-                terminal = (response.metadata or {}).get("terminal_action")
-                if terminal == "no_reply":
-                    main_logger.info(
-                        f"no_response_needed — no reply posted "
-                        f"(reason: {response.metadata.get('reason')!r})")
-                else:
-                    posted = response.metadata.get("posted")
-                    if posted is None:
-                        # Non-streaming handlers can't know; derive from the outcome.
-                        posted = bool(
-                            response.type == "text"
-                            and (response.metadata.get("streamed")
-                                 or (response.content or "").strip()))
-                    if (not posted and response.type == "text"
-                            and not (response.content or "").strip()
-                            and not response.metadata.get("reaction_only")):
-                        # Bare empty text without the terminal tool: contract violation.
-                        # Fail-safe silence, no re-prompt this phase.
-                        main_logger.warning(
-                            "Empty text response without a terminal action — posting nothing")
-
-        except Exception as e:
-            main_logger.error(f"Error handling message: {e}", exc_info=True)
-
-            # Delete thinking indicator on error — best-effort; a failed delete
-            # must never swallow the user-facing notice below.
-            if thinking_id:
+                except Exception as notify_error:
+                    main_logger.error(f"Failed to send error notice: {notify_error}")
+            finally:
+                # F38: settle the work claim. Runs in `finally` so an exception, a cancellation,
+                # or an early return can't strand a 👀 on a message the bot then ignored.
                 try:
-                    await client.delete_message(message.channel_id, thinking_id)
-                except Exception as delete_error:
-                    main_logger.error(f"Failed to delete thinking indicator: {delete_error}")
+                    await turn.settle_ack(
+                        client, self._produced_visible_output(response, turn))
+                except Exception as ack_error:  # noqa: BLE001
+                    main_logger.debug(f"Ack settle failed: {ack_error}")
 
-            # Fixed, friendly notice — the raw exception stays in the logs only.
-            try:
-                await client.handle_error(
-                    message.channel_id,
-                    message.thread_id,
-                    "⚠️ **Something Went Wrong**\n\n"
-                    "I hit a snag finishing that response. Please try again in a moment."
-                )
-            except Exception as notify_error:
-                main_logger.error(f"Failed to send error notice: {notify_error}")
+                # Native-streamed replies don't trip Slack's "auto-clear status on reply"
+                # (it keys on chat.postMessage, not chat.stopStream), so a status-only turn
+                # left the working bubble spinning forever (user report 2026-07-10).
+                # Explicit best-effort clear. Skipped for queued turns — their status
+                # belongs to the in-flight request that will answer them.
+                # Also skipped for background image gen (background_owns_status): the job owns
+                # the status-only progress surface and clears it on completion — clearing here
+                # would blank it the instant the turn returns (Codex finding 8).
+                # F38: and skipped entirely when progress was deferred — there is no status to
+                # clear, and clearing one we never set would auto-open the thread to say so.
+                if (thinking_id is None
+                        and turn.progress_enabled
+                        and not (response is not None and response.type == "queued")
+                        and not (response is not None and response.metadata.get("background_owns_status"))
+                        and hasattr(client, "clear_assistant_status")):
+                    try:
+                        await client.clear_assistant_status(message.channel_id, post_thread_id)
+                    except Exception as clear_error:
+                        main_logger.debug(f"Assistant status clear failed: {clear_error}")
         finally:
-            # F38: settle the work claim. Runs in `finally` so an exception, a cancellation,
-            # or an early return can't strand a 👀 on a message the bot then ignored.
-            try:
-                await turn.settle_ack(
-                    client, self._produced_visible_output(response, turn))
-            except Exception as ack_error:  # noqa: BLE001
-                main_logger.debug(f"Ack settle failed: {ack_error}")
-
-            # Native-streamed replies don't trip Slack's "auto-clear status on reply"
-            # (it keys on chat.postMessage, not chat.stopStream), so a status-only turn
-            # left the working bubble spinning forever (user report 2026-07-10).
-            # Explicit best-effort clear. Skipped for queued turns — their status
-            # belongs to the in-flight request that will answer them.
-            # Also skipped for background image gen (background_owns_status): the job owns
-            # the status-only progress surface and clears it on completion — clearing here
-            # would blank it the instant the turn returns (Codex finding 8).
-            # F38: and skipped entirely when progress was deferred — there is no status to
-            # clear, and clearing one we never set would auto-open the thread to say so.
-            if (thinking_id is None
-                    and turn.progress_enabled
-                    and not (response is not None and response.type == "queued")
-                    and not (response is not None and response.metadata.get("background_owns_status"))
-                    and hasattr(client, "clear_assistant_status")):
-                try:
-                    await client.clear_assistant_status(message.channel_id, post_thread_id)
-                except Exception as clear_error:
-                    main_logger.debug(f"Assistant status clear failed: {clear_error}")
+            participation_telemetry.abort_attempt(message)
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals - double Ctrl-C for force exit"""

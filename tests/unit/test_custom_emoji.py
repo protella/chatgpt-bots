@@ -209,15 +209,32 @@ async def _classifier_prompt(signals):
 
 
 @pytest.mark.asyncio
-async def test_classifier_renders_customs_when_no_allowlist(monkeypatch):
+async def test_customs_are_offered_as_names_with_no_popularity_claim(monkeypatch):
+    """Custom names are worth surfacing; a ranking over them is not, at any list length.
+
+    Measured 2026-07-26 in the shared test channel, both assistants answering the same room:
+    ranking these by observed use and calling them "this team's own vocabulary" concentrated our
+    social reactions onto 14 distinct emoji across 38, with :dumpster-fire: alone at 24%.
+    Anthropic's bot spread 43 reactions over 32 distinct names, most-used at 7% — and it has no
+    ranked palette at all, just an opt-in name lookup. So the tally no longer steers anything and
+    the list carries no ordering claim. Names the model cannot guess exist (:absolutecinema:) are
+    the entire remaining value.
+
+    A previous revision gated the framing on a hand-picked count of observed names. That was an
+    arbitrary threshold and is gone; there is one framing at every length."""
     monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
-    prompt = await _classifier_prompt({"workspace_custom_emojis": ["party_parrot", "shipit"]})
-    # Framed as the ROOM'S vocabulary, in observed-usage order — not a neutral catalog slice.
-    # The ordering carries the ranking, so the line must present it as meaningful.
-    assert "Custom emoji THIS WORKSPACE actually reacts with, most-used first" in prompt
-    assert "party_parrot, shipit" in prompt
-    assert "every standard Slack emoji also remains available" in prompt
-    assert "this team's own vocabulary" in prompt
+    for names in (["squirrel", "dumpster-fire", "absolutecinema"],
+                  ["party_parrot", "shipit", "rocket", "facepalm", "yay", "boom", "sadpanda",
+                   "tada2", "yolo"]):
+        prompt = await _classifier_prompt({"workspace_custom_emojis": names})
+        assert ", ".join(names) in prompt
+        # No claim that the order means anything, or that these are what the team favours.
+        assert "most-used first" not in prompt
+        assert "this team's own vocabulary" not in prompt
+        assert "prefer one of these" not in prompt
+        assert "do not stretch one to fit" in prompt
+        # Standard emoji stay on the table, so the model can still react with anything apt.
+        assert "any standard Slack emoji name (shorthand, no colons)" in prompt
 
 
 @pytest.mark.asyncio
@@ -237,8 +254,15 @@ async def test_classifier_no_customs_line_when_none(monkeypatch):
 
 
 def _gate_app(monkeypatch, customs):
+    """A gate wired to a fake engine, plus the declines it produced.
+
+    `evaluate` returns a GateEvaluation, which is what the engine actually returns — a bare
+    ParticipationVerdict makes the gate raise on `.decline_cause` and swallow it as silence, so
+    these tests passed while asserting the classifier inputs of a call the real code never
+    completes. `declines` exists so each test can prove the gate ran its real path.
+    """
     from main import ChatBotV2
-    from message_processor.participation import ParticipationVerdict
+    from message_processor.participation import GateEvaluation, ParticipationVerdict
     monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
     monkeypatch.setattr("message_processor.canvas_tools.build_catalog",
                         AsyncMock(return_value=[]))
@@ -246,11 +270,16 @@ def _gate_app(monkeypatch, customs):
     app.processor = MagicMock()
     app.processor.db.get_channel_memory_async = AsyncMock(return_value=[])
     captured = {}
+    declines = []
 
     async def _eval(**kw):
         captured.update(kw)
-        return ParticipationVerdict(action="ignore")
+        return GateEvaluation(verdict=ParticipationVerdict(action="ignore"))
 
+    def _decline(channel_id=None, trigger_ts=None, cause=None, **fields):
+        declines.append(cause)
+
+    monkeypatch.setattr("message_processor.participation_telemetry.gate_declined", _decline)
     app.participation_engine = MagicMock()
     app.participation_engine.evaluate = _eval
     app.participation_engine.note_arrival = MagicMock()
@@ -261,7 +290,7 @@ def _gate_app(monkeypatch, customs):
     msg = Message(text="x", user_id="U1", channel_id="C1", thread_id="10.0",
                   metadata={"ts": "10.0", "participation_check": True,
                             "participation_level": "judicious"})
-    return app, client, msg, captured
+    return app, client, msg, captured, declines
 
 
 @pytest.mark.asyncio
@@ -270,7 +299,7 @@ async def test_gate_feeds_observed_customs_ranked_by_use(monkeypatch):
     # alphabetical slice. `rare` is alphabetically first and least used; it must come LAST.
     monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
     monkeypatch.setattr(config, "participation_custom_emoji_cap", 3, raising=False)
-    app, client, msg, captured = _gate_app(
+    app, client, msg, captured, declines = _gate_app(
         monkeypatch, ["rare", "shipit", "party_parrot", "elsewhere"])
     pulse = ChannelPulse()
     for _ in range(5):
@@ -286,6 +315,7 @@ async def test_gate_feeds_observed_customs_ranked_by_use(monkeypatch):
     # cap=3 → the three most-used. `elsewhere` (1 use, another channel) IS counted but ranks
     # 4th, so it falls outside the cap; the next test proves cross-channel aggregation directly.
     assert captured["workspace_custom_emojis"] == ["shipit", "party_parrot", "rare"]
+    assert declines == []            # the real gate path ran, not its except-clause
 
 
 @pytest.mark.asyncio
@@ -295,12 +325,13 @@ async def test_gate_palette_includes_other_channels(monkeypatch):
     # gets the team's vocabulary instead of nothing.
     monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
     monkeypatch.setattr(config, "participation_custom_emoji_cap", 10, raising=False)
-    app, client, msg, captured = _gate_app(monkeypatch, ["elsewhere"])
+    app, client, msg, captured, declines = _gate_app(monkeypatch, ["elsewhere"])
     pulse = ChannelPulse()
     pulse.add_reaction("CZ", "14.0", "elsewhere")        # never seen in C1, the gated channel
     client.channel_pulse = pulse
     assert await app._gate_verdict(msg, client) is None
     assert captured["workspace_custom_emojis"] == ["elsewhere"]
+    assert declines == []
 
 
 @pytest.mark.asyncio
@@ -308,18 +339,20 @@ async def test_gate_sends_no_customs_when_nothing_observed_yet(monkeypatch):
     # The point of the rewrite: with no observed usage the gate sends NOTHING rather than
     # falling back to an alphabetical slice. Standard emoji are the fallback; junk is not.
     monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
-    app, client, msg, captured = _gate_app(monkeypatch, [f"c{i}" for i in range(10)])
+    app, client, msg, captured, declines = _gate_app(monkeypatch, [f"c{i}" for i in range(10)])
     client.channel_pulse = ChannelPulse()                        # nothing observed yet
     assert await app._gate_verdict(msg, client) is None
     assert captured["workspace_custom_emojis"] == []
+    assert declines == []
 
 
 @pytest.mark.asyncio
 async def test_gate_omits_customs_when_allowlist_set(monkeypatch):
     monkeypatch.setattr(config, "reaction_emojis", ["thumbsup"], raising=False)
-    app, client, msg, captured = _gate_app(monkeypatch, ["party_parrot"])
+    app, client, msg, captured, declines = _gate_app(monkeypatch, ["party_parrot"])
     assert await app._gate_verdict(msg, client) is None
     assert captured["workspace_custom_emojis"] == []             # never injected over an allowlist
+    assert declines == []
 
 
 # =============================================================== _coerce_emoji + executor

@@ -25,12 +25,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from config import config, valid_emoji_name
-from message_processor import gate_vision
+from message_processor import gate_vision, participation_telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +210,27 @@ class ParticipationVerdict:
     burst_earlier: Optional[List[str]] = None
 
 
+@dataclass
+class GateEvaluation:
+    """What ONE evaluation produced — the verdict, and, when there isn't one to act on, why.
+
+    `evaluate()` used to return `ParticipationVerdict | None`, which left the caller unable to
+    tell a burst collapse from an edit cancellation from a provider outage. It could only find
+    out by reading the engine's log lines, which is a side channel between two layers of the
+    same call: the caller owns the turn's single terminal event and has to be able to say what
+    ended it. So the cause comes back in the return value.
+
+    `decline_cause` is superseded | edit_superseded | classifier_error, or None on a real
+    verdict. On `classifier_error` the `verdict` field is still populated — validate_verdict(None)
+    produces the fail-safe `ignore` exactly as before, so terminal behaviour is unchanged — but
+    the cause says it was manufactured, and the caller must not score it as judgment.
+    """
+    verdict: Optional[ParticipationVerdict] = None
+    decline_cause: Optional[str] = None
+    # The model call alone, in ms. NOT the gate's wall time, which is mostly debounce.
+    classifier_ms: Optional[int] = None
+
+
 class ParticipationEngine:
     """Debounced wrapper around one utility-model judgment call."""
 
@@ -374,14 +396,21 @@ class ParticipationEngine:
                        images: Optional[List[Dict]] = None,
                        client: Any = None,
                        pulse: Any = None,
-                       thread_root_ts: Optional[str] = None) -> Optional[ParticipationVerdict]:
-        """Debounced judgment. Returns None when superseded — a newer message in the SAME
-        conversation (this thread, or this sender's top-level stream — F21/F27) arrived
-        during the debounce window. F27: the survivor of a same-author TOP-LEVEL burst
+                       thread_root_ts: Optional[str] = None,
+                       attempt_id: Optional[str] = None) -> GateEvaluation:
+        """Debounced judgment, returned as a GateEvaluation.
+
+        `verdict` is None when superseded — a newer message in the SAME conversation (this
+        thread, or this sender's top-level stream — F21/F27) arrived during the debounce
+        window. `decline_cause` says which kind of nothing that was, because the CALLER owns
+        the turn's single terminal event and cannot read it off a log line. `attempt_id` is
+        the gate's id for this attempt; it rides the diagnostics and changes no behaviour.
+
+        F27: the survivor of a same-author TOP-LEVEL burst
         collects the superseded siblings' texts into burst_earlier so its ONE reply covers
-        the whole burst; a superseded evaluation returns None but LEAVES its pending entry
-        for that survivor. Activity in other conversations (or from other senders at top
-        level) never supersedes.
+        the whole burst; a superseded evaluation returns no verdict but LEAVES its pending
+        entry for that survivor. Activity in other conversations (or from other senders at
+        top level) never supersedes.
 
         Burst CARRY is top-level-only: a top-level stream key (channel|top|<sender>) is
         per-author, so its collected siblings are guaranteed same-sender. A thread key
@@ -407,12 +436,15 @@ class ParticipationEngine:
             # Superseded — our pending entry stays for the burst's survivor. Release any held
             # image jobs promptly to the vision worker (this message's own images still get
             # analyzed; the gate just never looked at them). Never let it affect the return.
+            participation_telemetry.gate_declined(
+                channel_id, ts, cause="superseded", attempt_id=attempt_id,
+                survivor_ts=self._latest.get(key))
             if svc is not None:
                 try:
                     svc.resolve_gate(channel_id, ts, {})
                 except Exception:  # noqa: BLE001
                     pass
-            return None
+            return GateEvaluation(decline_cause="superseded")
 
         # F52: an edit-triggered evaluation carries edit context (old text + already-replied),
         # stashed on the Slack facade by the message-events edit path and keyed by (channel, ts).
@@ -428,12 +460,14 @@ class ParticipationEngine:
         # exempt (only the context-free original consumes the mark). This is the primary fix; the
         # queue-drop backstop covers a respond dispatch that already slipped into the busy queue.
         if edit_context is None and self._consume_edit_supersession(key, ts):
+            participation_telemetry.gate_declined(channel_id, ts, cause="edit_superseded",
+                                                  attempt_id=attempt_id)
             if svc is not None:
                 try:
                     svc.resolve_gate(channel_id, ts, {})
                 except Exception:  # noqa: BLE001
                     pass
-            return None
+            return GateEvaluation(decline_cause="edit_superseded")
 
         # F27: we survived the debounce — always drain this stream's pending siblings (bucket
         # hygiene), but only CARRY them as a burst at top level, where the per-sender key
@@ -521,6 +555,11 @@ class ParticipationEngine:
         # F52: fold the edit context into the message the CLASSIFIER sees, not the Message.text
         # the responder later uses. The system prompt's edited-message rule reads the [EDIT] block.
         classifier_text = self._augment_text_with_edit(text, edit_context) if edit_context else text
+        # Timed around the model call and NOTHING else. The gate's own wall time is dominated
+        # by the debounce sleep, so reading it as classifier latency blames the provider for a
+        # delay we chose. Measured on failure too — a timeout's duration is the story.
+        classifier_started = time.monotonic()
+        detail: Optional[str] = None
         try:
             # `images` only rides when there ARE images: the text-only call keeps its exact old
             # shape, so nothing that never sees a picture changes behaviour by one token.
@@ -528,8 +567,25 @@ class ParticipationEngine:
             if image_parts:
                 call_kwargs["images"] = image_parts
             raw = await self.openai_client.classify_participation(**call_kwargs)
-        except Exception:
+        except Exception as e:  # noqa: BLE001
             raw = None  # fail-safe: silence, never spam
+            detail = type(e).__name__
+        classifier_ms = int((time.monotonic() - classifier_started) * 1000)
+        # `raw is None` is now the single failure signal: classify_participation returns None on
+        # its own internal fail-safes (API exception, unparseable output) instead of a forged
+        # {"action": "ignore"}. Downstream this still becomes an `ignore` verdict, so behaviour
+        # is byte-identical — but an `ignore` the MODEL chose and an `ignore` we manufactured
+        # after an outage are no longer the same row, and a bad afternoon at the provider is
+        # never scored as good judgment.
+        classifier_failed = raw is None
+        if classifier_failed:
+            participation_telemetry.gate_declined(
+                channel_id, ts, cause="classifier_error", attempt_id=attempt_id,
+                detail=detail, classifier_ms=classifier_ms,
+                # WHICH model failed. `gate_decision` carries this, so without it here a utility
+                # model swap can be judged on its verdicts but not on its failure rate — and the
+                # failure rate is the half that decides whether the swap was worth it.
+                model=getattr(config, "utility_model", None))
         verdict = self.validate_verdict(raw)
         # F27: attach AFTER validate_verdict (which stays pure) so the survivor's reply can
         # be told about the earlier same-author messages it must also address.
@@ -547,18 +603,27 @@ class ParticipationEngine:
                 svc.resolve_gate(channel_id, ts, observations)
             except Exception as e:  # noqa: BLE001 — piggyback never alters/delays the verdict
                 logger.debug(f"gate/ambient piggyback failed (worker path covers): {e}")
-        return verdict
+        return GateEvaluation(
+            verdict=verdict,
+            decline_cause="classifier_error" if classifier_failed else None,
+            classifier_ms=classifier_ms)
 
     @staticmethod
     def _take_edit_context(client: Any, channel_id: str, ts: str) -> Optional[Dict[str, Any]]:
         """F52: pop this message's edit context from the Slack facade, where the message-events
         edit path stashed it, keyed by (channel, ts) — the SAME ts an edit keeps. Returns None
         for every ordinary message (the store is absent) or in tests without a facade. Popping
-        (not peeking) means a re-evaluation of the same ts falls back to a plain judgment."""
+        (not peeking) means a re-evaluation of the same ts falls back to a plain judgment.
+
+        The store must be an ACTUAL dict, not merely truthy. A MagicMock client answers every
+        attribute with another truthy mock whose .pop() returns a mock, so `not store` let a
+        fake edit context through: the classifier prompt silently grew an [EDIT] block and the
+        edit-supersession check was suppressed. That made a whole class of test pass against a
+        prompt production never sends — evidence about a code path that does not exist."""
         if client is None or not channel_id or not ts:
             return None
         store = getattr(client, "_edit_reply_ctx_map", None)
-        if not store:
+        if not isinstance(store, dict) or not store:
             return None
         try:
             return store.pop(f"{channel_id}|{ts}", None)
