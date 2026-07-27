@@ -75,7 +75,8 @@ async def test_quoted_or_ambient_name_hit_is_refused():
     db = _writable_db(before={"participation_level": "judicious"})
     ctx, res = await _run(
         {"sender_type": "human", "mentioned_self": False,
-         "participation_check": True, "participation_name_hit": True}, db)
+         "gate_required": True, "silence_capable": True,
+         "participation_name_hit": True}, db)
     assert ctx.structural_change_authorized is False
     assert res["ok"] is False and res["error"] == "not_addressed"
     db.set_channel_settings_async.assert_not_awaited()
@@ -98,7 +99,8 @@ async def test_human_unaddressed_non_structural_respond_turn_is_refused():
     # request) must NOT authorize a settings change even though the model is answering.
     db = _writable_db(before={"participation_level": "judicious"})
     ctx, res = await _run(
-        {"sender_type": "human", "mentioned_self": False, "participation_check": True}, db)
+        {"sender_type": "human", "mentioned_self": False,
+         "gate_required": True, "silence_capable": True}, db)
     assert ctx.structural_change_authorized is False
     assert res["ok"] is False and res["error"] == "not_addressed"
     db.set_channel_settings_async.assert_not_awaited()
@@ -128,7 +130,8 @@ async def test_human_unaddressed_structural_request_is_allowed():
     db = _writable_db(before=before, after=after)
     ctx, res = await _run(
         {"sender_type": "human", "mentioned_self": False,
-         "participation_check": True, "gate_authorized_structural": True}, db)
+         "gate_required": True, "silence_capable": True,
+         "gate_authorized_structural": True}, db)
     assert ctx.structural_change_authorized is True
     assert res["ok"] is True
     db.set_channel_settings_async.assert_awaited_once()

@@ -9,6 +9,7 @@ from slack_sdk.errors import SlackApiError
 
 from base_client import Message
 from config import config
+from message_processor.routing_facts import stamp_routing_facts
 from slack_client.channel_pulse import pulse_supplementary_budget as _pulse_supplementary_budget
 from slack_client.formatting.blocks import extract_supplementary_text
 
@@ -763,7 +764,11 @@ class SlackMessageEventsMixin:
         message.thread_id = synthetic.get("thread_ts") or msg_ts
         message.metadata["channel_listen"] = True
         message.metadata["participation_level"] = level
-        message.metadata["participation_check"] = True
+        # An edit re-dispatch is ambient traffic that must pass the gate — and, like any
+        # gate-routed turn, the responder may decide the edit deserves no words at all.
+        stamp_routing_facts(message, gate_required=True, silence_capable=True,
+                            addressed=False, ts=msg_ts,
+                            thread_ts=synthetic.get("thread_ts"))
         # F52: mark this as the EDIT's own dispatch so the queue drain keeps it (a queued PRE-EDIT
         # dispatch for the same ts carries no marker and is dropped as stale).
         if marker is not None:
@@ -947,11 +952,11 @@ class SlackMessageEventsMixin:
         # disabled → legacy deterministic name wake (humans only — a bot naming us
         # must never trigger a judgment-free reply, that's a loop seed).
         engine_on = getattr(config, "enable_participation_engine", True)
-        participation_check = False
+        gate_required = False
         if direct_continuation:
             pass  # respond directly
         elif engine_on and (level in ("judicious", "active") or name_hit):
-            participation_check = True
+            gate_required = True
         elif not engine_on and name_hit and not sender_is_bot:
             pass  # legacy deterministic name wake (engine disabled)
         else:
@@ -981,8 +986,15 @@ class SlackMessageEventsMixin:
             message.metadata["wake_source"] = "name_mention"
         else:
             message.metadata["wake_source"] = "ambient"
-        if participation_check:
-            message.metadata["participation_check"] = True
+        # The routing facts, stamped on EVERY dispatch out of this path — including the two
+        # routes that need no gate. A turn may end in silence when the gate judged it (the
+        # model that woke it can also decide there is nothing to add) or when it is a 1:1
+        # thread continuation (no gate ran, so the responder is the only decider); the
+        # engine-off legacy name wake is a deterministic answer and owes words.
+        stamp_routing_facts(message, gate_required=gate_required,
+                            silence_capable=gate_required or direct_continuation,
+                            addressed=False, ts=ts, thread_ts=thread_ts)
+        if gate_required:
             if name_hit:
                 message.metadata["participation_name_hit"] = True
             if sender_is_bot:
@@ -1016,7 +1028,7 @@ class SlackMessageEventsMixin:
         self.log_debug(
             f"Channel message dispatch: channel={channel_id}, ts={ts}, level={level}, "
             f"name_hit={name_hit}, direct_continuation={direct_continuation}, "
-            f"participation_check={participation_check}"
+            f"gate_required={gate_required}"
         )
         if self.message_handler:
             await self.message_handler(message, self)
@@ -1055,6 +1067,14 @@ class SlackMessageEventsMixin:
         message = await self._event_to_message(event, client)
         if wake_source:
             message.metadata["wake_source"] = wake_source
+        # This path is only ever reached by a message that ADDRESSED us — a DM, a real
+        # @mention, or the edit path's synthetic addressed wake — so it runs no gate and owes
+        # an answer. Stamped here rather than at each of the three dispatch sites below, and
+        # stamped even though three of the four facts are False: an absent fact and a False
+        # one must never look the same downstream.
+        stamp_routing_facts(message, gate_required=False, silence_capable=False,
+                            addressed=True, ts=event.get("ts"),
+                            thread_ts=event.get("thread_ts"))
         user_id = event.get("user")
 
         # Phase E: an @mention in a channel is also a wake — seed the pulse ring so the

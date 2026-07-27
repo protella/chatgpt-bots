@@ -234,7 +234,10 @@ retry mid-turn can no longer see different facts than the attempt it's retrying.
 Every unprompted-message decision — woke or declined, reacted or stayed silent, and why — is now
 one JSON line in `logs/participation.jsonl`, including the declines that previously left no trace
 anywhere. Off switch: `ENABLE_PARTICIPATION_TELEMETRY=false`. It changes no behavior; it exists so
-"is it talking too much?" can be answered from data instead of vibes.
+"is it talking too much?" can be answered from data instead of vibes. Messages that arrive while
+the bot is mid-reply and get folded into its next answer are now linked in the ledger to the turn
+that actually covered them, so a coalesced burst reads as one answered conversation instead of
+dropped messages.
 
 ### 🔇 Fixed - It occasionally went silent for no reason
 

@@ -78,7 +78,8 @@ def test_quoted_or_ambient_name_drop_does_not_enable_delete():
     # bot". The old signal authorized it (name regex); the new one does not.
     flag, gate, in_schema = _delete_offered(
         {"sender_type": "human", "mentioned_self": False,
-         "participation_check": True, "participation_name_hit": True})
+         "gate_required": True, "silence_capable": True,
+         "participation_name_hit": True})
     assert flag is False and gate is False and in_schema is False
 
 
@@ -86,7 +87,8 @@ def test_human_ambient_respond_turn_does_not_enable_delete():
     # An ordinary ambient respond turn (human, no mention, not a DM) must NOT expose delete even
     # though the model is answering — the model is acting on its own initiative here.
     flag, gate, in_schema = _delete_offered(
-        {"sender_type": "human", "mentioned_self": False, "participation_check": True})
+        {"sender_type": "human", "mentioned_self": False,
+         "gate_required": True, "silence_capable": True})
     assert flag is False and gate is False and in_schema is False
 
 
@@ -120,5 +122,6 @@ def test_name_addressed_participation_turn_with_a_real_mention_enables_delete():
     # exactly the intended tightening.
     flag, gate, in_schema = _delete_offered(
         {"sender_type": "human", "mentioned_self": True,
-         "participation_check": True, "participation_name_hit": True})
+         "gate_required": True, "silence_capable": True,
+         "participation_name_hit": True})
     assert flag is True and gate is True and in_schema is True

@@ -70,15 +70,14 @@ class TurnRuntime:
 
     @classmethod
     def for_message(cls, message: Any, reply_thread_id: Optional[str]) -> "TurnRuntime":
-        """Silence-capable == exactly the turns where `no_response_needed` is on the table:
-        an unprompted channel message the wake gate let through, or a 1:1 thread continuation
-        (which skips the gate entirely — there the model is the ONLY decider). Mirrors
-        text.py::_materialize_request_tools; keep them in step."""
+        """Silence-capable == the routing fact of the same name, and nothing else. Which routes
+        may end without words is decided once at dispatch (routing_facts.py); this used to
+        re-derive it from a gate flag plus a `wake_source` string, which is a second copy of
+        that table living where nobody would think to update it. The config switch stays
+        here — the route says whether silence is allowed, the flag says whether the tool that
+        performs it exists. Mirrors text.py::_materialize_request_tools; keep them in step."""
         meta = getattr(message, "metadata", None) or {}
-        unprompted = meta.get("participation_check") is True
-        continuation = (not unprompted
-                        and meta.get("wake_source") == "thread_continuation")
-        silence_capable = ((unprompted or continuation)
+        silence_capable = (meta.get("silence_capable") is True
                            and bool(getattr(config, "enable_no_reply_tool", True)))
 
         # F39 — the "(edited)" rule. Slack can only STREAM into a thread: chat.startStream
