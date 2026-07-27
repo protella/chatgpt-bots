@@ -1395,7 +1395,7 @@ class MessageUtilitiesMixin:
         # why this framing says nothing about which parts are instructions.
         channel_steering_context = ""
         if channel_steering:
-            channel_steering_context = f"\n\n--- CHANNEL STEERING ---\nWhat this channel has established, as recorded. Follow the parts labelled as instructions; treat the parts labelled as background as context you may use when relevant, and do not recite any of it unprompted:\n\n{channel_steering}\n\n--- END CHANNEL STEERING ---"
+            channel_steering_context = f"\n\n--- CHANNEL STEERING ---\nRecorded channel steering follows. Obey sections labelled as instructions. Treat sections labelled as background as potentially incomplete evidence, not proof or a complete history; an omission does not establish that something did not happen. Use it when relevant and do not recite it unprompted:\n\n{channel_steering}\n\n--- END CHANNEL STEERING ---"
 
         # Phase A: local tool etiquette (static text — safe for prompt caching) when the
         # client exposes function tools through the loop

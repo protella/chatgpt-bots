@@ -143,27 +143,50 @@ def test_tool_provenance_ground_truth_instruction_present():
 
 
 def test_grounding_rule_governs_binding_not_just_sourcing():
-    """The live failure that motivated this: asked why a nightly job slowed down, the bot answered
-    "you just called it a minute ago: replica warmup was the culprit" — lifting a cause from an
-    unrelated message someone had sent a colleague three minutes earlier.
+    """The live failure that motivated the rule: asked why a nightly job slowed down, the bot
+    answered "you just called it a minute ago: replica warmup was the culprit" — lifting a cause
+    from an unrelated message someone had sent a colleague three minutes earlier.
 
-    The pre-existing Truthfulness rule did not catch it, and could not: it governs SOURCING, and
-    the bot had genuinely called fetch_channel_history. What was unsupported was the LINK it drew
-    between two records. This paragraph is that missing rule, so it must keep saying so."""
+    The pre-existing Truthfulness rule did not catch it and could not: it governs SOURCING, and the
+    bot had genuinely called fetch_channel_history. What was unsupported was the LINK it drew
+    between two records.
+
+    REWRITTEN as evidence-not-proof. The first version was categorical — it told the bot what it
+    could not conclude, and a rule phrased that way invites the opposite failure, where an empty
+    lookup gets reported as a fact about the world ("that never happened") because absence felt
+    like a finding. This version says what the material IS: evidence about the room, incomplete by
+    nature, with strength that has to be carried honestly in both directions."""
     assert "Grounding:" in SLACK_SYSTEM_PROMPT
-    # Support for a record is not support for a link between records.
-    assert "not that some link you drew between two of them is real" in SLACK_SYSTEM_PROMPT
-    # Interleaved conversations, and fragments whose other half is invisible.
-    assert "several conversations interleaved" in SLACK_SYSTEM_PROMPT
-    # Adjacency and topical similarity are explicitly denied as evidence.
-    assert "never because the topics rhyme" in SLACK_SYSTEM_PROMPT
-    # A pronoun in someone else's message points back into THEIR exchange.
-    assert "points back into their own conversation" in SLACK_SYSTEM_PROMPT
-    # Claim strength is preserved rather than hardened.
-    assert "Keep a claim exactly as strong as its source" in SLACK_SYSTEM_PROMPT
-    # And the anti-hedge clause, without which this rule turns the bot to mush — the eval
-    # measures that cost directly (tests/integration/grounding_eval.py).
-    assert "when the support is there, say it plainly" in SLACK_SYSTEM_PROMPT
+    # The frame: what the bot can read is a partial record, not the events themselves.
+    assert "evidence about the room, not proof of everything that happened in it" in SLACK_SYSTEM_PROMPT
+    assert "partial, stale, mistaken, or missing the exchange that gives a line its meaning" \
+        in SLACK_SYSTEM_PROMPT
+    # THE new half: not finding something is a fact about the lookup, not about the world.
+    assert "Absence of evidence is not evidence that something did not happen" in SLACK_SYSTEM_PROMPT
+    assert "say only that you did not find it there" in SLACK_SYSTEM_PROMPT
+    # Adjacency, topic and a shared system name are explicitly denied as links.
+    assert "Do not invent links between records" in SLACK_SYSTEM_PROMPT
+    assert "proximity, similar topics, or the same system name" in SLACK_SYSTEM_PROMPT
+    # A related record is offered as a lead, not served as the answer.
+    assert "report a related record as a lead, not as the answer" in SLACK_SYSTEM_PROMPT
+    # Claim strength is preserved rather than hardened, and stays attributed.
+    assert "Keep every claim exactly as strong as its source" in SLACK_SYSTEM_PROMPT
+    assert "attribute it to whoever said it, about what they were actually discussing" \
+        in SLACK_SYSTEM_PROMPT
+    # And the anti-hedge clause, without which this rule turns the bot to mush.
+    assert "do not hedge ceremonially" in SLACK_SYSTEM_PROMPT
+    assert "when the evidence is sufficient, answer directly" in SLACK_SYSTEM_PROMPT
+
+
+def test_the_categorical_phrasing_is_gone():
+    """The sentences the rewrite replaced. Pinned as absences because the old wording reads as
+    more decisive and is the natural thing to reach for when tightening this paragraph again."""
+    for retired in ("not that some link you drew between two of them is real",
+                    "several conversations interleaved",
+                    "never because the topics rhyme",
+                    "points back into their own conversation",
+                    "when the support is there, say it plainly"):
+        assert retired not in SLACK_SYSTEM_PROMPT, retired
 
 
 def test_details_are_repeated_at_the_precision_they_were_given():
