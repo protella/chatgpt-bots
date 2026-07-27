@@ -406,17 +406,15 @@ class TextHandlerMixin:
                               artifacts_acc: Optional[List[dict]] = None,
                               turn: Optional[Any] = None,
                               lazy_surface_ts: Optional[str] = None,
-                              channel_memory_text: Optional[str] = None) -> Response:
+                              channel_steering_text: Optional[str] = None) -> Response:
         """Handle text-only response generation.
 
-        ``channel_memory_text`` (Phase 9): this RESPONDER TURN's CHANNEL MEMORY block, read
-        ONCE in base.py and passed down. This handler builds the whole system prompt itself, so
-        without it durable facts reached no ordinary model call at all — the block base.py
-        used to build went into `thread_state.system_prompt`, which nothing ever read. It is
-        a parameter rather than a fetch because every retry path re-enters this method.
-        One read for the responder, not for the whole logical turn: the participation gate
-        still fetches its own copy before the responder starts (shared-memory steering is a
-        later commit).
+        ``channel_steering_text``: THIS TURN's canonical channel-steering block — the standing
+        policy, the recorded participation preferences and the durable facts, rendered once for
+        the whole turn and stamped on the message (message_processor/channel_steering.py). It is
+        a parameter rather than a fetch because every retry path re-enters this method, and
+        because the participation gate that judged this message was given the identical string:
+        one read per turn, one set of rules for both halves of it. Inserted verbatim.
 
         ``artifacts_acc`` (F32): container ids seen by EARLIER attempts this turn. Each attempt
         used to start a fresh sink, so an attempt that ran code interpreter and then failed (an
@@ -459,7 +457,7 @@ class TextHandlerMixin:
                 exclude_mcp_server=failed_mcp_server,
                 visible_already_committed=visible_already_committed,
                 artifacts_acc=artifacts_acc, turn=turn, lazy_surface_ts=lazy_surface_ts,
-                channel_memory_text=channel_memory_text,
+                channel_steering_text=channel_steering_text,
             )
         
         # Fall back to non-streaming logic
@@ -533,7 +531,7 @@ class TextHandlerMixin:
         # Phase 9: channel memory arrives as this turn's snapshot (base.py reads it once). The
         # prompt is built from scratch here, so before it was passed down NO ordinary model
         # call ever carried the CHANNEL MEMORY block — not even the opening turn of a thread.
-        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_directives=getattr(thread_state, 'channel_directives', None), channel_memory=channel_memory_text, channel_info=await self._build_channel_info(client, message.channel_id), code_interpreter_enabled=thread_config.get('enable_code_interpreter', config.enable_code_interpreter))
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_steering=channel_steering_text, channel_info=await self._build_channel_info(client, message.channel_id), code_interpreter_enabled=thread_config.get('enable_code_interpreter', config.enable_code_interpreter))
 
         # Determine timeout based on retry attempt (needed to resolve tool exposure below)
         retry_timeout = 60.0 if retry_count > 0 else None
@@ -762,7 +760,7 @@ class TextHandlerMixin:
                     visible_already_committed=visible_already_committed,
                     artifacts_acc=artifacts, turn=turn, lazy_surface_ts=lazy_surface_ts,
                     # One snapshot per responder turn — a retry must not re-read the table.
-                    channel_memory_text=channel_memory_text
+                    channel_steering_text=channel_steering_text
                 )
             raise
         finally:
@@ -1005,14 +1003,14 @@ class TextHandlerMixin:
                                       artifacts_acc: Optional[List[dict]] = None,
                                       turn: Optional[Any] = None,
                                       lazy_surface_ts: Optional[str] = None,
-                                      channel_memory_text: Optional[str] = None) -> Response:
+                                      channel_steering_text: Optional[str] = None) -> Response:
         """Handle text-only response generation with streaming support.
 
         exclude_mcp_server accepts a single label or a set of labels (exclusions
         accumulate across MCP-failure retries).
 
-        ``channel_memory_text`` (Phase 9): this RESPONDER TURN's CHANNEL MEMORY block, read
-        once in base.py and passed down (see ``_handle_text_response``).
+        ``channel_steering_text``: THIS TURN's canonical channel-steering block, stamped on the
+        message and passed down (see ``_handle_text_response``).
 
         ``visible_already_committed`` (F8): True when an earlier attempt this turn already
         exposed visible text; seeds the tool loop's committed-text signal so a
@@ -1029,7 +1027,7 @@ class TextHandlerMixin:
                                                     visible_already_committed=visible_already_committed,
                                                     artifacts_acc=artifacts_acc, turn=turn,
                                                     lazy_surface_ts=lazy_surface_ts,
-                                                    channel_memory_text=channel_memory_text)
+                                                    channel_steering_text=channel_steering_text)
         
         # Get streaming configuration from client
         streaming_config = client.get_streaming_config() if hasattr(client, 'get_streaming_config') else {}
@@ -1121,7 +1119,7 @@ class TextHandlerMixin:
         # Phase 9: channel memory arrives as this turn's snapshot (base.py reads it once). The
         # prompt is built from scratch here, so before it was passed down NO ordinary model
         # call ever carried the CHANNEL MEMORY block — not even the opening turn of a thread.
-        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_directives=getattr(thread_state, 'channel_directives', None), channel_memory=channel_memory_text, channel_info=await self._build_channel_info(client, message.channel_id), code_interpreter_enabled=thread_config.get('enable_code_interpreter', config.enable_code_interpreter))
+        system_prompt = self._get_system_prompt(client, user_timezone, user_tz_label, user_real_name, user_email, model, web_search_enabled, getattr(thread_state, 'has_summary_head', False), thread_config.get('custom_instructions'), participant_roster=self._build_participant_roster(thread_state, client), channel_steering=channel_steering_text, channel_info=await self._build_channel_info(client, message.channel_id), code_interpreter_enabled=thread_config.get('enable_code_interpreter', config.enable_code_interpreter))
 
         # F2: resolve this turn's tool exposure ONCE. Streaming retries fall back to the
         # non-streaming path, so tools are never disabled here (tools_disabled=False).
@@ -2966,7 +2964,7 @@ class TextHandlerMixin:
                 # a SECOND message, and the turn posts its answer twice.
                 lazy_surface_ts=keeper,
                 # One snapshot per responder turn — the fallback must not re-read the table.
-                channel_memory_text=channel_memory_text,
+                channel_steering_text=channel_steering_text,
             )
 
     @staticmethod

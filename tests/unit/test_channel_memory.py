@@ -1,10 +1,10 @@
 """Phase 9 — per-channel memory (context-injection read + post-response extraction write).
 
 Covers: channel_memory CRUD (sync + async), scope partitioning (a channel never sees another
-channel's private rows; workspace rows shared), CHANNEL MEMORY system-prompt injection + the
-_build_channel_memory_text helper, the post-response extraction logic (add / update / none / cap
-eviction / flag-off / missing-exchange), _content_to_text flattening, and extract_memory's
-defensive JSON parsing. All with stubbed I/O — no live bot, no legacy suite.
+channel's private rows; workspace rows shared), CHANNEL STEERING system-prompt injection and the
+snapshot that feeds it, the post-response extraction logic (add / update / none / cap eviction /
+flag-off / missing-exchange), _content_to_text flattening, and extract_memory's defensive JSON
+parsing. All with stubbed I/O — no live bot, no legacy suite.
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import pytest
 
 from config import config
 from database import DatabaseManager
+from message_processor import channel_steering
 from message_processor.thread_management import ThreadManagementMixin
 from message_processor.utilities import MessageUtilitiesMixin
 from openai_client.api import responses as responses_api
@@ -100,15 +101,15 @@ def _utils():
 
 def test_system_prompt_injects_memory_block():
     proc = _utils()
-    out = proc._get_system_prompt(MagicMock(), channel_memory="- they deploy via #ops\n- Pat owns billing")
-    assert "CHANNEL MEMORY" in out
+    out = proc._get_system_prompt(MagicMock(), channel_steering="- they deploy via #ops\n- Pat owns billing")
+    assert "CHANNEL STEERING" in out
     assert "they deploy via #ops" in out
 
 
 def test_system_prompt_no_memory_block_when_absent():
     proc = _utils()
     out = proc._get_system_prompt(MagicMock())
-    assert "CHANNEL MEMORY" not in out
+    assert "CHANNEL STEERING" not in out
 
 
 def test_every_system_prompt_call_site_passes_channel_memory():
@@ -146,44 +147,42 @@ def test_every_system_prompt_call_site_passes_channel_memory():
             fn = node.func
             if not (isinstance(fn, ast.Attribute) and fn.attr == "_get_system_prompt"):
                 continue
-            if not any(kw.arg == "channel_memory" for kw in node.keywords):
+            if not any(kw.arg == "channel_steering" for kw in node.keywords):
                 missing.append(f"{path.relative_to(root)}:{node.lineno}")
-    assert not missing, "_get_system_prompt called without channel_memory at: " + ", ".join(missing)
+    assert not missing, "_get_system_prompt called without channel_steering at: " + ", ".join(missing)
 
 
-async def test_build_channel_memory_text_formats_rows():
-    proc = _utils()
-    proc.db = MagicMock()
-    proc.db.get_channel_memory_async = AsyncMock(
-        return_value=[{"id": 1, "content": "fact one"}, {"id": 2, "content": "fact two"}]
-    )
-    with patch.object(config, "enable_channel_memory", True):
-        text = await proc._build_channel_memory_text("C1")
-    # Phase C: [#id] prefixes so the model can target update_fact/forget_fact
-    assert text == "- [#1] fact one\n- [#2] fact two"
+def _steering_db(rows, policy=None):
+    """A db stub whose two steering reads are the only ones load_snapshot performs."""
+    db = MagicMock()
+    db.get_channel_memory_async = AsyncMock(return_value=rows)
+    db.get_channel_policy_async = AsyncMock(return_value=policy)
+    return db
 
 
-async def test_build_channel_memory_text_none_when_empty():
-    proc = _utils()
-    proc.db = MagicMock()
-    proc.db.get_channel_memory_async = AsyncMock(return_value=[])
-    with patch.object(config, "enable_channel_memory", True):
-        assert await proc._build_channel_memory_text("C1") is None
+async def test_snapshot_formats_fact_rows():
+    db = _steering_db([{"id": 1, "content": "fact one"}, {"id": 2, "content": "fact two"}])
+    snap = await channel_steering.load_snapshot(db, "C1")
+    # [#id] prefixes so the model can target update_fact/forget_fact, under a heading that says
+    # these are background rather than instructions.
+    assert channel_steering.CHANNEL_FACT_HEADING in snap.text
+    assert "- [#1] fact one\n- [#2] fact two" in snap.text
 
 
-async def test_build_channel_memory_text_none_when_flag_off():
-    proc = _utils()
-    proc.db = MagicMock()
-    proc.db.get_channel_memory_async = AsyncMock(return_value=[{"content": "fact"}])
-    with patch.object(config, "enable_channel_memory", False):
-        assert await proc._build_channel_memory_text("C1") is None
+async def test_snapshot_empty_when_no_rows():
+    snap = await channel_steering.load_snapshot(_steering_db([]), "C1")
+    assert snap.text is None and snap.is_empty
 
 
-async def test_build_channel_memory_text_none_without_db():
-    proc = _utils()
-    proc.db = None
-    with patch.object(config, "enable_channel_memory", True):
-        assert await proc._build_channel_memory_text("C1") is None
+async def test_snapshot_drops_facts_when_memory_disabled():
+    db = _steering_db([{"id": 1, "content": "fact", "scope": "channel"}])
+    snap = await channel_steering.load_snapshot(db, "C1", memory_enabled=False)
+    assert snap.text is None
+
+
+async def test_snapshot_empty_without_db():
+    snap = await channel_steering.load_snapshot(None, "C1")
+    assert snap.text is None
 
 
 # ------------------------------------------------------------- what the API actually receives
@@ -291,6 +290,7 @@ def _spy_processor(openai):
     p.openai_client = openai
     p.db = MagicMock()
     p.db.get_channel_memory_async = AsyncMock(return_value=MEMORY_ROWS)
+    p.db.get_channel_policy_async = AsyncMock(return_value=None)
 
     async def _passthru(m, *a, **k):
         return m
@@ -348,10 +348,10 @@ async def test_non_streaming_turn_puts_channel_memory_in_front_of_the_model():
                       side_effect=AsyncMock(return_value=_thread_config(enable_streaming=False))):
         await p._handle_text_response(
             "hi", _spy_state(), _FakeSlack(), _msg(),
-            channel_memory_text=await p._build_channel_memory_text("C1"))
+            channel_steering_text=(await channel_steering.load_snapshot(p.db, "C1")).text)
 
     assert openai.prompts, "expected the non-streaming path to reach the API"
-    assert "CHANNEL MEMORY" in openai.prompts[0]
+    assert "CHANNEL STEERING" in openai.prompts[0]
     assert MEMORY_FACT in openai.prompts[0]
 
 
@@ -363,10 +363,10 @@ async def test_streaming_turn_puts_channel_memory_in_front_of_the_model():
                       side_effect=AsyncMock(return_value=_thread_config())):
         await p._handle_streaming_text_response(
             "hi", _spy_state(), _FakeSlack(), _msg(),
-            channel_memory_text=await p._build_channel_memory_text("C1"))
+            channel_steering_text=(await channel_steering.load_snapshot(p.db, "C1")).text)
 
     assert openai.prompts, "expected the streaming path to reach the API"
-    assert "CHANNEL MEMORY" in openai.prompts[0]
+    assert "CHANNEL STEERING" in openai.prompts[0]
     assert MEMORY_FACT in openai.prompts[0]
 
 
@@ -379,9 +379,10 @@ async def test_a_retry_reuses_the_turns_snapshot_instead_of_refetching():
     with patch.object(config, "enable_channel_memory", True), \
          patch.object(config, "get_thread_config_async",
                       side_effect=AsyncMock(return_value=_thread_config())):
-        snapshot = await p._build_channel_memory_text("C1")   # the one read base.py performs
+        # the one read base.py performs
+        snapshot = (await channel_steering.load_snapshot(p.db, "C1")).text
         await p._handle_streaming_text_response(
-            "hi", _spy_state(), _FakeSlack(), _msg(), channel_memory_text=snapshot)
+            "hi", _spy_state(), _FakeSlack(), _msg(), channel_steering_text=snapshot)
 
     assert len(openai.prompts) == 2, "expected the failed stream to fall back to non-streaming"
     for prompt in openai.prompts:
@@ -408,6 +409,7 @@ async def test_base_reads_the_memory_once_and_passes_it_to_the_handler():
                             channel_directives=None)
     p.db = MagicMock()
     p.db.get_channel_memory_async = AsyncMock(return_value=MEMORY_ROWS)
+    p.db.get_channel_policy_async = AsyncMock(return_value=None)
     p.thread_manager.acquire_thread_lock = AsyncMock(return_value=True)
     p.thread_manager.release_thread_lock = AsyncMock()
     p.thread_manager._token_counter.count_thread_tokens = MagicMock(return_value=0)
@@ -439,7 +441,7 @@ async def test_base_reads_the_memory_once_and_passes_it_to_the_handler():
 
     p.db.get_channel_memory_async.assert_awaited_once()
     p._handle_text_response.assert_awaited()
-    passed = p._handle_text_response.await_args.kwargs.get("channel_memory_text")
+    passed = p._handle_text_response.await_args.kwargs.get("channel_steering_text")
     assert passed and MEMORY_FACT in passed, (
         "base.py must hand its one memory snapshot to the handler — the handlers build the "
         "real prompt and no longer read it themselves")
@@ -463,6 +465,7 @@ async def test_the_timeout_retry_carries_the_same_snapshot():
                             channel_directives=None)
     p.db = MagicMock()
     p.db.get_channel_memory_async = AsyncMock(return_value=MEMORY_ROWS)
+    p.db.get_channel_policy_async = AsyncMock(return_value=None)
     p.thread_manager.acquire_thread_lock = AsyncMock(return_value=True)
     p.thread_manager.release_thread_lock = AsyncMock()
     p.thread_manager._token_counter.count_thread_tokens = MagicMock(return_value=0)
@@ -490,7 +493,7 @@ async def test_the_timeout_retry_carries_the_same_snapshot():
 
     assert response.content == "ok"
     assert p._handle_text_response.await_count == 2
-    first, retry = [c.kwargs.get("channel_memory_text")
+    first, retry = [c.kwargs.get("channel_steering_text")
                     for c in p._handle_text_response.await_args_list]
     assert first and MEMORY_FACT in first
     assert retry == first                                  # the SAME snapshot, not a re-read
@@ -505,6 +508,7 @@ def _proc(decision):
     proc.db.get_channel_memory_async = AsyncMock(return_value=[])
     proc.db.add_channel_memory_async = AsyncMock()
     proc.db.update_channel_memory_async = AsyncMock()
+    proc.db.update_channel_fact_async = AsyncMock(return_value=True)
     proc.db.delete_channel_memory_async = AsyncMock()
     proc.openai_client = MagicMock()
     proc.openai_client.extract_memory = AsyncMock(return_value=decision)
@@ -546,14 +550,18 @@ async def test_extraction_none_writes_nothing():
     with patch.object(config, "enable_channel_memory", True):
         await proc._async_extract_channel_memory(_state())
     proc.db.add_channel_memory_async.assert_not_called()
-    proc.db.update_channel_memory_async.assert_not_called()
+    proc.db.update_channel_fact_async.assert_not_called()
 
 
 async def test_extraction_update_updates_row():
     proc = _proc({"action": "update", "id": 7, "content": "revised"})
+    # An id the extractor was actually SHOWN. One it wasn't is refused (see
+    # test_channel_steering.py) — an unknown id used to reach an unrestricted update.
+    proc.db.get_channel_memory_async = AsyncMock(
+        return_value=[{"id": 7, "content": "old wording", "scope": "channel", "author": "U1"}])
     with patch.object(config, "enable_channel_memory", True):
         await proc._async_extract_channel_memory(_state())
-    proc.db.update_channel_memory_async.assert_called_once_with(7, "revised")
+    proc.db.update_channel_fact_async.assert_called_once_with(7, "revised")
 
 
 async def test_extraction_none_decision_object_safe():

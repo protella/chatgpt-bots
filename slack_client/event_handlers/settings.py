@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from typing import TYPE_CHECKING, Any
 
 from slack_sdk.errors import SlackApiError
 
@@ -10,6 +11,16 @@ from slack_client.formatting.blocks import extract_supplementary_text
 
 
 class SlackSettingsHandlersMixin:
+
+    if TYPE_CHECKING:  # provided by the host (SlackBot) — declared so this mixin type-checks
+        app: Any
+        db: Any
+        settings_modal: Any
+        log_warning: Any
+        log_error: Any
+        log_info: Any
+        log_debug: Any
+
     async def _get_session_data(self, body) -> dict:
         """
         Helper to get session data from database using session_id in metadata.
@@ -66,6 +77,18 @@ class SlackSettingsHandlersMixin:
             self.log_warning(f"Could not load channel memory for modal ({channel_id}): {e}")
             return []
 
+    async def _load_channel_policy(self, channel_id: str):
+        """Fetch the channel's reserved standing-policy row (or None) for the modal.
+
+        Best-effort like the memory load: a DB hiccup must not stop the modal opening. It does
+        mean the box renders empty, so the submit handler's seed check is what stops that empty
+        box from wiping a live policy."""
+        try:
+            return await self.db.get_channel_policy_async(channel_id)
+        except Exception as e:
+            self.log_warning(f"Could not load channel policy for modal ({channel_id}): {e}")
+            return None
+
     @staticmethod
     def _overlay_channel_form_state(row, state):
         """Overlay the modal's in-flight form values onto the stored channel row for a re-render
@@ -73,7 +96,6 @@ class SlackSettingsHandlersMixin:
 
         SHOULD-FIX #7: in-flight values are AUTHORITATIVE — a field the user has edited but not yet
         saved is never overwritten by the stored row. Concretely:
-          - a CLEARED directives box stays cleared (we don't restore the stored text);
           - an 'inherit' participation choice stays inherit — we clear response_mode in lockstep so
             the builder's legacy fallback can't resurrect the stored explicit mode; and
           - reply placement round-trips the tri-state (inherit → None, channel → True, threads →
@@ -99,11 +121,6 @@ class SlackSettingsHandlersMixin:
         # back to 'inherit' (level=None) leaves the stale stored response_mode in cs, and the builder
         # falls back to it and reselects the old explicit level — silently undoing the user's edit.
         cs['response_mode'] = LEVEL_TO_MODE.get(level) if level else None
-
-        # Directives: the form value is authoritative. An empty box means the user cleared it — keep
-        # it empty, never fall back to the stored text (matches the submit handler's empty→None rule).
-        dir_raw = state.get('directives_block', {}).get('directives', {}).get('value')
-        cs['directives'] = dir_raw.strip() if dir_raw and dir_raw.strip() else None
 
         # Reply placement tri-state: inherit → None, channel → True, threads → False.
         ric_opt = state.get('reply_in_channel_block', {}).get('reply_in_channel', {}).get('selected_option') or {}
@@ -289,9 +306,10 @@ class SlackSettingsHandlersMixin:
                 current = await self.db.get_channel_settings_async(channel_id)
                 global_default = getattr(config, 'channel_response_mode', 'tag_only')
                 memories = await self._load_channel_modal_extras(channel_id)
+                policy = await self._load_channel_policy(channel_id)
                 modal = self.settings_modal.build_channel_settings_modal(
                     channel_id, current, global_default,
-                    channel_memories=memories)
+                    channel_memories=memories, channel_policy=policy)
                 self._inject_ambient_memory_toggle(modal, (current or {}).get("ambient_memory"))
                 await client.views_open(trigger_id=trigger_id, view=modal)
                 self.log_info(f"Channel settings modal opened for {channel_id} by {user_id} (footer button)")
@@ -356,8 +374,13 @@ class SlackSettingsHandlersMixin:
             participation_level = None if level_sel == 'inherit' else level_sel
             response_mode = None if participation_level is None else LEVEL_TO_MODE.get(participation_level)
 
-            dir_raw = state.get('directives_block', {}).get('directives', {}).get('value')
-            directives = dir_raw.strip() if dir_raw and dir_raw.strip() else None
+            # The standing policy. `directives_block` is the OLD field id: a modal opened before
+            # this deployed is still on someone's screen, and its Save must land somewhere real —
+            # so it is accepted as policy input. It writes the policy ROW either way; the legacy
+            # column is never written again.
+            pol_raw = (state.get('policy_block', {}).get('standing_policy', {}).get('value')
+                       or state.get('directives_block', {}).get('directives', {}).get('value'))
+            standing_policy = pol_raw.strip() if pol_raw and pol_raw.strip() else ""
 
             # Tri-state placement (SHOULD-FIX #5): 'inherit' → None (stays NULL, keeps inheriting the
             # global default), 'channel' → True, 'threads' → False. Never freeze today's default
@@ -397,7 +420,6 @@ class SlackSettingsHandlersMixin:
                 await self.db.set_channel_settings_async(
                     channel_id,
                     response_mode=response_mode,          # None → clears override
-                    directives=directives,                # None → clears
                     reply_in_channel=reply_in_channel,
                     participation_level=participation_level,  # None → clears override
                     model=channel_model,                  # None → each person's own setting
@@ -409,6 +431,54 @@ class SlackSettingsHandlersMixin:
                 default_level = MODE_TO_LEVEL.get(getattr(config, 'channel_response_mode', 'tag_only'), 'mentions_only')
                 effective = level_sel if level_sel != 'inherit' else f"inherit ({default_level})"
                 self.log_info(f"Channel settings saved for {channel_id} by {user_id}: participation={level_sel}")
+
+                # The standing policy. Isolated like the memory reconcile below so a policy
+                # failure never sinks the settings save.
+                #
+                # TWO kinds of submission arrive here, and they get opposite treatment:
+                #
+                #  * A modal built by this release carries `policy_seed` — the hash of the policy
+                #    it SHOWED. Its box replaces the policy wholesale, so it is applied as a
+                #    compare-and-swap inside one transaction: if the stored policy no longer
+                #    hashes to the seed, someone edited it while this was open and the save is
+                #    refused rather than reverting their rule (and an emptied box, which
+                #    legitimately means "clear it", would revert it to nothing at all). Reading
+                #    the hash here and writing it in a second statement would leave that same
+                #    gap open, just narrower — hence set_channel_policy_if_unchanged_async.
+                #
+                #  * A modal opened BEFORE this release has no seed and no policy field; what it
+                #    submits is the old directives box. It cannot be compared against anything,
+                #    and it cannot mean "clear the policy" either. Worse, startup has by now
+                #    migrated those very directives INTO the policy row, so a hash check would
+                #    refuse every such submission — the compatibility path the seed check was
+                #    supposed to protect. It is folded in under the migration's own rule instead:
+                #    identical text is a no-op, different text is preserved alongside.
+                policy_warning = ""
+                try:
+                    if 'policy_seed' in metadata:
+                        applied = await self.db.set_channel_policy_if_unchanged_async(
+                            channel_id, metadata.get('policy_seed') or "", standing_policy,
+                            author=user_id)
+                        if applied:
+                            self.log_info(
+                                f"Standing policy {'cleared' if not standing_policy else 'saved'} "
+                                f"for {channel_id} by {user_id}")
+                        else:
+                            policy_warning = (
+                                "\n⚠️ The standing channel policy was changed elsewhere while "
+                                "this was open — your edit to it was not saved.")
+                            self.log_info(
+                                f"Standing policy edit refused for {channel_id} by {user_id}: "
+                                f"changed since the modal opened")
+                    elif standing_policy:
+                        await self.db.merge_channel_policy_async(
+                            channel_id, standing_policy, author=user_id)
+                        self.log_info(
+                            f"Standing policy merged for {channel_id} by {user_id} from a modal "
+                            f"opened before the policy field existed")
+                except Exception as pe:
+                    self.log_error(f"Error saving standing policy for {channel_id}: {pe}")
+                    policy_warning += "\n⚠️ Couldn't save the standing channel policy — please try again."
 
                 # Reconcile the channel-memory textarea against the open-time seed. Isolated in its
                 # own try/except so a memory failure never sinks the settings save — we still confirm,
@@ -445,7 +515,8 @@ class SlackSettingsHandlersMixin:
                 try:
                     await client.chat_postEphemeral(
                         channel=channel_id, user=user_id,
-                        text=f"✅ Channel settings saved. Response mode: *{effective}*.{mem_warning}"
+                        text=(f"✅ Channel settings saved. Response mode: *{effective}*."
+                              f"{policy_warning}{mem_warning}")
                     )
                 except Exception:
                     pass
@@ -472,11 +543,18 @@ class SlackSettingsHandlersMixin:
                 # seed from the DB on re-render, or an unsaved deletion would silently re-anchor).
                 mem_text = state.get('channel_memory_block', {}).get('channel_memory', {}).get('value') or ""
                 mem_seed = metadata.get('mem_seed', [])
+                # Same rule for the policy box: the in-flight text wins and the OPEN-TIME hash is
+                # carried verbatim, so a re-render never re-anchors the conflict check to a policy
+                # the user never saw.
+                pol_text = (state.get('policy_block', {})
+                            .get('standing_policy', {}).get('value') or "")
+                pol_seed = metadata.get('policy_seed', "")
                 memories = await self._load_channel_modal_extras(channel_id)
                 global_default = getattr(config, 'channel_response_mode', 'tag_only')
                 modal = self.settings_modal.build_channel_settings_modal(
                     channel_id, cs, global_default, channel_memories=memories,
-                    memory_textarea_value=mem_text, mem_seed=mem_seed)
+                    memory_textarea_value=mem_text, mem_seed=mem_seed,
+                    policy_value=pol_text, policy_seed=pol_seed)
                 self._inject_ambient_memory_toggle(modal, cs.get("ambient_memory"))
                 await client.views_update(view_id=view.get('id'), view=modal)
                 self.log_debug(f"Channel modal rebuilt for model change in {channel_id}")

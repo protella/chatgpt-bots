@@ -138,6 +138,16 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 📜 Changed - One standing channel policy, and both halves of the bot read it
+
+The channel's "ground rules" box is now a **standing channel policy**: one authoritative text,
+always applied first, editable from the settings modal or by telling the bot directly. The
+decision about whether to speak and the reply itself now read the *same* policy and memory
+bytes — previously the two could quietly diverge. Existing ground rules migrate automatically
+on first start (and the bot refuses to start if that migration fails, rather than silently
+ignoring your rules). Behavioral rules belong in the policy; the fact memory keeps holding
+plain background facts.
+
 ### ⏸️ Added - It won't answer a message that's already been overtaken
 
 If a newer message arrives in the same conversation while the bot is still composing, the

@@ -44,27 +44,30 @@ class TestChannelSettingsDB:
 
     def test_set_then_get(self, temp_db):
         temp_db.set_channel_settings("C1", response_mode="auto_respond",
-                                     directives="only jump in on deploy failures",
+                                     verbosity="low",
                                      reply_in_channel=True, updated_by="U1")
         row = temp_db.get_channel_settings("C1")
         assert row["response_mode"] == "auto_respond"
-        assert row["directives"] == "only jump in on deploy failures"
+        assert row["verbosity"] == "low"
         assert row["reply_in_channel"] is True  # stored as int, returned as bool
         assert row["updated_by"] == "U1"
+        # The channel's standing rules are NOT here: they live in the reserved policy row, and
+        # this getter must not offer a second, stale place to look for them.
+        assert "directives" not in row
 
     def test_partial_update_keeps_other_fields(self, temp_db):
-        temp_db.set_channel_settings("C2", response_mode="auto_respond", directives="rule A")
-        # Update only directives — mode must be preserved.
-        temp_db.set_channel_settings("C2", directives="rule B")
+        temp_db.set_channel_settings("C2", response_mode="auto_respond", verbosity="low")
+        # Update only verbosity — mode must be preserved.
+        temp_db.set_channel_settings("C2", verbosity="high")
         row = temp_db.get_channel_settings("C2")
         assert row["response_mode"] == "auto_respond"
-        assert row["directives"] == "rule B"
+        assert row["verbosity"] == "high"
 
     async def test_async_roundtrip(self, temp_db):
-        await temp_db.set_channel_settings_async("C3", response_mode="off", directives="stay quiet")
+        await temp_db.set_channel_settings_async("C3", response_mode="off", verbosity="low")
         row = await temp_db.get_channel_settings_async("C3")
         assert row["response_mode"] == "off"
-        assert row["directives"] == "stay quiet"
+        assert row["verbosity"] == "low"
         # reply_in_channel was never set → NULL → None (inherit from the global default), no longer
         # collapsed to False. See the participation redesign (Layer 0) NULL-inheritance fix.
         assert row["reply_in_channel"] is None
@@ -136,30 +139,35 @@ async def test_dm_has_no_channel_settings():
     assert await bot._get_channel_settings("D123") is None
 
 
-# --------------------------------------------------------------------------- directive surfacing
+# --------------------------------------------------------------- steering, not settings metadata
 
-async def test_channel_message_surfaces_directives_and_reply_in_channel():
+async def test_channel_message_carries_no_directives_metadata():
+    """The Slack facade used to copy the settings row's `directives` onto every dispatched
+    message, and the responder read it from there. Nothing does: the standing policy reaches
+    both the gate and the responder as one stamped steering snapshot instead, so a per-message
+    copy is a second source of truth that could disagree with it."""
     bot = _make_bot()
     bot._get_channel_settings = AsyncMock(return_value={
-        "response_mode": "tag_only", "directives": "only deploys", "reply_in_channel": True,
+        "response_mode": "tag_only", "reply_in_channel": True,
     })
     # Addressed by name so it dispatches even in tag_only.
     await bot._handle_channel_message(_evt(text="ChatGPT status?"), bot.app.client)
     assert bot.message_handler.await_count == 1
     msg = bot.message_handler.await_args.args[0]
-    assert msg.metadata.get("channel_directives") == "only deploys"
+    assert "channel_directives" not in msg.metadata
     assert msg.metadata.get("channel_post_allowed") is True
 
 
-def test_system_prompt_includes_channel_directives():
+def test_system_prompt_has_no_separate_ground_rules_block():
+    """One block, not two. A separate GROUND RULES section is what let the operator's rules and
+    the remembered facts be rendered (and read) independently of each other."""
     proc = MessageUtilitiesMixin.__new__(type("P", (MessageUtilitiesMixin,), {}))
     client = MagicMock()
     client.name = "slack"
-    with_directive = proc._get_system_prompt(client, channel_directives="stay quiet unless tagged")
-    assert "CHANNEL GROUND RULES" in with_directive
-    assert "stay quiet unless tagged" in with_directive
-    without = proc._get_system_prompt(client)
-    assert "CHANNEL GROUND RULES" not in without
+    out = proc._get_system_prompt(client, channel_steering="stay quiet unless tagged")
+    assert "CHANNEL GROUND RULES" not in out
+    assert "CHANNEL STEERING" in out
+    assert "stay quiet unless tagged" in out
 
 
 # --------------------------------------------------------------------------- bot onboarding bypass

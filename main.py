@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 from config import GUIDANCE_TRUNCATION_CHARS, config
 from logger import log_session_start, log_session_end, main_logger
 from message_processor.base import MessageProcessor
-from message_processor import participation_telemetry, routing_facts
+from message_processor import channel_steering, participation_telemetry, routing_facts
 from message_processor.participation import (ParticipationEngine,
                                              render_capabilities_line)
 from message_processor.people_tools import format_people_summary
@@ -79,6 +79,33 @@ class ChatBotV2:
             # mention-added / meaning edit can SUPERSEDE the original message's in-flight
             # participation evaluation — the double-answer fix.
             self.processor.participation_engine = self.participation_engine
+            # Move any legacy channel_settings.directives into the reserved policy row, before
+            # any Slack traffic: from this build on NOTHING reads that column, so a workspace
+            # that upgraded with rules in it would otherwise start quietly ignoring them.
+            # Idempotent — a second start finds nothing to move.
+            #
+            # FATAL on failure, deliberately. The tempting alternative is to log and carry on,
+            # and that is the worst outcome available here: the bot comes up looking healthy in a
+            # channel whose "only speak up about deploys" is now unread, and behaves as though
+            # nobody ever set a rule. Nothing downstream can detect that, and the operator finds
+            # out from the noise. A process that refuses to start is visible in the first place
+            # anyone looks, and the fix (a reachable database) is the same either way.
+            migrated, failed, fatal = 0, 0, None
+            try:
+                migrated, failed = \
+                    await self.client.db.migrate_channel_directives_to_policy_async()
+            except Exception as e:  # noqa: BLE001 — reported below, then fatal
+                fatal = f"could not run ({type(e).__name__}: {e})"
+            if fatal is None and failed:
+                fatal = f"failed for {failed} channel(s), {migrated} migrated"
+            if fatal:
+                main_logger.error(
+                    f"Channel directives migration {fatal}. Refusing to start: channel policies "
+                    f"set before this release live in a column nothing reads any more, so those "
+                    f"channels' operator rules would be silently ignored. Fix the database "
+                    f"and restart.")
+                sys.exit(1)
+                return  # sys.exit is stubbed in some harnesses; never fall through into a live bot
         else:
             main_logger.error(f"Unknown platform: {self.platform}")
             sys.exit(1)
@@ -223,12 +250,16 @@ class ChatBotV2:
                     max_lines=config.channel_pulse_envelope_max,
                 ) or None
 
-            memory_facts = []
-            try:
-                if getattr(config, "enable_channel_memory", True) and self.processor.db:
-                    memory_facts = await self.processor.db.get_channel_memory_async(channel_id)
-            except Exception:
-                memory_facts = []
+            # THE channel-steering read for this turn — the only one. It is rendered once and
+            # STAMPED on the message, so if this gate wakes, the responder builds its prompt from
+            # this exact string rather than reading the database a second time. Between two reads
+            # a person can edit the channel's policy or a tool can write a fact, and the two
+            # halves of one turn would then obey different rules while each looked correct. A
+            # redispatch or an edit re-evaluation runs this again and overwrites the stamp: that
+            # is a new gate attempt judging a new moment, and it must not inherit an older view.
+            steering = channel_steering.stamp(message, await channel_steering.load_snapshot(
+                self.processor.db, channel_id,
+                memory_enabled=bool(getattr(config, "enable_channel_memory", True))))
 
             channel_topic = None
             num_members = None
@@ -314,8 +345,8 @@ class ChatBotV2:
                 sender_id=message.user_id,
                 sender_name=message.metadata.get("user_real_name") or message.metadata.get("username"),
                 is_thread_reply=is_thread_reply, level=level,
-                directives=message.metadata.get("channel_directives"),
-                memory_facts=memory_facts, channel_activity=channel_activity,
+                channel_steering_text=steering.text,
+                channel_activity=channel_activity,
                 name_hit=name_hit,
                 self_display_name=getattr(client, "bot_handle", None),
                 sender_is_bot=message.metadata.get("participation_sender_bot") is True,

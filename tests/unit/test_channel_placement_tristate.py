@@ -5,7 +5,7 @@ is a tri-state control; opening + saving an inheriting channel untouched has to 
 (still inheriting), and each explicit option round-trips None / True / False through the submit path.
 
 SHOULD-FIX #7 — a modal re-render (model-change) must preserve the user's in-flight form edits: a
-cleared directives box stays cleared, and an edited participation level / placement survives
+cleared standing-policy box stays cleared, and an edited participation level / placement survives
 instead of being silently reverted to the stored row. (The per-row delete-memory / clear-mute
 re-render buttons were removed with the mute mechanism and the per-row memory controls.)
 
@@ -69,7 +69,7 @@ def _make_host(db, *, real_modal=False):
 
 
 def _state(*, model="inherit", effort="inherit", verbosity="inherit",
-           participation="inherit", directives=None, placement="inherit"):
+           participation="inherit", policy=None, placement="inherit"):
     """A modal state.values payload with every channel-settings input block populated."""
     def sel(v):
         return {"selected_option": {"value": v}}
@@ -78,7 +78,7 @@ def _state(*, model="inherit", effort="inherit", verbosity="inherit",
         "channel_effort_block": {"channel_reasoning_effort": sel(effort)},
         "channel_verbosity_block": {"channel_verbosity": sel(verbosity)},
         "participation_block": {"participation_level": sel(participation)},
-        "directives_block": {"directives": {"value": directives}},
+        "policy_block": {"standing_policy": {"value": policy}},
         "reply_in_channel_block": {"reply_in_channel": sel(placement)},
     }
 
@@ -165,15 +165,13 @@ class TestOverlayInFlightState:
         from slack_client.event_handlers.settings import SlackSettingsHandlersMixin
         return SlackSettingsHandlersMixin._overlay_channel_form_state(row, _state(**state_kw))
 
-    def test_cleared_directives_stay_cleared(self):
-        # User cleared the box → must NOT be restored from the stored row.
-        assert self._overlay({"directives": "stored rule"}, directives=None)["directives"] is None
-
-    def test_edited_directives_win(self):
-        assert self._overlay({"directives": "old"}, directives="new")["directives"] == "new"
-
-    def test_whitespace_only_directives_treated_as_cleared(self):
-        assert self._overlay({"directives": "old"}, directives="   ")["directives"] is None
+    def test_overlay_carries_no_standing_policy(self):
+        # The standing policy is not a channel_settings column any more — it is the reserved
+        # policy row, and the re-render carries the in-flight text (plus the open-time hash)
+        # separately. An overlay that still produced a `directives` value would write it back
+        # into a column nothing reads.
+        cs = self._overlay({}, policy="new rule")
+        assert "directives" not in cs
 
     def test_inherit_participation_clears_stale_response_mode(self):
         # Stored an explicit mode; user moved the control to 'inherit'. BOTH columns must clear so
@@ -202,17 +200,17 @@ class TestOverlayInFlightState:
 
 # --------------------------------------------------------------------------- SHOULD-FIX #7: end-to-end re-render
 _STORED = {"participation_level": "mentions_only", "response_mode": "tag_only",
-           "directives": "stored rule", "reply_in_channel": True,
+           "reply_in_channel": True,
            "model": None, "reasoning_effort": None, "verbosity": None}
 
 # In-flight edits the user made but has NOT saved when they click a re-render button.
-_EDITED = dict(participation="active", directives=None, placement="inherit")
+_EDITED = dict(participation="active", policy=None, placement="inherit")
 
 
 def _assert_edits_survived(rebuilt):
     """The rebuilt modal must show the in-flight edits, not the stored row."""
     assert _block(rebuilt, "participation_block")["element"]["initial_option"]["value"] == "active"
-    assert _block(rebuilt, "directives_block")["element"]["initial_value"] == ""      # cleared, not restored
+    assert _block(rebuilt, "policy_block")["element"]["initial_value"] == ""      # cleared, not restored
     assert _block(rebuilt, "reply_in_channel_block")["element"]["initial_option"]["value"] == "inherit"
 
 
@@ -222,13 +220,14 @@ class TestRerenderPreservesEdits:
         db = SimpleNamespace(
             get_channel_settings_async=AsyncMock(return_value=dict(_STORED)),
             get_channel_memory_async=AsyncMock(return_value=memory_rows or []),
+            get_channel_policy_async=AsyncMock(return_value={"content": "stored rule"}),
         )
         return _make_host(db, real_modal=True)
 
     async def test_model_change_rerender_keeps_edits(self):
         host = self._host()
         client = SimpleNamespace(views_update=AsyncMock())
-        # Model swapped to gpt-5.5; participation/directives/placement edits must survive the rebuild.
+        # Model swapped to gpt-5.5; participation/policy/placement edits must survive the rebuild.
         state = _state(model="gpt-5.5", **_EDITED)
         body = {"user": {"id": "U1"}, "view": _view(state),
                 "actions": [{"action_id": "channel_model", "value": None}]}

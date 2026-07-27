@@ -46,7 +46,7 @@ class TestChannelSettingsModal:
         assert view["callback_id"] == "channel_settings_modal"
         assert json.loads(view["private_metadata"])["channel_id"] == "C1"
         assert self._block(view, "participation_block")["element"]["initial_option"]["value"] == "inherit"
-        assert self._block(view, "directives_block")["element"]["initial_value"] == ""
+        assert self._block(view, "policy_block")["element"]["initial_value"] == ""
         # No saved row → reply placement is the tri-state "inherit" option (NOT resolved to the
         # global default), so opening + saving untouched can never freeze that default into a row.
         element = self._block(view, "reply_in_channel_block")["element"]
@@ -55,10 +55,12 @@ class TestChannelSettingsModal:
 
     def test_prefill_from_row(self, modal):
         # Legacy row (response_mode only) maps to its participation-level equivalent.
-        cs = {"response_mode": "auto_respond", "directives": "only deploys", "reply_in_channel": True}
-        view = modal.build_channel_settings_modal("C2", cs, "tag_only")
+        cs = {"response_mode": "auto_respond", "reply_in_channel": True}
+        view = modal.build_channel_settings_modal(
+            "C2", cs, "tag_only", channel_policy={"content": "only deploys"})
         assert self._block(view, "participation_block")["element"]["initial_option"]["value"] == "judicious"
-        assert self._block(view, "directives_block")["element"]["initial_value"] == "only deploys"
+        # The standing policy comes from the reserved policy ROW, never from the settings row.
+        assert self._block(view, "policy_block")["element"]["initial_value"] == "only deploys"
         # reply_in_channel True → "channel"; False → "threads"; None → "inherit".
         assert self._block(view, "reply_in_channel_block")["element"]["initial_option"]["value"] == "channel"
 
@@ -173,8 +175,8 @@ class TestInheritClears:
                     db.conn.close()
 
     def test_omitted_arg_preserves(self, temp_db):
-        temp_db.set_channel_settings("C1", response_mode="auto_respond", directives="rule")
-        temp_db.set_channel_settings("C1", directives="rule2")  # omit mode → preserved
+        temp_db.set_channel_settings("C1", response_mode="auto_respond", verbosity="low")
+        temp_db.set_channel_settings("C1", verbosity="high")  # omit mode → preserved
         assert temp_db.get_channel_settings("C1")["response_mode"] == "auto_respond"
 
     def test_explicit_none_clears_mode(self, temp_db):
@@ -182,10 +184,10 @@ class TestInheritClears:
         temp_db.set_channel_settings("C1", response_mode=None)  # "inherit"
         assert temp_db.get_channel_settings("C1")["response_mode"] is None
 
-    def test_explicit_none_clears_directives(self, temp_db):
-        temp_db.set_channel_settings("C1", directives="only deploys")
-        temp_db.set_channel_settings("C1", directives=None)
-        assert temp_db.get_channel_settings("C1")["directives"] is None
+    def test_explicit_none_clears_verbosity(self, temp_db):
+        temp_db.set_channel_settings("C1", verbosity="low")
+        temp_db.set_channel_settings("C1", verbosity=None)
+        assert temp_db.get_channel_settings("C1")["verbosity"] is None
 
     @pytest.mark.asyncio
     async def test_async_inherit_clears(self, temp_db):

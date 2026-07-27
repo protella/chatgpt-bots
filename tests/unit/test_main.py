@@ -8,6 +8,18 @@ from unittest.mock import Mock, patch, AsyncMock
 from main import ChatBotV2, main
 
 
+def _startup_db():
+    """A db stub that can get through startup.
+
+    ``initialize`` runs the legacy directives→policy migration before any Slack traffic and
+    ABORTS if it fails — a channel left with rules in a column nothing reads would be silently
+    disobeyed. So every test that initializes needs the call to succeed.
+    """
+    db = Mock()
+    db.migrate_channel_directives_to_policy_async = AsyncMock(return_value=(0, 0))
+    return db
+
+
 class TestChatBotV2Initialization:
     """Test ChatBotV2 initialization and setup"""
     
@@ -42,7 +54,7 @@ class TestChatBotV2Initialization:
         """Test successful Slack initialization"""
         mock_config.validate.return_value = None
         mock_client = Mock()
-        mock_client.db = Mock()
+        mock_client.db = _startup_db()
         mock_slackbot_class.return_value = mock_client
 
         bot = ChatBotV2(platform="slack")
@@ -100,7 +112,7 @@ class TestChatBotV2Initialization:
     async def test_signal_handlers_setup(self, mock_processor, mock_slackbot, mock_config, mock_signal):
         """Test signal handlers are set up"""
         mock_config.validate.return_value = None
-        mock_client = Mock(db=Mock())
+        mock_client = Mock(db=_startup_db())
         mock_slackbot.return_value = mock_client
 
         bot = ChatBotV2(platform="slack")
@@ -355,7 +367,7 @@ class TestChatBotV2Lifecycle:
                              mock_slackbot_class, mock_log_start, mock_log_end, mock_exit, bot):
         """Test normal run flow"""
         mock_config.validate.return_value = None
-        mock_client = Mock(db=Mock())
+        mock_client = Mock(db=_startup_db())
         mock_slackbot_class.return_value = mock_client
 
         # No MCP servers — otherwise run() would try to create the health-probe
@@ -386,7 +398,7 @@ class TestChatBotV2Lifecycle:
                                    mock_slackbot_class, mock_log_start, mock_log_end, mock_exit, bot):
         """Test handling keyboard interrupt"""
         mock_config.validate.return_value = None
-        mock_client = Mock(db=Mock())
+        mock_client = Mock(db=_startup_db())
         mock_slackbot_class.return_value = mock_client
         mock_processor_class.return_value.mcp_manager.has_mcp_servers.return_value = False
         mock_client.start.side_effect = KeyboardInterrupt()
@@ -409,7 +421,7 @@ class TestChatBotV2Lifecycle:
                                  mock_slackbot_class, mock_log_start, mock_log_end, mock_exit, bot):
         """Test handling unexpected errors"""
         mock_config.validate.return_value = None
-        mock_client = Mock(db=Mock())
+        mock_client = Mock(db=_startup_db())
         mock_slackbot_class.return_value = mock_client
         mock_processor_class.return_value.mcp_manager.has_mcp_servers.return_value = False
         mock_client.start.side_effect = Exception("Unexpected error")
@@ -650,7 +662,7 @@ class TestChatBotV2Critical:
     async def test_critical_initialization_chain(self, mock_config, mock_slackbot_class, mock_processor_class):
         """Critical test for initialization chain"""
         mock_config.validate.return_value = None
-        mock_client = Mock(db=Mock())
+        mock_client = Mock(db=_startup_db())
         mock_slackbot_class.return_value = mock_client
 
         bot = ChatBotV2(platform="slack")
@@ -671,7 +683,7 @@ class TestChatBotV2Critical:
     async def test_critical_message_handler_callback(self, mock_config, mock_slackbot_class, mock_processor_class):
         """Critical test for message handler callback setup"""
         mock_config.validate.return_value = None
-        mock_client = Mock(db=Mock())
+        mock_client = Mock(db=_startup_db())
         mock_slackbot_class.return_value = mock_client
 
         bot = ChatBotV2(platform="slack")
@@ -725,7 +737,7 @@ class TestChatBotV2Integration:
         mock_config.cleanup_schedule = "0 0 * * *"
         mock_config.cleanup_max_age_hours = 24
 
-        mock_client = Mock(db=Mock())
+        mock_client = Mock(db=_startup_db())
         mock_slackbot_class.return_value = mock_client
 
         bot = ChatBotV2(platform="slack")

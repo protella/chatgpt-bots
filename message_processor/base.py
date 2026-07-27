@@ -11,7 +11,7 @@ from thread_manager import AsyncThreadStateManager
 from openai_client import OpenAIClient
 from config import config, pipeline_status
 from logger import LoggerMixin
-from . import image_catalog, participation_telemetry
+from . import channel_steering, image_catalog, participation_telemetry
 from .containers import ContainerManager
 from .message_timestamps import stamp_content
 from .thread_management import ThreadManagementMixin
@@ -170,9 +170,19 @@ class MessageProcessor(ThreadManagementMixin,
         # links at the gate (this is then a no-op); one whose attempt was never minted keeps its
         # sources staged for whichever turn does run. Reads its OWN routing fact rather than
         # trusting the caller: mislabeling the route here would misfile the lineage.
-        participation_telemetry.emit_queue_links(
-            message,
-            gate_required=(message.metadata or {}).get("gate_required") is True)
+        gate_required = (message.metadata or {}).get("gate_required") is True
+        participation_telemetry.emit_queue_links(message, gate_required=gate_required)
+
+        # An UNGATED turn (a DM, an @mention, a thread continuation) has no gate to have read the
+        # channel's steering, so it reads it HERE — at the point of no return, not earlier. A
+        # message that queues instead never reaches this line, so it costs nothing; when its
+        # redispatch finally runs, it reads the steering as it is THEN, not as it was when the
+        # message arrived. Gated turns arrive already stamped by the gate and must not read
+        # again; see message_processor/channel_steering.py for why a second read is the bug.
+        if not gate_required:
+            channel_steering.stamp(message, await channel_steering.load_snapshot(
+                self.db, message.channel_id,
+                memory_enabled=bool(getattr(config, "enable_channel_memory", True))))
 
         try:
             # Get or rebuild thread state
@@ -253,20 +263,25 @@ class MessageProcessor(ThreadManagementMixin,
                     message.user_id,
                     user_real_name or (message.metadata.get("username") if message.metadata else None) or message.user_id,
                 )
-            # Phase 7: per-channel ground rules ride on the message metadata into the prompt
-            thread_state.channel_directives = message.metadata.get("channel_directives") if message.metadata else None
-            # Phase 9: ONE channel-memory snapshot for this RESPONDER TURN, read here and passed
-            # down. The handlers build the real prompt themselves and every retry path re-enters
-            # them (context retry, streaming fallback, the timeout retry below), so a per-handler
-            # fetch would hit the DB several times for one turn and could hand two attempts of
-            # the SAME turn different memory. None when disabled/empty → prompt unchanged.
+            # THIS TURN's channel steering — the stamp, never a fresh read. The gate stamped it
+            # (gated turns) or the point-of-no-return above did (ungated ones), and the handlers
+            # get the string passed down because every retry path re-enters them (context retry,
+            # streaming fallback, MCP retry, the timeout retry below, the non-streaming fallback)
+            # and a per-attempt read would give two attempts of ONE turn different rules.
             #
-            # Scope, precisely: the responder. The participation GATE still reads its own copy of
-            # channel memory before this code ever runs (main.py::_gate_verdict), so a message
-            # that came through the gate has had two reads and could in principle have been
-            # judged on facts the reply never sees. Making it one read for the gate AND the
-            # responder is the shared-memory-steering commit, not this one.
-            channel_memory_text = await self._build_channel_memory_text(message.channel_id)
+            # No stamp on a gated turn is an invariant failure, not a cue to go and read: reading
+            # here is precisely the divergence this commit exists to remove — the gate would have
+            # judged the message against bytes the reply never saw. So it is logged loudly and
+            # this turn proceeds with NO steering, which is the one state that cannot disagree
+            # with anything.
+            steering = channel_steering.stamped(message)
+            if steering is None:
+                if gate_required:
+                    self.log_warning(
+                        f"No channel-steering stamp on a gated turn in {message.channel_id} — "
+                        "answering without steering rather than reading it a second time")
+                steering = channel_steering.EMPTY_SNAPSHOT
+            channel_steering_text = steering.text
 
             # F32: ONE artifact sink for the whole turn. The timeout/MCP retries below re-enter
             # the text handler; a per-attempt sink would drop the container id of an attempt that
@@ -559,7 +574,7 @@ class MessageProcessor(ThreadManagementMixin,
             response = await self._handle_text_response(
                 user_content, thread_state, client, message, thinking_id, retry_count=0,
                 artifacts_acc=turn_artifacts, turn=turn,
-                channel_memory_text=channel_memory_text)
+                channel_steering_text=channel_steering_text)
 
             # DEBUG: log conversation history after processing (with truncated content).
             # log_debug, not print — conversation content must not leak to stdout
@@ -649,7 +664,7 @@ class MessageProcessor(ThreadManagementMixin,
                         retry_count=1,
                         artifacts_acc=turn_artifacts, turn=turn,
                         # Same snapshot as the attempt that timed out — one responder turn.
-                        channel_memory_text=channel_memory_text
+                        channel_steering_text=channel_steering_text
                     )
                     self.log_info(f"Retry successful for {operation_type}")
                     return response

@@ -226,21 +226,31 @@ class TestReconcileLegacyAndMarkers:
         rows = _channel_rows(temp_db)
         assert len(rows) == 1 and rows[0]["author"] == MARK
 
-    async def test_pref_marker_edited_demotes_author(self, temp_db):
-        # Documented behavior: EDITING a marker line in the textarea is a delete+add — the engine's
-        # marker row is deleted and the new text is re-added as a human-authored channel fact. The
-        # preference loses its marker author (demoted); the engine can re-establish it later.
+    async def test_pref_marker_survives_an_edit_of_its_line(self, temp_db):
+        # The marker rows are STEERING, and this box only ever holds facts: the modal stops
+        # rendering them, and reconciliation refuses to delete one even when a stale seed names
+        # it. (It used to demote the row to a human-authored fact, which quietly transferred
+        # ownership of a preference the engine writes and targets by id.) The typed line is just
+        # a new fact; the preference itself is untouched.
         rid = temp_db.add_channel_memory("C1", "react less here", author=MARK)
         seed = [[rid, memory_content_hash("react less here")]]
         res = await temp_db.reconcile_channel_memory_from_textarea_async(
             "C1", seed, ["react a lot less here"], author="U2", max_rows=50)
-        assert res["deleted"] == [rid]
+        assert res["deleted"] == []
         assert res["added"] == ["react a lot less here"]
-        rows = _channel_rows(temp_db)
-        assert len(rows) == 1
-        assert rows[0]["content"] == "react a lot less here"
-        assert rows[0]["author"] == "U2"                   # demoted from marker to human author
-        assert not rows[0]["author"].startswith("participation_engine:pref:")
+        rows = {r["content"]: r["author"] for r in _channel_rows(temp_db)}
+        assert rows["react less here"] == MARK             # still the engine's, still there
+        assert rows["react a lot less here"] == "U2"
+
+    async def test_pref_markers_do_not_consume_fact_capacity(self, temp_db):
+        # The cap protects the PROMPT from a pile of remembered facts. A channel whose engine
+        # preferences filled it could store nothing at all — so they are not counted.
+        temp_db.add_channel_memory("C1", "react less here", author=MARK)
+        temp_db.add_channel_memory("C1", "verbosity: shorter", author=MARK + "2")
+        res = await temp_db.reconcile_channel_memory_from_textarea_async(
+            "C1", [], ["a real fact", "another real fact"], author="U2", max_rows=2)
+        assert res["over_cap"] == 0
+        assert res["added"] == ["a real fact", "another real fact"]
 
 
 # --------------------------------------------------------------------------- degenerate inputs

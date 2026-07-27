@@ -2,8 +2,9 @@
 
 Replaces the one-word wake classifier with a judgment layer that decides, per
 unprompted channel message, whether the bot should respond, react, stay silent,
-or back off — using real channel context (ChannelPulse envelope), channel memory,
-operator directives, and the bot's own recent participation rate.
+or back off — using real channel context (ChannelPulse envelope), the channel's
+steering block (standing policy + remembered facts, rendered once per turn by
+message_processor/channel_steering.py), and the bot's own recent participation rate.
 
 Authority order (cheap → expensive), enforced in code not prompt:
   prefilters (message_events: own message / subtype / level=off / muted-thread /
@@ -377,8 +378,7 @@ class ParticipationEngine:
                        sender_name: Optional[str] = None,
                        is_thread_reply: bool = False,
                        level: str = "judicious",
-                       directives: Optional[str] = None,
-                       memory_facts: Optional[List[Dict[str, Any]]] = None,
+                       channel_steering_text: Optional[str] = None,
                        channel_activity: Optional[str] = None,
                        name_hit: bool = False,
                        self_display_name: Optional[str] = None,
@@ -516,8 +516,11 @@ class ParticipationEngine:
             "sender_name": sender_name,
             "is_thread_reply": is_thread_reply,
             "strictness": level,
-            "directives": directives,
-            "memory_facts": memory_facts or [],
+            # ONE block of channel steering, rendered by the caller and inserted verbatim.
+            # The gate used to take the operator's rules and the raw memory rows as two separate
+            # inputs and render them itself, which is how it and the responder came to describe
+            # the same channel differently. See message_processor/channel_steering.py.
+            "channel_steering_text": channel_steering_text,
             "channel_activity": channel_activity,
             "thread_tail": thread_tail,
             # F47: authoritative addressee evidence for a top-level trigger (None for threaded

@@ -47,6 +47,29 @@ def normalize_memory_line(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def merged_policy_text(current: str, incoming: str) -> Optional[str]:
+    """Both texts, or one, or neither — the rule for folding an incoming policy into a stored one.
+
+    Used by the directives migration and by a legacy modal's submission, which are the only two
+    paths that CANNOT know what the stored policy is (one predates it, the other predates the
+    field). Guessing which text the operator meant is not their call, and silently dropping
+    either is how a live rule disappears — so both survive as separate lines, deduplicated only
+    on exact equality after whitespace normalization.
+
+    Returns None when there is nothing to store. Note the asymmetry with a deliberate REPLACE: a
+    writer that can see the current policy replaces it wholesale; a writer that cannot, merges.
+    """
+    current = (current or "").strip()
+    incoming = (incoming or "").strip()
+    if not incoming:
+        return current or None
+    if not current:
+        return incoming
+    if normalize_memory_line(current) == normalize_memory_line(incoming):
+        return current                      # the same rule arriving twice
+    return f"{current}\n{incoming}"
+
+
 def memory_content_hash(text: str) -> str:
     """Stable short identity for a memory line: sha256 hexdigest of the normalized text, [:16].
 
@@ -81,14 +104,19 @@ def _encode_muted_threads(val) -> Optional[str]:
 # them bumps updated_ts/updated_by; a write that touches only the non-structural columns
 # (snoozed_until, the deprecated muted_threads) leaves authorship untouched — so a background
 # housekeeping write never looks like the last human to edit the channel's response settings.
+#
+# `directives` is NOT here, and takes no parameter below: the channel's standing rules live in
+# the reserved policy row now (see message_processor/channel_steering.py). The COLUMN survives so
+# the migration has something to read on an old database; nothing writes it, and nothing but the
+# migration reads it.
 _CHANNEL_SETTINGS_STRUCTURAL = (
-    "response_mode", "directives", "reply_in_channel",
+    "response_mode", "reply_in_channel",
     "participation_level", "model", "reasoning_effort", "verbosity",
     "ambient_memory",
 )
 
 
-def _build_channel_settings_write(channel_id, response_mode=_UNSET, directives=_UNSET,
+def _build_channel_settings_write(channel_id, response_mode=_UNSET,
                                   reply_in_channel=_UNSET, participation_level=_UNSET,
                                   snoozed_until=_UNSET, muted_threads=_UNSET,
                                   model=_UNSET, reasoning_effort=_UNSET, verbosity=_UNSET,
@@ -114,8 +142,6 @@ def _build_channel_settings_write(channel_id, response_mode=_UNSET, directives=_
     provided: Dict[str, Any] = {}
     if response_mode is not _UNSET:
         provided["response_mode"] = response_mode
-    if directives is not _UNSET:
-        provided["directives"] = directives
     if reply_in_channel is not _UNSET:
         provided["reply_in_channel"] = (
             None if reply_in_channel is None else (1 if reply_in_channel else 0))
@@ -638,8 +664,11 @@ class DatabaseManager(LoggerMixin):
             ON mcp_tools(server_label)
         """)
 
-        # Phase 7: per-channel response settings (mode + freeform directives).
+        # Phase 7: per-channel response settings.
         # No row for a channel => global defaults apply (no behavior change).
+        # `directives` is LEGACY and inert: the channel's standing rules moved to the reserved
+        # policy row. The column stays so migrate_channel_directives_to_policy_async has
+        # something to read on a database that predates the move; nothing else touches it.
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS channel_settings (
                 channel_id TEXT PRIMARY KEY,
@@ -1339,6 +1368,15 @@ class DatabaseManager(LoggerMixin):
         )
         # Drop first so a re-run REPLACES an index created under the old (scope-agnostic)
         # predicate; CREATE ... IF NOT EXISTS alone would silently keep the stale predicate.
+        # The RESERVED POLICY ROW: at most one per channel. `scope` already distinguishes row
+        # KINDS ('channel' private facts vs 'workspace' shared ones), so 'policy' extends that
+        # column rather than introducing a parallel notion of kind. A partial unique index is
+        # what makes "reserved" true in the storage rather than only in the code that writes it.
+        self.conn.execute("DROP INDEX IF EXISTS idx_channel_memory_policy")
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_memory_policy "
+            "ON channel_memory (channel_id) WHERE scope = 'policy'"
+        )
         self.conn.execute("DROP INDEX IF EXISTS idx_channel_memory_pref_marker")
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_memory_pref_marker "
@@ -1439,7 +1477,7 @@ class DatabaseManager(LoggerMixin):
     def get_channel_settings(self, channel_id: str) -> Optional[Dict]:
         """Get per-channel settings (Phase 7). Returns a dict or None if the channel has no row."""
         cursor = self.conn.execute(
-            "SELECT response_mode, directives, reply_in_channel, participation_level, "
+            "SELECT response_mode, reply_in_channel, participation_level, "
             "snoozed_until, muted_threads, model, reasoning_effort, verbosity, updated_ts, updated_by "
             "FROM channel_settings WHERE channel_id = ?",
             (channel_id,)
@@ -1449,7 +1487,6 @@ class DatabaseManager(LoggerMixin):
             return None
         return {
             "response_mode": row["response_mode"],
-            "directives": row["directives"],
             # NULL reply_in_channel stays None (inherit → resolves to config.reply_in_channel_default
             # at read time). Collapsing NULL to False here erased the inherit distinction.
             "reply_in_channel": (None if row["reply_in_channel"] is None
@@ -1465,7 +1502,7 @@ class DatabaseManager(LoggerMixin):
         }
 
     def set_channel_settings(self, channel_id: str, response_mode=_UNSET,
-                             directives=_UNSET, reply_in_channel=_UNSET,
+                             reply_in_channel=_UNSET,
                              participation_level=_UNSET, snoozed_until=_UNSET,
                              muted_threads=_UNSET,
                              model=_UNSET, reasoning_effort=_UNSET, verbosity=_UNSET,
@@ -1481,7 +1518,7 @@ class DatabaseManager(LoggerMixin):
         per-thread mute mechanism was removed); it takes a Python list, None/[] clears it.
         """
         built = _build_channel_settings_write(
-            channel_id, response_mode=response_mode, directives=directives,
+            channel_id, response_mode=response_mode,
             reply_in_channel=reply_in_channel, participation_level=participation_level,
             snoozed_until=snoozed_until, muted_threads=muted_threads, model=model,
             reasoning_effort=reasoning_effort, verbosity=verbosity,
@@ -1519,6 +1556,49 @@ class DatabaseManager(LoggerMixin):
             (channel_id,)
         )
         return [dict(row) for row in cursor.fetchall()]
+
+    # --- the reserved policy row ---------------------------------------------------------
+    #
+    # Deliberately NOT reachable through get_channel_memory / add_channel_memory: those are the
+    # generic fact API the memory tools and the settings textarea speak, and the policy row must
+    # be untouchable from all of them. Its own accessors are the only way in, and the two
+    # authorized writers (the settings modal and set_channel_participation) are their only
+    # callers.
+
+    def get_channel_policy(self, channel_id: str) -> Optional[Dict]:
+        """The channel's standing policy row, or None. Never returns facts."""
+        cursor = self.conn.execute(
+            "SELECT id, channel_id, scope, content, author, created_ts, updated_ts "
+            "FROM channel_memory WHERE scope = 'policy' AND channel_id = ? LIMIT 1",
+            (channel_id,)
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def set_channel_policy(self, channel_id: str, content: Optional[str],
+                           author: Optional[str] = None) -> None:
+        """REPLACE the whole policy, or DELETE it when the text is blank.
+
+        Replace, never append or patch: a standing policy is a single statement of how the bot
+        should behave here, and merging a new one into an old one would silently accumulate
+        contradictions nobody chose. Blank means the operator cleared it, which is a deletion —
+        an empty row would render an empty instructions heading."""
+        text = (content or "").strip()
+        if not text:
+            self.conn.execute(
+                "DELETE FROM channel_memory WHERE scope = 'policy' AND channel_id = ?",
+                (channel_id,))
+            self.conn.commit()
+            return
+        # The partial unique index makes this an upsert rather than a race between readers.
+        self.conn.execute(
+            "INSERT INTO channel_memory (channel_id, scope, content, author) "
+            "VALUES (?, 'policy', ?, ?) "
+            "ON CONFLICT (channel_id) WHERE scope = 'policy' "
+            "DO UPDATE SET content = excluded.content, author = excluded.author, "
+            "              updated_ts = CURRENT_TIMESTAMP",
+            (channel_id, text, author))
+        self.conn.commit()
 
     def add_channel_memory(self, channel_id: str, content: str, scope: str = "channel",
                            author: Optional[str] = None) -> int:
@@ -3320,7 +3400,7 @@ class DatabaseManager(LoggerMixin):
             db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA journal_mode=WAL")
             async with db.execute(
-                "SELECT response_mode, directives, reply_in_channel, participation_level, "
+                "SELECT response_mode, reply_in_channel, participation_level, "
                 "snoozed_until, muted_threads, model, reasoning_effort, verbosity, "
                 "ambient_memory, updated_ts, updated_by "
                 "FROM channel_settings WHERE channel_id = ?",
@@ -3331,7 +3411,6 @@ class DatabaseManager(LoggerMixin):
                     return None
                 return {
                     "response_mode": row["response_mode"],
-                    "directives": row["directives"],
                     # F51 opt-out: NULL → None (inherit config.enable_ambient_memory at read time).
                     "ambient_memory": (None if row["ambient_memory"] is None
                                        else bool(row["ambient_memory"])),
@@ -3349,7 +3428,7 @@ class DatabaseManager(LoggerMixin):
                 }
 
     async def set_channel_settings_async(self, channel_id: str, response_mode=_UNSET,
-                                         directives=_UNSET, reply_in_channel=_UNSET,
+                                         reply_in_channel=_UNSET,
                                          participation_level=_UNSET, snoozed_until=_UNSET,
                                          muted_threads=_UNSET,
                                          model=_UNSET, reasoning_effort=_UNSET, verbosity=_UNSET,
@@ -3363,7 +3442,7 @@ class DatabaseManager(LoggerMixin):
         mechanism was removed).
         """
         built = _build_channel_settings_write(
-            channel_id, response_mode=response_mode, directives=directives,
+            channel_id, response_mode=response_mode,
             reply_in_channel=reply_in_channel, participation_level=participation_level,
             snoozed_until=snoozed_until, muted_threads=muted_threads, model=model,
             reasoning_effort=reasoning_effort, verbosity=verbosity,
@@ -3382,6 +3461,49 @@ class DatabaseManager(LoggerMixin):
                     "DELETE FROM channel_summaries WHERE channel_id = ?", (channel_id,))
             await db.commit()
             logger.debug(f"Saved channel_settings for {channel_id} (async)")
+
+    async def set_channel_settings_and_policy_async(self, channel_id: str,
+                                                    policy: Optional[str],
+                                                    author: Optional[str] = None,
+                                                    **settings) -> None:
+        """Write structural channel settings AND the standing policy as ONE transaction.
+
+        A single instruction — "only speak up about deploys, and keep it to threads" — is one
+        decision, and half of it landing is a channel configured in a way nobody asked for. The
+        two writes therefore share a transaction rather than being two calls that happen to run
+        next to each other.
+
+        `policy` follows set_channel_policy_async: text REPLACES the whole policy, blank DELETES
+        it. `settings` are the same keyword fields set_channel_settings_async takes; passing none
+        of them writes only the policy.
+        """
+        built = _build_channel_settings_write(channel_id, updated_by=author, **settings)
+        text = (policy or "").strip()
+        async with aiosqlite.connect(self.db_path, isolation_level=None) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                if built is not None:
+                    sql, params = built
+                    await db.execute(sql, params)
+                if not text:
+                    await db.execute(
+                        "DELETE FROM channel_memory WHERE scope = 'policy' AND channel_id = ?",
+                        (channel_id,))
+                else:
+                    await db.execute(
+                        "INSERT INTO channel_memory (channel_id, scope, content, author) "
+                        "VALUES (?, 'policy', ?, ?) "
+                        "ON CONFLICT (channel_id) WHERE scope = 'policy' "
+                        "DO UPDATE SET content = excluded.content, author = excluded.author, "
+                        "              updated_ts = CURRENT_TIMESTAMP",
+                        (channel_id, text, author))
+                await db.execute("COMMIT")
+            except Exception:
+                await db.execute("ROLLBACK")
+                raise
+        logger.debug(f"Saved channel_settings + policy for {channel_id} (async)")
 
     # --- Per-channel memory (Phase 9), async variants ---
     async def load_emoji_usage_async(self) -> Optional[Dict[str, int]]:
@@ -3442,6 +3564,243 @@ class DatabaseManager(LoggerMixin):
             ) as cursor:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
+
+    async def get_channel_policy_async(self, channel_id: str) -> Optional[Dict]:
+        """Async version of get_channel_policy. Never returns facts."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(
+                "SELECT id, channel_id, scope, content, author, created_ts, updated_ts "
+                "FROM channel_memory WHERE scope = 'policy' AND channel_id = ? LIMIT 1",
+                (channel_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def set_channel_policy_async(self, channel_id: str, content: Optional[str],
+                                       author: Optional[str] = None) -> None:
+        """Async version of set_channel_policy: REPLACE the whole policy, or DELETE when blank.
+
+        Replace, never append or patch — a standing policy is a single statement of how the bot
+        behaves here, and merging a new one into an old one accumulates contradictions nobody
+        chose. Blank means the operator cleared it, which is a deletion: an empty row would
+        render an empty instructions heading."""
+        text = (content or "").strip()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            if not text:
+                await db.execute(
+                    "DELETE FROM channel_memory WHERE scope = 'policy' AND channel_id = ?",
+                    (channel_id,))
+            else:
+                # The partial unique index turns this into an upsert rather than a race.
+                await db.execute(
+                    "INSERT INTO channel_memory (channel_id, scope, content, author) "
+                    "VALUES (?, 'policy', ?, ?) "
+                    "ON CONFLICT (channel_id) WHERE scope = 'policy' "
+                    "DO UPDATE SET content = excluded.content, author = excluded.author, "
+                    "              updated_ts = CURRENT_TIMESTAMP",
+                    (channel_id, text, author))
+            await db.commit()
+
+    async def set_channel_policy_if_unchanged_async(self, channel_id: str,
+                                                    expected_hash: Optional[str],
+                                                    content: Optional[str],
+                                                    author: Optional[str] = None) -> bool:
+        """Compare-and-swap the policy: replace it ONLY if it still hashes to `expected_hash`.
+
+        Returns True when the write landed, False when someone else changed the policy first.
+
+        The comparison and the write are ONE transaction on purpose. The settings modal replaces
+        the policy wholesale, so a save from a modal opened before someone else edited it would
+        revert their rule — and an emptied box would revert it to nothing at all. Reading the
+        hash in one statement and writing in another leaves exactly that gap open, just narrower:
+        a concurrent save landing between the two is silently overwritten by whichever modal
+        submits second. `expected_hash` is memory_content_hash of the policy the writer was
+        shown, or "" / None when it was shown no policy at all.
+        """
+        expected = expected_hash or ""
+        text = (content or "").strip()
+        async with aiosqlite.connect(self.db_path, isolation_level=None) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA busy_timeout=5000")
+            # IMMEDIATE, not deferred: the write lock is taken before the read, so a concurrent
+            # writer serializes behind this rather than racing inside it.
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT content FROM channel_memory "
+                    "WHERE scope = 'policy' AND channel_id = ? LIMIT 1",
+                    (channel_id,)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                stored = ((row["content"] if row else "") or "").strip()
+                current_hash = memory_content_hash(stored) if stored else ""
+                if current_hash != expected:
+                    await db.execute("ROLLBACK")
+                    return False
+                if stored == text:
+                    # Nothing changed. Writing anyway would re-attribute the policy to whoever
+                    # opened the modal and clicked Save without touching the box — the same
+                    # "field supplied is not value changed" rule the channel-settings writer
+                    # follows for updated_by.
+                    await db.execute("COMMIT")
+                    return True
+                if not text:
+                    await db.execute(
+                        "DELETE FROM channel_memory WHERE scope = 'policy' AND channel_id = ?",
+                        (channel_id,))
+                else:
+                    await db.execute(
+                        "INSERT INTO channel_memory (channel_id, scope, content, author) "
+                        "VALUES (?, 'policy', ?, ?) "
+                        "ON CONFLICT (channel_id) WHERE scope = 'policy' "
+                        "DO UPDATE SET content = excluded.content, author = excluded.author, "
+                        "              updated_ts = CURRENT_TIMESTAMP",
+                        (channel_id, text, author))
+                await db.execute("COMMIT")
+                return True
+            except Exception:
+                try:
+                    await db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+
+    async def merge_channel_policy_async(self, channel_id: str, content: Optional[str],
+                                         author: Optional[str] = None) -> Optional[str]:
+        """Fold `content` into the stored policy per ``merged_policy_text``, in ONE transaction.
+
+        For the writers that cannot see the current policy and therefore must not replace it: the
+        directives migration's own case, and a modal opened before the policy field existed. A
+        blank `content` is NOT a clear — a writer that cannot see the policy cannot mean "delete
+        it". Returns the stored text afterwards (None if there was and is nothing).
+        """
+        async with aiosqlite.connect(self.db_path, isolation_level=None) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT content FROM channel_memory "
+                    "WHERE scope = 'policy' AND channel_id = ? LIMIT 1",
+                    (channel_id,)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                stored = ((row["content"] if row else "") or "").strip()
+                merged = merged_policy_text(stored, content or "")
+                if merged and merged != stored:
+                    await db.execute(
+                        "INSERT INTO channel_memory (channel_id, scope, content, author) "
+                        "VALUES (?, 'policy', ?, ?) "
+                        "ON CONFLICT (channel_id) WHERE scope = 'policy' "
+                        "DO UPDATE SET content = excluded.content, author = excluded.author, "
+                        "              updated_ts = CURRENT_TIMESTAMP",
+                        (channel_id, merged, author))
+                await db.execute("COMMIT")
+                return merged
+            except Exception:
+                try:
+                    await db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+
+    async def update_channel_fact_async(self, memory_id: int, content: str) -> bool:
+        """Revise an ORDINARY channel fact. Returns True when a row actually changed.
+
+        The scope and author live in the WHERE clause, not in a caller's check, because the
+        callers that most need the guarantee are the ones least able to enforce it: the fallback
+        extractor hands this an id a utility model produced, and an id it never saw is either a
+        hallucination or stale. A policy row or one of the gate's preference markers matches
+        nothing here, so the write is a no-op rather than a silent overwrite of steering.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            from message_processor.channel_steering import PREF_AUTHOR_PREFIX
+            cursor = await db.execute(
+                "UPDATE channel_memory SET content = ?, updated_ts = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND scope = 'channel' "
+                "AND (author IS NULL OR author NOT LIKE ? || '%')",
+                (content, memory_id, PREF_AUTHOR_PREFIX))
+            await db.commit()
+            return (cursor.rowcount or 0) > 0
+
+    async def migrate_channel_directives_to_policy_async(self) -> tuple:
+        """Move every nonempty `channel_settings.directives` into its channel's policy row.
+
+        IDEMPOTENT, and safe to interrupt. Each channel is one transaction: the policy row is
+        written FIRST and the directives column nulled only after that write succeeds, so a
+        failure anywhere leaves the operator's rules exactly where they were. A rerun finds no
+        nonempty directives and does nothing.
+
+        A channel that somehow has BOTH keeps both texts as separate lines in a stable order,
+        deduplicated only on exact equality after whitespace normalization. Guessing which one
+        the operator meant is not this migration's call, and silently dropping either is how a
+        live rule disappears.
+
+        Returns ``(migrated, failed)``. A nonzero `failed` is NOT survivable at startup: the
+        legacy readers are gone, so a channel whose directives are still sitting in the column
+        has an operator rule that nothing will obey until a later run happens to succeed. The
+        caller aborts on it — see main.ChatBotV2.initialize."""
+        migrated = 0
+        failed = 0
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(
+                "SELECT channel_id, directives FROM channel_settings "
+                "WHERE directives IS NOT NULL AND TRIM(directives) != ''"
+            ) as cursor:
+                rows = await cursor.fetchall()
+            for row in rows:
+                channel_id = row["channel_id"]
+                directives = (row["directives"] or "").strip()
+                if not directives:
+                    continue
+                try:
+                    async with db.execute(
+                        "SELECT content FROM channel_memory "
+                        "WHERE scope = 'policy' AND channel_id = ? LIMIT 1",
+                        (channel_id,)
+                    ) as pol_cursor:
+                        existing = await pol_cursor.fetchone()
+                    current = (existing["content"] or "").strip() if existing else ""
+                    content = merged_policy_text(current, directives)
+                    if current and content != current:
+                        logger.warning(
+                            f"DB: channel {channel_id} had BOTH a policy row and legacy "
+                            f"directives — preserving both; an operator should review")
+                    await db.execute(
+                        "INSERT INTO channel_memory (channel_id, scope, content, author) "
+                        "VALUES (?, 'policy', ?, 'migration:channel_directives') "
+                        "ON CONFLICT (channel_id) WHERE scope = 'policy' "
+                        "DO UPDATE SET content = excluded.content, "
+                        "              updated_ts = CURRENT_TIMESTAMP",
+                        (channel_id, content))
+                    # ONLY after the policy write lands: the column is the fallback until it isn't.
+                    await db.execute(
+                        "UPDATE channel_settings SET directives = NULL WHERE channel_id = ?",
+                        (channel_id,))
+                    await db.commit()
+                    migrated += 1
+                except Exception as e:  # noqa: BLE001 — every channel gets its own attempt
+                    failed += 1
+                    try:
+                        await db.rollback()
+                    except Exception:
+                        pass
+                    logger.error(
+                        f"DB: directives→policy migration failed for {channel_id} "
+                        f"({type(e).__name__}); its directives are untouched and its operator "
+                        f"rule will NOT be obeyed until this succeeds")
+        if migrated:
+            logger.info(
+                f"DB: migrated channel directives to policy rows for {migrated} channel(s)")
+        return migrated, failed
 
     async def add_channel_memory_async(self, channel_id: str, content: str, scope: str = "channel",
                                        author: Optional[str] = None) -> int:
@@ -3517,10 +3876,16 @@ class DatabaseManager(LoggerMixin):
                     await db.execute("COMMIT")
                     return row_id
                 if max_rows is not None:
+                    # ORDINARY facts only. The cap exists to stop remembered facts from crowding
+                    # out the prompt; steering rows are not facts, and counting the engine's own
+                    # markers against it would let a channel's preferences lock out the very
+                    # thing the cap protects.
+                    from message_processor.channel_steering import PREF_AUTHOR_PREFIX
                     async with db.execute(
                         "SELECT COUNT(*) FROM channel_memory "
-                        "WHERE scope = 'channel' AND channel_id = ?",
-                        (channel_id,),
+                        "WHERE scope = 'channel' AND channel_id = ? "
+                        "AND (author IS NULL OR author NOT LIKE ? || '%')",
+                        (channel_id, PREF_AUTHOR_PREFIX),
                     ) as cur:
                         (count,) = await cur.fetchone()
                     if count >= max(1, int(max_rows)):
@@ -3591,11 +3956,16 @@ class DatabaseManager(LoggerMixin):
             await db.execute("PRAGMA busy_timeout=5000")
             await db.execute("BEGIN IMMEDIATE")
             try:
-                # 1. Snapshot all current channel-scope rows → {id: content}.
+                # 1. Snapshot the current ORDINARY channel-scope rows → {id: content}.
+                #    The engine's preference markers are excluded on purpose: they are steering,
+                #    they were never shown in the textarea, and a row the user could not see must
+                #    not be deletable by an edit to that box — nor may it eat the cap.
+                from message_processor.channel_steering import PREF_AUTHOR_PREFIX
                 async with db.execute(
                     "SELECT id, content FROM channel_memory "
-                    "WHERE scope = 'channel' AND channel_id = ?",
-                    (channel_id,),
+                    "WHERE scope = 'channel' AND channel_id = ? "
+                    "AND (author IS NULL OR author NOT LIKE ? || '%')",
+                    (channel_id, PREF_AUTHOR_PREFIX),
                 ) as cur:
                     current: Dict[Any, str] = {
                         row["id"]: row["content"] for row in await cur.fetchall()

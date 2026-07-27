@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from config import config
+from message_processor.channel_steering import is_ordinary_fact
 from tool_registry import ToolContext, ToolRegistry
 
 # Keep stored facts to a concise sentence-or-two; hard cap guards the prompt.
@@ -32,10 +33,13 @@ def get_remember_fact_schema() -> Dict[str, Any]:
         "type": "function",
         "name": "remember_fact",
         "description": (
-            "Save a durable, channel-relevant fact to this channel's long-term memory "
-            "(decisions, conventions, recurring events, preferences, who owns what). "
+            "Save a durable, channel-relevant BACKGROUND fact to this channel's long-term "
+            "memory (decisions, conventions, recurring events, who owns what). "
             "Bias strongly against saving; most exchanges contain nothing durable. "
-            "Update an existing [#id] fact instead of adding a near-duplicate."
+            "Update an existing [#id] fact instead of adding a near-duplicate. "
+            "NOT for rules about your own behavior here — 'stay quiet unless tagged', 'keep "
+            "answers short in this channel' and the like are the channel's standing policy: "
+            "write those with set_channel_participation(standing_policy=...)."
         ),
         "parameters": {
             "type": "object",
@@ -61,7 +65,9 @@ def get_update_fact_schema() -> Dict[str, Any]:
         "name": "update_fact",
         "description": (
             "Revise an existing channel-memory fact (shown in context as [#id]) when it "
-            "changed or needs refinement. Prefer this over remember_fact for near-duplicates."
+            "changed or needs refinement. Prefer this over remember_fact for near-duplicates. "
+            "It edits background facts only; to change a rule about how you behave here, "
+            "replace the standing policy with set_channel_participation(standing_policy=...)."
         ),
         "parameters": {
             "type": "object",
@@ -80,7 +86,9 @@ def get_forget_fact_schema() -> Dict[str, Any]:
         "name": "forget_fact",
         "description": (
             "Delete a channel-memory fact (shown in context as [#id]) — when someone asks you "
-            "to forget it, or it is obsolete/wrong."
+            "to forget it, or it is obsolete/wrong. Background facts only; to drop a rule about "
+            "how you behave here, replace the standing policy with "
+            "set_channel_participation(standing_policy=...)."
         ),
         "parameters": {
             "type": "object",
@@ -124,6 +132,14 @@ async def _visible_row(ctx: ToolContext, memory_id: Any) -> Dict[str, Any]:
     if row.get("scope") != "channel":
         return {"ok": False, "error": "workspace_scope_readonly",
                 "message": f"Memory [#{memory_id}] is workspace-shared and can't be changed from here."}
+    if not is_ordinary_fact(row):
+        # A recorded participation preference. Its id is visible to the participation gate (whose
+        # backoff contract targets it) and therefore visible here too, but it is steering, not a
+        # fact — the generic tools may read it and nothing more. The reserved policy row never
+        # reaches this code at all: get_channel_memory_async does not return it.
+        return {"ok": False, "error": "steering_row_readonly",
+                "message": (f"[#{memory_id}] is a recorded participation preference, not a fact. "
+                            "Change how you behave here with set_channel_participation instead.")}
     return {"row": row}
 
 
@@ -137,7 +153,9 @@ async def execute_remember_fact(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
     content = content[:MAX_FACT_CHARS]
 
     rows = await ctx.db.get_channel_memory_async(ctx.channel_id)
-    chan_rows = [r for r in rows if r.get("scope") == "channel"]
+    # Steering rows never consume fact capacity: the cap exists to keep remembered facts from
+    # crowding the prompt, and a channel whose preferences filled it could store nothing at all.
+    chan_rows = [r for r in rows if r.get("scope") == "channel" and is_ordinary_fact(r)]
     cap = max(1, config.memory_max_rows)
     if len(chan_rows) >= cap:
         # rows arrive ordered updated_ts ASC, so the head is the stalest.
@@ -163,7 +181,10 @@ async def execute_update_fact(ctx: ToolContext, args: Dict[str, Any]) -> Dict[st
     if "row" not in resolved:
         return resolved
     row = resolved["row"]
-    await ctx.db.update_channel_memory_async(row["id"], content[:MAX_FACT_CHARS])
+    # The scope-constrained update, even though _visible_row already refused everything but an
+    # ordinary channel fact: this is a model-driven write, and the storage should be the last word
+    # on what it can reach rather than a check three frames up.
+    await ctx.db.update_channel_fact_async(row["id"], content[:MAX_FACT_CHARS])
     return {"ok": True, "id": row["id"], "content": content[:MAX_FACT_CHARS]}
 
 
