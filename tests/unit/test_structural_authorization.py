@@ -12,12 +12,18 @@ lived precisely in how the flag was computed:
   (b) an `other_bot` @mention is dispatched to the main handler un-gated, so a bare `not
       unprompted` authorized a NON-human sender.
 
-The final authorization expression is:
+The authorization expression is:
     structural_change_authorized =
-        (sender_type == "human") AND (mentioned_self OR gate_authorized_structural)
-where `sender_type`/`mentioned_self` are stamped in _event_to_message and
-`gate_authorized_structural` is stamped by the participation gate (main._apply_backoff) when the
-classifier judged the CURRENT message an explicit structural request.
+        (sender_type == "human") AND (NOT gate_required OR gate_woke)
+where `sender_type` is stamped in _event_to_message and the gate pair are routing facts
+(routing_facts.py). It asks the honest question — did a PERSON write this, and did this turn
+genuinely reach the responder — instead of the two proxies it replaced. The proxies failed in
+the direction that matters: "only reply when I tag you", said in plain words to a bot that is
+already listening, carries no <@bot> mention, and we told the person we could not hear them.
+
+What the widening does NOT touch: a bot or self sender is refused, an unclassified sender is
+refused, DMs are refused by the executor, and the tool description still requires an explicit
+instruction in the CURRENT human message. It widens who can be HEARD, not what counts as asking.
 """
 from __future__ import annotations
 
@@ -68,14 +74,13 @@ async def _run(meta, db):
 # ------------------------------------------------------------------- refused end-to-end
 
 @pytest.mark.asyncio
-async def test_quoted_or_ambient_name_hit_is_refused():
-    # Bypass (a): a name-hit with NO real <@bot> mention and NO structural judgment from the
-    # classifier — "someone talked ABOUT the bot". The old signal authorized it (name regex);
-    # the new one does not.
+async def test_a_gated_turn_that_never_woke_is_refused():
+    """The shape that should be impossible: a message that REQUIRED the participation gate and
+    never woke it has no business writing settings, whatever else it carries. Fails closed."""
     db = _writable_db(before={"participation_level": "judicious"})
     ctx, res = await _run(
         {"sender_type": "human", "mentioned_self": False,
-         "gate_required": True, "silence_capable": True,
+         "gate_required": True, "gate_woke": False, "silence_capable": True,
          "participation_name_hit": True}, db)
     assert ctx.structural_change_authorized is False
     assert res["ok"] is False and res["error"] == "not_addressed"
@@ -94,16 +99,22 @@ async def test_bot_authored_mention_is_refused():
 
 
 @pytest.mark.asyncio
-async def test_human_unaddressed_non_structural_respond_turn_is_refused():
-    # An ordinary ambient respond turn (human, no mention, classifier did NOT flag a structural
-    # request) must NOT authorize a settings change even though the model is answering.
+async def test_an_unclassified_sender_is_refused():
+    """Absent sender classification fails CLOSED — a settings write withheld is the safe
+    default, and `None` is not a person."""
     db = _writable_db(before={"participation_level": "judicious"})
-    ctx, res = await _run(
-        {"sender_type": "human", "mentioned_self": False,
-         "gate_required": True, "silence_capable": True}, db)
+    ctx, res = await _run({"mentioned_self": True}, db)
     assert ctx.structural_change_authorized is False
     assert res["ok"] is False and res["error"] == "not_addressed"
     db.set_channel_settings_async.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_self_authored_turn_is_refused():
+    db = _writable_db(before={"participation_level": "judicious"})
+    ctx, res = await _run({"sender_type": "self", "mentioned_self": True}, db)
+    assert ctx.structural_change_authorized is False
+    assert res["ok"] is False and res["error"] == "not_addressed"
 
 
 # ------------------------------------------------------------------- allowed end-to-end
@@ -121,20 +132,46 @@ async def test_genuine_human_mention_is_allowed():
 
 
 @pytest.mark.asyncio
-async def test_human_unaddressed_structural_request_is_allowed():
-    # "only reply when I tag you": a human ambient turn with no literal <@bot> mention, but the
-    # classifier judged it an explicit structural request (gate stamped gate_authorized_structural).
-    # That semantic judgment authorizes without a mention.
+async def test_a_woken_gated_turn_is_allowed():
+    """"only reply when I tag you", said in plain words: a human ambient message with no literal
+    <@bot> mention that the gate judged worth waking for. The person is plainly talking to us."""
     before = {"participation_level": "judicious", "reply_in_channel": True}
     after = {"participation_level": "mentions_only", "reply_in_channel": True}
     db = _writable_db(before=before, after=after)
     ctx, res = await _run(
         {"sender_type": "human", "mentioned_self": False,
-         "gate_required": True, "silence_capable": True,
-         "gate_authorized_structural": True}, db)
+         "gate_required": True, "gate_woke": True, "silence_capable": True}, db)
     assert ctx.structural_change_authorized is True
     assert res["ok"] is True
     db.set_channel_settings_async.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_an_ungated_human_turn_is_allowed_without_a_mention():
+    """A DM or a thread continuation runs no gate at all. Requiring a literal mention here made
+    the tool unreachable on exactly the routes where the person is unambiguously talking to us."""
+    before = {"participation_level": "judicious", "reply_in_channel": True}
+    after = {"participation_level": "mentions_only", "reply_in_channel": True}
+    db = _writable_db(before=before, after=after)
+    ctx, res = await _run(
+        {"sender_type": "human", "mentioned_self": False,
+         "gate_required": False, "gate_woke": False}, db)
+    assert ctx.structural_change_authorized is True
+    assert res["ok"] is True
+
+
+def test_no_gate_authorized_structural_producers_or_consumers_remain():
+    """Tripwire: the flag is gone, and a half-deleted authorization signal is worse than either
+    state — a stale producer would keep stamping something no consumer honors, and a stale
+    consumer would read a key nobody sets."""
+    import pathlib
+    import subprocess
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    hits = subprocess.run(
+        ["grep", "-rn", "gate_authorized_structural", "--include=*.py", str(repo)],
+        capture_output=True, text=True).stdout.strip()
+    remaining = [ln for ln in hits.splitlines() if pathlib.Path(__file__).name not in ln]
+    assert remaining == [], remaining
 
 
 # ------------------------------------------------------------------- defense-in-depth

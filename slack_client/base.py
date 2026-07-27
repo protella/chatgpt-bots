@@ -146,8 +146,14 @@ class SlackBot(SlackMessageEventsMixin,
         # Decision #4: the gated set_channel_participation tool — the ONLY path that writes
         # structural participation/placement settings, and only on an explicit instruction.
         # Channel-only (executor refuses DMs), same as the memory tools.
-        if config.enable_participation_engine:
-            register_participation_tools(registry)
+        #
+        # Registered unconditionally. It used to hang off enable_participation_engine, which
+        # meant that with the engine globally off — the exact configuration where a person is
+        # most likely to want to change how the bot participates — an @mention asking for that
+        # change reached a model with no tool to do it. The engine decides whether unaddressed
+        # traffic is judged; it has nothing to say about whether a person who addressed us may
+        # adjust the settings. Authorization is the tool's own (human sender + a woken turn).
+        register_participation_tools(registry)
         if config.enable_read_document_tool:
             register_document_tools(registry)  # summary+ref rows; content re-derived in memory
         # F51: fetch_url — the SAME hardened fetcher as ambient link capture, so a directly-asked

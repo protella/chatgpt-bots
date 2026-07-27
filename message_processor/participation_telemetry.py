@@ -144,7 +144,11 @@ logger = setup_logger(name="slack_bot.ParticipationTelemetry")
 #     reaction event's placed-bool replaced by operation + result.
 # v3: the `queue_link` event — an attempt may now produce a line that is neither a decision nor
 #     an outcome, so event cardinality per attempt changed.
-CONTRACT_VERSION = 3
+# v4: `silence_reason` changed MEANING — model-authored prose became one of eight declared
+#     values (message_processor.terminal_actions), so v3 and v4 rows cannot be grouped together;
+#     and `reaction_visible` became explicit on every responder terminal rather than present
+#     only on replies, so its absence no longer means the same thing either.
+CONTRACT_VERSION = 4
 
 # WHICH gate produced these lines. The rich multi-signal classifier is "rich-v1"; a different
 # gate is a different population even at the same CONTRACT_VERSION, and the two must never be
@@ -778,15 +782,23 @@ def visible_action(channel_id: Optional[str], trigger_ts: Optional[str], *,
     only when the model produced one) or `gate_woke` (the gate handed the turn on).
 
     Other fields the terminal may carry:
-      reaction_visible    a reply that ALSO left an emoji in the room. `kind` names the words,
-                          because words are the louder half; without this field the reaction
-                          half of a react_and_respond vanishes from the terminal record.
+      reaction_visible    was one of OUR emoji on the message when the turn ended (the gate's or
+                          the responder's). Explicit true/false on EVERY responder terminal, not
+                          only on replies: read beside `silence_reason` it is what makes a model
+                          that declared `reacted_instead` and then placed no reaction visible as
+                          a mismatch. Neither field is corrected against the other — the
+                          disagreement IS the measurement, and a ledger that quietly reconciled
+                          them could never report it.
       post_delivery_error the words landed and something AFTER the send raised. `kind` keeps the
                           delivered outcome — Slack shows the reply, so the ledger must too —
                           and this says the turn was not clean.
       detached_started    a producer owned a surface AND the turn errored afterwards.
-      silence_reason      the model's own account of why it used no words (bounded — see
-                          PRIVACY), on reaction_only as well as silence.
+      silence_reason      the model's own account of why it used no words: ONE of the eight
+                          values in message_processor.terminal_actions, recorded verbatim, on
+                          reaction_only and detached as well as silence. Never inferred from the
+                          text, the reaction, the tools or the posture, and an unrecognized value
+                          never reaches here — it is rejected at the tool call, so this column
+                          only ever holds something the model actually chose.
 
     `kind` is what the room actually saw:
       reply            words went out

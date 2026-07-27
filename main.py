@@ -541,15 +541,6 @@ class ChatBotV2:
             main_logger.info(
                 f"Participation backoff: explicit structural request "
                 f"({verdict.structural_request}) in {channel_id} — routing to the response loop")
-            # BLOCKER #3: this is the classifier's SEMANTIC judgment that the current human
-            # message is an explicit structural request (it distinguishes addressed-to from
-            # talked-about, which the raw name regex cannot). Stamp the turn so the gated
-            # set_channel_participation tool is authorized in the response loop even without a
-            # literal <@bot> mention ("only reply when I tag you" carries no mention). The flag
-            # is one half of the authorization; the other half (human sender) is enforced in
-            # handlers.text where the tool context is built.
-            if isinstance(message.metadata, dict):
-                message.metadata["gate_authorized_structural"] = True
             return True, False
 
         standing = verdict.durability == "standing"
@@ -700,8 +691,14 @@ class ChatBotV2:
         card, a detached image). It is NOT honored by silence, by an error notice, or by a
         turn that got queued behind another — in all three the bot claimed work and then
         produced none of it, so the eye comes back off."""
-        if turn is not None and turn.visible_action_committed:
-            return True   # a detached producer (image gen / background job) owns a surface
+        # Both facts are read FIRST, before any outcome-shaped exit below. A turn that placed a
+        # reaction and then errored, was interrupted, or failed to deliver its text still left an
+        # emoji in the room — retracting the 👀 there takes back a mark the reader can still see,
+        # and the failure is not the reaction's fault. (A queued turn cannot reach either: it ran
+        # no tools, so nothing could have set them.)
+        if turn is not None and (turn.visible_action_committed
+                                 or getattr(turn, "reaction_committed", False)):
+            return True   # a detached producer owns a surface, or our emoji is on the message
         if response is None or response.type in ("error", "queued"):
             return False
         meta = response.metadata or {}
@@ -711,8 +708,13 @@ class ChatBotV2:
             # because a Slack surface exists to carry the notice.
             return False
         if meta.get("terminal_action") == "no_reply":
-            # The one sibling a no-reply turn may have: a reaction that IS the answer.
-            return bool(meta.get("response_reaction_committed"))
+            # A silent turn is no longer an empty one: its siblings ran. A reaction that IS the
+            # answer honors the claim, and so does a background job whose card is already in the
+            # room (a detached surface is caught by the turn check above, but the job's fact
+            # lives on the response).
+            return bool(meta.get("response_reaction_committed")
+                        or meta.get("background_job_started")
+                        or (turn is not None and getattr(turn, "reaction_committed", False)))
         if meta.get("reaction_only") or meta.get("background_job_started"):
             return True
         posted = meta.get("posted")
@@ -756,6 +758,14 @@ class ChatBotV2:
         if meta.get("interrupted"):
             return "interrupted"  # died partway; the thread got an apology, not an answer
         if meta.get("terminal_action") == "no_reply":
+            # Silence ends the WORDS, not the turn's effects — the terminal tool runs alongside
+            # its siblings now, so a turn can end without words and still have posted a picture,
+            # a status card or a reply in another thread. Those are checked FIRST: they are the
+            # loudest thing in the room, and a turn that visibly produced something is not a
+            # silence no matter what the model called at the end.
+            if (turn is not None and getattr(turn, "visible_action_committed", False)) \
+                    or meta.get("background_job_started"):
+                return "detached"
             # A no-reply turn that committed a reaction did not stay silent — the emoji WAS the
             # answer, and the room saw one. Filing it as silence understated how often the bot
             # participates without words, which is the very rate this ledger exists to measure.
@@ -764,7 +774,8 @@ class ChatBotV2:
             # The gate's own emoji counts for exactly the same reason: on react_and_respond the
             # reaction is already up when the responder decides to use no words, and calling
             # that turn a silence describes an empty message that is visibly reacted to.
-            if meta.get("response_reaction_committed") is True or gate_reaction_visible:
+            if (meta.get("response_reaction_committed") is True or gate_reaction_visible
+                    or (turn is not None and getattr(turn, "reaction_committed", False))):
                 return "reaction_only"
             return "silence"     # the model chose it, via the terminal tool
         if meta.get("reaction_only"):
@@ -1164,22 +1175,28 @@ class ChatBotV2:
                     message, kind,
                     ended_by="responder",
                     # The reason rides even when the reaction made this a reaction_only: WHY the
-                    # model declined to use words is the same question either way.
-                    silence_reason=participation_telemetry.truncate_reason(
-                        meta.get("reason") if meta.get("terminal_action") == "no_reply" else None),
+                    # model declined to use words is the same question either way. Recorded
+                    # VERBATIM — it is one of eight declared values, and the ledger's job here is
+                    # to report the model's own account, never to correct or second-guess it.
+                    silence_reason=(meta.get("silence_reason")
+                                    if meta.get("terminal_action") == "no_reply" else None),
                     # A detached producer that owns a surface AND an error afterwards is one turn
                     # with two outcomes. `kind` keeps the error (it is the more actionable half),
                     # so the surface has to be recorded beside it or it vanishes from the analysis.
                     detached_started=(True if kind == "error" and turn is not None
                                       and getattr(turn, "visible_action_committed", False)
                                       else None),
-                    # Words AND an emoji is one turn with two visible halves. `kind` names the
-                    # words because they are the louder half, so without this the reaction on a
-                    # react_and_respond exists only in the reaction rows and never in the
-                    # terminal that claims to say what the room saw.
-                    reaction_visible=(True if kind == "reply" and (
-                        gate_reaction or meta.get("response_reaction_committed") is True)
-                        else None),
+                    # Was there an emoji in the room at the end of this turn? Explicit on EVERY
+                    # responder terminal, true or false, not only on replies: paired with
+                    # `silence_reason` it is what makes a model that said `reacted_instead` and
+                    # then placed no reaction VISIBLE as a mismatch. Neither fact is corrected
+                    # against the other — the disagreement is the measurement.
+                    # Read from the turn, which the react tool stamps as the emoji lands, so
+                    # this is true on a reply that also reacted and on a reaction-only turn —
+                    # not just on the one branch that happened to build the metadata field.
+                    reaction_visible=bool(
+                        gate_reaction or meta.get("response_reaction_committed") is True
+                        or (turn is not None and getattr(turn, "reaction_committed", False))),
                     # WHICH model wrote it. Per-user and per-thread overrides mean two rows in
                     # this ledger can come from different models, and a reply-quality comparison
                     # that pools them describes neither. The footer path reads the same key.
@@ -1201,7 +1218,7 @@ class ChatBotV2:
                     if terminal == "no_reply":
                         main_logger.info(
                             f"no_response_needed — no reply posted "
-                            f"(reason: {response.metadata.get('reason')!r})")
+                            f"(reason: {response.metadata.get('silence_reason')})")
                     else:
                         posted = response.metadata.get("posted")
                         if posted is None:

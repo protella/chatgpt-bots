@@ -176,7 +176,6 @@ _EXCESS_FREE_RESULT = {
 # --- F2: no_response_needed terminal action ---
 
 _NO_REPLY_TOOL = "no_response_needed"
-_REACT_TOOL = "react_to_message"
 
 # F2: fed back when no_response_needed is called AFTER visible reply text already
 # streamed to Slack — the call is invalid; the model must finish the reply instead.
@@ -188,22 +187,72 @@ _INVALID_NO_REPLY_RESULT = {
 }
 
 
+# Fed back to the SECOND and later no_response_needed calls of one round. A turn cannot end
+# twice, so only the first is ever considered — but on a round where the first is rejected the
+# loop continues, and every call it continues past needs an output the model can read. Without
+# this they were dispatched normally and answered ok, so the model saw one terminal refused and
+# another accepted while the turn kept going.
+_DUPLICATE_TERMINAL_RESULT = {
+    "ok": False,
+    "error": "duplicate_terminal_call",
+    "message": ("Not run: you called this more than once in one round. One call ends the turn — "
+                "make a single call, or reply normally."),
+}
+
+
+def _invalid_silence_reason_result() -> Dict[str, Any]:
+    """Fed back when the terminal call's `reason` is absent or not one of the eight.
+
+    The turn is NOT ended: an unrecognized reason means we do not know why the model wants to
+    be quiet, and guessing one would put our inference in the ledger as its testimony. It gets
+    told the vocabulary and gets another round to decide — including the option of deciding to
+    speak after all."""
+    from message_processor.terminal_actions import SILENCE_REASONS
+    return {
+        "ok": False,
+        "error": "invalid_silence_reason",
+        "message": ("Not run: `reason` must be exactly one of "
+                    f"{', '.join(SILENCE_REASONS)}. Call it again with one of those values, "
+                    "or reply normally."),
+    }
+
+
 def _no_reply_call(calls: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return next((c for c in calls if c.get("name") == _NO_REPLY_TOOL), None)
 
 
-def _sanitize_reason(call: Dict[str, Any]) -> str:
-    """Extract + sanitize the no_response_needed reason (control-stripped, length-capped)."""
+def _silence_reason(call: Dict[str, Any]) -> Optional[str]:
+    """The call's declared silence reason, or None when it is not one of the eight.
+
+    No sanitizing and no coercion: the value is a closed enum, so it either IS a member — in
+    which case it is already exactly what the ledger stores — or the call is invalid. Rewriting
+    an unrecognized value to `other` would file our guess under the model's name, in the one
+    column that exists to record the model's own account of itself."""
     import json
+    from message_processor.terminal_actions import is_valid_silence_reason
     args = call.get("arguments")
     if isinstance(args, str):
         try:
             args = json.loads(args or "{}")
         except json.JSONDecodeError:
             args = {}
-    reason = (args or {}).get("reason", "") if isinstance(args, dict) else ""
-    reason = "".join(ch if ch.isprintable() else " " for ch in str(reason)).strip()
-    return reason[:300]
+    reason = (args or {}).get("reason") if isinstance(args, dict) else None
+    return reason if is_valid_silence_reason(reason) else None
+
+
+def _terminal_overrides(calls: List[Dict[str, Any]], terminal_call: Dict[str, Any],
+                        terminal_result: Dict[str, Any]) -> Dict[int, Any]:
+    """Short-circuit results for EVERY terminal call in a round the loop is continuing past.
+
+    The first one carries the reason it was rejected. The rest are duplicates: they must not be
+    dispatched (a turn cannot end twice, and the executor would answer them ok), and they cannot
+    simply be dropped either — the Responses API 400s on a function_call with no matching
+    output, and a model reading one refusal beside one success learns the wrong lesson."""
+    overrides: Dict[int, Any] = {id(terminal_call): terminal_result}
+    for call in calls:
+        if call is not terminal_call and call.get("name") == _NO_REPLY_TOOL:
+            overrides[id(call)] = _DUPLICATE_TERMINAL_RESULT
+    return overrides
 
 
 async def _handle_no_reply_terminal(
@@ -212,53 +261,94 @@ async def _handle_no_reply_terminal(
     tool_context: ToolContext,
     calls: List[Dict[str, Any]],
     terminal_call: Dict[str, Any],
+    silence_reason: str,
     tools_used_all: List[str],
     local_tool_calls: List[Dict[str, Any]],
     remaining_budget: Optional[int] = None,
+    result_overrides: Optional[Dict[int, Any]] = None,
+    tool_callback: Optional[Callable[[str, str], Any]] = None,
+    free_tools: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
-    """Terminal round: no_response_needed ends the turn. Only sibling react_to_message
-    calls execute (filtered BEFORE dispatch — dispatch_all runs a round concurrently);
-    other side-effect calls are suppressed with a logged skip. Returns a no_reply outcome
-    with the (sanitized) reason; nothing is posted.
+    """Terminal round: no_response_needed ends the turn's WORDS. It does not cancel the round.
 
-    F6 fix (b): react siblings still count against MAX_TOOL_CALLS_PER_TURN — the terminal
-    branch runs before the loop's own cap check, so apply the remaining global budget to
-    the react calls here.
+    It used to: every sibling except react_to_message was dropped before dispatch. That read
+    the tool as "abort the turn", and the effects it silently discarded were ones the model had
+    already decided on — a memory write it judged worth keeping, a cross-thread post, an image.
+    The model was choosing "say nothing HERE", and we were hearing "do nothing anywhere". So
+    every sibling now runs through the ordinary parallel dispatch, and silence is honored after
+    they finish, whatever they returned: a failed sibling is not a reason to start talking.
 
-    F4 fix: the terminal no_response_needed call itself consumes ONE slot of the remaining
-    budget, so react siblings are capped at remaining_budget - 1 (floor 0) — the round can
-    never exceed the cap by that one terminal call. Duplicate no_response_needed calls are
-    suppressed: only the FIRST (``terminal_call``) is honored (first wins)."""
-    react_calls = [c for c in calls if c.get("name") == _REACT_TOOL]
+    There is deliberately NO allowlist. A tool that must not run on an unaddressed turn is
+    refused by its own executor (that is where authorization lives, and it is checked whether or
+    not this turn ends in silence); an allowlist here would be a second, quietly diverging copy
+    of those rules.
+
+    Duplicate no_response_needed calls are still suppressed — the FIRST valid one wins, and the
+    turn cannot end twice. Budget is unchanged: PRODUCTIVE siblings count against
+    MAX_TOOL_CALLS_PER_TURN and the terminal call itself reserves one slot of the remaining
+    budget. ``free_tools`` (F37 bookkeeping calls) are budgeted separately by the caller and
+    must never take a productive slot — with one slot left and a round ordered
+    [update_todos, remember_fact], a naive slice spends it on the status card and drops the
+    memory write, which is the exact inversion the free-tool allowance exists to prevent.
+
+    ``result_overrides`` (id(call) -> result) passes through the caller's pre-dispatch
+    suppressions (the excess-bookkeeping rule) so that mechanism keeps working here too."""
+    overrides = result_overrides or {}
+    free_names = {str(n) for n in (free_tools or ())}
+    # Duplicates of the terminal are dropped, never executed: only `terminal_call` ends the turn.
+    siblings = [c for c in calls
+                if c is not terminal_call and c.get("name") != _NO_REPLY_TOOL]
+    productive = [c for c in siblings if c.get("name") not in free_names]
+    free_siblings = [c for c in siblings if c.get("name") in free_names]
     if remaining_budget is None:
-        react_budget = len(react_calls)
+        sibling_budget = len(productive)
     else:
-        react_budget = max(0, int(remaining_budget) - 1)  # reserve one slot for the terminal
-    allowed_react_ids = {id(c) for c in react_calls[:react_budget]}
-    # Only the first terminal call runs (identity match); duplicate no_response_needed
-    # calls are dropped into `skipped` below and never dispatched.
-    exec_calls = [c for c in calls
-                  if c is terminal_call or id(c) in allowed_react_ids]
+        sibling_budget = max(0, int(remaining_budget) - 1)  # the terminal reserves one slot
+    # Free calls are already capped per round by the caller's excess-bookkeeping suppression
+    # (the excess ones arrive here inside `overrides`, answered but never dispatched).
+    allowed_ids = {id(c) for c in productive[:sibling_budget]} | {id(c) for c in free_siblings}
+    exec_calls = [c for c in calls if c is terminal_call or id(c) in allowed_ids]
     exec_ids = {id(c) for c in exec_calls}
     skipped = [c.get("name") for c in calls if id(c) not in exec_ids]
     if skipped:
-        self.log_info(f"{_NO_REPLY_TOOL} terminal — suppressing sibling calls: {skipped}")
+        self.log_info(f"{_NO_REPLY_TOOL} terminal — over budget or duplicate, not run: {skipped}")
+
+    async def _notify(tool_id: str, status: str) -> None:
+        if not tool_callback:
+            return
+        try:
+            result = tool_callback(tool_id, status)
+            if result is not None and hasattr(result, "__await__"):
+                await result
+        except Exception as e:  # noqa: BLE001 — status UI must never break the loop
+            self.log_warning(f"Tool callback error for {tool_id}: {e}")
+
     from message_processor.tool_provenance import gist_from_arguments
 
-    results = await registry.dispatch_all(tool_context, exec_calls)
-    for call, result in zip(exec_calls, results):
-        if call.get("name") == _REACT_TOOL:
-            local_tool_calls.append({"name": call.get("name"), "ok": _call_ok(result),
+    for call in exec_calls:
+        await _notify(f"local:{call.get('name')}", "started")
+    dispatch_calls = [c for c in exec_calls if id(c) not in overrides]
+    results = await registry.dispatch_all(tool_context, dispatch_calls)
+    result_by_id = {id(c): r for c, r in zip(dispatch_calls, results)}
+    for call in exec_calls:
+        result = overrides.get(id(call), result_by_id.get(id(call)))
+        # Every executed sibling is recorded — the handler reads this list to learn what the
+        # turn actually did (a landed reaction, a post that went out), and a silent turn whose
+        # effects are missing from it is a turn the ledger describes as having done nothing.
+        if call is not terminal_call:
+            ok = _call_ok(result)
+            local_tool_calls.append({"name": call.get("name"), "ok": ok,
                                      "gist": gist_from_arguments(call.get("arguments"))})
+            self.log_info(f"Local tool '{call.get('name')}' -> {'ok' if ok else 'error'}")
+        await _notify(f"local:{call.get('name')}", "completed")
     _merge_used(tools_used_all, [c.get("name") for c in exec_calls if c.get("name")])
-    reason = _sanitize_reason(terminal_call)
-    self.log_info(f"{_NO_REPLY_TOOL}: ending turn without posting — reason: {reason!r}")
+    self.log_info(f"{_NO_REPLY_TOOL}: ending turn without words — reason: {silence_reason}")
     return {
         "text": "",
         "tools_used": tools_used_all,
         "local_tool_calls": local_tool_calls,
         "terminal_action": "no_reply",
-        "reason": reason,
+        "silence_reason": silence_reason,
     }
 
 
@@ -317,22 +407,31 @@ async def create_text_response_with_tool_loop(
 
         terminal_call = _no_reply_call(calls)
         if terminal_call is not None:
-            if not prior_committed:
+            silence_reason = _silence_reason(terminal_call)
+            if silence_reason is not None and not prior_committed:
                 return await _handle_no_reply_terminal(
-                    self, registry, tool_context, calls, terminal_call,
+                    self, registry, tool_context, calls, terminal_call, silence_reason,
                     tools_used_all, local_tool_calls,
                     remaining_budget=config.max_tool_calls_per_turn - total_calls)
-            # A prior attempt already exposed visible text — honoring silence now would
-            # orphan it. Reject the terminal (feed an error back), run any siblings, and
-            # continue so the model completes the reply.
-            self.log_warning(
-                f"{_NO_REPLY_TOOL} called after a prior attempt already exposed text — "
-                "rejecting; model must complete the reply")
+            # Either the reason is not one of the eight, or a prior attempt already exposed
+            # visible text (honoring silence now would orphan it). Reject the terminal (feed
+            # the matching error back), run every sibling, and continue so the model decides
+            # again with the contract in front of it.
+            if silence_reason is None:
+                self.log_warning(
+                    f"{_NO_REPLY_TOOL} called with an unrecognized reason — rejecting; "
+                    "the model must pick one of the declared values or reply")
+                terminal_result = _invalid_silence_reason_result()
+            else:
+                self.log_warning(
+                    f"{_NO_REPLY_TOOL} called after a prior attempt already exposed text — "
+                    "rejecting; model must complete the reply")
+                terminal_result = _INVALID_NO_REPLY_RESULT
             rounds += 1
             total_calls += len(calls)
             await _run_tool_round(
                 self, registry, tool_context, sink, input_items, local_tool_calls,
-                result_overrides={id(terminal_call): _INVALID_NO_REPLY_RESULT})
+                result_overrides=_terminal_overrides(calls, terminal_call, terminal_result))
             _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")])
             if rounds >= config.max_tool_rounds or total_calls >= config.max_tool_calls_per_turn:
                 self.log_warning(
@@ -506,25 +605,38 @@ async def create_streaming_response_with_tool_loop(
 
         terminal_call = _no_reply_call(calls)
         if terminal_call is not None:
-            if not visible_committed:
-                # Nothing visible has posted yet — honor the terminal (silent turn).
+            silence_reason = _silence_reason(terminal_call)
+            if silence_reason is not None and not visible_committed:
+                # Nothing visible has posted yet — honor the terminal (silent turn), after
+                # its siblings have run. The excess-bookkeeping suppression rides along so
+                # that rule holds on this round exactly as it does on any other.
+                suppressed = _suppress_excess_free(calls)
                 return await _handle_no_reply_terminal(
-                    self, registry, tool_context, calls, terminal_call,
+                    self, registry, tool_context, calls, terminal_call, silence_reason,
                     tools_used_all, local_tool_calls,
-                    remaining_budget=calls_cap - budget["calls"])
-            # A visible reply already began: no_response_needed is INVALID. Reject it
-            # (feed an error back), run any siblings, and CONTINUE so the model completes
-            # the reply into the same streamed message. WARNING = contract friction.
-            self.log_warning(
-                f"{_NO_REPLY_TOOL} called after visible text already streamed — rejecting; "
-                "model must complete the reply")
+                    remaining_budget=calls_cap - budget["calls"],
+                    result_overrides=suppressed or None, tool_callback=tool_callback,
+                    free_tools=free_tools)
+            # Either the reason is not one of the eight, or a visible reply already began (in
+            # which case silence is INVALID — the model must finish what the room is reading).
+            # Reject the terminal, run the siblings, and CONTINUE. WARNING = contract friction.
+            if silence_reason is None:
+                self.log_warning(
+                    f"{_NO_REPLY_TOOL} called with an unrecognized reason — rejecting; "
+                    "the model must pick one of the declared values or reply")
+                terminal_result = _invalid_silence_reason_result()
+            else:
+                self.log_warning(
+                    f"{_NO_REPLY_TOOL} called after visible text already streamed — rejecting; "
+                    "model must complete the reply")
+                terminal_result = _INVALID_NO_REPLY_RESULT
             suppressed = _suppress_excess_free(calls)
             _charge(calls, suppressed)
             _replay_committed_text(input_items, text)
             await _run_tool_round(
                 self, registry, tool_context, sink, input_items, local_tool_calls, tool_callback,
                 result_overrides={**suppressed,
-                                  id(terminal_call): _INVALID_NO_REPLY_RESULT})
+                                  **_terminal_overrides(calls, terminal_call, terminal_result)})
             _merge_used(tools_used_all, [c.get("name") for c in calls if c.get("name")])
             if _capped():
                 self.log_warning(

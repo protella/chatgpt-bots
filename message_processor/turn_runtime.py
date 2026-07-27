@@ -56,6 +56,12 @@ class TurnRuntime:
     # deliverable tool ran). Drives resolve_reply_target's top-level→thread override. Tracked
     # SEPARATELY from the 👀/claim_work, which early-returns when enable_ack_reaction is off.
     did_substantive_work: bool = False
+    # Did THIS turn put one of our emoji on a message? Set by the react tool at the moment the
+    # reaction lands, because that is the only place every reacting path passes through. It used
+    # to be derived per-Response in the handlers, and only the no-reply branch actually built
+    # the field — so a reaction-only turn and a reply that also reacted both told the ledger
+    # "no emoji" while the reaction event sat two lines above it in the same file.
+    reaction_committed: bool = False
     ack_lease: Optional[dict] = field(default=None, repr=False)
     ack_target_ts: Optional[str] = None
     # Where that claim was staked. Kept beside the ts purely so settle_ack can report a RETRACTED
