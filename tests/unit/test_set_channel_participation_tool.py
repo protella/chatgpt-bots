@@ -15,7 +15,7 @@ from message_processor.participation_tools import (
     register_participation_tools)
 from tool_registry import ToolContext, ToolRegistry
 
-CHANNEL = "C04QDHE8W8M"
+CHANNEL = "C0BKX77NU66"
 
 
 def _db(before=None, after=None):

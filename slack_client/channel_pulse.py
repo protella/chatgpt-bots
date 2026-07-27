@@ -743,7 +743,7 @@ class ChannelPulse:
         return (emoji or "").strip().strip(":").split("::", 1)[0]
 
     def add_reaction(self, channel_id: str, ts: str, emoji: str, count: int = 1,
-                     from_history: bool = False) -> None:
+                     from_history: bool = False, from_self: bool = False) -> None:
         """Accumulate a reaction on the message keyed by `ts` (zero-await, in-memory only).
         Tracked even if the message itself isn't in the ring — a reaction that arrives before
         the message event isn't lost. LRU-bounded per channel and across channels."""
@@ -772,7 +772,16 @@ class ChannelPulse:
         # first-ever run (nothing to rehydrate) needs history to warm the palette up.
         # Consequence, accepted: reactions sitting in the history of a channel the bot joins
         # later are never learned unless someone reacts again live.
-        if not (from_history and self._vocab_hydrated):
+        #
+        # `from_self` reactions are OUR OWN and must never teach the palette. Slack emits a
+        # reaction_added event for the bot's own reactions too, so without this the tally learns
+        # from the bot instead of from the room: an emoji the bot picked once ranks higher next
+        # turn, gets picked again, ranks higher still. Observed live — :dumpster-fire: went 0 -> 2
+        # purely on the bot's own two uses and was then the top custom emoji offered for anything
+        # negative. The palette is meant to answer "what does THIS WORKSPACE react with", and the
+        # bot is not the workspace. The per-message count above still includes it: that one is
+        # social proof about a specific message, where our reaction genuinely is present.
+        if not (from_history and self._vocab_hydrated) and not from_self:
             self._reaction_vocab[name] = self._reaction_vocab.get(name, 0) + max(1, int(count))
         while len(chan) > _SEEN_TS_MAX:
             chan.popitem(last=False)
@@ -780,7 +789,8 @@ class ChannelPulse:
         while len(self._reactions) > max(1, channels_max):
             self._reactions.popitem(last=False)
 
-    def remove_reaction(self, channel_id: str, ts: str, emoji: str) -> None:
+    def remove_reaction(self, channel_id: str, ts: str, emoji: str,
+                        from_self: bool = False) -> None:
         """Decrement a reaction count (floor 0; empties are pruned). No-op when untracked."""
         if not channel_id or not ts:
             return
@@ -791,8 +801,11 @@ class ChannelPulse:
         counts[name] -= 1
         if counts[name] <= 0:
             del counts[name]
-        # Keep the workspace tally in step, floored at zero and pruned when it empties.
-        if name in self._reaction_vocab:
+        # Keep the workspace tally in step, floored at zero and pruned when it empties. Our own
+        # reaction never incremented it (see add_reaction), so removing ours must not decrement
+        # it either — otherwise the bot reacting and then un-reacting would drive a genuinely
+        # popular emoji's count DOWN below what the room actually earned it.
+        if name in self._reaction_vocab and not from_self:
             self._reaction_vocab[name] -= 1
             if self._reaction_vocab[name] <= 0:
                 del self._reaction_vocab[name]
@@ -1140,7 +1153,13 @@ class ChannelPulse:
         stamp_on = getattr(config, "enable_message_timestamps", False)
         lines: List[str] = []
         kept: List[Dict[str, Any]] = []
-        for e in buf:
+        # Sorted by ts, not taken in ring order, because the header now DECLARES "oldest to
+        # newest" and that has to be true. record() appends in delivery order; the backfill
+        # re-sorts once at cold start, but Slack event delivery is best-effort and a delayed
+        # event lands after messages that are newer than it. Rendering the ring as-is would then
+        # put an older line below a newer one — which is precisely the discourse inversion this
+        # framing exists to prevent, reintroduced by the block that promises it doesn't happen.
+        for e in sorted(buf, key=lambda x: _ts_key(x["ts"])):
             root = e["thread_ts"] or e["ts"]
             if exclude_thread_ts and root == exclude_thread_ts:
                 continue
@@ -1165,9 +1184,19 @@ class ChannelPulse:
         # F47: MODEST peripheral framing. The authoritative "who addresses whom" record is the
         # separate addressee tail (render_channel_addressee_tail); overstating this capped,
         # process-local ring as that record both duplicated its job and read as an invite to
-        # continue other conversations. This block is reference-resolution context only.
+        # continue other conversations.
+        #
+        # The framing DESCRIBES the data rather than prescribing a use for it. It previously read
+        # "use it only to resolve references", which turned out to invite the exact failure it was
+        # meant to prevent: the model went looking for a dangling reference to resolve, found a
+        # stranger's "that was it", and bound it to the question in front of it. Saying what the
+        # block IS — interleaved exchanges, some of them missing the half that gives them meaning —
+        # leaves the model no such errand.
         text = (
-            "[Recent channel activity — peripheral context from OTHER conversations; use it "
-            "only to resolve references, don't jump in to continue them]\n" + "\n".join(lines)
+            "[Recent channel activity — the channel around this conversation, oldest to newest. "
+            "Separate exchanges are interleaved here, and a line may be missing the messages that "
+            "give it meaning; adjacency and a shared topic do not make two lines one conversation. "
+            "Background only — don't jump in to continue someone else's exchange.]\n"
+            + "\n".join(lines)
         )
         return text, len(lines), kept[0]["ts"], kept[-1]["ts"]

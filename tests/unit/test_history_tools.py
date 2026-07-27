@@ -136,11 +136,13 @@ async def test_fetch_surfaces_attached_file_names(bot):
     # document seen in history via read_document. Messages without files are unchanged.
     bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
     _member_of(bot, "C_PUBLIC")
+    # Fixture is NEWEST-first, the order conversations.history really returns; the tool inverts
+    # it, so the oldest message is messages[0] in the result.
     bot.app.client.conversations_history.return_value = {
         "messages": [
+            {"user": "U2", "ts": "1.2", "text": "no files here"},
             {"user": "U1", "ts": "1.1", "text": "contract attached",
              "files": [{"name": "vendor_contract.pdf", "mimetype": "application/pdf"}]},
-            {"user": "U2", "ts": "1.2", "text": "no files here"},
         ]
     }
     res = await bot.fetch_history_tool("C_PUBLIC", ctx=_ctx(channel_id="C_PUBLIC"))
@@ -155,10 +157,10 @@ async def test_fetch_surfaces_reply_count_so_threads_are_discoverable(bot):
     # signal that fetch_thread_messages(ts) would return a whole discussion.
     bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
     _member_of(bot, "C_PUBLIC")
-    bot.app.client.conversations_history.return_value = {
+    bot.app.client.conversations_history.return_value = {   # newest-first, as Slack returns
         "messages": [
-            {"user": "U1", "ts": "1.1", "text": "shipping the new model", "reply_count": 12},
             {"user": "U2", "ts": "1.2", "text": "standalone remark"},
+            {"user": "U1", "ts": "1.1", "text": "shipping the new model", "reply_count": 12},
         ]
     }
     res = await bot.fetch_history_tool("C_PUBLIC", ctx=_ctx(channel_id="C_PUBLIC"))
@@ -322,10 +324,10 @@ async def test_dispatch_bad_json(bot):
 async def test_history_includes_current_reactions(bot):
     bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
     _member_of(bot, "C_PUBLIC")
-    bot.app.client.conversations_history.return_value = {"messages": [
+    bot.app.client.conversations_history.return_value = {"messages": [   # newest-first
+        {"user": "U2", "ts": "1.2", "text": "plain"},
         {"user": "U1", "ts": "1.1", "text": "hi",
          "reactions": [{"name": "thumbsup", "count": 2, "users": ["U2", "U3"]}]},
-        {"user": "U2", "ts": "1.2", "text": "plain"},
     ]}
     res = await bot.fetch_history_tool("C_PUBLIC", ctx=_ctx(channel_id="C_PUBLIC"))
     assert res["messages"][0]["reactions"] == [{"emoji": "thumbsup", "count": 2, "users": ["U2", "U3"]}]
@@ -536,3 +538,128 @@ async def test_thread_single_page_makes_one_call(bot):
     res = await bot.fetch_history_tool("C1", limit=10, thread_ts="1.0", ctx=_ctx())
     assert bot.app.client.conversations_replies.await_count == 1
     assert res["has_more"] is False
+
+
+# --- discourse order (the grounding fix, 2026-07) ---
+#
+# conversations.history returns NEWEST-first while conversations.replies returns oldest-first, and
+# the result was passed through in whatever order Slack gave it, with nothing saying which. A
+# channel result therefore read top-to-bottom with the newest message FIRST, so an older line
+# landed *below* a question it could not possibly be answering and read exactly like a reply to it.
+# That is how the bot came to tell someone "you just called it a minute ago" about a cause nobody
+# had named. Both tools now emit oldest-first and declare it.
+
+@pytest.mark.asyncio
+async def test_channel_history_returned_oldest_first(bot):
+    """Slack hands back newest-first; the tool must invert it so reading order is discourse order."""
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
+    bot.app.client.conversations_history.return_value = {"messages": [
+        {"user": "U1", "ts": "300.0", "text": "newest"},
+        {"user": "U1", "ts": "200.0", "text": "middle"},
+        {"user": "U1", "ts": "100.0", "text": "oldest"},
+    ]}
+    res = await bot.fetch_history_tool("C1", ctx=_ctx())
+    assert [m["text"] for m in res["messages"]] == ["oldest", "middle", "newest"]
+
+
+@pytest.mark.asyncio
+async def test_channel_history_keeps_newest_when_trimmed_then_orders_them(bot):
+    """The limit must still select the NEWEST window — reversing must not turn it into the oldest."""
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
+    bot.app.client.conversations_history.return_value = {"messages": [
+        {"user": "U", "ts": "500.0", "text": "e"},
+        {"user": "U", "ts": "400.0", "text": "d"},
+        {"user": "U", "ts": "300.0", "text": "c"},
+        {"user": "U", "ts": "200.0", "text": "b"},
+        {"user": "U", "ts": "100.0", "text": "a"},
+    ]}
+    res = await bot.fetch_history_tool("C1", limit=2, ctx=_ctx())
+    assert [m["text"] for m in res["messages"]] == ["d", "e"]     # newest two, oldest-first
+    assert res["has_more"] is True
+
+
+@pytest.mark.asyncio
+async def test_both_fetch_shapes_declare_their_order(bot):
+    """`order` is stated rather than left for the model to infer from epoch strings."""
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
+    bot.app.client.conversations_history.return_value = {"messages": [
+        {"user": "U", "ts": "2.0", "text": "b"}, {"user": "U", "ts": "1.0", "text": "a"}]}
+    bot.app.client.conversations_replies.return_value = {"messages": [
+        {"user": "U", "ts": "1.0", "text": "root"}, {"user": "U", "ts": "1.1", "text": "reply"}]}
+    channel = await bot.fetch_history_tool("C1", ctx=_ctx())
+    thread = await bot.fetch_history_tool("C1", thread_ts="1.0", ctx=_ctx())
+    assert channel["order"] == thread["order"] == "oldest_to_newest"
+    # And the declaration is true of the thread branch too, which was already ascending.
+    assert [m["text"] for m in thread["messages"]] == ["root", "reply"]
+
+
+def test_build_history_result_is_pure_and_declares_order():
+    """The eval harness (tests/integration/grounding_eval.py) shares this exact serialization,
+    so it must be reachable without a Slack client."""
+    from slack_client.history_tool import build_history_result
+    res = build_history_result([{"user": "U", "ts": "1.0", "text": "x"}],
+                               channel_id="C1", thread_ts=None, has_more=False)
+    assert res == {"ok": True, "channel": "C1", "thread_ts": None, "count": 1,
+                   "order": "oldest_to_newest", "has_more": False,
+                   "messages": [{"user": "U", "ts": "1.0", "text": "x"}]}
+    assert "note" not in res
+
+
+@pytest.mark.asyncio
+async def test_thread_pagination_dedupes_a_repeated_root(bot):
+    """Slack's cursor contract doesn't promise a later page omits the thread root. Since the
+    result now DECLARES its order, a duplicated root would both falsify that and read as someone
+    saying the same thing twice."""
+    bot.app.client.conversations_info.return_value = {"channel": {"is_private": False, "is_member": True}}
+    _member_of(bot, "C1")
+    pages = [
+        {"messages": [{"user": "U", "ts": "1.0", "text": "root"},
+                      {"user": "U", "ts": "1.1", "text": "first reply"}],
+         "response_metadata": {"next_cursor": "PAGE2"}},
+        {"messages": [{"user": "U", "ts": "1.0", "text": "root"},        # repeated
+                      {"user": "U", "ts": "1.2", "text": "second reply"}]},
+    ]
+    bot.app.client.conversations_replies.side_effect = pages
+    res = await bot.fetch_history_tool("C1", thread_ts="1.0", ctx=_ctx())
+    assert [m["text"] for m in res["messages"]] == ["root", "first reply", "second reply"]
+
+
+def test_build_history_result_enforces_order_it_cannot_merely_assume():
+    """A declaration a caller can quietly falsify is worse than no declaration, so the sort lives
+    with the claim rather than in each caller."""
+    from slack_client.history_tool import build_history_result
+    scrambled = [{"user": "U", "ts": "3.0", "text": "c"},
+                 {"user": "U", "ts": "1.0", "text": "a"},
+                 {"user": "U", "ts": "2.0", "text": "b"}]
+    res = build_history_result(scrambled, channel_id="C1", thread_ts=None, has_more=False)
+    assert [m["text"] for m in res["messages"]] == ["a", "b", "c"]
+    assert res["order"] == "oldest_to_newest"
+
+
+def test_build_history_result_survives_an_unparseable_ts():
+    """Sorting must never be the thing that breaks a fetch."""
+    from slack_client.history_tool import build_history_result
+    res = build_history_result([{"user": "U", "ts": "2.0", "text": "ok"},
+                                {"user": "U", "ts": None, "text": "no ts"}],
+                               channel_id="C1", thread_ts=None, has_more=False)
+    assert res["count"] == 2
+
+
+def test_truncation_note_distinguishes_a_trimmed_thread_from_a_trimmed_channel():
+    """A trimmed THREAD returns the root plus the newest replies with the middle missing. Calling
+    that "only the newest window" was untrue and invited reading the root as adjacent to the
+    replies printed under it."""
+    from slack_client.history_tool import build_history_result
+    msgs = [{"user": "U", "ts": "1.0", "text": "x"}]
+    thread = build_history_result(msgs, channel_id="C1", thread_ts="1.0", has_more=True)
+    channel = build_history_result(msgs, channel_id="C1", thread_ts=None, has_more=True)
+    capped = build_history_result(msgs, channel_id="C1", thread_ts="1.0", has_more=True,
+                                 thread_truncated=True)
+    assert "root plus the newest replies" in thread["note"]
+    assert "replies between them were omitted" in thread["note"]
+    assert thread["note"] != channel["note"]
+    assert "newest window" in channel["note"] and "root" not in channel["note"]
+    assert "longer than the tool can page through" in capped["note"]

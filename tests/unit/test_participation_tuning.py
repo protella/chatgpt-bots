@@ -393,10 +393,12 @@ class _HistHarness(SlackHistoryToolMixin, SlackUtilitiesMixin):
 @pytest.mark.asyncio
 async def test_history_tool_resolves_authors_read_only():
     h = _HistHarness(db_users={"U1": {"username": "alice"}}, remote_names={"U2": "bob"})
+    # NEWEST-first, the order conversations.history really returns; the tool inverts it so the
+    # model reads the channel in discourse order.
     h.app.client.conversations_history.return_value = {"messages": [
-        {"user": "U1", "ts": "1.1", "text": "bout time"},
-        {"user": "U1", "ts": "1.2", "text": "again"},
         {"user": "U2", "ts": "1.3", "text": "hi"},
+        {"user": "U1", "ts": "1.2", "text": "again"},
+        {"user": "U1", "ts": "1.1", "text": "bout time"},
     ]}
     ctx = ToolContext(channel_id="C_PUBLIC", user_id="U_ASKER", requester_is_human=True)
     res = await h.fetch_history_tool("C_PUBLIC", ctx=ctx)
@@ -589,3 +591,37 @@ def test_build_pulse_envelope_logs_span(monkeypatch):
     env = h._build_pulse_envelope(SimpleNamespace(channel_pulse=pulse), "C1", None)
     assert env  # non-empty envelope injected
     assert any("Pulse envelope injected: channel=C1 lines=2 span=1.0→2.0" in m for m in h.logs)
+
+
+@pytest.mark.asyncio
+async def test_name_resolution_budget_favours_the_newest_speakers():
+    """resolve_usernames spends a bounded number of remote lookups and leaves the overflow as raw
+    ids, so the budget has to go to the most RECENT speakers. The 2026-07 grounding fix made the
+    result oldest-first, which — if author collection had simply followed display order — would
+    have handed the budget to the oldest authors and left the newest messages showing raw Slack
+    ids. Author order is decoupled from display order for exactly that reason."""
+    h = _HistHarness(remote_names={"U_OLD": "olderton", "U_NEW": "newman"})
+    h.app.client.conversations_history.return_value = {"messages": [
+        {"user": "U_NEW", "ts": "9.0", "text": "most recent"},     # newest-first, as Slack returns
+        {"user": "U_OLD", "ts": "1.0", "text": "ancient"},
+    ]}
+    ctx = ToolContext(channel_id="C_PUBLIC", user_id="U_ASKER", requester_is_human=True)
+    res = await h.fetch_history_tool("C_PUBLIC", ctx=ctx)
+    # Display order is oldest-first...
+    assert [m["text"] for m in res["messages"]] == ["ancient", "most recent"]
+    # ...while the newest speaker is the FIRST id offered to the budgeted resolver.
+    assert h.remote_calls[0] == "U_NEW"
+
+
+def test_no_special_case_bends_the_react_preference():
+    """The reverted room-humour lean. The owner asked for a slight lean toward reacting to funny
+    posts; measured live it fired on 5 of 5 jokes, and the owner's verdict was that the bot reacts
+    "the same way over and over". Both codex and the reference implementation say the same thing:
+    a special-case exception per topic is the wrong lever, and Claude Tag has no humour clause at
+    all. Stage 4's preference ordering stands unqualified."""
+    p = PARTICIPATION_SYSTEM_PROMPT
+    assert "between an emoji and nothing, prefer nothing" in p
+    assert "Room-wide humour" not in p
+    assert "lean slightly toward reacting" not in p
+    # and the older banter-licenses-a-REPLY clause stays removed (see test_b_banter_rule_replaced)
+    assert "invitation to play along" not in p

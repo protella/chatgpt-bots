@@ -22,7 +22,7 @@ from message_processor.people_tools import (
 )
 from tool_registry import ToolContext, ToolRegistry
 
-CHANNEL = "C04QDHE8W8M"
+CHANNEL = "C0BKX77NU66"
 
 
 # ---------------------------------------------------- format_people_summary

@@ -220,9 +220,15 @@ def note_reaction_pulse(client_self, event, *, added: bool) -> None:
         emoji = event.get("reaction", "")
         if not (channel_id and ts and emoji):
             return
+        # Whose reaction this is decides whether it teaches the emoji palette. Slack emits
+        # reaction_added for the bot's OWN reactions, and counting those made the tally learn
+        # from the bot rather than from the room (see ChannelPulse.add_reaction).
+        bot_user_id = getattr(client_self, "bot_user_id", None)
+        reactor = event.get("user")
+        from_self = bool(bot_user_id and reactor and reactor == bot_user_id)
         if added:
-            pulse.add_reaction(channel_id, ts, emoji)
+            pulse.add_reaction(channel_id, ts, emoji, from_self=from_self)
         else:
-            pulse.remove_reaction(channel_id, ts, emoji)
+            pulse.remove_reaction(channel_id, ts, emoji, from_self=from_self)
     except Exception as e:  # noqa: BLE001
         client_self.log_debug(f"reaction pulse update failed: {e}")
