@@ -31,7 +31,7 @@ class _Bot(SlackSearchToolMixin, SlackHistoryToolMixin):
 
 
 def _ctx(**kw):
-    defaults = dict(channel_id="C04QDHE8W8M", thread_ts="1.0", trigger_ts="1.0",
+    defaults = dict(channel_id="C0BKX77NU66", thread_ts="1.0", trigger_ts="1.0",
                     action_token="tok-123")
     defaults.update(kw)
     return ToolContext(**defaults)
@@ -108,7 +108,7 @@ async def test_search_success_maps_results():
     assert kwargs.args[0] == "assistant.search.context"
     data = kwargs.kwargs["data"]
     assert data["action_token"] == "tok-123"
-    assert data["context_channel_id"] == "C04QDHE8W8M"
+    assert data["context_channel_id"] == "C0BKX77NU66"
     assert data["channel_types"] == "public_channel,private_channel"
 
 
@@ -116,11 +116,11 @@ async def test_search_success_maps_results():
 async def test_scope_channel_filters_other_channels():
     bot = _Bot()
     bot.app.client.api_call = AsyncMock(return_value=_api_response([
-        {"channel_id": "C04QDHE8W8M", "message_ts": "1.1", "content": "here"},
+        {"channel_id": "C0BKX77NU66", "message_ts": "1.1", "content": "here"},
         {"channel_id": "C_OTHER", "message_ts": "1.2", "content": "elsewhere"},
     ]))
     out = await bot.execute_search_tool(_ctx(), {"query": "x", "scope": "channel"})
-    assert out["count"] == 1 and out["results"][0]["channel"] == "C04QDHE8W8M"
+    assert out["count"] == 1 and out["results"][0]["channel"] == "C0BKX77NU66"
 
 
 @pytest.mark.asyncio
@@ -131,7 +131,7 @@ async def test_scope_channel_constrains_query_at_api(monkeypatch):
     bot.app.client.api_call = AsyncMock(return_value=_api_response([]))
     await bot.execute_search_tool(_ctx(), {"query": "budget", "scope": "channel"})
     sent = bot.app.client.api_call.call_args.kwargs["data"]["query"]
-    assert sent == "budget in:<#C04QDHE8W8M>"
+    assert sent == "budget in:<#C0BKX77NU66>"
 
 
 @pytest.mark.asyncio

@@ -66,7 +66,7 @@ async def test_channels_stay_strict():
     """A channel thread IS a conversation boundary. Widening there would be a scope change."""
     db = _DB(thread_rows=[], channel_rows=[_row(7, "https://files.slack.com/other.png")])
 
-    entries = await image_catalog.build_catalog(db, "C04QDHE8W8M:1784921906.654579")
+    entries = await image_catalog.build_catalog(db, "C0BKX77NU66:1784921906.654579")
 
     assert entries == []
     assert db.channel_calls == [], "the channel-wide lookup is never even issued"

@@ -372,3 +372,34 @@ def test_note_reaction_pulse_removed_decrements():
     assert p.render_reactions("C1", "9.9") == "[reactions: 1× joy]"
     feedback_handlers.note_reaction_pulse(host, ev, added=False)
     assert p.render_reactions("C1", "9.9") == ""
+
+
+# --- the palette must learn from the ROOM, not from the bot (2026-07-26) ---
+
+def test_own_reactions_never_teach_the_emoji_palette():
+    """Slack emits reaction_added for the bot's OWN reactions, so without a filter the usage
+    tally learns from the bot: an emoji it picked once outranks the rest next turn, gets picked
+    again, and climbs. Observed live — :dumpster-fire: went 0 -> 2 on the bot's own two uses and
+    was then the top custom emoji offered for anything negative, in a workspace with 1,397 custom
+    emoji. The tally answers "what does THIS WORKSPACE react with"; the bot is not the workspace."""
+    from slack_client.channel_pulse import ChannelPulse
+    pulse = ChannelPulse(size=10)
+    pulse.add_reaction("C1", "1.0", "dumpster-fire", from_self=True)
+    pulse.add_reaction("C1", "1.0", "tada")                       # a human's
+    vocab = pulse.reaction_vocab_snapshot()
+    assert "dumpster-fire" not in vocab, "the bot taught itself its own preference"
+    assert vocab.get("tada") == 1
+    # Social proof on the specific message is different: our reaction really IS on it.
+    assert "dumpster-fire" in pulse.render_reactions("C1", "1.0")
+
+
+def test_removing_our_own_reaction_does_not_dock_the_room_s_tally():
+    """Ours never incremented the tally, so un-reacting must not decrement it — otherwise the bot
+    reacting then removing would push a genuinely popular emoji BELOW what the room earned it."""
+    from slack_client.channel_pulse import ChannelPulse
+    pulse = ChannelPulse(size=10)
+    for _ in range(3):
+        pulse.add_reaction("C1", "1.0", "tada")                   # the room's three
+    pulse.add_reaction("C1", "1.0", "tada", from_self=True)       # ours on top
+    pulse.remove_reaction("C1", "1.0", "tada", from_self=True)    # ours taken back
+    assert pulse.reaction_vocab_snapshot().get("tada") == 3

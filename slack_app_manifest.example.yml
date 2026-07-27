@@ -80,6 +80,9 @@ oauth_config:
       - search:read.mpim
       - search:read.files
       - search:read.users
+      # users.profile.get only — users:read already covers name/title/status/tz/email, so this
+      # adds just the workspace's custom profile fields and pronouns.
+      - users.profile:read
       - users:read
       - users:read.email
 settings:

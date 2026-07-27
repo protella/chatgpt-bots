@@ -30,7 +30,7 @@ from message_processor.handlers.text import TextHandlerMixin
 from message_processor.participation_tools import execute_set_channel_participation
 from tool_registry import ToolContext
 
-CHANNEL = "C04QDHE8W8M"
+CHANNEL = "C0BKX77NU66"
 
 
 class _Handler(TextHandlerMixin):

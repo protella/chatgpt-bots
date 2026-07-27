@@ -31,7 +31,7 @@ from message_processor import canvas_tools as ct
 from message_processor.handlers.text import TextHandlerMixin
 from tool_registry import ToolRegistry
 
-CHANNEL = "C04QDHE8W8M"
+CHANNEL = "C0BKX77NU66"
 DM = "D07PETERDM"
 CATALOG = [{"canvas_id": "F1", "title": "Old notes"}]  # one deletable (non-channel) canvas
 
