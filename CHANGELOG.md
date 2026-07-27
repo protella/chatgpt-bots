@@ -138,6 +138,21 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 🤐 Changed - When it stays quiet, it now says why (and finishes what it started)
+
+Choosing not to reply is now an explicit decision with a stated reason — one of eight
+(addressed to someone else, reacted instead, nothing to add, and so on) — recorded in the
+participation ledger instead of a free-form note. And staying quiet no longer throws away the
+rest of the turn: a memory it decided to save, an emoji reaction, or a cross-thread post now
+still happens even when the bot concludes words would add nothing. Previously, silence
+silently cancelled everything else it had chosen to do.
+
+### 🛠️ Changed - Any human who wakes it can adjust its channel settings
+
+Telling the bot "only reply when tagged here" now works from any message a person sent that
+reached it — not just from a direct @mention. Bots and apps still can't change settings, and
+it still takes an explicit instruction in your message.
+
 ### 🎯 Fixed - It stops borrowing an answer from the message above yours
 
 Asked *"anyone know why the nightly job started taking 40 min? it was 12 last week"*, the bot

@@ -325,35 +325,51 @@ mountable.
 --- END DATA ANALYSIS & ARTIFACTS ---"""
 
 
-# F2: volatile developer-suffix paragraph, added only on UNPROMPTED turns where the
-# no_response_needed tool is exposed. Never in the system prompt (cache hygiene) and never
-# on prompted/config-off turns (LOCAL_TOOLS_GUIDANCE deliberately doesn't advertise it).
-NO_REPLY_CONTRACT_SUFFIX = (
-    "[You joined this conversation uninvited. End your turn with exactly one of: a normal "
-    "reply, a reaction (react_to_message with empty text), or a no_response_needed call. "
-    "If you have nothing genuinely useful to add, prefer no_response_needed over filler. "
-    "If the honest answer to what was actually asked would consist only of \"I haven't "
-    "tried it,\" \"I can't access that,\" or \"I don't know,\" call no_response_needed instead "
-    "— but do not suppress a substantive answer merely because it includes a limitation, and "
-    "if you were addressed by name, prefer a brief honest answer over silence.]"
+# F2: volatile developer-suffix paragraph, added only on turns where the no_response_needed
+# tool is exposed. Never in the system prompt (cache hygiene) and never on addressed/config-off
+# turns (LOCAL_TOOLS_GUIDANCE deliberately doesn't advertise it).
+#
+# Selected by ROUTING POSTURE (routing_facts.py), because posture is exactly the question these
+# paragraphs answer: why is this message in front of you, and what does that imply about
+# speaking. The old split was gated/continuation, which described our plumbing rather than the
+# room. Neither variant lists the eight silence values — the tool schema supplies those, and
+# repeating them here would be two copies of one vocabulary drifting apart.
+#
+# CHANNEL_ACTIVITY: top-level channel traffic nobody addressed to us. The old wording opened
+# "You joined this conversation uninvited", which framed every one of these turns as a social
+# intrusion to be apologized for; the honest bar is not apology, it is worth.
+CHANNEL_ACTIVITY_NO_REPLY_SUFFIX = (
+    "[Nobody addressed this message to you — you are reading a channel you belong to. "
+    "Silence is the DEFAULT here, and it needs no justification: speak only when you can add "
+    "something the people here could not easily get themselves. End your turn with exactly one "
+    "of: a normal reply, a reaction (react_to_message with empty text), or a no_response_needed "
+    "call — that call ends your words, not your other actions, so anything else you do this "
+    "round still happens. If the honest answer to what was actually asked would consist only of "
+    "\"I haven't tried it,\" \"I can't access that,\" or \"I don't know,\" stay silent instead — "
+    "but do not suppress a substantive answer merely because it includes a limitation, and if "
+    "you were addressed by name, prefer a brief honest answer over silence. Never call "
+    "no_response_needed to wait for work you started yourself: finish it and report it.]"
 )
 
 
-# F18: volatile developer-suffix variant for thread-CONTINUATION turns (wake_source ==
-# "thread_continuation") — a 1:1 thread reply routed straight to the main model. Same
-# volatile delivery + exposure conditions as NO_REPLY_CONTRACT_SUFFIX (never in the system
-# prompt, never in rebuilt history), but the wording addresses the real failure: the model
-# is the thread's usual voice yet the latest message may be addressed to someone else.
-CONTINUATION_NO_REPLY_SUFFIX = (
-    "[You're seeing this because this thread has been a 1:1 conversation with you — but "
-    "check the latest message's addressee yourself: if it opens with or names a DIFFERENT "
-    "person or agent (\"claude, …\", \"Dana, can you…\"), it's theirs, not yours — end with "
-    "no_response_needed. And that hand-off STICKS: once the sender has turned to that other "
-    "party, an unnamed follow-up (\"can you see it?\", \"what do you think?\") continues THEIR "
-    "exchange — every bare \"you\" still means them, even on a new subject, even if you could "
-    "answer it. The addressee comes back to you only when the sender names or @-mentions you "
-    "again. NEVER post a placeholder announcing you're staying quiet or "
-    "deferring to them; silence means silence. Otherwise reply normally.]"
+# THREAD_ACTIVITY: a reply inside a thread that did not name us — the deterministic 1:1
+# continuation as well as any thread message the gate judged. Same restraint as the channel
+# variant, plus the sticky-addressee rule, which exists because of a live failure: the model
+# recognized a message was for someone else and said so out loud, which is words about not
+# saying words.
+THREAD_ACTIVITY_NO_REPLY_SUFFIX = (
+    "[This is a thread you are part of, but the latest message does not name you — check its "
+    "addressee yourself. If it opens with or names a DIFFERENT person or agent (\"claude, …\", "
+    "\"Dana, can you…\"), it is theirs, not yours: end with no_response_needed. That hand-off "
+    "STICKS — once the sender has turned to that other party, an unnamed follow-up (\"can you "
+    "see it?\", \"what do you think?\") continues THEIR exchange; every bare \"you\" still means "
+    "them, even on a new subject, even if you could answer it. The addressee comes back to you "
+    "only when the sender names or @-mentions you again. Otherwise the same restraint applies "
+    "as anywhere you were not addressed: speak only when you add something they could not "
+    "easily get themselves. no_response_needed ends your words, not your other actions — "
+    "anything else you do this round still happens. NEVER post a placeholder announcing you're "
+    "staying quiet or deferring to them; silence means silence. Never call it to wait for work "
+    "you started yourself: finish it and report it.]"
 )
 
 

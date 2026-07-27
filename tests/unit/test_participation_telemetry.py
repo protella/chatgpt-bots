@@ -192,9 +192,10 @@ def test_an_ungated_message_produces_no_terminal_event(sink):
 # ------------------------------------------------------------- queued-batch linkage (v3)
 
 def test_the_contract_version_says_the_event_set_changed():
-    """`queue_link` is a new event an attempt can produce, so this is a cardinality change and
-    an analysis written against v2 must be able to refuse the newer lines."""
-    assert pt.CONTRACT_VERSION == 3
+    """`queue_link` is a new event an attempt can produce (v3), and `silence_reason` changed
+    from prose to a declared enum while `reaction_visible` became unconditional (v4). Both are
+    changes an analysis written against the older contract must be able to refuse."""
+    assert pt.CONTRACT_VERSION == 4
 
 
 def test_a_gated_successor_names_the_attempt_it_absorbed_them_into(sink):
@@ -869,7 +870,8 @@ def _resp(rtype="text", content="", **meta):
     (_resp("queued"), None, "queued"),
     (_resp("error", "boom"), None, "error"),
     (_resp(content="sorry, that failed", interrupted=True), None, "interrupted"),
-    (_resp(terminal_action="no_reply", reason="addressed to someone else"), None, "silence"),
+    (_resp(terminal_action="no_reply", silence_reason="addressed_to_other"), None,
+     "silence"),
     (_resp(reaction_only=True), None, "reaction_only"),
     (_resp(content="here you go"), None, "reply"),
     (_resp(content="", streamed=True, posted=True), None, "reply"),
@@ -897,7 +899,7 @@ def test_a_silence_carrying_a_reaction_is_not_a_silence():
     often the bot participates without words — the very rate this ledger measures."""
     from main import ChatBotV2
     assert ChatBotV2._classify_visible_action(
-        _resp(terminal_action="no_reply", reason="just agreeing",
+        _resp(terminal_action="no_reply", silence_reason="reacted_instead",
               response_reaction_committed=True), None) == "reaction_only"
 
 
@@ -925,7 +927,7 @@ def test_chosen_silence_and_broken_contract_never_share_a_label():
     read as the bot exercising restraint — which is the exact claim the ledger has to test."""
     from main import ChatBotV2
     assert ChatBotV2._classify_visible_action(
-        _resp(terminal_action="no_reply", reason="nothing to add"), None) == "silence"
+        _resp(terminal_action="no_reply", silence_reason="nothing_to_add"), None) == "silence"
     assert ChatBotV2._classify_visible_action(_resp(content="   "), None) == "empty"
 
 
@@ -1007,12 +1009,42 @@ async def test_a_gate_reaction_plus_a_responder_veto_is_not_a_silence(sink):
     """react_and_respond puts the emoji up BEFORE the responder runs. If the responder then
     vetoes with no_response_needed, the terminal used to say `silence` about a message that
     visibly has a reaction on it — and the reason it gave was the reason for using no WORDS."""
-    app = _responder_app(_resp(terminal_action="no_reply", reason="just agreeing"))
+    app = _responder_app(_resp(terminal_action="no_reply", silence_reason="nothing_to_add"))
     await _run_responder(app, _msg(), gate_emoji="tada")
 
     terminal = _terminals(sink)[0]
     assert terminal["kind"] == "reaction_only"
-    assert terminal["silence_reason"] == "just agreeing"   # preserved, not swallowed
+    assert terminal["silence_reason"] == "nothing_to_add"   # preserved, not swallowed
+    assert terminal["reaction_visible"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["addressed_to_other", "nothing_to_add", "duplicate",
+                                    "user_requested_silence", "awaiting_context", "other"])
+async def test_the_declared_reason_reaches_the_ledger_verbatim(sink, reason):
+    """End to end, all the way from the terminal tool's argument to the column. Verbatim: the
+    ledger reports what the model said about itself, and a value we adjusted on the way through
+    would make the whole column untrustworthy at exactly the points worth reading."""
+    app = _responder_app(_resp(terminal_action="no_reply", silence_reason=reason))
+    await _run_responder(app, _msg())
+
+    terminal = _terminals(sink)[0]
+    assert terminal["kind"] == "silence"
+    assert terminal["silence_reason"] == reason
+    assert terminal["reaction_visible"] is False
+
+
+@pytest.mark.asyncio
+async def test_reacted_instead_with_no_reaction_records_both_halves(sink):
+    """The mismatch is the measurement: the model said the emoji was its answer, and no emoji
+    is there. Neither fact is corrected against the other, so the disagreement is countable."""
+    app = _responder_app(_resp(terminal_action="no_reply", silence_reason="reacted_instead"))
+    await _run_responder(app, _msg())
+
+    terminal = _terminals(sink)[0]
+    assert terminal["kind"] == "silence"                    # nothing was in the room
+    assert terminal["silence_reason"] == "reacted_instead"  # ...but this is what it claimed
+    assert terminal["reaction_visible"] is False
 
 
 @pytest.mark.asyncio
@@ -1036,7 +1068,9 @@ async def test_a_plain_reply_claims_no_reaction(sink):
 
     terminal = _terminals(sink)[0]
     assert terminal["kind"] == "reply"
-    assert "reaction_visible" not in terminal   # absent, never a false
+    # Explicit false, not absent: "no emoji" and "nobody recorded whether there was one" are
+    # different claims, and only one of them can be counted.
+    assert terminal["reaction_visible"] is False
 
 
 @pytest.mark.asyncio

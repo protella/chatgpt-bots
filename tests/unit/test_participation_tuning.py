@@ -15,7 +15,7 @@ from config import config
 from prompts import (
     PARTICIPATION_SYSTEM_PROMPT,
     SLACK_SYSTEM_PROMPT,
-    NO_REPLY_CONTRACT_SUFFIX,
+    CHANNEL_ACTIVITY_NO_REPLY_SUFFIX,
 )
 from slack_client.history_tool import SlackHistoryToolMixin
 from slack_client.search_tool import SlackSearchToolMixin
@@ -96,11 +96,11 @@ def test_b_banter_rule_replaced():
 
 
 def test_c1_mid_flight_escape_present():
-    s = NO_REPLY_CONTRACT_SUFFIX
+    s = CHANNEL_ACTIVITY_NO_REPLY_SUFFIX
     assert 'consist only of "I haven\'t tried it,"' in s
     assert "do not suppress a substantive answer merely because it includes a limitation" in s
     assert "addressed by name, prefer a brief honest answer over silence" in s
-    assert s.endswith("over silence.]")  # still one bracketed paragraph
+    assert s.endswith("]")  # still one bracketed paragraph
 
 
 def test_c2_truthfulness_sentence_present():
@@ -157,7 +157,7 @@ def test_name_mention_turn_exposes_no_reply_suffix_and_tool(mock_env):
     registry, request_config, available, suffix = host._materialize_request_tools(
         host._client, {"model": "gpt-5.6-sol"}, msg, tools_disabled=False)
     assert available is True
-    assert suffix == NO_REPLY_CONTRACT_SUFFIX
+    assert suffix == CHANNEL_ACTIVITY_NO_REPLY_SUFFIX
     names = {s["name"] for s in registry.schemas(request_config)}
     assert "no_response_needed" in names
 

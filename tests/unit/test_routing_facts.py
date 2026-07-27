@@ -291,13 +291,15 @@ def test_the_config_switch_still_closes_the_silence_option(mock_env, monkeypatch
     assert turn.silence_capable is False
 
 
-def test_the_suffix_wording_follows_gate_required_not_posture(mock_env, monkeypatch):
-    """A gated THREAD message keeps the F2 wording it gets today — posture must not reword the
-    prompt, or this rename would change what the model is told."""
-    from prompts import CONTINUATION_NO_REPLY_SUFFIX, NO_REPLY_CONTRACT_SUFFIX
+def test_the_suffix_wording_follows_posture_not_the_gate(mock_env, monkeypatch):
+    """The paragraphs describe why the message is in front of the model, so posture picks them.
+    A thread message the gate judged and an untouched 1:1 continuation raise the same question —
+    is this still mine? — and now read the same instruction."""
+    from prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX,
+                         THREAD_ACTIVITY_NO_REPLY_SUFFIX)
     monkeypatch.setattr(config, "enable_no_reply_tool", True, raising=False)
     host = _MatHost(_registry())
-    _, _, _, gated = host._materialize_request_tools(
+    _, _, _, gated_thread = host._materialize_request_tools(
         host._client, {"model": "m"},
         _msg(gate_required=True, silence_capable=True, routing_posture="thread_activity"),
         tools_disabled=False)
@@ -305,5 +307,10 @@ def test_the_suffix_wording_follows_gate_required_not_posture(mock_env, monkeypa
         host._client, {"model": "m"},
         _msg(gate_required=False, silence_capable=True, routing_posture="thread_activity"),
         tools_disabled=False)
-    assert gated == NO_REPLY_CONTRACT_SUFFIX
-    assert continuation == CONTINUATION_NO_REPLY_SUFFIX
+    _, _, _, ambient = host._materialize_request_tools(
+        host._client, {"model": "m"},
+        _msg(gate_required=True, silence_capable=True, routing_posture="channel_activity"),
+        tools_disabled=False)
+    assert gated_thread == THREAD_ACTIVITY_NO_REPLY_SUFFIX
+    assert continuation == THREAD_ACTIVITY_NO_REPLY_SUFFIX
+    assert ambient == CHANNEL_ACTIVITY_NO_REPLY_SUFFIX

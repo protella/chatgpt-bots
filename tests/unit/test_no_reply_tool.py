@@ -1,10 +1,12 @@
 """Unit tests for F2 — explicit no-reply terminal-action contract.
 
-Covers the tool-exposure gate (unprompted-only, config-off), the once-materialized
-request config (shared dict never mutated), the tool-loop terminal semantics (ends the
-loop, executes only sibling react, suppresses other siblings, sanitizes the reason), and
-the F2-revision committed-text contract for streaming (no_response_needed honored only
-while no visible text has streamed; rejected-and-completed once a reply has begun).
+Covers the tool-exposure gate (silence-capable routes only, config-off), the
+once-materialized request config (shared dict never mutated), the tool-loop terminal
+semantics (ends the turn's WORDS while every sibling still executes, and requires one of the
+eight declared reasons — see `message_processor/terminal_actions.py` and
+tests/unit/test_terminal_actions.py), and the F2-revision committed-text contract for
+streaming (no_response_needed honored only while no visible text has streamed;
+rejected-and-completed once a reply has begun).
 """
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -57,23 +59,25 @@ class _MatHost:
         self._client = SimpleNamespace(tool_registry=registry)
 
 
-def _msg(gate_required=False, silence_capable=False, wake_source=None):
-    # The routing facts as a dispatcher stamps them: both present on every message, and both
-    # False on the addressed routes rather than absent.
-    md = {"ts": "1.1", "gate_required": gate_required, "silence_capable": silence_capable}
+def _msg(gate_required=False, silence_capable=False, wake_source=None,
+         routing_posture="channel_activity"):
+    # The routing facts as a dispatcher stamps them: present on every message, and False on
+    # the addressed routes rather than absent.
+    md = {"ts": "1.1", "gate_required": gate_required, "silence_capable": silence_capable,
+          "routing_posture": routing_posture}
     if wake_source:
         md["wake_source"] = wake_source
     return SimpleNamespace(metadata=md, channel_id="C1")
 
 
 def test_materialize_gated_turn_exposes_tool_without_mutating_shared(mock_env):
-    from prompts import NO_REPLY_CONTRACT_SUFFIX
+    from prompts import CHANNEL_ACTIVITY_NO_REPLY_SUFFIX
     host = _MatHost(_registry_with_no_reply())
     shared = {"model": "gpt-5"}
     registry, request_config, available, suffix = host._materialize_request_tools(
         host._client, shared, _msg(gate_required=True, silence_capable=True), tools_disabled=False)
     assert available is True
-    assert suffix == NO_REPLY_CONTRACT_SUFFIX  # F2 gate-routed wording
+    assert suffix == CHANNEL_ACTIVITY_NO_REPLY_SUFFIX  # channel-activity wording
     assert request_config["_silence_capable_turn"] is True
     assert "_silence_capable_turn" not in shared  # copied, never mutated
     assert registry is not None
@@ -101,20 +105,22 @@ def test_materialize_timeout_retry_drops_tool_and_paragraph(mock_env):
 
 # ------------------------------------------------- F18 continuation exposure
 
-def test_materialize_continuation_exposes_tool_with_continuation_suffix(mock_env):
-    from prompts import CONTINUATION_NO_REPLY_SUFFIX, NO_REPLY_CONTRACT_SUFFIX
+def test_materialize_continuation_exposes_tool_with_thread_suffix(mock_env):
+    from prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX,
+                         THREAD_ACTIVITY_NO_REPLY_SUFFIX)
     host = _MatHost(_registry_with_no_reply())
     shared = {"model": "gpt-5"}
     registry, request_config, available, suffix = host._materialize_request_tools(
-        host._client, shared, _msg(silence_capable=True, wake_source="thread_continuation"),
+        host._client, shared, _msg(silence_capable=True, wake_source="thread_continuation",
+                                   routing_posture="thread_activity"),
         tools_disabled=False)
     assert available is True
     assert request_config["_silence_capable_turn"] is True  # drives the tool's enabled gate
     assert "_silence_capable_turn" not in shared  # copied, never mutated
     assert registry is not None
-    # F18 wording on the continuation path — NOT the F2 unprompted paragraph.
-    assert suffix == CONTINUATION_NO_REPLY_SUFFIX
-    assert suffix != NO_REPLY_CONTRACT_SUFFIX
+    # Thread wording on a thread reply — NOT the channel-activity paragraph.
+    assert suffix == THREAD_ACTIVITY_NO_REPLY_SUFFIX
+    assert suffix != CHANNEL_ACTIVITY_NO_REPLY_SUFFIX
 
 
 def test_materialize_continuation_hidden_when_config_off(mock_env, monkeypatch):
@@ -122,7 +128,8 @@ def test_materialize_continuation_hidden_when_config_off(mock_env, monkeypatch):
     host = _MatHost(_registry_with_no_reply())
     registry, request_config, available, suffix = host._materialize_request_tools(
         host._client, {"model": "gpt-5"},
-        _msg(silence_capable=True, wake_source="thread_continuation"), tools_disabled=False)
+        _msg(silence_capable=True, wake_source="thread_continuation",
+             routing_posture="thread_activity"), tools_disabled=False)
     assert available is False
     assert suffix is None
 
@@ -176,10 +183,10 @@ def _fc(name, call_id, arguments="{}"):
 
 
 @pytest.mark.asyncio
-async def test_tool_loop_no_reply_ends_and_suppresses_siblings(monkeypatch):
+async def test_tool_loop_no_reply_runs_every_sibling(monkeypatch):
     from openai_client.api import tool_loop
     scripts = [[
-        _fc("no_response_needed", "1", '{"reason": "not really for me"}'),
+        _fc("no_response_needed", "1", '{"reason": "addressed_to_other"}'),
         _fc("react_to_message", "2", '{"emoji": "eyes"}'),
         _fc("remember_fact", "3", "{}"),
     ]]
@@ -196,11 +203,14 @@ async def test_tool_loop_no_reply_ends_and_suppresses_siblings(monkeypatch):
         tool_context=None)
 
     assert result["terminal_action"] == "no_reply"
-    assert result["reason"] == "not really for me"
+    assert result["silence_reason"] == "addressed_to_other"
     assert result["text"] == ""
-    # Only the terminal + sibling react ran; the memory write was suppressed.
-    assert set(dispatched) == {"no_response_needed", "react_to_message"}
-    assert result["local_tool_calls"] == [{"name": "react_to_message", "ok": True, "gist": "emoji=<str>"}]
+    # EVERY sibling runs. Silence ends the words, not the round: the memory write the model
+    # chose is a decision it made, and dropping it was us overruling that decision silently.
+    assert set(dispatched) == {"no_response_needed", "react_to_message", "remember_fact"}
+    assert [c["name"] for c in result["local_tool_calls"]] == [
+        "react_to_message", "remember_fact"]
+    assert all(c["ok"] for c in result["local_tool_calls"])
 
 
 @pytest.mark.asyncio
@@ -212,7 +222,7 @@ async def test_terminal_round_reacts_respect_global_cap(monkeypatch):
     from openai_client.api import tool_loop
     monkeypatch.setattr(tool_loop.config, "max_tool_calls_per_turn", 2)
     scripts = [[
-        _fc("no_response_needed", "1", '{"reason": "silent"}'),
+        _fc("no_response_needed", "1", '{"reason": "nothing_to_add"}'),
         _fc("react_to_message", "2", '{"emoji": "eyes"}'),
         _fc("react_to_message", "3", '{"emoji": "tada"}'),
         _fc("react_to_message", "4", '{"emoji": "thumbsup"}'),
@@ -229,7 +239,7 @@ async def test_terminal_round_reacts_respect_global_cap(monkeypatch):
         _LoopSelf(), messages=[], tools=[], registry=_FakeRegistry(dispatched),
         tool_context=None)
     assert result["terminal_action"] == "no_reply"
-    # no_response_needed reserves one slot; only 1 react fits under the cap of 2.
+    # no_response_needed reserves one slot; only 1 sibling fits under the cap of 2.
     assert dispatched.count("react_to_message") == 1
     assert dispatched.count("no_response_needed") == 1
 
@@ -240,8 +250,8 @@ async def test_terminal_round_suppresses_duplicate_no_reply(monkeypatch):
     # round, only the FIRST is dispatched (first wins); the duplicates are suppressed.
     from openai_client.api import tool_loop
     scripts = [[
-        _fc("no_response_needed", "1", '{"reason": "first"}'),
-        _fc("no_response_needed", "2", '{"reason": "second"}'),
+        _fc("no_response_needed", "1", '{"reason": "not_relevant"}'),
+        _fc("no_response_needed", "2", '{"reason": "duplicate"}'),
         _fc("react_to_message", "3", '{"emoji": "eyes"}'),
     ]]
 
@@ -256,28 +266,69 @@ async def test_terminal_round_suppresses_duplicate_no_reply(monkeypatch):
         _LoopSelf(), messages=[], tools=[], registry=_FakeRegistry(dispatched),
         tool_context=None)
     assert result["terminal_action"] == "no_reply"
-    assert result["reason"] == "first"  # first wins
+    assert result["silence_reason"] == "not_relevant"  # first wins
     assert dispatched.count("no_response_needed") == 1  # duplicate suppressed
     assert dispatched.count("react_to_message") == 1
 
 
 @pytest.mark.asyncio
-async def test_tool_loop_no_reply_reason_sanitized(monkeypatch):
+@pytest.mark.parametrize("arguments", [
+    '{"reason": "it is not really for me"}',   # prose, the old contract
+    '{"reason": ""}',                          # empty
+    '{}',                                      # absent
+    '{"reason": 7}',                           # not a string
+    'not json at all',                         # unparseable
+])
+async def test_an_unrecognized_reason_is_rejected_never_coerced(monkeypatch, arguments):
+    """The turn is NOT silenced and the reason is NOT rewritten to `other`. We do not know why
+    the model wants to be quiet, and inventing a value would file our guess as its testimony."""
     from openai_client.api import tool_loop
-    dirty = "line one\nline two\t" + "x" * 400
-    scripts = [[_fc("no_response_needed", "1", '{"reason": %r}' % dirty)]]
+    scripts = [[_fc("no_response_needed", "1", arguments)], []]
+    state = {"n": 0}
 
     async def fake_create(self, messages, tools, return_metadata, function_call_sink,
                           tool_choice=None, **kw):
-        function_call_sink.extend(scripts.pop(0))
-        return {"text": "", "tools_used": []}
+        i = state["n"]
+        state["n"] += 1
+        if tool_choice != "none" and function_call_sink is not None:
+            function_call_sink.extend(scripts[min(i, len(scripts) - 1)])
+        return {"text": "" if i == 0 else "fine, here you go", "tools_used": []}
 
     monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake_create)
+    dispatched = []
     result = await tool_loop.create_text_response_with_tool_loop(
-        _LoopSelf(), messages=[], tools=[], registry=_FakeRegistry([]), tool_context=None)
-    reason = result["reason"]
-    assert "\n" not in reason and "\t" not in reason
-    assert len(reason) <= 300
+        _LoopSelf(), messages=[], tools=[], registry=_FakeRegistry(dispatched),
+        tool_context=None)
+    assert result.get("terminal_action") is None      # not silenced
+    assert result.get("silence_reason") is None       # and nothing invented
+    assert result["text"] == "fine, here you go"      # the model got another round
+    assert "no_response_needed" not in dispatched     # rejected, never executed
+    rejected = [c for c in result["local_tool_calls"] if c["name"] == "no_response_needed"]
+    assert rejected and all(c["ok"] is False for c in rejected)
+
+
+@pytest.mark.asyncio
+async def test_an_invalid_terminal_still_runs_its_siblings_exactly_once(monkeypatch):
+    from openai_client.api import tool_loop
+    scripts = [[_fc("no_response_needed", "1", '{"reason": "made up"}'),
+                _fc("react_to_message", "2", '{"emoji": "eyes"}')], []]
+    state = {"n": 0}
+
+    async def fake_create(self, messages, tools, return_metadata, function_call_sink,
+                          tool_choice=None, **kw):
+        i = state["n"]
+        state["n"] += 1
+        if tool_choice != "none" and function_call_sink is not None:
+            function_call_sink.extend(scripts[min(i, len(scripts) - 1)])
+        return {"text": "" if i == 0 else "done", "tools_used": []}
+
+    monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", fake_create)
+    dispatched = []
+    result = await tool_loop.create_text_response_with_tool_loop(
+        _LoopSelf(), messages=[], tools=[], registry=_FakeRegistry(dispatched),
+        tool_context=None)
+    assert dispatched.count("react_to_message") == 1   # ran, and only once
+    assert result.get("terminal_action") is None
 
 
 # ---------------------------------------------- F2 revision: streaming committed-text
@@ -309,13 +360,14 @@ def _streaming_fake(rounds):
 async def test_streaming_no_reply_honored_when_no_text_committed(monkeypatch):
     # Round 1 calls no_response_needed with NO streamed text → silence is honored.
     from openai_client.api import tool_loop
-    rounds = [("", [_fc("no_response_needed", "1", '{"reason": "not for me"}')])]
+    rounds = [("", [_fc("no_response_needed", "1", '{"reason": "addressed_to_other"}')])]
     monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
                         _streaming_fake(rounds))
     out = await tool_loop.create_streaming_response_with_tool_loop(
         _LoopSelf(), messages=[], tools=[], registry=_FakeRegistry([]),
         tool_context=None, stream_callback=lambda c: None)
     assert out["terminal_action"] == "no_reply"
+    assert out["silence_reason"] == "addressed_to_other"
     assert out["text"] == ""
 
 
@@ -325,7 +377,7 @@ async def test_streaming_no_reply_rejected_after_committed_text(monkeypatch):
     # rejected, the loop continues, and round 2 completes the reply. WARNING logged.
     from openai_client.api import tool_loop
     rounds = [
-        ("Sure, here's the answer", [_fc("no_response_needed", "1", '{"reason": "oops"}')]),
+        ("Sure, here's the answer", [_fc("no_response_needed", "1", '{"reason": "nothing_to_add"}')]),
         (" — all done.", []),
     ]
     monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
@@ -347,7 +399,7 @@ async def test_streaming_no_reply_with_committed_text_runs_react_sibling(monkeyp
     # A react sibling in the rejected round still executes; the reply then completes.
     from openai_client.api import tool_loop
     rounds = [
-        ("partial", [_fc("no_response_needed", "1", '{"reason": "x"}'),
+        ("partial", [_fc("no_response_needed", "1", '{"reason": "nothing_to_add"}'),
                      _fc("react_to_message", "2", '{"emoji": "eyes"}')]),
         ("done", []),
     ]
@@ -370,7 +422,7 @@ async def test_streaming_no_reply_rejected_when_prior_committed(monkeypatch):
     # shows NO text this attempt rejects a no_response_needed — a prior attempt's partial
     # reply must never be orphaned as fake silence.
     from openai_client.api import tool_loop
-    rounds = [("", [_fc("no_response_needed", "1", '{"reason": "x"}')]),
+    rounds = [("", [_fc("no_response_needed", "1", '{"reason": "nothing_to_add"}')]),
               ("recovered reply", [])]
     monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
                         _streaming_fake(rounds))
@@ -386,7 +438,7 @@ async def test_nonstreaming_no_reply_rejected_when_prior_committed(monkeypatch):
     # F8: the non-streaming loop honors no_reply normally, but when prior_committed is set
     # (a streaming attempt already exposed text) it rejects and forces completion instead.
     from openai_client.api import tool_loop
-    scripts = [[_fc("no_response_needed", "1", '{"reason": "late"}')], []]
+    scripts = [[_fc("no_response_needed", "1", '{"reason": "nothing_to_add"}')], []]
     texts = ["", "finished reply"]
     state = {"n": 0}
 
@@ -415,7 +467,7 @@ async def test_run_tool_round_override_is_identity_not_call_id():
     # A degenerate round where a sibling shares the terminal's call_id must NOT misroute the
     # override — identity keying short-circuits only the specific terminal object.
     from openai_client.api import tool_loop
-    terminal = _fc("no_response_needed", "dup", '{"reason": "x"}')
+    terminal = _fc("no_response_needed", "dup", '{"reason": "nothing_to_add"}')
     sibling = _fc("react_to_message", "dup", '{"emoji": "eyes"}')  # same call_id on purpose
     sink = [terminal, sibling]
     local, dispatched = [], []
@@ -473,28 +525,49 @@ async def test_cleanup_silent_stream_reports_abandon_failure_and_skips_none():
 
 # --------------------------------------------------------------- contract paragraph
 
-def test_contract_paragraph_wording():
-    from prompts import NO_REPLY_CONTRACT_SUFFIX
-    assert NO_REPLY_CONTRACT_SUFFIX.startswith("[You joined this conversation uninvited.")
-    assert "no_response_needed" in NO_REPLY_CONTRACT_SUFFIX
-    assert "prefer no_response_needed over filler." in NO_REPLY_CONTRACT_SUFFIX
-    # C1: the mid-flight escape — an answer that would only admit a limitation is a
-    # no_response_needed, but a substantive answer isn't suppressed for including one,
-    # and a name-summoned turn prefers a brief honest answer over silence.
-    assert 'consist only of "I haven\'t tried it,"' in NO_REPLY_CONTRACT_SUFFIX
-    assert "do not suppress a substantive answer merely because it includes a limitation" \
-        in NO_REPLY_CONTRACT_SUFFIX
-    assert "addressed by name, prefer a brief honest answer over silence" in NO_REPLY_CONTRACT_SUFFIX
-    assert NO_REPLY_CONTRACT_SUFFIX.endswith("over silence.]")
+def test_channel_activity_paragraph_wording():
+    from prompts import CHANNEL_ACTIVITY_NO_REPLY_SUFFIX as s
+    # Silence is the default and needs no apology — the old "you joined uninvited" framing
+    # asked the model to feel like an intruder rather than to judge whether it adds anything.
+    assert "uninvited" not in s
+    assert "Silence is the DEFAULT here" in s
+    assert "could not easily get themselves" in s
+    assert "no_response_needed" in s
+    # C1: the mid-flight escape — an answer that would only admit a limitation is silence,
+    # but a substantive answer isn't suppressed for including one, and a name-summoned turn
+    # prefers a brief honest answer.
+    assert 'consist only of "I haven\'t tried it,"' in s
+    assert "do not suppress a substantive answer merely because it includes a limitation" in s
+    assert "addressed by name, prefer a brief honest answer over silence" in s
+    # The terminal contract the schema also states: silence ends the words, not the round.
+    assert "ends your words, not your other actions" in s
+    assert "wait for work you started yourself" in s
+    assert s.startswith("[") and s.endswith("]")
 
 
-def test_continuation_paragraph_wording():
-    from prompts import CONTINUATION_NO_REPLY_SUFFIX, NO_REPLY_CONTRACT_SUFFIX
-    # F18: continuation wording — 1:1-thread framing, self-check the addressee, silence
-    # means silence (never a "staying quiet" placeholder). Distinct from the F2 paragraph.
-    assert CONTINUATION_NO_REPLY_SUFFIX.startswith("[You're seeing this because this thread")
-    assert "1:1 conversation with you" in CONTINUATION_NO_REPLY_SUFFIX
-    assert "no_response_needed" in CONTINUATION_NO_REPLY_SUFFIX
-    assert "silence means silence" in CONTINUATION_NO_REPLY_SUFFIX
-    assert CONTINUATION_NO_REPLY_SUFFIX.endswith("reply normally.]")
-    assert CONTINUATION_NO_REPLY_SUFFIX != NO_REPLY_CONTRACT_SUFFIX
+def test_thread_activity_paragraph_wording():
+    from prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX,
+                         THREAD_ACTIVITY_NO_REPLY_SUFFIX as s)
+    # Thread wording keeps the sticky-addressee rule: check the addressee yourself, the
+    # hand-off sticks, and silence means silence (never a "staying quiet" placeholder).
+    assert "check its addressee yourself" in s
+    assert "STICKS" in s
+    assert "silence means silence" in s
+    assert "no_response_needed" in s
+    assert "ends your words, not your other actions" in s
+    assert "wait for work you started yourself" in s
+    assert s != CHANNEL_ACTIVITY_NO_REPLY_SUFFIX
+    assert s.startswith("[") and s.endswith("]")
+
+
+def test_neither_paragraph_restates_the_silence_vocabulary():
+    """The eight values live in the tool schema. Two copies of one vocabulary drift.
+
+    Checked on the identifier-shaped values only — `other` is also an ordinary English word,
+    and "another person" is prose, not a restatement of the enum."""
+    from message_processor.terminal_actions import SILENCE_REASONS
+    from prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX,
+                         THREAD_ACTIVITY_NO_REPLY_SUFFIX)
+    identifiers = [v for v in SILENCE_REASONS if "_" in v]
+    for paragraph in (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX, THREAD_ACTIVITY_NO_REPLY_SUFFIX):
+        assert not [v for v in identifiers if v in paragraph]
