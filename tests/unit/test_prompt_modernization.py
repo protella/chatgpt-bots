@@ -136,3 +136,55 @@ def test_tool_provenance_ground_truth_instruction_present():
     assert "authoritative" in lowered
     # Absence of an annotation must be interpreted as "no local tools ran".
     assert "no such line means you used no local tools" in SLACK_SYSTEM_PROMPT
+
+
+def test_grounding_rule_governs_binding_not_just_sourcing():
+    """The live failure that motivated this: asked why a nightly job slowed down, the bot answered
+    "you just called it a minute ago: replica warmup was the culprit" — lifting a cause from an
+    unrelated message someone had sent a colleague three minutes earlier.
+
+    The pre-existing Truthfulness rule did not catch it, and could not: it governs SOURCING, and
+    the bot had genuinely called fetch_channel_history. What was unsupported was the LINK it drew
+    between two records. This paragraph is that missing rule, so it must keep saying so."""
+    assert "Grounding:" in SLACK_SYSTEM_PROMPT
+    # Support for a record is not support for a link between records.
+    assert "not that some link you drew between two of them is real" in SLACK_SYSTEM_PROMPT
+    # Interleaved conversations, and fragments whose other half is invisible.
+    assert "several conversations interleaved" in SLACK_SYSTEM_PROMPT
+    # Adjacency and topical similarity are explicitly denied as evidence.
+    assert "never because the topics rhyme" in SLACK_SYSTEM_PROMPT
+    # A pronoun in someone else's message points back into THEIR exchange.
+    assert "points back into their own conversation" in SLACK_SYSTEM_PROMPT
+    # Claim strength is preserved rather than hardened.
+    assert "Keep a claim exactly as strong as its source" in SLACK_SYSTEM_PROMPT
+    # And the anti-hedge clause, without which this rule turns the bot to mush — the eval
+    # measures that cost directly (tests/integration/grounding_eval.py).
+    assert "when the support is there, say it plainly" in SLACK_SYSTEM_PROMPT
+
+
+def test_details_are_repeated_at_the_precision_they_were_given():
+    """Found by the frozen holdout corpus: told "board review moved to the 14th", the bot answered
+    "August 14". No message named a month — it resolved the 14th against today's date and served
+    the inference as if it were the record. The pre-existing "never fabricate details" rule did not
+    catch it, because sharpening a detail doesn't feel like inventing one."""
+    assert "don't quietly sharpen one either" in SLACK_SYSTEM_PROMPT
+    assert "repeat a detail at the precision it was given" in SLACK_SYSTEM_PROMPT
+    # The three ways it actually over-resolves: month from today's date, year, surname.
+    assert "which month from today's date, which year, or whose surname" in SLACK_SYSTEM_PROMPT
+    # And why it matters more than plain invention.
+    assert "harder to catch" in SLACK_SYSTEM_PROMPT
+
+
+def test_voice_carries_no_word_blacklist():
+    """A previous revision added a list of banned tells to the voice paragraph (em dashes, the
+    "not just X, it's Y" reversal, delve/leverage/robust/seamless, tidy three-item lists). It was
+    added without authorization, never measured, and the owner rejected it. Codex's objection was
+    substantive too: banning useful words can make an answer worse, which is the opposite of the
+    goal. Tone work is deferred; if it returns, the mechanism to copy counts named defects and
+    sends at zero rather than blacklisting vocabulary."""
+    for banned_list_marker in ("The loudest tell is the em dash", "delve, leverage, robust",
+                               "it's not just X, it's Y", "a testament to"):
+        assert banned_list_marker not in SLACK_SYSTEM_PROMPT
+    # The voice paragraph itself survives — only the blacklist came out.
+    assert "write the way a sharp coworker writes in Slack" in SLACK_SYSTEM_PROMPT
+    assert "If one line covers it, send one line." in SLACK_SYSTEM_PROMPT

@@ -1324,11 +1324,22 @@ async def classify_participation(self, text: str, signals: Optional[Dict[str, An
         customs = [str(e).strip().strip(":") for e in (signals.get("workspace_custom_emojis") or [])
                    if str(e).strip().strip(":")]
         if customs:
+            # Names only, with NO popularity claim attached. Measured 2026-07-26 in the shared test
+            # channel: ranking these by observed use and telling the model to "prefer this team's
+            # own vocabulary" concentrated our reactions onto 14 distinct emoji across 38 social
+            # reactions, :dumpster-fire: alone taking 24% — while Anthropic's bot, answering the
+            # same room, spread 43 reactions across 32 distinct emoji with its most-used at 7%.
+            # That bot has no ranked palette at all: it has an opt-in name-lookup tool and nothing
+            # else, which is what `search_workspace_emoji` already is for us. A witnessed-usage
+            # tally is a popularity loop, not taste, so it no longer steers anything; it stays as
+            # analytics. The names themselves are still worth surfacing — :absolutecinema: is
+            # exactly what the model cannot guess exists.
             lines.append(
-                "- Custom emoji THIS WORKSPACE actually reacts with, most-used first — prefer "
-                "one of these when it fits the moment, since it is this team's own vocabulary: "
+                "- Custom emoji that exist in this workspace, offered only as names you would not "
+                "otherwise know are available: "
                 + ", ".join(customs)
-                + "; every standard Slack emoji also remains available."
+                + ". Every standard Slack emoji is available too; pick whatever actually fits this "
+                "moment, and if none of these do, do not stretch one to fit."
             )
     if signals.get("directives"):
         lines.append(f"- Channel ground rules (honor them): {signals['directives']}")

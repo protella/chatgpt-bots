@@ -6,7 +6,8 @@ only `text` and `files`, and the bot answered "I only see 'what about this?' —
 attached or quoted." `event["attachments"]` had zero readers on every ingest path.
 
 tests/fixtures/slack_table_event.json is that exact payload, fetched live from Slack
-(ts 1784222395.492299, C04QDHE8W8M). It is the ground truth here because several of its
+(ts 1784222395.492299, captured in the previous #chatgpt-bot-test channel — the channel id in
+the fixtures below is just an opaque stand-in). It is the ground truth here because several of its
 properties break a naive implementation: header cells are rich_text while data cells are
 raw_text, one cell is literal JSON null, and `fallback` is the noise string
 "[no preview available]" rather than the table's content.
@@ -789,7 +790,7 @@ async def test_history_rebuild_keeps_the_table_the_tuesday_amnesia_case():
     ev = _fixture()
     bot = _replies({**ev, "user": "U07HUMAN"})
 
-    history = await bot.get_thread_history("C04QDHE8W8M", "1784222395.492299")
+    history = await bot.get_thread_history("C0BKX77NU66", "1784222395.492299")
 
     assert len(history) == 1
     assert "what about this?" in history[0].text
@@ -803,7 +804,7 @@ async def test_history_rebuild_and_live_path_agree():
     # the model sees the thread change under it across a restart.
     ev = _fixture()
     bot = _replies({**ev, "user": "U07HUMAN"})
-    history = await bot.get_thread_history("C04QDHE8W8M", "1784222395.492299")
+    history = await bot.get_thread_history("C0BKX77NU66", "1784222395.492299")
 
     live_supplementary = _extract(ev, primary_text=ev["text"])
 
@@ -934,7 +935,7 @@ class _Host(SlackMessageEventsMixin, SlackFormattingMixin, SlackUtilitiesMixin):
 async def test_live_event_to_message_carries_the_table():
     ev = _fixture()
 
-    msg = await _Host()._event_to_message({**ev, "channel": "C04QDHE8W8M"}, MagicMock())
+    msg = await _Host()._event_to_message({**ev, "channel": "C0BKX77NU66"}, MagicMock())
 
     assert "what about this?" in msg.text
     assert "[Slack table]" in msg.text

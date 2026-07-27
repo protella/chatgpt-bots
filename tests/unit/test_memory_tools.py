@@ -20,7 +20,7 @@ from message_processor.memory_tools import (
 )
 from tool_registry import ToolContext, ToolRegistry
 
-CHANNEL = "C04QDHE8W8M"
+CHANNEL = "C0BKX77NU66"
 
 
 def _row(id, content, scope="channel", channel_id=CHANNEL, updated_ts="2026-07-01"):

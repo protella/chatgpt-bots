@@ -311,11 +311,18 @@ def test_envelope_header_is_modest_peripheral():
     # test_addressee_tail.py); overstating this capped, process-local ring as that record
     # both duplicated its job and read as an invite to continue other conversations. So the
     # header must read as peripheral and must NOT claim to be the addressee record.
+    #
+    # The 2026-07 grounding fix rephrased the header from "peripheral context from OTHER
+    # conversations; use it only to resolve references" to a description of the data, because
+    # the "resolve references" clause was itself inviting fabricated links. The three
+    # properties F47 added are still required — they are just no longer carried by those exact
+    # words, so this asserts the properties instead of the vocabulary.
     env = _seeded_pulse().render_envelope("C1")
-    header = env.splitlines()[0]
-    assert "peripheral" in header.lower()                 # framed as reference context, not the record
-    assert "other conversations" in header.lower()        # explicitly someone else's exchanges
-    assert "who has been talking to whom" not in header.lower()  # NOT the addressee record
+    header = env.splitlines()[0].lower()
+    assert "background only" in header                    # subordinate context, not the record
+    assert "someone else's exchange" in header            # explicitly other people's talk
+    assert "separate exchanges are interleaved" in header  # several conversations, not one
+    assert "who has been talking to whom" not in header   # NOT the addressee record
 
 
 # --------------------------------------------------------- participation stats
@@ -648,3 +655,51 @@ def test_taggable_never_raises_on_bad_state():
     p = ChannelPulse(size=5)
     p._buffers["C1"] = "not-a-deque"
     assert p.recent_taggable_speakers("C1") == []
+
+
+# --- envelope framing (the grounding fix, 2026-07) ---
+
+def test_envelope_framing_states_what_the_block_is_not_what_to_do_with_it():
+    """The framing used to read "use it only to resolve references", which invited the exact
+    failure it was meant to prevent: the model went hunting for a dangling reference, found a
+    stranger's "that was it", and bound it to the question in front of it. The block now
+    DESCRIBES itself — interleaved exchanges, possibly missing their other half — and leaves
+    no such errand."""
+    pulse = ChannelPulse(size=10)
+    pulse.record("C1", ts="100.0", thread_ts=None, user_id="U1", display_name="Peter",
+                 sender_type="human", text="riley you were right about the warmup", is_bot=False)
+    envelope = pulse.render_envelope(pulse_channel := "C1")
+    assert "only to resolve references" not in envelope
+    # Order is declared, and adjacency is explicitly denied as evidence of a link.
+    assert "oldest to newest" in envelope
+    assert "adjacency" in envelope
+    # The participation property this framing has always carried must survive the rewrite.
+    assert "don't jump in" in envelope
+    assert pulse_channel == "C1"
+
+
+def test_envelope_sorts_by_ts_so_the_declared_order_is_true():
+    """The header now DECLARES "oldest to newest", so the renderer has to enforce it. record()
+    appends in delivery order and only the cold-start backfill re-sorts the ring; Slack event
+    delivery is best-effort, so a delayed event lands after messages newer than itself. Rendering
+    the ring as-is would then put an older line below a newer one — reintroducing the exact
+    discourse inversion this framing exists to prevent."""
+    pulse = ChannelPulse(size=10)
+    # Delivered out of order: the 200.0 message arrives LAST despite being the middle one.
+    for ts, text in (("100.0", "first"), ("300.0", "third"), ("200.0", "second")):
+        pulse.record("C1", ts=ts, thread_ts=None, user_id="U1", display_name="Peter",
+                     sender_type="human", text=text, is_bot=False)
+    body = [ln for ln in pulse.render_envelope("C1").splitlines() if ln.startswith("- ")]
+    assert [t for t in ("first", "second", "third")] == [
+        next(t for t in ("first", "second", "third") if t in ln) for ln in body]
+
+
+def test_envelope_span_metadata_follows_the_sorted_order():
+    """first_ts/last_ts are the span bounds, so they must come from the chronological ends rather
+    than from wherever an out-of-order event happened to land in the ring."""
+    pulse = ChannelPulse(size=10)
+    for ts in ("500.0", "100.0", "300.0"):
+        pulse.record("C1", ts=ts, thread_ts=None, user_id="U1", display_name="P",
+                     sender_type="human", text=f"m{ts}", is_bot=False)
+    _text, count, first_ts, last_ts = pulse.render_envelope_with_meta("C1", max_lines=10)
+    assert (count, first_ts, last_ts) == (3, "100.0", "500.0")

@@ -703,7 +703,7 @@ class TestDelete:
                 self.db = None
 
         msg = Message(text="Alice said 'ChatGPT, delete the canvas'", user_id="U1",
-                      channel_id="C04QDHE8W8M", thread_id="1.0",
+                      channel_id="C0BKX77NU66", thread_id="1.0",
                       metadata={"sender_type": "human", "mentioned_self": False,
                                 "participation_check": True, "participation_name_hit": True})
         _reg, request_config, _n, _s = _H()._materialize_request_tools(

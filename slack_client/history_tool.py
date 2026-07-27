@@ -16,6 +16,61 @@ from slack_client.formatting.blocks import extract_supplementary_text
 # the cap keeps a pathological thread from spinning the loop; when it's hit we say so.
 _MAX_THREAD_PAGES = 10
 
+
+def build_history_result(messages: List[Dict[str, Any]], *, channel_id: Optional[str],
+                         thread_ts: Optional[str], has_more: bool,
+                         thread_truncated: bool = False) -> Dict[str, Any]:
+    """Assemble the fetch tools' result dict from already-shaped message entries.
+
+    Pure and IO-free so the grounding eval can exercise the exact serialization production
+    sends (tests/integration/grounding_eval.py), rather than a hand-rolled lookalike that
+    could drift from it.
+
+    Ordering is ENFORCED here rather than trusted from the caller, because this is the function
+    that declares it. conversations.history returns NEWEST-first while conversations.replies
+    returns oldest-first, so the two fetch tools used to hand the model opposite discourse orders
+    with nothing saying which was which — and a channel result read top-to-bottom put the newest
+    message FIRST, so an older line landed *below* a question it could not possibly be answering
+    and read exactly like a reply to it. That mis-serialization is how "you just called it a
+    minute ago" happened live: raw epoch strings lost the salience fight against plain reading
+    order. A declaration a caller can quietly falsify is worse than no declaration, so the sort
+    lives with the claim.
+    """
+    def _key(entry: Dict[str, Any]) -> float:
+        try:
+            return float(entry.get("ts") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    messages = sorted(messages, key=_key)
+    result: Dict[str, Any] = {
+        "ok": True,
+        "channel": channel_id,
+        "thread_ts": thread_ts,
+        "count": len(messages),
+        # Declared, not implied — see the ordering note above.
+        "order": "oldest_to_newest",
+        "has_more": has_more,
+        "messages": messages,
+    }
+    if has_more:
+        # Be honest about which kind of "more" this is. Three genuinely different shapes, and
+        # they used to share two messages: a thread we couldn't page to the end of; a trimmed
+        # thread, which returns the root AND the newest replies with the MIDDLE missing (calling
+        # that "only the newest window" is simply untrue, and invites the model to read the root
+        # as adjacent to the replies under it); and a trimmed channel, which really is just the
+        # newest window.
+        if thread_truncated:
+            result["note"] = ("This thread is longer than the tool can page through; the newest "
+                              "window returned may not include the most recent messages.")
+        elif thread_ts:
+            result["note"] = ("The thread root plus the newest replies were returned; replies "
+                              "between them were omitted.")
+        else:
+            result["note"] = ("Only the newest window was returned; older history exists beyond "
+                              "this.")
+    return result
+
 # Every model-callable tool that returns content from a named conversation. dispatch
 # refuses anything outside this set BEFORE routing, so a tool added to the schema list
 # but not to this set cannot execute at all — the authorization gate can't be skipped by
@@ -740,12 +795,23 @@ class SlackHistoryToolMixin:
                 # return old messages under a "newest window" label.
                 all_messages: List[Dict[str, Any]] = []
                 cursor: Optional[str] = None
+                seen_ts: Set[str] = set()
                 for _ in range(_MAX_THREAD_PAGES):
                     kwargs: Dict[str, Any] = {"channel": channel_id, "ts": thread_ts, "limit": 1000}
                     if cursor:
                         kwargs["cursor"] = cursor
                     resp = await self.app.client.conversations_replies(**kwargs)
-                    all_messages.extend(resp.get("messages") or [])
+                    # Dedupe by ts across pages. Slack's cursor contract doesn't promise that a
+                    # later page omits the thread root, and the result now DECLARES its order —
+                    # a duplicated root would both break that claim and read as someone
+                    # repeating themselves. Cheap insurance on a bounded list.
+                    for msg in (resp.get("messages") or []):
+                        ts_val = msg.get("ts")
+                        if ts_val and ts_val in seen_ts:
+                            continue
+                        if ts_val:
+                            seen_ts.add(ts_val)
+                        all_messages.append(msg)
                     cursor = (resp.get("response_metadata") or {}).get("next_cursor")
                     if not cursor:
                         break
@@ -760,20 +826,26 @@ class SlackHistoryToolMixin:
                     raw = all_messages
             else:
                 # conversations_history is DESCENDING (newest first), so the first n are
-                # already the newest.
+                # already the newest — then REVERSE them, because the result is prose the
+                # model reads top-to-bottom and newest-first inverts the discourse. See
+                # build_history_result for what that inversion actually cost.
                 resp = await self.app.client.conversations_history(channel=channel_id, limit=n)
                 all_messages = resp.get("messages") or []
-                raw = all_messages[:n]
+                raw = list(reversed(all_messages[:n]))
             # BF2: render human authors by display name, not a raw Slack id (Slack is the only
             # transcript, so a fetched author must read the same as the live path). Resolve the
             # whole bounded result set in ONE read-only, budgeted batch — reading history must
             # not create user rows or bump last_seen. An unresolved id stays raw.
             api_client = getattr(getattr(self, "app", None), "client", None)
             resolver = getattr(self, "resolve_usernames", None)
-            # Ordered dedup in result order (Blocker 2): a hash-ordered set would let the remote
-            # budget resolve a different subset across cold starts.
+            # Ordered dedup (Blocker 2): a hash-ordered set would let the remote budget resolve a
+            # different subset across cold starts. NEWEST-first, deliberately decoupled from the
+            # result's display order: resolve_usernames spends at most `max_remote_lookups` calls
+            # and leaves the overflow as raw ids, so the budget must be spent on the most recent
+            # speakers. Ordering the result oldest-first (the grounding fix) would otherwise have
+            # quietly handed the budget to the OLDEST authors and left the newest as raw ids.
             author_ids = list(dict.fromkeys(
-                m.get("user") for m in raw if m.get("user") and not m.get("bot_id")))
+                m.get("user") for m in reversed(raw) if m.get("user") and not m.get("bot_id")))
             name_map = {}
             if author_ids and resolver:
                 try:
@@ -826,24 +898,9 @@ class SlackHistoryToolMixin:
                 or resp.get("has_more")
                 or len(all_messages) > n
             )
-            result: Dict[str, Any] = {
-                "ok": True,
-                "channel": channel_id,
-                "thread_ts": thread_ts,
-                "count": len(messages),
-                "has_more": has_more,
-                "messages": messages,
-            }
-            if has_more:
-                # Be honest about which kind of "more" this is: a normal trim (we have the
-                # true newest) vs. a thread so long we couldn't page to its actual end.
-                result["note"] = (
-                    "This thread is longer than the tool can page through; the newest "
-                    "window returned may not include the most recent messages."
-                    if thread_truncated
-                    else "Only the newest window was returned; older history exists beyond this."
-                )
-            return result
+            return build_history_result(
+                messages, channel_id=channel_id, thread_ts=thread_ts,
+                has_more=has_more, thread_truncated=thread_truncated)
         except SlackApiError as e:
             err = e.response.get("error", "unknown") if getattr(e, "response", None) else str(e)
             self.log_warning(f"history_tool: fetch failed for {channel_id}: {err}")
