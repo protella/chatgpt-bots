@@ -315,7 +315,7 @@ async def test_participation_ignore_never_touches_status_or_indicator():
     client.set_assistant_status = AsyncMock()
 
     msg = Message(channel_id="C1", thread_id="T1", user_id="U1", text="hi",
-                  metadata={"participation_check": True, "ts": "T1"})
+                  metadata={"gate_required": True, "silence_capable": True, "ts": "T1"})
     await handler.handle_message(msg, client)
 
     client.send_thinking_indicator.assert_not_awaited()

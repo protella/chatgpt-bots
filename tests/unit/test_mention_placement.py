@@ -250,6 +250,7 @@ async def test_thread_verdict_overrides_setting_and_artifacts_still_thread(monke
     published = AsyncMock(return_value=["file_1"])
     monkeypatch.setattr("message_processor.artifacts.publish_artifacts", published)
     await app.handle_message(
-        _mention_msg({"reply_in_channel": True, "participation_check": True}), client)
+        _mention_msg({"reply_in_channel": True, "gate_required": True,
+                      "silence_capable": True}), client)
     assert client.send_message.await_args.args[1] == "10.0"        # threaded (verdict wins)
     assert published.await_args.kwargs["thread_id"] == "10.0"

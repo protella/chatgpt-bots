@@ -16,6 +16,7 @@ Also asserted: this can never cost a turn. Every entry point swallows its own fa
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -147,7 +148,8 @@ def test_a_model_authored_reason_is_bounded(sink):
 # ---------------------------------------------------------------- the attempt lifecycle helper
 
 def _msg(**meta):
-    m = {"ts": "10.0", "participation_check": True, "participation_level": "judicious"}
+    m = {"ts": "10.0", "gate_required": True, "silence_capable": True,
+         "participation_level": "judicious"}
     m.update(meta)
     return Message(text="anyone know the deploy status?", user_id="U1",
                    channel_id="C1", thread_id="10.0", metadata=m)
@@ -184,6 +186,182 @@ def test_an_ungated_message_produces_no_terminal_event(sink):
     letting its outcome in would put rows with no decision behind them into a population
     documented as decisions."""
     assert pt.finish_attempt(_msg(), "reply") is False
+    assert sink("visible_action") == []
+
+
+# ------------------------------------------------------------- queued-batch linkage (v3)
+
+def test_the_contract_version_says_the_event_set_changed():
+    """`queue_link` is a new event an attempt can produce, so this is a cardinality change and
+    an analysis written against v2 must be able to refuse the newer lines."""
+    assert pt.CONTRACT_VERSION == 3
+
+
+def test_a_gated_successor_names_the_attempt_it_absorbed_them_into(sink):
+    successor = _msg()
+    pt.stage_queue_links(successor, ["src-a", "src-b"])
+    attempt = pt.begin_attempt(successor)        # the successor's own gate attempt
+    pt.emit_queue_links(successor, gate_required=True)
+
+    rows = sink("queue_link")
+    assert [r["attempt_id"] for r in rows] == ["src-a", "src-b"]
+    for row in rows:
+        assert row["batched_into_attempt_id"] == attempt
+        assert row["batched_into_gate_required"] is True
+        assert row["batched_into_channel_id"] == "C1"
+        assert row["batched_into_trigger_ts"] == "10.0"
+
+
+def test_an_ungated_successor_omits_the_attempt_id_and_says_so(sink):
+    """A mention/DM/continuation mints no attempt, and inventing one to make the link prettier
+    would put a turn this ledger excludes into the population. The conversation key carries the
+    linkage instead."""
+    successor = _msg()
+    pt.stage_queue_links(successor, ["src-a"])
+    pt.emit_queue_links(successor, gate_required=False)
+
+    row = sink("queue_link")[0]
+    assert "batched_into_attempt_id" not in row
+    assert row["batched_into_gate_required"] is False
+    assert row["batched_into_channel_id"] == "C1"
+    assert row["batched_into_trigger_ts"] == "10.0"
+
+
+def test_links_are_written_once_and_never_inherited_by_the_next_batch(sink):
+    successor = _msg()
+    pt.stage_queue_links(successor, ["src-a"])
+    pt.begin_attempt(successor)
+    pt.emit_queue_links(successor, gate_required=True)
+    pt.emit_queue_links(successor, gate_required=True)   # e.g. a redispatch of the same object
+    assert len(sink("queue_link")) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_gated_turn_writes_its_links_after_the_attempt_exists(sink, instant_gate):
+    """Ordering, end to end: the successor's attempt is minted inside the gate, so the links
+    cannot be written before it — and they are written even when the gate then stays silent."""
+    from main import ChatBotV2
+    app = ChatBotV2.__new__(ChatBotV2)
+    app.processor = MagicMock()
+    minted = {}
+
+    async def _gate(message, client):
+        minted["id"] = pt.begin_attempt(message)
+        return None                      # the gate decided to stay quiet
+
+    app._run_participation_gate = _gate
+    message = _msg()
+    pt.stage_queue_links(message, ["src-a"])
+    await app.handle_message(message, MagicMock())
+
+    row = sink("queue_link")[0]
+    assert row["attempt_id"] == "src-a"
+    assert row["batched_into_attempt_id"] == minted["id"]
+
+
+@pytest.mark.asyncio
+async def test_a_gated_turn_that_dies_after_minting_still_writes_its_links(sink, instant_gate):
+    """The attempt is minted INSIDE the awaited gate. A cancellation on the way back out used to
+    skip the emission entirely, leaving an attempt that absorbed queued messages, was recorded as
+    `aborted`, and never said what it had taken on."""
+    from main import ChatBotV2
+    app = ChatBotV2.__new__(ChatBotV2)
+    app.processor = MagicMock()
+    minted = {}
+
+    async def _gate(message, client):
+        minted["id"] = pt.begin_attempt(message)
+        raise asyncio.CancelledError()
+
+    app._run_participation_gate = _gate
+    message = _msg()
+    pt.stage_queue_links(message, ["src-a"])
+    with pytest.raises(asyncio.CancelledError):
+        await app.handle_message(message, MagicMock())
+
+    row = sink("queue_link")[0]
+    assert row["attempt_id"] == "src-a"
+    assert row["batched_into_attempt_id"] == minted["id"]
+
+
+@pytest.mark.asyncio
+async def test_a_gate_that_dies_before_minting_keeps_the_links_for_a_later_turn(sink,
+                                                                                instant_gate):
+    """The other half: with no attempt there is no successor to name, so nothing is written and
+    the sources stay owed to whichever turn does run."""
+    from main import ChatBotV2
+    app = ChatBotV2.__new__(ChatBotV2)
+    app.processor = MagicMock()
+
+    async def _gate(message, client):
+        raise RuntimeError("died on the way to the model")
+
+    app._run_participation_gate = _gate
+    message = _msg()
+    pt.stage_queue_links(message, ["src-a"])
+    with pytest.raises(RuntimeError):
+        await app.handle_message(message, MagicMock())
+
+    assert sink("queue_link") == []
+    assert message.metadata[pt.BATCHED_SOURCES_KEY] == ["src-a"]
+
+
+class _LockOnlyProcessor:
+    """The REAL process_message on a bare harness — enough to reach the conversation lock and
+    no further, which is exactly the boundary the ungated emission sits on."""
+    from message_processor.base import MessageProcessor as _MP
+    process_message = _MP.process_message
+
+    def __init__(self, manager):
+        self.thread_manager = manager
+        self.db = None
+
+    def log_info(self, *a, **k): pass
+    def log_debug(self, *a, **k): pass
+    def log_warning(self, *a, **k): pass
+    def log_error(self, *a, **k): pass
+
+
+@pytest.mark.asyncio
+async def test_an_ungated_turn_claims_nothing_until_it_holds_the_lock(sink):
+    """THE RACE. An ungated successor mints no attempt, so a link written when the turn was
+    merely INTENDED can never be corrected downstream: if the turn then queues instead of
+    answering, the ledger says an ungated turn absorbed messages it never answered. So the write
+    waits for the lock — the point where the turn is genuinely running."""
+    from thread_manager import AsyncThreadStateManager
+
+    manager = AsyncThreadStateManager(db=None)
+    proc = _LockOnlyProcessor(manager)
+    message = _msg(gate_required=False, silence_capable=False)
+    pt.stage_queue_links(message, ["src-a"])
+
+    # Busy conversation: it queues instead of answering, and claims nothing.
+    assert await manager.acquire_thread_lock("10.0", "C1") is True
+    try:
+        queued = await proc.process_message(message, client=MagicMock(), thinking_id=None)
+    finally:
+        await manager.release_thread_lock("10.0", "C1")
+    assert queued.type == "queued"
+    assert sink("queue_link") == []
+    assert message.metadata[pt.BATCHED_SOURCES_KEY] == ["src-a"]   # still owed, not lost
+
+    # Free conversation: the same message genuinely runs, and now the link is written.
+    with contextlib.suppress(Exception):   # the bare harness dies past the lock; the write is done
+        await proc.process_message(message, client=MagicMock(), thinking_id=None)
+    row = sink("queue_link")[0]
+    assert row["attempt_id"] == "src-a"
+    assert "batched_into_attempt_id" not in row
+    assert row["batched_into_gate_required"] is False
+    assert pt.ATTEMPT_KEY not in message.metadata   # no attempt was minted to carry it
+
+
+def test_a_queue_link_is_not_a_terminal_event(sink):
+    """It says where a message's work went, not what the room saw. If it counted as an outcome
+    the queued exclusion rule would be undone by the very event meant to explain it."""
+    successor = _msg()
+    pt.stage_queue_links(successor, ["src-a"])
+    pt.begin_attempt(successor)
+    pt.emit_queue_links(successor, gate_required=True)
     assert sink("visible_action") == []
 
 
@@ -479,14 +657,18 @@ async def test_a_handled_backoff_without_an_ack_is_a_silence(sink, instant_gate)
 @pytest.mark.asyncio
 async def test_a_speaking_verdict_leaves_the_attempt_open_for_the_responder(sink, instant_gate):
     """The gate hands the turn on, so it must NOT close it — the responder owns what the room
-    finally saw, and a terminal here would be the double-count all over again."""
+    finally saw, and a terminal here would be the double-count all over again.
+
+    Through `_run_participation_gate`, not `_gate_verdict`: the wake is recorded once at the
+    single point where a verdict leaves the gate, rather than once per fall-through branch."""
     app, client = _app(_staged("respond"))
     message = _msg()
-    verdict = await app._gate_verdict(message, client)
+    verdict = await app._run_participation_gate(message, client)
 
     assert verdict is not None and verdict.action == "respond"
     assert _terminals(sink) == []
     assert message.metadata[pt.GATE_WOKE_KEY] is True
+    assert message.metadata["gate_woke"] is True   # …and the public routing fact agrees
 
 
 @pytest.mark.asyncio

@@ -469,7 +469,8 @@ def _make_app(verdict, pulse=None, engine_enabled=True, monkeypatch=None):
 
 
 def _channel_msg(**meta):
-    m = {"ts": "10.0", "participation_check": True, "participation_level": "judicious"}
+    m = {"ts": "10.0", "gate_required": True, "silence_capable": True,
+         "participation_level": "judicious"}
     m.update(meta)
     return Message(text="anyone know the deploy status?", user_id="U1",
                    channel_id="C1", thread_id="10.0", metadata=m)
@@ -546,7 +547,7 @@ class TestGateWiring:
 
     def test_the_unprompted_turn_helper_is_gone(self):
         # It existed only to decide whether a posted reply burned the hourly counter.
-        # The counter is gone, so the helper is too; `_unprompted_turn` on the request
+        # The counter is gone, so the helper is too; `_silence_capable_turn` on the request
         # config (which exposes no_response_needed) is a DIFFERENT thing and stays.
         from main import ChatBotV2
         assert not hasattr(ChatBotV2, "_is_unprompted_turn")
@@ -736,7 +737,8 @@ class TestPlacement:
         verdict = ParticipationVerdict(action="respond", emoji="", placement="thread", reason="long answer")
         app._run_participation_gate = AsyncMock(return_value=verdict)
         msg = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
-                      metadata={"ts": "10.0", "reply_in_channel": True, "participation_check": True})
+                      metadata={"ts": "10.0", "reply_in_channel": True,
+                                "gate_required": True, "silence_capable": True})
         await app.handle_message(msg, client)
         assert client.send_message.await_args.args[1] == "10.0"  # threaded
 
@@ -747,7 +749,8 @@ class TestPlacement:
         verdict = ParticipationVerdict(action="respond", emoji="", placement="channel", reason="quick answer")
         app._run_participation_gate = AsyncMock(return_value=verdict)
         msg = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
-                      metadata={"ts": "10.0", "reply_in_channel": True, "participation_check": True})
+                      metadata={"ts": "10.0", "reply_in_channel": True,
+                                "gate_required": True, "silence_capable": True})
         await app.handle_message(msg, client)
         assert client.send_message.await_args.args[1] is None  # top-level
 
@@ -770,7 +773,7 @@ class TestPlacement:
             burst_earlier=["first bit", "second bit"])
         app._run_participation_gate = AsyncMock(return_value=verdict)
         msg = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
-                      metadata={"ts": "10.0", "participation_check": True})
+                      metadata={"ts": "10.0", "gate_required": True, "silence_capable": True})
         await app.handle_message(msg, client)
         assert msg.metadata["participation_burst_earlier"] == ["first bit", "second bit"]
         assert msg.metadata["participation_reason"] == "combined ask"
@@ -783,7 +786,7 @@ class TestPlacement:
                                        reason="plain")
         app._run_participation_gate = AsyncMock(return_value=verdict)
         msg = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
-                      metadata={"ts": "10.0", "participation_check": True})
+                      metadata={"ts": "10.0", "gate_required": True, "silence_capable": True})
         await app.handle_message(msg, client)
         assert "participation_burst_earlier" not in msg.metadata
 

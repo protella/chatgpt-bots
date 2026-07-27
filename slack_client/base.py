@@ -124,11 +124,13 @@ class SlackBot(SlackMessageEventsMixin,
         # to this channel; muted target threads refused by the executor).
         if config.enable_post_to_thread_tool:
             registry.register(self.get_post_to_thread_tool_schema(), self.execute_post_to_thread)
-        # F2: no_response_needed is exposed only on unprompted turns (participation_check),
-        # via the per-request _unprompted_turn flag the text handler sets in a COPIED config.
+        # F2: no_response_needed is exposed only on turns whose ROUTE allows silence (the
+        # `silence_capable` routing fact), via the per-request _silence_capable_turn flag the
+        # text handler sets in a COPIED config.
         registry.register(
             self.get_no_reply_tool_schema(), self.execute_no_reply_tool,
-            enabled=lambda cfg: config.enable_no_reply_tool and bool(cfg.get("_unprompted_turn")),
+            enabled=lambda cfg: (config.enable_no_reply_tool
+                                 and bool(cfg.get("_silence_capable_turn"))),
         )
         if config.enable_search_tool:
             # BF1: Slack's Data Access API only mints action_token on @mention channel events

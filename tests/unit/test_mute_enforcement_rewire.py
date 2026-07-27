@@ -71,7 +71,7 @@ def _evt(**kw):
 
 @pytest.fixture
 def judicious(monkeypatch):
-    # auto_respond → judicious: unaddressed messages reach the engine (participation_check).
+    # auto_respond → judicious: unaddressed messages reach the engine (gate_required).
     monkeypatch.setattr(config, "channel_response_mode", "auto_respond", raising=False)
     monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
     monkeypatch.setattr(config, "bot_name_aliases", ["ChatGPT", "ChatGPT-Dev"], raising=False)

@@ -249,8 +249,8 @@ async def test_gate_none_ts_without_native_still_streams(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_unprompted_turn_streams_after_f2_revision(monkeypatch):
-    """F2 revision: an UNPROMPTED (participation-gated) turn now streams like any other —
+async def test_gate_routed_turn_streams_after_f2_revision(monkeypatch):
+    """F2 revision: a gate-routed turn now streams like any other —
     the old defer-to-non-streaming fork is gone."""
     from base_client import Message
     monkeypatch.setattr(config, "enable_no_reply_tool", True)
@@ -259,7 +259,7 @@ async def test_unprompted_turn_streams_after_f2_revision(monkeypatch):
     client.supports_streaming = MagicMock(return_value=True)
     client.supports_native_streaming = MagicMock(return_value=True)
     msg = Message(text="hi", user_id="U1", channel_id="C1", thread_id="T1",
-                  metadata={"participation_check": True})
+                  metadata={"gate_required": True, "silence_capable": True})
     thread_state = MagicMock()
 
     async def fake_config(**kw):

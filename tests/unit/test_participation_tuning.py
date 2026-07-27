@@ -122,7 +122,7 @@ def _registry_no_reply_and_search():
     reg = ToolRegistry()
     reg.register(
         _no_reply_schema(), AsyncMock(return_value={"ok": True}),
-        enabled=lambda cfg: config.enable_no_reply_tool and bool(cfg.get("_unprompted_turn")))
+        enabled=lambda cfg: config.enable_no_reply_tool and bool(cfg.get("_silence_capable_turn")))
     reg.register(
         {"type": "function", "name": "search_slack", "parameters": {}},
         AsyncMock(return_value={"ok": True}),
@@ -147,11 +147,13 @@ def _msg(**md_extra):
 
 
 def test_name_mention_turn_exposes_no_reply_suffix_and_tool(mock_env):
-    # The real bare-name hit sets participation_check=True, participation_name_hit=True,
-    # wake_source="name_mention" together (message_events ~709/717). That composition still
-    # receives the F2 suffix + no_response_needed, so the C1 mid-flight escape reaches it.
+    # The real bare-name hit stamps a gate-routed, silence-capable turn together with
+    # participation_name_hit=True and wake_source="name_mention" (message_events ~709/717).
+    # That composition still receives the F2 suffix + no_response_needed, so the C1 mid-flight
+    # escape reaches it.
     host = _MatHost(_registry_no_reply_and_search())
-    msg = _msg(participation_check=True, participation_name_hit=True, wake_source="name_mention")
+    msg = _msg(gate_required=True, silence_capable=True,
+               participation_name_hit=True, wake_source="name_mention")
     registry, request_config, available, suffix = host._materialize_request_tools(
         host._client, {"model": "gpt-5.6-sol"}, msg, tools_disabled=False)
     assert available is True
@@ -165,22 +167,24 @@ def test_name_mention_turn_exposes_no_reply_suffix_and_tool(mock_env):
 def test_materialize_sets_slack_search_available_from_action_token(mock_env):
     host = _MatHost(_registry_no_reply_and_search())
     _, cfg_on, _, _ = host._materialize_request_tools(
-        host._client, {"model": "m"}, _msg(participation_check=True, action_token="tok"), False)
+        host._client, {"model": "m"},
+        _msg(gate_required=True, silence_capable=True, action_token="tok"), False)
     assert cfg_on["_slack_search_available"] is True
 
     _, cfg_off, _, _ = host._materialize_request_tools(
-        host._client, {"model": "m"}, _msg(participation_check=True), False)
+        host._client, {"model": "m"}, _msg(gate_required=True, silence_capable=True), False)
     assert cfg_off["_slack_search_available"] is False
 
 
 def test_search_schema_present_only_with_action_token(mock_env):
     host = _MatHost(_registry_no_reply_and_search())
     reg_on, cfg_on, _, _ = host._materialize_request_tools(
-        host._client, {"model": "m"}, _msg(participation_check=True, action_token="tok"), False)
+        host._client, {"model": "m"},
+        _msg(gate_required=True, silence_capable=True, action_token="tok"), False)
     assert "search_slack" in {s["name"] for s in reg_on.schemas(cfg_on)}
 
     reg_off, cfg_off, _, _ = host._materialize_request_tools(
-        host._client, {"model": "m"}, _msg(participation_check=True), False)
+        host._client, {"model": "m"}, _msg(gate_required=True, silence_capable=True), False)
     assert "search_slack" not in {s["name"] for s in reg_off.schemas(cfg_off)}
 
 
@@ -233,8 +237,9 @@ def _real_registry_with_search(monkeypatch):
 @pytest.mark.parametrize("label, md, channel_id, expect_search", [
     ("app_mention", {"mentioned_self": True, "action_token": "tok"}, "C1", True),
     ("dm", {"action_token": "tok"}, "D1", True),
-    ("gated_channel", {"participation_check": True}, "C1", False),
-    ("thread_continuation", {"wake_source": "thread_continuation"}, "C1", False),
+    ("gated_channel", {"gate_required": True, "silence_capable": True}, "C1", False),
+    ("thread_continuation", {"silence_capable": True,
+                             "wake_source": "thread_continuation"}, "C1", False),
 ])
 def test_bf1_dispatch_matrix(mock_env, monkeypatch, label, md, channel_id, expect_search):
     # metadata → _materialize_request_tools (stamps _slack_search_available from action_token)
