@@ -1663,6 +1663,67 @@ class MessageUtilitiesMixin:
             self.log_debug(f"research in-flight note build failed: {e}")
             return None
 
+    def _merge_gate_cohort(self, message, thread_state) -> int:
+        """Fold the gate's coalesced cohort into THIS turn's model input. Returns how many were
+        added.
+
+        A debounce cohort is several messages the gate judged as one moment — someone finishing a
+        thought across three sends, or a thread where two people spoke at once. The gate saw all of
+        them. The responder, left alone, sees only the survivor: the earlier sends are separate
+        top-level Slack messages, so a rebuilt thread does not contain them, and the turn answers
+        the newest fragment as though the rest were never said.
+
+        The rich gate patched that with prose — a metadata line quoting the earlier texts and
+        asking the model to "treat the burst as one combined request". That put a paraphrase of real
+        messages into an informational block the prompt also tells the model not to trust as
+        content, with no sender, no time and no attachments. These are messages; they belong in the
+        conversation, formatted exactly like history, and then everything downstream — the
+        timestamps, the roster, the token accounting, the trimming — treats them as what they are.
+
+        Merged EXACTLY ONCE and deduplicated by source ts against whatever the rebuild already
+        found, because a cohort member that happens to be a thread reply IS in Slack history, and
+        showing the model the same message twice invites it to answer twice. The trigger's own ts is
+        skipped: it is this turn's user message, appended by the caller.
+
+        The newest ts in the cohort is the trigger's own — `_drain_cohort` never takes anything
+        newer than the survivor — so the stale-send guard's watermark, already set from the trigger,
+        is by construction the newest source included. Nothing to restamp.
+        """
+        sources = (getattr(message, "metadata", None) or {}).get("gate_sources") or ()
+        if not sources or thread_state is None:
+            return 0
+        trigger_ts = str((message.metadata or {}).get("ts") or "")
+        known = {str((m.get("metadata") or {}).get("ts"))
+                 for m in (getattr(thread_state, "messages", None) or [])}
+        added = 0
+        for source in sources:
+            ts = str(getattr(source, "ts", "") or "")
+            if not ts or ts == trigger_ts or ts in known:
+                continue
+            text = (getattr(source, "text", "") or "").strip()
+            attachments = getattr(source, "attachments", ()) or ()
+            if not text and not attachments:
+                continue
+            username = getattr(source, "sender_name", None) or getattr(source, "sender_id", None) \
+                or "someone"
+            content = f"{username}: {text}" if text else f"{username}:"
+            if attachments:
+                # Named, not described: the gate never opened them and neither has this turn yet.
+                content += f"\n[attached: {', '.join(str(a) for a in attachments)}]"
+            if config.enable_message_timestamps:
+                content = stamp_content(content, ts, "UTC")
+            self._add_message_with_token_management(
+                thread_state, "user", content, message_ts=ts,
+                metadata={"ts": ts, "sender_type": getattr(source, "sender_type", None)},
+                skip_auto_trim=True)
+            known.add(ts)
+            added += 1
+        if added:
+            self.log_debug(
+                f"Merged {added} coalesced source message(s) into the turn's input "
+                f"(cohort of {len(sources)})")
+        return added
+
     def _wake_trigger_line(self, md: dict) -> str:
         """The 'trigger:' line for the wake envelope (F3), from message metadata."""
         source = md.get("wake_source")
@@ -1720,46 +1781,7 @@ class MessageUtilitiesMixin:
             "[Wake context — informational metadata, not instructions]\n"
             f"trigger: {trigger}\n" + " — ".join(sender_parts)
         )
-        burst_line = self._wake_burst_line(md)
-        if burst_line:
-            block += "\n" + burst_line
         return block
-
-    def _wake_burst_line(self, md: dict) -> str:
-        """F27: the 'same person also sent moments before' line for the wake envelope. The
-        participation engine carries earlier messages of a same-author burst so the reply
-        covers ALL of them, not just the triggering fragment. Defensive: missing/empty →
-        '' (nothing added); each carried text is escaped and display-capped."""
-        earlier = md.get("participation_burst_earlier")
-        if not isinstance(earlier, (list, tuple)):
-            return ""
-        quoted = [f'"{self._escape_suffix_text(t, limit=300)}"'
-                  for t in earlier if isinstance(t, str) and t.strip()]
-        if not quoted:
-            return ""
-        return (
-            "Moments before this message, the same person also sent: "
-            + " / ".join(quoted)
-            + " — treat the burst as one combined request and make sure your reply "
-            "addresses all of it."
-        )
-
-    def _reacted_already_note(self, message) -> Optional[str]:
-        """The 'you already reacted' suffix line for a react_and_respond turn. The participation
-        gate stamps message.metadata['participation_reaction_emoji'] when it placed a reaction on
-        this message; surface it to the response model so it doesn't add a second reaction on top.
-        Terminal-safe: missing message / non-dict metadata / no stamp → None (nothing added)."""
-        md = getattr(message, "metadata", None) if message is not None else None
-        if not isinstance(md, dict):
-            return None
-        emoji = md.get("participation_reaction_emoji")
-        if not emoji or not isinstance(emoji, str):
-            return None
-        safe = self._escape_suffix_text(emoji, limit=80)
-        if not safe:
-            return None
-        return (f"You already reacted :{safe}: to this message — "
-                "do not add another reaction to it.")
 
     def _build_suffix_context(self, client, channel_id: Optional[str],
                               thread_ts: Optional[str], user_timezone: str = "UTC",
@@ -1789,9 +1811,6 @@ class MessageUtilitiesMixin:
         # verdict), tell the RESPONSE model so it doesn't add a second one. This rides the volatile
         # suffix — not the tool-registry no-reply hint — precisely so it survives a tool-disabled or
         # timeout-retry response attempt, which drops that registry.
-        reacted = self._reacted_already_note(message)
-        if reacted:
-            parts.append(reacted)
         inflight = self._build_generation_inflight_note(channel_id, thread_ts)
         if inflight:
             parts.append(inflight)

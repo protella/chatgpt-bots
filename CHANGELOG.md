@@ -138,6 +138,24 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 🚪 Changed - The wake-up call is now a simple yes or no
+
+The model that watches the channel now answers exactly one question — "should the bot look at
+this?" — and the full model that answers is also the one that decides *how*: reply, react, or
+stay silent, with all the context in front of it. Previously a lightweight classifier made
+those calls itself from a thin summary (and even placed reactions on its own — those now
+always come from the answering model). Consequences you'll notice:
+
+- **Participation levels are now `on` / `mentions_only` / `off`.** The old `judicious` and
+  `active` meant the same thing under the new gate and both become `on` automatically. `off`
+  now really means off — the bot won't answer even a direct @mention there.
+- **No message in a burst is ever dropped.** Rapid-fire messages are judged and answered as
+  one conversation, and a direct @mention that got queued behind channel chatter can no longer
+  be discarded by a "not interesting" verdict on the chatter.
+- **A provider outage is no longer scored as restraint.** If the wake-up check fails, the
+  ledger records a failure — the bot stays silent, but never pretends it chose to.
+- Old recorded participation preferences fold into the standing channel policy at first start.
+
 ### 📜 Changed - One standing channel policy, and both halves of the bot read it
 
 The channel's "ground rules" box is now a **standing channel policy**: one authoritative text,

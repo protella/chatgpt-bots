@@ -190,17 +190,21 @@ class SettingsModal(LoggerMixin):
 
         # Phase F: one Participation select replaces the old response-mode select.
         # Legacy rows with only response_mode map cleanly (off≡off, tag_only≡mentions_only,
-        # auto_respond≡judicious); submission writes BOTH columns in lockstep.
+        # auto_respond≡on); submission writes BOTH columns in lockstep.
+        #
+        # Three options, not four. `judicious` and `active` were labelled as restraint dials
+        # ("chime in when clearly valuable" vs. "participate more freely"), but the gate they tuned
+        # is now one bit: it decides whether the responder WAKES, not how eagerly it talks. Offering
+        # two names for one behavior would have sold the user a knob that turns nothing, so they
+        # collapse into `on`. The labels below therefore describe WHEN I wake, never how chatty I am.
         global_default_level = MODE_TO_LEVEL.get((global_default_mode or "tag_only").lower(), "mentions_only")
         mode_options = [
             {"text": {"type": "plain_text", "text": f"Use default (inherit — currently: {global_default_level})"},
              "value": "inherit"},
-            {"text": {"type": "plain_text", "text": "Mentions only — reply only when clearly addressed"},
+            {"text": {"type": "plain_text", "text": "Mentions only — @mentions always reach me; name-drops are judged"},
              "value": "mentions_only"},
-            {"text": {"type": "plain_text", "text": "Judicious — chime in when clearly valuable (recommended)"},
-             "value": "judicious"},
-            {"text": {"type": "plain_text", "text": "Active — participate more freely (higher reply cap)"},
-             "value": "active"},
+            {"text": {"type": "plain_text", "text": "On — I read the channel and judge when to answer (recommended)"},
+             "value": "on"},
             {"text": {"type": "plain_text", "text": "Off — never respond here, even when @mentioned"},
              "value": "off"},
         ]
@@ -250,7 +254,11 @@ class SettingsModal(LoggerMixin):
                          "options": mode_options, "initial_option": initial_mode_option},
              "label": {"type": "plain_text", "text": "Participation"},
              "hint": {"type": "plain_text",
-                      "text": f"How proactively I join conversations. 'Inherit' uses the global default ({global_default_level})."}},
+                      "text": "Whether I wake up here, not how talkative I am. 'Mentions only' answers a real "
+                              "@mention every time and weighs a bare name-drop before replying; 'On' also weighs "
+                              "ordinary channel messages. 'Off' silences me completely — even @mentions go "
+                              "unanswered, so this button is the only way back. 'Inherit' uses the global default "
+                              f"({global_default_level})."}},
             {"type": "input", "block_id": "policy_block", "optional": True,
              "element": {"type": "plain_text_input", "action_id": "standing_policy", "multiline": True,
                          "initial_value": policy_value or "", "max_length": POLICY_MAX_CHARS,

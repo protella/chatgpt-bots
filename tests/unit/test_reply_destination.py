@@ -606,6 +606,12 @@ def _notice_processor():
             self.thread_manager = AsyncThreadStateManager(db=None)
             self.db = None
 
+        # process_message folds the gate's coalesced cohort into the turn's input before it reads
+        # the thread. This bare harness carries only process_message, so the real mixin method is
+        # absent and the AttributeError was swallowed by the suppress() below — surfacing as "the
+        # notice never sent". A message with no cohort merges nothing.
+        def _merge_gate_cohort(self, message, thread_state): return 0
+
         def log_info(self, *a, **k): pass
         def log_debug(self, *a, **k): pass
         def log_warning(self, *a, **k): pass

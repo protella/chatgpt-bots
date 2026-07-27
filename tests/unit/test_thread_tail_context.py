@@ -1,13 +1,18 @@
-"""F5 — thread-tail context for the participation classifier.
+"""F5 — the ChannelPulse ring, and the debounce marker that orders the gate.
 
 Covers the ChannelPulse per-thread ring (population incl. roots + bot senders,
 judged-message exclusion by ts, LRU bounds, 400-char tail vs 300-char envelope,
 spoof resistance, idempotency, backfill-after-live ordering), the messaging-layer
 own-reply feed, the reliable event feed (bot_message / edits / dual delivery), the
 engine's monotonic debounce marker, and the direct-continuation denial.
+
+The pulse is no longer a GATE input — the binary gate is given the source messages and the
+steering snapshot, nothing else — so the "renders the thread tail into the classifier signals"
+test inverted into the tripwire at the bottom of this file. The ring itself is unchanged and still
+feeds the responder, which is why everything above it stands.
 """
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from config import config
 from message_markers import CHECKLIST_STATUS_MARKER
@@ -305,26 +310,38 @@ async def test_evaluate_superseded_by_newer_arrival(monkeypatch):
     monkeypatch.setattr(config, "participation_debounce_seconds", 0)
     eng = ParticipationEngine(MagicMock())
     eng.note_arrival("C1", "200.0")    # a newer message already registered at gate entry
-    verdict = (await eng.evaluate(channel_id="C1", ts="100.0",
-                                  text="stale event")).verdict
-    assert verdict is None             # the older event never classifies
+    evaluation = await eng.evaluate(channel_id="C1", ts="100.0", text="stale event")
+    assert evaluation.decision is None            # the older event never classifies
+    assert evaluation.decline_cause == "superseded"
 
 
 @pytest.mark.asyncio
-async def test_evaluate_renders_thread_tail_into_signals(monkeypatch):
+async def test_the_pulse_is_not_a_gate_input_any_more(monkeypatch):
+    """INVERTED, and the inversion is the contract.
+
+    This test used to assert that the pulse's thread tail rendered into the classifier's signals.
+    The binary gate takes the ordered source messages and the canonical steering snapshot; a thread
+    tail existed to help it decide whose conversation a message belonged to and whether the exchange
+    was still open, and it decides neither. The RESPONDER has the whole thread, which is a better
+    version of the same information.
+
+    Asserted at the signature, because that is what makes it unbuildable rather than merely
+    unrendered — there is nowhere to put a pulse."""
     monkeypatch.setattr(config, "participation_debounce_seconds", 0)
     p = ChannelPulse()
     _rec(p, "C1", "100.0", "root")
     _rec(p, "C1", "101.0", "prior exchange between two humans", thread_ts="100.0")
-    captured = {}
-
-    async def fake_classify(text, signals):
-        captured["signals"] = signals
-        return {"action": "ignore"}
 
     client = MagicMock()
-    client.classify_participation = fake_classify
+    client.classify_wake = AsyncMock(return_value=False)
     eng = ParticipationEngine(client)
+    with pytest.raises(TypeError):
+        await eng.evaluate(channel_id="C1", ts="102.0", text="an unnamed follow-up",
+                           pulse=p, thread_root_ts="100.0")
+
+    # Without it the evaluation runs, and the classifier is handed sources + steering only.
     await eng.evaluate(channel_id="C1", ts="102.0", text="an unnamed follow-up",
-                       pulse=p, thread_root_ts="100.0")
-    assert "prior exchange between two humans" in (captured["signals"]["thread_tail"] or "")
+                       thread_root_ts="100.0")
+    kwargs = client.classify_wake.await_args.kwargs
+    assert set(kwargs) == {"sources", "channel_steering_text"}
+    assert [s.text for s in kwargs["sources"]] == ["an unnamed follow-up"]

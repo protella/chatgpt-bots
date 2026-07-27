@@ -10,6 +10,13 @@ other channel edit goes through the participation engine's full typo-vs-meaning 
 These exercise the real decision code in SlackMessageEventsMixin + ParticipationEngine with
 stubbed I/O, asserting both the anti-annoyance guarantees (unfurl / identical / own-message /
 stale / flag-off cost nothing) and the two routing branches.
+
+Commit 6 changed WHO owns the edit context, not whether it survives. It is keyed by
+(channel, ts, MARKER) and rides the gate's typed SourceMessage instead of being spliced into a
+prose "[EDIT]" block, because an edit keeps its ORIGINAL Slack timestamp: (channel, ts) alone could
+not tell the edit's own re-evaluation from the stale original attempt it superseded, and whichever
+ran first popped the context. The original could therefore arrive holding the edit's before/after
+text, conclude it WAS the edit, and in doing so skip the supersession check meant to silence it.
 """
 from __future__ import annotations
 
@@ -22,7 +29,6 @@ import pytest
 from base_client import Message
 from config import config
 from message_processor.participation import ParticipationEngine
-from prompts import PARTICIPATION_SYSTEM_PROMPT
 from slack_client.event_handlers.message_events import SlackMessageEventsMixin
 from slack_client.utilities import SlackUtilitiesMixin
 
@@ -296,20 +302,24 @@ async def test_edit_burst_on_one_message_collapses(flag_on):
 @pytest.mark.asyncio
 async def test_engine_dispatch_stashes_context_and_marks_check(flag_on):
     bot = _make_bot()
-    bot._get_channel_settings = AsyncMock(return_value={"participation_level": "judicious"})
+    bot._get_channel_settings = AsyncMock(return_value={"participation_level": "on"})
     bot._thread_participation = AsyncMock(return_value=(True, 1, 0))  # bot already in thread
     msg_ts = _recent_ts()
     synthetic = {"channel": "C1", "ts": msg_ts, "user": "UHUMAN", "text": "please review the numbers"}
     await bot._dispatch_edit_to_engine(
-        bot.app.client, synthetic, "C1", msg_ts, "please review", "please review the numbers")
+        bot.app.client, synthetic, "C1", msg_ts, "please review", "please review the numbers",
+        marker="E1")
     bot.message_handler.assert_awaited_once()
     msg = bot.message_handler.await_args.args[0]
     assert msg.metadata["gate_required"] is True
-    assert msg.metadata["participation_level"] == "judicious"
-    # Edit context stashed on the facade for evaluate() to read, keyed by (channel, ts).
-    ctx = bot._edit_reply_ctx_map[f"C1|{msg_ts}"]
+    assert msg.metadata["participation_level"] == "on"
+    # Stashed for evaluate() to read, keyed (channel, ts, MARKER) — the marker is what makes the
+    # context THIS attempt's rather than "whoever pops it first".
+    ctx = bot._edit_reply_ctx_map[f"C1|{msg_ts}|E1"]
     assert ctx["old_text"] == "please review"
     assert ctx["already_replied"] is True
+    # And the dispatched message carries the same marker, so only its attempt can claim the context.
+    assert msg.metadata["edit_reply_marker"] == "E1"
 
 
 @pytest.mark.asyncio
@@ -337,98 +347,169 @@ async def test_engine_dispatch_silent_when_participation_off(flag_on):
 # ----------------------------------------------------------------- engine sees the edit context
 
 class _RecordingClient:
-    """A facade carrying a stashed edit context (as the real SlackBot would) + a classifier."""
+    """A facade carrying a stashed edit context (as the real SlackBot would) + the wake classifier.
 
-    def __init__(self, verdict):
-        self._verdict = verdict
+    In production the facade and the OpenAI client are two objects; the engine takes the classifier
+    from its constructor and the edit store from the `client=` it is handed. This harness plays both
+    so one object can assert on both halves."""
+
+    def __init__(self, wake=True):
+        self._wake = wake
         self.calls = 0
-        self.last_text = None
+        self.last_sources = ()
         self._edit_reply_ctx_map = {}
 
-    async def classify_participation(self, text, signals=None):
+    async def classify_wake(self, *, sources, channel_steering_text=None):
         self.calls += 1
-        self.last_text = text
-        return self._verdict
+        self.last_sources = tuple(sources)
+        return self._wake
 
 
 @pytest.mark.asyncio
-async def test_engine_folds_edit_block_into_classifier_prompt(monkeypatch):
+async def test_the_edit_rides_the_source_record_the_gate_judges(monkeypatch):
+    """Re-baselined: the edit's before/after text is INTRINSIC source data now, not a prose block.
+
+    It used to be spliced into the classifier's text as an "[EDIT] …" note, which is why this test
+    once asserted on the classifier's prompt string. The gate takes typed SourceMessage records, so
+    the edit travels as `source.edit` and the rendering is the renderer's business (asserted in
+    test_wake_classifier.py). What has to hold HERE is that the engine finds the stashed context,
+    attaches it to the record it judges, and consumes it."""
     monkeypatch.setattr(config, "participation_debounce_seconds", 0.0, raising=False)
-    client = _RecordingClient({"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "respond"})
-    client._edit_reply_ctx_map["C1|100.1"] = {
+    client = _RecordingClient(wake=True)
+    client._edit_reply_ctx_map["C1|100.1|E1"] = {
         "old_text": "please review", "new_text": "please review the Q3 numbers",
         "already_replied": True,
     }
     engine = ParticipationEngine(client)
-    verdict = (await engine.evaluate(
+    evaluation = await engine.evaluate(
         channel_id="C1", ts="100.1", text="please review the Q3 numbers",
-        client=client)).verdict
-    assert verdict.action == "respond"
+        client=client, edit_marker="E1")
+    assert evaluation.decision.wake is True
     assert client.calls == 1
-    # The classifier saw the \"[EDIT]\" note block with the old text + already-replied note; the verdict's
-    # own text stays untouched for the responder.
-    assert "[EDIT]" in client.last_text
-    assert "please review" in client.last_text
-    assert "already replied" in client.last_text
-    # Consumed: a re-eval of the same ts falls back to a plain judgment.
-    assert "C1|100.1" not in client._edit_reply_ctx_map
+    source = client.last_sources[-1]
+    assert source.edit == {"old_text": "please review",
+                           "new_text": "please review the Q3 numbers",
+                           "already_replied": True}
+    # The message's own text is untouched — the edit is metadata about it, not a rewrite of it.
+    assert source.text == "please review the Q3 numbers"
+    # Consumed (popped): a second evaluation of the same edit falls back to a plain judgment rather
+    # than replaying stale before-text.
+    assert "C1|100.1|E1" not in client._edit_reply_ctx_map
 
 
 @pytest.mark.asyncio
-async def test_typo_edit_one_eval_ignore_stays_silent(monkeypatch):
+async def test_the_original_attempt_cannot_consume_the_edits_context(monkeypatch):
+    """The ownership bug this keying exists to prevent, asserted directly.
+
+    The stale ORIGINAL attempt carries no marker. Under the old (channel, ts) key it could pop the
+    edit's context, read itself as the edit — which also suppressed the supersession check meant to
+    silence it — and answer twice. It must get None, and must leave the context sitting there for
+    the attempt that owns it."""
     monkeypatch.setattr(config, "participation_debounce_seconds", 0.0, raising=False)
-    client = _RecordingClient({"action": "ignore"})
-    client._edit_reply_ctx_map["C1|100.1"] = {
+    client = _RecordingClient(wake=True)
+    client._edit_reply_ctx_map["C1|100.1|E1"] = {
+        "old_text": "review", "new_text": "review the Q3 numbers", "already_replied": False}
+
+    # The direct helper: no marker at all, and a WRONG marker, both get nothing.
+    assert ParticipationEngine._take_edit_context(client, "C1", "100.1") is None
+    assert ParticipationEngine._take_edit_context(client, "C1", "100.1", "E0") is None
+    assert "C1|100.1|E1" in client._edit_reply_ctx_map      # still the edit's to claim
+
+    # And end to end: the marker-less attempt judges a plain message (no edit on the record)...
+    engine = ParticipationEngine(client)
+    await engine.evaluate(channel_id="C1", ts="100.1", text="review the Q3 numbers", client=client)
+    assert client.last_sources[-1].edit is None
+    # ...while the edit's own attempt, carrying the marker, still gets its context.
+    await engine.evaluate(channel_id="C1", ts="100.1", text="review the Q3 numbers",
+                          client=client, edit_marker="E1")
+    assert client.last_sources[-1].edit["old_text"] == "review"
+
+
+@pytest.mark.asyncio
+async def test_typo_edit_one_eval_and_no_wake(monkeypatch):
+    # A typo fix is exactly the case the gate is allowed to sleep through, and it costs ONE call.
+    monkeypatch.setattr(config, "participation_debounce_seconds", 0.0, raising=False)
+    client = _RecordingClient(wake=False)
+    client._edit_reply_ctx_map["C1|100.1|E1"] = {
         "old_text": "the wether is nice", "new_text": "the weather is nice",
         "already_replied": False,
     }
     engine = ParticipationEngine(client)
-    verdict = (await engine.evaluate(
-        channel_id="C1", ts="100.1", text="the weather is nice", client=client)).verdict
-    assert client.calls == 1        # at most ONE engine evaluation
-    assert verdict.action == "ignore"  # a typo fix stays silent
+    evaluation = await engine.evaluate(
+        channel_id="C1", ts="100.1", text="the weather is nice", client=client, edit_marker="E1")
+    assert client.calls == 1
+    assert evaluation.decision.wake is False
+    assert evaluation.decline_cause is None      # a real decision, not a decline
 
 
 @pytest.mark.asyncio
 async def test_ordinary_message_untouched_by_edit_plumbing(monkeypatch):
-    """A non-edit message has no stashed context, so the classifier text is byte-for-byte the
-    message text — nothing about the ordinary path changes."""
+    """A non-edit message has no stashed context and no marker, so its source record is a plain
+    message — nothing about the ordinary path changes."""
     monkeypatch.setattr(config, "participation_debounce_seconds", 0.0, raising=False)
-    client = _RecordingClient({"action": "ignore"})
+    client = _RecordingClient()
     engine = ParticipationEngine(client)
     await engine.evaluate(channel_id="C1", ts="9.9", text="hello team", client=client)
-    assert client.last_text == "hello team"
+    source = client.last_sources[-1]
+    assert source.text == "hello team"
+    assert source.edit is None
 
 
 @pytest.mark.asyncio
 async def test_a_mock_client_yields_no_edit_context_at_all(monkeypatch):
     """A bare MagicMock answers every attribute with another truthy mock, so a truthiness test
-    on the store handed back a MOCK edit context: the classifier prompt silently grew an [EDIT]
+    on the store handed back a MOCK edit context: the gate's source record silently grew an edit
     block and edit supersession was suppressed. Whole suites then asserted things about a prompt
     production never sends. The store has to be an actual mapping."""
     from unittest.mock import MagicMock
 
     monkeypatch.setattr(config, "participation_debounce_seconds", 0.0, raising=False)
     mock_client = MagicMock()
-    assert ParticipationEngine._take_edit_context(mock_client, "C1", "9.9") is None
+    # Even WITH a marker — the marker is necessary, not sufficient.
+    assert ParticipationEngine._take_edit_context(mock_client, "C1", "9.9", "E1") is None
 
-    recorder = _RecordingClient({"action": "ignore"})
+    recorder = _RecordingClient()
     # The classifier lives on the openai_client; the FACADE is the mock, exactly as in the
     # fixtures that carry one.
     engine = ParticipationEngine(recorder)
-    await engine.evaluate(channel_id="C1", ts="9.9", text="hello team", client=mock_client)
-    assert recorder.last_text == "hello team"      # unpolluted
-    assert "[EDIT]" not in recorder.last_text
+    await engine.evaluate(channel_id="C1", ts="9.9", text="hello team", client=mock_client,
+                          edit_marker="E1")
+    assert recorder.last_sources[-1].text == "hello team"   # unpolluted
+    assert recorder.last_sources[-1].edit is None
 
 
-# ----------------------------------------------------------------- prompt content
+# ----------------------------------------------------------------- what the model is told
 
-def test_participation_prompt_carries_edit_rubric():
-    assert "[EDIT]" in PARTICIPATION_SYSTEM_PROMPT
-    assert '"[EDIT]" note' in PARTICIPATION_SYSTEM_PROMPT
-    lower = PARTICIPATION_SYSTEM_PROMPT.lower()
-    assert "typo" in lower
-    assert "correction" in lower
+def test_the_edit_rubric_lives_in_the_rendered_source_not_the_prompt():
+    """Re-baselined: the typo-vs-meaning rubric moved from prompt prose to the rendered message.
+
+    The rich prompt carried a paragraph about "[EDIT]" notes, typos and corrections; the ten-line
+    binary prompt carries no rubric at all, because a rubric is per-message and the prompt is not.
+    The instruction now rides the source block itself, which is also the only place that KNOWS
+    whether the assistant already replied."""
+    from openai_client.api.responses import _render_wake_source
+    from message_processor.participation import SourceMessage
+
+    replied = _render_wake_source(SourceMessage(
+        ts="100.1", text="please review the Q3 numbers", sender_name="Peter",
+        sender_type="human", edit={"old_text": "please review", "already_replied": True}),
+        index=0, total=1)
+    assert "was EDITED" in replied
+    assert '"please review"' in replied           # the before-text, so a typo fix is visible as one
+    assert "already replied" in replied
+    assert "only if the edit changes what is being asked" in replied
+
+    unreplied = _render_wake_source(SourceMessage(
+        ts="100.1", text="please review the Q3 numbers", sender_name="Peter",
+        sender_type="human", edit={"old_text": "please review", "already_replied": False}),
+        index=0, total=1)
+    assert "has not replied to it yet" in unreplied
+
+    # An edit that ADDED text where there was none must still say so rather than quoting nothing.
+    from_nothing = _render_wake_source(SourceMessage(
+        ts="100.1", text="now with a question", sender_name="Peter", sender_type="human",
+        edit={"old_text": "", "already_replied": False}), index=0, total=1)
+    assert "it had no text before" in from_nothing
 
 
 # --------------------------------------------------- Bug A: engine supersession (double-answer)
@@ -438,7 +519,7 @@ async def test_edit_supersedes_original_in_flight_evaluation(monkeypatch):
     """The ORIGINAL (pre-edit) message is mid-debounce when an edit supersedes it: its evaluation
     must return None (no stale respond), exactly as a newer burst arrival would cause."""
     monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-    client = _RecordingClient({"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "respond"})
+    client = _RecordingClient(wake=True)
     engine = ParticipationEngine(client)
     # Kick off the original's evaluation, then supersede it mid-debounce (as the edit path does).
     task = asyncio.create_task(engine.evaluate(
@@ -447,7 +528,7 @@ async def test_edit_supersedes_original_in_flight_evaluation(monkeypatch):
     await asyncio.sleep(0.005)
     engine.supersede("C1", "100.1", thread_root=None, sender_id="UHUMAN")
     evaluation = await task
-    assert evaluation.verdict is None            # superseded — no second answer
+    assert evaluation.decision is None           # superseded — no second answer
     assert evaluation.decline_cause == "edit_superseded"
     assert client.calls == 0          # the classifier was never even consulted
 
@@ -457,16 +538,19 @@ async def test_edits_own_reevaluation_survives_supersession(monkeypatch):
     """The edit's OWN fresh evaluation carries edit context and must NOT be dropped by the
     supersession mark (only the context-free stale original is)."""
     monkeypatch.setattr(config, "participation_debounce_seconds", 0.0, raising=False)
-    client = _RecordingClient({"relation": "to_assistant", "exchange_state": "open", "answerability": "substantive", "action": "respond"})
-    client._edit_reply_ctx_map["C1|100.1"] = {
+    client = _RecordingClient(wake=True)
+    client._edit_reply_ctx_map["C1|100.1|E1"] = {
         "old_text": "review", "new_text": "review the Q3 numbers", "already_replied": False}
     engine = ParticipationEngine(client)
     engine.supersede("C1", "100.1", thread_root=None, sender_id="UHUMAN")
-    verdict = (await engine.evaluate(
+    evaluation = await engine.evaluate(
         channel_id="C1", ts="100.1", text="review the Q3 numbers",
-        sender_id="UHUMAN", client=client)).verdict
-    assert verdict.action == "respond"   # the edit's own eval answers
+        sender_id="UHUMAN", client=client, edit_marker="E1")
+    assert evaluation.decision.wake is True   # the edit's own eval answers
     assert client.calls == 1
+    # Structural, not a coincidence of pop ordering: the exemption is "this attempt HAS edit
+    # context", and the context is unreachable without the marker.
+    assert evaluation.decline_cause is None
 
 
 def test_maybe_edit_calls_supersede(flag_on):
@@ -519,7 +603,7 @@ async def test_engine_edit_dispatch_registers_marker(flag_on):
     """The engine-branch edit registers its ts with the surviving marker AND stamps the dispatched
     message, so the queue drain keeps the edit's own dispatch."""
     bot = _make_bot()
-    bot._get_channel_settings = AsyncMock(return_value={"participation_level": "judicious"})
+    bot._get_channel_settings = AsyncMock(return_value={"participation_level": "on"})
     await bot._run_edit_triggered_reply(
         _changed(channel="C1", msg_ts="100.1", old="review", new="review the Q3 numbers"),
         bot.app.client, "C1", "100.1", "review", "review the Q3 numbers",

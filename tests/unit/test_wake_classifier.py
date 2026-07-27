@@ -1,16 +1,31 @@
-"""Phase F — classify_participation contract: strict-JSON verdict parsing and the
-conservative fail-safe (any failure → {"action": "ignore"}).
+"""Commit 6 — the ONE classifier: `classify_wake`, one boolean out.
 
-Rewritten from the Phase-5 classify_wake tests (that classifier is deprecated and has
-no runtime call sites; engine-level behavior lives in test_participation_engine.py).
+This file used to test `classify_participation`, the rich gate's verdict call: a JSON object with
+action/emoji/placement/reason/relation/exchange_state/answerability, fished out of whatever prose
+the model happened to wrap it in, plus a dozen rendered signal lines (people, pulse, strictness,
+capabilities, identity aliases…). All of that is gone — see the commit-6 spec §2 and §8. The gate
+asks one question now, so this file asks one question about it:
+
+  1. does a strict-schema boolean survive the round trip, and does everything that ISN'T one
+     become None (never a forged decision);
+  2. is the strict `text.format` schema actually on the wire, so "did the model answer the
+     question" stops being a parsing problem;
+  3. does the prompt contain the source cohort and the canonical steering bytes VERBATIM — and
+     nothing that was retired.
+
+The retired-input assertions are deliberately part of the contract rather than a tidiness check.
+Every one of those inputs existed to support a judgment the gate no longer makes, and each is a
+line somebody could re-add in a hurry without noticing they had given the gate a second job.
 """
 from __future__ import annotations
 
+import inspect
 from unittest.mock import MagicMock
 
 import pytest
 
-from openai_client.api.responses import classify_participation
+from message_processor.participation import SourceMessage
+from openai_client.api.responses import classify_wake
 
 
 class _FakeContent:
@@ -18,22 +33,33 @@ class _FakeContent:
         self.text = text
 
 
+class _RefusalContent:
+    """A refusal content part: it carries no `.text` at all.
+
+    Not a part with text="" — the real shape has a `refusal` field and no text attribute, and the
+    accumulator has to skip it on the `hasattr` rather than on falsiness."""
+
+    def __init__(self, refusal="I can't help with that"):
+        self.refusal = refusal
+
+
 class _FakeItem:
-    def __init__(self, text):
-        self.content = [_FakeContent(text)]
+    def __init__(self, *contents):
+        self.content = list(contents)
 
 
 class _FakeResp:
-    def __init__(self, text):
-        self.output = [_FakeItem(text)]
+    def __init__(self, *contents):
+        self.output = [_FakeItem(*contents)]
 
 
 class _FakeLLM:
-    """Stands in for the OpenAIClient `self` that classify_participation is bound to."""
+    """Stands in for the OpenAIClient `self` that classify_wake is bound to."""
 
-    def __init__(self, text=None, exc=None):
+    def __init__(self, text=None, exc=None, response=None):
         self._text = text
         self._exc = exc
+        self._response = response
         self.client = MagicMock()
         self.captured_input = None
         self.captured_kwargs = None
@@ -43,7 +69,9 @@ class _FakeLLM:
             raise self._exc
         self.captured_input = k.get("input")
         self.captured_kwargs = k
-        return _FakeResp(self._text)
+        if self._response is not None:
+            return self._response
+        return _FakeResp(_FakeContent(self._text))
 
     def log_debug(self, *a, **k):
         pass
@@ -52,109 +80,115 @@ class _FakeLLM:
         pass
 
 
+def _sources(*texts):
+    return tuple(SourceMessage(ts=f"170000000{i}.000100", text=t, sender_name="Peter",
+                               sender_id="U1", sender_type="human")
+                 for i, t in enumerate(texts))
+
+
+# --------------------------------------------------------------------- parsing
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("raw,expected_action", [
-    ('{"action": "respond", "placement": "thread", "reason": "asked us"}', "respond"),
-    ('{"action": "react", "emoji": "thumbsup"}', "react"),
-    ('{"action": "react_and_respond", "emoji": "tada", "placement": "channel"}', "react_and_respond"),
-    ('{"action": "ignore"}', "ignore"),
-    ('{"action": "backoff", "reason": "told to chill"}', "backoff"),
-    # code fences / surrounding prose are tolerated
-    ('```json\n{"action": "respond"}\n```', "respond"),
-    ('Sure! Here is the verdict: {"action": "react", "emoji": "eyes"} hope that helps', "react"),
+@pytest.mark.parametrize("raw,expected", [
+    ('{"wake": true}', True),
+    ('{"wake": false}', False),
+    # A strict schema shouldn't produce fences, but tolerating them costs nothing and a
+    # provider-side wrapper change must not read as "no decision".
+    ('```json\n{"wake": true}\n```', True),
 ])
-async def test_classify_participation_json_parsing(raw, expected_action):
+async def test_a_real_boolean_round_trips(raw, expected):
     llm = _FakeLLM(text=raw)
-    verdict = await classify_participation(llm, "some channel message")
-    assert verdict["action"] == expected_action
+    assert await classify_wake(llm, sources=_sources("is the deploy done?")) is expected
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("raw", ["", "banana", "respond", "{not json}", "[]"])
-async def test_classify_participation_garbage_defaults_ignore(raw):
+@pytest.mark.parametrize("raw", [
+    '{"wake": "true"}',      # a STRING, not a boolean
+    '{"wake": 1}',           # a truthy int
+    '{"wake": null}',
+    '{"awake": true}',       # missing key
+    '{"wake": {}}',
+    "",                      # empty output (a budget-exhausted response looks like this)
+    "   ",
+    "yes",                   # no JSON at all
+    "wake",
+    "{not json}",
+    "[]",                    # JSON, but not our object
+    '{"wake": true',         # truncated
+])
+async def test_anything_that_is_not_a_json_boolean_is_none(raw):
+    """None, never a coerced bit.
+
+    With a strict schema in force, a string "true" or a 1 means the response is not the response we
+    asked for, and guessing what it meant is how a gate starts waking on noise. The engine turns
+    None into a `classifier_error` decline and a terminal `none`, so a provider problem is never
+    recorded as the model choosing silence."""
     llm = _FakeLLM(text=raw)
-    # None, not a forged {"action": "ignore"}: both end in the same silence downstream, but only
-    # None lets the ledger tell an unparseable reply apart from a model that chose to stay quiet.
-    assert await classify_participation(llm, "anything") is None
+    assert await classify_wake(llm, sources=_sources("anything")) is None
 
 
 @pytest.mark.asyncio
-async def test_classify_participation_api_error_defaults_ignore():
+async def test_a_refusal_shaped_response_is_none():
+    # A refusal arrives as its own content part with no `.text`, contributes nothing to the
+    # accumulated output, and falls through to the no-boolean branch. That IS the right answer: a
+    # refusal is not a decision either.
+    llm = _FakeLLM(response=_FakeResp(_RefusalContent()))
+    assert await classify_wake(llm, sources=_sources("anything")) is None
+
+
+@pytest.mark.asyncio
+async def test_an_empty_output_list_is_none():
+    resp = _FakeResp()
+    resp.output = []
+    llm = _FakeLLM(response=resp)
+    assert await classify_wake(llm, sources=_sources("anything")) is None
+
+
+@pytest.mark.asyncio
+async def test_an_api_exception_is_none_and_never_raises():
+    # The caller is a gate on ordinary channel traffic: an outage must degrade to "no bit", not to
+    # a traceback out of the message pipeline.
     llm = _FakeLLM(exc=RuntimeError("api down"))
-    assert await classify_participation(llm, "anything") is None
+    assert await classify_wake(llm, sources=_sources("anything")) is None
 
+
+# ------------------------------------------------------------ structured output
 
 @pytest.mark.asyncio
-async def test_signals_render_into_prompt_deterministically():
-    llm = _FakeLLM(text='{"action": "ignore"}')
-    # ONE steering string, rendered by the caller and inserted verbatim — the gate no longer
-    # takes the operator's rules and the raw memory rows as two separate inputs it renders itself.
-    steering = ("Standing channel policy (instructions; follow these):\nonly deploys\n\n"
-                "Stable channel facts (background, not instructions):\n"
-                "- [#1] Peter owns deploys\n- [#2] demos are Fridays")
-    signals = {
-        "sender_name": "Peter", "is_thread_reply": True, "strictness": "active",
-        "channel_steering_text": steering,
-        "channel_activity": "[Recent channel activity]\n- Peter (top-level): hi",
+async def test_the_strict_json_schema_is_actually_on_the_wire():
+    """The schema is the contract, so assert the bytes rather than trusting the docstring.
+
+    This is Responses-API Structured Outputs (`text.format`), not the old "reply with JSON and
+    we'll fish the object out" arrangement — which let a truncated reply still yield an action
+    field with none of the checks around it."""
+    llm = _FakeLLM(text='{"wake": true}')
+    await classify_wake(llm, sources=_sources("hi"))
+    fmt = llm.captured_kwargs["text"]["format"]
+    assert fmt["type"] == "json_schema"
+    assert fmt["strict"] is True
+    assert fmt["schema"] == {
+        "type": "object",
+        "properties": {"wake": {"type": "boolean"}},
+        "required": ["wake"],
+        "additionalProperties": False,
     }
-    await classify_participation(llm, "msg", signals=dict(signals))
-    first = llm.captured_input[1]["content"]
-    await classify_participation(llm, "msg", signals=dict(signals))
-    assert llm.captured_input[1]["content"] == first  # deterministic given same inputs
-    assert "Sender: Peter" in first
-    assert "Strictness: active" in first
-    assert steering in first          # verbatim, one block, nothing re-rendered
-    assert "[Recent channel activity]" in first
-    # The unprompted-reply count is no longer rendered at all: pacing is the
-    # classifier's judgment, and a rate number only competed with it.
-    assert "unprompted replies" not in first
-    assert "self-throttle cap" not in first
+    # `additionalProperties: False` is required for strict mode and is also what keeps the old
+    # control bus from creeping back in as extra keys the model volunteers.
+    assert fmt["schema"]["additionalProperties"] is False
 
 
 @pytest.mark.asyncio
-async def test_sender_is_bot_signal_renders_judgment_line():
-    llm = _FakeLLM(text='{"action": "ignore"}')
-    await classify_participation(llm, "msg", signals={"sender_is_bot": True})
-    prompt = llm.captured_input[1]["content"]
-    assert "another bot/agent" in prompt
-    assert "use judgment" in prompt  # allowed, not banned
-    # And absent the signal, the line stays out.
-    llm2 = _FakeLLM(text='{"action": "ignore"}')
-    await classify_participation(llm2, "msg", signals={})
-    assert "another bot/agent" not in llm2.captured_input[1]["content"]
+async def test_utility_output_floor_stays_at_2048_for_the_gate():
+    """Unchanged policy, and no new number (spec §1: "Add no numerical policy").
 
-
-@pytest.mark.asyncio
-async def test_channel_people_signal_renders_and_skips_cleanly():
-    # F29: the people signal surfaces who's around; absent, the line stays out.
-    llm = _FakeLLM(text='{"action": "ignore"}')
-    await classify_participation(llm, "msg", signals={
-        "channel_people": "~12 members; recently active: Erin Evans, Claude"})
-    prompt = llm.captured_input[1]["content"]
-    assert "Channel people (who's around): ~12 members; recently active: Erin Evans, Claude" in prompt
-
-    llm2 = _FakeLLM(text='{"action": "ignore"}')
-    await classify_participation(llm2, "msg", signals={})
-    assert "Channel people" not in llm2.captured_input[1]["content"]
-
-
-@pytest.mark.asyncio
-async def test_f17_utility_output_floor_is_1024():
-    # F17: the utility output ceiling is 1024 on every utility call site — the
-    # participation classifier, the memory extractor, and the tool-result summarizer.
-    # (utility_max_tokens defaults to 20; the floor is what prevents a verdict/JSON
-    # from being cut off mid-reasoning and manifesting as unjustified silence.)
-    #
-    # Participation alone sits at 2048: it is the only utility call that runs elevated
-    # reasoning effort (PARTICIPATION_REASONING_EFFORT), and reasoning tokens are billed
-    # against this same cap. At `medium` a live verdict came back EMPTY — thinking had
-    # eaten the whole budget — and the fail-safe silently returned `ignore`, so the gate
-    # never ran. Measured worst case was 815/1024, and a SHORT channel tail is the risk
-    # case because less context to read means more inference to do.
+    Reasoning tokens bill against this cap, so the floor covers the THINKING and not the answer.
+    At `medium` effort a live rich verdict once came back EMPTY — reasoning had eaten the whole
+    budget — and the fail-safe swallowed it, so the gate never actually ran. The output is one
+    boolean now; the reasoning is not smaller for that. The other utility calls keep 1024."""
     from openai_client.api.responses import extract_memory, summarize_tool_result
 
-    llm = _FakeLLM(text='{"action": "ignore"}')
-    await classify_participation(llm, "msg")
+    llm = _FakeLLM(text='{"wake": false}')
+    await classify_wake(llm, sources=_sources("msg"))
     assert llm.captured_kwargs["max_output_tokens"] == 2048
 
     llm2 = _FakeLLM(text='{"action": "none"}')
@@ -167,152 +201,194 @@ async def test_f17_utility_output_floor_is_1024():
 
 
 @pytest.mark.asyncio
-async def test_deprecated_classify_wake_still_importable():
-    # Kept one release for rollback; no runtime call sites.
-    from openai_client.api.responses import classify_wake
-    llm = _FakeLLM(exc=RuntimeError("api down"))
-    assert await classify_wake(llm, "anything") == "ignore"
+async def test_the_call_is_stateless_and_hybrid_legal():
+    # store=False (Slack is the transcript) and temperature pinned to 1.0, because on the 5.6
+    # hybrid family temperature is only legal at effort `none` and this call reasons.
+    llm = _FakeLLM(text='{"wake": true}')
+    await classify_wake(llm, sources=_sources("msg"))
+    assert llm.captured_kwargs["store"] is False
+    assert llm.captured_kwargs["temperature"] == 1.0
+    assert llm.captured_kwargs["reasoning"]["effort"]
 
 
-
-def test_prompt_carries_addressed_to_someone_else_rule():
-    """Regression guard for the "hey claude, ..." bug (2026-07-10): a message naming ANOTHER party
-    is never for the assistant, however helpful it could be.
-
-    The old prompt hardcoded the rival assistant's name as an example. That was papering over a
-    DATA gap: the roster the gate sees listed other assistants exactly like colleagues, so
-    "hey <name>" was genuinely ambiguous and the rule had to name one vendor to compensate. The
-    roster now marks them (ChannelPulse.recent_speakers), so the rule stays general and the
-    example is gone. Measured: this scenario went from 1/4 to 4/4 once the marker existed."""
-    from prompts import PARTICIPATION_SYSTEM_PROMPT
-    p = PARTICIPATION_SYSTEM_PROMPT
-    assert "opens with or names another party is THEIRS" in p
-    assert "those are separate participants with their own names" in p
-    # general, not vendor-specific: no rival assistant is named in the policy any more
-    assert "hey claude" not in p.lower()
-
-
-
-def test_prompt_carries_addressee_precedence_over_name_hit():
-    """Regression guard (2026-07-10): "claude, do you still have the chatgpt bot's repo checked
-    out?" — the alias prefilter flags "chatgpt" (a possessive topic reference) as a name hit, and
-    the model must not let that outrank the opener naming another party. Both the policy and the
-    name_hit signal carry it, and relation="about_assistant" now gives the case a name that
-    _apply_invariants can refuse mechanically."""
-    from prompts import PARTICIPATION_SYSTEM_PROMPT
-    assert "Being named is not the same as being addressed" in PARTICIPATION_SYSTEM_PROMPT
-    assert "about_assistant" in PARTICIPATION_SYSTEM_PROMPT
-    import inspect
-    from openai_client.api import responses
-    src = inspect.getsource(responses.classify_participation)
-    assert "DIFFERENT party" in src
-    # the invariant layer refuses a speaking action on an about_assistant verdict
-    from message_processor.participation import ParticipationEngine
-    v = ParticipationEngine.validate_verdict(
-        {"action": "respond", "relation": "about_assistant",
-         "exchange_state": "open", "answerability": "substantive"})
-    assert v.action == "ignore" and v.overruled_by == ["relation_about_assistant"]
-
-
-
-def test_prompt_carries_second_person_continuity_rule():
-    """Regression guard for the "how does your background workspace work?" bug (2026-07-10): an
-    unnamed "you" follow-up mid-exchange with another participant continues THAT exchange and is
-    not an invitation to jump in. The old prompt spelled out the "helpful third voice" temptation
-    at length; the staged form states the principle once and lets relation="to_other" carry it."""
-    from prompts import PARTICIPATION_SYSTEM_PROMPT
-    p = PARTICIPATION_SYSTEM_PROMPT
-    assert "Second person carries the addressee forward" in p
-    assert "changing the subject does not reassign them" in p
-    assert "whoever the sender has been going back and forth with" in p
-
-
-
-def test_prompt_capability_is_not_address():
-    """Regression guard for the "do you stream messages?" bug (2026-07-16): a bare top-level "you"
-    continuing Peter's exchange with another assistant got claimed because the classifier read
-    "ChatGPT can explain this" as "ChatGPT is addressed".
-
-    The staged prompt makes this structural rather than a proviso: capability is Stage 3 and is
-    not even reached until Stage 1 has assigned the message. The clause still leaves room to
-    answer a genuinely open ask, which is what F47 softened it for."""
-    from prompts import PARTICIPATION_SYSTEM_PROMPT
-    p = PARTICIPATION_SYSTEM_PROMPT
-    assert "being able to help is not evidence of having been asked" in p
-    assert "Reach this stage only when Stages 1 and 2 have left room to participate" in p
-    assert p.index("STAGE 1") < p.index("STAGE 3")
-    # still room to answer a genuinely open-room question
-    assert "genuinely open to the channel at large" in p
-
-
-
-@pytest.mark.asyncio
-async def test_gate_is_told_the_resolved_handle_not_just_the_config_aliases():
-    """Live bug (2026-07-26): deployed as "chatgpt-dev" with BOT_NAME_ALIASES=["ChatGPT"], the gate
-    read "chatgpt-dev, what model are you running?" as addressed to a DIFFERENT assistant and
-    stayed silent — verdict relation=to_other, reason "ChatGPT-Dev, a different assistant".
-
-    The alias regex counted it a name hit; the model, shown only the alias list, did not. So the
-    prefilter and the model disagreed about who the bot is. The resolved handle (free from the
-    auth.test that already runs at startup) now leads the identity line, and the aliases follow as
-    other names it answers to."""
-    llm = _FakeLLM(text='{"relation":"to_room","exchange_state":"open",'
-                        '"answerability":"not_applicable","action":"ignore"}')
-    await classify_participation(llm, "chatgpt-dev, what model are you on?",
-                                 signals={"self_display_name": "chatgpt-dev"})
-    rendered = llm.captured_input[1]["content"]
-    assert 'its ONLY ones: "chatgpt-dev" / "ChatGPT"' in rendered
-    assert "all of these are the same assistant" in rendered
-    assert "environment suffix" in rendered
-    # ...and bounded on the other side: the claim must NOT sweep in other assistants' names.
-    # Stated without this, named-other-bot fell to 2/6 — the model started reading "claude" as
-    # a variant of its own name.
-    assert "Any OTHER name belongs to somebody else" in rendered
-    assert "are not variants of these" in rendered
-
-
-@pytest.mark.asyncio
-async def test_identity_line_falls_back_to_config_when_the_handle_is_unknown():
-    """auth.test can fail, and the CLI platform has no handle at all. The line must still name the
-    assistant from config rather than vanishing — losing it entirely would leave the gate with no
-    idea what it is called."""
-    llm = _FakeLLM(text='{"relation":"to_room","exchange_state":"open",'
-                        '"answerability":"not_applicable","action":"ignore"}')
-    await classify_participation(llm, "hi", signals={})
-    rendered = llm.captured_input[1]["content"]
-    assert "its ONLY ones:" in rendered
+def test_the_gate_keeps_its_own_reasoning_effort():
+    # Referent resolution failed at effort=none (verified live 2026-07-10), so the gate has its own
+    # knob rather than riding the general utility effort up or down.
     import config as config_module
-    assert config_module.config.bot_name_aliases[0] in rendered
+    assert config_module.config.participation_reasoning_effort  # field exists, non-empty
+    from openai_client.api import responses
+    src = inspect.getsource(responses.classify_wake)
+    assert "participation_reasoning_effort" in src
+    assert "utility_reasoning_effort" not in src
 
 
-def test_prompt_carries_channel_people_rule():
-    """F29: the people signal is teaching material for addressee resolution — the names there are
-    real, distinct participants, and an unknown name is never assumed to be the assistant. It now
-    also distinguishes other ASSISTANTS from people, which is what lets the "names another party"
-    rule stay general instead of naming a specific rival."""
-    from prompts import PARTICIPATION_SYSTEM_PROMPT
-    p = PARTICIPATION_SYSTEM_PROMPT
-    assert "Channel people" in p
-    assert "marks which of them are other assistants" in p
-    assert "Only the names given as this assistant" in p
+# ----------------------------------------------------------------- the prompt
+
+@pytest.mark.asyncio
+async def test_the_prompt_carries_every_source_in_order_with_who_and_where():
+    """The cohort is the input. Each source appears once, oldest first, with sender and topology —
+    the facts that decide whether a burst is one thought or two people talking, and exactly what
+    the old flattened "earlier in this burst: …" prose lost."""
+    sources = (
+        SourceMessage(ts="1700000001.000100", text="quick q about the export",
+                      sender_id="U1", sender_name="Peter", sender_type="human"),
+        SourceMessage(ts="1700000002.000100", text="does it include Canada?",
+                      sender_id="U2", sender_name="Erin", sender_type="human",
+                      thread_root_ts="1700000000.000100"),
+    )
+    llm = _FakeLLM(text='{"wake": true}')
+    await classify_wake(llm, sources=sources)
+    prompt = llm.captured_input[1]["content"]
+
+    assert "oldest first" in prompt
+    assert "[1 of 2] Peter" in prompt and "[2 of 2] Erin" in prompt
+    assert prompt.index("quick q about the export") < prompt.index("does it include Canada?")
+    assert "posted to the channel" in prompt          # Peter, top-level
+    assert "a reply inside a thread" in prompt        # Erin, in-thread
+    # The developer prompt is the binary-gate prompt, and it is the only system input.
+    from prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT
+    assert llm.captured_input[0] == {"role": "developer",
+                                     "content": WAKE_CLASSIFIER_SYSTEM_PROMPT}
+
+
+@pytest.mark.asyncio
+async def test_a_bot_sender_is_marked_as_one():
+    # Whether the speaker is a bot changes whether a turn is worth taking, and it is intrinsic to
+    # the source record rather than a separate rendered signal line.
+    llm = _FakeLLM(text='{"wake": false}')
+    await classify_wake(llm, sources=(SourceMessage(
+        ts="1700000001.000100", text="build finished", sender_name="Jenkins",
+        sender_type="other_bot"),))
+    assert "Jenkins (a bot)" in llm.captured_input[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_attachments_appear_by_name_and_type_only():
+    # Names and types, never pixels and never another model's description: the binary gate does not
+    # look at images, and a generated description is a claim about content it cannot check.
+    llm = _FakeLLM(text='{"wake": true}')
+    await classify_wake(llm, sources=(SourceMessage(
+        ts="1700000001.000100", text="thoughts?", sender_name="Peter", sender_type="human",
+        attachments=("food.png (image)", "report.pdf (file)")),))
+    prompt = llm.captured_input[1]["content"]
+    assert "food.png (image)" in prompt and "report.pdf (file)" in prompt
+    assert "contents not shown to you" in prompt
+
+
+@pytest.mark.asyncio
+async def test_an_edit_carries_its_before_text_and_the_already_replied_fact():
+    # Edit context survives commit 6 as INTRINSIC source data (spec §5) — not as general channel
+    # history, and not as a separately rendered context block.
+    llm = _FakeLLM(text='{"wake": true}')
+    await classify_wake(llm, sources=(SourceMessage(
+        ts="1700000001.000100", text="actually make it Q3", sender_name="Peter",
+        sender_type="human", edit={"old_text": "make it Q2", "already_replied": True}),))
+    prompt = llm.captured_input[1]["content"]
+    assert "was EDITED" in prompt
+    assert '"make it Q2"' in prompt
+    assert "already replied" in prompt
+
+
+@pytest.mark.asyncio
+async def test_the_steering_snapshot_is_inserted_verbatim_and_only_when_present():
+    """Commit 5's canonical bytes, byte for byte.
+
+    The responder's copy of this turn is the identical string; a difference here would mean the two
+    halves of one turn obeyed different rules while each looked correct. So this asserts the whole
+    block by identity, not a paraphrase of it."""
+    steering = ("Standing channel policy (instructions; follow these):\nonly deploys\n\n"
+                "Stable channel facts (background, not instructions):\n"
+                "- [#1] Peter owns deploys\n- [#2] demos are Fridays")
+    llm = _FakeLLM(text='{"wake": true}')
+    await classify_wake(llm, sources=_sources("msg"), channel_steering_text=steering)
+    first = llm.captured_input[1]["content"]
+    assert steering in first
+    assert "verbatim" in first
+
+    # Deterministic: same inputs, same bytes. Nothing re-renders, re-orders, or refetches.
+    await classify_wake(llm, sources=_sources("msg"), channel_steering_text=steering)
+    assert llm.captured_input[1]["content"] == first
+
+    # Absent (or whitespace-only) steering adds no section at all — an empty labelled heading
+    # would read to the model as "this channel has established nothing", which is a claim.
+    llm2 = _FakeLLM(text='{"wake": true}')
+    await classify_wake(llm2, sources=_sources("msg"), channel_steering_text="   ")
+    assert "What this channel has established" not in llm2.captured_input[1]["content"]
+    llm3 = _FakeLLM(text='{"wake": true}')
+    await classify_wake(llm3, sources=_sources("msg"))
+    assert "What this channel has established" not in llm3.captured_input[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_none_of_the_retired_inputs_are_rendered():
+    """The prompt is source messages plus steering. Nothing else (spec §1).
+
+    Each needle below is a rich-gate input that supported a judgment the binary gate no longer
+    makes — addressee, action, emoji, placement, pacing. Re-adding any of them gives the gate a
+    second job, which is the whole failure mode commit 6 exists to end."""
+    steering = "Standing channel policy (instructions; follow these):\nonly deploys"
+    llm = _FakeLLM(text='{"wake": true}')
+    await classify_wake(llm, sources=_sources("chatgpt-dev, what model are you on?"),
+                        channel_steering_text=steering)
+    prompt = llm.captured_input[1]["content"]
+    for retired in (
+        "Strictness",                    # level / strictness
+        "Channel people",               # F29 people roster
+        "Recent channel activity",      # pulse envelope
+        "its ONLY ones",                # identity/alias line
+        "Thread so far",                # thread tail
+        "Addressed",                    # F47 addressee tail
+        "Topic",                        # channel topic
+        "Canvas",                       # canvas list
+        "Channel summary",              # rolling summary
+        "Capabilities",                 # capability inventory
+        "emoji",                        # emoji shortlist
+        "unprompted replies",           # pacing rate
+        "name hit",                     # prefilter's name-hit flag
+    ):
+        assert retired not in prompt, f"retired gate input rendered into the prompt: {retired}"
+
+
+def test_the_rich_classifier_and_its_prompt_are_gone():
+    """Tripwire (spec §9). These are import-time absences, so a rollback that restores the module
+    without restoring the wiring fails here rather than in production."""
+    from openai_client.api import responses
+    assert not hasattr(responses, "classify_participation")
+    import prompts
+    assert not hasattr(prompts, "PARTICIPATION_SYSTEM_PROMPT")
+    import message_processor.participation as participation
+    assert not hasattr(participation, "ParticipationVerdict")
+    assert not hasattr(participation, "validate_verdict")
+
+
+def test_the_binary_prompt_asks_for_a_bit_and_nothing_else():
+    """The whole developer prompt, held to what §1 says it may say.
+
+    It is ~10 lines now. The old one ran to staged addressee/exchange/answerability reasoning with
+    per-bug regression clauses bolted on; those tests are gone with those clauses, because the
+    judgments they guarded moved to the responder."""
+    from prompts import WAKE_CLASSIFIER_SYSTEM_PROMPT as p
+    # what it decides
+    assert "whether to run the assistant" in p
+    # what it must NOT do
+    assert "You do not answer, react, choose where a reply goes, or explain yourself" in p
+    # participation feedback wakes the responder — only the responder can record or apply it, so a
+    # gate that stays quiet here silently discards the instruction.
+    assert "feedback about how it participates" in p
+    # generosity is the design: an uncertain case wakes.
+    assert "When you are unsure, wake it" in p
+    # and the responder's option to say nothing is named, so a wake is not read as "make it talk"
+    assert "say nothing at all" in p
+    # no action vocabulary, no placement vocabulary, no staged findings
+    for retired in ("react_and_respond", "placement", "exchange_state", "answerability",
+                    "relation", "backoff", "STAGE 1"):
+        assert retired not in p, f"retired rich-gate concept still in the wake prompt: {retired}"
 
 
 def test_local_tools_guidance_carries_people_tools():
-    # F29: the main model is taught both tools and the discoverability + freshness lessons.
+    # Unrelated to the gate (it teaches the RESPONDER), but it has always lived here and still
+    # covers live behaviour: F29's two people tools plus the discoverability/freshness lessons.
     from prompts import LOCAL_TOOLS_GUIDANCE
     for needle in ("lookup_user", "list_channel_members", "who is X",
                    "never need their Slack id", "THIS turn"):
         assert needle in LOCAL_TOOLS_GUIDANCE
-
-
-def test_participation_uses_dedicated_reasoning_effort():
-    # Referent resolution fails at effort=none (verified live 2026-07-10), so the
-    # participation call has its own knob, defaulting to "low" — without dragging
-    # the rest of the utility calls (intent classification) up with it.
-    import config as config_module
-    assert config_module.config.participation_reasoning_effort  # field exists, non-empty
-    import inspect
-    from openai_client.api import responses
-    src = inspect.getsource(responses.classify_participation)
-    assert "participation_reasoning_effort" in src
-    assert "utility_reasoning_effort" not in src

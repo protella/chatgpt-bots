@@ -112,10 +112,11 @@ old generations are eventually deleted, not kept. Any analysis of more than the 
 has to read `participation.jsonl.1` … `.5` as well, and has to accept that history older than
 those five generations is gone.
 
-PRIVACY. Raw trigger text is never intentionally logged. But `reason` and `guidance` are
-model-authored summaries of a human's message and may echo its content, so they are truncated to
-the same shared bound (`config.GUIDANCE_TRUNCATION_CHARS`) the stored preference sentence uses.
-Truncation lowers the exposure; it cannot promise none.
+PRIVACY. Raw trigger text is never intentionally logged, and as of v7 nothing model-authored is
+logged either. The rich gate wrote a `reason` and a `guidance` — summaries of a human's message,
+truncated to a shared bound because truncation lowers exposure even though it cannot promise none.
+The binary gate produces neither, so the exposure is gone rather than bounded. `truncate_reason`
+survives for whatever future field needs the same treatment; it has no current caller.
 
 `v` is the contract version. Bump it when a field changes MEANING, and equally when event
 CARDINALITY or TERMINAL SEMANTICS change (one visible_action per attempt is part of the
@@ -163,12 +164,20 @@ logger = setup_logger(name="slack_bot.ParticipationTelemetry")
 # v6: the `stale_suppressed` terminal kind and the `stale_send` diagnostic event — a turn can
 #     now end because the conversation moved past it, which is neither a silence nor a delivery
 #     failure and had no representation before.
-CONTRACT_VERSION = 6
+# v7: the BINARY gate. `gate_decision` carries one bit and four facts about the call; every rich
+#     field is gone — action, emoji, placement, reason, the staged findings, the overrules and the
+#     whole backoff taxonomy — because the gate no longer decides any of it. A `wake=false` is a
+#     terminal `silence` with NO `silence_reason`: that enum belongs to the responder, which can
+#     say why it chose quiet after seeing everything, where the gate knows only that it did not
+#     open. `classifier_error` no longer arrives with a manufactured decision beside it.
+CONTRACT_VERSION = 7
 
-# WHICH gate produced these lines. The rich multi-signal classifier is "rich-v1"; a different
-# gate is a different population even at the same CONTRACT_VERSION, and the two must never be
-# pooled just because the field names line up.
-GATE_CONTRACT = "rich-v1"
+# WHICH gate produced these lines. The rich multi-signal classifier was "rich-v1"; the one-bit
+# wake gate is "binary-v1". A different gate is a different population even at the same
+# CONTRACT_VERSION, and the two must never be pooled just because some field names line up —
+# a rich `ignore` and a binary `wake=false` are not the same event, and the rate of one says
+# nothing about the rate of the other. v2–v6 rows stay valid under their own contracts.
+GATE_CONTRACT = "binary-v1"
 
 # One per process. Restarts lose all in-memory participation state, so a line's session is what
 # tells a burst of odd verdicts after a deploy apart from a genuine change in the room.
@@ -199,11 +208,21 @@ KINDS = frozenset({
 })
 DECLINE_CAUSES = frozenset({
     "superseded", "edit_superseded", "classifier_error", "engine_off", "error", "action_error",
+    # A gate-routed cohort of nothing but captionless images. Structural, not a judgment: there is
+    # no text to decide about, so no classifier runs and no responder wakes. The ambient worker
+    # still analyses the pictures and the files are still catalogued — declining to answer a
+    # wordless upload is not the same as forgetting it happened.
+    "image_only",
 })
 REACTION_OPERATIONS = frozenset({"add", "remove"})
 REACTION_RESULTS = frozenset({
     "added", "already_present", "refused", "failed", "removed", "remove_failed",
 })
+# `gate` and `backoff_ack` are RETIRED: the binary gate places nothing in the room, so a runtime
+# row can only be `responder` (a social reaction the answering model chose) or `work_claim` (the
+# 👀 staked by slow work, which was never a gate reaction). The retired names stay in the
+# vocabulary because v2–v6 history is full of them and a reader of those rows must not be told
+# they are invalid.
 REACTION_ORIGINS = frozenset({"gate", "responder", "work_claim", "backoff_ack"})
 
 # Warn once per unknown value, not once per line: a typo in a hot path would otherwise fill
@@ -493,6 +512,35 @@ def begin_attempt(message: Any) -> Optional[str]:
         return None
 
 
+def detach_attempt(message: Any) -> Optional[str]:
+    """Strip a CLOSED gate attempt off a message that is about to run as an ungated turn, and
+    return the id that was removed (None when there was nothing to detach).
+
+    One caller: the queue drain, when a batch it folded together contains an answer already owed,
+    so the successor turn runs without re-gating. That turn is now an ungated route — the same
+    shape as a DM or an @mention — but the trigger is still carrying the attempt from its earlier
+    gated pass, already closed with `queued`. Left in place it corrupts two things at once: every
+    reaction this turn places is attributed to a closed attempt, and `finish_attempt` sees the
+    closed flag and writes NO terminal event at all, so the turn the room actually saw is missing
+    from the ledger entirely.
+
+    Detaching rather than re-minting is deliberate. A fresh id here would put a gate attempt into
+    a ledger documented as gate attempts, for a turn no gate judged. Ungated routes mint nothing,
+    and this turn is one of them; the returned id is staged as an absorbed source instead, so the
+    earlier attempt still says what became of it."""
+    try:
+        meta = getattr(message, "metadata", None)
+        if not isinstance(meta, dict):
+            return None
+        detached = meta.pop(ATTEMPT_KEY, None)
+        for key in (CLOSED_KEY, GATE_WOKE_KEY, RESPONDER_STARTED_KEY, PARENT_KEY):
+            meta.pop(key, None)
+        return detached or None
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"Participation attempt not detached: {e}")
+        return None
+
+
 def attempt_id_for(message: Any) -> Optional[str]:
     """This message's live attempt id, or None when it was never gated.
 
@@ -681,50 +729,43 @@ def gate_declined(channel_id: Optional[str], trigger_ts: Optional[str],
            cause=cause, attempt_id=attempt_id, **fields)
 
 
-def gate_decision(channel_id: Optional[str], trigger_ts: Optional[str],
-                  verdict: Any, *, attempt_id: Optional[str] = None,
+def gate_decision(channel_id: Optional[str], trigger_ts: Optional[str], *,
+                  wake: bool, attempt_id: Optional[str] = None,
                   gate_ms: Optional[int] = None,
-                  classifier_ms: Optional[int] = None) -> None:
-    """The model's own verdict, INCLUDING `ignore`. NOT emitted when the classifier failed —
-    that is a decline, and a manufactured `ignore` in this event would be scored as judgment.
+                  classifier_ms: Optional[int] = None,
+                  source_count: Optional[int] = None,
+                  newest_source_ts: Optional[str] = None) -> None:
+    """The gate's decision: one bit, and four facts about the call that produced it.
 
-    `gate_ms` is TOTAL gate wall time and includes the debounce sleep and all the context
-    gathering; `classifier_ms` is the model call alone. Only the second is a latency number
-    about the model, and reading the first as one would blame the provider for our own
-    debounce.
+    NOT emitted when the classifier failed — that is a decline, and there is no decision to
+    record. (The rich gate manufactured a fail-safe verdict in that case and logged it here,
+    which scored a provider outage as the model choosing restraint.)
 
-    Carries the BACKOFF TAXONOMY's enum fields, and never its `guidance`. Without them a handled
-    backoff is a bare `reaction_only` or `silence` with no way to ask what the feedback was
-    about, whether it was meant to stick, or why a structural request fell through to the
-    responder — the four questions the taxonomy exists to answer. `guidance` is excluded on
-    purpose: it is free prose about a human's message, and the enums explain the routing without
-    it. (`reason` is already bounded by the PRIVACY policy above; guidance would need the same
-    treatment for far less analytical value.)
+    `gate_ms` is TOTAL gate wall time and includes the debounce sleep; `classifier_ms` is the model
+    call alone. Only the second is a latency number about the model, and reading the first as one
+    blames the provider for a debounce we chose.
 
-    Reads through getattr because not every verdict comes from validate_verdict (the edit path
-    and tests build their own), and a missing attribute must not turn a telemetry call into an
-    exception the gate converts to silence."""
+    `source_count` and `newest_source_ts` describe the COHORT this bit was decided over — how many
+    messages were coalesced, and the newest one included. Without them a wake on a five-message
+    burst is indistinguishable from a wake on one message, which is the difference between the
+    debounce working and the debounce dropping things.
+
+    What is deliberately absent: an action, an emoji, a placement, a reason, the staged findings,
+    the overrules, the backoff taxonomy. The gate decides none of those, so recording them would
+    describe a decision nobody made. A reason is doubly excluded — it was free prose about a
+    person's message, and it is not written anywhere in this build.
+    """
     record(
         "gate_decision", channel_id=channel_id, trigger_ts=trigger_ts,
         attempt_id=attempt_id,
-        action=getattr(verdict, "action", None),
-        emoji=getattr(verdict, "emoji", None),
-        placement=getattr(verdict, "placement", None),
-        reason=truncate_reason(getattr(verdict, "reason", None)),
-        relation=getattr(verdict, "relation", None),
-        exchange_state=getattr(verdict, "exchange_state", None),
-        answerability=getattr(verdict, "answerability", None),
-        overruled_by=getattr(verdict, "overruled_by", None) or None,
-        dimension=getattr(verdict, "dimension", None),
-        durability=getattr(verdict, "durability", None),
-        scope=getattr(verdict, "scope", None),
-        memory_op=getattr(verdict, "memory_op", None),
-        structural_request=getattr(verdict, "structural_request", None),
-        # WHICH model produced it. The utility model changes independently of this contract,
-        # and a verdict-quality comparison across a model swap is meaningless without it.
+        wake=bool(wake),
+        # WHICH model produced it. The utility model changes independently of this contract, and a
+        # decision-quality comparison across a model swap is meaningless without it.
         model=getattr(config, "utility_model", None),
         gate_ms=gate_ms,
         classifier_ms=classifier_ms,
+        source_count=source_count,
+        newest_source_ts=newest_source_ts,
     )
 
 
@@ -786,12 +827,15 @@ def reaction(channel_id: Optional[str], trigger_ts: Optional[str], *,
       allowlist, no target) is not `failed` (we called and it did not land). One is policy and
       one is an outage, and they need different fixes.
 
-    `origin` is which decision chose it — `gate` (the verdict placed it directly), `responder`
-    (the model called react_to_message), `work_claim` (the 👀 staked by slow work), or
-    `backoff_ack` (the acknowledgment of participation feedback). Diversity has to be measured
-    per origin: the gate picks blind from one prompt, the responder can search the catalog, the
-    work claim is a fixed operational marker that is not taste at all — and mixing them
-    describes none of them.
+    `origin` is which decision chose it. In THIS build only two are emitted: `responder` (the
+    model called react_to_message) and `work_claim` (the 👀 staked by slow work). `gate` and
+    `backoff_ack` are v2–v6 history — the rich gate could place a reaction itself, and could
+    acknowledge participation feedback with one; the binary gate puts nothing in the room. The
+    names stay legal so a reader of those older rows is not told they are invalid.
+
+    Diversity has to be measured per origin, and pooling across the contract boundary is exactly
+    the mistake to avoid: the old gate picked blind from one prompt, the responder can search the
+    catalog, and the work claim is a fixed operational marker that is not taste at all.
 
     `target_ts` is the message the emoji went ON, kept separate from `trigger_ts` (the message
     that caused the turn). The react tool may target an older message, and collapsing the two

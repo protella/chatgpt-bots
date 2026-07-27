@@ -17,8 +17,9 @@ channel has. Nothing here parses policy text, and a structural-only call never i
 
 Why a model tool and not the classifier: a channel-settings change is high-consequence and
 context-dependent ("only reply when I tag you" vs. someone QUOTING that line), so it is made in
-the response loop with full judgment. The participation classifier only ROUTES an explicit
-structural request here (see main._apply_backoff); it never writes settings itself.
+the response loop with full judgment. The gate does not route it and cannot: it decides only
+whether this turn runs, so an instruction to change how the assistant participates simply wakes
+the responder, and this tool — under the authorization gate below — is the only thing that writes.
 
 Guardrails enforced here, not by prompt:
 - Channel surface only: DM calls are refused (participation settings are per-channel).
@@ -66,9 +67,11 @@ def get_set_channel_participation_schema() -> Dict[str, Any]:
             "Acts on the current channel only "
             "(there is no channel argument); it is not available in DMs. After it succeeds, "
             "briefly confirm the new setting to the channel in your reply.\n"
-            "participation: 'mentions_only' (respond only when explicitly @-mentioned or named), "
-            "'judicious' (default restraint — chime in when it clearly adds value), 'active' "
-            "(more proactive, still not noisy), 'off' (never respond unprompted). "
+            "participation: 'on' (you consider every ordinary channel message, and answer the ones "
+            "worth answering), 'mentions_only' (an explicit @-mention always reaches you; a bare "
+            "use of your name is weighed first; nothing else wakes you), 'off' (you never respond "
+            "in this channel at all — not even to an explicit @-mention, which means the person "
+            "cannot undo this by asking you to; only the Configure button can). "
             "placement: 'threads_only' (always reply inside a thread) or 'channel_allowed' (may "
             "reply at the channel's top level when it fits). "
             "standing_policy: the channel's standing rules in your own words, for anything the two "
@@ -84,7 +87,11 @@ def get_set_channel_participation_schema() -> Dict[str, Any]:
             "properties": {
                 "participation": {
                     "type": "string",
-                    "enum": ["mentions_only", "judicious", "active", "off"],
+                    # The three levels of message_processor.participation.VALID_LEVELS. There is no
+                    # "how chatty" dial to expose: the gate is one bit, so an instruction like "be
+                    # more active in here" resolves to `on`, and a tone or frequency request that
+                    # `on` cannot express belongs in standing_policy instead.
+                    "enum": ["on", "mentions_only", "off"],
                     "description": "New participation level for this channel. Omit to leave it unchanged.",
                 },
                 "placement": {

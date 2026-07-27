@@ -23,7 +23,7 @@ import pytest
 
 from database import DatabaseManager
 from message_processor.channel_summary import ChannelSummaryService, _HistoryFetchError
-from openai_client.api.responses import classify_participation
+from openai_client.api.responses import classify_wake
 from slack_client.channel_pulse import ChannelPulse
 
 
@@ -413,7 +413,7 @@ def test_render_block_uses_verbatim_framing():
     assert block.endswith("the narrative body")
 
 
-# --------------------------------------------------------------------------- G. Wiring: classifier signal
+# ------------------------------------------------------- G. Wiring: NOT a gate input any more
 
 
 class _FakeContent:
@@ -427,8 +427,8 @@ class _FakeResp:
 
 
 class _FakeLLM:
-    """Stands in for the OpenAIClient `self` that classify_participation is bound to."""
-    def __init__(self, text='{"action": "ignore"}'):
+    """Stands in for the OpenAIClient `self` that classify_wake is bound to."""
+    def __init__(self, text='{"wake": false}'):
         self._text = text
         self.client = MagicMock()
         self.captured_input = None
@@ -444,20 +444,31 @@ class _FakeLLM:
         pass
 
 
-async def test_classifier_renders_channel_summary_signal_when_present():
-    llm = _FakeLLM()
+async def test_the_narrative_is_never_rendered_into_the_gate_prompt():
+    """Re-baselined, and the inversion IS the new contract.
+
+    The rolling narrative used to be a gate signal: two tests here asserted it rendered into the
+    classifier prompt when present and stayed out when absent. The binary gate takes exactly two
+    inputs — the ordered source messages and the canonical steering snapshot — because it no longer
+    judges what a message is about or whether an exchange is open, which is all the narrative
+    informed. It has no parameter to carry a summary, so this asserts the absence two ways: the
+    signature will not accept one, and a prompt built from real sources contains no narrative frame.
+
+    The narrative itself is very much alive — it goes to the RESPONDER, which is covered in
+    section H below."""
+    from message_processor.participation import SourceMessage
+
     block = ChannelSummaryService.render_block("channel is about deploys", "42.0")
-    await classify_participation(llm, "some message", signals={"channel_summary": block})
-    prompt = llm.captured_input[1]["content"]
-    assert "channel is about deploys" in prompt
-    assert "Channel narrative — derived only from recent messages" in prompt
-
-
-async def test_classifier_omits_channel_summary_when_absent():
     llm = _FakeLLM()
-    await classify_participation(llm, "some message", signals={"strictness": "judicious"})
+    with pytest.raises(TypeError):
+        await classify_wake(llm, sources=(), channel_summary=block)
+
+    await classify_wake(llm, sources=(SourceMessage(
+        ts="1700000001.000100", text="anyone know the q3 numbers?", sender_name="Peter",
+        sender_type="human"),))
     prompt = llm.captured_input[1]["content"]
-    assert "Channel narrative — derived only from recent messages" not in prompt
+    assert "Channel narrative" not in prompt
+    assert "channel is about deploys" not in prompt
 
 
 # --------------------------------------------------------------------------- H. Wiring: responder block placement

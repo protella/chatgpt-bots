@@ -11,8 +11,8 @@ from unittest.mock import MagicMock
 
 from message_processor.utilities import MessageUtilitiesMixin
 from prompts import (
-    PARTICIPATION_SYSTEM_PROMPT,
     SLACK_SYSTEM_PROMPT,
+    WAKE_CLASSIFIER_SYSTEM_PROMPT,
 )
 
 
@@ -117,13 +117,17 @@ def test_f17_participation_banter_clause_is_gone():
     """Superseded 2026-07-26 — see test_b_banter_rule_replaced for the full story. F17 added a
     clause making teasing aimed at the assistant participation-worthy; it turned out to be the
     mechanism behind a real misfire (the bot replying to a jab 52s after being told to hush) and
-    was removed. Kept as an inverted guard so the clause cannot quietly return."""
+    was removed. Kept as an inverted guard so the clause cannot quietly return.
+
+    Re-baselined for the binary gate: the prompt it was removed from (PARTICIPATION_SYSTEM_PROMPT)
+    no longer exists, so the guard now points at the ONE gate prompt that replaced it. The two
+    positive assertions that used to live here pinned the rich prompt's staged addressee reasoning
+    ("STAGE 1 — WHOSE MESSAGE IS THIS?", relation=about_assistant); the gate does not decide
+    addressee at all now, so there is nothing left to assert and asserting the successor would be
+    inventing a contract."""
     assert "Playful banter or teasing genuinely aimed AT the assistant is participation-worthy" \
-        not in PARTICIPATION_SYSTEM_PROMPT
-    assert "not marginal-value noise" not in PARTICIPATION_SYSTEM_PROMPT
-    # the addressee discipline it was supposed to defer to is now structural, not a proviso
-    assert "STAGE 1 — WHOSE MESSAGE IS THIS?" in PARTICIPATION_SYSTEM_PROMPT
-    assert "about_assistant" in PARTICIPATION_SYSTEM_PROMPT
+        not in WAKE_CLASSIFIER_SYSTEM_PROMPT
+    assert "not marginal-value noise" not in WAKE_CLASSIFIER_SYSTEM_PROMPT
 
 
 def test_tool_provenance_ground_truth_instruction_present():

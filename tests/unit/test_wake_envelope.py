@@ -3,6 +3,19 @@
 Exercises the deterministic renderer (_build_wake_envelope) across every trigger enum,
 sender role, bot flag, escaping, and the config/missing-metadata off-paths, plus its
 placement in the volatile developer suffix.
+
+TWO BLOCKS LEFT THE ENVELOPE IN COMMIT 6, and both were the gate describing messages in prose:
+
+* the F27 burst line ("Moments before this message, the same person also sent: …"). It quoted real
+  messages into a block the prompt also tells the model not to trust as content, stripped of
+  sender, time and attachments. The burst is now merged into the turn's actual input as
+  conversation (_merge_gate_cohort), formatted exactly like history, so the timestamps, the roster,
+  the token accounting and the trimming all treat those messages as what they are.
+* the "you already reacted" note. It existed because the gate placed an emoji before the responder
+  ran and then had to confess it. The gate places nothing, so there is nothing to confess.
+
+Both are asserted as absences below rather than deleted silently, because either one coming back is
+the gate growing a second channel into the responder's prompt.
 """
 from types import SimpleNamespace
 
@@ -15,7 +28,7 @@ from message_processor.utilities import MessageUtilitiesMixin
 class _WakeHost:
     def __init__(self):
         for n in ("_build_wake_envelope", "_wake_trigger_line", "_wake_sender_role",
-                  "_wake_burst_line", "_reacted_already_note", "_build_suffix_context"):
+                  "_build_suffix_context"):
             setattr(self, n, getattr(MessageUtilitiesMixin, n).__get__(self))
         self._escape_suffix_text = MessageUtilitiesMixin._escape_suffix_text
 
@@ -124,38 +137,59 @@ def test_unknown_root_omits_role():
     assert "root author" not in env and "participant" not in env
 
 
-# ------------------------------------------------------------------- F27 burst line
+# ------------------------------------------------- the burst is conversation, not prose now
 
-def test_burst_earlier_rendered():
-    env = _WakeHost()._build_wake_envelope(
-        _msg(wake_source="ambient", sender_type="human",
-             participation_burst_earlier=["first thought", "and this too"]), _state())
-    assert "Moments before this message, the same person also sent:" in env
-    assert '"first thought"' in env and '"and this too"' in env
-    assert "treat the burst as one combined request" in env
+def test_no_burst_prose_however_the_metadata_is_shaped():
+    """The four burst-rendering tests collapse into one absence.
 
-
-def test_burst_earlier_absent_adds_nothing():
-    env = _WakeHost()._build_wake_envelope(
-        _msg(wake_source="ambient", sender_type="human"), _state())
-    assert "Moments before" not in env
-
-
-def test_burst_earlier_empty_or_malformed_adds_nothing():
-    for bad in ([], ["", "  "], "not a list", None, [123, None]):
-        env = _WakeHost()._build_wake_envelope(
+    They asserted the line rendered, escaped its brackets, capped long text, and stayed out when
+    the metadata was absent or malformed — all of which was careful handling of a paraphrase that
+    should never have been a paraphrase. The producer (`participation_burst_earlier`) and the
+    renderer (`_wake_burst_line`) are both gone; a stale stamp from a rolling deploy must render
+    nothing rather than half a block."""
+    host = _WakeHost()
+    assert not hasattr(MessageUtilitiesMixin, "_wake_burst_line")
+    for stamp in (["first thought", "and this too"], [], ["", "  "], "not a list", None,
+                  [123, None]):
+        env = host._build_wake_envelope(
             _msg(wake_source="ambient", sender_type="human",
-                 participation_burst_earlier=bad), _state())
+                 participation_burst_earlier=stamp), _state())
         assert "Moments before" not in env
+        assert "first thought" not in env
 
 
-def test_burst_earlier_escaped_and_capped():
-    env = _WakeHost()._build_wake_envelope(
-        _msg(wake_source="ambient", sender_type="human",
-             participation_burst_earlier=["a\nb[c]", "x" * 500]), _state())
-    # brackets/control chars from the carried text don't leak; long text is capped with …
-    assert "b[c]" not in env
-    assert "…" in env
+def test_the_cohort_reaches_the_model_as_real_messages_instead():
+    """Where it went: `_merge_gate_cohort` adds each source to the thread as a user turn, with the
+    sender's name, its own timestamp and its attachments named — deduplicated by source ts against
+    what the rebuild already found, and skipping the trigger's own message (the caller appends
+    that one)."""
+    from message_processor.participation import SourceMessage
+
+    added = []
+
+    class _Host:
+        _merge_gate_cohort = MessageUtilitiesMixin._merge_gate_cohort
+
+        def _add_message_with_token_management(self, state, role, content, **kw):
+            added.append((role, content, kw.get("message_ts")))
+
+        def log_debug(self, *a, **k):
+            pass
+
+    message = SimpleNamespace(metadata={"ts": "3.0", "gate_sources": (
+        SourceMessage(ts="1.0", text="first thought", sender_name="alice",
+                      sender_type="human"),
+        SourceMessage(ts="2.0", text="", sender_name="alice", sender_type="human",
+                      attachments=("chart.png (image)",)),
+        SourceMessage(ts="3.0", text="and this too", sender_name="alice",
+                      sender_type="human"),
+    )})
+    state = SimpleNamespace(messages=[])
+    assert _Host()._merge_gate_cohort(message, state) == 2   # the trigger's own ts is skipped
+    assert [ts for _, _, ts in added] == ["1.0", "2.0"]
+    assert added[0][0] == "user"                             # a message, not metadata
+    assert "alice: first thought" in added[0][1]
+    assert "[attached: chart.png (image)]" in added[1][1]    # named, not described
 
 
 # ------------------------------------------------------------------- escaping / off
@@ -200,26 +234,20 @@ def test_no_envelope_without_message():
     assert "[Wake context" not in suffix
 
 
-def test_reacted_already_note_present_when_stamped():
-    # react_and_respond: the gate stamped participation_reaction_emoji, so the response suffix
-    # tells the model it already reacted (and not to add a second reaction).
+def test_the_suffix_never_claims_the_bot_already_reacted():
+    """INVERTED. The note told the model "you already reacted :tada: — do not add another", which
+    was only ever true because the gate's react_and_respond verdict put an emoji on the message
+    before the responder ran. Nothing does that now, so the note would be a false statement about
+    the room; a stale stamp must produce nothing at all."""
     host = _WakeHost()
+    assert not hasattr(MessageUtilitiesMixin, "_reacted_already_note")
     suffix = host._build_suffix_context(
         client=None, channel_id="C1", thread_ts="T1",
         message=_msg(wake_source="ambient", sender_type="human",
                      participation_reaction_emoji="tada"),
         thread_state=_state())
-    assert "You already reacted :tada: to this message" in suffix
-    assert "do not add another reaction to it" in suffix
-
-
-def test_reacted_already_note_absent_without_stamp():
-    host = _WakeHost()
-    suffix = host._build_suffix_context(
-        client=None, channel_id="C1", thread_ts="T1",
-        message=_msg(wake_source="ambient", sender_type="human"),
-        thread_state=_state())
     assert "already reacted" not in suffix
+    assert ":tada:" not in suffix   # (":tada:", not "tada" — "metadata" contains it)
 
 
 @pytest.mark.asyncio

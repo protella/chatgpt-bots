@@ -1,4 +1,4 @@
-"""F10 — per-message timestamps in model context + classifier time-awareness.
+"""F10 — per-message timestamps in model context.
 
 Covers the pure stamp helpers (deterministic render, UTC fallbacks, non-string /
 unparseable passthrough, sender-tz resolution order), the rebuild-loop stamping of
@@ -6,8 +6,12 @@ self and non-self turns, warm-inbound stamping that renders identically to the l
 rebuild, coexistence with the pinned [used tools:]/[reactions:] suffix order and
 footer stripping, the never-stamped compaction summary head, the flag-off
 byte-identical guarantee (warm + rebuild + tail + envelope), the stamped classifier
-thread-tail / channel-activity envelope lines, and the participation-prompt
-time-awareness line.
+thread-tail / channel-activity envelope lines.
+
+(The participation-prompt time-awareness assertion is gone with the prompt it pinned: the binary
+wake gate's prompt is ten lines about one bit and says nothing about time, because it no longer
+judges whether an exchange is still open. The RESPONDER's date/time context is unchanged and is
+covered by the stamp tests above.)
 """
 import re
 
@@ -23,7 +27,6 @@ from message_processor.message_timestamps import (
 )
 from message_processor.thread_management import ThreadManagementMixin
 from message_processor.utilities import MessageUtilitiesMixin
-from prompts import PARTICIPATION_SYSTEM_PROMPT
 from slack_client.channel_pulse import ChannelPulse
 from thread_manager import AsyncThreadStateManager
 
@@ -280,9 +283,3 @@ def test_channel_activity_envelope_lines_are_stamped():
     for ln in activity_lines:
         assert _STAMP_RE.match(ln[2:])
     assert "[Thu 1970-01-01 12:01 AM UTC] Alice (top-level): deploy question here" in env
-
-
-# --------------------------------------------------------------- participation prompt
-
-def test_participation_prompt_has_time_awareness_line():
-    assert "the current date and time (every message it sees is stamped with one)" in PARTICIPATION_SYSTEM_PROMPT

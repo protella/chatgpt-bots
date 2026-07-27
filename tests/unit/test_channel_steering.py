@@ -30,7 +30,7 @@ from database import DatabaseManager, memory_content_hash
 from settings_modal import SettingsModal
 from message_processor import channel_steering
 from message_processor.channel_steering import (
-    CHANNEL_FACT_HEADING, EMPTY_SNAPSHOT, POLICY_HEADING, POLICY_MAX_CHARS, PREF_HEADING,
+    CHANNEL_FACT_HEADING, EMPTY_SNAPSHOT, POLICY_HEADING, POLICY_MAX_CHARS,
     WORKSPACE_FACT_HEADING, ChannelSteeringSnapshot, is_ordinary_fact, is_policy_row, is_pref_row,
     load_snapshot, render_snapshot, stamp, stamped,
 )
@@ -102,23 +102,26 @@ class TestRendering:
     def test_instructions_and_background_are_separately_labelled(self):
         text = render_snapshot(
             {"content": "only deploys"},
-            [_fact(1, "react less", author=MARK), _fact(2, "Pat owns billing"),
+            [_fact(2, "Pat owns billing"),
              _fact(3, "the company ships on Thursdays", scope="workspace")]).text
         # Each heading states its KIND — the one thing a model cannot recover from the content.
-        assert "instructions" in POLICY_HEADING and "instructions" in PREF_HEADING
+        assert "instructions" in POLICY_HEADING
         assert "background" in CHANNEL_FACT_HEADING and "background" in WORKSPACE_FACT_HEADING
-        assert (text.index(POLICY_HEADING) < text.index(PREF_HEADING)
-                < text.index(CHANNEL_FACT_HEADING) < text.index(WORKSPACE_FACT_HEADING))
+        assert (text.index(POLICY_HEADING) < text.index(CHANNEL_FACT_HEADING)
+                < text.index(WORKSPACE_FACT_HEADING))
 
-    def test_prefs_render_before_facts_and_keep_their_ids(self):
-        # The gate's backoff contract targets a preference by [#id], so those ids stay visible.
+    def test_a_stray_preference_row_is_inert_rather_than_rendered(self):
+        # Nothing writes these any more and the startup migration deletes every survivor (a
+        # process that fails that migration refuses to start), so one cannot exist during a live
+        # run. If one somehow did, it stays OUT of the prompt rather than arriving as an ordinary
+        # fact with an editable [#id] pointing at an operator instruction.
         text = render_snapshot(None, [_fact(9, "a fact"), _fact(4, "react less", author=MARK)]).text
-        assert "- [#4] react less" in text
-        assert text.index("[#4]") < text.index("[#9]")
+        assert "react less" not in text
+        assert "[#9] a fact" in text
 
     def test_empty_sections_are_omitted_entirely(self):
         text = render_snapshot({"content": "only deploys"}, []).text
-        assert PREF_HEADING not in text and CHANNEL_FACT_HEADING not in text
+        assert CHANNEL_FACT_HEADING not in text and WORKSPACE_FACT_HEADING not in text
 
     def test_blank_rows_and_blank_policy_are_dropped(self):
         snap = render_snapshot({"content": "   "}, [_fact(1, ""), _fact(2, "  ")])
@@ -146,15 +149,13 @@ class TestLoadSnapshot:
         db.get_channel_memory_async.assert_awaited_once()
         assert POLICY_HEADING in snap.text and "a fact" in snap.text
 
-    async def test_memory_disabled_still_renders_policy_and_prefs(self):
+    async def test_memory_disabled_still_renders_the_policy(self):
         # ENABLE_CHANNEL_MEMORY=false means "stop remembering things", never "stop obeying the
         # rules I set" — if it silenced the policy, the directives migration would quietly turn
         # off every live operator rule in the workspace.
-        db = _steering_db([_fact(1, "a fact"), _fact(2, "react less", author=MARK)],
-                          policy={"content": "only deploys"})
+        db = _steering_db([_fact(1, "a fact")], policy={"content": "only deploys"})
         snap = await load_snapshot(db, "C1", memory_enabled=False)
         assert "only deploys" in snap.text
-        assert "react less" in snap.text
         assert "a fact" not in snap.text
 
     async def test_a_failed_read_yields_the_ready_but_empty_snapshot(self):
@@ -395,9 +396,11 @@ class TestDirectivesMigration:
         _legacy_directives(temp_db, "C1", "only deploys")
         await temp_db.migrate_channel_directives_to_policy_async()
         snap = await load_snapshot(temp_db, "C1")
-        assert snap.text.index(POLICY_HEADING) < snap.text.index(PREF_HEADING) \
-            < snap.text.index(CHANNEL_FACT_HEADING)
-        assert "react less here" in snap.text and "Pat owns billing" in snap.text
+        assert snap.text.index(POLICY_HEADING) < snap.text.index(CHANNEL_FACT_HEADING)
+        assert "Pat owns billing" in snap.text
+        # The row itself survives THIS migration untouched — it is the participation-preference
+        # migration's job to move it, and that one runs at startup too.
+        assert any(r["author"] == MARK for r in temp_db.get_channel_memory("C1"))
 
 
 # --------------------------------------------------------------------------- the length bound
@@ -451,12 +454,13 @@ def _gate_msg(**meta):
                    metadata=md)
 
 
-def _ignoring_engine(captured):
-    from message_processor.participation import GateEvaluation, ParticipationVerdict
+def _sleeping_engine(captured):
+    """An engine that records what it was handed and decides not to wake."""
+    from message_processor.participation import GateEvaluation, WakeDecision
 
     async def _eval(**kw):
         captured.update(kw)
-        return GateEvaluation(verdict=ParticipationVerdict(action="ignore"))
+        return GateEvaluation(decision=WakeDecision(wake=False))
     return _eval
 
 
@@ -464,10 +468,10 @@ class TestGateReads:
     async def test_the_gate_reads_once_stamps_and_hands_the_engine_the_text(self):
         db = _steering_db([_fact(1, "Pat owns billing")], policy={"content": "only deploys"})
         captured = {}
-        app, client = _gate_app(db, _ignoring_engine(captured))
+        app, client = _gate_app(db, _sleeping_engine(captured))
         msg = _gate_msg()
 
-        assert await app._gate_verdict(msg, client) is None      # ignore → the gate stays silent
+        assert await app._gate_verdict(msg, client) is None      # wake=false → stays silent
         db.get_channel_memory_async.assert_awaited_once()
         db.get_channel_policy_async.assert_awaited_once()
 
@@ -483,7 +487,7 @@ class TestGateReads:
         # it must not inherit the first attempt's view of the channel.
         db = _steering_db([], policy={"content": "only deploys"})
         captured = {}
-        app, client = _gate_app(db, _ignoring_engine(captured))
+        app, client = _gate_app(db, _sleeping_engine(captured))
         msg = _gate_msg()
 
         await app._gate_verdict(msg, client)
@@ -500,7 +504,7 @@ class TestGateReads:
         db = _steering_db(memory_error=RuntimeError("db gone"),
                           policy_error=RuntimeError("db gone"))
         captured = {}
-        app, client = _gate_app(db, _ignoring_engine(captured))
+        app, client = _gate_app(db, _sleeping_engine(captured))
         msg = _gate_msg()
 
         await app._gate_verdict(msg, client)
@@ -627,22 +631,22 @@ class TestResponderReads:
 # ------------------------------------------------------- the same bytes, as the API receives them
 
 class _GateSpy:
-    """The OpenAI client the classifier is bound to: runs the REAL prompt builder and keeps the
-    payload it would have sent."""
+    """The OpenAI client the wake classifier is bound to: runs the REAL prompt builder and keeps
+    the payload it would have sent."""
 
-    def __init__(self, verdict):
+    def __init__(self, wake=True):
         self.client = MagicMock()
         self.payloads = []
-        self._verdict = verdict
+        self._wake = wake
 
-    async def classify_participation(self, text, signals=None, images=None):
+    async def classify_wake(self, *, sources, channel_steering_text=None):
         from openai_client.api import responses as responses_api
-        return await responses_api.classify_participation(
-            self, text, signals=signals, images=images)
+        return await responses_api.classify_wake(
+            self, sources=sources, channel_steering_text=channel_steering_text)
 
     async def _safe_api_call(self, *a, **k):
         self.payloads.append(k.get("input"))
-        item = SimpleNamespace(content=[SimpleNamespace(text=json.dumps(self._verdict))])
+        item = SimpleNamespace(content=[SimpleNamespace(text=json.dumps({"wake": self._wake}))])
         return SimpleNamespace(output=[item])
 
     def log_debug(self, *a, **k):
@@ -764,9 +768,7 @@ async def test_the_gate_and_the_responder_receive_the_IDENTICAL_snapshot_bytes(m
     assert expected and POLICY_HEADING in expected
 
     # --- the gate half: the real engine, the real classifier prompt builder.
-    gate_spy = _GateSpy({"action": "respond", "relation": "to_assistant",
-                         "exchange_state": "open", "answerability": "substantive",
-                         "placement": "thread", "reason": "asked us"})
+    gate_spy = _GateSpy(wake=True)
     app, client = _gate_app(db, None)
     # The REAL engine, including its own arrival bookkeeping — a stubbed note_arrival makes every
     # message look superseded, and the gate would never wake.
@@ -1105,37 +1107,6 @@ class TestGenericToolsCannotTouchSteering:
 
 # --------------------------------------------------------------------------- the gate's prompt
 
-async def test_the_gate_keeps_every_non_memory_signal():
-    """The gate lost its two memory inputs and gained one steering string. Nothing else about it
-    changed — the pulse, the people, the staged fields, the capabilities and the emoji palette are
-    what make its judgment better than a keyword match."""
-    from openai_client.api.responses import classify_participation
-
-    spy = _GateSpy({"action": "ignore"})
-    signals = {
-        "sender_name": "Peter", "is_thread_reply": True, "strictness": "active",
-        "channel_steering_text": "Standing channel policy (instructions; follow these):\nonly deploys",
-        "channel_activity": "[Recent channel activity]\n- Peter (top-level): hi",
-        "channel_topic": "deploys and incidents",
-        "channel_people": "12 people here; recently active: Peter, Sam",
-        "channel_canvases": ["DevOps Agenda"],
-        "capabilities": "web search, code interpreter",
-        "name_hit": True,
-        "self_display_name": "ChatGPT",
-        "burst_earlier": ["and the build is red"],
-    }
-    await classify_participation(spy, "deploy failed", signals=signals)
-    prompt = spy.payloads[0][1]["content"]
-    for expected in ("Peter", "active", "deploys and incidents", "12 people here",
-                     "DevOps Agenda", "web search", "ChatGPT", "and the build is red",
-                     "[Recent channel activity]"):
-        assert expected in prompt, f"the gate lost the {expected!r} signal"
-    assert "only deploys" in prompt
-    # The two inputs it replaced are gone, headings and all.
-    assert "Channel ground rules" not in prompt
-    assert "Channel memory (may be stale)" not in prompt
-
-
 # --------------------------------------------------------------------------- the removal guard
 
 def test_no_active_reader_or_writer_of_channel_settings_directives_remains():
@@ -1232,7 +1203,6 @@ class TestMemoryOffStillSteers:
 
     async def test_a_turn_with_memory_off_still_carries_the_policy_to_the_responder(self, temp_db):
         temp_db.add_channel_memory("C1", "a remembered fact")
-        temp_db.add_channel_memory("C1", "react less here", author=MARK)
         await temp_db.set_channel_policy_async("C1", "only deploys")
         p = _responder(temp_db)
         with patch.object(config, "enable_channel_memory", False):
@@ -1240,7 +1210,7 @@ class TestMemoryOffStillSteers:
             client.send_message = AsyncMock()
             await p.process_message(_turn_msg(), client, None)
         passed = _passed_steering(p)
-        assert "only deploys" in passed and "react less here" in passed
+        assert "only deploys" in passed
         assert "a remembered fact" not in passed
 
 
@@ -1517,7 +1487,13 @@ class TestStartupRefusesToRunWithUnmigratedRules:
         app = main_mod.ChatBotV2.__new__(main_mod.ChatBotV2)
         app.platform = "slack"
         app.participation_engine = None
-        fake_db = SimpleNamespace(migrate_channel_directives_to_policy_async=migrate)
+        # Startup runs THREE state migrations, each fatal on failure for the same reason. This
+        # class drives the directives one; the other two must succeed so the abort under test is
+        # unambiguously the one being injected.
+        fake_db = SimpleNamespace(
+            migrate_channel_directives_to_policy_async=migrate,
+            migrate_participation_levels_to_binary_async=AsyncMock(return_value=(0, 0)),
+            migrate_participation_prefs_to_policy_async=AsyncMock(return_value=(0, 0)))
         fake_client = SimpleNamespace(db=fake_db, processor=None)
 
         import slack_client

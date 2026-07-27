@@ -202,13 +202,13 @@ class TestSubmitPersists:
         assert (await temp_db.get_channel_settings_async("C1"))["ambient_memory"] is None
 
     async def test_opt_out_preserves_other_fields(self, temp_db):
-        await temp_db.set_channel_settings_async("C1", participation_level="active")
+        await temp_db.set_channel_settings_async("C1", participation_level="on")
         host = _make_host(temp_db)
-        await _submit(host, _state(participation="active", ambient="off"),
+        await _submit(host, _state(participation="on", ambient="off"),
                       SimpleNamespace(chat_postEphemeral=AsyncMock()))
         row = await temp_db.get_channel_settings_async("C1")
         assert row["ambient_memory"] is False
-        assert row["participation_level"] == "active"
+        assert row["participation_level"] == "on"
 
     async def test_master_off_does_not_write(self, temp_db, monkeypatch):
         # Master switch off: even if a stale block rode in, submit must not touch ambient_memory.

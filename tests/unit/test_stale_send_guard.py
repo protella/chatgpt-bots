@@ -459,9 +459,14 @@ def test_a_refused_turn_that_still_reacted_keeps_the_louder_label():
     reacted = TurnRuntime(reaction_committed=True)
     assert ChatBotV2._stale_terminal_kind(None, reacted, message) == "reaction_only"
 
-    gate_reacted = Message(text="q", user_id="U1", channel_id="C1", thread_id="100.0",
-                           metadata={"ts": "100.0", "participation_reaction_emoji": "eyes"})
-    assert ChatBotV2._stale_terminal_kind(None, TurnRuntime(), gate_reacted) == "reaction_only"
+    # Re-baselined: the second half of this test used to assert that a GATE-placed emoji also
+    # counted as the louder fact. The gate places nothing in the room now — the metadata stamp it
+    # read (`participation_reaction_emoji`) has no producer — so a stale-refused turn with no
+    # reaction of its own really did leave the room empty, and labelling it `reaction_only` on the
+    # strength of a stamp nobody writes would report an emoji that is not there.
+    stale_stamp = Message(text="q", user_id="U1", channel_id="C1", thread_id="100.0",
+                          metadata={"ts": "100.0", "participation_reaction_emoji": "eyes"})
+    assert ChatBotV2._stale_terminal_kind(None, TurnRuntime(), stale_stamp) == "stale_suppressed"
 
 
 def test_a_refused_turn_with_a_detached_surface_is_detached():
@@ -480,7 +485,10 @@ def test_a_refused_turn_with_a_detached_surface_is_detached():
 def test_the_new_kind_is_in_the_vocabulary_and_the_contract_moved():
     from message_processor import participation_telemetry as pt
     assert "stale_suppressed" in pt.KINDS
-    assert pt.CONTRACT_VERSION == 6
+    # v7 = the binary gate. The version moves whenever the ledger's field set changes, and this
+    # assertion exists so a field change cannot ship without someone bumping it deliberately.
+    assert pt.CONTRACT_VERSION == 7
+    assert pt.GATE_CONTRACT == "binary-v1"
 
 
 # ==================================== the buffered path is the one that most needs guarding
@@ -642,6 +650,12 @@ async def test_a_prior_timeout_notice_is_guarded_like_any_first_surface(supersed
             from thread_manager import AsyncThreadStateManager
             self.thread_manager = AsyncThreadStateManager(db=None)
             self.db = None
+
+        # process_message now folds the gate's coalesced cohort into the turn's input before it
+        # reads the thread. This harness carries only process_message, so the real mixin method is
+        # absent and the AttributeError was being swallowed by the suppress() below — which showed
+        # up as "the timeout notice never sent". A message with no cohort merges nothing.
+        def _merge_gate_cohort(self, message, thread_state): return 0
 
         def log_info(self, *a, **k): pass
         def log_debug(self, *a, **k): pass

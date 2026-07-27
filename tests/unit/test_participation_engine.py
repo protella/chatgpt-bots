@@ -1,9 +1,28 @@
-"""Phase F — ParticipationEngine: verdict validation, level/mode mapping, debounce,
-uncapped participation (F17: no hourly-cap rail), backoff pref-memory writes (thread-scope
-now persists nothing; the mute mechanism was removed), placement wiring, modal dual-write,
+"""ParticipationEngine — the binary wake gate: level/mode mapping, debounce supersession,
+conversation keying, COHORT coalescing, the main.py wiring around one bit, modal dual-write,
 DB columns/migration, and the busy-rejection needs_refresh fix.
 
 All stubbed I/O — no live bot, no legacy suite.
+
+WHAT LEFT THIS FILE IN COMMIT 6, and why deleting rather than re-pointing was right:
+
+* the verdict-validation suite (`validate_verdict`, `_apply_invariants`, emoji coercion,
+  placement coercion, reason truncation, the staged-findings fail-closed rule). There is no
+  verdict. `WakeDecision` has one field, a bool, produced by a strict json_schema — so the entire
+  class of "the model sent something shaped wrong and we must repair it safely" cannot occur, and
+  a test asserting how it is repaired would be testing dead code.
+* the backoff/preference-write tests. A classifier that had seen one message wrote to the
+  database; that path is gone (its taxonomy tests went with the file
+  test_participation_backoff_taxonomy.py). Participation feedback now WAKES the responder, whose
+  memory and settings tools own the write.
+* the gate-reaction tests. The gate places nothing in the room, so "does a respond verdict also
+  react" has no subject. The inverted guard survives below as one test, because a reaction
+  appearing before the responder ran is the specific regression worth catching.
+* the burst-carry tests as written. Carrying survives and is stronger — typed source records
+  merged into the responder's real input instead of quoted prose — but `_MAX_BURST_CARRY`, the
+  freshness window and the pending-map eviction are deleted on purpose: each could silently drop a
+  message somebody sent, in the one structure whose whole job is not to lose it. The replacements
+  assert that nothing is capped or dropped.
 """
 from __future__ import annotations
 
@@ -19,8 +38,8 @@ from base_client import Message
 from config import config
 from database import DatabaseManager
 from message_processor.participation import (
-    _MAX_PENDING_KEYS, LEVEL_TO_MODE, MODE_TO_LEVEL, ParticipationEngine,
-    ParticipationVerdict, resolve_participation_level,
+    LEVEL_TO_MODE, MODE_TO_LEVEL, VALID_LEVELS, GateEvaluation, ParticipationEngine,
+    SourceMessage, WakeDecision, resolve_participation_level,
 )
 
 
@@ -28,163 +47,131 @@ from message_processor.participation import (
 
 class TestLevelResolution:
     def test_mode_mapping_round_trip(self):
-        assert MODE_TO_LEVEL == {"off": "off", "tag_only": "mentions_only", "auto_respond": "judicious"}
+        assert MODE_TO_LEVEL == {"off": "off", "tag_only": "mentions_only", "auto_respond": "on"}
+        # Under a binary gate the mapping is a genuine bijection: every level has exactly one
+        # legacy mode and vice versa. It was NOT one before — `judicious` and `active` shared
+        # `auto_respond`, so a round trip through the legacy column silently rewrote `active`.
         for level, mode in LEVEL_TO_MODE.items():
-            if level != "active":  # active has no distinct legacy mode
-                assert MODE_TO_LEVEL[mode] in (level, "judicious")
+            assert MODE_TO_LEVEL[mode] == level
+        assert set(LEVEL_TO_MODE) == set(VALID_LEVELS)
+
+    def test_level_truth_table(self, monkeypatch):
+        """The whole resolution contract in one place: legal levels pass through untouched, each
+        legacy response_mode maps to exactly one level, and the retired names are not levels."""
+        # A global default that is NOT the answer to any of these cases, so a silent fallthrough
+        # to it would show up as a wrong result instead of an accidentally-right one.
+        monkeypatch.setattr(config, "channel_response_mode", "off", raising=False)
+        for level in VALID_LEVELS:
+            assert resolve_participation_level({"participation_level": level}) == level
+        for mode, level in MODE_TO_LEVEL.items():
+            assert resolve_participation_level({"response_mode": mode}) == level
+        # `judicious` and `active` are retired, and a row still carrying one resolves to
+        # mentions_only — NOT to whatever its legacy response_mode says.
+        #
+        # Absent and present-but-unrecognised are different questions. An absent level means the
+        # channel never chose one, so the legacy mode is the honest answer. A level we cannot read
+        # means the channel DID choose something, and falling through to `auto_respond` would
+        # resolve it to `on` — turning an unreadable setting into the most talkative one available.
+        # These rows should not exist (the startup migration rewrites them, and a process that
+        # fails that migration refuses to start); if one does, quiet is the safe direction.
+        assert "judicious" not in VALID_LEVELS and "active" not in VALID_LEVELS
+        for retired in ("judicious", "active"):
+            assert resolve_participation_level({"participation_level": retired}) == "mentions_only"
+            assert resolve_participation_level(
+                {"participation_level": retired,
+                 "response_mode": "auto_respond"}) == "mentions_only"
 
     def test_participation_level_wins_over_mode(self):
-        cs = {"participation_level": "active", "response_mode": "off"}
-        assert resolve_participation_level(cs) == "active"
+        cs = {"participation_level": "on", "response_mode": "off"}
+        assert resolve_participation_level(cs) == "on"
 
     def test_falls_back_to_row_mode(self):
-        assert resolve_participation_level({"response_mode": "auto_respond"}) == "judicious"
+        assert resolve_participation_level({"response_mode": "auto_respond"}) == "on"
         assert resolve_participation_level({"response_mode": "off"}) == "off"
 
     def test_falls_back_to_global_default(self, monkeypatch):
         monkeypatch.setattr(config, "channel_response_mode", "tag_only", raising=False)
         assert resolve_participation_level(None) == "mentions_only"
         monkeypatch.setattr(config, "channel_response_mode", "auto_respond", raising=False)
-        assert resolve_participation_level({}) == "judicious"
+        assert resolve_participation_level({}) == "on"
 
     def test_garbage_degrades_safe(self, monkeypatch):
         monkeypatch.setattr(config, "channel_response_mode", "banana", raising=False)
         assert resolve_participation_level({"participation_level": "loud"}) == "mentions_only"
 
 
-# A verdict dict carrying the STAGED findings a real classifier reply includes. `_apply_invariants`
-# now fails CLOSED: a speaking action with any stage missing is forced to ignore, because the
-# response is not strict Structured Outputs (arbitrary JSON is lifted out of the text) and a
-# truncated reply would otherwise skip every check on the one path most likely to be garbage.
-# Tests below that only care about gate WIRING or emoji coercion use this so their fixtures are
-# shaped like production traffic; the fail-closed behaviour has its own tests.
-def _staged(action, relation="to_assistant", exchange_state="open",
-            answerability="substantive", **extra):
-    v = {"action": action, "relation": relation, "exchange_state": exchange_state,
-         "answerability": answerability}
-    v.update(extra)
-    return v
+# ------------------------------------------------------------------- the shape of the output
+
+class TestWakeDecisionShape:
+    def test_the_decision_is_one_bit_and_nothing_else(self):
+        """Tripwire, not a tautology. Every field the old verdict carried became a control bus —
+        `action` branched the caller four ways, `emoji` placed a reaction, `reason` was forwarded
+        into the responder's prompt and pre-argued the turn. A new field here is how that starts
+        again, so the field set is pinned."""
+        assert [f for f in WakeDecision.__dataclass_fields__] == ["wake"]
+        assert WakeDecision(wake=True).wake is True
+        # Frozen: nothing downstream may edit a decision on its way through.
+        with pytest.raises(Exception):
+            WakeDecision(wake=True).wake = False
+
+    def test_the_evaluation_reports_which_kind_of_nothing(self):
+        """`evaluate()` returning verdict-or-None left the caller unable to tell a cohort collapse
+        from an edit cancellation from a provider outage — it could only find out by reading the
+        engine's log lines, and the caller owns the turn's single terminal event."""
+        assert set(GateEvaluation.__dataclass_fields__) == {
+            "decision", "decline_cause", "classifier_ms", "sources"}
+        empty = GateEvaluation()
+        assert empty.decision is None and empty.decline_cause is None and empty.sources == ()
+
+    def test_a_source_knows_its_own_topology(self):
+        # A thread ROOT is not a thread reply: its root ts is its own ts. This is what decides
+        # whether the prompt says "a reply inside a thread" or "posted to the channel".
+        assert SourceMessage(ts="10.0", thread_root_ts="10.0").is_thread_reply is False
+        assert SourceMessage(ts="10.5", thread_root_ts="10.0").is_thread_reply is True
+        assert SourceMessage(ts="10.0").is_thread_reply is False
 
 
-# ----------------------------------------------------------------- verdict validation
-
-class TestVerdictValidation:
-    def test_malformed_and_invalid_action_ignore(self):
-        assert ParticipationEngine.validate_verdict(None).action == "ignore"
-        assert ParticipationEngine.validate_verdict("respond").action == "ignore"
-        assert ParticipationEngine.validate_verdict({"action": "shout"}).action == "ignore"
-
-    def test_respond_defaults(self):
-        v = ParticipationEngine.validate_verdict(_staged("respond"))
-        assert (v.action, v.placement, v.emoji) == ("respond", "thread", None)
-
-    def test_speaking_action_without_staged_findings_fails_closed(self):
-        # The parser lifts whatever JSON object it can find, so a truncated reply can arrive
-        # with an action and no stages — and every stage field coerces to None when missing.
-        # That path used to skip the invariants entirely, i.e. the likeliest-garbage verdict was
-        # the least checked. Silence is the safe direction.
-        # The react actions carry an emoji here on purpose: without one they are already
-        # downgraded by emoji coercion ("react-no-valid-emoji"), which would make this pass
-        # without ever reaching the invariant under test.
-        for action, extra in (("respond", {}),
-                              ("react", {"emoji": "tada"}),
-                              ("react_and_respond", {"emoji": "tada"})):
-            v = ParticipationEngine.validate_verdict({"action": action, **extra})
-            assert v.action == "ignore", action
-            assert v.overruled_by == ["incomplete_stages"], action
-            assert v.emoji is None, action
-        # a PARTIAL set of stages is just as unacceptable
-        v = ParticipationEngine.validate_verdict(
-            {"action": "respond", "relation": "to_assistant"})
-        assert v.action == "ignore" and v.overruled_by == ["incomplete_stages"]
-        # backoff is exempt: it is how "stop participating" arrives, and it never speaks
-        assert ParticipationEngine.validate_verdict({"action": "backoff"}).action == "backoff"
-
-    def test_react_allowlist_and_colon_strip(self, monkeypatch):
-        monkeypatch.setattr(config, "reaction_emojis", ["thumbsup", "eyes"], raising=False)
-        assert ParticipationEngine.validate_verdict(
-            _staged("react", emoji=":eyes:")).emoji == "eyes"
-        # off-allowlist → first allowlisted emoji
-        assert ParticipationEngine.validate_verdict(
-            _staged("react", emoji="middle_finger")).emoji == "thumbsup"
-
-    def test_react_and_respond_keeps_valid_emoji_and_placement(self, monkeypatch):
-        # react_and_respond reacts AND replies in one turn: a valid emoji is kept and placement
-        # is coerced exactly like a respond verdict.
-        monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
-        v = ParticipationEngine.validate_verdict(
-            _staged("react_and_respond", emoji=":tada:", placement="channel"))
-        assert (v.action, v.emoji, v.placement) == ("react_and_respond", "tada", "channel")
-
-    def test_react_and_respond_no_allowlist_invalid_emoji_downgrades_to_respond(self, monkeypatch):
-        # (a) With NO allowlist, an unresolvable emoji drops the reaction but KEEPS the reply:
-        # downgrade to a plain respond, NEVER to ignore (react→None ignores; this must not).
-        monkeypatch.setattr(config, "reaction_emojis", [], raising=False)
-        v = ParticipationEngine.validate_verdict(
-            _staged("react_and_respond", emoji="bad name!"))
-        assert v.action == "respond" and v.emoji is None
-
-    def test_react_and_respond_allowlist_offlist_falls_back_and_stays(self, monkeypatch):
-        # (b) With an allowlist set, an off-list emoji falls back to the first allowed emoji and the
-        # action STAYS react_and_respond (the emoji resolved, so there is no downgrade).
-        monkeypatch.setattr(config, "reaction_emojis", ["thumbsup", "eyes"], raising=False)
-        v = ParticipationEngine.validate_verdict(
-            _staged("react_and_respond", emoji="middle_finger"))
-        assert v.action == "react_and_respond" and v.emoji == "thumbsup"
-
-    def test_bad_placement_coerced_to_thread(self):
-        v = ParticipationEngine.validate_verdict(_staged("respond", placement="everywhere"))
-        assert v.placement == "thread"
-
-    def test_reason_truncated(self):
-        v = ParticipationEngine.validate_verdict({"action": "ignore", "reason": "x" * 999})
-        assert len(v.reason) == 300
-
-    # F38: the classifier's `ack` bit is GONE — it predicted "real work ahead" before the
-    # model had done anything, and the gate dropped a 👀 on that guess. The verdict must
-    # carry no such field, and a stale `ack` key from an old prompt must be inert.
-    def test_verdict_has_no_ack_field(self):
-        assert not hasattr(ParticipationEngine.validate_verdict(_staged("respond")), "ack")
-
-    def test_stale_ack_key_is_ignored(self):
-        v = ParticipationEngine.validate_verdict(_staged("respond", ack=True))
-        assert v.action == "respond"
-        assert not hasattr(v, "ack")
-
-
-# ------------------------------------------------------------------- debounce + rails
+# ------------------------------------------------------------------- debounce + cohorts
 
 class _FakeClient:
-    def __init__(self, verdict):
-        self._verdict = verdict
+    """The classifier half of the world: records every cohort it is asked to judge."""
+
+    def __init__(self, wake=True):
+        self._wake = wake
         self.calls = 0
+        self.cohorts = []          # one entry per call: the tuple of sources it saw
+        self.steering = []
 
-    async def classify_participation(self, text, signals=None):
+    async def classify_wake(self, *, sources, channel_steering_text=None):
         self.calls += 1
-        return self._verdict
+        self.cohorts.append(tuple(sources))
+        self.steering.append(channel_steering_text)
+        return self._wake
+
+    @property
+    def last_cohort(self):
+        return self.cohorts[-1] if self.cohorts else ()
 
 
-class _FakePulse:
-    def __init__(self, count=0):
-        self._count = count
-
-    def render_envelope(self, *a, **k):
-        return "[Recent channel activity]\n- Peter (top-level): hi"
+def _texts(cohort):
+    return [s.text for s in cohort]
 
 
-class TestDebounceAndRails:
+class TestDebounceAndSupersession:
     @pytest.mark.asyncio
     async def test_rapid_fire_collapses_to_latest(self, monkeypatch):
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient(_staged("respond"))
+        fake = _FakeClient(wake=True)
         engine = ParticipationEngine(fake)
         first = asyncio.create_task(engine.evaluate(channel_id="C1", ts="1.0", text="line one"))
         await asyncio.sleep(0.01)
         second = asyncio.create_task(engine.evaluate(channel_id="C1", ts="2.0", text="line two"))
-        r1, r2 = (r.verdict for r in await asyncio.gather(first, second))
-        assert r1 is None            # superseded — silent
-        assert r2.action == "respond"
-        assert fake.calls == 1       # ONE engine call for the burst
+        r1, r2 = await asyncio.gather(first, second)
+        assert r1.decision is None and r1.decline_cause == "superseded"
+        assert r2.decision.wake is True
+        assert fake.calls == 1       # ONE model call for the burst
+        # ...and the superseded message is not lost: it is in the survivor's cohort.
+        assert _texts(fake.last_cohort) == ["line one", "line two"]
 
     @pytest.mark.asyncio
     async def test_thread_message_survives_newer_message_in_other_thread(self, monkeypatch):
@@ -192,49 +179,35 @@ class TestDebounceAndRails:
         must NOT be dropped because thread B (or another conversation) posted something
         newer in the same channel during the debounce window."""
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient(_staged("respond"))
+        fake = _FakeClient(wake=True)
         engine = ParticipationEngine(fake)
         a = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="10.5", text="question in thread A", thread_root_ts="10.0"))
         await asyncio.sleep(0.01)
         b = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="20.5", text="chatter in thread B", thread_root_ts="20.0"))
-        ra, rb = (r.verdict for r in await asyncio.gather(a, b))
-        assert ra is not None and ra.action == "respond"   # thread A still judged
-        assert rb is not None and rb.action == "respond"
-        assert fake.calls == 2                             # both conversations evaluated
+        ra, rb = await asyncio.gather(a, b)
+        assert ra.decision.wake is True    # thread A still judged
+        assert rb.decision.wake is True
+        assert fake.calls == 2             # both conversations evaluated
+        # Independent streams, so neither cohort may contain the other's message.
+        assert _texts(fake.cohorts[0]) == ["question in thread A"]
+        assert _texts(fake.cohorts[1]) == ["chatter in thread B"]
 
     @pytest.mark.asyncio
     async def test_thread_message_survives_newer_top_level(self, monkeypatch):
         """F21: a newer TOP-LEVEL message must not supersede a pending thread reply."""
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient(_staged("respond"))
+        fake = _FakeClient(wake=True)
         engine = ParticipationEngine(fake)
         a = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="10.5", text="thread question", thread_root_ts="10.0"))
         await asyncio.sleep(0.01)
         b = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="30.0", text="unrelated top-level"))  # roots key as |top
-        ra, rb = (r.verdict for r in await asyncio.gather(a, b))
-        assert ra is not None and rb is not None
+        ra, rb = await asyncio.gather(a, b)
+        assert ra.decision is not None and rb.decision is not None
         assert fake.calls == 2
-
-    @pytest.mark.asyncio
-    async def test_same_thread_burst_still_collapses(self, monkeypatch):
-        """F21: within ONE thread the old behavior holds — the newest message of a
-        rapid burst supersedes the older ones (its tail covers the batch)."""
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient(_staged("respond"))
-        engine = ParticipationEngine(fake)
-        first = asyncio.create_task(engine.evaluate(
-            channel_id="C1", ts="10.5", text="line one", thread_root_ts="10.0"))
-        await asyncio.sleep(0.01)
-        second = asyncio.create_task(engine.evaluate(
-            channel_id="C1", ts="10.6", text="line two", thread_root_ts="10.0"))
-        r1, r2 = (r.verdict for r in await asyncio.gather(first, second))
-        assert r1 is None            # superseded within the conversation
-        assert r2.action == "respond"
-        assert fake.calls == 1
 
     def test_conv_key_root_vs_reply(self):
         """A thread ROOT keys as top-level (thread_root == ts); its replies key by root.
@@ -248,433 +221,414 @@ class TestDebounceAndRails:
     @pytest.mark.asyncio
     async def test_channels_debounce_independently(self, monkeypatch):
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.02, raising=False)
-        fake = _FakeClient({"action": "ignore"})
+        fake = _FakeClient(wake=False)
         engine = ParticipationEngine(fake)
-        r1, r2 = (r.verdict for r in await asyncio.gather(
+        r1, r2 = await asyncio.gather(
             engine.evaluate(channel_id="C1", ts="1.0", text="a"),
             engine.evaluate(channel_id="C2", ts="1.0", text="b"),
-        ))
-        assert r1 is not None and r2 is not None
+        )
+        assert r1.decision.wake is False and r2.decision.wake is False
         assert fake.calls == 2
 
     @pytest.mark.asyncio
-    async def test_engine_api_failure_is_silent_ignore(self, monkeypatch):
+    async def test_a_classifier_failure_is_a_decline_not_a_decision(self, monkeypatch):
+        """RE-BASELINED, and this is the behaviour change worth reading twice.
+
+        The rich gate turned an API failure into a manufactured `{"action": "ignore"}` — silence
+        either way, but it scored a provider outage as the model choosing restraint, in the same
+        ledger field used to judge the model's judgment. Now there is no bit: `decision` is None,
+        `decline_cause` is "classifier_error", and the caller ends the turn as `none` rather than
+        `silence`. The failure is still measured (classifier_ms is recorded even on the failing
+        path — a timeout's duration is the story)."""
         monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
 
         class _Boom:
-            async def classify_participation(self, *a, **k):
+            async def classify_wake(self, *, sources, channel_steering_text=None):
                 raise RuntimeError("api down")
 
-        v = (await ParticipationEngine(_Boom()).evaluate(
-            channel_id="C1", ts="1.0", text="x")).verdict
-        assert v.action == "ignore"
+        ev = await ParticipationEngine(_Boom()).evaluate(channel_id="C1", ts="1.0", text="x")
+        assert ev.decision is None
+        assert ev.decline_cause == "classifier_error"
+        assert ev.classifier_ms is not None
+        # The cohort still comes back, so the caller can catalogue what it could not answer.
+        assert _texts(ev.sources) == ["x"]
 
-    def test_hourly_cap_rail_removed(self):
-        # F17: the hourly-cap hard rail is gone entirely — no hourly_cap/over_throttle
-        # methods remain on the engine (pacing is the classifier's judgment now).
+    @pytest.mark.asyncio
+    async def test_a_none_from_the_classifier_is_also_a_decline(self, monkeypatch):
+        # classify_wake returns None for a refusal, an empty output, or a non-boolean payload.
+        # Same outcome as an exception: no bit, therefore no decision.
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
+
+        class _NoBit:
+            async def classify_wake(self, *, sources, channel_steering_text=None):
+                return None
+
+        ev = await ParticipationEngine(_NoBit()).evaluate(channel_id="C1", ts="1.0", text="x")
+        assert ev.decision is None and ev.decline_cause == "classifier_error"
+
+    @pytest.mark.asyncio
+    async def test_a_captionless_upload_declines_structurally(self, monkeypatch):
+        """A cohort of nothing but wordless files: no question, no addressee, nothing for a wake
+        decision to be ABOUT. Named as a structural outcome rather than dressed up as the model
+        choosing silence — no classifier runs at all. The sources still come back, because
+        declining to answer a wordless upload is not the same as forgetting it happened (the caller
+        catalogues them)."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
+        fake = _FakeClient(wake=True)
+        ev = await ParticipationEngine(fake).evaluate(
+            channel_id="C1", ts="1.0", text="   ", attachments=["food.png (image)"])
+        assert ev.decision is None and ev.decline_cause == "image_only"
+        assert fake.calls == 0
+        assert ev.sources[0].attachments == ("food.png (image)",)
+
+    @pytest.mark.asyncio
+    async def test_a_caption_anywhere_in_the_cohort_reaches_the_classifier(self, monkeypatch):
+        # The rule is about the COHORT, not the survivor: someone who posts a file and then says
+        # what it is has asked a question, and judging only the newest fragment would miss it.
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
+        fake = _FakeClient(wake=True)
+        engine = ParticipationEngine(fake)
+        first = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="1.0", text="what do we think?", sender_id="U1"))
+        await asyncio.sleep(0.01)
+        second = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="2.0", text="", sender_id="U1",
+            attachments=["poster.png (image)"]))
+        _, survivor = await asyncio.gather(first, second)
+        assert survivor.decline_cause is None
+        assert survivor.decision.wake is True
+        assert fake.calls == 1
+
+    def test_the_engine_has_no_pacing_rails(self):
+        # F17: the hourly-cap hard rail is gone entirely, and the binary gate adds no replacement.
+        # Pacing is not a gate question — the responder decides whether to speak.
         engine = ParticipationEngine(MagicMock())
         assert not hasattr(engine, "hourly_cap")
         assert not hasattr(engine, "over_throttle")
 
 
-# ---------------------------------------------------------- F27 same-author burst carry
+# ------------------------------------------------------- cohorts: nothing capped, nothing dropped
 
-
-class _CapturingClient:
-    """Records the signals of the LAST classify call (survivors only reach here)."""
-    def __init__(self, verdict):
-        self._verdict = verdict
-        self.calls = 0
-        self.signals = None
-
-    async def classify_participation(self, text, signals=None):
-        self.calls += 1
-        self.signals = signals
-        return self._verdict
-
-
-class TestBurstCarryForward:
+class TestCohortDelivery:
     @pytest.mark.asyncio
     async def test_different_authors_top_level_both_survive(self, monkeypatch):
         """F27: two DIFFERENT users' unrelated top-level messages within the debounce no
-        longer collapse — each is the newest in its own per-sender stream, both answered."""
+        longer collapse — each is the newest in its own per-sender stream, both answered,
+        and neither cohort contains the other's message."""
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient(_staged("respond"))
+        fake = _FakeClient(wake=True)
         engine = ParticipationEngine(fake)
         a = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="1.0", text="alice question", sender_id="U1"))
         await asyncio.sleep(0.01)
         b = asyncio.create_task(engine.evaluate(
             channel_id="C1", ts="2.0", text="bob question", sender_id="U2"))
-        ra, rb = (r.verdict for r in await asyncio.gather(a, b))
-        assert ra is not None and ra.action == "respond"
-        assert rb is not None and rb.action == "respond"
-        assert fake.calls == 2                       # both evaluated independently
-        assert ra.burst_earlier is None and rb.burst_earlier is None
+        ra, rb = await asyncio.gather(a, b)
+        assert ra.decision.wake is True and rb.decision.wake is True
+        assert fake.calls == 2
+        assert _texts(fake.cohorts[0]) == ["alice question"]
+        assert _texts(fake.cohorts[1]) == ["bob question"]
 
     @pytest.mark.asyncio
-    async def test_same_author_top_level_burst_carries_earlier(self, monkeypatch):
-        """F27: a same-author fast-follow supersedes the first message, but the survivor
-        carries the earlier text so ONE reply covers the whole burst."""
+    async def test_a_multi_message_top_level_cohort_reaches_the_model_once_in_order(
+            self, monkeypatch):
+        """Five sends from one person inside one debounce window: ONE model call, all five
+        messages, oldest first, no duplication.
+
+        This is the replacement for the old carry test, which asserted the newest THREE were kept
+        (`_MAX_BURST_CARRY`). A cap here is a message the person actually sent that neither model
+        ever sees, so there is no cap now and this asserts the whole burst arrives."""
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient(_staged("respond"))
+        fake = _FakeClient(wake=True)
         engine = ParticipationEngine(fake)
-        first = asyncio.create_task(engine.evaluate(
-            channel_id="C1", ts="1.0", text="first thought", sender_id="U1"))
-        await asyncio.sleep(0.01)
-        second = asyncio.create_task(engine.evaluate(
-            channel_id="C1", ts="2.0", text="actually also this", sender_id="U1"))
-        r1, r2 = (r.verdict for r in await asyncio.gather(first, second))
-        assert r1 is None                            # superseded — silent
-        assert r2.action == "respond"
-        assert r2.burst_earlier == ["first thought"]
-        assert fake.calls == 1                        # ONE reply for the burst
-        # pending bucket drained after the survivor collected it
-        assert not engine._pending.get("C1|top|U1")
-
-    @pytest.mark.asyncio
-    async def test_burst_signal_reaches_classifier(self, monkeypatch):
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        cap = _CapturingClient(_staged("respond"))
-        engine = ParticipationEngine(cap)
-        first = asyncio.create_task(engine.evaluate(
-            channel_id="C1", ts="1.0", text="one", sender_id="U1"))
-        await asyncio.sleep(0.01)
-        second = asyncio.create_task(engine.evaluate(
-            channel_id="C1", ts="2.0", text="two", sender_id="U1"))
-        await asyncio.gather(first, second)
-        assert cap.signals["burst_earlier"] == ["one"]
-
-    @pytest.mark.asyncio
-    async def test_channel_people_signal_reaches_classifier(self, monkeypatch):
-        # F29: the people summary passed to evaluate is forwarded in the classifier signals.
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0.0, raising=False)
-        cap = _CapturingClient({"action": "ignore"})
-        engine = ParticipationEngine(cap)
-        await engine.evaluate(channel_id="C1", ts="1.0", text="hi", sender_id="U1",
-                              channel_people="~5 members; recently active: Alice")
-        assert cap.signals["channel_people"] == "~5 members; recently active: Alice"
-
-    def test_burst_of_five_keeps_newest_three(self):
-        """F27: a same-author burst of 5 carries only the newest 3 earlier messages."""
-        eng = ParticipationEngine(MagicMock())
-        key = "C1|top|U1"
+        tasks = []
         for i in range(1, 6):
-            eng._register_pending(key, f"{i}.0", f"m{i}")
-        eng._latest[key] = "5.0"                     # 5.0 is the survivor
-        carried = eng._collect_burst(key, "5.0", 0.05)
-        assert carried == ["m2", "m3", "m4"]         # newest 3 strictly-older, oldest-first
-        assert key not in eng._pending               # bucket drained
+            tasks.append(asyncio.create_task(engine.evaluate(
+                channel_id="C1", ts=f"{i}.0", text=f"m{i}", sender_id="U1")))
+            await asyncio.sleep(0.002)
+        results = await asyncio.gather(*tasks)
+        assert fake.calls == 1
+        assert _texts(fake.last_cohort) == ["m1", "m2", "m3", "m4", "m5"]
+        # exactly one survivor, and its GateEvaluation carries the same bundle for the responder
+        survivors = [r for r in results if r.decision is not None]
+        assert len(survivors) == 1
+        assert _texts(survivors[0].sources) == ["m1", "m2", "m3", "m4", "m5"]
+        assert all(r.decline_cause == "superseded" for r in results if r.decision is None)
+        # Drained: the survivor took the bucket with it, so a later message starts a fresh cohort.
+        assert "C1|top|U1" not in engine._cohorts
 
-    def test_stale_pending_entry_not_carried(self):
-        """F27: an entry far older than the survivor (a leftover from a crashed evaluation)
-        is dropped, never leaked into a fresh burst minutes later."""
+    @pytest.mark.asyncio
+    async def test_a_cross_author_thread_cohort_reaches_the_model_once_in_order(self, monkeypatch):
+        """RE-BASELINED. A thread collapses cross-author (F21 — the reply lands in-thread with full
+        history), and the old code then THREW THE SUPERSEDED TEXT AWAY: carry was top-level-only
+        because the prose render labelled the carried lines "the same sender", so keeping them would
+        have misattributed. Typed records carry the sender, so the reason to drop them is gone —
+        two people talking at once in a thread is exactly the case where the second message alone
+        reads as a non sequitur."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
+        fake = _FakeClient(wake=True)
+        engine = ParticipationEngine(fake)
+        first = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="10.5", text="alice's words", sender_id="U1",
+            sender_name="Alice", thread_root_ts="10.0"))
+        await asyncio.sleep(0.01)
+        second = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="10.6", text="bob's reply", sender_id="U2",
+            sender_name="Bob", thread_root_ts="10.0"))
+        r1, r2 = await asyncio.gather(first, second)
+        assert r1.decision is None and r1.decline_cause == "superseded"
+        assert r2.decision.wake is True
+        assert fake.calls == 1
+        assert _texts(fake.last_cohort) == ["alice's words", "bob's reply"]
+        # Attribution is preserved per record, which is what makes the carry safe.
+        assert [s.sender_name for s in fake.last_cohort] == ["Alice", "Bob"]
+        assert "C1|10.0" not in engine._cohorts       # bucket drained (memory hygiene)
+
+    def test_an_old_enrollment_is_still_carried(self):
+        """RE-BASELINED, deliberately inverting the old assertion.
+
+        The old `_collect_burst` dropped entries more than ~15s older than the survivor, calling
+        them stale leftovers. That is a silent message-loss path: the only way a stale enrollment
+        exists is that its own evaluation never ran, which is a bug to SEE, not to paper over — and
+        the same window would drop a genuine slow burst. Age is no longer a reason to discard."""
         eng = ParticipationEngine(MagicMock())
         key = "C1|top|U1"
-        eng._register_pending(key, "100.0", "ancient")    # >15s before survivor → stale
-        eng._register_pending(key, "1000.0", "recent")    # within freshness window
-        eng._register_pending(key, "1001.0", "survivor")
-        eng._latest[key] = "1001.0"
-        carried = eng._collect_burst(key, "1001.0", 0.05)  # window = max(15, 0.25) = 15s
-        assert carried == ["recent"]
-        assert key not in eng._pending
+        eng._enroll_source(key, SourceMessage(ts="100.0", text="ancient"))
+        eng._enroll_source(key, SourceMessage(ts="1000.0", text="recent"))
+        eng._enroll_source(key, SourceMessage(ts="1001.0", text="survivor"))
+        carried = eng._drain_cohort(key, "1001.0")
+        assert _texts(carried) == ["ancient", "recent", "survivor"]
+        assert key not in eng._cohorts          # bucket removed once drained
 
-    def test_pending_map_is_bounded(self):
-        """F27: the pending map can't grow unbounded over the process lifetime."""
+    def test_a_newer_enrollment_is_left_for_its_own_survivor(self):
+        # Strictly-newer entries belong to a later survivor: taking one would judge a message whose
+        # own debounce has not finished.
         eng = ParticipationEngine(MagicMock())
-        for i in range(_MAX_PENDING_KEYS + 50):
-            eng._register_pending(f"C1|top|U{i}", "1.0", "x")
-        assert len(eng._pending) <= _MAX_PENDING_KEYS
+        key = "C1|top|U1"
+        for ts, text in (("1.0", "mine"), ("2.0", "not yet mine")):
+            eng._enroll_source(key, SourceMessage(ts=ts, text=text))
+        assert _texts(eng._drain_cohort(key, "1.0")) == ["mine"]
+        assert list(eng._cohorts[key]) == ["2.0"]     # bucket kept, holding the newer one
+        assert _texts(eng._drain_cohort(key, "2.0")) == ["not yet mine"]
+        assert key not in eng._cohorts
+
+    def test_re_enrolling_one_ts_replaces_rather_than_duplicates(self):
+        # An edit keeps its original timestamp, so it re-enrolls the same ts. The cohort must hold
+        # the CURRENT text, not two versions of one message.
+        eng = ParticipationEngine(MagicMock())
+        eng._enroll_source("K", SourceMessage(ts="1.0", text="draft"))
+        eng._enroll_source("K", SourceMessage(ts="1.0", text="draft final"))
+        assert _texts(eng._drain_cohort("K", "1.0")) == ["draft final"]
+
+    def test_the_cohort_map_is_deliberately_unbounded(self):
+        """A correctness requirement, not an oversight, so it is asserted rather than commented.
+
+        The pending map used to evict the oldest bucket past `_MAX_PENDING_KEYS`. Eviction there
+        discards an ENROLLED message — one somebody sent, waiting for its turn — and the busiest
+        workspace is exactly where it would happen. Cancellation is explicit instead
+        (`discard_source`), and buckets go away when their survivor drains them."""
+        import message_processor.participation as participation
+        assert not hasattr(participation, "_MAX_PENDING_KEYS")
+        assert not hasattr(participation, "_MAX_BURST_CARRY")
+        eng = ParticipationEngine(MagicMock())
+        for i in range(2000):
+            eng._enroll_source(f"C1|top|U{i}", SourceMessage(ts="1.0", text="x"))
+        assert len(eng._cohorts) == 2000
+        # The one bound that IS kept: supersession MARKS, which are bookkeeping about messages
+        # already handled elsewhere, so dropping one can never lose something awaiting a turn.
+        assert participation._MAX_SUPERSESSION_KEYS == 512
+
+    def test_discard_source_forgets_an_abandoned_source(self):
+        eng = ParticipationEngine(MagicMock())
+        eng._enroll_source("C1|10.0", SourceMessage(ts="10.5", text="orphan"))
+        eng.discard_source("C1", "10.5", thread_root="10.0")
+        assert "C1|10.0" not in eng._cohorts     # it was the last one out, so the bucket goes too
+        # Idempotent, and a missing channel/ts is a no-op rather than a crash.
+        eng.discard_source("C1", "10.5", thread_root="10.0")
+        eng.discard_source("", None)
 
     @pytest.mark.asyncio
-    async def test_thread_burst_still_collapses_cross_author(self, monkeypatch):
-        """F27 leaves F21 thread behavior intact: within one thread a cross-author burst
-        still collapses to the newest (its in-thread reply has full history)."""
+    async def test_a_superseded_attempt_leaves_its_record_enrolled(self, monkeypatch):
+        """The invariant the whole design rests on: being superseded must not delete you.
+
+        Checked mid-flight rather than only through the survivor's cohort, because "the survivor
+        happened to see it" and "the record was still there to be seen" are different facts, and
+        only the second one holds when the survivor arrives late."""
         monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient(_staged("respond"))
+        fake = _FakeClient(wake=True)
         engine = ParticipationEngine(fake)
         first = asyncio.create_task(engine.evaluate(
-            channel_id="C1", ts="10.5", text="alice in thread",
-            sender_id="U1", thread_root_ts="10.0"))
+            channel_id="C1", ts="1.0", text="the real question", sender_id="U1"))
         await asyncio.sleep(0.01)
-        second = asyncio.create_task(engine.evaluate(
-            channel_id="C1", ts="10.6", text="bob in thread",
-            sender_id="U2", thread_root_ts="10.0"))   # different author, SAME thread
-        r1, r2 = (r.verdict for r in await asyncio.gather(first, second))
-        assert r1 is None                              # still collapses in-thread
-        assert r2.action == "respond"
-        assert fake.calls == 1
+        # Advance the marker WITHOUT starting a second evaluation, so the first attempt is
+        # superseded by a survivor that has not run yet.
+        engine.note_arrival("C1", "2.0", None, "U1")
+        ev = await first
+        assert ev.decline_cause == "superseded"
+        assert fake.calls == 0
+        assert _texts(engine._drain_cohort("C1|top|U1", "2.0")) == ["the real question"]
 
     @pytest.mark.asyncio
-    async def test_thread_cross_author_burst_not_carried(self, monkeypatch):
-        """F27: an in-thread cross-author burst collapses (F21) but the survivor must NOT
-        carry the superseded — possibly different-author — text: the render sites label it
-        "the same sender", so carrying it would misattribute. Carry is top-level-only."""
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        cap = _CapturingClient(_staged("respond"))
-        engine = ParticipationEngine(cap)
-        first = asyncio.create_task(engine.evaluate(
-            channel_id="C1", ts="10.5", text="alice's words",
-            sender_id="U1", thread_root_ts="10.0"))
-        await asyncio.sleep(0.01)
-        second = asyncio.create_task(engine.evaluate(
-            channel_id="C1", ts="10.6", text="bob's reply",
-            sender_id="U2", thread_root_ts="10.0"))   # different author, same thread
-        r1, r2 = (r.verdict for r in await asyncio.gather(first, second))
-        assert r1 is None
-        assert r2.action == "respond"
-        assert not r2.burst_earlier                    # None/empty — no cross-author carry
-        assert cap.signals["burst_earlier"] == []      # classifier sees no burst texts
-
-    @pytest.mark.asyncio
-    async def test_thread_survivor_drains_bucket_despite_discard(self, monkeypatch):
-        """F27: a thread survivor discards the carry but must STILL drain its pending bucket
-        (memory hygiene) so a busy thread's bucket can't grow unbounded."""
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
-        fake = _FakeClient(_staged("respond"))
-        engine = ParticipationEngine(fake)
-        first = asyncio.create_task(engine.evaluate(
-            channel_id="C1", ts="10.5", text="one",
-            sender_id="U1", thread_root_ts="10.0"))
-        await asyncio.sleep(0.01)
-        second = asyncio.create_task(engine.evaluate(
-            channel_id="C1", ts="10.6", text="two",
-            sender_id="U1", thread_root_ts="10.0"))
-        await asyncio.gather(first, second)
-        assert not engine._pending.get("C1|10.0")      # bucket emptied
+    async def test_the_steering_bytes_are_passed_through_untouched(self, monkeypatch):
+        # Commit 5's invariant: the gate inserts the caller's exact string. It does not render,
+        # re-read, or reorder it — the responder's copy of this turn must be byte-identical.
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
+        fake = _FakeClient(wake=True)
+        steering = "Standing channel policy (instructions; follow these):\nonly deploys"
+        await ParticipationEngine(fake).evaluate(
+            channel_id="C1", ts="1.0", text="hi", channel_steering_text=steering)
+        assert fake.steering == [steering]
 
 
 # --------------------------------------------------------------- main.py gate wiring
 
-def _make_app(verdict, pulse=None, engine_enabled=True, monkeypatch=None):
+def _make_app(wake=True, engine=True):
     from main import ChatBotV2
     app = ChatBotV2.__new__(ChatBotV2)
-    fake = _FakeClient(verdict)
-    app.participation_engine = ParticipationEngine(fake)
+    fake = _FakeClient(wake)
+    app.participation_engine = ParticipationEngine(fake) if engine else None
     app.processor = MagicMock()
     app.processor.db = MagicMock()
+    app.processor.db.get_channel_policy_async = AsyncMock(return_value=None)
     app.processor.db.get_channel_memory_async = AsyncMock(return_value=[])
     app.processor.db.set_channel_settings_async = AsyncMock()
     app.processor.db.add_channel_memory_async = AsyncMock()
-    app.processor.db.update_channel_memory_async = AsyncMock()
-    app.processor.db.delete_channel_memory_async = AsyncMock()
-    # Redesign SHOULD-FIX #8: the pref add/refresh path routes through the atomic marker upsert.
-    app.processor.db.upsert_channel_pref_memory = AsyncMock(return_value=7)
+    app.processor._schedule_async_call = MagicMock()
     client = MagicMock()
-    client.channel_pulse = pulse
     client.react = AsyncMock()
-    # F6 addendum: the gate's react verdict routes through _reserve_and_react (guard-aware).
     client._reserve_and_react = AsyncMock(return_value={"ok": True})
     return app, client, fake
 
 
 def _channel_msg(**meta):
     m = {"ts": "10.0", "gate_required": True, "silence_capable": True,
-         "participation_level": "judicious"}
+         "participation_level": "on"}
     m.update(meta)
     return Message(text="anyone know the deploy status?", user_id="U1",
                    channel_id="C1", thread_id="10.0", metadata=m)
 
 
 class TestGateWiring:
+    @pytest.fixture(autouse=True)
+    def _no_debounce(self, monkeypatch):
+        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
+
     @pytest.mark.asyncio
     async def test_engine_disabled_stays_silent(self, monkeypatch):
+        # The inner `engine_off` terminal is kept as a race/test backstop even though
+        # message_events also prefilters on the flag.
         monkeypatch.setattr(config, "enable_participation_engine", False, raising=False)
-        app, client, fake = _make_app(_staged("respond"))
+        app, client, fake = _make_app()
         assert await app._run_participation_gate(_channel_msg(), client) is None
         assert fake.calls == 0
 
     @pytest.mark.asyncio
-    async def test_name_hit_still_reaches_engine(self, monkeypatch):
-        # F17: a name-addressed message reaches the engine like any other — only the
-        # classifier decides if it's a genuine summons.
-        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        app, client, fake = _make_app(_staged("respond"), pulse=_FakePulse(40))
-        verdict = await app._run_participation_gate(
-            _channel_msg(participation_name_hit=True), client)
-        assert verdict is not None and verdict.action == "respond"
+    async def test_no_engine_object_stays_silent(self):
+        app, client, _ = _make_app(engine=False)
+        assert await app._run_participation_gate(_channel_msg(), client) is None
+
+    @pytest.mark.asyncio
+    async def test_wake_true_hands_the_turn_on(self):
+        app, client, fake = _make_app(wake=True)
+        decision = await app._run_participation_gate(_channel_msg(), client)
+        assert isinstance(decision, WakeDecision) and decision.wake is True
         assert fake.calls == 1
 
     @pytest.mark.asyncio
-    async def test_respond_verdict_passes_through(self, monkeypatch):
-        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        app, client, _ = _make_app(_staged("respond", placement="thread"))
-        verdict = await app._run_participation_gate(_channel_msg(), client)
-        assert verdict is not None and verdict.action == "respond"
-
-    # F38: the gate NEVER reacts on a respond verdict. The 👀 is a claim on work, staked by
-    # the work itself once a slow tool really starts — not a prediction the classifier makes
-    # before the model has looked at anything. A gate that acks a passing comment and then
-    # says nothing is exactly the misleading behavior this removed.
-    @pytest.mark.asyncio
-    async def test_respond_never_reacts(self, monkeypatch):
-        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        monkeypatch.setattr(config, "enable_ack_reaction", True, raising=False)
-        monkeypatch.setattr(config, "ack_reaction_emoji", "eyes", raising=False)
-        app, client, _ = _make_app(_staged("respond"))
-        verdict = await app._run_participation_gate(_channel_msg(), client)
-        assert verdict is not None and verdict.action == "respond"
-        client._reserve_and_react.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_respond_never_reacts_even_with_a_stale_ack_bit(self, monkeypatch):
-        # An old prompt (or a model reciting the old contract) can still emit "ack": true.
-        # It must be inert — no reaction, no crash.
-        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        monkeypatch.setattr(config, "enable_ack_reaction", True, raising=False)
-        monkeypatch.setattr(config, "ack_reaction_emoji", "eyes", raising=False)
-        app, client, _ = _make_app(_staged("respond", ack=True))
-        verdict = await app._run_participation_gate(_channel_msg(), client)
-        assert verdict is not None and verdict.action == "respond"
-        client._reserve_and_react.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_react_verdict_ignores_ack_field(self, monkeypatch):
-        # A react verdict never acks even if the model leaks an ack field — only the
-        # react emoji is placed, once.
-        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        monkeypatch.setattr(config, "enable_ack_reaction", True, raising=False)
-        monkeypatch.setattr(config, "ack_reaction_emoji", "eyes", raising=False)
-        monkeypatch.setattr(config, "reaction_emojis", ["thumbsup"], raising=False)
-        app, client, _ = _make_app(_staged("react", emoji="thumbsup", ack=True))
+    async def test_wake_false_ends_the_turn_at_the_gate(self):
+        # RE-BASELINED: there is no `ignore` action to branch on. A genuine wake=false returns None
+        # from the wiring, which is the caller's whole signal to stop.
+        app, client, fake = _make_app(wake=False)
         assert await app._run_participation_gate(_channel_msg(), client) is None
-        client._reserve_and_react.assert_awaited_once_with("C1", "10.0", "thumbsup")
+        assert fake.calls == 1
 
-    def test_the_unprompted_turn_helper_is_gone(self):
-        # It existed only to decide whether a posted reply burned the hourly counter.
-        # The counter is gone, so the helper is too; `_silence_capable_turn` on the request
-        # config (which exposes no_response_needed) is a DIFFERENT thing and stays.
+    @pytest.mark.asyncio
+    async def test_name_hit_still_reaches_the_gate(self):
+        # F17: a name-addressed message is judged like any other. Being named is not being
+        # addressed, and the prefilter does not get to decide which it was.
+        app, client, fake = _make_app(wake=True)
+        decision = await app._run_participation_gate(
+            _channel_msg(participation_name_hit=True), client)
+        assert decision is not None and fake.calls == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("wake", [True, False])
+    async def test_the_gate_never_puts_a_reaction_in_the_room(self, wake, monkeypatch):
+        """The inverted guard that replaces the whole gate-reaction suite (spec §3).
+
+        The rich gate could place an emoji before the responder ran — so a responder that then
+        chose silence had not actually left the room quiet, and every downstream label had to be
+        told about the gate's emoji. On no outcome, with reactions fully enabled, may the gate
+        touch the room."""
+        monkeypatch.setattr(config, "enable_reactions", True, raising=False)
+        monkeypatch.setattr(config, "reaction_emojis", ["thumbsup", "eyes"], raising=False)
+        app, client, _ = _make_app(wake=wake)
+        msg = _channel_msg()
+        await app._run_participation_gate(msg, client)
+        client._reserve_and_react.assert_not_awaited()
+        client.react.assert_not_awaited()
+        assert "participation_reaction_emoji" not in msg.metadata
+
+    @pytest.mark.asyncio
+    async def test_a_wake_stamps_the_cohort_for_the_responders_input(self, monkeypatch):
+        """The replacement for `participation_burst_earlier`: typed records on the message, which
+        the input builder merges into the real conversation — not prose metadata describing
+        messages the model cannot see."""
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.05, raising=False)
+        app, client, fake = _make_app(wake=True)
+        engine = app.participation_engine
+        first = asyncio.create_task(engine.evaluate(
+            channel_id="C1", ts="9.0", text="earlier thought", sender_id="U1"))
+        await asyncio.sleep(0.005)
+        msg = _channel_msg(ts="10.0")
+        gate = asyncio.create_task(app._run_participation_gate(msg, client))
+        await first
+        decision = await gate
+        assert decision is not None and decision.wake is True
+        assert _texts(msg.metadata["gate_sources"]) == [
+            "earlier thought", "anyone know the deploy status?"]
+        # and none of the retired prose keys are stamped anywhere
+        for retired in ("participation_reason", "participation_burst_earlier",
+                        "participation_reaction_emoji", "participation_images"):
+            assert retired not in msg.metadata
+
+    @pytest.mark.asyncio
+    async def test_a_silent_gate_still_catalogues_the_files(self):
+        """Deciding not to REPLY is not deciding to FORGET. Live on the first run of this feature:
+        four files landed seconds apart, the CSV's message was superseded, and the CSV ceased to
+        exist as far as the bot was concerned — then the model correctly refused to build the
+        report it could not read."""
+        app, client, _ = _make_app(wake=False)
+        msg = _channel_msg()
+        msg.attachments = [{"type": "file", "id": "F1", "name": "data.csv"}]
+        assert await app._run_participation_gate(msg, client) is None
+        app.processor._schedule_async_call.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_woken_turn_leaves_the_files_to_the_turn(self):
+        # On a wake the turn does the richer job (extraction, summaries, descriptions) and
+        # save_document is a plain INSERT — cataloguing here too would just duplicate the row.
+        app, client, _ = _make_app(wake=True)
+        msg = _channel_msg()
+        msg.attachments = [{"type": "file", "id": "F1", "name": "data.csv"}]
+        assert await app._run_participation_gate(msg, client) is not None
+        app.processor._schedule_async_call.assert_not_called()
+
+    def test_the_gate_reaction_and_backoff_machinery_is_gone(self):
+        """AST-level tripwire (spec §9). Each of these was a way for a classifier that had seen one
+        message to act on the workspace: place an emoji, acknowledge a backoff, write a preference
+        row. Leaving any of them executable changes behaviour, which is why they die in this commit
+        rather than in the cleanup one."""
         from main import ChatBotV2
-        assert not hasattr(ChatBotV2, "_is_unprompted_turn")
-
-    @pytest.mark.asyncio
-    async def test_react_verdict_reacts_and_stays_silent(self, monkeypatch):
-        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        monkeypatch.setattr(config, "reaction_emojis", ["eyes"], raising=False)
-        app, client, _ = _make_app(_staged("react", emoji="eyes"))
-        assert await app._run_participation_gate(_channel_msg(), client) is None
-        # F6 addendum: routed through the guard-aware reservation, not the raw react.
-        client._reserve_and_react.assert_awaited_once_with("C1", "10.0", "eyes")
-
-    @pytest.mark.asyncio
-    async def test_react_and_respond_reacts_and_falls_through(self, monkeypatch):
-        # react_and_respond places the gate reaction AND returns the verdict so the response loop
-        # runs — and it stamps the emoji so the response turn's suffix can tell the model.
-        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        monkeypatch.setattr(config, "reaction_emojis", ["tada"], raising=False)
-        app, client, _ = _make_app(_staged("react_and_respond", emoji="tada"))
-        msg = _channel_msg()
-        verdict = await app._run_participation_gate(msg, client)
-        assert verdict is not None and verdict.action == "react_and_respond"
-        client._reserve_and_react.assert_awaited_once_with("C1", "10.0", "tada")
-        assert msg.metadata["participation_reaction_emoji"] == "tada"
-
-    @pytest.mark.asyncio
-    async def test_queue_redispatch_react_and_respond_twice_places_one(self, monkeypatch):
-        # Queue dedup (i): the SAME Message object is re-run through the gate on redispatch, and the
-        # fresh pass picks a DIFFERENT emoji but the same react_and_respond verdict. The stamp from
-        # the first placement makes the second pass a no-op — exactly ONE reaction total.
-        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        monkeypatch.setattr(config, "reaction_emojis", ["tada", "fire"], raising=False)
-        app, client, fake = _make_app(_staged("react_and_respond", emoji="tada"))
-        msg = _channel_msg()
-        v1 = await app._run_participation_gate(msg, client)
-        assert v1 is not None and v1.action == "react_and_respond"
-        fake._verdict = _staged("react_and_respond", emoji="fire")  # redispatch, new emoji
-        v2 = await app._run_participation_gate(msg, client)
-        assert v2 is not None and v2.action == "react_and_respond"
-        assert client._reserve_and_react.await_count == 1
-        client._reserve_and_react.assert_awaited_with("C1", "10.0", "tada")
-        assert msg.metadata["participation_reaction_emoji"] == "tada"
-
-    @pytest.mark.asyncio
-    async def test_queue_redispatch_react_and_respond_then_react_places_one(self, monkeypatch):
-        # Queue dedup (ii): react_and_respond on the first pass, then a redispatch flips to a PLAIN
-        # react with a different emoji. Both branches route through the shared helper, so the stamp
-        # still blocks the second reaction — one reaction total, and the plain react is terminal.
-        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        monkeypatch.setattr(config, "reaction_emojis", ["tada", "fire"], raising=False)
-        app, client, fake = _make_app(_staged("react_and_respond", emoji="tada"))
-        msg = _channel_msg()
-        v1 = await app._run_participation_gate(msg, client)
-        assert v1 is not None and v1.action == "react_and_respond"
-        fake._verdict = _staged("react", emoji="fire")  # redispatch flips to plain react
-        v2 = await app._run_participation_gate(msg, client)
-        assert v2 is None  # a plain react is terminal
-        assert client._reserve_and_react.await_count == 1
-        client._reserve_and_react.assert_awaited_with("C1", "10.0", "tada")
-
-    @pytest.mark.asyncio
-    async def test_backoff_thread_exit_persists_nothing_via_gate(self, monkeypatch):
-        # Redesign: an explicit "stay out of THIS thread" (standing, thread-scoped) backoff routes
-        # through the gate into _apply_backoff. The per-thread mute mechanism was removed, so it is
-        # guidance for the current message only — it writes NOTHING durable (no structural
-        # channel_settings — the clobber this redesign fixes — no channel memory, no marker upsert).
-        # The gate stays silent (returns None).
-        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        monkeypatch.setattr(config, "enable_channel_memory", True, raising=False)
-        app, client, _ = _make_app({
-            "action": "backoff", "durability": "standing", "scope": "thread",
-            "dimension": "thread_participation", "guidance": "stay out of this thread",
-            "memory_op": "add"})
-        assert await app._run_participation_gate(_channel_msg(), client) is None
-        app.processor.db.set_channel_settings_async.assert_not_awaited()
-        app.processor.db.add_channel_memory_async.assert_not_awaited()
-        app.processor.db.upsert_channel_pref_memory.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_backoff_standing_channel_pref_updates_marker_via_gate(self, monkeypatch):
-        # Redesign: a standing, channel-scoped soft preference records ONE per-channel/
-        # per-dimension memory keyed by the stable marker author `participation_engine:pref:
-        # <dimension>`, written through the atomic upsert so a repeat converges on that single
-        # row instead of piling up duplicates (the false "REPEATED = observe-only" escalation is
-        # gone). No mute, no structural write, and never the raw add.
-        monkeypatch.setattr(config, "enable_participation_engine", True, raising=False)
-        monkeypatch.setattr(config, "participation_debounce_seconds", 0, raising=False)
-        monkeypatch.setattr(config, "enable_channel_memory", True, raising=False)
-        app, client, _ = _make_app({
-            "action": "backoff", "durability": "standing", "scope": "channel",
-            "dimension": "reactions", "guidance": "react less here", "memory_op": "add"})
-        assert await app._run_participation_gate(_channel_msg(), client) is None
-        app.processor.db.upsert_channel_pref_memory.assert_awaited_once()
-        args = app.processor.db.upsert_channel_pref_memory.await_args
-        assert args.args[1] == "participation_engine:pref:reactions"   # stable marker author
-        assert "react less" in args.args[2]                           # normalized content
-        app.processor.db.add_channel_memory_async.assert_not_awaited()
-        app.processor.db.set_channel_settings_async.assert_not_awaited()
-
-    def test_participation_prompt_treats_remembered_feedback_as_a_soft_rule(self):
-        """Recorded participation preferences bias how eager the assistant is — and nothing more.
-
-        The old prompt escalated REPEATED butt-out facts into a hidden "observe-only" mode. That
-        escalation is gone (codex flagged it, 2026-07-26): repetition of a soft preference should
-        not silently create a stricter mode than any channel setting can express, and channel
-        memory must never outrank the addressee decision either."""
-        from prompts import PARTICIPATION_SYSTEM_PROMPT
-        p = PARTICIPATION_SYSTEM_PROMPT
-        assert "remembered preferences can change how eager" in p
-        assert "cannot move a message from someone else's conversation into this one" in p
-        assert "observe-only" not in p
-
-    def test_participation_prompt_documents_burst_signal(self):
-        """A same-author burst is one thought split across messages, so it is judged as a whole —
-        otherwise a trailing fragment ("...actually nvm") gets judged alone and the real request
-        goes unanswered."""
-        from prompts import PARTICIPATION_SYSTEM_PROMPT
-        p = PARTICIPATION_SYSTEM_PROMPT
-        assert "same-author burst" in p
-        assert "ONE thought split across messages" in p
-        assert "a reply is expected to cover all of it" in p
+        for gone in ("_place_gate_reaction", "_apply_backoff", "_backoff_ack",
+                     "_apply_pref_memory", "_own_pref_row", "_is_own_dimension_pref",
+                     "_pref_memory_content", "_is_unprompted_turn"):
+            assert not hasattr(ChatBotV2, gone), gone
+        # And the visible-action classifier no longer takes a gate-reaction argument: it can see
+        # all of its own inputs, because nothing put an emoji in the room before it ran.
+        params = list(inspect.signature(ChatBotV2._classify_visible_action).parameters)
+        assert params == ["response", "turn"]
 
 
 class TestPlacement:
@@ -730,23 +684,6 @@ class TestPlacement:
         client.maybe_post_response_footer.assert_awaited_once()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("gate_placement", ["thread", "channel"])
-    async def test_the_gate_placement_verdict_no_longer_routes_delivery(self, gate_placement):
-        """The gate forms its verdict BEFORE the answer exists, so it cannot know whether what
-        gets written belongs in the room or in a thread. Delivery now ignores it entirely — the
-        field survives only until the binary-gate commit removes it."""
-        app, client = self._app_with_processor(self._resp())
-        app.participation_engine = MagicMock()
-        verdict = ParticipationVerdict(action="respond", emoji="",
-                                       placement=gate_placement, reason="whatever")
-        app._run_participation_gate = AsyncMock(return_value=verdict)
-        msg = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
-                      metadata={"ts": "10.0", "channel_post_allowed": True,
-                                "gate_required": True, "silence_capable": True})
-        await app.handle_message(msg, client)
-        assert client.send_message.await_args.args[1] == "10.0"  # the default, either way
-
-    @pytest.mark.asyncio
     async def test_thread_reply_never_moves_top_level_despite_setting(self):
         app, client = self._app_with_processor(self._resp())
         msg = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
@@ -755,32 +692,35 @@ class TestPlacement:
         assert client.send_message.await_args.args[1] == "10.0"
 
     @pytest.mark.asyncio
-    async def test_respond_verdict_burst_earlier_lands_in_metadata(self):
-        # F27: a respond verdict carrying earlier same-author burst messages stamps them
-        # onto message.metadata so the wake envelope can tell the reply to cover them all.
+    async def test_a_woken_turn_carries_no_gate_prose_into_the_responder(self):
+        """RE-BASELINED from two tests that asserted the gate's `burst_earlier` and `reason`
+        landed in metadata for the wake envelope to render.
+
+        `reason` is deleted outright — it was forwarded into the responder's prompt, where it
+        pre-argued the turn and undercut the responder's own option to stay silent — and the burst
+        is delivered as real conversation instead (see the gate-wiring cohort test). So the
+        assertion inverts: a woken turn's metadata gains none of it."""
         app, client = self._app_with_processor(self._resp())
         app.participation_engine = MagicMock()
-        verdict = ParticipationVerdict(
-            action="respond", emoji="", placement="thread", reason="combined ask",
-            burst_earlier=["first bit", "second bit"])
-        app._run_participation_gate = AsyncMock(return_value=verdict)
+        app._run_participation_gate = AsyncMock(return_value=WakeDecision(wake=True))
         msg = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
                       metadata={"ts": "10.0", "gate_required": True, "silence_capable": True})
         await app.handle_message(msg, client)
-        assert msg.metadata["participation_burst_earlier"] == ["first bit", "second bit"]
-        assert msg.metadata["participation_reason"] == "combined ask"
+        assert client.send_message.await_args.args[1] == "10.0"
+        for retired in ("participation_reason", "participation_burst_earlier",
+                        "participation_reaction_emoji"):
+            assert retired not in msg.metadata
 
     @pytest.mark.asyncio
-    async def test_no_burst_earlier_leaves_metadata_unset(self):
+    async def test_a_gate_that_does_not_wake_produces_no_reply_at_all(self):
         app, client = self._app_with_processor(self._resp())
         app.participation_engine = MagicMock()
-        verdict = ParticipationVerdict(action="respond", emoji="", placement="thread",
-                                       reason="plain")
-        app._run_participation_gate = AsyncMock(return_value=verdict)
+        app._run_participation_gate = AsyncMock(return_value=None)
         msg = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
                       metadata={"ts": "10.0", "gate_required": True, "silence_capable": True})
         await app.handle_message(msg, client)
-        assert "participation_burst_earlier" not in msg.metadata
+        client.send_message.assert_not_awaited()
+        app.processor.process_message.assert_not_awaited()
 
 
 # ------------------------------------------------------- modal dual-write + DB columns
@@ -803,15 +743,15 @@ class TestDBAndModal:
                     db.conn.close()
 
     def test_new_columns_set_get_preserve_clear(self, temp_db):
-        temp_db.set_channel_settings("C1", participation_level="active",
+        temp_db.set_channel_settings("C1", participation_level="on",
                                      snoozed_until="2026-07-09T20:00:00+00:00")
         row = temp_db.get_channel_settings("C1")
-        assert row["participation_level"] == "active"
+        assert row["participation_level"] == "on"
         assert row["snoozed_until"] == "2026-07-09T20:00:00+00:00"
         # omitted fields preserved
         temp_db.set_channel_settings("C1", verbosity="low")
         row = temp_db.get_channel_settings("C1")
-        assert row["participation_level"] == "active"
+        assert row["participation_level"] == "on"
         assert row["snoozed_until"] == "2026-07-09T20:00:00+00:00"
         # explicit None clears
         temp_db.set_channel_settings("C1", participation_level=None, snoozed_until=None)
@@ -861,13 +801,15 @@ class TestDBAndModal:
         from settings_modal import SettingsModal
         builder = SettingsModal.__new__(SettingsModal)
         view = builder.build_channel_settings_modal(
-            "C1", {"participation_level": "active"}, "tag_only")
+            "C1", {"participation_level": "on"}, "tag_only")
         blocks = {b.get("block_id"): b for b in view["blocks"] if b.get("block_id")}
         sel = blocks["participation_block"]["element"]
         assert sel["action_id"] == "participation_level"
-        assert sel["initial_option"]["value"] == "active"
+        assert sel["initial_option"]["value"] == "on"
         values = [o["value"] for o in sel["options"]]
-        assert values == ["inherit", "mentions_only", "judicious", "active", "off"]
+        # Three levels + inherit. The retired restraint dials must not linger as pickable options:
+        # a user selecting one would store a level nothing resolves.
+        assert values == ["inherit", "mentions_only", "on", "off"]
         assert "snooze_block" not in blocks
 
     def test_modal_legacy_mode_row_maps_and_no_snooze_block(self):
@@ -875,7 +817,7 @@ class TestDBAndModal:
         builder = SettingsModal.__new__(SettingsModal)
         view = builder.build_channel_settings_modal("C1", {"response_mode": "auto_respond"}, "tag_only")
         blocks = {b.get("block_id"): b for b in view["blocks"] if b.get("block_id")}
-        assert blocks["participation_block"]["element"]["initial_option"]["value"] == "judicious"
+        assert blocks["participation_block"]["element"]["initial_option"]["value"] == "on"
         assert "snooze_block" not in blocks
 
 

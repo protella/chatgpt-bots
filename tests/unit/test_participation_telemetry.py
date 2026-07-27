@@ -26,7 +26,7 @@ import pytest
 from base_client import Message
 from config import config
 from message_processor import participation_telemetry as pt
-from message_processor.participation import ParticipationEngine
+from message_processor.participation import ParticipationEngine, WakeDecision
 
 
 @pytest.fixture
@@ -135,14 +135,24 @@ def test_record_never_raises_and_never_writes_before_initialization():
         pt.record("gate_start", channel_id="C1", trigger_ts="1.0")   # must not raise
 
 
-def test_a_model_authored_reason_is_bounded(sink):
-    """Reasons are the classifier's prose about a human's message and may echo it. Same bound
-    as the stored preference sentence — one shared privacy policy, not two."""
+def test_the_bound_on_model_authored_prose_still_exists_for_the_rows_that_carry_it(sink):
+    """RE-BASELINED. This used to bound the GATE's `reason` — prose the classifier wrote about a
+    human's message, which is why it was capped in the first place. The gate writes no reason
+    anywhere now (spec §2: "Deleted; never forwarded or logged"), so the cap has one fewer caller
+    and the honest test is of the helper plus the absence.
+
+    The privacy policy is one policy, not two, so the bound is asserted where it still applies."""
     long_reason = "x" * (pt.GUIDANCE_TRUNCATION_CHARS + 50)
-    pt.gate_decision("C1", "1.0", MagicMock(action="ignore", reason=long_reason))
-    written = sink("gate_decision")[0]["reason"]
+    written = pt.truncate_reason(long_reason)
     assert len(written) == pt.GUIDANCE_TRUNCATION_CHARS + 1   # + the ellipsis
     assert written.endswith("…")
+    assert pt.truncate_reason("") is None and pt.truncate_reason("   ") is None
+
+    # ...and gate_decision has nowhere to put one: the signature is keyword-only and closed.
+    pt.gate_decision("C1", "1.0", wake=False)
+    assert "reason" not in sink("gate_decision")[0]
+    with pytest.raises(TypeError):
+        pt.gate_decision("C1", "1.0", wake=False, reason=long_reason)
 
 
 # ---------------------------------------------------------------- the attempt lifecycle helper
@@ -195,9 +205,34 @@ def test_the_contract_version_says_the_event_set_changed():
     """v3 added the `queue_link` event; v4 turned `silence_reason` from prose into a declared
     enum and made `reaction_visible` unconditional; v5 dropped the ambiguous `placement` field
     for `destination` + `destination_source`; v6 added the `stale_suppressed` terminal kind and
-    the `stale_send` diagnostic. Each is a change an analysis written against the older contract
-    must be able to refuse."""
-    assert pt.CONTRACT_VERSION == 6
+    the `stale_send` diagnostic; v7 is the binary gate — `gate_decision` loses action, emoji,
+    placement, reason, the staged findings, the overrules and the backoff taxonomy, and carries
+    one bool plus four facts about the call. Each is a change an analysis written against the
+    older contract must be able to refuse.
+
+    GATE_CONTRACT is asserted beside it because the two move independently — v2–v6 rows remain
+    valid under their own contracts, and a reader has to be able to tell which one a row obeys."""
+    assert pt.CONTRACT_VERSION == 7
+    assert pt.GATE_CONTRACT == "binary-v1"
+
+
+def test_a_decision_row_carries_the_bit_and_nothing_the_gate_does_not_decide(sink):
+    """The v7 field set, pinned. Every name in the second list is a judgment the gate no longer
+    makes, so a row carrying one would describe a decision nobody made."""
+    pt.gate_decision("C1", "1.0", wake=True, attempt_id="A1", gate_ms=3100,
+                     classifier_ms=740, source_count=3, newest_source_ts="1.2")
+    row = sink("gate_decision")[0]
+    assert row["wake"] is True
+    assert row["model"] == config.utility_model
+    assert (row["gate_ms"], row["classifier_ms"]) == (3100, 740)
+    # The cohort this bit was decided over: without these, a wake on a five-message burst is
+    # indistinguishable from a wake on one, which is the difference between the debounce working
+    # and the debounce dropping things.
+    assert (row["source_count"], row["newest_source_ts"]) == (3, "1.2")
+    for retired in ("action", "emoji", "placement", "reason", "relation", "exchange_state",
+                    "answerability", "overruled_by", "dimension", "durability", "scope",
+                    "guidance", "memory_op", "structural_request", "burst_earlier"):
+        assert retired not in row, retired
 
 
 def test_a_gated_successor_names_the_attempt_it_absorbed_them_into(sink):
@@ -371,31 +406,24 @@ def test_a_queue_link_is_not_a_terminal_event(sink):
 # ------------------------------------------------------------------------ gate-terminal wiring
 
 class _FakeClassifier:
-    """An openai_client stand-in. `verdict` may be a dict, None (the failure signal), or an
-    exception instance to raise."""
+    """An openai_client stand-in. `wake` may be True/False, None (the classifier's own
+    no-usable-bit signal), or an exception instance to raise."""
 
-    def __init__(self, verdict):
-        self._verdict = verdict
+    def __init__(self, wake):
+        self._wake = wake
         self.calls = 0
 
-    async def classify_participation(self, text, signals=None, **kwargs):
+    async def classify_wake(self, *, sources, channel_steering_text=None):
         self.calls += 1
-        if isinstance(self._verdict, Exception):
-            raise self._verdict
-        return self._verdict
+        if isinstance(self._wake, Exception):
+            raise self._wake
+        return self._wake
 
 
-def _staged(action, **extra):
-    v = {"action": action, "relation": "to_assistant", "exchange_state": "open",
-         "answerability": "substantive"}
-    v.update(extra)
-    return v
-
-
-def _app(verdict, react_result=None):
+def _app(wake, react_result=None):
     from main import ChatBotV2
     app = ChatBotV2.__new__(ChatBotV2)
-    app.participation_engine = ParticipationEngine(_FakeClassifier(verdict))
+    app.participation_engine = ParticipationEngine(_FakeClassifier(wake))
     app.processor = MagicMock()
     app.processor.db = MagicMock()
     app.processor.db.get_channel_memory_async = AsyncMock(return_value=[])
@@ -423,7 +451,7 @@ def _terminals(lines):
 
 @pytest.mark.asyncio
 async def test_a_supersession_ends_in_exactly_one_terminal_event(sink, instant_gate):
-    app, client = _app(_staged("respond"))
+    app, client = _app(True)
     message = _msg()
     app.participation_engine.note_arrival("C1", "20.0", None, "U1")  # a newer message arrived
 
@@ -439,7 +467,7 @@ async def test_a_supersession_ends_in_exactly_one_terminal_event(sink, instant_g
 
 @pytest.mark.asyncio
 async def test_an_edit_supersession_ends_in_exactly_one_terminal_event(sink, instant_gate):
-    app, client = _app(_staged("respond"))
+    app, client = _app(True)
     message = _msg()
     app.participation_engine.supersede("C1", "10.0", thread_root="10.0", sender_id="U1")
 
@@ -482,20 +510,30 @@ async def test_a_classifier_exception_records_its_type_and_its_latency(sink, ins
 
 
 @pytest.mark.asyncio
-async def test_a_failure_after_the_verdict_is_not_a_classifier_decline(sink, instant_gate):
+async def test_a_failure_after_the_decision_is_not_a_classifier_decline(sink, instant_gate):
     """The model decided; carrying the decision out is what broke. Filing that as a decline
-    reports the gate as unable to judge while its verdict sits two lines above in the same
+    reports the gate as unable to judge while its decision sits two lines above in the same
     file — and inflates exactly the number ("how often does the classifier fail?") that would
-    send someone looking at the wrong system."""
-    app, client = _app(_staged("react", emoji="tada"))
+    send someone looking at the wrong system.
 
-    async def _boom(*a, **k):
-        raise RuntimeError("slack down")
+    RE-BASELINED in how it is provoked, not in what it asserts. There used to be a rich action to
+    fail at (`_place_gate_reaction` raising on the way to Slack); with the reaction and the backoff
+    write deleted, the only work left after the bit is stamping the cohort on the message. So the
+    metadata itself refuses the write — contrived, deliberately, because the SPLIT is the thing
+    worth keeping: `decision_recorded` is what tells "the gate could not judge" apart from "the
+    gate judged and the handoff broke", and an untested branch is how that distinction rots."""
+    class _HostileMetadata(dict):
+        def __setitem__(self, key, value):
+            if key == "gate_sources":
+                raise RuntimeError("slack down")
+            super().__setitem__(key, value)
 
-    app._place_gate_reaction = _boom
-    assert await app._gate_verdict(_msg(), client) is None
+    app, client = _app(True)
+    message = _msg()
+    message.metadata = _HostileMetadata(message.metadata)
+    assert await app._gate_verdict(message, client) is None
 
-    assert sink("gate_decision")[0]["action"] == "react"      # the verdict IS on record
+    assert sink("gate_decision")[0]["wake"] is True           # the decision IS on record
     decline = sink("gate_declined")[0]
     assert (decline["cause"], decline["detail"]) == ("action_error", "RuntimeError")
     terminals = _terminals(sink)
@@ -505,7 +543,7 @@ async def test_a_failure_after_the_verdict_is_not_a_classifier_decline(sink, ins
 @pytest.mark.asyncio
 async def test_a_failure_before_any_verdict_is_still_a_plain_error(sink, instant_gate):
     """The other side of the same split: nothing was decided, so this one really is a decline."""
-    app, client = _app(_staged("respond"))
+    app, client = _app(True)
     app.participation_engine.note_arrival = MagicMock(side_effect=RuntimeError("boom"))
     assert await app._gate_verdict(_msg(), client) is None
 
@@ -515,146 +553,88 @@ async def test_a_failure_before_any_verdict_is_still_a_plain_error(sink, instant
 
 
 @pytest.mark.asyncio
-async def test_failure_and_a_real_ignore_are_the_same_silence_and_different_rows(
+async def test_failure_and_a_real_no_wake_are_the_same_silence_and_different_rows(
         sink, instant_gate):
     """Behaviour equivalence, asserted rather than assumed: returning None from the classifier
-    changed what we WRITE DOWN, and nothing about what the room sees."""
+    changed what we WRITE DOWN, and nothing about what the room sees.
+
+    `none` vs `silence` is the whole point. Only a genuine wake=false is the model choosing to stay
+    out; a provider outage is the gate never opening, and scoring it as restraint would corrupt the
+    one number this ledger exists to produce."""
     app_failed, client = _app(None)
-    app_quiet, client2 = _app(_staged("ignore"))
+    app_quiet, client2 = _app(False)
 
     assert await app_failed._gate_verdict(_msg(), client) is None
     assert await app_quiet._gate_verdict(_msg(), client2) is None    # identical outcome
 
     kinds = [(r["kind"], r.get("cause")) for r in _terminals(sink)]
     assert kinds == [("none", "classifier_error"), ("silence", None)]
+    # ...and only the second produced a decision row at all.
+    assert [r["wake"] for r in sink("gate_decision")] == [False]
 
 
 @pytest.mark.asyncio
-async def test_a_quiet_verdict_is_a_decision_and_says_so(sink, instant_gate):
-    app, client = _app(_staged("ignore"))
+async def test_a_decision_not_to_wake_is_a_decision_and_says_so(sink, instant_gate):
+    app, client = _app(False)
     assert await app._gate_verdict(_msg(), client) is None
 
     decision = sink("gate_decision")[0]
-    assert decision["action"] == "ignore"
-    assert decision["model"] == config.utility_model    # verdict quality is model-specific
+    assert decision["wake"] is False
+    assert decision["model"] == config.utility_model    # decision quality is model-specific
     assert "gate_ms" in decision and "classifier_ms" in decision
+    assert decision["source_count"] == 1 and decision["newest_source_ts"] == "10.0"
     terminal = _terminals(sink)[0]
     assert terminal["kind"] == "silence" and terminal["ended_by"] == "gate"
+    # No silence_reason: that eight-value enum belongs to the RESPONDER, which can say why it chose
+    # to stay quiet after seeing everything. The gate knows only that it did not open.
+    assert "silence_reason" not in terminal
     # A gate-only outcome never woke the responder. Conflating "the gate acted" with "the gate
     # woke the bot" makes the wake rate unreadable.
     assert terminal["gate_woke"] is False and terminal["responder_started"] is False
 
 
 @pytest.mark.asyncio
-async def test_a_react_verdict_that_lands_is_a_reaction_only_turn(sink, instant_gate):
-    app, client = _app(_staged("react", emoji="tada"))
-    assert await app._gate_verdict(_msg(), client) is None
+@pytest.mark.parametrize("wake", [True, False, None])
+async def test_the_gate_writes_no_reaction_row_on_any_outcome(sink, instant_gate, wake):
+    """SEVEN TESTS COLLAPSE INTO THIS ONE, and the collapse is the commit.
 
-    reaction = sink("reaction")[0]
-    assert (reaction["operation"], reaction["result"]) == ("add", "added")
-    assert reaction["origin"] == "gate" and reaction["emoji"] == "tada"
-    terminals = _terminals(sink)
-    assert len(terminals) == 1 and terminals[0]["kind"] == "reaction_only"
+    They covered the gate's own reactions in detail: a react verdict that landed (reaction_only), one
+    whose emoji failed (none), one Slack said was already there (already_present), one the
+    once-per-message stamp refused before Slack (already_stamped), and three backoff-ack variants
+    (acked → reaction_only, feedback about reactions → silence, redispatched ack → not a silence).
+    Every one of them described the gate placing an emoji before the responder ran — which is
+    exactly what commit 6 deletes, along with `_place_gate_reaction`, `_backoff_ack`, and the
+    `origin=gate` / `origin=backoff_ack` runtime emissions.
 
-
-@pytest.mark.asyncio
-async def test_a_react_verdict_whose_emoji_never_landed_showed_nothing(sink, instant_gate):
-    """The emoji IS the turn. Filing a failed add as reaction_only would report a reaction that
-    is not on the message."""
-    app, client = _app(_staged("react", emoji="tada"),
-                       react_result={"ok": False, "error": "reaction_cap"})
-    assert await app._gate_verdict(_msg(), client) is None
-
-    reaction = sink("reaction")[0]
-    assert reaction["result"] == "failed" and reaction["detail"] == "reaction_cap"
-    terminals = _terminals(sink)
-    assert len(terminals) == 1 and terminals[0]["kind"] == "none"
-
-
-@pytest.mark.asyncio
-async def test_an_emoji_somebody_else_placed_is_not_one_we_added(sink, instant_gate):
-    """`idempotent` from the reservation layer means the emoji is present, not that we put it
-    there. Counting those as placements would credit the gate with reactions it never made."""
-    app, client = _app(_staged("react", emoji="tada"),
-                       react_result={"ok": True, "idempotent": True})
-    await app._gate_verdict(_msg(), client)
-    assert sink("reaction")[0]["result"] == "already_present"
-
-
-@pytest.mark.asyncio
-async def test_a_gate_reaction_refused_before_slack_is_still_recorded(sink, instant_gate):
-    """A redispatch re-runs the same message and the once-per-message stamp refuses the second
-    reaction. Invisible before this — which made "the gate stopped reacting" impossible to tell
-    apart from "the gate stopped choosing emoji"."""
-    app, client = _app(_staged("react", emoji="tada"))
-    message = _msg(participation_reaction_emoji="eyes")   # a previous pass already reacted
-
-    await app._gate_verdict(message, client)
-
-    reaction = sink("reaction")[0]
-    assert reaction["result"] == "already_present"
-    assert reaction["detail"] == "already_stamped"
-    client._reserve_and_react.assert_not_awaited()
-    # ...and the TURN is still a reaction turn. The stamp is only ever written on a genuine
-    # placement, so the emoji is on that message right now; filing this as `none` described an
-    # untouched message that visibly has a reaction on it.
-    terminals = _terminals(sink)
-    assert len(terminals) == 1 and terminals[0]["kind"] == "reaction_only"
-
-
-@pytest.mark.asyncio
-async def test_a_backoff_whose_ack_was_already_stamped_is_not_a_silence(sink, instant_gate):
-    """Same fact, the other branch: a redispatched backoff finds its ack already on the message.
-    The feedback WAS visibly acknowledged, so the turn is not silent."""
-    app, client = _app({"action": "backoff", "emoji": "ok_hand", "dimension": "replies",
-                        "durability": "momentary", "scope": "thread", "memory_op": "none",
-                        "structural_request": "none"})
-    message = _msg(participation_reaction_emoji="ok_hand")
-    assert await app._gate_verdict(message, client) is None
-
-    terminals = _terminals(sink)
-    assert len(terminals) == 1
-    assert terminals[0]["kind"] == "reaction_only" and terminals[0]["detail"] == "backoff"
-
-
-@pytest.mark.asyncio
-async def test_a_handled_backoff_with_an_ack_is_not_a_silent_turn(sink, instant_gate):
-    app, client = _app({"action": "backoff", "emoji": "ok_hand", "dimension": "replies",
-                        "durability": "momentary", "scope": "thread", "memory_op": "none",
-                        "structural_request": "none"})
-    assert await app._gate_verdict(_msg(), client) is None
-
-    reaction = sink("reaction")[0]
-    # Its own origin: a protocol acknowledgment is not a social reaction the classifier chose
-    # for its own sake, and pooling them would flatter every emoji-diversity number.
-    assert reaction["origin"] == "backoff_ack" and reaction["result"] == "added"
-    terminals = _terminals(sink)
-    assert len(terminals) == 1
-    assert terminals[0]["kind"] == "reaction_only" and terminals[0]["detail"] == "backoff"
-    # The taxonomy rides the DECISION. Without it a handled backoff is a bare reaction_only with
-    # no way to ask what the feedback was about or whether it was meant to stick — the whole
-    # question the taxonomy exists to answer.
-    decision = sink("gate_decision")[0]
-    assert (decision["dimension"], decision["durability"]) == ("replies", "momentary")
-    assert (decision["scope"], decision["memory_op"]) == ("thread", "none")
-    assert decision["structural_request"] == "none"
-    # ...and never the free-text guidance, which is prose about a human's message.
-    assert "guidance" not in decision
-
-
-@pytest.mark.asyncio
-async def test_a_handled_backoff_without_an_ack_is_a_silence(sink, instant_gate):
-    """Feedback ABOUT reactions never gets acked with a reaction — acking "stop reacting" with
-    a reaction is absurd — so that turn really did show the room nothing."""
-    app, client = _app({"action": "backoff", "emoji": "ok_hand", "dimension": "reactions",
-                        "durability": "momentary", "scope": "thread", "memory_op": "none",
-                        "structural_request": "none"})
-    assert await app._gate_verdict(_msg(), client) is None
+    So there is nothing left to parametrize over except the outcomes, and the assertion is that the
+    room is untouched on all of them. `origin=work_claim` (TurnRuntime.claim_work) and
+    `origin=responder` (the react tool) are unaffected and are covered in their own sections."""
+    app, client = _app(wake)
+    message = _msg()
+    assert (await app._gate_verdict(message, client) is None) is (wake is not True)
 
     assert sink("reaction") == []
-    terminals = _terminals(sink)
-    assert len(terminals) == 1
-    assert terminals[0]["kind"] == "silence" and terminals[0]["detail"] == "backoff"
+    client._reserve_and_react.assert_not_awaited()
+    assert "participation_reaction_emoji" not in message.metadata
+    # No decision row carries an emoji or a backoff taxonomy either — a reaction that is only
+    # recorded and never placed is the same lie told in the ledger instead of the room.
+    for row in sink("gate_decision"):
+        for retired in ("emoji", "dimension", "durability", "scope", "memory_op",
+                        "structural_request", "guidance"):
+            assert retired not in row, retired
+
+
+@pytest.mark.asyncio
+async def test_the_gate_writes_nothing_durable_on_any_outcome(sink, instant_gate):
+    """The other half of the deleted backoff path: a classifier that had seen ONE message used to
+    write channel settings and a preference memory row. Participation feedback wakes the responder
+    now, whose memory/settings tools own the write under commit-3 authorization — so the gate must
+    touch neither database method on any outcome."""
+    for wake in (True, False, None):
+        app, client = _app(wake)
+        await app._gate_verdict(_msg(), client)
+        app.processor.db.upsert_channel_pref_memory.assert_not_called()
+        app.processor.db.set_channel_settings_async.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -664,11 +644,11 @@ async def test_a_speaking_verdict_leaves_the_attempt_open_for_the_responder(sink
 
     Through `_run_participation_gate`, not `_gate_verdict`: the wake is recorded once at the
     single point where a verdict leaves the gate, rather than once per fall-through branch."""
-    app, client = _app(_staged("respond"))
+    app, client = _app(True)
     message = _msg()
-    verdict = await app._run_participation_gate(message, client)
+    decision = await app._run_participation_gate(message, client)
 
-    assert verdict is not None and verdict.action == "respond"
+    assert decision is not None and decision.wake is True
     assert _terminals(sink) == []
     assert message.metadata[pt.GATE_WOKE_KEY] is True
     assert message.metadata["gate_woke"] is True   # …and the public routing fact agrees
@@ -681,7 +661,7 @@ async def test_the_engine_off_path_still_counts_as_an_attempt(sink):
     decline and a terminal but no start contributed two numerators and nothing to divide by.
     (The OTHER engine-off drop, the pre-dispatch one in message_events, never reaches the gate
     and is documented as outside this population.)"""
-    app, client = _app(_staged("respond"))
+    app, client = _app(True)
     with patch.object(config, "enable_participation_engine", False):
         assert await app._gate_verdict(_msg(), client) is None
 
@@ -698,7 +678,7 @@ async def test_the_engine_off_path_still_counts_as_an_attempt(sink):
 
 @pytest.mark.asyncio
 async def test_gate_start_records_the_posture_the_message_arrived_with(sink, instant_gate):
-    app, client = _app(_staged("ignore"))
+    app, client = _app(False)
     message = _msg(sender_type="human", wake_source="ambient", edit_reply_marker="99.9")
     message.metadata[pt.ATTEMPT_KEY] = "an-earlier-attempt"   # i.e. a queued redispatch
 
@@ -940,14 +920,15 @@ async def test_engine_records_a_supersession_decline(sink):
     """End-to-end through the real ParticipationEngine: a message overtaken during the debounce
     yields no verdict, and that nothing is the invisible half of the population."""
     engine = ParticipationEngine(MagicMock())
-    engine.openai_client.classify_participation = AsyncMock(return_value={"action": "ignore"})
+    engine.openai_client.classify_wake = AsyncMock(return_value=False)
     with patch.object(config, "participation_debounce_seconds", 0.0):
         engine.note_arrival("C1", "20.0", None, "U1")  # a newer message already arrived
         evaluation = await engine.evaluate(channel_id="C1", ts="10.0", text="hi",
                                            sender_id="U1", attempt_id="A1")
 
-    assert evaluation.verdict is None
+    assert evaluation.decision is None
     assert evaluation.decline_cause == "superseded"
+    engine.openai_client.classify_wake.assert_not_awaited()   # nothing was even asked
     rows = sink("gate_declined")
     assert len(rows) == 1
     assert rows[0]["cause"] == "superseded"
@@ -956,18 +937,23 @@ async def test_engine_records_a_supersession_decline(sink):
 
 @pytest.mark.asyncio
 async def test_engine_reports_the_failure_and_still_fails_safe(sink):
-    """An API error still becomes an `ignore` verdict downstream — byte-identical silence — but
-    the engine now says so in the return value, so the caller can close the attempt honestly
-    instead of reading the cause off a log line."""
+    """An API error is still silence in the room — that has not changed — but it is no longer
+    DRESSED as a decision.
+
+    RE-BASELINED: the old assertion was `evaluation.verdict.action == "ignore"`, i.e. the engine
+    manufactured a fail-safe verdict and the caller could not tell it from the model choosing to
+    stay out. Now `decision` is None and `decline_cause` says which kind of nothing it was, so the
+    caller closes the attempt as `none` instead of scoring a provider outage as restraint."""
     engine = ParticipationEngine(MagicMock())
-    engine.openai_client.classify_participation = AsyncMock(side_effect=TimeoutError("upstream"))
+    engine.openai_client.classify_wake = AsyncMock(side_effect=TimeoutError("upstream"))
     with patch.object(config, "participation_debounce_seconds", 0.0):
         evaluation = await engine.evaluate(channel_id="C1", ts="10.0", text="hi", sender_id="U1")
 
-    assert evaluation.verdict.action == "ignore"       # behaviour unchanged
+    assert evaluation.decision is None                 # no forged bit
     assert evaluation.decline_cause == "classifier_error"
-    assert isinstance(evaluation.classifier_ms, int)
+    assert isinstance(evaluation.classifier_ms, int)   # measured even on the failing path
     assert sink("gate_declined")[0]["detail"] == "TimeoutError"
+    assert sink("gate_decision") == []
 
 
 # --------------------------------------------------------- the responder's own terminal event
@@ -984,17 +970,19 @@ def _responder_app(response, *, provenance_error=None):
     return app
 
 
-async def _run_responder(app, message, *, gate_emoji=None):
-    """Drive handle_message past a gate that woke the responder. `gate_emoji` stands in for a
-    react_and_respond that already put an emoji on the message."""
+async def _run_responder(app, message):
+    """Drive handle_message past a gate that woke the responder.
+
+    The old `gate_emoji=` knob is gone with the thing it simulated: react_and_respond put an emoji
+    on the message BEFORE the responder ran, and the terminal classifier had to be told about it
+    separately. Every reaction is the responder's own now, so a test that wants one in the room
+    puts `response_reaction_committed` on the RESPONSE — which is where the live path reads it."""
     from main import ChatBotV2
 
     async def _gate(msg, client):
         pt.begin_attempt(msg)
         pt.mark_gate_woke(msg)
-        if gate_emoji:
-            msg.metadata["participation_reaction_emoji"] = gate_emoji
-        return MagicMock(placement="thread", reason=None, burst_earlier=None)
+        return WakeDecision(wake=True)
 
     app._run_participation_gate = _gate
     client = MagicMock()
@@ -1007,12 +995,18 @@ async def _run_responder(app, message, *, gate_emoji=None):
 
 
 @pytest.mark.asyncio
-async def test_a_gate_reaction_plus_a_responder_veto_is_not_a_silence(sink):
-    """react_and_respond puts the emoji up BEFORE the responder runs. If the responder then
-    vetoes with no_response_needed, the terminal used to say `silence` about a message that
-    visibly has a reaction on it — and the reason it gave was the reason for using no WORDS."""
-    app = _responder_app(_resp(terminal_action="no_reply", silence_reason="nothing_to_add"))
-    await _run_responder(app, _msg(), gate_emoji="tada")
+async def test_a_reaction_plus_a_declared_silence_is_not_a_silence(sink):
+    """A turn that reacted and then declared "no words needed" left something in the room, so the
+    terminal must not call it silence — and the reason it gave was the reason for using no WORDS,
+    which is preserved rather than swallowed.
+
+    RE-BASELINED as to WHOSE emoji it is: this was the react_and_respond case, where the gate put
+    the emoji up before the responder ran. The gate places nothing now, so the same shape arises
+    from the responder reacting through react_to_message and then vetoing — the identical terminal
+    question with one fewer actor in it."""
+    app = _responder_app(_resp(terminal_action="no_reply", silence_reason="nothing_to_add",
+                               response_reaction_committed=True))
+    await _run_responder(app, _msg())
 
     terminal = _terminals(sink)[0]
     assert terminal["kind"] == "reaction_only"
@@ -1051,10 +1045,11 @@ async def test_reacted_instead_with_no_reaction_records_both_halves(sink):
 
 @pytest.mark.asyncio
 async def test_a_reply_that_also_reacted_says_so(sink):
-    """`kind` names the words because they are the louder half — so the emoji half of a
-    react_and_respond has to ride beside it or it leaves the terminal record entirely."""
-    app = _responder_app(_resp(content="here you go", posted=True, streamed=True, model="m-1"))
-    await _run_responder(app, _msg(), gate_emoji="tada")
+    """`kind` names the words because they are the louder half — so the emoji half of a turn that
+    both reacted and replied has to ride beside it or it leaves the terminal record entirely."""
+    app = _responder_app(_resp(content="here you go", posted=True, streamed=True, model="m-1",
+                               response_reaction_committed=True))
+    await _run_responder(app, _msg())
 
     terminal = _terminals(sink)[0]
     assert terminal["kind"] == "reply" and terminal["reaction_visible"] is True

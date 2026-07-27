@@ -16,7 +16,13 @@ def _startup_db():
     disobeyed. So every test that initializes needs the call to succeed.
     """
     db = Mock()
-    db.migrate_channel_directives_to_policy_async = AsyncMock(return_value=(0, 0))
+    # Startup runs every state migration before Slack traffic and ABORTS if one fails — a channel
+    # left behind has something its operator set that this build would silently ignore. So each of
+    # them has to succeed for a test to get through initialize().
+    for name in ("migrate_channel_directives_to_policy_async",
+                 "migrate_participation_levels_to_binary_async",
+                 "migrate_participation_prefs_to_policy_async"):
+        setattr(db, name, AsyncMock(return_value=(0, 0)))
     return db
 
 

@@ -4,7 +4,7 @@ When the bot is ADDED to a real channel, it posts ONE public intro:
   - a grounded read on what the channel is about + up to two concrete offers (composed FROM the
     Track 1 channel summary — omitted entirely for an empty/new channel; never invented),
   - a plain-English "how to manage my participation" note worded by the channel's CURRENT
-    participation state (judicious / mentions_only / off — see _participation_howto), and
+    participation state (on / mentions_only / off — see _participation_howto), and
   - a Configure button (the SAME open_channel_settings action the response footer uses) — the only
     control path when the channel is `off`.
 
@@ -45,7 +45,7 @@ _HELLO_TEXT = (
     "how to work with me right here in the thread. 🧵"
 )
 
-# The plain-English tuning line, appended for judicious/mentions_only (NOT off — an off channel
+# The plain-English tuning line, appended for on/mentions_only (NOT off — an off channel
 # never responds, so plain-English tuning can't reach it; only Configure can).
 _TUNE_LINE = (
     " You can tune that in plain English — tag me with “jump in when someone shares a paper,” "
@@ -281,13 +281,15 @@ class SlackChannelJoinMixin:
         if level == "off":
             return ("Participation is currently off here, so I won't respond even to tags. "
                     "Use Configure to turn me on.")
-        if level == "mentions_only":
-            return ("I'm set to mentions only here, so I'll stay quiet unless you tag or name me."
-                    + _TUNE_LINE)
-        if level == "active":
-            return ("I'll take part actively here, jumping in where I can help." + _TUNE_LINE)
-        # judicious (the default) and any unknown value fall through to the gentlest on-wording.
-        return ("I'll chime in selectively when I can add something concrete." + _TUNE_LINE)
+        if level == "on":
+            return ("I'm reading along here, so I'll chime in when I can add something concrete "
+                    "and stay out of it when I can't." + _TUNE_LINE)
+        # mentions_only, plus any unknown value. Falling back to the QUIETEST speaking wording is
+        # deliberate and matches resolve_participation_level, which degrades an unrecognized level to
+        # mentions_only: if we can't tell what the channel is set to, promising less than the bot
+        # might do is recoverable, while promising more reads as a broken bot.
+        return ("I'm set to mentions only here, so I'll stay quiet unless you tag or name me."
+                + _TUNE_LINE)
 
     # -- context helpers ----------------------------------------------------------------
 
