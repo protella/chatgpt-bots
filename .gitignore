@@ -189,6 +189,9 @@ slack_app_manifest.yml
 # Company-branded loading messages stay local (like .env) — the generic set is the committed default
 status_messages/loading_messages.datassential.txt
 
+# Working specs co-authored by Claude + codex (never published: internal IDs, live plans)
+Docs/specs/
+
 # Relocated auto-memory notes (internal, never published)
 # This repo is PUBLIC: these files hold internal Slack channel names/IDs, employee
 # references, and operational detail that must not be committed.

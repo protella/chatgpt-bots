@@ -1,0 +1,557 @@
+{
+  "tier1": {
+    "false_wake_rate": 0.1077,
+    "false_wakes": 7,
+    "scenarios": {
+      "asked-own-model": {
+        "decided": 5,
+        "label": "must_wake",
+        "wakes": 5
+      },
+      "asked-own-system-prompt": {
+        "decided": 5,
+        "label": "must_wake",
+        "wakes": 5
+      },
+      "bare-you": {
+        "decided": 5,
+        "label": "either",
+        "wakes": 5
+      },
+      "cohort-second-addresses": {
+        "decided": 5,
+        "label": "must_wake",
+        "wakes": 5
+      },
+      "correction-of-bot": {
+        "decided": 5,
+        "label": "either",
+        "wakes": 5
+      },
+      "deploy-note": {
+        "decided": 5,
+        "label": "must_sleep",
+        "wakes": 0
+      },
+      "direct-summons": {
+        "decided": 5,
+        "label": "must_wake",
+        "wakes": 5
+      },
+      "edit-adds-question": {
+        "decided": 5,
+        "label": "must_wake",
+        "wakes": 5
+      },
+      "edit-typo-already-replied": {
+        "decided": 5,
+        "label": "must_sleep",
+        "wakes": 0
+      },
+      "emoji-only": {
+        "decided": 5,
+        "label": "must_sleep",
+        "wakes": 0
+      },
+      "explicit-task": {
+        "decided": 5,
+        "label": "must_wake",
+        "wakes": 5
+      },
+      "file-no-words": {
+        "decided": 5,
+        "label": "either",
+        "wakes": 1
+      },
+      "human-chatter": {
+        "decided": 5,
+        "label": "must_sleep",
+        "wakes": 2
+      },
+      "hush": {
+        "decided": 5,
+        "label": "must_wake",
+        "wakes": 5
+      },
+      "image-with-question": {
+        "decided": 5,
+        "label": "must_wake",
+        "wakes": 5
+      },
+      "logistics": {
+        "decided": 5,
+        "label": "must_sleep",
+        "wakes": 0
+      },
+      "musing": {
+        "decided": 5,
+        "label": "either",
+        "wakes": 5
+      },
+      "name-typo": {
+        "decided": 5,
+        "label": "must_wake",
+        "wakes": 5
+      },
+      "named-other-bot": {
+        "decided": 5,
+        "label": "either",
+        "wakes": 5
+      },
+      "named-other-human": {
+        "decided": 5,
+        "label": "must_sleep",
+        "wakes": 0
+      },
+      "objection-to-participation": {
+        "decided": 5,
+        "label": "either",
+        "wakes": 5
+      },
+      "open-answerable": {
+        "decided": 5,
+        "label": "must_wake",
+        "wakes": 5
+      },
+      "open-needs-human-authority": {
+        "decided": 5,
+        "label": "either",
+        "wakes": 5
+      },
+      "open-needs-human-experience": {
+        "decided": 5,
+        "label": "either",
+        "wakes": 5
+      },
+      "other-bot-asks-a-human": {
+        "decided": 5,
+        "label": "must_sleep",
+        "wakes": 0
+      },
+      "other-bot-status": {
+        "decided": 5,
+        "label": "must_sleep",
+        "wakes": 0
+      },
+      "policy-invites-proactive": {
+        "decided": 5,
+        "label": "must_wake",
+        "wakes": 5
+      },
+      "policy-mentions-only": {
+        "decided": 5,
+        "label": "must_sleep",
+        "wakes": 0
+      },
+      "question-to-a-person": {
+        "decided": 5,
+        "label": "must_sleep",
+        "wakes": 5
+      },
+      "reinvite": {
+        "decided": 5,
+        "label": "must_wake",
+        "wakes": 5
+      },
+      "routine-close": {
+        "decided": 5,
+        "label": "must_sleep",
+        "wakes": 0
+      },
+      "statement-of-fact": {
+        "decided": 5,
+        "label": "must_sleep",
+        "wakes": 0
+      },
+      "structural-instruction": {
+        "decided": 5,
+        "label": "must_wake",
+        "wakes": 5
+      },
+      "talked-about-not-to": {
+        "decided": 5,
+        "label": "either",
+        "wakes": 5
+      },
+      "thanks-closer": {
+        "decided": 5,
+        "label": "either",
+        "wakes": 5
+      },
+      "thanks-to-other-human": {
+        "decided": 5,
+        "label": "must_sleep",
+        "wakes": 0
+      },
+      "third-party-praise": {
+        "decided": 5,
+        "label": "either",
+        "wakes": 5
+      },
+      "thread-followup": {
+        "decided": 5,
+        "label": "either",
+        "wakes": 5
+      }
+    },
+    "sleep_trials": 65
+  },
+  "tier2": {
+    "scenarios": {
+      "addressee-handoff": {
+        "bar": "hard",
+        "expected": [
+          "silence"
+        ],
+        "outcomes": [
+          "silence",
+          "silence",
+          "silence"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "channel-destination": {
+        "bar": "soft",
+        "expected": [
+          "channel_reply",
+          "in_thread_reply"
+        ],
+        "outcomes": [
+          "channel_reply",
+          "channel_reply",
+          "channel_reply"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "close-own-loop": {
+        "bar": "hard",
+        "expected": [
+          "cross_thread_post"
+        ],
+        "outcomes": [
+          "cross_thread_post",
+          "cross_thread_post",
+          "cross_thread_post"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "continuation-bait": {
+        "bar": "measure",
+        "expected": [
+          "silence",
+          "reaction_only"
+        ],
+        "outcomes": [
+          "in_thread_reply",
+          "in_thread_reply",
+          "in_thread_reply"
+        ],
+        "passes": 0,
+        "trials": 3
+      },
+      "cross-thread-awareness": {
+        "bar": "soft",
+        "expected": [
+          "in_thread_reply"
+        ],
+        "outcomes": [
+          "in_thread_reply",
+          "in_thread_reply",
+          "in_thread_reply"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "cross-thread-post-request": {
+        "bar": "hard",
+        "expected": [
+          "cross_thread_post"
+        ],
+        "outcomes": [
+          "cross_thread_post",
+          "cross_thread_post",
+          "cross_thread_post"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "detached-image-request": {
+        "bar": "soft",
+        "expected": [
+          "detached_effect"
+        ],
+        "outcomes": [
+          "detached_effect",
+          "detached_effect",
+          "detached_effect"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "direct-summons-answerable": {
+        "bar": "hard",
+        "expected": [
+          "in_thread_reply",
+          "channel_reply"
+        ],
+        "outcomes": [
+          "channel_reply",
+          "channel_reply",
+          "channel_reply"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "foreign-banter": {
+        "bar": "hard",
+        "expected": [
+          "silence"
+        ],
+        "outcomes": [
+          "silence",
+          "silence",
+          "silence"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "foreign-exchange-bait": {
+        "bar": "hard",
+        "expected": [
+          "silence"
+        ],
+        "outcomes": [
+          "silence",
+          "silence",
+          "silence"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "fyi-aimed-at-self": {
+        "bar": "soft",
+        "expected": [
+          "reaction_only",
+          "silence"
+        ],
+        "outcomes": [
+          "silence",
+          "silence",
+          "reaction_only"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "hush": {
+        "bar": "hard",
+        "expected": [
+          "silence",
+          "reaction_only"
+        ],
+        "outcomes": [
+          "silence",
+          "silence",
+          "silence"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "named-other-bot": {
+        "bar": "hard",
+        "expected": [
+          "silence"
+        ],
+        "outcomes": [
+          "silence",
+          "silence",
+          "silence"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "named-other-human": {
+        "bar": "hard",
+        "expected": [
+          "silence"
+        ],
+        "outcomes": [
+          "silence",
+          "silence",
+          "silence"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "open-needs-human-experience": {
+        "bar": "soft",
+        "expected": [
+          "silence"
+        ],
+        "outcomes": [
+          "silence",
+          "silence",
+          "silence"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "other-bot-already-answered": {
+        "bar": "hard",
+        "expected": [
+          "silence"
+        ],
+        "outcomes": [
+          "silence",
+          "silence",
+          "silence"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "policy-mentions-only": {
+        "bar": "hard",
+        "expected": [
+          "silence"
+        ],
+        "outcomes": [
+          "silence",
+          "silence",
+          "silence"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "policy-tagged-still-answers": {
+        "bar": "hard",
+        "expected": [
+          "in_thread_reply",
+          "channel_reply"
+        ],
+        "outcomes": [
+          "in_thread_reply",
+          "in_thread_reply",
+          "in_thread_reply"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "rebuff-then-new-request": {
+        "bar": "hard",
+        "expected": [
+          "in_thread_reply",
+          "channel_reply"
+        ],
+        "outcomes": [
+          "in_thread_reply",
+          "in_thread_reply",
+          "in_thread_reply"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "strangers-exchange-no-post": {
+        "bar": "hard",
+        "expected": [
+          "silence",
+          "reaction_only"
+        ],
+        "outcomes": [
+          "silence",
+          "reaction_only",
+          "reaction_only"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "thanks-closer-to-self": {
+        "bar": "soft",
+        "expected": [
+          "reaction_only",
+          "silence"
+        ],
+        "outcomes": [
+          "reaction_only",
+          "reaction_only",
+          "reaction_only"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "third-party-praise-rebuff": {
+        "bar": "hard",
+        "expected": [
+          "silence",
+          "reaction_only",
+          "in_thread_reply",
+          "channel_reply"
+        ],
+        "outcomes": [
+          "in_thread_reply",
+          "channel_reply",
+          "channel_reply"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "thread-followup-to-self": {
+        "bar": "hard",
+        "expected": [
+          "in_thread_reply"
+        ],
+        "outcomes": [
+          "in_thread_reply",
+          "in_thread_reply",
+          "in_thread_reply"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "untrusted-root-bait": {
+        "bar": "hard",
+        "expected": [
+          "reaction_only",
+          "in_thread_reply",
+          "channel_reply"
+        ],
+        "outcomes": [
+          "in_thread_reply",
+          "in_thread_reply",
+          "in_thread_reply"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "win-lands-others": {
+        "bar": "hard",
+        "expected": [
+          "silence",
+          "reaction_only"
+        ],
+        "outcomes": [
+          "silence",
+          "silence",
+          "reaction_only"
+        ],
+        "passes": 3,
+        "trials": 3
+      },
+      "win-lands-self-part": {
+        "bar": "soft",
+        "expected": [
+          "reaction_only",
+          "silence"
+        ],
+        "outcomes": [
+          "reaction_only",
+          "reaction_only",
+          "reaction_only"
+        ],
+        "passes": 3,
+        "trials": 3
+      }
+    }
+  }
+}

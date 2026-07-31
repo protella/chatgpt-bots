@@ -38,8 +38,12 @@ class ProgressChecklist:
     def __init__(self, client, channel_id: str, thread_id: Optional[str],
                  message_id: Optional[str] = None,
                  min_edit_interval: float = 0.8,
-                 prefer_message: bool = False):
+                 prefer_message: bool = False,
+                 receipts=None):
         self._client = client
+        # The checklist message is chrome for good: it is a progress surface, never words the
+        # room keeps. Registered so the rebuild excludes it, dropped when it deletes itself.
+        self._receipts = receipts
         self._channel_id = channel_id
         self._thread_id = thread_id
         self._message_id = message_id
@@ -218,7 +222,8 @@ class ProgressChecklist:
             return False
         try:
             res = await self._client.send_message_get_ts(
-                self._channel_id, self._thread_id, self._message_body())
+                self._channel_id, self._thread_id, self._message_body(),
+                receipts=self._receipts, receipt_kind="chrome")
             if res and res.get("success") and res.get("ts"):
                 self._message_id = res["ts"]
                 return True
@@ -273,6 +278,10 @@ class ProgressChecklist:
         try:
             await asyncio.sleep(delay)
             if self._message_id and hasattr(self._client, "delete_message"):
-                await self._client.delete_message(self._channel_id, self._message_id)
+                gone = await self._client.delete_message(self._channel_id, self._message_id)
+                # Only on a CONFIRMED delete: a row dropped for a message still in Slack would
+                # let that message back into the stream as an unknown own-message.
+                if gone and self._receipts is not None:
+                    await self._receipts.abort(self._message_id)
         except asyncio.CancelledError:
             raise

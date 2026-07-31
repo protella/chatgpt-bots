@@ -10,6 +10,8 @@ import ast
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 
 from base_client import Message
 from main import ChatBotV2
@@ -304,3 +306,104 @@ class TestFooterModalFailureEphemeral:
         body = {"trigger_id": "t1", "container": {"channel_id": "C1"},
                 "user": {"id": "U1"}}
         await handler(ack=AsyncMock(), body=body, client=client)  # must not raise
+
+
+# ------------------------- a malformed record is not a Slack outage (FX1 F7 / codex P2 review)
+
+class TestStreamTimestampNotice:
+    """`StreamTimestampError` is a sibling of HistoryFetchError, not a flavour of it.
+
+    Both fail a channel turn closed, but they are opposite failures: Slack being busy is
+    transient and worth retrying, while a timestamp that does not parse is a malformed record and
+    will not parse on the next attempt either. Wearing the Slack notice would send the user back
+    for a second helping of the same failure ("please try again in a moment"), which is the exact
+    dishonesty the four-code split exists to avoid.
+    """
+
+    def test_it_gets_its_own_code_and_says_retrying_will_not_help(self):
+        from message_processor import channel_stream
+
+        code, notice = MessageProcessor._channel_stream_failure(
+            channel_stream.StreamTimestampError("unparseable timestamp: 'x'"))
+        assert code == "stream_data_invalid"
+        assert "won't clear this one" in notice["message"]
+        assert notice["status"] and not notice["status"].startswith("Something")
+        # No raw exception text, and no invented cause.
+        assert "unparseable timestamp: 'x'" not in notice["message"]
+
+    def test_it_does_not_borrow_the_slack_history_notice(self):
+        from message_processor import channel_stream
+
+        _, invalid = MessageProcessor._channel_stream_failure(
+            channel_stream.StreamTimestampError("boom"))
+        _, fetch_failed = MessageProcessor._channel_stream_failure(
+            channel_stream.ChannelStreamError("boom"))
+        assert invalid["message"] != fetch_failed["message"]
+        assert "try again in a moment" in fetch_failed["message"]
+        assert "try again in a moment" not in invalid["message"]
+
+    def test_the_history_fetch_default_still_owns_every_other_condition(self):
+        from message_processor import channel_stream
+
+        code, _ = MessageProcessor._channel_stream_failure(
+            channel_stream.ChannelStreamError("boom"))
+        assert code == "history_fetch_failed"
+
+
+# --------------------- an over-size refusal from the API is an over-budget turn (codex r2 item 4)
+
+class TestChannelOversizeBackstop:
+    """The admission estimate is supposed to catch this at the door. When it does not, the API's
+    refusal must arrive as the same honest "too much for one request" notice — not as "something
+    went wrong", and never as a compaction retry: a channel request IS the pinned window, so
+    trimming it would answer a different question than the one that was admitted.
+    """
+
+    @pytest.mark.parametrize("error", [
+        Exception("Request too large for gpt-5.6-sol"),
+        Exception("400 - Invalid 'input': string too long"),
+        Exception("This model's maximum context length is 1050000 tokens"),
+        SimpleNamespace(code="string_above_max_length"),
+        SimpleNamespace(status_code=413),
+    ])
+    def test_every_wording_of_a_size_refusal_is_recognized(self, error):
+        assert MessageProcessor._channel_request_too_large(error) is True
+
+    @pytest.mark.parametrize("error", [
+        Exception("mcp server 424 failed"),
+        Exception("rate limit exceeded"),
+        Exception("context7 server is down"),
+        SimpleNamespace(status_code=500),
+    ])
+    def test_unrelated_failures_are_not_mistaken_for_size(self, error):
+        assert MessageProcessor._channel_request_too_large(error) is False
+
+    def test_the_notice_it_maps_to_is_the_over_budget_one(self):
+        from message_processor import channel_stream
+
+        code, notice = MessageProcessor._channel_stream_failure(
+            channel_stream.StreamOverBudgetError("C1: too large"))
+        assert code == "stream_over_budget"
+        assert "larger than I can send in one go" in notice["message"]
+
+
+class TestTurnEffectsUnsettledStreamingBoundary:
+    """[codex P3 r5] The outer streaming boundary must pass TurnEffectsUnsettled OUT, exactly as
+    it does StaleSendSuppressed — the generic handler below it retries non-streaming, which would
+    run a second attempt behind unknown, unrevoked effect state."""
+
+    def test_the_boundary_reraises_before_the_generic_retry(self):
+        import inspect
+
+        from message_processor.handlers import text as text_mod
+
+        src = inspect.getsource(text_mod)
+        anchor = src.index("THE outer streaming boundary")
+        window = src[anchor:anchor + 2000]
+        stale = window.index("raise")
+        unsettled = window.index("except TurnEffectsUnsettled:")
+        generic = window.index("except Exception as e:")
+        assert stale < unsettled < generic, (
+            "TurnEffectsUnsettled must be re-raised at the outer streaming boundary, "
+            "before the generic except that launches the non-streaming fallback")
+        assert "raise" in window[unsettled:generic]

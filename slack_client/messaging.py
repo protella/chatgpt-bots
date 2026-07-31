@@ -5,12 +5,14 @@ import random
 import re
 import time
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_sdk.errors import SlackApiError
 
+import prompts
 from base_client import HistoryFetchError, Message
 from config import SUPPORTED_CHAT_MODELS, config, pipeline_status_markers, valid_emoji_name
 from message_processor import participation_telemetry
@@ -21,6 +23,7 @@ from message_markers import (
     fence_safe_chunks,
     is_checklist_status_text,
 )
+from slack_client.event_handlers.activity_index import feed_own_mutation
 from slack_client.event_handlers.feedback import (
     FEEDBACK_ACTION_ID,
     USER_SETTINGS_ACTION_ID,
@@ -52,6 +55,51 @@ _UI_HELPER_FALLBACK_TEXTS = frozenset(
     {"Rate this response", "Settings available", RESPONSE_FOOTER_FALLBACK_TEXT}
     | set(SUPPORTED_CHAT_MODELS)
 )
+
+
+@dataclass(frozen=True)
+class Delivery:
+    """What Slack ACTUALLY accepted for one send, as against what we handed it.
+
+    `text` is the POSTED text: the formatted string that went to Slack, not the caller's source
+    markdown. Those two differ — `format_text` rewrites bold, links and lists into Slack's own
+    syntax — and reporting the source made the claim "what the room saw" false in every send that
+    formatting touched. A split reports the chunks that landed, joined the way Slack holds them
+    (the continuation heads are chrome the rebuild strips, so they are not part of what was said).
+    `complete` is the flag a COMMITTED destination record carries, so a half-delivered answer can
+    never be remembered as a whole one.
+    """
+
+    first_ts: Optional[str]
+    text: str
+    complete: bool
+    parts_delivered: int
+    parts_total: int
+    split: bool = False
+    # 1-based index of the part that failed twice and aborted the remainder. None when whole.
+    truncated_at: Optional[int] = None
+
+
+def _report_delivery(meta_out: Optional[dict], delivery: Delivery) -> Delivery:
+    if meta_out is not None:
+        meta_out["delivery"] = delivery
+    return delivery
+
+
+def _note_first_accept(callback: Optional[Callable[[str], None]], ts: Optional[str]) -> None:
+    """Tell the caller the room can see words NOW, before the rest of the send runs.
+
+    A record appended only after the whole coroutine returns is lost to a cancellation that
+    lands between the first accepted chunk and the last — and that is exactly the case where
+    text is visible in Slack with nothing in the ledger claiming it. Bookkeeping never breaks
+    a send, so the callback's own failure is swallowed.
+    """
+    if callback is None or not ts:
+        return
+    try:
+        callback(ts)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _is_ui_helper_message(msg: dict) -> bool:
@@ -380,6 +428,10 @@ class WorkspaceEmojiCache:
 
 
 class SlackMessagingMixin:
+    # How long stop() will wait out a socket-mode close that hung past its first 0.1s try. Long
+    # enough for a real close to finish, short enough that a wedged one cannot hold shutdown.
+    _HANDLER_CLOSE_TIMEOUT = 5.0
+
     async def start(self):
         """Start the Slack bot"""
         self.handler = AsyncSocketModeHandler(self.app, config.slack_app_token)
@@ -530,8 +582,21 @@ class SlackMessagingMixin:
                         await asyncio.wait_for(asyncio.shield(close_task), timeout=0.1)
                         self.log_debug("Socket mode handler closed")
                     except asyncio.TimeoutError:
-                        self.log_warning("Socket mode handler close timed out after 0.1 seconds, continuing...")
-                        # Don't cancel the task, let it complete in background
+                        self.log_warning("Socket mode handler close timed out after 0.1 seconds, "
+                                         "waiting it out below")
+                        # NOT abandoned. The close that is still running is the thing that stops
+                        # Bolt dispatching, so walking away from it here made `stop()` returning
+                        # mean nothing: callbacks kept arriving while the caller believed ingress
+                        # was down. It is awaited at the end of stop() instead, on a real timeout.
+                        self._handler_close_task = close_task
+                        # And registered with the ingress barrier, because the end-of-stop() wait
+                        # is bounded: if it times out, quiescence must not be declared on a close
+                        # that can still dispatch. The barrier waits this task out before it looks
+                        # at the callback count at all, and names it if it outlives that too.
+                        # Local import: registration imports the event-handler stack, and this
+                        # module sits underneath it.
+                        from slack_client.event_handlers.registration import ingress
+                        ingress.track_dispatcher(close_task, name="the socket-mode handler close")
                 except Exception as e:
                     self.log_warning(f"Error closing socket mode handler: {e}")
 
@@ -565,40 +630,26 @@ class SlackMessagingMixin:
             except Exception as e:
                 self.log_warning(f"Error cleaning up utilities session: {e}")
 
-    def _record_own_reply_pulse(self, channel_id: str, thread_id: Optional[str],
-                                ts: Optional[str], text: str) -> None:
-        """F5 fix (a): record the bot's OWN final reply into the pulse at send time.
-
-        The clean, complete reply text keyed on its real ts — the authoritative source for
-        the assistant's own turns in the classifier's thread tail (echoed placeholders /
-        footers / native-stream edits are unreliable). Chrome and empty text are skipped.
-        Best-effort; never breaks sending."""
-        pulse = getattr(self, "channel_pulse", None)
-        if pulse is None or not ts:
-            return
-        if not (text or "").strip() or is_checklist_status_text(text):
-            return
-        try:
-            pulse.record_own_reply(channel_id, thread_ts=thread_id, ts=ts, text=text)
-        except Exception as e:
-            self.log_debug(f"own-reply pulse record failed: {e}")
-
-    def _record_own_reaction_pulse(self, channel_id: str, ts: Optional[str],
-                                   emoji: str) -> Optional[dict]:
-        """F31: record a reaction the bot itself just placed into the channel pulse, so the
-        envelope and thread tails surface the bot's own reactions. All real Slack reaction
-        paths (verdict, work-claim, react_to_message tool) commit through _reserve_and_react,
-        so hooking that single choke point covers them once. Best-effort; never breaks
-        reacting. Returns the pulse receipt (F38) so an owned reaction that gets taken back
-        can take its synthetic history entry back with it."""
-        pulse = getattr(self, "channel_pulse", None)
-        if pulse is None or not ts:
-            return None
-        try:
-            return pulse.record_own_reaction(channel_id, message_ts=ts, emoji=emoji)
-        except Exception as e:
-            self.log_debug(f"own-reaction pulse record failed: {e}")
-            return None
+        # The socket-mode close that outran its 0.1s wait above. Everything after this call treats
+        # ingress as stopped, so the one thing stop() must not do is return while that close is
+        # still in progress. Bounded, and loud if the bound is hit: the caller's own callback drain
+        # is what then catches whatever Bolt is still dispatching.
+        close_task = getattr(self, "_handler_close_task", None)
+        if close_task is not None:
+            self._handler_close_task = None
+            try:
+                await asyncio.wait_for(asyncio.shield(close_task),
+                                       timeout=self._HANDLER_CLOSE_TIMEOUT)
+                self.log_debug("Socket mode handler closed")
+            except asyncio.TimeoutError:
+                # The task stays registered with the ingress barrier, deliberately: this bound
+                # exists so a wedged close cannot hold stop() open, not so the caller can treat
+                # ingress as down. The barrier is what refuses to call it quiet.
+                self.log_error(
+                    f"Socket mode handler close did not finish within "
+                    f"{self._HANDLER_CLOSE_TIMEOUT:g}s — Slack may still be dispatching events")
+            except Exception as e:  # noqa: BLE001
+                self.log_warning(f"Socket mode handler close ended with: {e}")
 
     # Slack section-block text hard limit is 3000 chars; keep a margin so the reply text
     # fits one section when we attach the footer as blocks.
@@ -632,17 +683,43 @@ class SlackMessagingMixin:
             return None
         return [{"type": "section", "text": {"type": "mrkdwn", "text": formatted_text}}] + list(footer_blocks)
 
+    async def _record_receipt(self, channel_id: Optional[str], message_ts: Optional[str], *,
+                              receipts: Any = None, receipt_kind: Optional[str] = None,
+                              thread_root_ts: Optional[str] = None, site: str = "") -> None:
+        """Spec §5 intent contract for one durable post. Never raises into the send path."""
+        from message_processor.outbound_receipts import record_transport_post
+        try:
+            await record_transport_post(
+                team_id=getattr(self, "self_team_id", None), channel_id=channel_id,
+                message_ts=message_ts, receipts=receipts, receipt_kind=receipt_kind,
+                thread_root_ts=thread_root_ts, site=site)
+        except Exception as e:  # noqa: BLE001
+            self.log_debug(f"receipt record failed at {site}: {e}")
+
     async def send_message(self, channel_id: str, thread_id: str, text: str,
                            blocks: Optional[list] = None,
                            meta_out: Optional[dict] = None,
                            username: Optional[str] = None,
                            lease: Any = None,
-                           surface: str = "final_post") -> Optional[str]:
+                           surface: str = "final_post",
+                           receipts: Any = None,
+                           receipt_kind: Optional[str] = None,
+                           on_first_accept: Optional[Callable[[str], None]] = None
+                           ) -> Optional[str]:
         """Send a text message to Slack, splitting if needed.
 
         Returns the posted message ts (the FIRST chunk's ts when split), or None on
         failure. Truthy-on-success, so legacy `if await send_message(...)` callers keep
         working while F7 can key tool-use provenance on the returned ts.
+
+        `on_first_accept(ts)` fires the instant Slack accepts the FIRST message or chunk, before
+        the rest of a split runs, so a caller can record a surface the room can already see even
+        if the send is then cancelled.
+
+        WHAT WAS ACTUALLY DELIVERED rides `meta_out["delivery"]` (a `Delivery`): the text Slack
+        accepted and whether all of it did. A split that aborts partway reports the delivered
+        prefix with `complete=False` — the caller must commit that, never the text it asked for,
+        or the room and the record disagree about what the bot said.
 
         `blocks` (F8): the settings-footer ACTIONS row. When provided AND the reply fits a
         single section block, the reply text + footer ride the message itself (composed via
@@ -716,11 +793,25 @@ class SlackMessagingMixin:
                         f"Final post response timed out but the message landed "
                         f"(reconciled ts={reconciled_ts}); not re-posting: {transport_error}")
                     result = {"ts": reconciled_ts}
+                    # The caller records this as its destination, and it is not an ordinary
+                    # reply: nobody watched it land, the ts came back out of history. Reported
+                    # so the ledger can tell a delivery we saw from one we reconstructed.
+                    if meta_out is not None:
+                        meta_out["reconciled"] = True
                 posted_ts = result.get("ts")
+                # First (and only) accepted surface — before the receipt write, which is the
+                # first thing after this that can raise or be cancelled.
+                _note_first_accept(on_first_accept, posted_ts)
+                if posted_ts:
+                    _report_delivery(meta_out, Delivery(
+                        first_ts=posted_ts, text=formatted_text, complete=True,
+                        parts_delivered=1, parts_total=1))
+                await self._record_receipt(
+                    channel_id, posted_ts, receipts=receipts, receipt_kind=receipt_kind,
+                    thread_root_ts=thread_id, site="send_message")
                 # Report footer attachment only AFTER Slack returns a ts — a post that never
                 # landed hasn't attached anything, and the separate footer must still fire.
                 _set_attached(composed is not None and bool(posted_ts))
-                self._record_own_reply_pulse(channel_id, thread_id, posted_ts, text)
                 # The reply is IN the room. Committing here (not at some later bookkeeping
                 # step) is what stops a second visible piece of this same turn — a footer, an
                 # artifact, a post_to_thread — being refused after the answer is already up.
@@ -738,6 +829,8 @@ class SlackMessagingMixin:
                 chunks = self._split_message(formatted_text)
                 last = len(chunks) - 1
                 first_ts = None
+                delivered_parts = 0
+                truncated_at: Optional[int] = None
                 for i, chunk in enumerate(chunks):
                     body = chunk
                     if i > 0:
@@ -767,9 +860,20 @@ class SlackMessagingMixin:
                                 # The FIRST chunk landing is the moment the turn became
                                 # visible. Waiting until the loop finished meant a suppression
                                 # could still be raised against a reply already half in the
-                                # room — and a half answer is worse than a late one.
+                                # room — and a half answer is worse than a late one. The
+                                # caller's record is appended here for the same reason: from
+                                # this instant the room can read us, whatever happens next.
                                 if lease is not None and first_ts:
                                     lease.commit()
+                                _note_first_accept(on_first_accept, first_ts)
+                            delivered_parts = i + 1
+                            # EVERY part earns its own receipt — the split is a delivery
+                            # detail, and parts 2..N are as much of the answer as part 1.
+                            # They finalize together when the turn settles.
+                            await self._record_receipt(
+                                channel_id, result.get("ts"), receipts=receipts,
+                                receipt_kind=receipt_kind, thread_root_ts=thread_id,
+                                site="send_message_split")
                             posted = True
                             break
                         except SlackApiError as chunk_error:
@@ -788,6 +892,7 @@ class SlackMessagingMixin:
                             await asyncio.sleep(min(max(delay, 0.5), 30.0))
                     if not posted:
                         missing = last + 1 - i
+                        truncated_at = i + 1
                         self.log_error(
                             f"Aborting split post after chunk {i + 1}/{last + 1} failed twice — "
                             f"{missing} part(s) not delivered")
@@ -800,15 +905,30 @@ class SlackMessagingMixin:
                         try:
                             if lease is not None:
                                 lease.authorize(surface)
-                            await self.app.client.chat_postMessage(  # unleased-ok: reauthorized on the line above
+                            notice = await self.app.client.chat_postMessage(  # unleased-ok: reauthorized on the line above
                                 channel=channel_id, thread_ts=thread_id,
                                 text=(f"⚠️ This message was cut off — the remaining {missing} "
                                       f"part(s) failed to post to Slack."))
+                            # A terminal explanation the room can read: conversation, not chrome.
+                            await self._record_receipt(
+                                channel_id, notice.get("ts") if notice else None,
+                                receipts=receipts, receipt_kind="finalized",
+                                thread_root_ts=thread_id, site="send_message_truncation")
                         except SlackApiError:
                             pass  # posting is broken; the ERROR log above stays loud
                         break
-                # Record the full reply once, keyed on the first chunk's ts.
-                self._record_own_reply_pulse(channel_id, thread_id, first_ts, text)
+                if first_ts:
+                    # The delivered text is the chunks that landed, joined as Slack holds them
+                    # (continuation heads are chrome the rebuild strips, so they are not part of
+                    # what was said). Whole or truncated, it is the same construction: reporting
+                    # the caller's own text for a complete split described a delivery in markdown
+                    # the room never received.
+                    complete = truncated_at is None
+                    delivered = "\n\n".join(chunks[:delivered_parts])
+                    _report_delivery(meta_out, Delivery(
+                        first_ts=first_ts, text=delivered, complete=complete,
+                        parts_delivered=delivered_parts, parts_total=last + 1,
+                        split=True, truncated_at=truncated_at))
                 return first_ts
         except SlackApiError as e:
             self.log_error(f"Error sending message: {e}")
@@ -920,7 +1040,9 @@ class SlackMessagingMixin:
 
     async def send_message_get_ts(self, channel_id: str, thread_id: str, text: str,
                                   lease: Any = None,
-                                  surface: str = "legacy_seed") -> Dict:
+                                  surface: str = "legacy_seed",
+                                  receipts: Any = None,
+                                  receipt_kind: Optional[str] = None) -> Dict:
         """Send a message and return the response including timestamp.
 
         `lease` (stale guard): the legacy streaming path seeds its reply with this call, so it
@@ -944,6 +1066,9 @@ class SlackMessagingMixin:
                 text=formatted_text
             )
             
+            await self._record_receipt(
+                channel_id, result.get("ts"), receipts=receipts, receipt_kind=receipt_kind,
+                thread_root_ts=thread_id, site="send_message_get_ts")
             if lease is not None:
                 lease.commit()
             return {"success": True, "ts": result["ts"]}
@@ -951,8 +1076,65 @@ class SlackMessagingMixin:
             self.log_error(f"Error sending message: {e}")
             return {"success": False, "error": str(e)}
 
+    async def _record_pending_share(self, channel_id: Optional[str], file_id: Optional[str],
+                                    receipts: Any, thread_id: Optional[str],
+                                    site: str, resolve_share: bool = False) -> None:
+        """Spec §5: an upload has no message ts, so the file id is the only handle we can
+        record. Written the instant Slack returns it, before resolution starts — the crash
+        window in between is accepted (Slack supplies no id before the upload).
+
+        `resolve_share` starts the share-ts poll that finalizes the receipt. Image delivery
+        passes False and runs its own (one poll there feeds the upload indicator and provenance
+        as well); every other upload has nobody else asking the question, and without the poll
+        the file stays pending — outside the stream — until a restart recovers it.
+        """
+        if receipts is None or not file_id:
+            return
+        from message_processor.outbound_receipts import (record_pending_share,
+                                                         schedule_share_resolution)
+        try:
+            await record_pending_share(
+                getattr(self, "db", None), team_id=getattr(self, "self_team_id", None),
+                channel_id=channel_id, file_id=file_id,
+                owner_turn_id=getattr(receipts, "owner_id", ""), thread_root_ts=thread_id)
+        except Exception as e:  # noqa: BLE001
+            self.log_debug(f"pending share record failed at {site}: {e}")
+        if not resolve_share:
+            return
+        try:
+            schedule_share_resolution(
+                self, getattr(self, "db", None),
+                team_id=getattr(self, "self_team_id", None), channel_id=channel_id,
+                file_id=file_id, site=site)
+        except Exception as e:  # noqa: BLE001
+            self.log_debug(f"share resolution not scheduled at {site}: {e}")
+
+    async def ensure_receipt_identity(self) -> bool:
+        """Whether bot + team identity are known — the two facts every channel receipt needs.
+
+        Re-runs auth.test when either is missing. `_ensure_self_identity` returns early once a
+        user id is cached, so a boot that resolved the user but not the team could never repair
+        itself through it. A channel turn without a team id would write no receipts at all and
+        say nothing about it, which is why the caller refuses to run one.
+        """
+        if getattr(self, "self_team_id", None) and getattr(self, "bot_user_id", None):
+            return True
+        try:
+            resp = await self.app.client.auth_test()
+            if resp.get("ok"):
+                self.bot_user_id = resp.get("user_id") or getattr(self, "bot_user_id", None)
+                self.bot_id = resp.get("bot_id") or getattr(self, "bot_id", None)
+                self.bot_handle = resp.get("user") or getattr(self, "bot_handle", None)
+                self.self_team_id = resp.get("team_id") or getattr(self, "self_team_id", None)
+            else:
+                self.log_warning(f"auth_test returned not ok: {resp.get('error')}")
+        except Exception as e:  # noqa: BLE001 — reported by the caller's refusal
+            self.log_warning(f"Could not re-resolve bot identity: {e}")
+        return bool(getattr(self, "self_team_id", None) and getattr(self, "bot_user_id", None))
+
     async def send_image(self, channel_id: str, thread_id: str, image_data: bytes, filename: str,
-                         caption: str = "", meta_out: Optional[dict] = None) -> Optional[str]:
+                         caption: str = "", meta_out: Optional[dict] = None,
+                         receipts: Any = None) -> Optional[str]:
         """Send an image to Slack and return the file URL.
 
         `meta_out` (F7): optional dict the caller reads back — `meta_out["file_id"]` is the
@@ -978,6 +1160,8 @@ class SlackMessagingMixin:
                 file_url = file_info.get("url_private", file_info.get("permalink"))
                 if meta_out is not None:
                     meta_out["file_id"] = file_info.get("id")
+                await self._record_pending_share(
+                    channel_id, file_info.get("id"), receipts, thread_id, "send_image")
                 self.log_info(f"Image uploaded: {filename} - URL: {file_url}")
                 return file_url
             else:
@@ -1041,9 +1225,12 @@ class SlackMessagingMixin:
         caller has no way to know which applies. That entry's `ts` IS the file-share
         message's ts (cross-checked against conversations.replies / conversations.history).
 
-        A transient failure is RETRIED within the budget rather than surrendering the row: a
-        429 or a blip is not an answer, and giving up on the first one throws away provenance
-        that a second poll would have had. Only clearly permanent errors bail early.
+        The retry contract is a TIME BUDGET, not an attempt count: polling continues on the
+        backoff below until `IMAGE_SHARE_TS_TIMEOUT_SECONDS` (config.image_share_ts_timeout_
+        seconds) is spent. A transient failure is retried inside it rather than surrendering the
+        row — a 429 or a blip is not an answer, and giving up on the first one throws away
+        provenance a second poll would have had, while a fixed "3 attempts" would turn a slow
+        day into lost provenance. Only clearly permanent errors bail early.
 
         Best-effort chrome: a timeout, a SlackApiError, or any other failure returns None and
         is logged, never raised. The image is already posted by the time anyone calls this,
@@ -1099,7 +1286,8 @@ class SlackMessagingMixin:
 
     async def send_file(self, channel_id: str, thread_id: str, file_data,
                         filename: str, title: Optional[str] = None,
-                        initial_comment: str = "") -> Optional[Dict[str, Any]]:
+                        initial_comment: str = "",
+                        receipts: Any = None) -> Optional[Dict[str, Any]]:
         """F32: upload an arbitrary file (BytesIO) and return its full Slack identity.
 
         Distinct from send_image, which returns a bare URL: an artifact has to be findable
@@ -1134,6 +1322,8 @@ class SlackMessagingMixin:
                 return None
             identity = {"file_id": file_id, "url_private": url,
                         "permalink": info.get("permalink")}
+            await self._record_pending_share(
+                channel_id, file_id, receipts, thread_id, "send_file", resolve_share=True)
             self.log_info(f"File uploaded: {filename} (id={file_id})")
             return identity
         except SlackApiError as e:
@@ -1143,7 +1333,8 @@ class SlackMessagingMixin:
             self.log_error(f"Unexpected error uploading file '{filename}': {e}")
             return None
 
-    async def send_thinking_indicator(self, channel_id: str, thread_id: str) -> Optional[str]:
+    async def send_thinking_indicator(self, channel_id: str, thread_id: str,
+                                      receipts: Any = None) -> Optional[str]:
         """Show a progress indicator; returns the placeholder message ts, or None.
 
         Contract: assistant.threads.setStatus is the SOLE indicator wherever Slack
@@ -1166,6 +1357,11 @@ class SlackMessagingMixin:
                 thread_ts=thread_id,
                 text=f"{config.circle_loader_emoji} {config.random_loading_message()}"
             )
+            # Chrome until the turn writes its answer INTO it — the streaming handlers promote
+            # it (same owner) right before the first answer-bearing edit.
+            await self._record_receipt(
+                channel_id, result.get("ts"), receipts=receipts, receipt_kind="chrome",
+                thread_root_ts=thread_id, site="send_thinking_indicator")
             return result.get("ts")  # Return message timestamp for deletion
         except SlackApiError as e:
             self.log_error(f"Error sending thinking indicator: {e}")
@@ -1178,6 +1374,10 @@ class SlackMessagingMixin:
                 channel=channel_id,
                 ts=message_id
             )
+            # §1c: our own deletion is not channel activity (no watermark, no wake), but a
+            # snapshot that summarized this message is wrong from here on.
+            await feed_own_mutation(self, channel_id, message_id, "delete",
+                                    operation_id=f"delete:{channel_id}:{message_id}")
             return True
         except SlackApiError as e:
             self.log_debug(f"Could not delete message: {e}")
@@ -1185,7 +1385,9 @@ class SlackMessagingMixin:
 
     async def update_message(self, channel_id: str, message_id: str, text: str,
                              lease: Any = None,
-                             surface: str = "error_notice") -> bool:
+                             surface: str = "error_notice",
+                             receipts: Any = None,
+                             receipt_kind: Optional[str] = None) -> bool:
         """Update a message in Slack.
 
         `lease` (stale guard): passed by the callers whose edit publishes TERMINAL text — an
@@ -1205,6 +1407,18 @@ class SlackMessagingMixin:
                 text=text,
                 mrkdwn=True  # Enable markdown parsing for italics/bold
             )
+            # §1c: an edit of our own message, recorded non-wake. The id is fresh per call
+            # rather than derived from the ts — the same message edited twice is two mutations,
+            # and one identity for both would lose the second.
+            await feed_own_mutation(self, channel_id, message_id, "edit",
+                                    operation_id=f"update:{channel_id}:{message_id}:{uuid4().hex}")
+            # An EDIT mints no ts, so there is nothing to register — only a state change, and
+            # only when the caller names one (a terminal notice written into a chrome surface
+            # is conversation from that moment on).
+            if receipts is not None and receipt_kind:
+                await self._record_receipt(
+                    channel_id, message_id, receipts=receipts, receipt_kind=receipt_kind,
+                    site="update_message")
             # A terminal notice that LANDED is what the room saw, so this turn has spoken —
             # exactly like every other transport. Without it a leased error notice stayed
             # `pending`, and any later visible piece of the same turn could still be refused
@@ -1217,7 +1431,8 @@ class SlackMessagingMixin:
             return False
 
     async def post_status_card(self, channel_id: str, thread_id: str, text: str,
-                               blocks: list, username: Optional[str] = None) -> Optional[str]:
+                               blocks: list, username: Optional[str] = None,
+                               receipts: Any = None) -> Optional[str]:
         """F30.1: post a blocks status card (e.g. the deep-research todo card). Returns the
         posted ts, or None on failure. `text` is the CONSTANT notification fallback; `blocks`
         carry the visible card. `username` optionally labels the poster (needs the
@@ -1229,16 +1444,22 @@ class SlackMessagingMixin:
             if username:
                 kwargs["username"] = username
             result = await self.app.client.chat_postMessage(**kwargs)  # unleased-ok: post_ephemeral-style helper for chrome/notices, not the turn's answer
+            await self._record_receipt(
+                channel_id, result.get("ts"), receipts=receipts, receipt_kind="chrome",
+                thread_root_ts=thread_id, site="post_status_card")
             return result.get("ts")
         except SlackApiError as e:
             self.log_warning(f"Status card post failed: {e}")
             return None
 
     async def update_status_card(self, channel_id: str, ts: str, text: str,
-                                 blocks: list) -> bool:
+                                 blocks: list, receipts: Any = None) -> bool:
         """F30.1: update a blocks status card in place. `text` MUST stay CONSTANT across
         updates (Slack badges '(edited)' only when the top-level text changes; blocks-only
-        edits don't badge). Best-effort — returns False on failure, never raises."""
+        edits don't badge). Best-effort — returns False on failure, never raises.
+
+        `receipts` is accepted for symmetry with post_status_card and deliberately unused: an
+        edit mints no ts, and the card's chrome row was written when it was posted."""
         try:
             await self.app.client.chat_update(  # unleased-ok: a background job's own status card — a detached surface the guard exempts
                 channel=channel_id, ts=ts, text=text, blocks=blocks)
@@ -1638,6 +1859,9 @@ class SlackMessagingMixin:
                     " This workspace also has custom emoji; call search_workspace_emoji to find "
                     "one by meaning when a workspace-specific reaction would fit better."
                 )
+        return self._react_tool_schema(emoji_schema)
+
+    def _react_tool_schema(self, emoji_schema: dict) -> dict:
         return {
             "type": "function",
             "name": "react_to_message",
@@ -1658,6 +1882,29 @@ class SlackMessagingMixin:
                 "required": ["emoji"],
             },
         }
+
+    def get_react_tool_schema_static(self, cfg: Optional[dict] = None) -> dict:
+        """Channel-surface react_to_message: identical shape, but the custom-emoji pointer is
+        decided by CONFIG rather than by the live cache.
+
+        `_custom_emoji_available()` reads a cache that warms after start and can empty on an
+        API failure, so the DM factory's sentence appears and disappears under a running
+        process — a schema fork with no channel-level cause. The pointer instead rides exactly
+        when `search_workspace_emoji` is registered: no REACTION_EMOJIS allowlist. The cache
+        still decides what that tool RETURNS; it just no longer decides what the schema says.
+
+        `cfg` is accepted and ignored so the registry can call it like a factory."""
+        allowed = [e.strip().strip(":") for e in (config.reaction_emojis or []) if e and e.strip().strip(":")]
+        emoji_schema = {"type": "string",
+                        "description": "Any standard Slack emoji shorthand name (no colons), e.g. joy, tada, fire."}
+        if allowed:
+            emoji_schema["enum"] = allowed
+        else:
+            emoji_schema["description"] += (
+                " This workspace may also have custom emoji; call search_workspace_emoji to "
+                "find one by meaning when a workspace-specific reaction would fit better."
+            )
+        return self._react_tool_schema(emoji_schema)
 
     def get_emoji_search_tool_schema(self) -> dict:
         """Schema for search_workspace_emoji — lookup over the workspace's CUSTOM emoji.
@@ -1856,7 +2103,7 @@ class SlackMessagingMixin:
 
     def settle_reaction_lease(self, lease: Optional[dict]) -> None:
         """The turn produced something: the reaction has earned its place. Drop the claim —
-        the emoji, the guard slot and the pulse entry all stay exactly as they are.
+        the emoji and the guard slot stay exactly as they are.
 
         Releasing matters even for reactions nobody intends to remove (a gate verdict, the
         model's own react tool): an owned slot is pinned against eviction, so never settling
@@ -1872,7 +2119,7 @@ class SlackMessagingMixin:
             slots[lease["emoji"]] = True  # committed, unowned, evictable again
 
     def _settle_removal_slot(self, channel_id: str, ts: str, emoji: str, token: str,
-                             ok: bool, lease: dict) -> None:
+                             ok: bool) -> None:
         """Transition a `removing` slot to its final state. Runs from the removal TASK's
         `finally`, so it happens even if the turn that asked for the removal is cancelled —
         otherwise the slot would stay `removing` forever, and since owned slots are pinned
@@ -1896,16 +2143,10 @@ class SlackMessagingMixin:
             ts_map = getattr(self, "_reaction_guard_ts", None)
             if ts_map is not None:
                 ts_map.pop((channel_id, ts), None)
-        pulse = getattr(self, "channel_pulse", None)
-        if pulse is not None and lease.get("pulse_receipt"):
-            try:
-                pulse.remove_own_reaction(lease["pulse_receipt"])
-            except Exception as e:  # noqa: BLE001 — history cleanup must never break a turn
-                self.log_debug(f"own-reaction pulse removal failed: {e}")
         self.log_debug(f"Took back :{emoji}: — the turn produced nothing")
 
-    async def _run_reaction_removal(self, channel_id: str, ts: str, emoji: str, token: str,
-                                    lease: dict) -> bool:
+    async def _run_reaction_removal(self, channel_id: str, ts: str, emoji: str,
+                                    token: str) -> bool:
         """The removal itself, as its own task. Bounded, and it ALWAYS settles the slot."""
         ok = False
         try:
@@ -1919,7 +2160,7 @@ class SlackMessagingMixin:
         finally:
             # `finally`, not `except Exception` — a CancelledError is a BaseException and
             # would otherwise sail straight past, stranding the slot in `removing`.
-            self._settle_removal_slot(channel_id, ts, emoji, token, ok, lease)
+            self._settle_removal_slot(channel_id, ts, emoji, token, ok)
         return ok
 
     async def remove_owned_reaction(self, lease: Optional[dict]) -> bool:
@@ -1945,7 +2186,7 @@ class SlackMessagingMixin:
         # and a concurrent reserver can WAIT on the outcome rather than being told the emoji
         # is safely present when it is moments from disappearing.
         task = asyncio.ensure_future(
-            self._run_reaction_removal(channel_id, ts, emoji, token, lease))
+            self._run_reaction_removal(channel_id, ts, emoji, token))
         slots[emoji] = {"token": token, self._REMOVING: task}
         try:
             return await asyncio.shield(task)
@@ -2098,14 +2339,11 @@ class SlackMessagingMixin:
                     # take back a reaction that is not ours.
                     slots[emoji] = True
                     return {"ok": True, "emoji": emoji, "ts": ts, "idempotent": True}, None, False
-                # F31: a genuine new commit — record it as the bot's own reaction so it's
-                # self-visible in the rings (idempotent duplicates below never reach here).
-                receipt = self._record_own_reaction_pulse(channel_id, ts, emoji)
                 token = uuid4().hex
                 slots[emoji] = {"token": token}   # committed AND owned by this caller
                 return ({"ok": True, "emoji": emoji, "ts": ts},
                         {"token": token, "channel_id": channel_id, "ts": ts,
-                         "emoji": emoji, "pulse_receipt": receipt},
+                         "emoji": emoji},
                         False)
             if not fut.done():
                 fut.set_result(False)
@@ -2128,29 +2366,35 @@ class SlackMessagingMixin:
             # pending (nothing evictable then); now that this call resolved, sweep again.
             self._trim_reaction_guard(guard, ts_map, time.monotonic())
 
-    def get_post_to_thread_tool_schema(self) -> dict:
-        """F23: schema for the cross-thread reply tool. CURRENT CHANNEL ONLY — there is no
-        channel_id param; cross-channel posting is out of scope (a write boundary, unlike the
-        read tools that can reach other channels)."""
+    # The DM surface's wording, kept as the single source of the legacy bytes: the channel schema
+    # below reads its own constants and falls back to these, so a wave that lands the READ without
+    # the words changes nothing anywhere.
+    _POST_TO_THREAD_DESCRIPTION = (
+        "Post a reply into a DIFFERENT thread in THIS channel. Use when a reply "
+        "belongs somewhere other than the current conversation — someone asked you to "
+        "answer a message over in another thread, or you're closing a loop you were "
+        "part of elsewhere. Acknowledge briefly in the current thread rather than "
+        "duplicating the whole answer in both places. Only targets threads in the "
+        "current channel; there is no way to post to another channel."
+    )
+    _POST_TO_THREAD_TARGET_DESCRIPTION = (
+        "Root ts of the target conversation (a top-level message's ts "
+        "targets its thread). Must be a ts you have actually seen in "
+        "context or from a tool — never guess one."
+    )
+
+    @staticmethod
+    def _post_to_thread_schema(description: str, target_description: str) -> dict:
         return {
             "type": "function",
             "name": "post_to_thread",
-            "description": (
-                "Post a reply into a DIFFERENT thread in THIS channel. Use when a reply "
-                "belongs somewhere other than the current conversation — someone asked you to "
-                "answer a message over in another thread, or you're closing a loop you were "
-                "part of elsewhere. Acknowledge briefly in the current thread rather than "
-                "duplicating the whole answer in both places. Only targets threads in the "
-                "current channel; there is no way to post to another channel."
-            ),
+            "description": description,
             "parameters": {
                 "type": "object",
                 "properties": {
                     "thread_ts": {
                         "type": "string",
-                        "description": "Root ts of the target conversation (a top-level message's ts "
-                                       "targets its thread). Must be a ts you have actually seen in "
-                                       "context or from a tool — never guess one.",
+                        "description": target_description,
                     },
                     "text": {
                         "type": "string",
@@ -2162,12 +2406,37 @@ class SlackMessagingMixin:
             },
         }
 
+    def get_post_to_thread_tool_schema(self) -> dict:
+        """F23: schema for the cross-thread reply tool. CURRENT CHANNEL ONLY — there is no
+        channel_id param; cross-channel posting is out of scope (a write boundary, unlike the
+        read tools that can reach other channels)."""
+        return self._post_to_thread_schema(self._POST_TO_THREAD_DESCRIPTION,
+                                           self._POST_TO_THREAD_TARGET_DESCRIPTION)
+
+    def get_post_to_thread_channel_schema(self, thread_config: Optional[dict] = None) -> dict:
+        """The CHANNEL surface's variant: static (``thread_config`` is accepted and ignored, so
+        the registry can call it like any channel schema) and read from prompts constants.
+
+        Two things the channel wording has to say differently, which is why it is its own schema
+        rather than a shared string. The origin-acknowledgment instruction cannot stand on a
+        surface where the model may post once and stay quiet here — and the promise about WHERE a
+        target id may come from has to match what the executor actually allows, which on a channel
+        turn is the stream's own thread labels and nothing else. An empty constant means the words
+        have not landed yet, and the legacy description is used verbatim."""
+        return self._post_to_thread_schema(
+            getattr(prompts, "CHANNEL_POST_TO_THREAD_DESCRIPTION", "")
+            or self._POST_TO_THREAD_DESCRIPTION,
+            getattr(prompts, "CHANNEL_POST_TO_THREAD_TARGET_DESCRIPTION", "")
+            or self._POST_TO_THREAD_TARGET_DESCRIPTION)
+
     async def execute_post_to_thread(self, ctx, args: dict) -> dict:
         """Executor for post_to_thread (F23). Posts a markdown-converted reply into another
-        thread of the CURRENT channel via the standard messaging layer (which also records the
-        own-reply pulse, keeping the rings truthful). Never raises — every refusal/failure is an
-        {"ok": False, ...} result. Runs inside an addressed/judged turn, so no unprompted
-        accounting is added."""
+        thread of the CURRENT channel via the standard messaging layer. Every refusal and every
+        failure is an {"ok": False, ...} result, with ONE deliberate exception:
+        ``StaleSendSuppressed`` is re-raised (the conversation moved on and nothing was
+        attempted, which is control flow the turn's own handler files — reporting it as a tool
+        error would have the model retry the post the guard just refused). Runs inside an
+        addressed/judged turn, so no unprompted accounting is added."""
         if not config.enable_post_to_thread_tool:
             return {"ok": False, "error": "disabled", "message": "Cross-thread posting is disabled."}
         channel_id = getattr(ctx, "channel_id", None)
@@ -2185,11 +2454,115 @@ class SlackMessagingMixin:
         if target == current or target == trigger:
             return {"ok": False, "error": "same_thread",
                     "message": "That's the current thread — just reply normally instead."}
+        # AUTHORIZATION, before anything is sent. The allowlist is the set of thread roots this
+        # turn's stream actually SHOWED the model, frozen when the stream was pinned — so the
+        # answer to "may I post there?" is a fact about what was rendered, not a live Slack lookup
+        # that could say yes to a thread the model never saw and is only guessing at.
+        #
+        # None means there is no stream to authorize against (a DM, a background agent, a
+        # hand-built context) and the legacy behavior is kept exactly — which is why the handler
+        # never hands None for a stream that exists but is unreadable: that case arrives as the
+        # EMPTY set, and an empty set still enforces, the same as a turn whose stream genuinely
+        # rendered no thread. Either way there is no thread to post into.
+        #
+        # EXTENSION POINT (P4): when a turn can PIN a root it reached another way — a
+        # select_and_pin anchor, a search result the user asked us to answer — that root joins this
+        # set at pin time. It must never be widened here, at the moment of posting, because then
+        # "authorized" would mean "the model named it".
+        trusted = getattr(ctx, "trusted_thread_roots", None)
+        if trusted is not None and target not in trusted:
+            return {"ok": False, "error": "unknown_thread",
+                    "message": ("That thread isn't one of the threads in front of you. Use a "
+                                "thread's root ts exactly as it appears in this channel's stream, "
+                                "or answer here instead.")}
         turn = getattr(ctx, "turn", None)
         lease = getattr(turn, "send_lease", None) if turn is not None else None
+        from message_processor.turn_runtime import (DEST_KIND_POST_TO_THREAD, EffectRevoked,
+                                                   LaunchNotRecorded, mark_tool_launched,
+                                                   run_effect)
+
+        def _observe(ts: str) -> None:
+            """Slack accepted the first part. Recorded HERE, not after the send returns: a
+            cancellation in between would otherwise leave words in another thread that this
+            turn's ledger never mentions."""
+            if turn is None:
+                return
+            try:
+                turn.note_destination_observed(channel_id=channel_id, first_ts=ts,
+                                              kind=DEST_KIND_POST_TO_THREAD,
+                                              thread_root_ts=target)
+            except Exception as e:  # noqa: BLE001 — bookkeeping never fails a post
+                self.log_debug(f"post_to_thread: could not observe the destination: {e}")
+
+        send_meta: dict = {}
+
+        async def _post_and_account():
+            """THE critical section: launch, delivery, receipt, and every record of both.
+
+            All of it inside the lease because a cancellation between any two of these steps
+            leaves our own words in somebody else's thread described as something they are not.
+            `mark_launched` is first and has no await after it before the send — a cancelled
+            flight whose shielded body is still posting must keep its key, or a replay of the
+            same call id would post the message a second time.
+            """
+            mark_tool_launched(ctx)
+            posted = await self.send_message(
+                channel_id, target, text, lease=lease, surface="post_to_thread",
+                meta_out=send_meta, on_first_accept=_observe,
+                receipts=getattr(turn, "receipt_ledger", None) if turn is not None else None)
+            if not posted:
+                return None, None
+            landed = send_meta.get("delivery")
+            # Words went into the workspace, just not into this thread. The turn may still end
+            # with no_response_needed — that is now a legitimate pairing ("I answered over
+            # there") — and without this the ledger would file a turn that visibly posted as a
+            # silence. It is written HERE, beside the delivery it describes, because a
+            # continuation that ran only if the caller was still waiting would leave an accepted
+            # foreign post recorded as an observation with no commitment and no visible action.
+            if turn is not None:
+                try:
+                    turn.visible_action_committed = True
+                    # WHERE they landed: a different thread of this channel, so the record is
+                    # keyed on the TARGET root rather than the turn's own conversation. A
+                    # cross-thread post is written once and never edited afterwards, so
+                    # acceptance IS finalization — but only of what Slack took: a split that
+                    # aborted partway commits its delivered prefix and says so.
+                    turn.mark_destination_committed(
+                        first_ts=posted, kind=DEST_KIND_POST_TO_THREAD,
+                        text=landed.text if landed is not None else text,
+                        complete=landed.complete if landed is not None else True,
+                        channel_id=channel_id, thread_root_ts=target)
+                except Exception as e:  # noqa: BLE001 — never fail a delivered post
+                    self.log_debug(f"post_to_thread: could not record the destination: {e}")
+            return posted, landed
+
         try:
-            posted_ts = await self.send_message(channel_id, target, text, lease=lease,
-                                                surface="post_to_thread")
+            # The target root rides the receipt: a cross-thread post belongs to the thread it
+            # landed in, not to the turn's own conversation (spec §5 / P2 root discovery).
+            #
+            # LEASED: Slack accepting the post, `note_post` claiming it as ours, and this turn's
+            # record of both are one critical section. Split them and a cancellation in between
+            # leaves our own words in somebody else's thread with nothing claiming them —
+            # permanently outside the stream we rebuild the room from, and unattributable
+            # forever after. The lease also refuses outright once this turn has revoked its
+            # effects, so a straggler that outlived its own cancellation cannot post at all.
+            posted_ts, delivery = await run_effect(turn, "post_to_thread", _post_and_account)
+        except LaunchNotRecorded as e:
+            # The one mechanism that stops this call id posting twice is broken. Nothing was
+            # sent, and it is said plainly rather than sent anyway.
+            self.log_error(f"post_to_thread: launch not recorded for {channel_id}/{target}: {e}")
+            return {"ok": False, "error": "launch_not_recorded",
+                    "message": ("Something went wrong before the post was sent, so nothing was "
+                                "posted in that thread.")}
+        except EffectRevoked:
+            # The turn withdrew permission before this post started, so NOTHING was attempted.
+            # Reported as its own outcome rather than as a failed post: "could not post" would
+            # invite a retry of something we deliberately did not do.
+            self.log_warning(
+                f"post_to_thread: refused for {channel_id}/{target} — the turn was cut short")
+            return {"ok": False, "error": "turn_cancelled",
+                    "message": ("This turn was cut short before the post went out, so nothing "
+                                "was posted in that thread.")}
         except StaleSendSuppressed:
             # The conversation moved on before this landed. NOT a post failure: nothing was
             # attempted, so telling the model the send failed would invite a retry of something
@@ -2201,15 +2574,13 @@ class SlackMessagingMixin:
             return {"ok": False, "error": "post_failed", "message": "Could not post to that thread."}
         if not posted_ts:
             return {"ok": False, "error": "post_failed", "message": "Could not post to that thread."}
-        # Words went into the workspace, just not into this thread. The turn may still end with
-        # no_response_needed — that is now a legitimate pairing ("I answered over there") — and
-        # without this the ledger would file a turn that visibly posted as a silence.
-        turn = getattr(ctx, "turn", None)
-        if turn is not None:
-            try:
-                turn.visible_action_committed = True
-            except Exception as e:  # noqa: BLE001 — bookkeeping must never fail a delivered post
-                self.log_debug(f"post_to_thread: could not mark visible action: {e}")
+        if delivery is not None and not delivery.complete:
+            # The model is told the truth so it can decide what to do about it, and the post is
+            # still reported as landed — part of it did.
+            return {"ok": True, "thread_ts": target, "posted_ts": posted_ts,
+                    "truncated": True,
+                    "message": (f"Only {delivery.parts_delivered} of {delivery.parts_total} "
+                                "parts reached that thread; the rest failed to post.")}
         return {"ok": True, "thread_ts": target, "posted_ts": posted_ts}
 
     def get_no_reply_tool_schema(self) -> dict:
@@ -2247,17 +2618,42 @@ class SlackMessagingMixin:
 
     async def execute_no_reply_tool(self, ctx, args: dict) -> dict:
         """Executor for no_response_needed. Terminal signal only — the tool loop stops the
-        turn and the handler surfaces the outcome; nothing is posted here."""
+        turn and the handler surfaces the outcome; nothing is posted here.
+
+        The route's authorization now lives HERE rather than in the schema gate. On the channel
+        surface the tool is statically exposed (a per-turn schema is a cache fork), so the only
+        remaining place that can tell an owed-words turn from a silence-capable one is the turn
+        itself. Fails CLOSED: an absent turn, or one that owes words, is refused, and the loop
+        keeps going rather than swallowing a reply somebody is waiting for."""
+        if not config.enable_no_reply_tool:
+            return {"ok": False, "error": "disabled",
+                    "message": "Ending a turn without a reply is disabled here."}
+        turn = getattr(ctx, "turn", None)
+        if turn is None or not getattr(turn, "silence_capable", False):
+            return {
+                "ok": False, "error": "reply_owed",
+                "message": ("Not run: this turn owes a reply — you were addressed directly, so "
+                            "silence is not available. Answer normally."),
+            }
         return {"ok": True}
 
     async def update_message_streaming(self, channel_id: str, message_id: str, text: str,
                                        lease: Any = None,
-                                       surface: str = "legacy_update") -> Dict:
+                                       surface: str = "legacy_update",
+                                       receipts: Any = None) -> Dict:
         """Updates a message with rate limit awareness.
 
         `lease` (stale guard): the caller passes it only for the FIRST edit that turns a
         thinking placeholder into answer text — that edit is when the room first reads an
-        answer. Subsequent edits grow a surface that already exists and are never guarded."""
+        answer. Subsequent edits grow a surface that already exists and are never guarded.
+
+        `receipts`: passed by the ANSWER-bearing callers only. The edited surface stops being
+        chrome at that moment, so it is promoted (same owner) and settles with the turn.
+        Status/phase callers pass nothing and the surface stays excluded.
+
+        Deliberately NOT wired to `feed_own_mutation` (§1c), unlike update_message: Slack
+        delivers an own-message `message_changed` for every streamed edit, and the listener feed
+        already records an observation for each one. A call here would only duplicate them."""
         if lease is not None:
             lease.authorize(surface)
         try:
@@ -2295,6 +2691,11 @@ class SlackMessagingMixin:
                 mrkdwn=True  # Enable markdown parsing for italics/bold
             )
             
+            if receipts is not None:
+                try:
+                    await receipts.promote(message_id)
+                except Exception as e:  # noqa: BLE001
+                    self.log_debug(f"receipt promote failed for {message_id}: {e}")
             # The placeholder now reads as an answer — a first surface for the guard's
             # purposes, so the rest of this turn's edits proceed without rechecking.
             if lease is not None:
@@ -2423,7 +2824,7 @@ class SlackMessagingMixin:
             ]
         return self._build_response_footer_blocks(model)
 
-    async def maybe_post_response_footer(self, message, response) -> None:
+    async def maybe_post_response_footer(self, message, response, receipts: Any = None) -> None:
         """Trailing chrome under a final text response — surface-dependent:
 
         - Channels: the Phase 7 footer (model + Configure button), when
@@ -2462,25 +2863,32 @@ class SlackMessagingMixin:
                 if not should_offer_feedback(channel_id, thread_ts):
                     return
                 model = (getattr(response, "metadata", None) or {}).get("model")
-                await self.app.client.chat_postMessage(  # unleased-ok: the settings footer, which only ever follows an answer already posted
+                posted = await self.app.client.chat_postMessage(  # unleased-ok: the settings footer, which only ever follows an answer already posted
                     channel=channel_id,
                     thread_ts=thread_ts,
                     text="Rate this response",  # fallback text for notifications
                     blocks=build_feedback_blocks(model),
                 )
+                await self._record_receipt(
+                    channel_id, posted.get("ts") if posted else None, receipts=receipts,
+                    receipt_kind="chrome", thread_root_ts=thread_ts, site="feedback_footer")
                 return
             # Channels: per-channel settings footer.
             if not getattr(config, "enable_response_footer", True):
                 return
             model = (getattr(response, "metadata", None) or {}).get("model")
             blocks = self._build_response_footer_blocks(model)
-            await self.app.client.chat_postMessage(  # unleased-ok: the same footer on the fallback path
+            thread_ts = getattr(message, "thread_id", None)
+            posted = await self.app.client.chat_postMessage(  # unleased-ok: the same footer on the fallback path
                 channel=channel_id,
-                thread_ts=getattr(message, "thread_id", None),
+                thread_ts=thread_ts,
                 # Describes the footer's purpose instead of showing a bare model name (which reads
                 # as a spurious standalone message — the "gpt-5.6-sol" post seen live 2026-07-16).
                 text=RESPONSE_FOOTER_FALLBACK_TEXT,
                 blocks=blocks,
             )
+            await self._record_receipt(
+                channel_id, posted.get("ts") if posted else None, receipts=receipts,
+                receipt_kind="chrome", thread_root_ts=thread_ts, site="response_footer")
         except Exception as e:
             self.log_debug(f"Could not post response footer: {e}")

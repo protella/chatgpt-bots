@@ -4,9 +4,13 @@ Covers the pure stamp helpers (deterministic render, UTC fallbacks, non-string /
 unparseable passthrough, sender-tz resolution order), the rebuild-loop stamping of
 self and non-self turns, warm-inbound stamping that renders identically to the later
 rebuild, coexistence with the pinned [used tools:]/[reactions:] suffix order and
-footer stripping, the never-stamped compaction summary head, the flag-off
-byte-identical guarantee (warm + rebuild + tail + envelope), the stamped classifier
-thread-tail / channel-activity envelope lines.
+footer stripping, the never-stamped compaction summary head, and the flag-off
+byte-identical guarantee.
+
+These stamps are DM/legacy only as of P2. The pulse envelope was the other stamped surface and
+it is retired; a channel turn renders the stream, whose header carries its own UTC minute stamp
+(channel_stream.iso_minute). The last section pins that the two renderings stay distinct — one
+sits inside a cached prefix, the other does not — while describing the same instant.
 
 (The participation-prompt time-awareness assertion is gone with the prompt it pinned: the binary
 wake gate's prompt is ten lines about one bit and says nothing about time, because it no longer
@@ -27,7 +31,6 @@ from message_processor.message_timestamps import (
 )
 from message_processor.thread_management import ThreadManagementMixin
 from message_processor.utilities import MessageUtilitiesMixin
-from slack_client.channel_pulse import ChannelPulse
 from thread_manager import AsyncThreadStateManager
 
 # A stamp is a leading "[Weekday YYYY-MM-DD H:MM AM/PM TZ]" bracket.
@@ -240,32 +243,26 @@ async def test_flag_off_is_byte_identical_everywhere(temp_db, monkeypatch):
     assert next(m for m in state.messages if m["role"] == "user")["content"] == "Peter: q"
     assert next(m for m in state.messages if m["role"] == "assistant")["content"] == "a"
 
-    # channel-activity envelope — no stamp
-    p = ChannelPulse()
-    p.record("C1", ts="100.0", thread_ts=None, user_id="U1", display_name="Alice",
-             sender_type="human", text="root question", is_bot=False)
-    p.record("C1", ts="101.0", thread_ts="100.0", user_id="U2", display_name="Bob",
-             sender_type="human", text="a reply", is_bot=False)
-    env = p.render_envelope("C1")
-    # No line carries a leading stamp (the "- " bullet is followed straight by the name).
-    assert not any(_STAMP_RE.match(ln.lstrip("- ")) for ln in env.splitlines())
 
-
-# ------------------------------------------------------------------ pulse stamping
+# ------------------------------------------------------- these stamps are DM-only now
 #
-# The thread-tail half of this section went with the rich gate's prose tails: the per-thread ring
-# now holds actor state (ts / is_bot / sender_type) and no text, so there is no line to stamp.
-# The envelope is the surviving stamped surface, and it feeds the responder.
+# The pulse envelope was the other stamped surface, and it is retired: a channel turn renders
+# the stream instead, and the stream's own header carries a UTC minute stamp built from the
+# shared timestamp parser's SECONDS field (channel_stream.iso_minute). These helpers are the
+# DM/legacy renderer — a per-sender local time, 12-hour clock, weekday and tz label — and the two
+# must not converge, because one is inside a cached prefix and the other is not.
 
-def test_channel_activity_envelope_lines_are_stamped():
-    p = ChannelPulse()
-    p.record("C1", ts="100.0", thread_ts=None, user_id="U1", display_name="Alice",
-             sender_type="human", text="deploy question here", is_bot=False)
-    p.record("C1", ts="101.0", thread_ts=None, user_id="U2", display_name="Cara",
-             sender_type="human", text="unrelated top level", is_bot=False)
-    env = p.render_envelope("C1")
-    activity_lines = [ln for ln in env.splitlines() if ln.startswith("- ")]
-    assert activity_lines
-    for ln in activity_lines:
-        assert _STAMP_RE.match(ln[2:])
-    assert "[Thu 1970-01-01 12:01 AM UTC] Alice (top-level): deploy question here" in env
+def test_the_channel_stream_header_does_not_use_the_dm_stamp():
+    from message_processor.channel_stream import iso_minute
+    assert iso_minute("1783692913.675809") == "2026-07-10 14:15"
+    assert not _STAMP_RE.match(iso_minute("1783692913.675809"))
+    assert render_message_timestamp("1783692913.675809", "America/New_York") == (
+        "[Fri 2026-07-10 10:15 AM EDT]")
+
+
+def test_the_two_stamps_read_the_same_instant():
+    """Different renderings, one ts: the stream is UTC and cache-stable, the DM stamp is local
+    to the sender. A drift between them would be a real reporting bug, not a formatting one."""
+    from message_processor.channel_stream import iso_minute
+    assert iso_minute("1783692913.675809").endswith("14:15")
+    assert "10:15 AM EDT" in render_message_timestamp("1783692913.675809", "America/New_York")

@@ -38,6 +38,7 @@ from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 from config import clamp_effort, config
+from message_processor import outbound_receipts
 from message_processor.artifacts import strip_citation_markers, strip_sandbox_links
 from tool_registry import ToolContext, ToolRegistry
 
@@ -714,7 +715,11 @@ class _ResearchCard:
                  label: Optional[str], todos: Optional["_TodoState"] = None,
                  clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], Any] = asyncio.sleep,
-                 now_label: Callable[[], str] = _now_label):
+                 now_label: Callable[[], str] = _now_label,
+                 receipts=None):
+        # The card is the JOB's chrome, owned by the job's ledger — the turn that dispatched
+        # the job is long over by the time it posts.
+        self.receipts = receipts
         self.processor = processor
         self.client = client
         self.channel_id = channel_id
@@ -824,7 +829,7 @@ class _ResearchCard:
         if self.label:
             ts = await client.post_status_card(
                 self.channel_id, self.thread_root, _CARD_FALLBACK_TEXT, blocks,
-                username=self.label)
+                username=self.label, receipts=self.receipts)
             if ts is None:
                 setattr(self.processor, _RESEARCH_LABEL_DISABLED_ATTR, True)
                 self.processor.log_info(
@@ -833,7 +838,8 @@ class _ResearchCard:
                 self.label = None
         if ts is None:
             ts = await client.post_status_card(
-                self.channel_id, self.thread_root, _CARD_FALLBACK_TEXT, blocks)
+                self.channel_id, self.thread_root, _CARD_FALLBACK_TEXT, blocks,
+                receipts=self.receipts)
         self.ts = ts
 
     async def set_todos(self, todos: Any) -> Optional[str]:
@@ -1259,9 +1265,11 @@ async def _run_build_phase(*, processor, client, channel_id: str, thread_root: s
     # A build phase may only produce INGREDIENTS; the publisher decides what the user sees.
     registry = ToolRegistry()
     registry.register(get_update_todos_schema(), _make_update_todos(card))
+    # The job registry reads the DEFAULT (dm) surface, so this stays the dynamic factory —
+    # a build phase wants the container-aware shape, not the channel-stable one.
     registry.register(image_tools.get_create_image_asset_schema,
                       image_tools.execute_create_image_asset,
-                      name="create_image_asset",
+                      name="create_image_asset", dynamic=True,
                       timeout=float(config.api_timeout_image) + 60.0)
     file_mount.register_file_mount_tools(registry)
 
@@ -1436,9 +1444,15 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
     # The dispatching model's plan seeds the todo list, so the card lands ALREADY populated —
     # the user reads what the job intends to do at t=0, instead of watching a bare "Researching…"
     # until the job model's first round comes back.
+    # Spec §5: a detached job owns its OWN receipts. Borrowing the dispatching turn's ledger
+    # would attribute the findings to a turn that ended minutes earlier — and that turn's
+    # settle would have finalized them before they were written.
+    receipts = outbound_receipts.ledger_for_job(
+        job_id, getattr(client, "self_team_id", None), channel_id)
     card = _ResearchCard(processor=processor, client=client, channel_id=channel_id,
                          thread_root=thread_root, task=task, todos=_TodoState(plan),
-                         label=_research_label(processor, label_source))
+                         label=_research_label(processor, label_source),
+                         receipts=receipts)
     try:
         await card.start()
     except Exception as e:  # noqa: BLE001 — a card failure must never kill the research
@@ -1459,7 +1473,7 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
                 processor.log_warning(f"Background job {job_id} produced no findings")
                 await card.finalize_failure("the research came back empty")
                 await _deliver_failure(client, channel_id, thread_root,
-                                       "the research came back empty")
+                                       "the research came back empty", receipts=receipts)
                 return
 
         # Phase 2 — BUILD, then STAGE. Nothing is published here; the bytes come out of the
@@ -1492,7 +1506,7 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
             thread_key=thread_key, job_id=job_id, plan=plan, report=text, staged=staged,
             label_source=label_source, deliverables=deliverables, card=card,
             ledger_key=(build or {}).get("ledger_key") or thread_key,
-            elapsed=elapsed, effort=effort, tools_used=tools_used)
+            elapsed=elapsed, effort=effort, tools_used=tools_used, receipts=receipts)
         if not delivered:
             return
         processor.log_info(f"Background job {job_id} completed for {thread_key} in {elapsed:.1f}s")
@@ -1507,13 +1521,14 @@ async def _run_background_job(*, processor, client, channel_id: str, thread_root
         processor.log_warning(f"Background job {job_id} timed out after {timeout_s:.0f}s")
         await card.finalize_failure("it ran past the time limit before finishing")
         await _deliver_failure(client, channel_id, thread_root,
-                               "it ran past the time limit before finishing")
+                               "it ran past the time limit before finishing", receipts=receipts)
     except Exception as e:  # noqa: BLE001 — a job failure must post an honest note, never crash
         processor.log_error(f"Background job {job_id} failed for {thread_key}: {e}", exc_info=True)
         reason = str(e)[:200] or "an unexpected error"
         await card.finalize_failure(reason)
-        await _deliver_failure(client, channel_id, thread_root, reason)
+        await _deliver_failure(client, channel_id, thread_root, reason, receipts=receipts)
     finally:
+        await outbound_receipts.settle_ledger(receipts)
         if tm is not None and hasattr(tm, "finish_research"):
             tm.finish_research(thread_key, job_id)
 
@@ -1697,7 +1712,7 @@ async def _transact_delivery(processor, client, *, channel_id: str, thread_root:
                              report: str, staged: List[Any], label_source: str,
                              deliverables: List[Dict[str, str]], card: "_ResearchCard",
                              ledger_key: str, elapsed: float, effort: str,
-                             tools_used: List[str]) -> bool:
+                             tools_used: List[str], receipts=None) -> bool:
     """Execute the delivery plan in reading order — the model's message, then the report if it
     asked for one, then the files — and finalize the card from what actually landed.
 
@@ -1730,7 +1745,8 @@ async def _transact_delivery(processor, client, *, channel_id: str, thread_root:
 
     async def _post_report() -> bool:
         return bool(await _deliver_findings(processor, client, channel_id, thread_root,
-                                            report + trailer, label_source))
+                                            report + trailer, label_source,
+                                            receipts=receipts))
 
     if has_report and not post_report and not publish_ids:
         # The model is shipping nothing at all. Post the report in its proper place (above any
@@ -1743,7 +1759,8 @@ async def _transact_delivery(processor, client, *, channel_id: str, thread_root:
     posted_any = False
     if reply:
         posted_any = bool(await _deliver_findings(processor, client, channel_id, thread_root,
-                                                  reply, label_source)) or posted_any
+                                                  reply, label_source,
+                                                  receipts=receipts)) or posted_any
 
     report_posted = False
     if has_report and post_report:
@@ -1757,7 +1774,7 @@ async def _transact_delivery(processor, client, *, channel_id: str, thread_root:
             staged, publish_ids, client=client, channel_id=channel_id, thread_id=thread_root,
             thread_key=thread_key, db=getattr(processor, "db", None),
             container_manager=getattr(processor, "container_manager", None),
-            ledger_key=ledger_key)
+            ledger_key=ledger_key, receipts=receipts)
         posted_any = posted_any or bool(published)
     elif staged:
         processor.log_info(f"Background job {job_id}: model withheld all "
@@ -1797,7 +1814,7 @@ async def _transact_delivery(processor, client, *, channel_id: str, thread_root:
             f"(posted_any={posted_any}, report_posted={report_posted}, "
             f"published={len(published)})")
         await card.finalize_failure(detail)
-        await _deliver_failure(client, channel_id, thread_root, detail)
+        await _deliver_failure(client, channel_id, thread_root, detail, receipts=receipts)
         return False
 
     # Whether a deliverable exists is an application fact — Slack returned a file id — never the
@@ -1825,7 +1842,7 @@ async def _transact_delivery(processor, client, *, channel_id: str, thread_root:
 
 
 async def _deliver_findings(processor, client, channel_id: str, thread_root: str,
-                            text: str, label_source: str) -> Optional[str]:
+                            text: str, label_source: str, receipts=None) -> Optional[str]:
     """Post the findings through the normal send path (inherits markdown conversion +
     record_own_reply pulse recording). Optionally label the post with a chat.postMessage
     username override built from ``label_source`` (the model's short topic tag, falling back
@@ -1835,7 +1852,8 @@ async def _deliver_findings(processor, client, channel_id: str, thread_root: str
     posted = None
     if label:
         try:
-            posted = await client.send_message(channel_id, thread_root, text, username=label)
+            posted = await client.send_message(channel_id, thread_root, text, username=label,
+                                               receipts=receipts)
         except Exception as e:  # noqa: BLE001
             processor.log_debug(f"Labelled research post raised: {e}")
             posted = None
@@ -1845,16 +1863,18 @@ async def _deliver_findings(processor, client, channel_id: str, thread_root: str
                 "Research label post failed (missing chat:write.customize?) — falling back to "
                 "plain posts for the rest of this process")
     if not posted:
-        posted = await client.send_message(channel_id, thread_root, text)
+        posted = await client.send_message(channel_id, thread_root, text, receipts=receipts)
     return posted
 
 
-async def _deliver_failure(client, channel_id: str, thread_root: str, reason: str) -> None:
+async def _deliver_failure(client, channel_id: str, thread_root: str, reason: str,
+                           receipts=None) -> None:
     """Post an honest one-line failure note to the originating thread. Best-effort."""
     try:
         await client.send_message(
             channel_id, thread_root,
-            f"⚠️ That deep-research job hit a wall: {reason}. Try asking again.")
+            f"⚠️ That deep-research job hit a wall: {reason}. Try asking again.",
+            receipts=receipts)
     except Exception:
         pass
 

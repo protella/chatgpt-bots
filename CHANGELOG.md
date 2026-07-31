@@ -138,6 +138,37 @@ From then on the database backs itself up nightly (7-day retention) as part of t
 cleanup, which it never did before. The three `pre-v3-*` backups are **exempt from that
 retention** — they're your rollback path, so nothing deletes them but you.
 
+### 🧵 Changed - A channel is one conversation now, not a stack of keyholes
+
+Channel answers used to be built from the current thread plus a short "recent activity" list.
+The bot now rebuilds the whole room as a single time-ordered stream — every message, every
+thread labeled in place — so it follows the channel the way a person scrolling it would, and
+stops missing context that lived one thread over. Still stateless: the view is rebuilt from
+Slack on every turn, and nothing new is stored.
+
+### 🔀 Added - It answers where the answer belongs
+
+When something said in one thread is really an answer for another, the bot can now post
+directly into that other thread instead of talking about it from the wrong one. Replies land
+under the right root, and its own posts are tracked with receipts so it never loses track of
+what it already said, even across restarts.
+
+### 🗜️ Added - Busy channels get summarized instead of erroring
+
+Very active channels could fail outright with "Couldn't Load Conversation History" once their
+history outgrew what a single turn may fetch. Hitting that limit now triggers a background
+compaction pass that condenses older history into a stored summary; later turns read the
+summary plus the live recent window. Summaries hold only digests and structure — message text
+still lives exclusively in Slack. (Window sizing is being retuned; the current bounds are
+generous.)
+
+### 📒 Changed - The participation ledger grew up (operators)
+
+Telemetry moved to ledger v8: turn lifecycle, stream builds, model responses, and outbound
+receipts are all recorded as structured events, with a checker (`tools/participation_ledger_check.py`)
+that validates a ledger end-to-end. Live testing now reads this ledger as evidence instead of
+eyeballing logs.
+
 ### ⚙️ Fixed - It knows its own channel settings instead of guessing them
 
 Ask it "what's your participation setting in here?" and it used to answer from the chat

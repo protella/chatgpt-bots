@@ -91,7 +91,6 @@ def _make_bot(*, settings_completed=False, claim_result=True):
     bot.app = MagicMock()
     bot.app.client = MagicMock()
     bot.app.client.chat_postMessage = AsyncMock(return_value=_ok_resp())
-    bot.channel_pulse = None  # skip the pulse feed/backfill branch
     bot.db = MagicMock()
     bot.db.get_user_preferences_async = AsyncMock(
         return_value={"settings_completed": settings_completed})

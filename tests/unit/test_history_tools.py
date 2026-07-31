@@ -663,3 +663,76 @@ def test_truncation_note_distinguishes_a_trimmed_thread_from_a_trimmed_channel()
     assert thread["note"] != channel["note"]
     assert "newest window" in channel["note"] and "root" not in channel["note"]
     assert "longer than the tool can page through" in capped["note"]
+
+
+# ---------------------------- DM bytes are frozen (codex P2 review, finding 16) ---------------
+
+def _baseline_text(host, msg):
+    """`_text_with_supplementary` EXACTLY as it stood before P2 (p2_baseline/history_tool.py).
+
+    The oracle, not a paraphrase: the P2 rewrite routed every conversation through the channel
+    normalizer, which control-strips text, declines whole subtypes and raises on a malformed ts —
+    all of which can turn a readable DM message into an empty one. DM bytes are frozen by
+    contract, so the fix is a branch and this is what it must match.
+    """
+    from slack_client.formatting.blocks import extract_supplementary_text
+
+    text = msg.get("text", "") or ""
+    try:
+        if host.classify_sender(msg) == "self":
+            return text
+    except Exception:
+        pass
+    supplementary = extract_supplementary_text(msg, primary_text=text)
+    if not supplementary:
+        return text
+    return f"{text}\n\n{supplementary}" if text.strip() else supplementary
+
+
+_DM_CASES = {
+    "plain": {"ts": "100.000100", "user": "U1", "text": "just a sentence"},
+    "with_attachment_fields": {
+        "ts": "100.000200", "user": "U1", "text": "look at this",
+        "attachments": [{"title": "Quarterly report", "text": "Revenue up 4%",
+                         "fields": [{"title": "Owner", "value": "Dana"}]}]},
+    "empty_text_all_supplementary": {
+        "ts": "100.000300", "user": "U1", "text": "",
+        "attachments": [{"title": "Only the card", "text": "body"}]},
+    # Control characters survive: the channel serializer strips them for its own grammar, and
+    # nothing about a DM tool round needs that.
+    "control_chars": {"ts": "100.000400", "user": "U1", "text": "bell\x07 and tab\tinside"},
+    # A subtype the channel normalizer declines outright.
+    "declined_subtype": {
+        "ts": "100.000500", "subtype": "channel_join", "user": "U1", "text": "joined",
+        "attachments": [{"title": "still readable", "text": "body"}]},
+    # A ts the shared comparator raises on.
+    "malformed_ts": {
+        "ts": "1.2.3", "user": "U1", "text": "unreadable stamp",
+        "attachments": [{"title": "still readable", "text": "body"}]},
+    "no_ts_at_all": {
+        "user": "U1", "text": "no stamp",
+        "attachments": [{"title": "still readable", "text": "body"}]},
+}
+
+
+@pytest.mark.parametrize("case", sorted(_DM_CASES))
+def test_dm_history_text_is_byte_identical_to_the_pre_p2_baseline(bot, case):
+    msg = _DM_CASES[case]
+    for channel in ("D0123456", "U0123456", "W0123456"):
+        assert bot._text_with_supplementary(msg, channel) == _baseline_text(bot, msg)
+
+
+def test_an_unidentified_conversation_takes_the_dm_branch(bot):
+    """No channel id means we cannot prove it is a channel surface, and the frozen path is the
+    safe default."""
+    msg = _DM_CASES["with_attachment_fields"]
+    assert bot._text_with_supplementary(msg, None) == _baseline_text(bot, msg)
+    assert bot._text_with_supplementary(msg) == _baseline_text(bot, msg)
+
+
+@pytest.mark.parametrize("case", ["control_chars", "declined_subtype", "malformed_ts"])
+def test_the_channel_route_really_is_the_lossy_one(bot, case):
+    """Proof the branch is load-bearing rather than decorative: on a CHANNEL id these three cases
+    come out different from the baseline, which is exactly the leak finding 16 reported."""
+    msg = _DM_CASES[case]
+    assert bot._text_with_supplementary(msg, "C0123456") != _baseline_text(bot, msg)

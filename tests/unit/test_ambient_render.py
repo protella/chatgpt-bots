@@ -1,5 +1,5 @@
-"""F51 — render seams: thread-history injection (batched, user-scoped), pulse composition in all
-three renderers + deletion, and the fetch_url tool."""
+"""F51 — render seams: thread-history injection (batched, user-scoped), ambient artifact deletion
+cascades, and the fetch_url tool."""
 import sqlite3
 import tempfile
 import types
@@ -9,7 +9,6 @@ import pytest
 import ambient_fetch
 from database import DatabaseManager
 from message_processor.utilities import MessageUtilitiesMixin, _render_ambient_artifact
-from slack_client.channel_pulse import ChannelPulse
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
@@ -179,44 +178,6 @@ def test_render_ambient_artifact_frames_untrusted():
     unfurl = _render_ambient_artifact({"kind": "link", "title": "", "summary": "S",
                                        "derivation_source": "unfurl"})
     assert "link preview" in unfurl
-
-
-# ------------------------------------------------------------------- pulse composition
-
-def _record(p, channel="C1", ts="1.0", thread_ts=None, text="hello"):
-    p.record(channel, ts=ts, thread_ts=thread_ts, user_id="U1", display_name="Alice",
-             sender_type="human", text=text, is_bot=False)
-
-
-def test_pulse_upsert_appears_in_the_envelope():
-    # Was "…in all three renderers". The two thread/addressee tail renderers were gate prompt
-    # surfaces and are gone, so the envelope is the only renderer of an artifact note now — and
-    # the per-thread ring, which holds actor state and no text, is deliberately not written.
-    p = ChannelPulse(size=30)
-    _record(p, ts="1.0", text="root msg")
-    _record(p, ts="2.0", thread_ts="1.0", text="a chart was posted")
-    note = "[image (analyzed): benchmark chart]"
-    assert p.upsert_artifacts("C1", "2.0", [note]) is True
-    assert note in p.render_envelope("C1")
-    assert all("artifacts" not in e for e in p._thread_tails["C1"]["1.0"])
-
-
-def test_pulse_upsert_idempotent_and_late():
-    p = ChannelPulse(size=30)
-    _record(p, ts="5.0", text="msg")
-    note = "[link content: X]"
-    assert p.upsert_artifacts("C1", "5.0", [note]) is True
-    assert p.upsert_artifacts("C1", "5.0", [note]) is False  # dedup, no double-render
-    assert p.render_envelope("C1").count(note) == 1
-
-
-def test_pulse_remove_message_drops_entry():
-    p = ChannelPulse(size=30)
-    _record(p, ts="1.0", text="keep")
-    _record(p, ts="2.0", text="delete me")
-    assert p.remove_message("C1", "2.0") is True
-    assert "delete me" not in p.render_envelope("C1")
-    assert "keep" in p.render_envelope("C1")
 
 
 # ------------------------------------------------------------------- fetch_url tool

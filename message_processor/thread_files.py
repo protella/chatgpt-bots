@@ -22,6 +22,7 @@ import os
 from typing import Any, Dict, List, Optional
 from urllib.parse import unquote, urlparse
 
+from database import UNATTENDED_SUMMARY_TEMPLATE
 from logger import setup_logger
 
 logger = setup_logger(name="slack_bot.ThreadFiles")
@@ -185,6 +186,20 @@ def catalog_lines(entries: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+EVIDENCE_HEADER = "Files in this thread (mount_file ids):"
+
+
+def catalog_evidence_lines(entries: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+    """The file section of a channel turn's tool-evidence block, one entry per line.
+
+    Same text the mount_file schema used to carry, moved out of the cached prefix.
+    """
+    entries = entries or []
+    if not entries:
+        return [EVIDENCE_HEADER, "(none)"]
+    return [EVIDENCE_HEADER] + catalog_lines(entries).split("\n")
+
+
 async def catalog_unattended(processor, client, message) -> None:
     """Record the files on a message the bot decided NOT to answer.
 
@@ -236,7 +251,7 @@ async def catalog_unattended(processor, client, message) -> None:
                 db.save_document(
                     thread_id=thread_key, filename=name,
                     mime_type=mime or "application/octet-stream",
-                    summary=f"Shared in this conversation ({name}). Not yet read.",
+                    summary=UNATTENDED_SUMMARY_TEMPLATE.format(name=name),
                     file_id=file_id, url_private=url,
                     size_bytes=att.get("size"),
                     metadata={"source": "uploaded", "cataloged": "unattended"},

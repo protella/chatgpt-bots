@@ -176,6 +176,14 @@ class TurnSendLease:
     state: str = PENDING
     _watermarks: Any = field(default=None, repr=False)
     _closed: bool = field(default=False, repr=False)
+    # WHY this turn was suppressed, kept from the first refusal. A turn is refused once and then
+    # refused again at every later surface it tries, and those later refusals used to carry no
+    # evidence at all — a dozen log lines reading "newer message None in None supersedes this
+    # turn", which names neither the message that superseded it nor the scope it happened in. The
+    # fact does not change after the first refusal, so it is remembered rather than re-derived
+    # (the watermark entry may be gone by then; the turn that raised it has closed its lease).
+    _suppressed_scope: Optional[Scope] = field(default=None, repr=False)
+    _suppressed_latest_ts: Optional[str] = field(default=None, repr=False)
 
     # --- what this turn has accounted for -------------------------------------------------
 
@@ -204,12 +212,15 @@ class TurnSendLease:
         if self.state == COMMITTED:
             return
         if self.state == SUPPRESSED:
+            # The ORIGINAL evidence, rethrown: the surface differs, the reason does not.
             raise StaleSendSuppressed(
-                scope=None, last_seen_ts=self.last_seen_ts,
-                observed_latest_ts=None, surface=surface)
+                scope=self._suppressed_scope, last_seen_ts=self.last_seen_ts,
+                observed_latest_ts=self._suppressed_latest_ts, surface=surface)
         latest, scope = self.observed_latest()
         if latest is not None and is_newer(latest, self.last_seen_ts):
             self.state = SUPPRESSED
+            self._suppressed_scope = scope
+            self._suppressed_latest_ts = latest
             logger.info(
                 f"Stale send suppressed ({surface}): {scope} advanced to {latest}, "
                 f"this turn had seen {self.last_seen_ts}")
@@ -261,9 +272,8 @@ class _Entry:
 class ConversationWatermarks:
     """Process-wide record of the newest inbound message per conversation scope.
 
-    ONE instance, on ChatBotV2. Deliberately not in ThreadStateManager (a top-level burst is a
-    stream of separate thread keys, so its per-thread locks cannot see the collision) and not in
-    channel_pulse (optional awareness state, a different population, and switchable off).
+    ONE instance, on ChatBotV2. Deliberately not in ThreadStateManager: a top-level burst is a
+    stream of separate thread keys, so its per-thread locks cannot see the collision.
 
     The map is bounded by CONCURRENCY, not by a policy: a scope exists only while some turn in
     it holds a lease, and disappears when the last one closes. No timers, no caps, no sweeps.

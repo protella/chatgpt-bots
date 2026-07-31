@@ -76,11 +76,11 @@ class TestBotConfig:
         assert config.api_timeout_image > config.api_timeout_read
 
     def test_thread_tail_defaults(self, mock_env):
-        """F17: thread-tail default raised 6 → 15 (50 / 30 unchanged)."""
+        """F17: thread-tail default raised 6 → 15 (50 / 30 unchanged, now actor_tail_*)."""
         config = BotConfig()
         assert config.participation_thread_tail == 15
-        assert config.pulse_thread_tails_max == 50
-        assert config.pulse_thread_tail_channels_max == 30
+        assert config.actor_tail_threads_max == 50
+        assert config.actor_tail_channels_max == 30
 
     @patch.dict(os.environ, {"PARTICIPATION_THREAD_TAIL": "9"})
     def test_thread_tail_env_override(self, mock_env):
@@ -94,27 +94,37 @@ class TestBotConfig:
         config = BotConfig()
         assert config.participation_thread_tail == 0
 
+    def test_index_drain_timeout_default(self, mock_env, monkeypatch):
+        """INDEX_DRAIN_TIMEOUT_SECONDS defaults to 10.0."""
+        monkeypatch.delenv("INDEX_DRAIN_TIMEOUT_SECONDS", raising=False)
+        config = BotConfig()
+        assert isinstance(config.index_drain_timeout_seconds, float)
+        assert config.index_drain_timeout_seconds == 10.0
+
+    @patch.dict(os.environ, {"INDEX_DRAIN_TIMEOUT_SECONDS": "3.5"})
+    def test_index_drain_timeout_env_override(self, mock_env):
+        """INDEX_DRAIN_TIMEOUT_SECONDS honors env overrides."""
+        config = BotConfig()
+        assert config.index_drain_timeout_seconds == 3.5
+
     def test_reaction_max_per_message_default(self, mock_env):
         """F6 per-message reaction cap defaults to 4."""
         config = BotConfig()
         assert config.reaction_max_per_message == 4
 
     def test_f14_cap_overhaul_defaults(self, mock_env, monkeypatch):
-        """F14/F17 defaults: 5 / 60 / 500 / 500 / 20 / 80 / 300 / 90 (F17 raised the
-        two pulse truncations to 500; the hourly cap knob is gone entirely).
+        """F14 defaults: 5 / 20 / 80 / 300 / 90 (the hourly cap knob is gone entirely; the
+        channel-pulse truncation knobs are gone too — the pulse module was retired).
 
         mock_env only SETS its own keys — it never clears the developer's real .env, so
         these CODE defaults have to be read with the backing vars removed or a tuned local
-        .env (e.g. a raised CHANNEL_PULSE_SIZE) fails a test that is about the fallbacks."""
-        for key in ("MAX_CONCURRENT_IMAGE_GENERATIONS", "CHANNEL_PULSE_SIZE",
-                    "PULSE_TEXT_TRUNCATE",
+        .env fails a test that is about the fallbacks."""
+        for key in ("MAX_CONCURRENT_IMAGE_GENERATIONS",
                     "TOOL_PROVENANCE_MAX_ENTRIES", "TOOL_PROVENANCE_GIST_CHARS",
                     "TOOL_PROVENANCE_LINE_BUDGET", "TOOL_USAGE_RETENTION_DAYS"):
             monkeypatch.delenv(key, raising=False)
         config = BotConfig()
         assert config.max_concurrent_image_generations == 5
-        assert config.channel_pulse_size == 60
-        assert config.pulse_text_truncate == 500
         assert config.tool_provenance_max_entries == 20
         assert config.tool_provenance_gist_chars == 80
         assert config.tool_provenance_line_budget == 300
@@ -126,16 +136,12 @@ class TestBotConfig:
         assert not hasattr(config, "max_unprompted_replies_per_hour")
 
     @patch.dict(os.environ, {
-        "CHANNEL_PULSE_SIZE": "12",
-        "PULSE_TEXT_TRUNCATE": "111",
         "TOOL_PROVENANCE_MAX_ENTRIES": "7", "TOOL_PROVENANCE_GIST_CHARS": "40",
         "TOOL_PROVENANCE_LINE_BUDGET": "150", "TOOL_USAGE_RETENTION_DAYS": "30",
     })
     def test_f14_env_overrides_respected(self, mock_env):
-        """F14/F17 caps are env-backed and honor overrides."""
+        """F14 caps are env-backed and honor overrides."""
         config = BotConfig()
-        assert config.channel_pulse_size == 12
-        assert config.pulse_text_truncate == 111
         assert config.tool_provenance_max_entries == 7
         assert config.tool_provenance_gist_chars == 40
         assert config.tool_provenance_line_budget == 150

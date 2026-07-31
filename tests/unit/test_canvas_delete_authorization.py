@@ -23,7 +23,9 @@ classification fails CLOSED.
 """
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 
 from base_client import Message
@@ -125,3 +127,82 @@ def test_name_addressed_participation_turn_with_a_real_mention_enables_delete():
          "gate_required": True, "silence_capable": True,
          "participation_name_hit": True})
     assert flag is True and gate is True and in_schema is True
+
+
+# ------------------------------------------------------- the CHANNEL surface (static schema)
+#
+# On a channel turn the schema is static and `_delete_enabled` never runs: the tool is on the
+# table for every turn, so the EXECUTOR has to reach the same verdict the gate would have. These
+# feed the SAME production-derived signal into `execute_delete_canvas` and assert the two
+# surfaces agree — a delete the DM gate would have withheld must be refused, not merely hidden.
+
+def _executor_verdict(meta, *, channel_id=CHANNEL):
+    """Run the real derivation, hand it to the executor as ToolContext.canvas_delete_authorized,
+    and report (result, was_slack_asked_to_delete)."""
+    import asyncio
+
+    from tool_registry import ToolContext
+
+    msg = Message(text="delete that canvas", user_id="U07PETER",
+                  channel_id=channel_id, thread_id="100.0", metadata=dict(meta))
+    _reg, request_config, _n, _s = _Handler()._materialize_request_tools(
+        MagicMock(), {}, msg, tools_disabled=True)
+
+    web = MagicMock()
+    web.canvases_delete = AsyncMock(return_value={"ok": True})
+    web.files_info = AsyncMock(return_value={
+        "file": {"id": "F1", "filetype": "quip", "channels": [channel_id]}})
+    web.files_list = AsyncMock(return_value={"files": [{"id": "F1", "title": "Old notes"}]})
+    web.conversations_info = AsyncMock(
+        return_value={"channel": {"properties": {"canvas": None, "tabs": []}}})
+    client = MagicMock()
+    client.app = MagicMock()
+    client.app.client = web
+
+    ctx = ToolContext(channel_id=channel_id, thread_ts="100.0", client=client, message=msg)
+    ctx.canvas_delete_authorized = request_config.get("_canvas_delete_authorized", False)
+    result = asyncio.run(ct.execute_delete_canvas(ctx, {"canvas_id": "F1"}))
+    return result, web.canvases_delete.await_count > 0
+
+
+REFUSED = [
+    ({"sender_type": "other_bot", "mentioned_self": True}, "not_authorized"),
+    ({"sender_type": "self", "mentioned_self": True}, "not_authorized"),
+    ({"sender_type": "human", "mentioned_self": False,
+      "gate_required": True, "silence_capable": True,
+      "participation_name_hit": True}, "not_authorized"),
+    ({"sender_type": "human", "mentioned_self": False,
+      "gate_required": True, "silence_capable": True}, "not_authorized"),
+    ({"mentioned_self": True}, "not_authorized"),        # classification absent
+]
+
+
+@pytest.mark.parametrize("meta, error", REFUSED)
+def test_the_executor_refuses_everything_the_dm_gate_would_have_withheld(meta, error):
+    flag, gate, in_schema = _delete_offered(meta)
+    assert flag is False and gate is False and in_schema is False   # the DM surface
+
+    result, deleted = _executor_verdict(meta)
+    assert result["ok"] is False and result["error"] == error
+    assert deleted is False
+
+
+def test_the_executor_serves_a_genuine_human_mention_on_the_channel_surface():
+    meta = {"sender_type": "human", "mentioned_self": True}
+    assert _delete_offered(meta) == (True, True, True)
+
+    result, deleted = _executor_verdict(meta)
+    assert result["ok"] is True and result["deleted"] is True
+    assert deleted is True
+
+
+def test_a_context_that_never_derived_the_flag_cannot_delete():
+    """The field is read with getattr(..., False), so a ToolContext built by a path that does not
+    derive it — a background agent's own registry, an older call site — fails closed."""
+    import asyncio
+
+    from tool_registry import ToolContext
+
+    ctx = ToolContext(channel_id=CHANNEL, thread_ts="100.0", client=MagicMock())
+    result = asyncio.run(ct.execute_delete_canvas(ctx, {"canvas_id": "F1"}))
+    assert result["ok"] is False and result["error"] == "not_authorized"

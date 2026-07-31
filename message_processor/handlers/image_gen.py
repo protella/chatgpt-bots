@@ -16,9 +16,14 @@ class ImageJobMixin:
             thread_key, prompt, enhance, conversation_history, thread_config, checklist,
             generating_id, generation_id, message_ts=None) -> None:
         """The slow generate_image call plus delivery, run after the thread lock released."""
+        from message_processor import outbound_receipts
         from message_processor.image_delivery import publish_image, review_produced_image
         from message_processor.image_service import resolve_settings
         status_only = checklist is not None and checklist.surface == "assistant_status"
+        # A detached generation outlives its turn, so it owns its OWN receipts (spec §5) and
+        # settles them itself — the dispatching turn settled minutes ago.
+        receipts = outbound_receipts.ledger_for_job(
+            generation_id, getattr(client, "self_team_id", None), channel_id)
         settings, _ = resolve_settings(thread_config)
         try:
             image_data = await self.openai_client.generate_image(
@@ -38,12 +43,14 @@ class ImageJobMixin:
                 generation_id=generation_id, prompt=image_data.prompt, db=self.db,
                 thread_manager=self.thread_manager,
                 message_ts=message_ts, provenance_tool="generate_image",
+                receipts=receipts,
             )
             if file_url is None:
                 # publish_image already failed the checklist; surface a friendly notice
                 # (recoverable via the post-refresh Slack rebuild).
                 await client.handle_error(channel_id, thread_id,
-                    "⚠️ I generated the image but couldn't post it. Please try again.")
+                    "⚠️ I generated the image but couldn't post it. Please try again.",
+                    receipts=receipts)
             else:
                 # The picture is posted; now let the model SEE it. A detached generation lands
                 # after its turn ended, so this one short call is the only point at which the
@@ -52,23 +59,26 @@ class ImageJobMixin:
                 # but it can never fail the job — review_produced_image swallows everything.
                 await review_produced_image(
                     processor=self, client=client, channel_id=channel_id, thread_id=thread_id,
-                    conversation_history=conversation_history, image_data=image_data, ask=prompt)
+                    conversation_history=conversation_history, image_data=image_data,
+                    ask=prompt, receipts=receipts)
         except asyncio.CancelledError:
             # Shutdown/cancel: clear the progress surface (message-surface checklists too,
             # which the finally's status-only clear wouldn't reach), then let finally run.
-            await self._abort_checklist(checklist, client, channel_id, thread_id)
+            await self._abort_checklist(checklist, client, channel_id, thread_id,
+                                        receipts=receipts)
             raise
         except Exception as e:  # noqa: BLE001
             error_str = str(e)
             if ("moderation_blocked" in error_str or "safety system" in error_str
                     or "content policy" in error_str.lower()):
-                await self._abort_checklist(checklist, client, channel_id, thread_id)
+                await self._abort_checklist(checklist, client, channel_id, thread_id,
+                                        receipts=receipts)
                 try:
                     await client.send_message(channel_id, thread_id,
                         "I couldn't generate that image as it was flagged by content safety "
                         "filters. This can happen with certain brand names, people, or other "
                         "protected content. Try rephrasing your request or describing what you "
-                        "want without using specific names.")
+                        "want without using specific names.", receipts=receipts)
                 except Exception:
                     pass
             else:
@@ -80,7 +90,8 @@ class ImageJobMixin:
                         pass
                 try:
                     await client.handle_error(channel_id, thread_id,
-                        "⚠️ I couldn't finish generating that image. Please try again.")
+                        "⚠️ I couldn't finish generating that image. Please try again.",
+                        receipts=receipts)
                 except Exception:
                     pass
         finally:
@@ -93,7 +104,12 @@ class ImageJobMixin:
                     if status_only and hasattr(client, "clear_assistant_status"):
                         await client.clear_assistant_status(channel_id, thread_id)
                 elif generating_id and hasattr(client, "delete_message"):
-                    await client.delete_message(channel_id, generating_id)
+                    # The row goes only once Slack confirms the message is gone — a receipt
+                    # dropped for a surface still on screen would readmit it as an own-message
+                    # nobody claims.
+                    gone = await client.delete_message(channel_id, generating_id)
+                    if gone and receipts is not None:
+                        await receipts.abort(generating_id)
                 elif not generating_id and hasattr(client, "clear_assistant_status"):
                     await client.clear_assistant_status(channel_id, thread_id)
             except Exception:
@@ -110,8 +126,10 @@ class ImageJobMixin:
                 pass
             # Next turn rebuilds the transcript from Slack (now has the posted image).
             self.thread_manager.mark_needs_refresh(thread_key)
+            await outbound_receipts.settle_ledger(receipts)
 
-    async def _abort_checklist(self, checklist, client, channel_id, thread_id) -> None:
+    async def _abort_checklist(self, checklist, client, channel_id, thread_id,
+                               receipts=None) -> None:
         """Remove a checklist's progress surface entirely (moderation blocks — neither a
         completed ✓ nor a failed ✗ checklist should linger)."""
         if checklist is None:
@@ -126,6 +144,8 @@ class ImageJobMixin:
                 if checklist.mirrors_status and hasattr(client, "clear_assistant_status"):
                     await client.clear_assistant_status(channel_id, thread_id)
                 if checklist.message_id and hasattr(client, "delete_message"):
-                    await client.delete_message(channel_id, checklist.message_id)
+                    gone = await client.delete_message(channel_id, checklist.message_id)
+                    if gone and receipts is not None:
+                        await receipts.abort(checklist.message_id)
         except Exception as e:  # noqa: BLE001
             self.log_warning(f"Failed to clear checklist surface: {e}")

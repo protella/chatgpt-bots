@@ -53,6 +53,25 @@ architecture notes.
   `.env` and are opt-in via `make test-integration` / `make test-all`.
 - Never start the bot as part of a test run; the maintainer manages the running process.
 
+## Spec workflow (Claude ↔ codex ↔ implementer)
+
+- Working specs and plans co-authored by Claude (orchestrator) and codex live in
+  **`Docs/specs/`** (gitignored — they carry internal IDs and live plans). Session
+  scratch directories die with the session; anything a later round needs goes here.
+- Every implementation task gets a **Markdown spec** in that folder before code is
+  written. The spec must map each requirement to a concrete technical design anchored
+  in the real code — exact files, functions, config names, schemas, literal grammars —
+  so the implementing agent (Opus 5) has **zero room to invent**. If something is
+  unspecified, that is a spec gap to send back, never a decision for the implementer.
+- **Authorship: Claude (the orchestrator) writes the spec; codex is the adversarial
+  sounding board, not the author and not the final say.** Codex findings are input;
+  what ships is decided by Claude's rulings and the owner's decisions, recorded in the
+  spec. Codex should challenge hard — and expect to be overruled with reasons.
+- Numeric limits are never invented: defaults come from existing tuned values or an
+  explicit owner decision, and the spec says which.
+- Review rounds check the diff **against the spec first** (conformance, point by
+  point), then do the general adversarial pass.
+
 ## Commit & Pull Request Guidelines
 - History uses **plain imperative subjects — no conventional-commit prefixes**
   (e.g. "Fix: forward tool_event_callback through the OpenAIClient wrapper",

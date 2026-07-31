@@ -4,13 +4,18 @@ Exercises the deterministic renderer (_build_wake_envelope) across every trigger
 sender role, bot flag, escaping, and the config/missing-metadata off-paths, plus its
 placement in the volatile developer suffix.
 
+The envelope itself is DM/legacy now: a channel turn states the same facts through
+`build_coordinates_suffix`, which took the envelope's content shape with it (covered in
+test_channel_evidence_builders.py; the bridge is asserted at the foot of this file).
+
 TWO BLOCKS LEFT THE ENVELOPE IN COMMIT 6, and both were the gate describing messages in prose:
 
 * the F27 burst line ("Moments before this message, the same person also sent: …"). It quoted real
   messages into a block the prompt also tells the model not to trust as content, stripped of
-  sender, time and attachments. The burst is now merged into the turn's actual input as
-  conversation (_merge_gate_cohort), formatted exactly like history, so the timestamps, the roster,
-  the token accounting and the trimming all treat those messages as what they are.
+  sender, time and attachments. The cohort is real input now — and under one whole-channel stream
+  it is not history either: every member Slack propagated is IN the stream with its own header,
+  and only the rest is quoted, post-breakpoint, as messages awaiting the stream
+  (channel_request.build_cohort_fallback).
 * the "you already reacted" note. It existed because the gate placed an emoji before the responder
   ran and then had to confess it. The gate places nothing, so there is nothing to confess.
 
@@ -35,15 +40,6 @@ class _WakeHost:
     # Sub-builders the suffix assembles — stubbed so the wake block is isolated.
     def _build_time_suffix_context(self, *a, **k):
         return "[time]"
-
-    def _build_pulse_envelope(self, *a, **k):
-        return None
-
-    def _build_channel_people_line(self, *a, **k):
-        return None
-
-    def _build_taggable_speakers_block(self, *a, **k):
-        return None
 
     def _build_generation_inflight_note(self, *a, **k):
         return None
@@ -158,38 +154,98 @@ def test_no_burst_prose_however_the_metadata_is_shaped():
         assert "first thought" not in env
 
 
-def test_the_cohort_reaches_the_model_as_real_messages_instead():
-    """Where it went: `_merge_gate_cohort` adds each source to the thread as a user turn, with the
-    sender's name, its own timestamp and its attachments named — deduplicated by source ts against
-    what the rebuild already found, and skipping the trigger's own message (the caller appends
-    that one)."""
+def _sources(*records, trigger_ts="3.0"):
+    return SimpleNamespace(metadata={"ts": trigger_ts, "gate_sources": tuple(records)})
+
+
+def _cohort():
     from message_processor.participation import SourceMessage
 
-    added = []
+    return (SourceMessage(ts="1.0", text="first thought", sender_name="alice",
+                          sender_id="U1", sender_type="human"),
+            SourceMessage(ts="2.0", text="", sender_name="alice", sender_id="U1",
+                          sender_type="human", attachments=("chart.png (image)",)),
+            SourceMessage(ts="3.0", text="and this too", sender_name="alice",
+                          sender_id="U1", sender_type="human"))
 
-    class _Host:
-        _merge_gate_cohort = MessageUtilitiesMixin._merge_gate_cohort
 
-        def _add_message_with_token_management(self, state, role, content, **kw):
-            added.append((role, content, kw.get("message_ts")))
+def test_the_cohort_becomes_typed_sources_not_prose():
+    """`_merge_gate_cohort` is gone with `ThreadState.messages` as a channel input. The gate's
+    burst and the queue's drained batch both become CohortSources — one shape, two producers —
+    deduplicated by ts, with the trigger's own message dropped because it is not "also" anything."""
+    from message_processor.channel_request import cohort_sources_from_message
 
-        def log_debug(self, *a, **k):
-            pass
+    assert not hasattr(MessageUtilitiesMixin, "_merge_gate_cohort")
+    sources = cohort_sources_from_message(_sources(*_cohort()))
+    assert [s.ts for s in sources] == ["1.0", "2.0"]
+    assert sources[0].text == "first thought" and sources[0].sender_name == "alice"
+    assert sources[1].attachment_names == ("chart.png (image)",)
 
-    message = SimpleNamespace(metadata={"ts": "3.0", "gate_sources": (
-        SourceMessage(ts="1.0", text="first thought", sender_name="alice",
-                      sender_type="human"),
-        SourceMessage(ts="2.0", text="", sender_name="alice", sender_type="human",
-                      attachments=("chart.png (image)",)),
-        SourceMessage(ts="3.0", text="and this too", sender_name="alice",
-                      sender_type="human"),
-    )})
-    state = SimpleNamespace(messages=[])
-    assert _Host()._merge_gate_cohort(message, state) == 2   # the trigger's own ts is skipped
-    assert [ts for _, _, ts in added] == ["1.0", "2.0"]
-    assert added[0][0] == "user"                             # a message, not metadata
-    assert "alice: first thought" in added[0][1]
-    assert "[attached: chart.png (image)]" in added[1][1]    # named, not described
+
+def test_only_the_part_of_the_burst_the_stream_cannot_see_is_quoted():
+    """The whole point of the move. A source Slack propagated is IN the stream with its real
+    header; quoting it again would show the model the same message twice and invite two answers.
+    What is quoted is what the window fetched too early to contain."""
+    from message_processor.channel_request import build_cohort_fallback, cohort_sources_from_message
+    from tests.unit import channel_turn_harness as harness
+
+    stream = harness.build_stream([harness.normalized("1.0", "first thought"),
+                                   harness.normalized("3.0", "and this too")])
+    turn = SimpleNamespace()
+    ctx = harness.pin_channel_turn(
+        turn, stream=stream, trigger_ts="3.0",
+        cohort_sources=cohort_sources_from_message(_sources(*_cohort())))
+    block = build_cohort_fallback(ctx)
+    assert "Also awaiting the stream — 1 message(s)" in block["content"]
+    assert "first thought" not in block["content"]           # the stream already has it
+    assert "[attached: chart.png (image)]" in block["content"]   # named, not described
+    assert block["role"] == "user"                          # content, never developer voice
+
+
+def test_a_burst_the_stream_caught_up_to_is_quoted_nowhere():
+    from message_processor.channel_request import build_cohort_fallback, cohort_sources_from_message
+    from tests.unit import channel_turn_harness as harness
+
+    stream = harness.build_stream([harness.normalized(ts) for ts in ("1.0", "2.0", "3.0")])
+    turn = SimpleNamespace()
+    ctx = harness.pin_channel_turn(
+        turn, stream=stream, trigger_ts="3.0",
+        cohort_sources=cohort_sources_from_message(_sources(*_cohort())))
+    assert build_cohort_fallback(ctx) is None
+
+
+def test_every_message_the_turn_is_answering_is_quoted():
+    """[r2-8] The gate's cohort is uncapped, so a cap here dropped messages the turn had already
+    decided it was answering — the model replied to a burst of forty having been shown ten of them,
+    with nothing saying so. Size is not a reason to drop them silently: every quoted line is charged
+    by the admission estimate, so a burst too large to send is refused out loud instead."""
+    from message_processor.channel_request import CohortSource, build_cohort_fallback
+    from tests.unit import channel_turn_harness as harness
+
+    turn = SimpleNamespace()
+    ctx = harness.pin_channel_turn(
+        turn, messages=[harness.normalized("3.0")], trigger_ts="3.0",
+        cohort_sources=[CohortSource(ts=f"{i}.5", text=f"m{i}") for i in range(40)])
+    block = build_cohort_fallback(ctx)
+    assert "40 message(s)" in block["content"]
+    assert block["content"].count("(ts=") == 40
+    for i in range(40):
+        assert f"m{i}" in block["content"]
+
+
+def test_a_cohort_members_files_are_still_authorized_by_id():
+    """Without this, a burst that dropped a CSV and then asked about it would put the question in
+    front of the model with the file unreadable for the length of one turn."""
+    from message_processor.channel_request import (CohortSource, canonical_files_from_stream,
+                                                   merge_absent_source_files)
+    from tests.unit import channel_turn_harness as harness
+
+    stream = harness.build_stream([harness.normalized("3.0")])
+    ref = harness.file_ref("FCSV", "numbers.csv", "text/csv")
+    merged = merge_absent_source_files(canonical_files_from_stream(stream),
+                                      [CohortSource(ts="2.0", files=(ref,))], "C1")
+    assert merged["FCSV"]["filename"] == "numbers.csv"
+    assert merged["FCSV"]["message_ts"] == "2.0"
 
 
 # ------------------------------------------------------------------- escaping / off
@@ -272,6 +328,22 @@ async def test_event_to_message_captures_sender_type():
     other_bot = {"text": "hi", "user": "U2", "channel": "C1", "ts": "3.0", "bot_id": "B9"}
     msg2 = await bot._event_to_message(other_bot, client=MagicMock())
     assert msg2.metadata["sender_type"] == "other_bot"
+
+
+def test_the_channel_path_states_the_same_wake_facts_through_its_coordinates():
+    """The envelope did not survive P2 on a channel turn — `build_coordinates_suffix` states the
+    trigger, the sender's relation to the thread and the wake source, and states them alongside
+    the ids the turn may act on. Asserted here so the F3 CONTENT cannot go missing in the move:
+    the coordinates block's own rules are covered in test_channel_evidence_builders.py."""
+    from message_processor.utilities import TurnCoordinates, build_coordinates_suffix
+
+    out = build_coordinates_suffix(TurnCoordinates(
+        channel_id="C1", trigger_ts="3.0", origin_thread_ts="1.0",
+        trigger_sender_name="alice", trigger_sender_id="U1", trigger_sender_type="human",
+        sender_is_root_author=True, wake_source="ambient", queued_batch_size=3))
+    assert "woke on: catch_up_batch (3) — latest trigger: ambient" in out
+    assert "from alice, the thread's root author" in out
+    assert "reason" not in out.lower()          # still no gate justification
 
 
 def test_wake_before_inflight_note():

@@ -13,11 +13,22 @@ the response.
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from config import config
+from logger import setup_logger
+
+logger = setup_logger(name="slack_bot.ToolRegistry")
+
+# The two tool surfaces (spec §3a). "dm" is the legacy, per-request-dynamic one; "channel" is
+# the cache-stable one, where a tool's shape is a function of (channel, channel config, bot
+# version) and nothing else.
+SURFACE_DM = "dm"
+SURFACE_CHANNEL = "channel"
 
 
 @dataclass
@@ -97,6 +108,11 @@ class ToolContext:
     # injection / hallucination / "being talked about ≠ talked to" vector — can never flip
     # channel settings even if the model emits the call.
     structural_change_authorized: bool = False
+    # The parallel, stricter signal for the irreversible canvas-delete tool: a HUMAN sender AND a
+    # genuine current-message address (a real <@bot> mention, or a DM). It used to live only in
+    # the tool's per-turn schema gate, which the channel surface structurally ignores — so the
+    # authorization moved here, where the executor checks it on BOTH surfaces. Fail-closed False.
+    canvas_delete_authorized: bool = False
     # F38: the turn's presentation + work-claim state (message_processor.turn_runtime).
     # A slow local tool calls `await ctx.turn.claim_work(ctx.client, ctx.message)` once its
     # arguments and capacity checks have PASSED and immediately before the slow part starts —
@@ -133,6 +149,41 @@ class ToolContext:
     origin_membership_attested: bool = False
     requester_is_human: bool = False
     channel_access_memo: Optional[Dict[Any, Any]] = None
+    # Every file the pinned channel window saw, `file_id -> {filename, mime_type, url_private,
+    # kind, channel_id, message_ts, thread_root_ts}`. Built from the stream's own fetch snapshot
+    # plus the live payloads of any cohort member Slack had not propagated yet, so a document
+    # dropped in ANOTHER thread of this channel is readable on the turn it is asked about rather
+    # than one turn later, once a `documents` row exists.
+    #
+    # AUTHORIZATION, not convenience: it names only ids the stream actually rendered, so it can
+    # widen what `read_document` reaches without widening it to arbitrary ids. Empty on DM turns,
+    # which have no channel window and keep the `documents`-table path verbatim.
+    canonical_files: Optional[Dict[str, Dict[str, Any]]] = None
+    # The thread roots this turn's stream actually SHOWED the model, frozen at pin time — the
+    # allowlist `post_to_thread` authorizes a cross-thread target against. It is deliberately
+    # three-valued in spirit: None means "no channel stream" (a DM, a background agent, a
+    # hand-built context) and keeps the legacy behavior verbatim; a frozenset — including an EMPTY
+    # one — means channel enforcement, because a turn whose stream rendered no thread has no
+    # thread it may post into. It comes from the SERIALIZED stream, not the fetch snapshot: what
+    # the model was shown is what it may act on, and the excluded/in-flight messages a snapshot
+    # still carries were withheld from it on purpose.
+    trusted_thread_roots: Optional[frozenset] = None
+    # --- per-call identity (spec §6 d2) ---------------------------------------------------
+    # These four are set on a SHALLOW PER-CALL COPY of the context, never on the shared one: a
+    # round's calls run CONCURRENTLY (dispatch_all gathers them), so a single mutable "current
+    # call" field would name whichever sibling wrote to it last. Everything above is shared BY
+    # REFERENCE across those copies — the vision staging, the mounted-file record, the membership
+    # memo — so the bookkeeping stays in one place and only the identity is per-call.
+    tool_call_id: Optional[str] = None
+    # THE resolved bound for this call and the monotonic instant it expires, stamped once at
+    # dispatch. Generic tools and the synchronous image tools resolve very different values, so
+    # anything downstream that needs the bound reads THIS rather than re-deriving one from config.
+    tool_timeout: Optional[float] = None
+    tool_deadline: Optional[float] = None
+    # This call's single-flight entry (message_processor.turn_runtime.ToolFlight). An executor
+    # calls `tool_flight.mark_launched()` immediately before it issues the side-effect request it
+    # cannot take back. None when the call carries no id, which is the legacy no-dedup path.
+    tool_flight: Any = None
 
     def container_recycled(self) -> bool:
         """F15: True when this turn's `container_id` died mid-turn and was recorded dead.
@@ -145,6 +196,49 @@ class ToolContext:
 
 
 Executor = Callable[[ToolContext, Dict[str, Any]], Awaitable[Dict[str, Any]]]
+
+
+# Containers the executors SHARE across a round. They are created here, before the per-call copies
+# exist, so no executor ever has to install one — an assign-if-None inside an executor would write
+# into its own copy, and two siblings that each installed a list would keep one of them.
+_SHARED_CONTAINERS = (("pending_vision_parts", list), ("sandbox_image_assets", list),
+                      ("mounted_files", list), ("channel_access_memo", dict))
+
+# Monotonic flags an executor sets to tell the HANDLER what happened (the ack reply it must drop,
+# the surface a detached producer owns). They are set on the per-call copy, so they are adopted
+# back onto the shared context when the call ends — including when it ends by raising, which is
+# how a suppressed cross-thread post still reports the image it had already started.
+_PER_CALL_FLAGS = ("background_job_started", "image_generation_started")
+
+
+def _ensure_shared_containers(ctx: Any) -> None:
+    for name, factory in _SHARED_CONTAINERS:
+        try:
+            if getattr(ctx, name, None) is None:
+                setattr(ctx, name, factory())
+        except Exception:  # noqa: BLE001 — a read-only stand-in context keeps today's behavior
+            continue
+
+
+def _adopt_per_call_flags(parent: Any, call_ctx: Any) -> None:
+    if parent is call_ctx:
+        return
+    for name in _PER_CALL_FLAGS:
+        try:
+            if getattr(call_ctx, name, False) and not getattr(parent, name, False):
+                setattr(parent, name, True)
+        except Exception:  # noqa: BLE001
+            continue
+
+
+def _call_fingerprint(name: str, args: Dict[str, Any]) -> str:
+    """What a call id is a name FOR. Two calls with one id and different fingerprints are two
+    different questions, and the second must never be answered with the first one's result."""
+    try:
+        payload = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001
+        payload = repr(args)
+    return hashlib.sha256(f"{name}\x00{payload}".encode("utf-8")).hexdigest()
 
 
 class ToolRegistry:
@@ -160,6 +254,9 @@ class ToolRegistry:
         enabled: Optional[Callable[[dict], bool]] = None,
         timeout: Optional[float] = None,
         name: Optional[str] = None,
+        dynamic: bool = False,
+        channel_schema: Any = None,
+        channel_enabled: Optional[Callable[[dict], bool]] = None,
     ) -> None:
         """Register a tool.
 
@@ -167,9 +264,20 @@ class ToolRegistry:
         tool whose shape depends on the request (F34: the image tools' legal option values
         differ by the user's selected image model, and their description names the user's
         saved defaults). A factory must be given an explicit ``name``, since there is no
-        dict to read it from.
+        dict to read it from, and must declare ``dynamic=True`` — per-request shape is now a
+        DM-surface-only privilege, and an undeclared factory would silently reintroduce it.
+
+        ``channel_schema`` / ``channel_enabled`` are the channel surface's answers to the same
+        two questions. The channel schema must not vary with the request (A3a's ``_static``
+        variants accept and ignore the config so the registry can call them uniformly), and
+        ``channel_enabled`` may read only channel-config-stable facts. A tool with neither
+        keeps its static base schema and is exposed unconditionally there.
         """
         if callable(schema):
+            if not dynamic:
+                raise ValueError(
+                    f"Tool {name or '<unnamed>'}: a callable schema is per-request and must be "
+                    "registered with dynamic=True")
             if not name:
                 raise ValueError("A schema factory must be registered with an explicit name")
         else:
@@ -180,42 +288,71 @@ class ToolRegistry:
         # worst case (e.g. read_document, which may download + render + OCR a scan)
         # sets its own longer bound so the generic 20s cap can't abort it.
         self._tools[name] = {"schema": schema, "executor": executor,
-                             "enabled": enabled, "timeout": timeout}
+                             "enabled": enabled, "timeout": timeout,
+                             "dynamic": bool(dynamic),
+                             "channel_schema": channel_schema,
+                             "channel_enabled": channel_enabled}
 
-    def schemas(self, thread_config: Optional[dict] = None) -> List[Dict[str, Any]]:
+    def schemas(self, thread_config: Optional[dict] = None,
+                surface: str = SURFACE_DM) -> List[Dict[str, Any]]:
         """Schemas of the tools enabled for this request (a failing gate hides the tool).
 
-        A schema factory that raises hides its tool rather than failing the turn — the same
-        fail-closed rule the enable-gate already follows.
+        ``surface="dm"`` is the legacy behavior, verbatim: per-request ``enabled`` gates and
+        per-request schema factories.
+
+        ``surface="channel"`` reads the channel pair instead — ``channel_schema`` (falling back
+        to the static base schema) gated by ``channel_enabled`` alone. Per-turn ``enabled``
+        callables are structurally ignored there: a gate that varies within a channel is exactly
+        the cache fork §3a exists to remove, so authorization moves into the executors.
+
+        A gate or factory that raises hides its tool rather than failing the turn — fail-closed
+        omission, logged with the tool's name so a broken schema is not silently invisible.
         """
         out = []
         cfg = thread_config or {}
-        for tool in self._tools.values():
-            gate = tool["enabled"]
+        channel = surface == SURFACE_CHANNEL
+        for name, tool in self._tools.items():
             try:
+                gate = tool["channel_enabled"] if channel else tool["enabled"]
                 if gate is not None and not gate(cfg):
                     continue
                 schema = tool["schema"]
+                if channel and tool["channel_schema"] is not None:
+                    schema = tool["channel_schema"]
                 if callable(schema):
                     schema = schema(cfg)
                     if not schema:
                         continue
                 out.append(schema)
-            except Exception:
+            except Exception as e:  # noqa: BLE001 — a broken schema costs its tool, not the turn
+                logger.error(
+                    f"tool schema omitted: name={name} surface={surface} error={e}",
+                    exc_info=True)
                 continue
         return out
 
-    def has_tools(self, thread_config: Optional[dict] = None) -> bool:
-        return bool(self.schemas(thread_config))
+    def has_tools(self, thread_config: Optional[dict] = None,
+                  surface: str = SURFACE_DM) -> bool:
+        return bool(self.schemas(thread_config, surface=surface))
 
-    async def dispatch(self, ctx: ToolContext, name: str, arguments: Any) -> Dict[str, Any]:
+    async def dispatch(self, ctx: ToolContext, name: str, arguments: Any,
+                       call_id: Optional[str] = None) -> Dict[str, Any]:
         """Run one tool call.
 
         Returns a result for everything a tool can do wrong — an unknown name, bad arguments, a
         timeout, a bug — so a broken tool never kills the response. The ONE exception it lets
         through is `StaleSendSuppressed`: a guarded tool declining to post because the
         conversation moved on is control flow, and reporting it as a tool error would have the
-        model retry the post the guard just refused."""
+        model retry the post the guard just refused.
+
+        ``call_id`` is the model's own id for this call, and with a turn to hold it, it is the
+        in-turn retry key: the FIRST dispatch owns the work and every later one with the same id
+        receives that same work's outcome instead of doing it again. Absent, there is nothing to
+        dedup on — distinct calls must never collapse onto one another just because neither
+        carried an id — but the turn still takes ownership of the WORK, under an anonymous
+        flight, so an id-less call is drained, cancelled and revoked with every other one. With
+        no turn able to hold a flight at all, the legacy bounded-and-cancelled path is kept
+        verbatim."""
         tool = self._tools.get(name)
         if tool is None:
             return {"ok": False, "error": "unknown_tool", "message": f"No tool named '{name}'."}
@@ -233,6 +370,54 @@ class ToolRegistry:
         timeout = tool.get("timeout")
         if timeout is None:
             timeout = config.tool_call_timeout
+
+        turn = getattr(ctx, "turn", None)
+        if not call_id and turn is not None and hasattr(turn, "open_anonymous_tool_flight"):
+            # No id to key on, so no dedup — but the turn still has to OWN this call, or a
+            # sibling's suppression propagating out of the round leaves it running with nothing
+            # to drain, cancel or revoke it, and it can post after the receipts have settled.
+            flight = self._open_anonymous_flight(turn, name=name, timeout=timeout)
+            if flight is None:
+                logger.error(f"anonymous tool flight could not be opened: name={name} — "
+                             "refusing to run the call untracked")
+                return {"ok": False, "error": "flight_unavailable",
+                        "message": (f"Tool '{name}' could not be started safely. Nothing ran — "
+                                    "try the call again.")}
+            return await self._fly_call(tool, ctx, args, name=name, flight=flight,
+                                        created=True, turn=turn, call_id=None)
+        if call_id and turn is not None and hasattr(turn, "open_tool_flight"):
+            opened = self._open_flight(turn, name=name, args=args, call_id=call_id,
+                                       timeout=timeout)
+            if opened is None:
+                # A REAL turn and a REAL call id, and the protection could not be opened. Running
+                # the tool anyway is unprotected execution of exactly the calls this key exists
+                # to make once — chosen at the moment the bookkeeping is known to be broken. It
+                # fails closed instead: the model is told plainly and nothing irreversible runs.
+                logger.error(
+                    f"tool flight could not be opened: id={call_id} name={name} — refusing to "
+                    "run the call unprotected")
+                return {"ok": False, "error": "flight_unavailable",
+                        "message": (f"Tool '{name}' could not be started safely. Nothing ran — "
+                                    "try the call again.")}
+            else:
+                flight, created = opened
+                if flight is None:
+                    # The same id, describing something else. Serving the first result here would
+                    # answer a question nobody asked; re-running under a key already spent would
+                    # be the double-dispatch this whole mechanism exists to prevent.
+                    logger.error(
+                        f"tool call id reused for a different call: id={call_id} name={name}")
+                    return {"ok": False, "error": "duplicate_call_id",
+                            "message": ("This call re-used the id of a different call already "
+                                        "made this turn. Nothing was run — make the call again.")}
+                return await self._fly_call(tool, ctx, args, name=name, flight=flight,
+                                           created=created, turn=turn, call_id=call_id)
+
+        return await self._run_bounded(tool, ctx, args, name=name, timeout=timeout)
+
+    async def _run_bounded(self, tool: Dict[str, Any], ctx: Any, args: Dict[str, Any], *,
+                           name: str, timeout: float) -> Dict[str, Any]:
+        """The legacy execution: bounded inline, cancelled when the bound expires."""
         try:
             return await asyncio.wait_for(tool["executor"](ctx, args), timeout=timeout)
         except asyncio.TimeoutError:
@@ -249,10 +434,159 @@ class ToolRegistry:
                 raise
             return {"ok": False, "error": "execution_error", "message": str(e)[:500]}
 
+    @staticmethod
+    def _open_flight(turn: Any, *, name: str, args: Dict[str, Any], call_id: str,
+                     timeout: float) -> Optional[tuple]:
+        """The turn's answer for this call id, or None when the turn could not give one.
+
+        None is a PLUMBING FAILURE on a turn that has the mechanism (the caller has already
+        checked that), and the caller refuses the call rather than running it unprotected. A
+        runtime without `open_tool_flight` at all — a stand-in object in a test, an older turn —
+        never reaches here and keeps the legacy path verbatim."""
+        try:
+            return turn.open_tool_flight(call_id=call_id, tool_name=name,
+                                        fingerprint=_call_fingerprint(name, args),
+                                        timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"tool flight unavailable for {name}: {e}")
+            return None
+
+    @staticmethod
+    def _open_anonymous_flight(turn: Any, *, name: str,
+                               timeout: float) -> Optional[Any]:
+        """Lifecycle ownership for an id-less call, or None when the turn could not give one.
+
+        None is a PLUMBING FAILURE on a turn that HAS the mechanism (the caller has already
+        checked), and the caller refuses the call rather than running it untracked. A raise, a
+        None and a value that is not a `ToolFlight` are the SAME failure: the mechanism is
+        present and there is no flight, so nothing would drain, cancel or revoke the call. Only a
+        turn without the API at all keeps the legacy bounded path."""
+        from message_processor.turn_runtime import ToolFlight  # lazy: cycle at module scope
+        try:
+            flight = turn.open_anonymous_tool_flight(tool_name=name, timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"anonymous tool flight unavailable for {name}: {e}")
+            return None
+        return flight if isinstance(flight, ToolFlight) else None
+
+    async def _fly_call(self, tool: Dict[str, Any], ctx: Any, args: Dict[str, Any], *,
+                        name: str, flight: Any, created: bool, turn: Any,
+                        call_id: Optional[str]) -> Dict[str, Any]:
+        """Await this call's ONE execution, bounded by the deadline stamped when it was opened."""
+        label = call_id or "no id"
+        if created:
+            _ensure_shared_containers(ctx)
+            call_ctx = self._per_call_context(ctx, call_id=call_id, flight=flight)
+            if call_ctx is None:
+                # Without the per-call stamp the executor has no flight to mark launched, so the
+                # one thing standing between a replayed call id and a second picture is gone.
+                # Refused rather than run: nothing has happened yet, and this is the last moment
+                # that is still true.
+                self._abandon(turn, flight)
+                logger.error(f"per-call context unavailable for {name} (call {label}) — "
+                             "refusing to run the call unprotected")
+                return {"ok": False, "error": "flight_unavailable",
+                        "message": (f"Tool '{name}' could not be started safely. Nothing ran — "
+                                    "try the call again.")}
+            invocation = self._invoke(tool, ctx, call_ctx, args)
+            try:
+                turn.launch_tool_flight(flight, invocation)
+            except Exception as e:  # noqa: BLE001 — could not own the work; refuse it
+                # Nobody took the coroutine, so nobody will ever await it: closed here, by the
+                # caller that made it. Left open it becomes a "coroutine was never awaited"
+                # warning attached to a turn that is otherwise reporting itself honestly.
+                invocation.close()
+                self._abandon(turn, flight)
+                logger.error(f"tool flight not launched for {name} (call {label}): {e}")
+                return {"ok": False, "error": "flight_unavailable",
+                        "message": (f"Tool '{name}' could not be started safely. Nothing ran — "
+                                    "try the call again.")}
+        task = getattr(flight, "task", None)
+        if task is None:
+            return {"ok": False, "error": "execution_error",
+                    "message": f"Tool '{name}' could not be started."}
+        try:
+            # SHIELDED: a caller that gives up — this bound expiring, the round being cancelled —
+            # must not abort an effect already in flight, or a posted message loses the receipt
+            # that makes it ours. Cancellation is the outer finally's job, and it is established
+            # there rather than requested here.
+            return await asyncio.wait_for(asyncio.shield(task), timeout=flight.remaining())
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"tool '{name}' (call {label}) outran its {flight.timeout:.0f}s bound; the "
+                "turn will settle it before its receipts")
+            return {"ok": False, "error": "timeout",
+                    "message": f"Tool '{name}' timed out after {flight.timeout:.0f}s."}
+        except asyncio.CancelledError:
+            # THE ONE EXECUTION was cancelled (the turn settling its flights), and we were not.
+            # That is a result, not a cancellation of the round: whoever is waiting here still
+            # owes the model an output for this call, and a duplicate arriving after the fact was
+            # never cancelled at all. Our OWN cancellation still propagates — `cancelling()` is
+            # what tells the two apart.
+            current = asyncio.current_task()
+            if task.cancelled() and not (current is not None and current.cancelling()):
+                return {"ok": False, "error": "cancelled",
+                        "message": (f"Tool '{name}' was stopped before it finished; it was not "
+                                    "run again.")}
+            raise
+        except Exception as e:  # noqa: BLE001 — a tool bug must not kill the response
+            from message_processor.stale_send_guard import StaleSendSuppressed
+            if isinstance(e, StaleSendSuppressed):
+                raise
+            return {"ok": False, "error": "execution_error", "message": str(e)[:500]}
+
+    @staticmethod
+    def _abandon(turn: Any, flight: Any) -> None:
+        """Give the call id back after a plumbing failure that ran nothing. Never after a
+        launch — the turn refuses that, and it is right to."""
+        try:
+            turn.abandon_tool_flight(flight)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"tool flight not abandoned: {e}")
+
+    @staticmethod
+    def _per_call_context(ctx: Any, *, call_id: Optional[str], flight: Any) -> Any:
+        """A shallow copy carrying this call's identity, or None when it cannot be made.
+
+        None is fatal to the call by design. The stamp is how the executor reaches
+        `mark_launched`, so an unstamped context is a call running with its duplicate protection
+        silently disabled — and the tools this guards are the ones where a second run is a second
+        picture, a second bill and a second post."""
+        try:
+            call_ctx = copy.copy(ctx)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"per-call context copy failed: {e}")
+            return None
+        try:
+            # An id-less call gets no identity stamp — there is none to give, and inventing one
+            # would put a synthetic id in front of an executor that reads it as the model's.
+            if call_id:
+                call_ctx.tool_call_id = str(call_id)
+            call_ctx.tool_flight = flight
+            call_ctx.tool_timeout = flight.timeout
+            call_ctx.tool_deadline = flight.deadline
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"per-call context not stamped: {e}")
+            return None
+        return call_ctx
+
+    @staticmethod
+    async def _invoke(tool: Dict[str, Any], parent_ctx: Any, call_ctx: Any,
+                      args: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return await tool["executor"](call_ctx, args)
+        finally:
+            _adopt_per_call_flags(parent_ctx, call_ctx)
+
     async def dispatch_all(self, ctx: ToolContext, calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Run a round's calls in parallel; result order matches ``calls``."""
+        """Run a round's calls in parallel; result order matches ``calls``.
+
+        The call's own id rides along, because THIS is the seam a duplicate dispatch would arrive
+        at: the loop hands the ids it already has, and the registry decides whether the work has
+        been done before."""
         return list(await asyncio.gather(
-            *(self.dispatch(ctx, c.get("name", ""), c.get("arguments")) for c in calls)
+            *(self.dispatch(ctx, c.get("name", ""), c.get("arguments"), c.get("call_id"))
+              for c in calls)
         ))
 
 

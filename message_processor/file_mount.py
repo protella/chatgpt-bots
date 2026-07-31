@@ -109,6 +109,48 @@ def get_mount_file_schema(thread_config: Optional[Dict[str, Any]] = None) -> Opt
     }
 
 
+def get_mount_file_schema_static(thread_config: Optional[Dict[str, Any]] = None
+                                 ) -> Dict[str, Any]:
+    """Channel-surface mount_file: no id enum, no catalog text, no container gating.
+
+    ``thread_config`` is accepted and IGNORED so the registry can call it like a factory; the
+    output never varies. Both facts the dynamic factory gated on — is there a sandbox, is there
+    anything to mount — are per-thread, so the executor answers them instead
+    (``sandbox_unavailable`` / ``unknown_file_id`` with the valid ids).
+    """
+    return {
+        "type": "function",
+        "name": "mount_file",
+        "description": (
+            "Copy a file shared in this thread into the code-interpreter sandbox so your code "
+            "can open its REAL bytes. Returns the /mnt/data path.\n\n"
+            "Use this before code_interpreter whenever you need the actual file — analysing a "
+            "spreadsheet or CSV with pandas, embedding a user's image into a deck or PDF, "
+            "editing an existing Office document, OCR, format conversion, or bundling files "
+            "into an archive. You do NOT need it merely to read, summarise, or look at "
+            "something: you can already see images and document text directly.\n\n"
+            "Never retype a file's contents into your code as a literal — mount it and read it. "
+            "Mounting is idempotent: calling it twice returns the same path.\n\n"
+            "A mounted file is an INGREDIENT. It is not posted to the user, and copying it "
+            "unchanged to a new name will not deliver it either — only files you genuinely "
+            "create are published.\n\n"
+            "Ids come from the file catalog in this turn's evidence; an id that is not listed "
+            "there does not resolve, and mounting needs a live code sandbox."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_id": {
+                    "type": "string",
+                    "description": "Which thread file to mount, by id from the catalog.",
+                },
+            },
+            "required": ["file_id"],
+            "additionalProperties": False,
+        },
+    }
+
+
 def _mount_key(container_id: str, file_id: str) -> str:
     return f"{container_id}|{file_id}"
 
@@ -164,12 +206,15 @@ async def execute_mount_file(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str
 
     entry = thread_files.resolve(ctx.thread_files, file_id)
     if entry is None:
-        # The ids are an enum built from this turn's snapshot; an unresolvable one is either
-        # invented or from another thread. Say so rather than guessing at what was meant —
-        # mounting the wrong file silently corrupts whatever gets built from it.
+        # An unresolvable id is either invented or from another thread. Say so rather than
+        # guessing at what was meant — mounting the wrong file silently corrupts whatever gets
+        # built from it. On the channel surface there is no enum to fall back on, so an empty
+        # catalog arrives here and is answered as the empty catalog it is.
+        valid = thread_files.valid_ids(ctx.thread_files)
         return _err("unknown_file_id",
-                    f"{file_id} is not a file in this thread.",
-                    valid_file_ids=thread_files.valid_ids(ctx.thread_files))
+                    (f"{file_id} is not a file in this thread."
+                     if valid else "There are no files in this thread to mount."),
+                    valid_file_ids=valid)
 
     if ctx.mounted_files is None:
         ctx.mounted_files = []
@@ -261,4 +306,6 @@ def register_file_mount_tools(registry: ToolRegistry) -> None:
     name is explicit. Generous timeout: a mount is a Slack download plus a container upload."""
     registry.register(get_mount_file_schema, execute_mount_file,
                       name="mount_file",
-                      timeout=float(getattr(config, "read_document_timeout", 60.0)) + 30.0)
+                      timeout=float(getattr(config, "read_document_timeout", 60.0)) + 30.0,
+                      dynamic=True, channel_schema=get_mount_file_schema_static,
+                      channel_enabled=lambda cfg: bool(config.enable_code_interpreter))

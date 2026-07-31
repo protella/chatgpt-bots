@@ -201,32 +201,3 @@ async def ingest_reaction(client_self, event) -> None:
         )
     except Exception as e:  # noqa: BLE001
         client_self.log_debug(f"reaction feedback ingestion failed: {e}")
-
-
-def note_reaction_pulse(client_self, event, *, added: bool) -> None:
-    """F20 social proof: mirror a reaction_added/removed onto the in-memory channel-pulse
-    ring entry for the target message ts (zero-await, in-memory only). Additive to the
-    feedback sink above (which still records reactions on the bot's OWN messages). Fires for
-    reactions on any tracked message, keyed by ts. Never raises."""
-    try:
-        pulse = getattr(client_self, "channel_pulse", None)
-        if pulse is None:
-            return
-        item = event.get("item") or {}
-        if item.get("type", "message") != "message":
-            return
-        channel_id = item.get("channel")
-        ts = item.get("ts")
-        emoji = event.get("reaction", "")
-        if not (channel_id and ts and emoji):
-            return
-        # No from_self/from_history distinction any more: those existed only to keep the bot's
-        # own reactions out of the workspace emoji-popularity tally, and that tally is gone with
-        # the rich gate. Per-message social proof is about a specific message, where our own
-        # reaction genuinely is on screen and belongs in the count.
-        if added:
-            pulse.add_reaction(channel_id, ts, emoji)
-        else:
-            pulse.remove_reaction(channel_id, ts, emoji)
-    except Exception as e:  # noqa: BLE001
-        client_self.log_debug(f"reaction pulse update failed: {e}")

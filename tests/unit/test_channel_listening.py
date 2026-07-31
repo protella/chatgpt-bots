@@ -179,7 +179,7 @@ async def test_bare_chrome_bot_message_still_dropped(monkeypatch):
 @pytest.mark.asyncio
 async def test_edit_and_delete_mark_thread_needs_refresh():
     # Blocker 1: a message edit/delete must flag the affected thread's warm ThreadState for
-    # rebuild, or it can retain the deleted/pre-edit content even after the pulse is corrected.
+    # rebuild, or it can keep answering from the deleted/pre-edit content.
     from types import SimpleNamespace
 
     from slack_client.event_handlers.message_events import SlackMessageEventsMixin
@@ -191,10 +191,6 @@ async def test_edit_and_delete_mark_thread_needs_refresh():
         async def delete_ambient_artifacts_by_source(self, c, t):
             return 0
 
-    class _Pulse:
-        def remove_message(self, c, t):
-            return True
-
     class _Svc:
         def offer_event(self, ev, cl):
             pass
@@ -203,15 +199,11 @@ async def test_edit_and_delete_mark_thread_needs_refresh():
         def __init__(self):
             self.processor = SimpleNamespace(ambient_service=_Svc(), thread_manager=tm)
             self.db = _DB()
-            self.channel_pulse = _Pulse()
 
         def is_own_message(self, e):
             return False
 
         def log_debug(self, *a, **k):
-            pass
-
-        async def _feed_channel_pulse(self, e):
             pass
 
     host = _Host()
@@ -231,25 +223,21 @@ async def test_edit_and_delete_mark_thread_needs_refresh():
 async def test_tombstoned_root_takes_deletion_path_not_edit_path():
     # Deleting a root that has (or had) replies does NOT arrive as message_deleted —
     # Slack tombstones it via message_changed (nested subtype "tombstone", text
-    # "This message was deleted."). Treated as an edit, the tombstone text got re-fed
-    # into the pulse as content and the edit-triggered engine ran on it (live
-    # 2026-07-18: the model then "remembered" deleted threads as still visible). It
-    # must take the deletion path: purge + refresh, no re-feed, no offer, no edit engine.
+    # "This message was deleted."). Treated as an edit, the tombstone text reached ambient
+    # memory as content and the edit-triggered engine ran on it (live 2026-07-18: the model
+    # then "remembered" deleted threads as still visible). It must take the deletion path:
+    # purge + refresh, no offer, no edit engine.
     from types import SimpleNamespace
 
     from slack_client.event_handlers.message_events import SlackMessageEventsMixin
 
-    refreshed, removed, fed, offered, edit_dispatches = [], [], [], [], []
+    refreshed, purged, offered, edit_dispatches = [], [], [], []
     tm = SimpleNamespace(mark_needs_refresh=lambda k: refreshed.append(k))
 
     class _DB:
         async def delete_ambient_artifacts_by_source(self, c, t):
+            purged.append((c, t))
             return 0
-
-    class _Pulse:
-        def remove_message(self, c, t):
-            removed.append((c, t))
-            return True
 
     class _Svc:
         def offer_event(self, ev, cl):
@@ -259,16 +247,12 @@ async def test_tombstoned_root_takes_deletion_path_not_edit_path():
         def __init__(self):
             self.processor = SimpleNamespace(ambient_service=_Svc(), thread_manager=tm)
             self.db = _DB()
-            self.channel_pulse = _Pulse()
 
         def is_own_message(self, e):
             return False
 
         def log_debug(self, *a, **k):
             pass
-
-        async def _feed_channel_pulse(self, e):
-            fed.append(e)
 
         def _maybe_edit_triggered_reply(self, event, client):
             edit_dispatches.append(event)
@@ -284,9 +268,8 @@ async def test_tombstoned_root_takes_deletion_path_not_edit_path():
         {"subtype": "message_changed", "channel": "C1",
          "message": {"ts": "8.0", "thread_ts": "8.0",
                      "text": "This message was deleted."}}, object())
-    assert removed == [("C1", "7.0"), ("C1", "8.0")]      # pulse entries purged
+    assert purged == [("C1", "7.0"), ("C1", "8.0")]         # derived artifacts purged
     assert "C1:7.0" in refreshed and "C1:8.0" in refreshed  # warm threads rebuilt
-    assert fed == []                                        # tombstone never re-fed as content
     assert offered == []                                    # never offered to ambient memory
     assert edit_dispatches == []                            # edit engine never runs on it
 
@@ -479,6 +462,47 @@ async def test_one_to_one_continuation_responds_with_no_mute_lookup(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_a_channel_dispatch_stamps_the_ts_the_listener_admitted(tag_only):
+    """H is pinned against what this process has already ADMITTED, and for an ordinary post that is
+    the message's own ts. Stamping it at dispatch keeps the one place that knows which ts the
+    listener observed — the handler — as the place that says so."""
+    bot = _make_bot()
+    await bot._handle_channel_message(_evt(text="ChatGPT what about q4?"), bot.app.client)
+    msg = bot.message_handler.call_args[0][0]
+    assert msg.metadata["trigger_admission_ts"] == "100.1"
+
+
+@pytest.mark.asyncio
+async def test_a_mention_dispatch_stamps_the_admission_ts(tag_only):
+    bot = _make_bot()
+    bot.db = MagicMock()
+    bot.db.get_user_preferences_async = AsyncMock(return_value={"settings_completed": True})
+    bot._get_channel_settings = AsyncMock(return_value=None)
+    bot._post_settings_button_if_new_thread = AsyncMock()
+    await bot._handle_slack_message(
+        _evt(text="<@UBOT> what about q4?", ts="300.5"), bot.app.client,
+        wake_source="app_mention")
+    msg = bot.message_handler.call_args[0][0]
+    assert msg.metadata["trigger_admission_ts"] == "300.5"
+
+
+@pytest.mark.asyncio
+async def test_a_dm_dispatch_carries_no_admission_stamp():
+    """A DM has no channel stream to pin, and DM request shape is frozen — the key must not
+    appear on that path at all."""
+    bot = _make_bot()
+    bot.db = MagicMock()
+    bot.db.get_user_preferences_async = AsyncMock(return_value={"settings_completed": True})
+    bot._get_channel_settings = AsyncMock(return_value=None)
+    bot._maybe_set_assistant_thread_title = AsyncMock()
+    bot._post_settings_button_if_new_thread = AsyncMock()
+    await bot._handle_slack_message(
+        _evt(channel="D1", channel_type="im", ts="200.5"), bot.app.client, wake_source="dm")
+    msg = bot.message_handler.call_args[0][0]
+    assert "trigger_admission_ts" not in msg.metadata
+
+
+@pytest.mark.asyncio
 async def test_participation_level_off_row_silences_channel(monkeypatch):
     monkeypatch.setattr(config, "channel_response_mode", "auto_respond", raising=False)
     monkeypatch.setattr(config, "bot_name_aliases", ["ChatGPT"], raising=False)
@@ -517,6 +541,32 @@ async def test_thread_with_other_agent_is_not_a_continuation(tag_only):
     bot._thread_participation = AsyncMock(return_value=(True, 1, 1))
     await bot._handle_channel_message(_evt(text="sounds good", thread_ts="50.0", ts="60.0"), bot.app.client)
     bot.message_handler.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_actor_tail_cancels_a_continuation_the_replies_scan_called_one_on_one(tag_only):
+    """The replies fast path reads only Slack's oldest page, so a second agent deeper in a long
+    thread is invisible to it — `_thread_participation` genuinely reports 1:1 here. The actor tail
+    saw that agent arrive live, and it has to be able to cancel a route that answers with no gate
+    involved at all."""
+    from slack_client import actor_tail
+
+    actor_tail.actor_tail.reset()
+    try:
+        bot = _make_bot()
+        bot._thread_participation = AsyncMock(return_value=(True, 1, 0))
+        await bot._handle_channel_message(
+            _evt(text="and what about friday?", thread_ts="50.0", ts="60.0"), bot.app.client)
+        bot.message_handler.assert_called_once()          # tail empty → the fast path stands
+
+        actor_tail.record("C1", ts="55.0", root_ts="50.0", is_bot=True,
+                          sender_type="other_bot")
+        bot.message_handler.reset_mock()
+        await bot._handle_channel_message(
+            _evt(text="and what about saturday?", thread_ts="50.0", ts="61.0"), bot.app.client)
+        bot.message_handler.assert_not_called()           # gate-judged instead, and tag_only → silent
+    finally:
+        actor_tail.actor_tail.reset()
 
 
 @pytest.mark.asyncio

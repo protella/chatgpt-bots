@@ -19,8 +19,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from config import config
-from slack_client.channel_pulse import ChannelPulse, pulse_supplementary_budget
 from slack_client.event_handlers.message_events import SlackMessageEventsMixin
 from slack_client.formatting.blocks import (SUPPLEMENTARY_CHAR_BUDGET,
                                             extract_supplementary_text)
@@ -628,7 +626,7 @@ def test_char_budget_truncation_is_honest_and_bounded():
 
 
 def test_tight_budget_still_yields_header_first_rows_and_a_marker():
-    # The ChannelPulse case: cut at ROW boundaries so a table-only message still says
+    # A small budget still cuts at ROW boundaries so a table-only message still says
     # something true, rather than being dropped whole.
     ev = _fixture()
 
@@ -916,7 +914,6 @@ class _Host(SlackMessageEventsMixin, SlackFormattingMixin, SlackUtilitiesMixin):
         self.user_cache = {}
         self.db = MagicMock()
         self.db.get_user_info_async = AsyncMock(return_value=None)
-        self.channel_pulse = None
 
     async def get_username(self, uid, client=None):
         return "tester"
@@ -1008,102 +1005,3 @@ async def test_live_path_skips_our_own_chrome():
 
     assert msg.text == "Here is what I found."
 
-
-# ---------------------------------------------------------------- channel pulse
-
-
-class _PulseHost(SlackMessageEventsMixin, SlackUtilitiesMixin):
-    def __init__(self, pulse):
-        self.bot_id = "B07SELF"
-        self.bot_user_id = "U07SELF"
-        self.app_id = None
-        self.user_cache = {}
-        self.channel_pulse = pulse
-
-    def log_debug(self, *a, **k):
-        pass
-
-
-@pytest.mark.asyncio
-async def test_pulse_feed_records_a_webhook_post_with_empty_text():
-    # The empty-text guard returned early, so a webhook post whose content lives only in
-    # attachments[] never reached awareness at all.
-    pulse = ChannelPulse()
-    host = _PulseHost(pulse)
-
-    await host._feed_channel_pulse(
-        {
-            "channel": "C1",
-            "ts": "100.0",
-            "subtype": "bot_message",
-            "bot_id": "BJIRA",
-            "username": "Jira",
-            "text": "",
-            "attachments": [{"fields": [{"title": "Issue", "value": "PROJ-42"}]}],
-        }
-    )
-
-    assert "PROJ-42" in pulse.render_envelope("C1")
-
-
-@pytest.mark.asyncio
-async def test_pulse_feed_keeps_its_marker_inside_the_entry_cap():
-    # record() head-slices to pulse_text_truncate (500). Extracting against the default
-    # 12,000-char budget would put the extractor's own end marker past the slice, leaving
-    # a partial table that looks complete.
-    pulse = ChannelPulse()
-    host = _PulseHost(pulse)
-    ev = _fixture()
-
-    await host._feed_channel_pulse({**ev, "channel": "C1", "ts": "100.0"})
-
-    entry = pulse._buffers["C1"][0]
-    assert len(entry["text"]) <= int(config.pulse_text_truncate)
-    assert "Name | Email" in entry["text"]  # header survives
-    assert "more table rows omitted]" in entry["text"]  # and says so
-
-
-@pytest.mark.asyncio
-async def test_pulse_backfill_and_live_feed_agree():
-    # Fixing only the live feed gives a cold start and a live session DIFFERENT evidence
-    # for the same message.
-    ev = _fixture()
-    live, cold = ChannelPulse(), ChannelPulse()
-    await _PulseHost(live)._feed_channel_pulse({**ev, "channel": "C1", "ts": "100.0"})
-
-    bot = _Bot()
-    client = MagicMock()
-    client.conversations_history = AsyncMock(
-        return_value={"messages": [{**ev, "channel": "C1", "ts": "100.0"}]}
-    )
-    await cold.ensure_backfill("C1", client, bot)
-
-    assert live._buffers["C1"][0]["text"] == cold._buffers["C1"][0]["text"]
-    assert "Name | Email" in cold._buffers["C1"][0]["text"]
-
-
-def test_pulse_supplementary_budget_leaves_room_for_the_marker():
-    assert (
-        pulse_supplementary_budget("what about this?")
-        == int(config.pulse_text_truncate) - 18
-    )
-    # A long primary text can't drive the budget to a point where nothing honest fits.
-    assert pulse_supplementary_budget("x" * 5000) == 160
-
-
-def test_pulse_record_truncation_admits_what_it_dropped():
-    pulse = ChannelPulse()
-    pulse.record(
-        "C1",
-        ts="1.0",
-        thread_ts=None,
-        user_id="U1",
-        display_name="Dana",
-        sender_type="human",
-        text="A" * 900,
-        is_bot=False,
-    )
-
-    entry = pulse._buffers["C1"][0]
-    assert len(entry["text"]) <= int(config.pulse_text_truncate)
-    assert "chars truncated]" in entry["text"]

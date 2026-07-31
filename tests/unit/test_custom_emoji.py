@@ -39,7 +39,6 @@ import pytest
 
 from config import config, valid_emoji_name
 from message_processor.participation import ParticipationEngine
-from slack_client.channel_pulse import ChannelPulse
 from slack_client.messaging import SlackMessagingMixin, WorkspaceEmojiCache
 from tool_registry import ToolContext
 
@@ -148,7 +147,9 @@ def _react_host(cache):
     # Must be bound explicitly: on a bare MagicMock the call would return a truthy Mock, so the
     # "no customs → no search pointer" case would pass for the wrong reason.
     s._custom_emoji_available = SlackMessagingMixin._custom_emoji_available.__get__(s)
+    s._react_tool_schema = SlackMessagingMixin._react_tool_schema.__get__(s)
     s.get_react_tool_schema = SlackMessagingMixin.get_react_tool_schema.__get__(s)
+    s.get_react_tool_schema_static = SlackMessagingMixin.get_react_tool_schema_static.__get__(s)
     return s
 
 
@@ -495,11 +496,16 @@ def test_no_ranked_custom_emoji_shortlist_survives():
 
     No destructive migration goes with this. The `emoji_usage` table is no longer CREATED on a
     fresh schema; an existing installation keeps its orphaned copy, because dropping it would
-    destroy data on upgrade to save a few kilobytes."""
+    destroy data on upgrade to save a few kilobytes.
+
+    The ring that HELD the tally went with P2's single stream, so the three accessors are now
+    asserted at the module: `slack_client.channel_pulse` does not exist."""
+    import importlib
+
     from database import DatabaseManager
 
-    for gone in ("top_custom_reactions", "reaction_vocab_snapshot", "hydrate_reaction_vocab"):
-        assert not hasattr(ChannelPulse, gone)
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("slack_client.channel_pulse")
     for gone in ("load_emoji_usage_async", "save_emoji_usage_async"):
         assert not hasattr(DatabaseManager, gone)
     # The fresh-schema CREATE is gone; the absence of a DROP is the load-bearing half.
@@ -508,18 +514,15 @@ def test_no_ranked_custom_emoji_shortlist_survives():
     assert "DROP TABLE" not in src.upper()
 
 
-@pytest.mark.asyncio
-async def test_backfill_still_seeds_per_message_social_proof():
-    # What the backfill's reaction seeding was ALSO doing, and the half that survives: a cold
-    # ring must show what the room already reacted to on a message, not just what it reacts to
-    # after the next live event.
-    client = SimpleNamespace(conversations_history=AsyncMock(return_value={"messages": [
-        {"ts": "1.0", "user": "U1", "text": "deploy is green",
-         "reactions": [{"name": "shipit", "count": 3}, {"name": "tada", "count": 1}]},
-        {"ts": "2.0", "user": "U2", "text": "nice"},
-    ]}))
-    bot = SimpleNamespace(classify_sender=lambda m: "human", user_cache={})
-    pulse = ChannelPulse()
-    await pulse.ensure_backfill("C1", client, bot)
-    assert pulse.render_reactions("C1", "1.0") == "[reactions: 3\u00d7 shipit, 1\u00d7 tada]"
-    assert pulse.render_reactions("C1", "2.0") == ""
+# =============================================================== how the cache reaches the model
+
+def test_the_live_cache_reaches_the_model_as_channel_evidence():
+    """Where the emoji facts go now. They used to sit inside the react tool's schema, which forked
+    the cached prefix every time a cache warmed mid-process; they ride post-breakpoint evidence
+    instead, so a cache that fills after startup changes nothing above the breakpoint."""
+    from message_processor.handlers.text import _emoji_evidence_lines
+
+    warm = SimpleNamespace(_custom_emoji_available=lambda: True)
+    cold = SimpleNamespace(_custom_emoji_available=lambda: False)
+    assert "search_workspace_emoji finds one by meaning" in " ".join(_emoji_evidence_lines(warm))
+    assert "use a standard Slack emoji" in " ".join(_emoji_evidence_lines(cold))

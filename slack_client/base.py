@@ -22,7 +22,6 @@ from .history_tool import SlackHistoryToolMixin
 from .channel_lookup_tool import (SlackChannelLookupToolMixin,
                                   register_channel_lookup_tool)
 from .search_tool import SlackSearchToolMixin
-from .channel_pulse import ChannelPulse
 from tool_registry import ToolRegistry
 from message_processor.destination_tools import register_destination_tools
 from message_processor.memory_tools import register_memory_tools
@@ -87,10 +86,6 @@ class SlackBot(SlackMessageEventsMixin,
         # Flags are read at construction — flipping them requires a restart, like all env config.
         self.tool_registry = self._build_tool_registry()
 
-        # Phase E: per-channel ambient-awareness ring buffer (process-lifetime, no DB).
-        # None when disabled so consumers can simply `getattr(client, "channel_pulse", None)`.
-        self.channel_pulse = ChannelPulse(size=config.channel_pulse_size) if config.enable_channel_pulse else None
-
         # Register Slack event handlers
         self._register_handlers()
 
@@ -112,8 +107,12 @@ class SlackBot(SlackMessageEventsMixin,
         if config.enable_reactions and config.enable_react_tool:
             # C4: registered as a FACTORY (bound method, called per request as schema(cfg)) so
             # the emoji-field description reflects the live custom-emoji cache without a restart.
+            # The CHANNEL variant answers the same question from config alone — a cache that
+            # warms mid-process would otherwise change the schema under a live prefix, and the
+            # cache still powers search_workspace_emoji's results.
             registry.register(self.get_react_tool_schema, self.execute_react_tool,
-                              name="react_to_message")
+                              name="react_to_message", dynamic=True,
+                              channel_schema=self.get_react_tool_schema_static)
             # Discovery for the ~1,400 custom emoji that cannot all fit in a schema description.
             # Hidden entirely under a REACTION_EMOJIS allowlist: there, the enum IS the palette
             # and searching a catalog the model may not draw from would only invite refusals.
@@ -124,20 +123,29 @@ class SlackBot(SlackMessageEventsMixin,
         # F23: cross-thread reply into a DIFFERENT thread of the current channel (write-scoped
         # to this channel; muted target threads refused by the executor).
         if config.enable_post_to_thread_tool:
-            registry.register(self.get_post_to_thread_tool_schema(), self.execute_post_to_thread)
-        # F2: no_response_needed is exposed only on turns whose ROUTE allows silence (the
-        # `silence_capable` routing fact), via the per-request _silence_capable_turn flag the
-        # text handler sets in a COPIED config.
+            # The channel surface gets its own STATIC schema: same tool, and a description that
+            # matches what a channel turn may actually do (post once, into a thread the stream
+            # showed it) instead of the DM instruction to acknowledge in the origin thread.
+            registry.register(self.get_post_to_thread_tool_schema(), self.execute_post_to_thread,
+                              channel_schema=self.get_post_to_thread_channel_schema)
+        # F2: on the DM surface no_response_needed is exposed only on turns whose ROUTE allows
+        # silence (the `silence_capable` routing fact), via the per-request
+        # _silence_capable_turn flag the text handler sets in a COPIED config. On the channel
+        # surface it is STATIC — silence capability is a per-turn fact and a per-turn schema is
+        # a cache fork — and `execute_no_reply_tool` enforces the route instead.
         registry.register(
             self.get_no_reply_tool_schema(), self.execute_no_reply_tool,
             enabled=lambda cfg: (config.enable_no_reply_tool
                                  and bool(cfg.get("_silence_capable_turn"))),
+            channel_enabled=lambda cfg: bool(config.enable_no_reply_tool),
         )
         if config.enable_search_tool:
             # BF1: Slack's Data Access API only mints action_token on @mention channel events
             # and DMs; unmentioned channel-listening turns never carry one, so the search tool
             # would fail at runtime. The text handler stamps _slack_search_available from the
             # event's action_token in a COPIED config; hide the schema when it's absent.
+            # Static on the channel surface: the token lives in ToolContext, and the executor
+            # already fails honestly without one.
             registry.register(
                 self.get_search_tool_schema(), self.execute_search_tool,
                 enabled=lambda cfg: bool(cfg.get("_slack_search_available")),
@@ -197,29 +205,37 @@ class SlackBot(SlackMessageEventsMixin,
                                  blocks: Optional[list] = None,
                                  meta_out: Optional[dict] = None,
                                  lease: Any = None,
-                                 surface: str = "error_notice") -> Optional[str]:
-        """Send a text message (async version); forwards footer blocks, meta_out and the
-        stale-send lease to send_message."""
+                                 surface: str = "error_notice",
+                                 receipts: Any = None,
+                                 receipt_kind: Optional[str] = None) -> Optional[str]:
+        """Send a text message (async version); forwards footer blocks, meta_out, the
+        stale-send lease and the receipt intent to send_message."""
         return await self.send_message(channel_id, thread_id, text, blocks=blocks,
-                                       meta_out=meta_out, lease=lease, surface=surface)
+                                       meta_out=meta_out, lease=lease, surface=surface,
+                                       receipts=receipts, receipt_kind=receipt_kind)
 
     async def send_image_async(self, channel_id: str, thread_id: str, image_data: bytes, filename: str,
-                               caption: str = "", meta_out: Optional[dict] = None) -> Optional[str]:
+                               caption: str = "", meta_out: Optional[dict] = None,
+                               receipts: Any = None) -> Optional[str]:
         """Send an image (async version); forwards meta_out to send_image."""
         return await self.send_image(channel_id, thread_id, image_data, filename, caption,
-                                     meta_out=meta_out)
+                                     meta_out=meta_out, receipts=receipts)
 
-    async def send_thinking_indicator_async(self, channel_id: str, thread_id: str) -> Optional[str]:
+    async def send_thinking_indicator_async(self, channel_id: str, thread_id: str,
+                                            receipts: Any = None) -> Optional[str]:
         """Send a thinking/processing indicator (async version)"""
-        return await self.send_thinking_indicator(channel_id, thread_id)
+        return await self.send_thinking_indicator(channel_id, thread_id, receipts=receipts)
 
     async def delete_message_async(self, channel_id: str, message_id: str) -> bool:
         """Delete a message (async version)"""
         return await self.delete_message(channel_id, message_id)
 
-    async def update_message_async(self, channel_id: str, message_id: str, text: str) -> bool:
+    async def update_message_async(self, channel_id: str, message_id: str, text: str,
+                                   receipts: Any = None,
+                                   receipt_kind: Optional[str] = None) -> bool:
         """Update a message (async version)"""
-        return await self.update_message(channel_id, message_id, text)
+        return await self.update_message(channel_id, message_id, text, receipts=receipts,
+                                         receipt_kind=receipt_kind)
 
     async def get_thread_history_async(self, channel_id: str, thread_id: str, limit: int = None,
                                        oldest: str = None) -> List[Message]:

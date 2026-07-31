@@ -10,8 +10,16 @@ from slack_sdk.errors import SlackApiError
 from base_client import Message
 from config import config
 from message_processor.routing_facts import stamp_routing_facts
-from slack_client.channel_pulse import pulse_supplementary_budget as _pulse_supplementary_budget
+from slack_client import actor_tail
 from slack_client.formatting.blocks import extract_supplementary_text
+
+
+# Slack's own text for a message deleted with replies (it tombstones the root rather than
+# sending message_deleted). Matched as a fallback where the `tombstone` subtype is absent.
+_TOMBSTONE_TEXT = "This message was deleted."
+
+# Bound on the live actor-tail dedup set (per process, all channels).
+_ACTOR_TAIL_SEEN_MAX = 512
 
 
 def _channel_post_allowed(cs: Any) -> bool:
@@ -78,6 +86,54 @@ def attest_message_origin(message: Message, event: Dict[str, Any],
     message.metadata["origin_event_verified"] = True
     message.metadata["origin_user_id"] = user_id
     message.metadata["origin_channel_id"] = channel_id
+
+
+
+async def _register_raw_receipt(client_self, channel_id, message_ts, kind,
+                                thread_root_ts=None, site="onboarding"):
+    """Spec §5 for the onboarding posts, which go out through raw chat.postMessage.
+
+    Every one of them is replaceable setup UI — a welcome, a "check your DMs", a reminder to
+    configure — so they register as CHROME and stay out of the stream. DM targets no-op by
+    themselves (is_dm_conversation)."""
+    if not message_ts:
+        return
+    from message_processor.outbound_receipts import record_transport_post
+    try:
+        await record_transport_post(
+            team_id=getattr(client_self, "self_team_id", None), channel_id=channel_id,
+            message_ts=message_ts, receipts=None, receipt_kind=kind,
+            thread_root_ts=thread_root_ts, site=site)
+    except Exception:  # noqa: BLE001 — onboarding chrome never fails a turn
+        pass
+
+
+async def _post_onboarding_notice(client_self, client, *, site, receipt_channel,
+                                  thread_root_ts=None, **post_kwargs):
+    """Post one piece of onboarding chrome and register it, under the shutdown gate.
+
+    These run inside Bolt callbacks, and Socket Mode stays connected until the very end of
+    shutdown — long after the receipt queue closes. Returns None when admission refused it, so
+    the message is never sent at all; callers already handle a post that did not happen.
+
+    The post and its registration go through `post_then_register`, so a drain cancelling this
+    callback cannot land between Slack accepting the message and the row that accounts for it.
+    """
+    from message_processor.outbound_receipts import (channel_post_admission,
+                                                     post_then_register)
+
+    async with channel_post_admission(site) as admitted:
+        if not admitted:
+            return None
+
+        async def _post_and_register():
+            resp = await client.chat_postMessage(**post_kwargs)
+            await _register_raw_receipt(client_self, receipt_channel,
+                                        resp.get("ts") if resp else None, "chrome",
+                                        thread_root_ts=thread_root_ts, site=site)
+            return resp
+
+        return await post_then_register(_post_and_register())
 
 
 class SlackMessageEventsMixin:
@@ -271,9 +327,10 @@ class SlackMessageEventsMixin:
         return (bot_present, len(humans), len(other_bots))
 
     # Slack subtypes that are NOT semantic messages (edits/deletes/membership/topic
-    # churn) — excluded from the pulse. Everything else, INCLUDING bot_message and
-    # ordinary content subtypes (file_share, thread_broadcast), is real awareness.
-    _PULSE_FEED_SKIP_SUBTYPES = frozenset({
+    # churn) — no actor spoke, so they never reach the actor tail. Everything else,
+    # INCLUDING bot_message and ordinary content subtypes (file_share, thread_broadcast),
+    # is a real speaker in a real thread.
+    _TAIL_FEED_SKIP_SUBTYPES = frozenset({
         "message_changed", "message_deleted", "message_replied",
         "channel_join", "channel_leave", "channel_topic", "channel_purpose",
         "channel_name", "channel_archive", "channel_unarchive",
@@ -301,6 +358,87 @@ class SlackMessageEventsMixin:
             return bool(extract_supplementary_text(event, primary_text=event.get("text") or ""))
         except Exception:  # noqa: BLE001 — never let content-sniffing break dispatch
             return False
+
+    # ------------------------------------------------------------- actor tail (live feed)
+
+    def _actor_tail_seen(self):
+        """Bounded (channel, ts) set of actors already recorded this process (lazy-init)."""
+        seen = getattr(self, "_actor_tail_seen_map", None)
+        if seen is None:
+            from collections import OrderedDict
+            seen = OrderedDict()
+            self._actor_tail_seen_map = seen
+        return seen
+
+    def _feed_actor_tail(self, event: Dict[str, Any]) -> None:
+        """Record WHO spoke in a thread — never what they said (spec §8). SYNCHRONOUS.
+
+        Called straight from the raw Slack listeners, deliberately NOT from ambient ingest: the
+        tail's one reader is the deterministic 1:1-thread continuation veto, and that route must
+        not depend on whether ambient memory happens to be wired. Both listeners call it, so a
+        mention arrives twice; the (channel, ts) dedup keeps the second delivery from counting as
+        a second speaker — and from bumping the generation a turn's stream reconcile is watching.
+
+        Never raises: a missed actor costs one too-eager continuation, an exception here costs
+        the event.
+        """
+        try:
+            if not isinstance(event, dict):
+                return
+            channel_id = event.get("channel")
+            if not channel_id or str(channel_id).startswith("D"):
+                return  # a DM has no second agent to find and no continuation to cancel
+            subtype = event.get("subtype")
+            if subtype == "message_deleted":
+                prev = event.get("previous_message") or {}
+                self._forget_actor(channel_id, event.get("deleted_ts") or prev.get("ts"))
+                return
+            if subtype == "message_changed":
+                edited = event.get("message") or {}
+                if edited.get("subtype") == "tombstone" or (
+                        (edited.get("text") or "").strip() == _TOMBSTONE_TEXT):
+                    self._forget_actor(channel_id, edited.get("ts"))
+                    return
+                # An ordinary edit changes the words, not the speaker — recording is idempotent,
+                # and it is the one chance to learn about a message posted before we started.
+                self._record_actor(channel_id, edited)
+                return
+            if subtype in self._TAIL_FEED_SKIP_SUBTYPES:
+                return
+            self._record_actor(channel_id, event)
+        except Exception as e:  # noqa: BLE001
+            self.log_debug(f"actor tail feed failed: {e}")
+
+    def _record_actor(self, channel_id: str, msg: Dict[str, Any]) -> None:
+        ts = msg.get("ts")
+        if not ts:
+            return
+        seen = self._actor_tail_seen()
+        key = f"{channel_id}|{ts}"
+        if key in seen:
+            return
+        try:
+            if self.is_own_message(msg):
+                return  # the tail exists to spot OTHER agents; our own posts are noise in it
+            sender_type = self.classify_sender(msg)
+        except Exception:  # noqa: BLE001
+            return
+        if sender_type == "self":
+            return
+        # Root asymmetry (see actor_tail): a root files under its OWN ts, so it shares a bucket
+        # with its replies.
+        actor_tail.record(channel_id, ts=ts, root_ts=msg.get("thread_ts") or ts,
+                          is_bot=sender_type != "human", sender_type=sender_type)
+        seen[key] = True
+        seen.move_to_end(key)
+        while len(seen) > _ACTOR_TAIL_SEEN_MAX:
+            seen.popitem(last=False)
+
+    def _forget_actor(self, channel_id: str, ts: Optional[str]) -> None:
+        if not ts:
+            return
+        actor_tail.remove(channel_id, ts)
+        self._actor_tail_seen().pop(f"{channel_id}|{ts}", None)
 
     def _ambient_service(self):
         """The AmbientArtifactService (owned by the processor), or None if not wired/available."""
@@ -342,15 +480,14 @@ class SlackMessageEventsMixin:
         """F51 capture + lifecycle seam, invoked at the registered Slack message event BEFORE the
         channel_type / channel-listening branch — so ambient content is captured even when
         listening or participation is off. Handles new content (enqueue), edits (reconcile +
-        re-enqueue), and deletions (purge artifacts + pulse entry). Best-effort; never raises,
-        never blocks the wake path (offer_event only enqueues)."""
+        re-enqueue), and deletions (purge artifacts). Best-effort; never raises, never blocks the
+        wake path (offer_event only enqueues)."""
         svc = self._ambient_service()
         if svc is None:
             return
-        # The service needs the SlackBot FACADE — it owns download_file() (image/file capture)
-        # and channel_pulse (late-summary patching). The Bolt `client` is a raw AsyncWebClient
-        # with neither, so passing it makes every image/file job AttributeError into
-        # download_failed and link summaries never patch the pulse. `self` IS that facade.
+        # The service needs the SlackBot FACADE — it owns download_file() (image/file capture).
+        # The Bolt `client` is a raw AsyncWebClient without it, so passing that makes every
+        # image/file job AttributeError into download_failed. `self` IS that facade.
         facade = self
         try:
             subtype = event.get("subtype")
@@ -365,15 +502,12 @@ class SlackMessageEventsMixin:
                             await db.delete_ambient_artifacts_by_source(channel_id, deleted_ts)
                         except Exception as e:
                             self.log_debug(f"ambient delete-by-source failed: {e}")
-                    pulse = getattr(self, "channel_pulse", None)
-                    if pulse is not None:
-                        pulse.remove_message(channel_id, deleted_ts)
                     # A warm ThreadState may still hold the deleted message — force a rebuild.
                     self._mark_thread_refresh(channel_id, prev.get("thread_ts") or deleted_ts)
                     # Track 1: a deleted message inside the narrative's window invalidates the cache.
                     await self._invalidate_channel_summary(channel_id, deleted_ts)
-                    self.log_debug(f"message_deleted: purged {channel_id}:{deleted_ts} "
-                                   f"from pulse/artifacts")
+                    self.log_debug(f"message_deleted: purged artifacts for "
+                                   f"{channel_id}:{deleted_ts}")
                 return
             if subtype == "message_changed":
                 edited = event.get("message") or {}
@@ -381,16 +515,13 @@ class SlackMessageEventsMixin:
                 # Deleting a root that has (or had) replies does NOT arrive as
                 # message_deleted — Slack tombstones it: message_changed whose nested
                 # message carries subtype "tombstone" / the text "This message was
-                # deleted." Treating that as an ordinary edit re-feeds the tombstone text
-                # into the pulse as content and runs the edit-triggered engine on it (seen
-                # live 2026-07-18: six tombstones dispatched, one classified — the model
-                # then "remembered" threads that no longer existed). It is a deletion:
-                # purge the root's pulse entry + ambient artifacts and force a thread
-                # rebuild — never re-feed, never offer, never classify. The thread's
-                # surviving replies keep their own pulse entries, which stays accurate:
-                # Slack keeps them visible under a tombstoned root.
+                # deleted." Treating that as an ordinary edit runs the edit-triggered engine
+                # on the tombstone text (seen live 2026-07-18: six tombstones dispatched, one
+                # classified — the model then "remembered" threads that no longer existed).
+                # It is a deletion: purge the root's ambient artifacts and force a thread
+                # rebuild — never offer, never classify.
                 if edited.get("subtype") == "tombstone" or (
-                        (edited.get("text") or "").strip() == "This message was deleted."):
+                        (edited.get("text") or "").strip() == _TOMBSTONE_TEXT):
                     if channel_id and new_ts:
                         db = getattr(self, "db", None)
                         if db is not None:
@@ -398,9 +529,6 @@ class SlackMessageEventsMixin:
                                 await db.delete_ambient_artifacts_by_source(channel_id, new_ts)
                             except Exception as e:
                                 self.log_debug(f"ambient tombstone delete failed: {e}")
-                        pulse = getattr(self, "channel_pulse", None)
-                        if pulse is not None:
-                            pulse.remove_message(channel_id, new_ts)
                         self._mark_thread_refresh(
                             channel_id, edited.get("thread_ts") or new_ts)
                         # Track 1: a deleted-with-replies root inside the window invalidates too.
@@ -425,16 +553,6 @@ class SlackMessageEventsMixin:
                     if not synthetic.get("thread_ts") and event.get("message", {}).get("thread_ts"):
                         synthetic["thread_ts"] = event["message"]["thread_ts"]
                     if not self.is_own_message(synthetic):
-                        # Replace the stale pulse entry: drop the old text + its now-deleted
-                        # artifact notes, then re-record the edited content so a warm thread
-                        # doesn't keep showing the pre-edit message.
-                        pulse = getattr(self, "channel_pulse", None)
-                        if pulse is not None:
-                            pulse.remove_message(channel_id, new_ts)
-                            try:
-                                await self._feed_channel_pulse(synthetic)
-                            except Exception as e:  # noqa: BLE001
-                                self.log_debug(f"ambient edit pulse re-feed failed: {e}")
                         # A warm ThreadState may still hold the pre-edit text — force a rebuild.
                         self._mark_thread_refresh(
                             channel_id, synthetic.get("thread_ts") or new_ts)
@@ -656,6 +774,11 @@ class SlackMessageEventsMixin:
             # event ts. Two edits of the same message get two different markers.
             marker = str((edited.get("edited") or {}).get("ts")
                          or event.get("ts") or event.get("event_ts") or msg_ts)
+            # The OUTER message_changed event_ts — when the edit ARRIVED, not when the message was
+            # first posted. It is what the listeners admitted into the watermark for this event, so
+            # it is also what this turn must pin H against: the subject ts may be hours old, and a
+            # turn pinned there would build a stream that stops before the edit that woke it.
+            admission_ts = event.get("event_ts") or event.get("ts") or msg_ts
             seq_key = f"{channel_id}|{msg_ts}"
             seqs = self._edit_reply_seqs()
             seqs[seq_key] = marker
@@ -698,18 +821,21 @@ class SlackMessageEventsMixin:
                     return
                 # Addressed wake — route into the very path an ordinary new mention/DM takes.
                 await self._handle_slack_message(
-                    synthetic, client, wake_source="dm" if is_dm else "app_mention")
+                    synthetic, client, wake_source="dm" if is_dm else "app_mention",
+                    admission_ts=admission_ts)
                 return
             # Otherwise: the participation engine's full judgment, carrying the edit context. The
             # marker rides the dispatched message so the queue drain keeps THIS (edit) dispatch.
             await self._dispatch_edit_to_engine(
-                client, synthetic, channel_id, msg_ts, old_text, new_text, marker=marker)
+                client, synthetic, channel_id, msg_ts, old_text, new_text, marker=marker,
+                admission_ts=admission_ts)
         except Exception as e:  # noqa: BLE001
             self.log_debug(f"edit-triggered reply run failed: {e}")
 
     async def _dispatch_edit_to_engine(self, client, synthetic: Dict[str, Any], channel_id: str,
                                        msg_ts: str, old_text: str, new_text: str,
-                                       marker: Optional[str] = None) -> None:
+                                       marker: Optional[str] = None,
+                                       admission_ts: Optional[str] = None) -> None:
         """F52: send a non-mention channel edit through the participation engine, respecting the
         SAME gating a new message gets, and stashing the edit context so the classifier can make
         the typo-vs-meaning call. Mirrors _handle_channel_message's participation-check condition:
@@ -730,18 +856,6 @@ class SlackMessageEventsMixin:
         name_hit = self._text_mentions_bot_name(new_text)
         if not (mention_present or name_hit or level == "on"):
             return  # mentions_only + no mention/name → silent, exactly as a new ambient message is
-
-        # Seed the pulse (idempotent, once per channel per process). NOT for the gate — the binary
-        # gate has no envelope and never reads the pulse. For the RESPONDER, which still renders
-        # "[Recent channel activity]" on a channel turn: an edit is the one route into a woken turn
-        # that does not pass the ordinary dispatch path's backfill, so without this an edit in a
-        # channel nothing else has touched since startup answers with an empty envelope.
-        pulse = getattr(self, "channel_pulse", None)
-        if pulse is not None:
-            try:
-                await pulse.ensure_backfill(channel_id, self.app.client, self)
-            except Exception as e:  # noqa: BLE001
-                self.log_debug(f"edit pulse backfill failed: {e}")
 
         # Already-replied signal: _thread_participation runs one conversations.replies and reports
         # bot_present — the bot already appears in this message's thread (a top-level answer lands
@@ -769,6 +883,8 @@ class SlackMessageEventsMixin:
         stamp_routing_facts(message, gate_required=True, silence_capable=True,
                             addressed=False, ts=msg_ts,
                             thread_ts=synthetic.get("thread_ts"))
+        # The edit's OUTER event_ts, not the message ts (see _run_edit_triggered_reply).
+        message.metadata["trigger_admission_ts"] = str(admission_ts or msg_ts)
         # F52: mark this as the EDIT's own dispatch so the queue drain keeps it (a queued PRE-EDIT
         # dispatch for the same ts carries no marker and is dropped as stale).
         if marker is not None:
@@ -794,7 +910,12 @@ class SlackMessageEventsMixin:
 
     async def _ambient_file_deleted(self, event: Dict[str, Any]) -> None:
         """F51: a Slack `file_deleted` event — purge summaries derived from that file id across
-        the workspace. Best-effort; never raises."""
+        the workspace. Best-effort; never raises.
+
+        Spec §5: it is also the ONLY Slack-confirmed deletion a pending share will ever get. A
+        file that was deleted before its share ts resolved would otherwise be re-polled and
+        logged critically at every boot for the life of the database.
+        """
         db = getattr(self, "db", None)
         file_id = event.get("file_id") or (event.get("file") or {}).get("id")
         if db is None or not file_id:
@@ -803,61 +924,11 @@ class SlackMessageEventsMixin:
             await db.delete_ambient_artifacts_by_file_id(file_id)
         except Exception as e:  # noqa: BLE001
             self.log_debug(f"ambient file_deleted purge failed for {file_id}: {e}")
-
-    async def _feed_channel_pulse(self, event: Dict[str, Any]) -> None:
-        """F5 fix (a): the single reliable semantic feed into the ambient ring buffer.
-        Covers channel message events (including other apps' `bot_message` posts) and
-        app_mention events; excludes edits/deletes/membership churn and our OWN posts —
-        the bot's own final replies are recorded cleanly at the messaging layer
-        (record_own_reply), so the echoed placeholder/footer/streamed-edit chrome must
-        not leak in here. Best-effort; never blocks dispatch."""
-        pulse = getattr(self, "channel_pulse", None)
-        if pulse is None:
-            return
         try:
-            if event.get("subtype") in self._PULSE_FEED_SKIP_SUBTYPES:
-                return
-            if self.is_own_message(event):
-                return  # recorded at the messaging layer with clean final text
-            sender_type = self.classify_sender(event)
-            # F48: a legacy webhook post (Jira/GitHub/Drive) has EMPTY text — its whole
-            # payload is in attachments[].fields[] — so the empty-text guard below used to
-            # drop it from awareness entirely. Extract first, then decide. Budgeted to the
-            # pulse's own cap so the extractor's honest end marker lands INSIDE the entry
-            # rather than being sliced off by record()'s head truncation.
-            text = event.get("text", "") or ""
-            supplementary = ""
-            if sender_type != "self":
-                supplementary = extract_supplementary_text(
-                    event, primary_text=text, budget=_pulse_supplementary_budget(text))
-            # F51: a bare file share with no comment (empty text, no supplementary) STILL carries
-            # awareness — its files feed the attachment note + ambient artifacts. Cold backfill
-            # records it, so dropping it live created a live/restart divergence. Record it when
-            # files are present even with empty text.
-            if not text.strip() and not supplementary and not event.get("files"):
-                return  # nothing to add
-            if supplementary:
-                text = f"{text}\n\n{supplementary}" if text.strip() else supplementary
-            user_id = event.get("user")
-            display_name = event.get("username")
-            if not display_name and user_id and user_id in self.user_cache:
-                display_name = self.user_cache[user_id].get("real_name")
-            pulse.record(
-                event.get("channel"),
-                ts=event.get("ts"),
-                thread_ts=event.get("thread_ts"),
-                user_id=user_id,
-                display_name=display_name,
-                sender_type=sender_type,
-                text=text,
-                is_bot=sender_type != "human",
-                files=event.get("files"),
-                # Preserve subtype so the channel-summary timeline filter keeps a thread_broadcast
-                # (timeline content) but drops ordinary in-thread replies.
-                subtype=event.get("subtype"),
-            )
-        except Exception as e:
-            self.log_debug(f"channel_pulse feed failed: {e}")
+            from message_processor.outbound_receipts import delete_pending_shares_for_file
+            await delete_pending_shares_for_file(db, file_id)
+        except Exception as e:  # noqa: BLE001
+            self.log_debug(f"pending share cleanup failed for {file_id}: {e}")
 
     async def _handle_channel_message(self, event: Dict[str, Any], client):
         """Phase 5: decide whether to respond to a NON-mention channel message, then dispatch.
@@ -865,13 +936,9 @@ class SlackMessageEventsMixin:
         SAFE BY DEFAULT — the caller already gated on config.enable_channel_listening. Honors
         channel_response_mode (default 'tag_only'); short-circuits our own posts; de-dups against
         the app_mention event; and bypasses the welcome/settings onboarding flow entirely."""
-        # Phase E / F5: awareness BEFORE any gate — feed EVERY semantic message (incl.
-        # other apps' bot_message posts and ones we go on to ignore) into the pulse. The
-        # feed does its own subtype/own-message filtering. This path only runs when channel
-        # listening is on, so the pulse is inert otherwise by construction.
-        await self._feed_channel_pulse(event)
         # Ignore non-real messages (edits, deletes, joins, message_changed, etc.) for the
-        # RESPONSE gate — they never drive a reply (awareness already captured above).
+        # RESPONSE gate — they never drive a reply (the stream and the actor tail have already
+        # taken account of them at the listener).
         # EXCEPTION (F14): content-bearing subtypes (file_share uploads, thread_broadcast)
         # ARE real content and proceed through the gate; _event_to_message plumbs any
         # `files` onto the Message exactly as the @-mention path does, so downstream intent
@@ -927,12 +994,11 @@ class SlackMessageEventsMixin:
             bot_present, human_count, other_bots = await self._thread_participation(channel_id, thread_ts)
             if bot_present and human_count <= 1 and other_bots == 0:
                 direct_continuation = True
-                # F5 fix (b): the replies fast path only scans the oldest page (limit=50)
-                # and can miss a SECOND bot later in a long thread. The pulse tail holds
-                # recent senders — if it shows another agent, drop the deterministic
-                # continuation and let the engine judge (a bot may be the real addressee).
-                pulse = getattr(self, "channel_pulse", None)
-                if pulse is not None and pulse.thread_has_other_bot(channel_id, thread_ts):
+                # F5 fix (b): the replies fast path only scans the oldest page (limit=50) and can
+                # miss a SECOND bot later in a long thread. The actor tail knows who has spoken in
+                # this thread — if it shows another agent, drop the deterministic continuation and
+                # let the engine judge (a bot may be the real addressee).
+                if actor_tail.thread_has_other_bot(channel_id, thread_ts):
                     direct_continuation = False
 
         # Decide: 1:1 thread continuation → respond directly; `on` → the gate judges every
@@ -950,12 +1016,6 @@ class SlackMessageEventsMixin:
             pass  # legacy deterministic name wake (engine disabled)
         else:
             return
-
-        # Phase E: first wake in this channel since startup seeds the pulse ring
-        # (one conversations.history call, once per channel per process).
-        pulse = getattr(self, "channel_pulse", None)
-        if pulse is not None:
-            await pulse.ensure_backfill(channel_id, self.app.client, self)
 
         # Build the universal message (no onboarding side effects) and dispatch.
         message = await self._event_to_message(event, client)
@@ -983,6 +1043,9 @@ class SlackMessageEventsMixin:
         stamp_routing_facts(message, gate_required=gate_required,
                             silence_capable=gate_required or direct_continuation,
                             addressed=False, ts=ts, thread_ts=thread_ts)
+        # What this turn pins H against: for an ordinary post, the message's own ts (the listener
+        # admitted exactly that).
+        message.metadata["trigger_admission_ts"] = str(ts or "")
         if gate_required:
             if name_hit:
                 message.metadata["participation_name_hit"] = True
@@ -1009,11 +1072,16 @@ class SlackMessageEventsMixin:
             await self.message_handler(message, self)
 
     async def _handle_slack_message(self, event: Dict[str, Any], client, wake_source: str = None,
-                                    origin_verified: bool = False):
+                                    origin_verified: bool = False,
+                                    admission_ts: Optional[str] = None):
         """Handle a mention/DM event: build the message, run onboarding, dispatch (unchanged).
 
         wake_source (F3): "app_mention" or "dm" — this path is shared by both, so the
         caller (registration) tags which one so the wake envelope can tell them apart.
+
+        admission_ts: the ts the LISTENER admitted for this event, when that is not the message's
+        own ts — an edit-triggered dispatch carries the outer message_changed event_ts, so the turn
+        pins H at the moment the edit arrived rather than when the message was first posted.
 
         origin_verified: True only when `event` came straight from Slack (the Bolt handlers in
         registration.py). It authorizes the membership attestation below. It defaults False
@@ -1050,34 +1118,14 @@ class SlackMessageEventsMixin:
         stamp_routing_facts(message, gate_required=False, silence_capable=False,
                             addressed=True, ts=event.get("ts"),
                             thread_ts=event.get("thread_ts"))
+        # Channel turns only: it is what a channel stream pins H against, and a DM has no stream.
+        if message.channel_id and not str(message.channel_id).startswith("D"):
+            message.metadata["trigger_admission_ts"] = str(admission_ts or event.get("ts") or "")
         # Explicit default. A DM has no channel settings and no top level to post at, and the
         # non-DM block below overwrites this with the resolved allowance — but every dispatched
         # message carries the key either way, so nothing downstream has to guess.
         message.metadata["channel_post_allowed"] = False
         user_id = event.get("user")
-
-        # Phase E: an @mention in a channel is also a wake — seed the pulse ring so the
-        # response envelope has content. Also enabled when ambient memory is on even if channel
-        # listening is off: F51 summarizes images/links/files posted in OTHER threads, and the
-        # ONLY way a cross-thread ambient artifact reaches this @mention turn is the pulse
-        # envelope (backfill batch-loads the artifacts). Some staleness is acceptable — a mention
-        # is an explicit interaction where peripheral context helps.
-        pulse = getattr(self, "channel_pulse", None)
-        if (pulse is not None and message.channel_id
-                and not message.channel_id.startswith("D")):
-            # Channel listening populates the pulse regardless. The AMBIENT-driven widening
-            # (listening off, ambient memory on) must honor the per-channel opt-out — load the
-            # settings BEFORE the backfill, not after, or an opted-out channel still gets a full
-            # backfill + cross-thread raw content in the mention response.
-            do_backfill = config.enable_channel_listening
-            if not do_backfill and config.enable_ambient_memory:
-                cs_early = await self._get_channel_settings(message.channel_id)
-                do_backfill = not (cs_early and cs_early.get("ambient_memory") is False)
-            if do_backfill:
-                # F5 fix (a): an @mention is a semantic message too — feed it (idempotent with
-                # the parallel `message` event via record()'s (channel, ts) dedup).
-                await self._feed_channel_pulse(event)
-                await pulse.ensure_backfill(message.channel_id, self.app.client, self)
 
         # Phase 7: surface per-channel ground rules (in-channel only) and skip the
         # settings-modal onboarding for BOT senders — a bot can't click the modal
@@ -1180,7 +1228,10 @@ class SlackMessageEventsMixin:
                         self.log_info(f"Welcome modal opened for new user {user_id}")
                         
                         # Send welcome message
-                        await client.chat_postMessage(
+                        await _post_onboarding_notice(
+                            self, client, site="welcome_modal_notice",
+                            receipt_channel=message.channel_id,
+                            thread_root_ts=message.thread_id,
                             channel=message.channel_id,
                             thread_ts=message.thread_id,
                             text="👋 Welcome! I've opened your settings panel. Please configure your preferences and I'll be ready to help!"
@@ -1231,7 +1282,10 @@ class SlackMessageEventsMixin:
                         target_thread = None  # No thread in DM
                         
                         # Also send a brief message in the thread to acknowledge
-                        await client.chat_postMessage(
+                        await _post_onboarding_notice(
+                            self, client, site="welcome_dm_notice",
+                            receipt_channel=message.channel_id,
+                            thread_root_ts=message.thread_id,
                             channel=message.channel_id,
                             thread_ts=message.thread_id,
                             text="👋 Welcome! I've sent you a direct message to configure your settings."
@@ -1268,7 +1322,9 @@ class SlackMessageEventsMixin:
                     
                     # No need to warn user - we handle truncation transparently
                     
-                    response = await client.chat_postMessage(
+                    response = await _post_onboarding_notice(
+                        self, client, site="welcome_button",
+                        receipt_channel=target_channel, thread_root_ts=target_thread,
                         channel=target_channel,
                         thread_ts=target_thread,
                         text="👋 Welcome! Please configure your settings to get started.",
@@ -1276,7 +1332,7 @@ class SlackMessageEventsMixin:
                     )
                     
                     # Track welcome message for updating after settings saved
-                    if response.get('ok'):
+                    if response and response.get('ok'):
                         if not hasattr(self, '_welcome_messages'):
                             self._welcome_messages = {}
                         self._welcome_messages[user_id] = {
@@ -1291,13 +1347,16 @@ class SlackMessageEventsMixin:
             else:
                 # Not first message - send regular reminder that we can delete later
                 try:
-                    response = await client.chat_postMessage(
+                    response = await _post_onboarding_notice(
+                        self, client, site="settings_reminder",
+                        receipt_channel=message.channel_id,
+                        thread_root_ts=message.thread_id,
                         channel=message.channel_id,
                         thread_ts=message.thread_id,
                         text="⚠️ Please configure your settings before I can help you. Click the *Configure Settings* button above to get started."
                     )
                     # Track reminder message for cleanup
-                    if response.get('ok'):
+                    if response and response.get('ok'):
                         if not hasattr(self, '_reminder_messages'):
                             self._reminder_messages = {}
                         if user_id not in self._reminder_messages:
@@ -1360,7 +1419,7 @@ class SlackMessageEventsMixin:
         ]
         try:
             # Posting to a user id routes to that user's DM with the bot.
-            await client.chat_postMessage(
+            await client.chat_postMessage(  # DM target: structurally exempt from receipts
                 channel=user_id,
                 text="Set your personal preferences anytime (optional).",
                 blocks=blocks
@@ -1466,7 +1525,10 @@ class SlackMessageEventsMixin:
                     return
 
                 # Post the onboarding settings button as the first message in the thread
-                await client.chat_postMessage(
+                await _post_onboarding_notice(
+                    self, client, site="settings_button",
+                    receipt_channel=message.channel_id,
+                    thread_root_ts=message.thread_id,
                     channel=message.channel_id,
                     thread_ts=message.thread_id,  # Always use thread_ts to post in the thread
                     text="Settings available",

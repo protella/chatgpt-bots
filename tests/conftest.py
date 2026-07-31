@@ -120,3 +120,47 @@ def event_loop():
     loop = asyncio.new_event_loop()
     yield loop
     loop.close()
+
+# The channel-post admission gate is process-wide, like the receipt service, and shutdown closes
+# it permanently by design. Any test that drives ChatBotV2.shutdown() would otherwise leave it
+# shut for every test after it, silently refusing their posts.
+@pytest.fixture(autouse=True)
+def _open_channel_post_gate():
+    from message_processor import outbound_receipts
+
+    outbound_receipts.reset_channel_post_gate()
+    yield
+    outbound_receipts.reset_channel_post_gate()
+
+
+# The document extraction cache is a process-wide singleton keyed by file id alone, so one test
+# file's fixture ids collide with another's across the whole session — and the collision is
+# INVISIBLE: the later test gets a plausible string back and fails on its content, which reads as a
+# bug in the code under test rather than in the run order. (Seen exactly that way: a DM attachment
+# test warmed "F1" and a channel read_document test then asserted against the wrong document.)
+# The participation ledger is a process-wide sink built from config.log_directory the first time
+# anything records an event — so without this the suite writes its synthetic rows into the REAL
+# ledger (301 of them, against channel "C123", seen after the P2 battery), where they are
+# indistinguishable from production decisions in every later analysis.
+#
+# ORDER IS THE WHOLE FIXTURE. The open sink holds a file handle from the OLD directory, so it is
+# drained and closed BEFORE the swap and again after it: closing after the restore would flush this
+# test's rows into whatever directory came next, which is the leak in miniature.
+@pytest.fixture(autouse=True)
+def _isolated_participation_ledger(tmp_path, monkeypatch):
+    from config import config
+    from message_processor import participation_telemetry
+
+    participation_telemetry.shutdown()
+    monkeypatch.setattr(config, "log_directory", str(tmp_path / "ledger"), raising=False)
+    yield
+    participation_telemetry.shutdown()
+
+
+@pytest.fixture(autouse=True)
+def _empty_document_extraction_cache():
+    from message_processor.document_tools import _extraction_cache
+
+    _extraction_cache.clear()
+    yield
+    _extraction_cache.clear()

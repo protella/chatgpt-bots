@@ -27,7 +27,7 @@ import pytest
 
 from message_processor.stale_send_guard import (COMMITTED, PENDING, SUPPRESSED,
                                                 ConversationWatermarks,
-                                                StaleSendSuppressed, is_newer,
+                                                StaleSendSuppressed, TurnSendLease, is_newer,
                                                 primary_scope_key, scopes_for, ts_key)
 
 
@@ -230,6 +230,81 @@ def test_the_ownership_ceiling_refuses_a_source_from_a_later_turn():
     assert not lease.owns("101.0")
 
 
+# ------------------------------------------ a channel request is not one conversation
+
+def _channel_items(*messages):
+    """The stream items a channel request carries, off the real serializer.
+
+    The assembler forwards each `message_items` entry verbatim — role, content, metadata — so
+    these are the items the lease actually reads on a channel turn.
+    """
+    from tests.unit.channel_turn_harness import build_stream
+
+    stream = build_stream(messages)
+    return [{"role": item.role, "content": item.content, "metadata": dict(item.metadata)}
+            for item in stream.message_items]
+
+
+def _turn_answering_root_100():
+    """A turn answering root 100.0 that owns the window up to 110.0 and has so far accounted
+    only for the root.
+
+    The two marks are independent by design — the ceiling says what this turn OWNS, `last_seen_ts`
+    what it has ACCOUNTED FOR — and they are set apart here so the SCOPE rule is what gets
+    measured. Equal, the ownership ceiling would refuse every candidate on its own and the scoping
+    would never run.
+    """
+    lease = TurnSendLease(scopes=scopes_for("C1", "100.0", "100.0", "U1"),
+                          last_seen_ts="100.0", ceiling_ts="110.0")
+    return SimpleNamespace(send_lease=lease), _msg("100.0")
+
+
+def test_a_channel_request_never_advances_the_lease_across_threads():
+    """THE SCOPE FIX. A channel request contains the whole channel, so "the newest role:user ts
+    in it" is somebody else's conversation. Absorbing that would tell the guard this turn had
+    accounted for a message it is not answering — and the guard would then wave through an answer
+    a real newer reply should have suppressed."""
+    from message_processor.handlers.text import (advance_channel_lease_to_request,
+                                                 advance_lease_to_request)
+    from tests.unit.channel_turn_harness import normalized
+
+    items = _channel_items(
+        normalized("100.0", "the question", sender_id="U1"),
+        normalized("104.0", "a reply under it", sender_id="U2", thread_root_ts="100.0"),
+        normalized("102.0", "somebody else's thread", sender_id="U9"),
+        normalized("105.0", "…and its reply", sender_id="U9", thread_root_ts="102.0"),
+        normalized("111.0", "a reply a LATER turn owns", sender_id="U2", thread_root_ts="100.0"),
+    )
+
+    turn, message = _turn_answering_root_100()
+    advance_channel_lease_to_request(turn, items, message)
+    assert turn.send_lease.last_seen_ts == "104.0", (
+        "only the reply in this turn's own thread scope, and nothing above the ceiling")
+
+    dm_turn, _ = _turn_answering_root_100()
+    advance_lease_to_request(dm_turn, items, message)
+    assert dm_turn.send_lease.last_seen_ts == "105.0", (
+        "precondition: the DM helper reads the newest owned ts anywhere in the request, which is "
+        "exactly why a channel turn cannot use it")
+
+
+def test_a_channel_lease_still_absorbs_its_own_senders_top_level_burst():
+    """The other half of the scope rule, unchanged: one person's rapid second top-level question
+    is the same moment, and a stranger's unrelated one is not."""
+    from message_processor.handlers.text import advance_channel_lease_to_request
+    from tests.unit.channel_turn_harness import normalized
+
+    items = _channel_items(
+        normalized("100.0", "the question", sender_id="U1"),
+        normalized("106.0", "same person, straight after", sender_id="U1"),
+        normalized("107.0", "a stranger's own question", sender_id="U9"),
+    )
+
+    turn, message = _turn_answering_root_100()
+    advance_channel_lease_to_request(turn, items, message)
+    assert turn.send_lease.last_seen_ts == "106.0"
+
+
 def test_advancing_the_mark_is_monotonic_across_retries():
     """Retries and fallbacks rebuild the request and recompute this. It must never slide back —
     a regression would re-expose a turn to a message it had already accounted for."""
@@ -374,7 +449,6 @@ async def test_only_messages_that_reach_a_turn_raise_the_watermark():
     app.processor.process_message = AsyncMock(return_value=None)
     app._run_participation_gate = AsyncMock(return_value=None)
     client = MagicMock()
-    client.channel_pulse = None
     client.send_thinking_indicator = AsyncMock(return_value=None)
     client.delete_message = AsyncMock()
 
@@ -412,7 +486,6 @@ async def test_a_turn_holds_its_scope_for_exactly_its_own_lifetime():
     newer_admitted = asyncio.Event()
     app.processor.process_message = AsyncMock(side_effect=_slow_turn)
     client = MagicMock()
-    client.channel_pulse = None
     client.send_thinking_indicator = AsyncMock(return_value=None)
     client.delete_message = AsyncMock()
 
@@ -485,9 +558,10 @@ def test_a_refused_turn_with_a_detached_surface_is_detached():
 def test_the_new_kind_is_in_the_vocabulary_and_the_contract_moved():
     from message_processor import participation_telemetry as pt
     assert "stale_suppressed" in pt.KINDS
-    # v7 = the binary gate. The version moves whenever the ledger's field set changes, and this
-    # assertion exists so a field change cannot ship without someone bumping it deliberately.
-    assert pt.CONTRACT_VERSION == 7
+    # v8 = the single-stream events on top of the binary gate. The version moves whenever the
+    # ledger's field set or event cardinality changes, and this assertion exists so a field change
+    # cannot ship without someone bumping it deliberately.
+    assert pt.CONTRACT_VERSION == 8
     assert pt.GATE_CONTRACT == "binary-v1"
 
 
@@ -624,7 +698,10 @@ async def test_process_message_never_turns_a_suppression_into_an_error_response(
         raise StaleSendSuppressed(scope=("top", "C1", "U1"), last_seen_ts="100.0",
                                   observed_latest_ts="101.0", surface="final_post")
 
+    # Either step-2 entry point — a channel turn creates its state, a DM rebuilds one — and the
+    # suppression has to come back out of process_message untouched.
     proc._get_or_rebuild_thread_state = _raise
+    proc.get_or_create_channel_thread_state = _raise
     message = Message(text="q", user_id="U1", channel_id="C1", thread_id="100.0",
                       metadata={"ts": "100.0"})
     with pytest.raises(StaleSendSuppressed):
@@ -645,17 +722,13 @@ async def test_a_prior_timeout_notice_is_guarded_like_any_first_surface(supersed
 
     class _Proc:
         process_message = MessageProcessor.process_message
+        # The real notice helper, so this still exercises the send it is about.
+        _post_prior_timeout_notice = MessageProcessor._post_prior_timeout_notice
 
         def __init__(self):
             from thread_manager import AsyncThreadStateManager
             self.thread_manager = AsyncThreadStateManager(db=None)
             self.db = None
-
-        # process_message now folds the gate's coalesced cohort into the turn's input before it
-        # reads the thread. This harness carries only process_message, so the real mixin method is
-        # absent and the AttributeError was being swallowed by the suppress() below — which showed
-        # up as "the timeout notice never sent". A message with no cohort merges nothing.
-        def _merge_gate_cohort(self, message, thread_state): return 0
 
         def log_info(self, *a, **k): pass
         def log_debug(self, *a, **k): pass
@@ -685,10 +758,20 @@ async def test_a_prior_timeout_notice_is_guarded_like_any_first_surface(supersed
     async def _state(*a, **k):
         return SimpleNamespace(had_timeout=True, messages=[], channel_id="C1",
                                thread_ts="100.0", root_author=("U1", "human"),
-                               config_overrides={}, current_model="gpt-5.6-sol")
+                               config_overrides={}, current_model="gpt-5.6-sol",
+                               participants={}, has_trimmed_messages=False)
 
     proc = _Proc()
+    # A channel turn creates its state instead of rebuilding one; both entry points answer with
+    # the timed-out thread so the notice is reached whichever way step 2 goes.
     proc._get_or_rebuild_thread_state = _state
+    proc.get_or_create_channel_thread_state = _state
+    # r2-11: on a channel turn the notice now waits for the window and the admission, so the two
+    # steps in front of it have to succeed for this test to reach the thing it is about.
+    proc._build_channel_turn_stream = AsyncMock(return_value=None)
+    proc._admit_channel_request = AsyncMock()
+    proc._process_attachments = AsyncMock(return_value=([], [], []))
+    proc._build_user_content = MagicMock(return_value="q")
     with contextlib.suppress(Exception):
         await proc.process_message(message, client=client, thinking_id=None, turn=turn)
 
@@ -711,8 +794,8 @@ async def test_a_split_reply_commits_when_its_FIRST_chunk_lands():
     host = MagicMock()
     host.MAX_MESSAGE_LENGTH = 40
     host.format_text = lambda t: t
-    host._record_own_reply_pulse = MagicMock()
     host._compose_reply_with_footer = MagicMock(return_value=None)
+    host._record_receipt = AsyncMock()
     host._split_message = lambda t: ["first chunk", "second chunk", "third chunk"]
 
     async def _post(**kw):
@@ -741,8 +824,8 @@ async def test_a_single_message_send_commits_so_later_pieces_are_never_refused()
     host = MagicMock()
     host.MAX_MESSAGE_LENGTH = 4000
     host.format_text = lambda t: t
-    host._record_own_reply_pulse = MagicMock()
     host._compose_reply_with_footer = MagicMock(return_value=None)
+    host._record_receipt = AsyncMock()
     host.app.client.chat_postMessage = AsyncMock(return_value={"ts": "99.9"})
     host.send_message = SlackMessagingMixin.send_message.__get__(host)
 
@@ -777,8 +860,8 @@ async def test_a_split_retry_reauthorizes_before_its_second_attempt():
     host = MagicMock()
     host.MAX_MESSAGE_LENGTH = 40
     host.format_text = lambda t: t
-    host._record_own_reply_pulse = MagicMock()
     host._compose_reply_with_footer = MagicMock(return_value=None)
+    host._record_receipt = AsyncMock()
     host._split_message = lambda t: ["chunk one", "chunk two"]
     host.app.client.chat_postMessage = AsyncMock(side_effect=_post)
     host.send_message = SlackMessagingMixin.send_message.__get__(host)
@@ -806,8 +889,8 @@ async def test_the_truncation_notice_is_refused_when_nothing_landed():
     host = MagicMock()
     host.MAX_MESSAGE_LENGTH = 40
     host.format_text = lambda t: t
-    host._record_own_reply_pulse = MagicMock()
     host._compose_reply_with_footer = MagicMock(return_value=None)
+    host._record_receipt = AsyncMock()
     host._split_message = lambda t: ["chunk one", "chunk two"]
     host.app.client.chat_postMessage = AsyncMock(side_effect=_post)
     host.send_message = SlackMessagingMixin.send_message.__get__(host)
@@ -841,8 +924,8 @@ async def test_a_committed_split_still_posts_its_remaining_chunks_and_notice():
     host = MagicMock()
     host.MAX_MESSAGE_LENGTH = 40
     host.format_text = lambda t: t
-    host._record_own_reply_pulse = MagicMock()
     host._compose_reply_with_footer = MagicMock(return_value=None)
+    host._record_receipt = AsyncMock()
     host._split_message = lambda t: ["chunk one", "chunk two"]
     host.app.client.chat_postMessage = AsyncMock(side_effect=_post)
     host.send_message = SlackMessagingMixin.send_message.__get__(host)
@@ -977,7 +1060,14 @@ def test_no_delivery_boundary_can_swallow_a_suppression():
                     # substring test of the enclosing block.
                     if any(kw.arg == "lease" for kw in c.keywords):
                         hands_lease = True
-                    if any(isinstance(a, ast.Name) and a.id in LEASE_NAMES for a in c.args):
+                    # …but only for a callee that could refuse. A local named `lease` is not
+                    # necessarily a SEND lease — a turn also holds a compaction-snapshot lease and
+                    # a reaction lease — and reading the name alone flagged
+                    # `coordinator.unpin(lease)` as a delivery boundary.
+                    callee = (c.func.attr if isinstance(c.func, ast.Attribute)
+                              else getattr(c.func, "id", ""))
+                    if (callee in TRANSPORT or callee in propagating) and any(
+                            isinstance(a, ast.Name) and a.id in LEASE_NAMES for a in c.args):
                         hands_lease = True
             can_raise = hands_lease or ".authorize(" in body or bool(body_calls & propagating)
             if not can_raise:
@@ -1092,7 +1182,8 @@ async def test_handle_error_carries_the_lease_end_to_end(superseded):
 
     sent = []
 
-    async def _send(channel_id, thread_id, text, blocks=None, meta_out=None, lease=None):
+    async def _send(channel_id, thread_id, text, blocks=None, meta_out=None, lease=None,
+                    receipts=None, receipt_kind=None):
         if lease is not None:
             lease.authorize("error_notice")
         sent.append(text)
@@ -1148,7 +1239,8 @@ async def test_the_timeout_notice_is_awaited_with_the_lease_not_scheduled(supers
 
     edits = []
 
-    async def _update(channel_id, message_id, text, lease=None, surface=None):
+    async def _update(channel_id, message_id, text, lease=None, surface=None,
+                      receipts=None, receipt_kind=None):
         if lease is not None:
             lease.authorize(surface or "error_notice")
         edits.append(text)
@@ -1161,9 +1253,160 @@ async def test_the_timeout_notice_is_awaited_with_the_lease_not_scheduled(supers
         raise TimeoutError("the model took too long")
 
     proc = _Proc()
+    # Both step-2 entry points time out, so the notice under test is the TIMEOUT one whichever
+    # way the surface routes — not a generic error notice standing in for it.
     proc._get_or_rebuild_thread_state = _state
+    proc.get_or_create_channel_thread_state = _state
     with contextlib.suppress(Exception):
         await proc.process_message(message, client=client, thinking_id="T1", turn=turn)
 
     assert (edits == []) is superseded, (
         "a superseded turn must write no timeout notice; a current one must write exactly one")
+
+
+# ============================================================ rider E: the suppression's evidence
+#
+# A refused turn is refused ONCE and then refused again at every later surface it tries, and those
+# later refusals used to carry nothing: fourteen copies of "newer message None in None supersedes
+# this turn", which names neither the message that superseded it nor the scope. The fact does not
+# change after the first refusal, so it is remembered.
+
+def test_a_re_authorization_rethrows_the_original_evidence():
+    marks = ConversationWatermarks()
+    lease = marks.begin_turn(_msg("100.0"))
+    marks.begin_turn(_msg("101.0"))          # the room moves on
+
+    with pytest.raises(StaleSendSuppressed) as first:
+        lease.authorize("native_start")
+    with pytest.raises(StaleSendSuppressed) as second:
+        lease.authorize("footer")
+
+    assert first.value.observed_latest_ts == "101.0"
+    assert second.value.observed_latest_ts == "101.0", "the same fact, not a blank one"
+    assert second.value.scope == first.value.scope
+    assert second.value.surface == "footer"          # …only the surface differs
+    assert "None in None" not in str(second.value)
+
+
+def test_the_evidence_survives_the_superseding_turn_closing_its_lease():
+    """The watermark entry is gone by the time the later surfaces try — which is exactly when the
+    old code re-derived it and got nothing."""
+    marks = ConversationWatermarks()
+    lease = marks.begin_turn(_msg("100.0"))
+    newer = marks.begin_turn(_msg("101.0"))
+
+    with pytest.raises(StaleSendSuppressed):
+        lease.authorize("native_start")
+    newer.close()
+
+    with pytest.raises(StaleSendSuppressed) as again:
+        lease.authorize("artifact")
+    assert again.value.observed_latest_ts == "101.0"
+
+
+# ---------------------------------------------------- rider E: no streaming layer swallows it
+
+def _stream_host():
+    from unittest.mock import AsyncMock as _AsyncMock
+
+    host = MagicMock()
+    host.logged = {"warning": [], "error": []}
+    host.log_info = host.log_debug = lambda *a, **k: None
+    host.log_warning = lambda msg, *a, **k: host.logged["warning"].append(str(msg))
+    host.log_error = lambda msg, *a, **k: host.logged["error"].append(str(msg))
+    host._safe_api_call = _AsyncMock(return_value=SimpleNamespace())
+    return host
+
+
+def _events(kind):
+    """A finite stream (pitfall #6) shaped for the layer under test."""
+    if kind == "event":
+        class _Hostile:
+            @property
+            def type(self):
+                raise StaleSendSuppressed(scope=("thread", "C1", "10.0"), last_seen_ts="10.0",
+                                          observed_latest_ts="11.0", surface="probe")
+
+        return [_Hostile()]
+    if kind == "delta":
+        return [SimpleNamespace(type="response.output_text.delta", delta="hello")]
+    return [SimpleNamespace(type="response.output_text.delta", delta="hello"),
+            SimpleNamespace(type="response.completed",
+                            response=SimpleNamespace(usage=SimpleNamespace(
+                                input_tokens=1, output_tokens=1)))]
+
+
+def _callback(kind):
+    """Raises the suppression at the layer this case is about."""
+    def _cb(chunk):
+        if kind == "delta" and chunk is not None:
+            raise StaleSendSuppressed(scope=("thread", "C1", "10.0"), last_seen_ts="10.0",
+                                      observed_latest_ts="11.0", surface="stream_delta")
+        if kind == "completion" and chunk is None:
+            raise StaleSendSuppressed(scope=("thread", "C1", "10.0"), last_seen_ts="10.0",
+                                      observed_latest_ts="11.0", surface="stream_flush")
+    return _cb
+
+
+@pytest.mark.parametrize("with_tools", [False, True])
+@pytest.mark.parametrize("layer", ["delta", "completion", "event"])
+@pytest.mark.asyncio
+async def test_no_streaming_layer_swallows_a_suppression(layer, with_tools):
+    """SIX catch sites — a delta callback, a completion flush and a per-event catch, in each of the
+    two streaming implementations — every one of which used to log the suppression as an ordinary
+    callback/event error and carry on. The turn then streamed to a room that had moved on, and the
+    fourteen uninformative WARNINGs the P2 battery saw were these layers each catching it in turn.
+
+    Everything ELSE those handlers catch keeps today's swallow; that is the next test."""
+    from openai_client.api import responses as R
+
+    host = _stream_host()
+
+    async def _iter(response, op):
+        for event in _events(layer):
+            yield event
+
+    host._safe_stream_iteration = _iter
+
+    call = (R.create_streaming_response_with_tools if with_tools
+            else R.create_streaming_response)
+    kwargs = {"tools": [{"type": "web_search"}]} if with_tools else {}
+
+    with pytest.raises(StaleSendSuppressed) as raised:
+        await call(host, messages=[{"role": "user", "content": "hi"}],
+                   stream_callback=_callback(layer), model="gpt-5.6-sol", **kwargs)
+
+    # The evidence reaches the top intact, and the outer handler files it as a suppression rather
+    # than as an API error with a stack trace under a turn where nothing went wrong.
+    assert raised.value.observed_latest_ts == "11.0"
+    assert any("ended without posting" in line for line in host.logged["warning"])
+    assert host.logged["error"] == []
+
+
+@pytest.mark.parametrize("with_tools", [False, True])
+@pytest.mark.asyncio
+async def test_an_ordinary_callback_error_is_still_swallowed(with_tools):
+    """The mutation of the test above. A broken buffer must not end the stream — only a
+    suppression does."""
+    from openai_client.api import responses as R
+
+    host = _stream_host()
+
+    async def _iter(response, op):
+        for event in _events("completion"):
+            yield event
+
+    host._safe_stream_iteration = _iter
+
+    def _cb(chunk):
+        raise RuntimeError("the buffer fell over")
+
+    call = (R.create_streaming_response_with_tools if with_tools
+            else R.create_streaming_response)
+    kwargs = {"tools": [{"type": "web_search"}]} if with_tools else {}
+
+    text = await call(host, messages=[{"role": "user", "content": "hi"}],
+                      stream_callback=_cb, model="gpt-5.6-sol", **kwargs)
+
+    assert text == "hello", "the stream completed; the callback's failure was its own"
+    assert any("callback error" in line for line in host.logged["warning"])

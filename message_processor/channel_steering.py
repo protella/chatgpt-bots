@@ -28,6 +28,16 @@ ORDER IS FIXED, not chronological. Policy first, always — regardless of row id
 Everything else follows in a deterministic order, so the same state renders the same bytes on
 every turn. That determinism is what makes prompt caching work at all, and it is what makes the
 same-bytes invariant checkable rather than merely intended.
+
+WHY THE SNAPSHOT IS SPLIT (P2, spec §3). One read still, one version still — but the two halves
+are now addressable separately, because they belong at different places in a channel request and
+under different authority. `developer_policy` is the operator's directive and rides the final
+developer suffix; `user_facts` is remembered background and rides the post-breakpoint user
+evidence, where untrusted-derived content belongs. `gate_text` is the flattened block the wake
+classifier reads, and `.text` is the same bytes under its old name for the DM path and every
+intermediate caller. Both are DERIVED from the halves, so the split cannot drift from what the
+gate saw: tests/fixtures/channel_steering_golden.json pins those bytes against the pre-split
+renderer.
 """
 import hashlib
 from dataclasses import dataclass
@@ -82,18 +92,39 @@ def is_ordinary_fact(row: Dict[str, Any]) -> bool:
     return not is_policy_row(row) and not is_pref_row(row)
 
 
+# Bumped when the RENDERED bytes of either half change. It travels with the snapshot so a
+# consumer (and the request-cache tuple) can say which grammar it obeyed.
+STEERING_SNAPSHOT_VERSION = 1
+
+
 @dataclass(frozen=True)
 class ChannelSteeringSnapshot:
     """What this turn believes the channel's steering to be. FROZEN on purpose: a turn that
-    could mutate its own snapshot is a turn whose two halves can disagree again."""
+    could mutate its own snapshot is a turn whose two halves can disagree again.
 
-    text: Optional[str] = None
+    Stored as the two halves; every flattened form is derived (see the module docstring)."""
+
+    developer_policy: Optional[str] = None
+    user_facts: Optional[str] = None
+    version: int = STEERING_SNAPSHOT_VERSION
     policy_hash: Optional[str] = None
     policy_present: bool = False
 
     @property
+    def gate_text(self) -> Optional[str]:
+        """The flattened block the wake classifier reads — policy first, then facts."""
+        sections = [s for s in (self.developer_policy, self.user_facts) if s]
+        return "\n\n".join(sections) if sections else None
+
+    @property
+    def text(self) -> Optional[str]:
+        """The pre-split name for the same bytes. DMs and the intermediate callers that thread
+        one string through the responder keep working unchanged."""
+        return self.gate_text
+
+    @property
     def is_empty(self) -> bool:
-        return not (self.text or "").strip()
+        return not (self.gate_text or "").strip()
 
 
 # A snapshot that is READY and carries nothing — the honest result of "there is no steering", and
@@ -145,16 +176,14 @@ def render_snapshot(policy_row: Optional[Dict[str, Any]],
     def _ordered(items):
         return [entry for _, entry in sorted(items, key=lambda pair: pair[0])]
 
-    blocks: List[List[str]] = []
-    if policy_text:
-        blocks.append([POLICY_HEADING, policy_text])
-    blocks.append(_render_section(CHANNEL_FACT_HEADING, _ordered(channel_facts)))
-    blocks.append(_render_section(WORKSPACE_FACT_HEADING, _ordered(workspace_facts)))
-
-    sections = ["\n".join(block) for block in blocks if block]
-    text = "\n\n".join(sections) if sections else None
+    fact_blocks = [
+        _render_section(CHANNEL_FACT_HEADING, _ordered(channel_facts)),
+        _render_section(WORKSPACE_FACT_HEADING, _ordered(workspace_facts)),
+    ]
+    fact_sections = ["\n".join(block) for block in fact_blocks if block]
     return ChannelSteeringSnapshot(
-        text=text,
+        developer_policy=("\n".join([POLICY_HEADING, policy_text]) if policy_text else None),
+        user_facts=("\n\n".join(fact_sections) if fact_sections else None),
         policy_hash=(hashlib.sha256(policy_text.encode("utf-8")).hexdigest()
                      if policy_text else None),
         policy_present=bool(policy_text),

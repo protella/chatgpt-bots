@@ -43,7 +43,6 @@ def _make_bot(cs):
     bot.message_handler = AsyncMock()
     bot.app = MagicMock()
     bot.app.client = MagicMock()
-    bot.channel_pulse = None  # skip pulse backfill in the dispatch path
     bot.db = MagicMock()
 
     async def _cs(channel_id):

@@ -153,7 +153,12 @@ ENABLE_FEEDBACK_BUTTONS = "false"                                     # the one 
 SLACK_NATIVE_STREAMING = "true"                                       # validated live in dev since 2026-07-09; kills the "(edited)" markers on streamed replies
 ENABLE_MENTION_PLACEMENT_MODEL = "true"                               # F46 thread-vs-channel judgment for plain-text mentions; code default is false
 ENABLE_EDIT_TRIGGERED_REPLIES = "true"                                # meaningful message edits go through the participation judgment; code default is false
+CHANNEL_PULSE_ENVELOPE_MAX = "50"                                     # dev runs 50 (matches Claude Tag's observed backfill); code default is 15
 ```
+> **Pending — single-stream redesign:** `Docs/SINGLE_STREAM_SPEC.md` (approved, in build)
+> retires the pulse ring/envelope and introduces new env keys (stream/coverage/claims/compaction;
+> dev-only `DEV_TURN_BARRIERS` must stay EMPTY in prod). Update this section from the spec's §11
+> config table when that work merges — until then the line above stands.
 The other ~84 new keys can be omitted — each has a working default (and every remaining feature
 defaults **on**, which is the posture we want), and `.env.example` documents each one inline if you
 prefer to pin them explicitly. Ambient memory (F51: quiet notes on links/images/files for later

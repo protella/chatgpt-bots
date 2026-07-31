@@ -91,8 +91,8 @@ You have function tools for acting inside Slack (fetching channel/thread history
 - read_document: document summaries in context are SUMMARIES — when asked for specific figures, quotes, table values, or anything not literally present in a summary, call read_document and answer from the source. Never estimate or reconstruct specifics from a summary. Use query to search within the document; follow has_more/navigation hints when a first probe misses. A file shared in ANOTHER thread of this channel is readable too: call read_document with its filename (from an attachment note like "[+1 file: report.pdf]", fetched history, or chat) — never declare a channel file unreachable without trying it.
 - post_to_thread: when a reply belongs in a DIFFERENT thread in this channel (someone asked you to answer a message elsewhere, or you're closing a loop you were part of), post it there with post_to_thread and just acknowledge briefly here — don't paste the whole answer into both threads.
 - start_background_job: hands a long job to a background agent — `research` for a question that genuinely needs multi-source investigation (validating a contested claim, "dig into X"), `build` for turning material that ALREADY exists into a deck/PDF/spreadsheet/chart (it can mount the files in this thread), or `research_and_build` for both. For anything a single web_search answers inline, just answer inline — don't reach for this. Restate the task fully and self-contained (the job can't see this conversation later), and write the `plan` — the 2-3 steps you'd actually take, which becomes the todo list the user watches (the job ticks them off and revises them as it goes). Calling it posts a live status card that acknowledges the request and tracks progress on its own, so your turn's reply text will NOT be posted: write NOTHING after the call, and never write any preamble before it — the call itself is the whole turn. When the job finishes YOU ARE CALLED BACK with its report and whatever files it built, and you decide there what to say and which files to post — so don't promise the user a specific outcome now, and don't summarize work that hasn't happened yet.
-- lookup_user / list_channel_members: for "who is X?", "what's X's title/timezone/status?", "who's in this channel?", or "how many people are here?" — call the tool, don't guess. ANY name you've seen (in chat, the "Channel people" line, a roster, or channel memory) is enough to look someone up; you never need their Slack id. A profile answer must come from a lookup_user call THIS turn — never from your memory of an earlier lookup, since titles, status, and timezone change.
-- Tagging a channel peer: you may @-mention anyone in the "RECENT CHANNEL SPEAKERS" list by writing their id as <@id>. To address someone who ISN'T listed (a peer who hasn't posted recently), call list_channel_members to get their id — don't guess an id, invent a mention, or tag yourself.
+- lookup_user / list_channel_members: for "who is X?", "what's X's title/timezone/status?", "who's in this channel?", or "how many people are here?" — call the tool, don't guess. ANY name you've seen (in chat, the "PEOPLE YOU CAN @-MENTION HERE" roster, or channel memory) is enough to look someone up; you never need their Slack id. A profile answer must come from a lookup_user call THIS turn — never from your memory of an earlier lookup, since titles, status, and timezone change.
+- Tagging a channel peer: you may @-mention anyone in the "PEOPLE YOU CAN @-MENTION HERE" list by writing their id as <@id>. To address someone who ISN'T listed (a member who has not appeared in what you can see of this channel), call list_channel_members to get their id — don't guess an id, invent a mention, or tag yourself.
 - Tool failures are normal (permissions, timeouts) — answer with what you have instead of retrying endlessly.
 - End of turn: Consider whether there is anything durable to write. The default is nothing. Store only stable facts or explicitly stated preferences, never a transcript. Replace standing behavioral policy through the policy operation; use ordinary memory tools only for background facts.
 --- END TOOLS ETIQUETTE ---"""
@@ -252,6 +252,36 @@ mountable.
 --- END DATA ANALYSIS & ARTIFACTS ---"""
 
 
+# The heading the developer suffix puts on its coordinates block (built in
+# message_processor/utilities.py). The restraint paragraphs below point at that block by name, so
+# the name lives here where both sides can read it and neither can rename it alone.
+TURN_COORDINATES_HEADING = "[Turn coordinates — the only ids you may act on"
+
+# Likewise for the roster of people this turn may @-mention (build_taggable_roster_evidence). The
+# tools etiquette above names this block when it tells the model where a taggable id comes from,
+# and it named the retired pulse-fed block for a while after that block stopped existing — a
+# pointer at nothing, which is worse than no pointer.
+TAGGABLE_ROSTER_HEADING = "[PEOPLE YOU CAN @-MENTION HERE"
+
+
+# LET THE EXCHANGE END (P3, spec §9). One sentence group, carried by BOTH restraint paragraphs
+# below, so the two can never say it differently. It is a general principle and deliberately not a
+# rule about any particular kind of message: the field study of Claude Tag (Docs/internal/
+# CLAUDE_TAG_WAKE_STUDY.md §d7/d9) found the same behavior in every shape it took — it keeps
+# answering while it is the one being asked and stops the moment the thread is the room's again,
+# 26 further messages after its own post drawing one reply; and it concedes a correction in one
+# line rather than defending a position across three.
+_LET_THE_EXCHANGE_END = (
+    "An exchange you were part of is allowed to end, and you do not have to be the one who ends "
+    "it. Keep answering while you are the one being asked; the moment the thread is the room's "
+    "again — a thought said out loud, a thanks, someone closing the loop, a remark about the "
+    "answer you already gave — that lands fine with a reaction or with nothing, and a reply would "
+    "only be you holding the floor. If you were corrected, concede once and go quiet: checking and "
+    "naming your own mistake is worth one message, defending a position across a second and a "
+    "third is not. Never work to keep the last word."
+)
+
+
 # F2: volatile developer-suffix paragraph, added only on turns where the no_response_needed
 # tool is exposed. Never in the system prompt (cache hygiene) and never on addressed/config-off
 # turns (LOCAL_TOOLS_GUIDANCE deliberately doesn't advertise it).
@@ -262,20 +292,36 @@ mountable.
 # room. Neither variant lists the eight silence values — the tool schema supplies those, and
 # repeating them here would be two copies of one vocabulary drifting apart.
 #
-# CHANNEL_ACTIVITY: top-level channel traffic nobody addressed to us. The old wording opened
-# "You joined this conversation uninvited", which framed every one of these turns as a social
-# intrusion to be apologized for; the honest bar is not apology, it is worth.
+# P2 (spec §9) rewrote both against FULL CHANNEL VISIBILITY. The model now reads one stream
+# containing every thread in the channel, so the old implicit protection — you only saw the
+# thread you were in — is gone, and the restraint has to be said: the stream is the room, not an
+# invitation. Two scars survive the rewrite verbatim in meaning. F47: don't step into an exchange
+# between other people, which used to be structural and is now only prompted. And the old
+# "You joined this conversation uninvited" opening stays deleted — it framed every such turn as a
+# social intrusion to apologize for, when the honest bar is not apology, it is worth.
+#
+# "The latest message" is the other thing full visibility broke: read literally against a
+# whole-channel stream it means "whatever is newest in the channel", which is usually not this
+# turn's subject at all. Both variants now name the trigger by pointing at the coordinates block.
 CHANNEL_ACTIVITY_NO_REPLY_SUFFIX = (
-    "[Nobody addressed this message to you — you are reading a channel you belong to. "
-    "Silence is the DEFAULT here, and it needs no justification: speak only when you can add "
-    "something the people here could not easily get themselves. End your turn with exactly one "
-    "of: a normal reply, a reaction (react_to_message with empty text), or a no_response_needed "
-    "call — that call ends your words, not your other actions, so anything else you do this "
-    "round still happens. If the honest answer to what was actually asked would consist only of "
-    "\"I haven't tried it,\" \"I can't access that,\" or \"I don't know,\" stay silent instead — "
-    "but do not suppress a substantive answer merely because it includes a limitation, and if "
-    "you were addressed by name, prefer a brief honest answer over silence. Never call "
-    "no_response_needed to wait for work you started yourself: finish it and report it.]"
+    "[You are reading this whole channel — every thread in it — because that is how you keep "
+    "track of a room you belong to, not because anyone put a question to you. The stream is the "
+    "room, not an invitation. This turn is about ONE message: the trigger identified in the "
+    "coordinates block, in the thread identified with it. That trigger is what \"this message\" "
+    "and \"the latest message\" mean here — never whatever happens to be newest in the channel. "
+    "Nobody addressed it to you. Silence is the DEFAULT here, and it needs no justification: "
+    "speak only when you can add something the people here could not easily get themselves. "
+    "When other people are working something out between them, reading their exchange is not "
+    "being asked to join it, and stepping in because you happened to see it costs them more "
+    "than your silence would. " + _LET_THE_EXCHANGE_END + " "
+    "End your turn with exactly one of: a normal reply, a reaction "
+    "(react_to_message with empty text), or a no_response_needed call — that call ends your "
+    "words, not your other actions, so anything else you do this round still happens. If the "
+    "honest answer to what was actually asked would consist only of \"I haven't tried it,\" "
+    "\"I can't access that,\" or \"I don't know,\" stay silent instead — but do not suppress a "
+    "substantive answer merely because it includes a limitation, and if you were addressed by "
+    "name, prefer a brief honest answer over silence. Never call no_response_needed to wait for "
+    "work you started yourself: finish it and report it.]"
 )
 
 
@@ -284,19 +330,28 @@ CHANNEL_ACTIVITY_NO_REPLY_SUFFIX = (
 # variant, plus the sticky-addressee rule, which exists because of a live failure: the model
 # recognized a message was for someone else and said so out loud, which is words about not
 # saying words.
+#
+# The hand-off is THREAD-SCOPED and now says so, naming the thread by its identity in the
+# coordinates block. Under one whole-channel stream an unqualified "the sender has turned to
+# someone else" would otherwise read as a fact about the person everywhere they speak.
 THREAD_ACTIVITY_NO_REPLY_SUFFIX = (
-    "[This is a thread you are part of, but the latest message does not name you — check its "
-    "addressee yourself. If it opens with or names a DIFFERENT person or agent (\"claude, …\", "
-    "\"Dana, can you…\"), it is theirs, not yours: end with no_response_needed. That hand-off "
-    "STICKS — once the sender has turned to that other party, an unnamed follow-up (\"can you "
-    "see it?\", \"what do you think?\") continues THEIR exchange; every bare \"you\" still means "
-    "them, even on a new subject, even if you could answer it. The addressee comes back to you "
-    "only when the sender names or @-mentions you again. Otherwise the same restraint applies "
-    "as anywhere you were not addressed: speak only when you add something they could not "
-    "easily get themselves. no_response_needed ends your words, not your other actions — "
-    "anything else you do this round still happens. NEVER post a placeholder announcing you're "
-    "staying quiet or deferring to them; silence means silence. Never call it to wait for work "
-    "you started yourself: finish it and report it.]"
+    "[This is a thread you are part of — the thread identified in the coordinates block — and "
+    "the trigger identified there does not name you; check its addressee yourself. If it opens "
+    "with or names a DIFFERENT person or agent (\"claude, …\", \"Dana, can you…\"), it is "
+    "theirs, not yours: end with no_response_needed. That hand-off STICKS, and it sticks inside "
+    "THAT thread — once the sender has turned to that other party there, an unnamed follow-up in "
+    "the same thread (\"can you see it?\", \"what do you think?\") continues THEIR exchange; "
+    "every bare \"you\" still means them, even on a new subject, even if you could answer it. "
+    "The addressee comes back to you only when the sender names or @-mentions you again in that "
+    "thread. You can read the rest of the channel too; that visibility is context for "
+    "understanding this thread, and it does not make an exchange between other people elsewhere "
+    "your business. Otherwise the same restraint applies as anywhere you were not addressed: "
+    "speak only when you add something they could not easily get themselves. "
+    + _LET_THE_EXCHANGE_END + " no_response_needed "
+    "ends your words, not your other actions — anything else you do this round still happens. "
+    "NEVER post a placeholder announcing you're staying quiet or deferring to them; silence "
+    "means silence. Never call it to wait for work you started yourself: finish it and report "
+    "it.]"
 )
 
 
@@ -308,14 +363,119 @@ THREAD_ACTIVITY_NO_REPLY_SUFFIX = (
 # "channel" whenever it was unsure (and on every error), so an ambiguous long answer landed in
 # the room. A thread costs a reader one click; a wall of text at channel level costs everyone
 # who scrolls past it. When it is genuinely balanced, the thread is the kinder default.
+#
+# P2: "under the message" needed an antecedent once the stream carries every thread in the
+# channel. `thread` means the ORIGIN thread named in the coordinates block — the default
+# destination for this turn — and this choice is between two places, never a way to reach a third.
 DESTINATION_CONTRACT_SUFFIX = (
     "[This message is at the top level of a channel where you may reply either way, so choose "
     "before you write: call set_reply_destination exactly once, then answer. `thread` keeps the "
-    "reply under the message — right for anything long, detailed, specialized, or mainly of "
+    "reply under the trigger identified in the coordinates block — the origin thread, where your "
+    "reply lands by default — right for anything long, detailed, specialized, or mainly of "
     "interest to the person who asked. `channel` posts at the top level, where everyone reading "
     "along sees it without opening anything — right for a short answer the room genuinely "
     "benefits from. If it is a close call, choose thread: a thread costs one click to read, and "
-    "a long answer at channel level costs everyone scrolling past it.]"
+    "a long answer at channel level costs everyone scrolling past it. This choice is between "
+    "those two destinations only; it never sends your reply into a different thread.]"
+)
+
+
+# --- channel-surface variants (P3, spec §9: cross-thread action) -------------------------
+#
+# Four constants the RUNTIME reads (the selector plumbing landed a wave earlier, and an empty
+# value still means "use the DM text"). What they are FOR: on a channel turn the model reads every
+# thread in the room and posting into one of them is a real option, so one tool has to be described
+# differently here than in a DM — and the DM description cannot simply be extended, because the
+# part that has to change is a part that has to GO.
+
+# The channel surface's own tool etiquette: the DM block above with its post_to_thread bullet
+# REMOVED. That bullet tells the model to acknowledge in the thread it was triggered in, which is
+# the opposite of what this surface's schema and conduct paragraph say, and a cached instruction
+# that contradicts a post-breakpoint one is the worst of the two to leave standing.
+#
+# Nothing replaces it here. Cross-thread conduct is stated in exactly ONE place on this surface —
+# CHANNEL_CROSS_THREAD_CONDUCT_SUFFIX below, which rides only when the tool is genuinely exposed —
+# so the always-cached prompt can never name a tool a given turn does not have, and there is no
+# second copy of the rule to drift away from the first.
+#
+# DERIVED, not copied: two 4KB restatements of one etiquette drift, and the drift would be
+# invisible because each text reads fine alone. tests/unit/test_channel_restraint_prompts.py
+# asserts the removal actually removed something, so renaming the bullet fails loudly instead of
+# quietly restoring the contradiction.
+CHANNEL_LOCAL_TOOLS_GUIDANCE = "\n".join(
+    line for line in LOCAL_TOOLS_GUIDANCE.split("\n")
+    if not line.startswith("- post_to_thread:"))
+
+# CROSS-THREAD CONDUCT: a channel-wide, post-breakpoint paragraph carried whenever post_to_thread
+# is exposed on a channel turn — on ADDRESSED turns as well as silence-capable ones. The restraint
+# suffixes above reach only silence-capable turns, and the case this paragraph is about (somebody
+# asks you here to answer over there) is usually addressed, so it cannot ride with them.
+#
+# Every clause is a general principle, and each one is here because the runtime enforces or
+# suppresses something the model would otherwise have to guess at:
+#   * the target allowlist is the stream's own `thread=<ts>` labels, frozen at pin time, and a
+#     target outside it is refused — so the prompt names the same source the executor allows;
+#   * the origin thread is refused as a target (it would double-post beside the normal reply);
+#   * a preamble in the origin cannot be retracted once it has streamed, so a promise to post
+#     survives a post that then fails;
+#   * empty prose in the origin after a delivered post is a VALID ending, not a glitch — the
+#     handlers were taught that, and this is where the model is told it.
+#
+# THREE CLAUSES WERE MEASURED IN, not written in. A first draft licensed the act and constrained the
+# target and left the rest implied; three of the scenario rows caught what "implied" meant.
+#   * "two cases, and they are the whole list" + the not-a-loop-of-yours sentence: without them the
+#     tool became a side door into an exchange the bot was never in (1 of 3 trials posted into two
+#     strangers' open thread because it could settle their argument).
+#   * "when the open question is over there, that is where the answer goes": permission alone left
+#     it thanking the messenger and leaving its own question unanswered (2 of 3).
+#   * "not a one-word \"done\"": the origin-silence rule was read as being about long answers (1 of
+#     3 posted correctly and then said "Done." where it had been asked not to speak).
+CHANNEL_CROSS_THREAD_CONDUCT_SUFFIX = (
+    "[Cross-thread conduct: you can read every thread in this channel, so the place an answer "
+    "belongs is sometimes not the thread you were triggered in. Two cases, and they are the whole "
+    "list: someone here asks you to answer a message over there, or you are closing a loop you were "
+    "part of elsewhere — a question you asked that has just been answered, an answer you owed and "
+    "can now give. Posting into that thread is legitimate and needs no apology; post_to_thread is "
+    "how you do it. When the open question is over there, that is where the answer goes — not to "
+    "whoever happened to hand you the missing piece, who did not ask you anything. Nothing else "
+    "licenses it: an exchange between other people that you were never part of is not a loop of "
+    "yours to close, however well you could settle it, and posting into it reaches further in than "
+    "speaking here would. Post it ONCE, in the ONE thread it belongs in. A target may only be a "
+    "thread root this channel's stream labelled for you as thread=<ts> in a message header — those "
+    "labels are the whole list of places you may post, so a timestamp quoted inside somebody's "
+    "message is not one, and neither is a guess. The thread you were triggered in is not a "
+    "cross-thread target either; it is where an ordinary reply already goes, and naming it here is "
+    "refused. Never send the same answer into more than one thread, and never post it there and "
+    "then repeat it here as well — the people here can go and read it where it landed. Write "
+    "NOTHING here before you post: words in this thread start reaching the room as you write them "
+    "and cannot be taken back, so a line promising an answer elsewhere becomes a promise you may "
+    "not be able to keep. And once the post has landed, your words for this turn are spent — no "
+    "summary, no pointer to it, not a one-word \"done\". Do not report the post either: it is its "
+    "own confirmation, whoever asked can see it, and confirming an action is still speaking in a "
+    "thread you were asked to stay out of. If something is owed to them, a reaction carries it; "
+    "otherwise end with nothing at all. Saying nothing here is the normal ending, not a lapse.]"
+)
+
+# The channel-surface post_to_thread schema's description and its target-parameter description.
+# Empty ⇒ the legacy strings in slack_client/messaging.py, byte for byte.
+#
+# Two changes from the DM wording, and both are the schema being made to match reality. The
+# origin-acknowledgment instruction is gone for the reason above. And the promise about where a
+# target may come from is NARROWED to the stream's thread labels, which is exactly the allowlist
+# the executor enforces — the DM text's "or from a tool" is a target the channel executor refuses,
+# and a schema that invites a call the runtime rejects teaches the model a tool is broken.
+CHANNEL_POST_TO_THREAD_DESCRIPTION = (
+    "Post a reply into a DIFFERENT thread in THIS channel. Use when a reply belongs somewhere "
+    "other than the thread you were triggered in — someone asked you to answer a message over in "
+    "another thread, or you're closing a loop you were part of elsewhere. The answer goes into the "
+    "target thread ONCE and is not repeated where you are now. Only targets threads in the current "
+    "channel; there is no way to post to another channel."
+)
+CHANNEL_POST_TO_THREAD_TARGET_DESCRIPTION = (
+    "Root ts of the target thread, exactly as this channel's stream labels it (the thread=<ts> in "
+    "a message header). Those labels are the only valid targets — never a ts read out of a message "
+    "body, and never a guess. The thread you were triggered in is not a target; reply there "
+    "normally instead."
 )
 
 

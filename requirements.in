@@ -6,6 +6,7 @@ slack_sdk>=3.43.0  # imported directly (WebClient, SlackApiError); do not rely o
 Pillow>=11.0.0
 croniter>=6.0.0
 pytz>=2024.1
+tiktoken>=0.13.0  # Channel admission estimate counts real o200k tokens; degrades to a byte ratio if the vocab can't load
 
 # Logging dependencies
 concurrent-log-handler>=0.9.28

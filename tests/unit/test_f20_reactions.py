@@ -2,9 +2,8 @@
 
 Covers what remains of the five design points: the main model's react etiquette
 (LOCAL_TOOLS_GUIDANCE), unrestricted standard-emoji judgment at the two enforcement points that
-still exist (schema enum, executor) with the optional REACTION_EMOJIS allowlist still honored, tool
-registration, and the pulse-ring social-proof signal (reaction_added/removed accumulation +
-envelope summary rendering).
+still exist (schema enum, executor) with the optional REACTION_EMOJIS allowlist still honored, and
+tool registration.
 
 TWO OF THE FOUR ENFORCEMENT POINTS ARE GONE, along with the prompt they served. The gate used to
 CHOOSE the emoji and place it — hence a react verdict, `validate_verdict`'s emoji coercion, and a
@@ -17,17 +16,19 @@ The F20/F24 prompt tests went with PARTICIPATION_SYSTEM_PROMPT. Their content �
 lower bar than words, ownership still governs, prefer an emoji when it fully carries the reply, do
 not strain for a joke — was guidance for CHOOSING an emoji, which the responder's own prompt and
 tool guidance now own; the surviving assertions are on LOCAL_TOOLS_GUIDANCE below.
+
+The pulse-ring social-proof signal (reaction accumulation, envelope rendering, the workspace
+emoji tally, and the bot's own-reaction bookkeeping) is gone with ChannelPulse itself (retired
+2026-07-27) — reactions are no longer remembered in memory at all, so there is nothing left here
+to test.
 """
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from config import config, valid_emoji_name
 from tool_registry import ToolContext
-from slack_client.channel_pulse import ChannelPulse
 from slack_client.messaging import SlackMessagingMixin
-from slack_client.event_handlers import feedback as feedback_handlers
 from message_processor.participation import ParticipationEngine
 import prompts
 
@@ -81,6 +82,7 @@ def test_f24_local_tools_guidance_broadened():
 
 def _mixin_host():
     s = MagicMock()
+    s._react_tool_schema = SlackMessagingMixin._react_tool_schema.__get__(s)
     s.get_react_tool_schema = SlackMessagingMixin.get_react_tool_schema.__get__(s)
     return s
 
@@ -215,6 +217,8 @@ def test_gate_registers_react_with_empty_default(monkeypatch):
         "type": "function", "name": "post_to_thread", "parameters": {}}
     s.get_no_reply_tool_schema.return_value = {
         "type": "function", "name": "no_response_needed", "parameters": {}}
+    s.get_emoji_search_tool_schema.return_value = {
+        "type": "function", "name": "search_workspace_emoji", "parameters": {}}
     registry = SlackBot._build_tool_registry(s)
     assert "react_to_message" in {t["name"] for t in registry.schemas()}
 
@@ -241,125 +245,3 @@ def test_the_gate_prompt_renders_neither_a_palette_nor_an_allowlist(monkeypatch,
         SourceMessage(ts="1.0", text="hi", sender_name="Peter", sender_type="human"),
         index=0, total=1)
     assert "emoji" not in block.lower()
-
-
-# --------------------------------------------------------------- point 3: pulse social proof
-
-def _entry(ts, text="hello", thread_ts=None, name="Alice", sender="human"):
-    return dict(ts=ts, thread_ts=thread_ts, user_id="U1", display_name=name,
-                sender_type=sender, text=text, is_bot=sender != "human")
-
-
-def test_pulse_accumulates_and_decrements_keyed_by_ts():
-    p = ChannelPulse(size=5)
-    p.add_reaction("C1", "1.0", "joy")
-    p.add_reaction("C1", "1.0", "joy")
-    p.add_reaction("C1", "1.0", "fire")
-    p.add_reaction("C1", "2.0", "tada")
-    assert p.render_reactions("C1", "1.0") == "[reactions: 2× joy, 1× fire]"
-    assert p.render_reactions("C1", "2.0") == "[reactions: 1× tada]"
-    # decrement on removed, keyed by ts
-    p.remove_reaction("C1", "1.0", "fire")
-    assert p.render_reactions("C1", "1.0") == "[reactions: 2× joy]"
-    p.remove_reaction("C1", "1.0", "joy")
-    p.remove_reaction("C1", "1.0", "joy")
-    assert p.render_reactions("C1", "1.0") == ""  # pruned when empty
-
-
-def test_pulse_reactions_dm_excluded_and_colon_stripped():
-    p = ChannelPulse(size=5)
-    p.add_reaction("D1", "1.0", "joy")  # DM excluded
-    assert p.render_reactions("D1", "1.0") == ""
-    p.add_reaction("C1", "1.0", ":thumbsup::skin-tone-2:")  # folded to base
-    assert p.render_reactions("C1", "1.0") == "[reactions: 1× thumbsup]"
-
-
-def test_pulse_render_top2_deterministic():
-    p = ChannelPulse(size=5)
-    # insertion order shouldn't affect output (sorted by count desc then name)
-    for e in ["b", "b", "b", "a", "a", "a", "c"]:
-        p.add_reaction("C1", "1.0", e)
-    first = p.render_reactions("C1", "1.0")
-    assert first == "[reactions: 3× a, 3× b]"  # tie broken by name; top 2 only
-    p2 = ChannelPulse(size=5)
-    for e in ["c", "a", "b", "a", "b", "a", "b"]:
-        p2.add_reaction("C1", "1.0", e)
-    assert p2.render_reactions("C1", "1.0") == "[reactions: 3× a, 3× b]"
-
-
-def test_envelope_appends_reaction_summary_and_omits_when_none():
-    p = ChannelPulse(size=5)
-    p.record("C1", **_entry("1.0", text="landed a big win"))
-    p.record("C1", **_entry("2.0", text="quiet message"))
-    p.add_reaction("C1", "1.0", "tada")
-    p.add_reaction("C1", "1.0", "tada")
-    env = p.render_envelope("C1")
-    assert "landed a big win [reactions: 2× tada]" in env
-    assert "quiet message" in env and "quiet message [reactions" not in env
-
-
-# ------------------------------------------------------- point 3: own-message feedback intact
-
-class _Host:
-    def __init__(self, pulse):
-        self.channel_pulse = pulse
-        self.bot_user_id = "UBOT"
-        self.db = SimpleNamespace(record_response_feedback_async=AsyncMock())
-
-    def log_debug(self, *a, **k):
-        pass
-
-
-def _reaction_event(reaction="tada", item_user="UBOT", user="U1", channel="C1", ts="9.9"):
-    return {"type": "reaction_added", "reaction": reaction, "user": user,
-            "item_user": item_user, "item": {"type": "message", "channel": channel, "ts": ts}}
-
-
-@pytest.mark.asyncio
-async def test_own_message_reaction_still_reaches_feedback_sink():
-    # F20 pulse update is additive; the feedback path for the bot's OWN messages is intact.
-    p = ChannelPulse(size=5)
-    host = _Host(p)
-    event = _reaction_event(reaction="+1", item_user="UBOT")  # +1 maps to a feedback signal
-    await feedback_handlers.ingest_reaction(host, event)
-    host.db.record_response_feedback_async.assert_awaited_once()
-    # and the additive pulse update records the same reaction in-memory
-    feedback_handlers.note_reaction_pulse(host, event, added=True)
-    assert p.render_reactions("C1", "9.9") == "[reactions: 1× +1]"
-
-
-def test_note_reaction_pulse_removed_decrements():
-    p = ChannelPulse(size=5)
-    host = _Host(p)
-    ev = _reaction_event(reaction="joy", ts="9.9")
-    feedback_handlers.note_reaction_pulse(host, ev, added=True)
-    assert p.render_reactions("C1", "9.9") == "[reactions: 1× joy]"
-    feedback_handlers.note_reaction_pulse(host, ev, added=False)
-    assert p.render_reactions("C1", "9.9") == ""
-
-
-# --- the workspace popularity tally is gone (2026-07-27) ---
-
-def test_no_workspace_emoji_tally_survives():
-    """DELETED, and the deletion is the contract.
-
-    Two tests here defended a workspace-wide emoji-popularity tally against learning from the bot
-    itself (`from_self`) and against re-counting history on every restart (`from_history`). The
-    tally existed for ONE consumer: the ranked custom-emoji shortlist rendered into the old rich
-    gate prompt. The binary gate reads no shortlist, so the tally, its persistence, and the two
-    flags that protected it all went with it — there is nothing left to bias.
-
-    What survives is per-message social proof, which was always a different thing: it is a fact
-    about a specific message, where the bot's own reaction genuinely IS on screen and belongs in
-    the count. Asserted at the signature, so re-adding the tally cannot pass quietly."""
-    import inspect
-
-    from slack_client.channel_pulse import ChannelPulse
-    for gone in ("top_custom_reactions", "reaction_vocab_snapshot", "hydrate_reaction_vocab"):
-        assert not hasattr(ChannelPulse, gone)
-    params = inspect.signature(ChannelPulse.add_reaction).parameters
-    assert "from_self" not in params and "from_history" not in params
-
-    pulse = ChannelPulse(size=10)
-    pulse.add_reaction("C1", "1.0", "dumpster-fire")
-    assert "dumpster-fire" in pulse.render_reactions("C1", "1.0")

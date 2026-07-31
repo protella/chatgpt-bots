@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from typing import Any, Callable, Dict, List, Optional
 
 from config import config, clamp_effort
@@ -9,6 +10,36 @@ from openai_client.container_errors import (demote_container_tools, is_container
                                             persistent_container_ids)
 from prompts import (MEMORY_EXTRACTION_SYSTEM_PROMPT, TOOL_RESULT_SUMMARIZE_PROMPT,
                      WAKE_CLASSIFIER_SYSTEM_PROMPT)
+
+
+_SUPPRESSED_CLASS: Any = None
+
+
+def _is_suppression(error: BaseException) -> bool:
+    """Is this the stale-send guard refusing a surface?
+
+    Resolved lazily and by predicate rather than caught by name: importing
+    `message_processor.stale_send_guard` at module scope pulls in the `message_processor` package,
+    whose `__init__` imports back into `openai_client` — the same cycle `tool_registry` sidesteps
+    the same way. A failure to resolve the class answers False, which keeps today's swallow.
+    """
+    global _SUPPRESSED_CLASS
+    if _SUPPRESSED_CLASS is None:
+        try:
+            from message_processor.stale_send_guard import StaleSendSuppressed
+
+            _SUPPRESSED_CLASS = StaleSendSuppressed
+        except Exception:  # noqa: BLE001
+            return False
+    return isinstance(error, _SUPPRESSED_CLASS)
+
+
+def _build(**kwargs) -> Dict[str, Any]:
+    """The one request assembler, imported function-locally: openai_client.base imports THIS
+    module, so a module-level import back into it is a cycle."""
+    from openai_client.base import _build_request_params
+
+    return _build_request_params(**kwargs)
 
 
 def _segment_separator(text_so_far: str) -> str:
@@ -45,15 +76,110 @@ def _join_output_text(response) -> str:
     return text
 
 
-def _capture_usage(usage_sink, response):
-    """Copy response.usage into the caller's sink (usage-driven context budgeting)."""
-    if usage_sink is None or response is None:
-        return
+def _capture_usage(usage_sink, response) -> Dict[str, Any]:
+    """Copy response.usage into the caller's sink (usage-driven context budgeting), and hand the
+    same numbers back so telemetry can read them without a second sink.
+
+    `cached_input_tokens` is written ONLY when the provider actually sent `input_tokens_details`.
+    An absent key and a zero are different facts — one says the cache reported nothing, the other
+    says it reported a miss — and the sink is compared by exact equality elsewhere.
+    """
+    captured: Dict[str, Any] = {}
+    if response is None:
+        return captured
     usage = getattr(response, "usage", None)
     if not usage:
+        return captured
+    captured["input_tokens"] = getattr(usage, "input_tokens", 0) or 0
+    captured["output_tokens"] = getattr(usage, "output_tokens", 0) or 0
+    details = getattr(usage, "input_tokens_details", None)
+    if details is not None:
+        cached = (details.get("cached_tokens") if isinstance(details, dict)
+                  else getattr(details, "cached_tokens", None))
+        captured["cached_input_tokens"] = cached or 0
+    if usage_sink is not None:
+        usage_sink.update(captured)
+    return captured
+
+
+# --------------------------------------------------------- v8 `model_response` telemetry (CV8)
+#
+# The carrier is threaded alongside `usage_sink`: the layer that knows a request happened is the
+# only one that can count them, and it must not have to know what a turn is. `attempt_sink=None`
+# — every DM, and every direct caller — is a total no-op, so no request state changes.
+#
+# Written on the attempt object rather than tracked per call site: a path may close on its
+# success line AND from its `finally`, and one API call must never produce two ledger rows.
+_ATTEMPT_CLOSED = "_pt_model_attempt_written"
+
+
+# The one fork this layer names for itself. Every other `fork_reason` describes why a HANDLER
+# re-entered and is fixed for the whole entry, so the sink carries it; a container that died
+# mid-turn is discovered here, inside a single handler entry, and is invisible from above.
+# `code_interpreter` container scope is one of the four documented cache-fork exceptions
+# (spec §3a), and this is the attempt that pays for it.
+FORK_CONTAINER_RECOVERY = "container_recovery"
+
+
+def _open_attempt(attempt_sink, request_params: Dict[str, Any], attempts: List[Any],
+                  fork_reason: Optional[str] = None) -> None:
+    """Open a telemetry attempt for the request about to be sent, and stage it as the live one.
+
+    The model named is the one in the REQUEST, not the caller's argument — that may be None, and
+    the row has to say what was actually asked. `attempts` is this wrapper's call log: a container
+    retry appends a second entry, because it is a second request.
+
+    `fork_reason` OVERRIDES the sink's entry-wide reason for this one attempt. Written onto the
+    attempt rather than passed to the sink so nothing about the shared vocabulary or the sink's
+    contract changes: the row is emitted from the attempt's own field.
+    """
+    if attempt_sink is None:
         return
-    usage_sink["input_tokens"] = getattr(usage, "input_tokens", 0) or 0
-    usage_sink["output_tokens"] = getattr(usage, "output_tokens", 0) or 0
+    try:
+        attempt = attempt_sink.open((request_params or {}).get("model"))
+        if attempt is not None and fork_reason:
+            attempt.fork_reason = fork_reason
+        attempts.append(attempt)
+    except Exception:  # noqa: BLE001 — telemetry must never cost a request
+        pass
+
+
+def _close_attempt(attempt_sink, attempts: List[Any], *, status: str,
+                   usage: Optional[Dict[str, Any]] = None, detail: Any = None) -> None:
+    """Write the live attempt's `model_response` line, exactly once."""
+    if attempt_sink is None or not attempts:
+        return
+    attempt = attempts[-1]
+    if attempt is None:
+        return
+    try:
+        if getattr(attempt, _ATTEMPT_CLOSED, False):
+            return
+        setattr(attempt, _ATTEMPT_CLOSED, True)
+        numbers = usage or {}
+        attempt_sink.close(
+            attempt, status=status, detail=detail,
+            input_tokens=numbers.get("input_tokens"),
+            output_tokens=numbers.get("output_tokens"),
+            cached_input_tokens=numbers.get("cached_input_tokens"))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _close_attempt_error(attempt_sink, attempts: List[Any],
+                         usage: Optional[Dict[str, Any]] = None) -> None:
+    """The `finally` twin: close the live attempt as the exception in flight.
+
+    A `finally` rather than a clause per `except` so a CancelledError is recorded too, and so the
+    careful terminal-state and container-recovery handling above it is not restructured. Reads the
+    propagating exception instead of being handed one, and no-ops when nothing is propagating —
+    a normal return has already written its own line.
+    """
+    exc = sys.exc_info()[1]
+    if exc is None:
+        return
+    _close_attempt(attempt_sink, attempts, status="error", usage=usage,
+                   detail=type(exc).__name__)
 
 
 def _incomplete_reason(response) -> str:
@@ -85,6 +211,8 @@ def _stream_failure_error(response) -> Exception:
 async def _create_with_container_recovery(self, request_params: Dict[str, Any],
                                          operation_type: str,
                                          container_gone_sink: Optional[List[str]] = None,
+                                         attempt_sink: Optional[Any] = None,
+                                         attempts: Optional[List[Any]] = None,
                                          **safe_call_kwargs):
     """`responses.create`, surviving a container that died since we verified it.
 
@@ -97,8 +225,17 @@ async def _create_with_container_recovery(self, request_params: Dict[str, Any],
     container) and retry the SAME call once. Local tools already executed this turn are not
     replayed: only this one API call repeats. The dead id lands in `container_gone_sink` so the
     caller can drop its DB binding.
+
+    THE DEMOTED RETRY IS A SECOND ATTEMPT in the ledger, because it is a second request: the
+    first is closed as the error it was, and the second is opened here and left live for the
+    caller to close with its usage. Folding the two into one row would report a turn as costing
+    one call when it cost two, which is exactly the accounting this event exists for. The second
+    attempt names `container_recovery` as its own fork: inheriting the entry's reason left the one
+    attempt that exists BECAUSE the container died indistinguishable from the one that lost it.
     """
+    attempt_log = attempts if attempts is not None else []
     try:
+        _open_attempt(attempt_sink, request_params, attempt_log)
         return await self._safe_api_call(
             self.client.responses.create, operation_type=operation_type,
             **safe_call_kwargs, **request_params)
@@ -118,6 +255,9 @@ async def _create_with_container_recovery(self, request_params: Dict[str, Any],
             f"Container {dead} died mid-turn — retrying this call with an ephemeral sandbox")
 
         retry_params = {**request_params, "tools": demoted}
+        _close_attempt(attempt_sink, attempt_log, status="error", detail=type(e).__name__)
+        _open_attempt(attempt_sink, retry_params, attempt_log,
+                      fork_reason=FORK_CONTAINER_RECOVERY)
         return await self._safe_api_call(
             self.client.responses.create, operation_type=operation_type,
             **safe_call_kwargs, **retry_params)
@@ -206,7 +346,10 @@ async def create_text_response(
     verbosity: Optional[str] = None,
     store: bool = False,  # Don't store by default for stateless operation
     prompt_cache_key: Optional[str] = None,
+    prompt_cache_options: Optional[Dict[str, Any]] = None,
     usage_sink: Optional[Dict[str, Any]] = None,
+    attempt_sink: Optional[Any] = None,
+    layout: str = "legacy",
 ) -> str:
     """
     Create a text response using the Responses API
@@ -227,83 +370,53 @@ async def create_text_response(
     """
     model = model or config.gpt_model
     temperature = temperature if temperature is not None else config.default_temperature
-    max_tokens = max_tokens or config.default_max_tokens
-    top_p = top_p if top_p is not None else config.default_top_p
-    
-    # Build input for Responses API
-    input_messages = []
-    
-    # Add system prompt if provided
-    if system_prompt:
-        input_messages.append({
-            "role": "developer",
-            "content": system_prompt
-        })
-    
-    # Add conversation messages (filter out metadata - Responses API rejects unknown fields)
-    for msg in messages:
-        # Only include role and content for API
-        api_msg = {"role": msg["role"], "content": msg["content"]}
-        input_messages.append(api_msg)
-    
-    # Build request parameters
-    request_params = {
-        "model": model,
-        "input": input_messages,
-        "temperature": temperature,
-        "max_output_tokens": max_tokens,
-        "store": store,
-    }
-    
-    # Model-specific parameters — all supported models are GPT-5-series reasoning
-    # models (gpt-5.5 primary, gpt-5-mini utility)
-    # Clamp guards against stored/legacy efforts the model rejects (e.g. `minimal`
-    # on 5.6, `max` on 5.5)
-    reasoning_effort = clamp_effort(model, reasoning_effort or config.default_reasoning_effort)
-    request_params["reasoning"] = {"effort": reasoning_effort}
-    verbosity = verbosity or config.default_verbosity
-    request_params["text"] = {"verbosity": verbosity}
 
-    # gpt-5.5 and the 5.6 family allow temperature/top_p when reasoning=none
-    # (5.6 verified live 2026-07-09: effort=none + temperature/top_p -> 200)
-    if (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")) and reasoning_effort == "none":
-        request_params["top_p"] = top_p
-    else:
-        request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
-
-    # Prompt caching: gpt-5.5 keeps the explicit 24h retention param; the 5.6 family
-    # uses implicit caching (verified live 2026-07-09: second identical call returned
-    # cached_tokens>0 with NO cache params; prompt_cache_retention is deprecated on 5.6).
-    # The per-thread cache key still helps route repeat calls to the same cache shard.
-    if model.startswith("gpt-5.5"):
-        request_params["prompt_cache_retention"] = "24h"
-    if prompt_cache_key and (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")):
-        request_params["prompt_cache_key"] = prompt_cache_key
+    request_params = _build(
+        model=model,
+        input_items=messages,
+        system_prompt=system_prompt,
+        max_output_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        verbosity=verbosity,
+        temperature=temperature,
+        top_p=top_p,
+        store=store,
+        prompt_cache_key=prompt_cache_key,
+        prompt_cache_options=prompt_cache_options,
+        layout=layout,
+        legacy_kind="plain",
+    )
 
     self.log_debug(f"Creating text response with model {model}, temp {temperature}")
 
+    attempts: List[Any] = []
+    usage_captured: Dict[str, Any] = {}
     try:
         # Determine operation type based on reasoning effort and context
         # All text operations use the same timeout regardless of reasoning level
         operation_type = "text_normal"
 
         # API call with enforced timeout wrapper
+        _open_attempt(attempt_sink, request_params, attempts)
         response = await self._safe_api_call(
             self.client.responses.create,
             operation_type=operation_type,
             **request_params
         )
-        
-        _capture_usage(usage_sink, response)
+
+        usage_captured = _capture_usage(usage_sink, response)
+        _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
 
         output_text = _join_output_text(response)
 
         self.log_info(f"Generated response: {len(output_text)} chars")
         return output_text
-        
+
     except Exception as e:
         self.log_error(f"Error creating text response: {e}", exc_info=True)
         raise
+    finally:
+        _close_attempt_error(attempt_sink, attempts, usage_captured)
 
 async def create_text_response_with_tools(
     self,
@@ -321,11 +434,14 @@ async def create_text_response_with_tools(
     function_call_sink: Optional[List[Dict[str, Any]]] = None,
     tool_choice: Optional[str] = None,
     prompt_cache_key: Optional[str] = None,
+    prompt_cache_options: Optional[Dict[str, Any]] = None,
     usage_sink: Optional[Dict[str, Any]] = None,
+    attempt_sink: Optional[Any] = None,
     mcp_tools_sink: Optional[Dict[str, Any]] = None,
     mcp_results_sink: Optional[List[Dict[str, Any]]] = None,
     artifacts_sink: Optional[List[Dict[str, Any]]] = None,
-    container_gone_sink: Optional[List[str]] = None
+    container_gone_sink: Optional[List[str]] = None,
+    layout: str = "legacy"
 ) -> str:
     """
     Create text response with tools (e.g., web search)
@@ -349,59 +465,32 @@ async def create_text_response_with_tools(
         Generated text response
     """
     model = model or config.gpt_model
-    temperature = temperature if temperature is not None else config.default_temperature
-    max_tokens = max_tokens or config.default_max_tokens
-    top_p = top_p if top_p is not None else config.default_top_p
 
-    # Build request parameters. Raw Responses-API items (function_call /
-    # function_call_output from the tool loop) carry a "type" and pass through as-is.
-    request_params = {
-        "model": model,
-        "input": [msg if "type" in msg else {"role": msg["role"], "content": msg["content"]}
-                  for msg in messages],
-        "tools": tools,
-        "temperature": temperature,
-        "max_output_tokens": max_tokens,
-        "store": store,
-    }
-    if tool_choice is not None:
-        request_params["tool_choice"] = tool_choice
-    if function_call_sink is not None:
+    request_params = _build(
+        model=model,
+        input_items=messages,
+        system_prompt=system_prompt,
+        max_output_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        verbosity=verbosity,
+        temperature=temperature,
+        top_p=top_p,
+        store=store,
+        tools=tools,
+        tool_choice=tool_choice,
         # Stateless tool loop: reasoning items must round-trip between rounds, which
         # requires their encrypted content when store=False
-        request_params["include"] = ["reasoning.encrypted_content"]
-
-    # Add system prompt if provided
-    if system_prompt:
-        request_params["instructions"] = system_prompt
-    
-    # Model-specific parameters — all supported models are GPT-5-series reasoning
-    # models (gpt-5.5 primary, gpt-5-mini utility)
-    # Clamp guards against stored/legacy efforts the model rejects (e.g. `minimal`
-    # on 5.6, `max` on 5.5)
-    reasoning_effort = clamp_effort(model, reasoning_effort or config.default_reasoning_effort)
-    request_params["reasoning"] = {"effort": reasoning_effort}
-    verbosity = verbosity or config.default_verbosity
-    request_params["text"] = {"verbosity": verbosity}
-
-    # gpt-5.5 and the 5.6 family allow temperature/top_p when reasoning=none
-    # (5.6 verified live 2026-07-09: effort=none + temperature/top_p -> 200)
-    if (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")) and reasoning_effort == "none":
-        request_params["top_p"] = top_p
-    else:
-        request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
-
-    # Prompt caching: gpt-5.5 keeps the explicit 24h retention param; the 5.6 family
-    # uses implicit caching (verified live 2026-07-09: second identical call returned
-    # cached_tokens>0 with NO cache params; prompt_cache_retention is deprecated on 5.6).
-    # The per-thread cache key still helps route repeat calls to the same cache shard.
-    if model.startswith("gpt-5.5"):
-        request_params["prompt_cache_retention"] = "24h"
-    if prompt_cache_key and (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")):
-        request_params["prompt_cache_key"] = prompt_cache_key
+        include=["reasoning.encrypted_content"] if function_call_sink is not None else None,
+        prompt_cache_key=prompt_cache_key,
+        prompt_cache_options=prompt_cache_options,
+        layout=layout,
+        legacy_kind="tools",
+    )
 
     self.log_debug(f"Creating text response with tools using model {model}, tools: {tools}")
 
+    attempts: List[Any] = []
+    usage_captured: Dict[str, Any] = {}
     try:
         # Determine operation type based on reasoning effort and context
         # All text operations use the same timeout regardless of reasoning level
@@ -411,9 +500,11 @@ async def create_text_response_with_tools(
         response = await _create_with_container_recovery(
             self, request_params, operation_type,
             container_gone_sink=container_gone_sink,
+            attempt_sink=attempt_sink, attempts=attempts,
         )
 
-        _capture_usage(usage_sink, response)
+        usage_captured = _capture_usage(usage_sink, response)
+        _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
 
         # Text first (seams and all — see _join_output_text); the loop below is tool bookkeeping.
         output_text = _join_output_text(response)
@@ -477,10 +568,12 @@ async def create_text_response_with_tools(
         if return_metadata:
             return {"text": output_text, "tools_used": tools_actually_used}
         return output_text
-        
+
     except Exception as e:
         self.log_error(f"Error creating response with tools: {e}", exc_info=True)
         raise
+    finally:
+        _close_attempt_error(attempt_sink, attempts, usage_captured)
 
 async def create_streaming_response(
     self,
@@ -496,7 +589,10 @@ async def create_streaming_response(
     store: bool = False,
     tool_callback: Optional[Callable[[str, str], Any]] = None,
     prompt_cache_key: Optional[str] = None,
+    prompt_cache_options: Optional[Dict[str, Any]] = None,
     usage_sink: Optional[Dict[str, Any]] = None,
+    attempt_sink: Optional[Any] = None,
+    layout: str = "legacy",
 ) -> str:
     """
     Create a streaming text response using the Responses API
@@ -519,67 +615,34 @@ async def create_streaming_response(
     """
     model = model or config.gpt_model
     temperature = temperature if temperature is not None else config.default_temperature
-    max_tokens = max_tokens or config.default_max_tokens
-    top_p = top_p if top_p is not None else config.default_top_p
-    
-    # Build input for Responses API
-    input_messages = []
-    
-    # Add system prompt if provided
-    if system_prompt:
-        input_messages.append({
-            "role": "developer",
-            "content": system_prompt
-        })
-    
-    # Add conversation messages (filter out metadata - Responses API rejects unknown fields)
-    for msg in messages:
-        # Only include role and content for API
-        api_msg = {"role": msg["role"], "content": msg["content"]}
-        input_messages.append(api_msg)
-    
-    # Build request parameters
-    request_params = {
-        "model": model,
-        "input": input_messages,
-        "temperature": temperature,
-        "max_output_tokens": max_tokens,
-        "store": store,
-        "stream": True,  # Enable streaming
-    }
-    
-    # Model-specific parameters — all supported models are GPT-5-series reasoning
-    # models (gpt-5.5 primary, gpt-5-mini utility)
-    # Clamp guards against stored/legacy efforts the model rejects (e.g. `minimal`
-    # on 5.6, `max` on 5.5)
-    reasoning_effort = clamp_effort(model, reasoning_effort or config.default_reasoning_effort)
-    request_params["reasoning"] = {"effort": reasoning_effort}
-    verbosity = verbosity or config.default_verbosity
-    request_params["text"] = {"verbosity": verbosity}
 
-    # gpt-5.5 and the 5.6 family allow temperature/top_p when reasoning=none
-    # (5.6 verified live 2026-07-09: effort=none + temperature/top_p -> 200)
-    if (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")) and reasoning_effort == "none":
-        request_params["top_p"] = top_p
-    else:
-        request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
-
-    # Prompt caching: gpt-5.5 keeps the explicit 24h retention param; the 5.6 family
-    # uses implicit caching (verified live 2026-07-09: second identical call returned
-    # cached_tokens>0 with NO cache params; prompt_cache_retention is deprecated on 5.6).
-    # The per-thread cache key still helps route repeat calls to the same cache shard.
-    if model.startswith("gpt-5.5"):
-        request_params["prompt_cache_retention"] = "24h"
-    if prompt_cache_key and (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")):
-        request_params["prompt_cache_key"] = prompt_cache_key
+    request_params = _build(
+        model=model,
+        input_items=messages,
+        system_prompt=system_prompt,
+        max_output_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        verbosity=verbosity,
+        temperature=temperature,
+        top_p=top_p,
+        stream=True,
+        store=store,
+        prompt_cache_key=prompt_cache_key,
+        prompt_cache_options=prompt_cache_options,
+        layout=layout,
+        legacy_kind="plain",
+    )
 
     self.log_debug(f"Creating streaming response with model {model}, temp {temperature}")
 
+    attempts: List[Any] = []
+    usage_captured: Dict[str, Any] = {}
     try:
         # Determine operation type based on reasoning effort and context
         # All text operations use the same timeout regardless of reasoning level
         operation_type = "text_normal"
 
+        _open_attempt(attempt_sink, request_params, attempts)
         response = await self._safe_api_call(
             self.client.responses.create,
             operation_type=operation_type,
@@ -637,6 +700,8 @@ async def create_streaming_response(
                             if hasattr(result, '__await__'):
                                 await result
                         except Exception as callback_error:
+                            if _is_suppression(callback_error):
+                                raise   # the room moved on: end the attempt, not an error
                             self.log_warning(f"Stream callback error: {callback_error}")
                     continue
                 elif event_type == "response.output_item.done":
@@ -663,7 +728,7 @@ async def create_streaming_response(
                     resp = getattr(event, "response", None)
                     # Usage rides the terminal event's response object on every outcome, not
                     # just success — capture it so token budgeting doesn't fall back to chars/4.
-                    _capture_usage(usage_sink, resp)
+                    usage_captured = _capture_usage(usage_sink, resp)
                     if event_type == "response.failed":
                         stream_error = _stream_failure_error(resp)
                         self.log_error(
@@ -685,6 +750,8 @@ async def create_streaming_response(
                         if hasattr(result, '__await__'):
                             await result
                     except Exception as callback_error:
+                        if _is_suppression(callback_error):
+                            raise   # the room moved on: nothing flushes, nothing posts
                         self.log_warning(f"Stream completion callback error: {callback_error}")
                     break
                 elif event_type and ("call" in event_type or "tool" in event_type):
@@ -743,6 +810,8 @@ async def create_streaming_response(
                     pass
 
             except Exception as event_error:
+                if _is_suppression(event_error):
+                    raise   # a refused surface ends the attempt; it is not one bad event
                 self.log_warning(f"Error processing stream event: {event_error}")
                 continue
 
@@ -750,12 +819,20 @@ async def create_streaming_response(
         # swallowed it) so it propagates like every other API error.
         if stream_error is not None:
             raise stream_error
+        _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
         self.log_info(f"Generated streaming response: {len(complete_text)} chars")
         return complete_text
-        
+
     except Exception as e:
+        if _is_suppression(e):
+            # NOT an API error: the guard refused a surface because the conversation moved on,
+            # before Slack was called. One line, carrying the evidence, and the attempt ends here.
+            self.log_warning(f"Streaming attempt ended without posting — {e}")
+            raise
         self.log_error(f"Error creating streaming response: {e}", exc_info=True)
         raise
+    finally:
+        _close_attempt_error(attempt_sink, attempts, usage_captured)
 
 async def create_streaming_response_with_tools(
     self,
@@ -774,12 +851,15 @@ async def create_streaming_response_with_tools(
     function_call_sink: Optional[List[Dict[str, Any]]] = None,
     tool_choice: Optional[str] = None,
     prompt_cache_key: Optional[str] = None,
+    prompt_cache_options: Optional[Dict[str, Any]] = None,
     usage_sink: Optional[Dict[str, Any]] = None,
+    attempt_sink: Optional[Any] = None,
     mcp_tools_sink: Optional[Dict[str, Any]] = None,
     mcp_results_sink: Optional[List[Dict[str, Any]]] = None,
     tool_event_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
     artifacts_sink: Optional[List[Dict[str, Any]]] = None,
-    container_gone_sink: Optional[List[str]] = None
+    container_gone_sink: Optional[List[str]] = None,
+    layout: str = "legacy"
 ) -> str:
     """
     Create streaming text response with tools (e.g., web search)
@@ -808,61 +888,34 @@ async def create_streaming_response_with_tools(
         Complete generated text response
     """
     model = model or config.gpt_model
-    temperature = temperature if temperature is not None else config.default_temperature
-    max_tokens = max_tokens or config.default_max_tokens
-    top_p = top_p if top_p is not None else config.default_top_p
 
-    # Build request parameters. Raw Responses-API items (function_call /
-    # function_call_output from the tool loop) carry a "type" and pass through as-is.
-    request_params = {
-        "model": model,
-        "input": [msg if "type" in msg else {"role": msg["role"], "content": msg["content"]}
-                  for msg in messages],
-        "tools": tools,
-        "temperature": temperature,
-        "max_output_tokens": max_tokens,
-        "store": store,
-        "stream": True,  # Enable streaming
-        "parallel_tool_calls": True,  # Allow parallel tool execution
-    }
-    if tool_choice is not None:
-        request_params["tool_choice"] = tool_choice
-    if function_call_sink is not None:
+    request_params = _build(
+        model=model,
+        input_items=messages,
+        system_prompt=system_prompt,
+        max_output_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        verbosity=verbosity,
+        temperature=temperature,
+        top_p=top_p,
+        stream=True,
+        store=store,
+        tools=tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=True,
         # Stateless tool loop: reasoning items must round-trip between rounds, which
         # requires their encrypted content when store=False
-        request_params["include"] = ["reasoning.encrypted_content"]
-
-    # Add system prompt if provided
-    if system_prompt:
-        request_params["instructions"] = system_prompt
-    
-    # Model-specific parameters — all supported models are GPT-5-series reasoning
-    # models (gpt-5.5 primary, gpt-5-mini utility)
-    # Clamp guards against stored/legacy efforts the model rejects (e.g. `minimal`
-    # on 5.6, `max` on 5.5)
-    reasoning_effort = clamp_effort(model, reasoning_effort or config.default_reasoning_effort)
-    request_params["reasoning"] = {"effort": reasoning_effort}
-    verbosity = verbosity or config.default_verbosity
-    request_params["text"] = {"verbosity": verbosity}
-
-    # gpt-5.5 and the 5.6 family allow temperature/top_p when reasoning=none
-    # (5.6 verified live 2026-07-09: effort=none + temperature/top_p -> 200)
-    if (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")) and reasoning_effort == "none":
-        request_params["top_p"] = top_p
-    else:
-        request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
-
-    # Prompt caching: gpt-5.5 keeps the explicit 24h retention param; the 5.6 family
-    # uses implicit caching (verified live 2026-07-09: second identical call returned
-    # cached_tokens>0 with NO cache params; prompt_cache_retention is deprecated on 5.6).
-    # The per-thread cache key still helps route repeat calls to the same cache shard.
-    if model.startswith("gpt-5.5"):
-        request_params["prompt_cache_retention"] = "24h"
-    if prompt_cache_key and (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")):
-        request_params["prompt_cache_key"] = prompt_cache_key
+        include=["reasoning.encrypted_content"] if function_call_sink is not None else None,
+        prompt_cache_key=prompt_cache_key,
+        prompt_cache_options=prompt_cache_options,
+        layout=layout,
+        legacy_kind="tools",
+    )
 
     self.log_debug(f"Creating streaming response with tools using model {model}")
 
+    attempts: List[Any] = []
+    usage_captured: Dict[str, Any] = {}
     try:
         # Determine operation type based on reasoning effort and context
         # Determine operation type - all text operations use same timeout regardless of reasoning/tools
@@ -874,6 +927,7 @@ async def create_streaming_response_with_tools(
         response = await _create_with_container_recovery(
             self, request_params, operation_type,
             container_gone_sink=container_gone_sink,
+            attempt_sink=attempt_sink, attempts=attempts,
         )
 
         complete_text = ""
@@ -949,6 +1003,8 @@ async def create_streaming_response_with_tools(
                             if hasattr(result, '__await__'):
                                 await result
                         except Exception as callback_error:
+                            if _is_suppression(callback_error):
+                                raise   # the room moved on: end the attempt, not an error
                             self.log_warning(f"Stream callback error: {callback_error}")
                     continue
                 elif event_type == "response.output_item.done":
@@ -1018,7 +1074,7 @@ async def create_streaming_response_with_tools(
                     resp = getattr(event, "response", None)
                     # Usage rides the terminal event's response object on every outcome, not
                     # just success — capture it so token budgeting doesn't fall back to chars/4.
-                    _capture_usage(usage_sink, resp)
+                    usage_captured = _capture_usage(usage_sink, resp)
                     if event_type == "response.failed":
                         stream_error = _stream_failure_error(resp)
                         self.log_error(
@@ -1046,6 +1102,8 @@ async def create_streaming_response_with_tools(
                         if hasattr(result, '__await__'):
                             await result
                     except Exception as callback_error:
+                        if _is_suppression(callback_error):
+                            raise   # the room moved on: nothing flushes, nothing posts
                         self.log_warning(f"Stream completion callback error: {callback_error}")
                     break
                 elif event_type and ("call" in event_type or "tool" in event_type):
@@ -1104,6 +1162,8 @@ async def create_streaming_response_with_tools(
                     pass
                     
             except Exception as event_error:
+                if _is_suppression(event_error):
+                    raise   # a refused surface ends the attempt; it is not one bad event
                 self.log_warning(f"Error processing stream event: {event_error}")
                 continue
 
@@ -1111,14 +1171,20 @@ async def create_streaming_response_with_tools(
         # swallowed it) so it reaches the outer handler and propagates like any other error.
         if stream_error is not None:
             raise stream_error
+        _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
         self.log_info(f"Generated streaming response with tools: {len(complete_text)} chars")
         return complete_text
-        
+
     except asyncio.TimeoutError as e:
         # Log timeout as warning without stack trace
         self.log_warning(f"Streaming response with tools timed out: {e}")
         raise
     except Exception as e:
+        if _is_suppression(e):
+            # Control flow, not an API error: the guard refused a surface before Slack was called.
+            # A stack trace here would file a turn where nothing went wrong as a failure.
+            self.log_warning(f"Streaming attempt ended without posting — {e}")
+            raise
         # Check if this is an MCP connection error (expected failure, handled gracefully)
         error_msg = str(e)
         is_mcp_error = "mcp server" in error_msg.lower() and ("404" in error_msg or "424" in error_msg)
@@ -1135,6 +1201,8 @@ async def create_streaming_response_with_tools(
             # Unexpected errors - log as ERROR with stack trace
             self.log_error(f"Error creating streaming response with tools: {e}", exc_info=True)
         raise
+    finally:
+        _close_attempt_error(attempt_sink, attempts, usage_captured)
 
 async def classify_wake(self, *, sources: Any,
                         channel_steering_text: Optional[str] = None) -> Optional[bool]:
@@ -1419,6 +1487,10 @@ async def _create_text_response_with_timeout(
     verbosity: Optional[str] = None,
     store: bool = False,
     timeout_seconds: float = 60.0,
+    prompt_cache_key: Optional[str] = None,
+    prompt_cache_options: Optional[Dict[str, Any]] = None,
+    attempt_sink: Optional[Any] = None,
+    layout: str = "legacy",
 ) -> str:
     """
     Create a text response with custom timeout (for retry scenarios)
@@ -1439,65 +1511,49 @@ async def _create_text_response_with_timeout(
         Generated text response
     """
     model = model or config.gpt_model
-    temperature = temperature if temperature is not None else config.default_temperature
-    max_tokens = max_tokens or config.default_max_tokens
-    top_p = top_p if top_p is not None else config.default_top_p
 
-    # Build input for Responses API
-    input_messages = []
-
-    # Add system prompt if provided
-    if system_prompt:
-        input_messages.append({
-            "role": "developer",
-            "content": system_prompt
-        })
-
-    # Add conversation messages (filter out metadata - Responses API rejects unknown fields)
-    for msg in messages:
-        # Only include role and content for API
-        api_msg = {"role": msg["role"], "content": msg["content"]}
-        input_messages.append(api_msg)
-
-    # Build request parameters
-    request_params = {
-        "model": model,
-        "input": input_messages,
-        "temperature": temperature,
-        "max_output_tokens": max_tokens,
-        "store": store,
-    }
-
-    # Model-specific parameters — all supported models are GPT-5-series reasoning
-    # models (gpt-5.5 primary, gpt-5-mini utility)
-    # Clamp guards against stored/legacy efforts the model rejects (e.g. `minimal`
-    # on 5.6, `max` on 5.5)
-    reasoning_effort = clamp_effort(model, reasoning_effort or config.default_reasoning_effort)
-    request_params["reasoning"] = {"effort": reasoning_effort}
-    verbosity = verbosity or config.default_verbosity
-    request_params["text"] = {"verbosity": verbosity}
-
-    # gpt-5.5 and the 5.6 family allow temperature/top_p when reasoning=none
-    # (5.6 verified live 2026-07-09: effort=none + temperature/top_p -> 200)
-    if (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")) and reasoning_effort == "none":
-        request_params["top_p"] = top_p
-    else:
-        request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
+    request_params = _build(
+        model=model,
+        input_items=messages,
+        system_prompt=system_prompt,
+        max_output_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        verbosity=verbosity,
+        temperature=temperature,
+        top_p=top_p,
+        store=store,
+        prompt_cache_key=prompt_cache_key,
+        prompt_cache_options=prompt_cache_options,
+        layout=layout,
+        legacy_kind="plain",
+        # This twin has never sent cache params — not even 5.5's retention. Keeping the gap
+        # is what makes the legacy request byte-identical; the channel layout fixes it.
+        legacy_cache_params=False,
+    )
 
     self.log_debug(f"Creating text response with custom timeout {timeout_seconds}s, model {model}")
 
+    attempts: List[Any] = []
+    usage_captured: Dict[str, Any] = {}
     try:
         # Determine operation type based on reasoning effort and context
         # All text operations use the same timeout regardless of reasoning level
         operation_type = "text_normal"
 
         # API call with custom timeout
+        _open_attempt(attempt_sink, request_params, attempts)
         response = await self._safe_api_call(
             self.client.responses.create,
             operation_type=operation_type,
             timeout_seconds=timeout_seconds,
             **request_params
         )
+
+        # Usage read for the ledger ONLY — this twin has never had a usage_sink, and giving it
+        # one would change what the caller budgets against. `_capture_usage(None, …)` writes
+        # nothing anywhere; it just hands back the numbers.
+        usage_captured = _capture_usage(None, response)
+        _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
 
         output_text = _join_output_text(response)
 
@@ -1511,6 +1567,8 @@ async def _create_text_response_with_timeout(
     except Exception as e:
         self.log_error(f"Error creating text response with timeout: {e}", exc_info=True)
         raise
+    finally:
+        _close_attempt_error(attempt_sink, attempts, usage_captured)
 
 async def _create_text_response_with_tools_with_timeout(
     self,
@@ -1529,11 +1587,14 @@ async def _create_text_response_with_tools_with_timeout(
     function_call_sink: Optional[List[Dict[str, Any]]] = None,
     tool_choice: Optional[str] = None,
     prompt_cache_key: Optional[str] = None,
+    prompt_cache_options: Optional[Dict[str, Any]] = None,
     usage_sink: Optional[Dict[str, Any]] = None,
+    attempt_sink: Optional[Any] = None,
     mcp_tools_sink: Optional[Dict[str, Any]] = None,
     mcp_results_sink: Optional[List[Dict[str, Any]]] = None,
     artifacts_sink: Optional[List[Dict[str, Any]]] = None,
-    container_gone_sink: Optional[List[str]] = None
+    container_gone_sink: Optional[List[str]] = None,
+    layout: str = "legacy"
 ) -> str:
     """
     Create text response with tools and custom timeout (for retry scenarios)
@@ -1555,58 +1616,32 @@ async def _create_text_response_with_tools_with_timeout(
         Generated text response
     """
     model = model or config.gpt_model
-    temperature = temperature if temperature is not None else config.default_temperature
-    max_tokens = max_tokens or config.default_max_tokens
-    top_p = top_p if top_p is not None else config.default_top_p
 
-    # Build request parameters. Raw Responses-API items (function_call /
-    # function_call_output from the tool loop) carry a "type" and pass through as-is.
-    request_params = {
-        "model": model,
-        "input": [msg if "type" in msg else {"role": msg["role"], "content": msg["content"]}
-                  for msg in messages],
-        "tools": tools,
-        "temperature": temperature,
-        "max_output_tokens": max_tokens,
-        "store": store,
-    }
-    if tool_choice is not None:
-        request_params["tool_choice"] = tool_choice
-    if function_call_sink is not None:
+    request_params = _build(
+        model=model,
+        input_items=messages,
+        system_prompt=system_prompt,
+        max_output_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        verbosity=verbosity,
+        temperature=temperature,
+        top_p=top_p,
+        store=store,
+        tools=tools,
+        tool_choice=tool_choice,
         # Stateless tool loop: reasoning items must round-trip between rounds, which
         # requires their encrypted content when store=False
-        request_params["include"] = ["reasoning.encrypted_content"]
-
-    # Add system prompt if provided
-    if system_prompt:
-        request_params["instructions"] = system_prompt
-
-    # Model-specific parameters — all supported models are GPT-5-series reasoning
-    # models (gpt-5.5 primary, gpt-5-mini utility)
-    # Clamp guards against stored/legacy efforts the model rejects (e.g. `minimal`
-    # on 5.6, `max` on 5.5)
-    reasoning_effort = clamp_effort(model, reasoning_effort or config.default_reasoning_effort)
-    request_params["reasoning"] = {"effort": reasoning_effort}
-    verbosity = verbosity or config.default_verbosity
-    request_params["text"] = {"verbosity": verbosity}
-
-    # gpt-5.5 and the 5.6 family allow temperature/top_p when reasoning=none
-    # (5.6 verified live 2026-07-09: effort=none + temperature/top_p -> 200)
-    if (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")) and reasoning_effort == "none":
-        request_params["top_p"] = top_p
-    else:
-        request_params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
-
-    # Prompt caching — parity with the non-timeout twin. gpt-5.5 keeps the explicit 24h
-    # retention param; the 5.6 family uses implicit caching, and the per-thread cache key still
-    # routes repeat calls to the same cache shard.
-    if model.startswith("gpt-5.5"):
-        request_params["prompt_cache_retention"] = "24h"
-    if prompt_cache_key and (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")):
-        request_params["prompt_cache_key"] = prompt_cache_key
+        include=["reasoning.encrypted_content"] if function_call_sink is not None else None,
+        prompt_cache_key=prompt_cache_key,
+        prompt_cache_options=prompt_cache_options,
+        layout=layout,
+        legacy_kind="tools",
+    )
 
     self.log_debug(f"Creating text response with tools and custom timeout {timeout_seconds}s, model {model}, tools: {tools}")
 
+    attempts: List[Any] = []
+    usage_captured: Dict[str, Any] = {}
     try:
         # Determine operation type based on reasoning effort and context
         # All text operations use the same timeout regardless of reasoning level
@@ -1616,12 +1651,14 @@ async def _create_text_response_with_tools_with_timeout(
         response = await _create_with_container_recovery(
             self, request_params, operation_type,
             container_gone_sink=container_gone_sink,
+            attempt_sink=attempt_sink, attempts=attempts,
             timeout_seconds=timeout_seconds,
         )
 
         # Usage-driven context budgeting must not degrade on the retry path — parity with the
         # non-timeout twin. Without this, a retried turn silently falls back to chars/4.
-        _capture_usage(usage_sink, response)
+        usage_captured = _capture_usage(usage_sink, response)
+        _close_attempt(attempt_sink, attempts, status="ok", usage=usage_captured)
 
         # Text first (seams and all — see _join_output_text); the loop below is tool bookkeeping.
         output_text = _join_output_text(response)
@@ -1695,3 +1732,5 @@ async def _create_text_response_with_tools_with_timeout(
     except Exception as e:
         self.log_error(f"Error creating response with tools and timeout: {e}", exc_info=True)
         raise
+    finally:
+        _close_attempt_error(attempt_sink, attempts, usage_captured)

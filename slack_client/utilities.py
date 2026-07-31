@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import aiohttp
+import logging
 import re
 import time
 from typing import Dict, Iterable, Optional
@@ -8,6 +9,8 @@ from typing import Dict, Iterable, Optional
 from slack_sdk.errors import SlackApiError
 
 from config import config
+
+logger = logging.getLogger(__name__)
 
 
 # Author ids that users.info can never resolve, so looking them up only buys a 404 and a
@@ -27,6 +30,36 @@ def _is_resolvable_user_id(uid: str) -> bool:
     if uid in _SENTINEL_USER_IDS:
         return False
     return not uid.startswith("B")
+
+
+def is_dm_conversation(channel_id: Optional[str], channel_type: Optional[str] = None) -> bool:
+    """True for a 1:1 DM surface, False for a channel-shaped one (spec §8 surface ruling).
+
+    The permanent DM/channel discriminator: DMs keep the legacy layout and tool surface and get
+    no receipts or index; "mpim" is channel-shaped and already routes that way today.
+
+    A "U" prefix counts as DM because outbound DMs are posted with channel=<user_id>. An
+    unrecognized id falls to the DM side and logs: the fail-safe for a surface we cannot
+    classify is "no receipt row for it", never a bogus row attributed to a channel.
+    """
+    kind = (channel_type or "").strip().lower()
+    if kind == "im":
+        return True
+    if kind in ("channel", "group", "mpim", "private_channel", "public_channel"):
+        return False
+
+    cid = (channel_id or "").strip()
+    if not cid:
+        logger.warning("is_dm_conversation: empty conversation id; treating as DM")
+        return True
+    prefix = cid[0].upper()
+    if prefix in ("D", "U", "W"):
+        return True
+    if prefix in ("C", "G"):
+        return False
+    logger.warning(
+        f"is_dm_conversation: unrecognized conversation id {cid!r}; treating as DM")
+    return True
 
 
 def strip_citations(text: str) -> str:

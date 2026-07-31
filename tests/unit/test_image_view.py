@@ -393,3 +393,65 @@ def test_produced_image_drains_into_the_user_message():
     _drain(ctx, items)
     assert items[0]["role"] == "user"
     assert [p["type"] for p in items[0]["content"]] == ["input_text", "input_image"]
+
+
+# ------------------------------------------------------------------ static channel schema
+
+def test_static_schema_is_byte_stable_across_catalogs_and_requesters():
+    import json
+    from message_processor.image_view import get_view_image_schema_static
+
+    a = json.dumps(get_view_image_schema_static(
+        {CATALOG_KEY: _catalog(), "user_id": "U_A", "model": "gpt-5.6-sol"}), sort_keys=True)
+    b = json.dumps(get_view_image_schema_static(
+        {CATALOG_KEY: [], "user_id": "U_B", "model": "gpt-5.5"}), sort_keys=True)
+    c = json.dumps(get_view_image_schema_static(), sort_keys=True)
+    assert a == b == c
+
+
+def test_static_schema_carries_no_ids_and_no_enum():
+    import json
+    from message_processor.image_view import get_view_image_schema_static
+
+    schema = get_view_image_schema_static({CATALOG_KEY: _catalog()})
+    assert "enum" not in schema["parameters"]["properties"]["image_id"]
+    blob = json.dumps(schema)
+    assert "img_9" not in blob and "a model pricing table" not in blob
+    # It still has to steer the model the same way the factory did.
+    assert "do NOT call this for those" in schema["description"]
+    assert "Never render an image in the sandbox merely to see it." in schema["description"]
+    assert "evidence" in schema["description"]
+
+
+def test_static_schema_is_never_hidden():
+    """The factory returned None with no catalog. The static variant cannot — the executor's
+    honest refusal is what covers an empty catalog on the channel surface."""
+    from message_processor.image_view import get_view_image_schema_static
+    for cfg in (None, {}, {CATALOG_KEY: []}):
+        assert get_view_image_schema_static(cfg)["name"] == "view_image"
+
+
+def test_the_dynamic_factory_is_untouched():
+    assert get_view_image_schema({CATALOG_KEY: []}) is None
+    assert get_view_image_schema(
+        {CATALOG_KEY: _catalog()})["parameters"]["properties"]["image_id"]["enum"] == [
+            "img_9", "img_8", "img_7"]
+
+
+# ------------------------------------------------------------------ executor: honest empty
+
+async def test_an_empty_catalog_is_answered_honestly():
+    """With no enum to stop it, the model can name an id on a thread that has no images at all.
+    The refusal has to say THAT, not imply the id was merely wrong."""
+    res = await execute_view_image(_ctx(catalog=[]), {"image_id": "img_9"})
+
+    assert res["ok"] is False and res["error"] == "unknown_image"
+    assert res["valid_image_ids"] == []
+    assert "no images" in res["message"]
+
+
+async def test_an_unknown_id_lists_the_ids_that_would_have_worked():
+    res = await execute_view_image(_ctx(), {"image_id": "img_999"})
+
+    assert res["error"] == "unknown_image"
+    assert res["valid_image_ids"] == ["img_9", "img_8", "img_7"]

@@ -6,22 +6,24 @@ import asyncio
 import logging
 import time
 from typing import Optional
-from base_client import BaseClient, HistoryFetchError, Message, Response
+from base_client import BaseClient, ChannelStreamError, HistoryFetchError, Message, Response
 from thread_manager import AsyncThreadStateManager
 from openai_client import OpenAIClient
 from config import config, pipeline_status
 from logger import LoggerMixin
+from slack_client import admission_watermark
 from . import channel_steering, image_catalog, participation_telemetry, routing_facts
 from .containers import ContainerManager
 from .message_timestamps import stamp_content
 from .thread_management import ThreadManagementMixin
 from .stale_send_guard import StaleSendSuppressed
 from .turn_runtime import TurnRuntime
-from .handlers.text import TextHandlerMixin
+from .handlers.text import TextHandlerMixin, pinned_thread_config
 from .handlers.image_gen import ImageJobMixin
-from .utilities import MessageUtilitiesMixin
+from .utilities import MessageUtilitiesMixin, effective_request_model
 from image_url_handler import ImageURLHandler
 from mcp_manager import MCPManager
+from tool_registry import SURFACE_CHANNEL
 try:
     from document_handler import DocumentHandler
     DOCUMENT_HANDLER_AVAILABLE = True
@@ -70,15 +72,13 @@ class MessageProcessor(ThreadManagementMixin,
         self.mcp_manager.initialize()
 
         # F51: ambient-memory ingestion service. Owned here so its lifecycle is drained in
-        # cleanup() BEFORE the OpenAI client closes. channel_pulse is captured lazily from the
-        # Slack client at first offer_event (the client isn't wired to the processor yet).
+        # cleanup() BEFORE the OpenAI client closes.
         from message_processor.ambient_memory import AmbientArtifactService
         self.ambient_service = AmbientArtifactService(
-            db=db, openai_client=self.openai_client, channel_pulse=None)
+            db=db, openai_client=self.openai_client)
 
-        # Track 1: persistent per-channel "recent channel narrative" cache. The Slack client +
-        # channel pulse are passed per call by the read paths (they already hold them), so this
-        # only needs the db + openai client here. Background builds are fire-and-forget.
+        # Track 1: the per-channel narrative service. Only build_for_intro survives P2 (the
+        # channel stream renders the room itself), and that one needs the db + openai client.
         from message_processor.channel_summary import ChannelSummaryService
         self.channel_summary_service = ChannelSummaryService(
             db=db, openai_client=self.openai_client)
@@ -173,30 +173,61 @@ class MessageProcessor(ThreadManagementMixin,
         gate_required = (message.metadata or {}).get("gate_required") is True
         participation_telemetry.emit_queue_links(message, gate_required=gate_required)
 
-        # An UNGATED turn (a DM, an @mention, a thread continuation) has no gate to have read the
-        # channel's steering, so it reads it HERE — at the point of no return, not earlier. A
-        # message that queues instead never reaches this line, so it costs nothing; when its
-        # redispatch finally runs, it reads the steering as it is THEN, not as it was when the
-        # message arrived. Gated turns arrive already stamped by the gate and must not read
-        # again; see message_processor/channel_steering.py for why a second read is the bug.
-        if not gate_required:
-            channel_steering.stamp(message, await channel_steering.load_snapshot(
-                self.db, message.channel_id,
-                memory_enabled=bool(getattr(config, "enable_channel_memory", True))))
+        channel_turn = TextHandlerMixin._turn_surface(message) == SURFACE_CHANNEL
+        h_pin = None
 
         try:
-            # Get or rebuild thread state
-            thread_state = await self._get_or_rebuild_thread_state(
-                message,
-                client,
-                thinking_id
-            )
+            # H, pinned HERE and never refreshed (spec §1). This is the first instant at which the
+            # turn genuinely exists — the lock is held, the queue is this turn's, and nothing has
+            # been awaited since — so it is the honest answer to "what had this channel said by the
+            # time we committed to answering". Pinned before the steering read and before any
+            # stream or capability await, because every one of those is time in which the channel
+            # moves, and a window whose ceiling drifts is a window two builds of one turn would
+            # disagree about.
+            #
+            # The frontier travels WITH it, captured in the same synchronous step: the turn waits
+            # only for index writes at or below the frontier, so an event that arrived after H can
+            # neither delay this turn nor fail it.
+            #
+            # INSIDE the try, deliberately. A malformed timestamp anywhere on the turn path fails
+            # closed [r3-24], and the pin is the first place that can happen — outside the try the
+            # raise would escape past the `finally` that releases the conversation lock, and the
+            # thread would be wedged for the life of the process by a single bad ts.
+            if channel_turn:
+                meta = message.metadata or {}
+                h_pin = admission_watermark.pin(
+                    message.channel_id,
+                    meta.get("trigger_admission_ts") or meta.get("ts") or message.thread_id)
+                turn.H = h_pin.h
 
-            # The gate's coalesced cohort becomes real conversation, before anything reads the
-            # thread. Earlier sends of one burst are separate top-level Slack messages, so the
-            # rebuild above cannot have found them, and without this the turn answers the newest
-            # fragment as if the rest were never said. Merged once, deduplicated by source ts.
-            self._merge_gate_cohort(message, thread_state)
+            # An UNGATED turn (a DM, an @mention, a thread continuation) has no gate to have read
+            # the channel's steering, so it reads it HERE — at the point of no return, not earlier.
+            # A message that queues instead never reaches this line, so it costs nothing; when its
+            # redispatch finally runs, it reads the steering as it is THEN, not as it was when the
+            # message arrived. Gated turns arrive already stamped by the gate and must not read
+            # again; see message_processor/channel_steering.py for why a second read is the bug.
+            if not gate_required:
+                channel_steering.stamp(message, await channel_steering.load_snapshot(
+                    self.db, message.channel_id,
+                    memory_enabled=bool(getattr(config, "enable_channel_memory", True))))
+
+            # Step 2. A channel turn CREATES its state and never rebuilds one: the rebuild exists
+            # to reconstruct a transcript from conversations.replies, and the whole channel is
+            # about to be pinned. The state is still needed for what is not a transcript — the
+            # config overrides, the participants, the root author, the timeout flag.
+            #
+            # The gate's coalesced cohort is no longer merged into that state either. Every member
+            # Slack propagated is IN the stream with its real header; the rest are quoted
+            # post-breakpoint as awaiting-stream evidence (message_processor/channel_request.py),
+            # which is what they are.
+            if channel_turn:
+                thread_state = await self.get_or_create_channel_thread_state(message)
+            else:
+                thread_state = await self._get_or_rebuild_thread_state(
+                    message,
+                    client,
+                    thinking_id
+                )
 
             # F3: if the root author is still unknown and THIS message is the thread root
             # (a new top-level message whose warm state skipped the rebuild), the sender is
@@ -206,7 +237,15 @@ class MessageProcessor(ThreadManagementMixin,
                 if message.metadata.get("ts") == thread_state.thread_ts:
                     thread_state.root_author = (message.user_id, message.metadata.get("sender_type"))
 
-            # Check if this thread had a previous timeout
+            # Check if this thread had a previous timeout.
+            #
+            # A CHANNEL turn only DECIDES here; the words wait. The notice is permanent prose, and
+            # posting it before the stream is built and the request admitted meant a coverage,
+            # history, timestamp, snapshot or budget failure could leave "Picking up from here"
+            # standing in the thread with no answer behind it — the turn's only visible output
+            # being a promise it then broke. It is posted below, once those have succeeded (still
+            # leased, still receipted). A DM has neither step, so it posts here as it always has.
+            prior_timeout_owed = False
             if hasattr(thread_state, 'had_timeout') and thread_state.had_timeout:
                 # F38: this notice fires BEFORE the model has decided anything, so on a turn
                 # that may end in silence it would break that silence all by itself — the bot
@@ -223,27 +262,10 @@ class MessageProcessor(ThreadManagementMixin,
                 # into anything, so it carries no "(edited)" risk. The only reason to hold it
                 # back is a turn that might say nothing at all.
                 if not getattr(turn, "silence_capable", False):
-                    timeout_msg = "⚠️ Heads up — my last answer in this thread never finished. Picking up from here."
-                    # GUARDED like any first surface. This notice is the turn's first visible
-                    # words, and attachment work can run for a while afterwards — so without the
-                    # lease a newer message could leave "picking up from here" sitting alone in
-                    # the thread with no answer behind it. Notices were never exempt: the
-                    # exemption is for CHROME (a thinking bubble), and this is prose.
-                    notice_ts = await client.send_message(
-                        channel_id=message.channel_id,
-                        text=timeout_msg,
-                        thread_id=message.thread_id,
-                        lease=getattr(turn, "send_lease", None),
-                        surface="prior_timeout_notice",
-                    )
-                    # A notice that LANDED is a visible surface in the thread, so the answer
-                    # belongs with it — settle the destination there. Only on a confirmed send:
-                    # send_message swallows SlackApiError and returns None, and settling on a
-                    # notice nobody saw would silently withhold the destination choice and force
-                    # the reply into a thread for no reason the user could observe.
-                    if notice_ts and turn is not None:
-                        turn.settle_structural_thread()
-                    self.log_info(f"Notified user about previous timeout in thread {thread_key}")
+                    if channel_turn:
+                        prior_timeout_owed = True
+                    else:
+                        await self._post_prior_timeout_notice(message, client, turn, thread_key)
                 else:
                     self.log_debug(
                         f"Prior timeout in {thread_key} — clearing silently (turn may say nothing)")
@@ -251,13 +273,18 @@ class MessageProcessor(ThreadManagementMixin,
 
 
             # Get thread config to determine model (user prefs + shared channel
-            # settings; DMs simply have no channel_settings row → no-op there)
-            thread_config = await config.get_thread_config_async(
-                overrides=thread_state.config_overrides,
-                user_id=message.user_id,
-                db=self.db,
-                channel_id=message.channel_id
-            )
+            # settings; DMs simply have no channel_settings row → no-op there).
+            # Spec §3b: on a channel turn the capability keys are the CHANNEL's, resolved the
+            # same way the handler resolves them. The values here are not advisory — they pick
+            # the model this turn trims against and decide whether an attachment is mounted for
+            # the sandbox — so reading them requester-first would let whoever spoke change the
+            # room's machine before the handler ever corrected it.
+            #
+            # Resolved ONCE for the whole turn and pinned on the TurnRuntime: the handlers and
+            # every retry path below read the pin rather than the table, so a settings change
+            # landing mid-turn cannot split one request across two profiles.
+            thread_config = await pinned_thread_config(
+                self, thread_state, message, channel_turn, turn=turn)
             
             # Update thread state with current model for token limit calculations
             thread_state.current_model = thread_config["model"]
@@ -294,14 +321,28 @@ class MessageProcessor(ThreadManagementMixin,
             # ran code interpreter and then failed, stranding the file it wrote in the sandbox.
             turn_artifacts: list = []
 
+            # Steps 3-10 — the channel stream. Everything the turn can see, pinned: the
+            # capability profile's hash and the tool schema version go IN so a build is
+            # attributable to the machine that made it, and the origin thread's files and people
+            # come back OUT as side state the tools address.
+            stream = None
+            if channel_turn:
+                stream = await self._build_channel_turn_stream(
+                    message, client, turn, h_pin, thread_config, thread_state)
+
             # Process any attachments (images, documents, and other files).
             # The CI setting must be the PER-THREAD one, resolved the same way the tools array
             # resolves it — a spreadsheet is only worth mounting when the sandbox that reads it
             # will actually be there.
+            #
+            # SPLIT on a channel turn [r3-4]: download and extraction happen now, the utility
+            # model's summary waits until the admission estimate below has passed. A DM keeps the
+            # combined sequencing verbatim.
             image_inputs, document_inputs, unsupported_files = await self._process_attachments(
                 message, client, thinking_id,
                 code_interpreter_enabled=thread_config.get(
-                    'enable_code_interpreter', config.enable_code_interpreter))
+                    'enable_code_interpreter', config.enable_code_interpreter),
+                defer_document_summaries=channel_turn)
 
             # T2-10: a catch-up trigger carries EARLIER batched messages' already-processed image
             # parts and attachment failures (staged in _dispatch_pending_batch — re-downloading
@@ -309,12 +350,18 @@ class MessageProcessor(ThreadManagementMixin,
             # acknowledges them, and fold the image parts into THIS turn's image_inputs so the
             # model can actually see them. The trigger's OWN images win the per-turn slots;
             # earlier-batch images fill what's left; any overflow is noted in the text.
+            #
+            # A CHANNEL turn does neither fold: the carried images ride POST-BREAKPOINT as their
+            # own labeled block, where the assembler applies the same cap and writes the same
+            # omission note (channel_request.build_batched_images). Folding them into this turn's
+            # own parts here would put earlier messages' pictures inside the block that says "the
+            # message you are answering", and would spend the trigger's image slots on them.
             batched_image_inputs = (message.metadata or {}).get("batched_image_inputs") or []
             batched_unsupported = (message.metadata or {}).get("batched_unsupported_files") or []
             if batched_unsupported:
                 unsupported_files = list(unsupported_files) + list(batched_unsupported)
             batched_images_omitted = 0
-            if batched_image_inputs:
+            if batched_image_inputs and not channel_turn:
                 image_cap = 10  # matches _process_attachments' max_images (utilities.py)
                 room = max(0, image_cap - len(image_inputs))
                 if room:
@@ -324,58 +371,65 @@ class MessageProcessor(ThreadManagementMixin,
             # Files that were accepted but couldn't be fetched/processed create an
             # obligation: use them or tell the user they failed — never answer as
             # if they were never attached.
+            failed_files_notice_owed = None
             if unsupported_files:
                 files_str = ", ".join(f"*{f['name']}*" for f in unsupported_files)
                 unsupported_msg = self._build_failed_files_notice(unsupported_files)
-                
+
+                # Is there anything left to answer? On a DM the trigger IS the turn, so its own text
+                # and attachments settle it. On a CHANNEL turn they do not [r4-5]: a catch-up is
+                # answering earlier messages too, and their images ride the request as their own
+                # post-breakpoint block rather than being folded into `image_inputs` above. A trigger
+                # whose only content was a file that failed can therefore still owe an answer to a
+                # whole cohort, and shortcutting here would leave every one of those senders in
+                # silence.
+                anything_else = bool((message.text and message.text.strip())
+                                     or image_inputs or document_inputs)
+                if channel_turn and not anything_else:
+                    from message_processor.channel_request import cohort_sources_from_message
+                    anything_else = bool(batched_image_inputs
+                                         or cohort_sources_from_message(message))
+
                 # If there's also text, images, or documents, continue processing those
-                if (message.text and message.text.strip()) or image_inputs or document_inputs:
+                if anything_else:
                     unsupported_msg += "\n\nI'll process your text/image/document request now."
                     # The MIXED path continues on to generate the real reply, so — unlike the
                     # all-failed branch below, which RETURNS the notice for main.py to post — it
                     # must deliver this notice itself. Recording it only in thread state (as it
                     # used to) left the model believing it had acknowledged the failed files while
-                    # the user saw nothing. Post it now, then record the same text as an assistant
-                    # turn so the model's context matches what was actually delivered.
+                    # the user saw nothing.
+                    #
+                    # A CHANNEL turn holds the words until the request has been admitted [r3-4],
+                    # for the same reason the prior-timeout notice does: this promises "I'll
+                    # process your request now", and a coverage, history, timestamp or budget
+                    # failure after it would leave that promise standing alone as the turn's only
+                    # visible output. A DM has no admission step, so it posts here as it always has.
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                     message_ts = message.metadata.get("ts") if message.metadata else None
-                    try:
-                        # Guarded for the same reason as the prior-timeout notice above: this
-                        # promises "I'll process your text/image/document request now", and the
-                        # processing it promises takes time. A newer message during that window
-                        # must not leave the promise standing on its own.
-                        notice_ts = await client.send_message(
-                            channel_id=message.channel_id,
-                            text=unsupported_msg,
-                            thread_id=message.thread_id,
-                            lease=getattr(turn, "send_lease", None),
-                            surface="failed_files_notice",
-                        )
-                        # Same rule as the prior-timeout notice above, and the same reason for
-                        # waiting on the returned ts: only a notice that actually landed settles
-                        # where the answer goes.
-                        if notice_ts and turn is not None:
-                            turn.settle_structural_thread()
-                    except StaleSendSuppressed:
-                        # Not a notice failure: the guard declined to post it. Swallowed here
-                        # the turn carries on, and if the responder then ends silently the
-                        # suppression is never recorded anywhere — the one outcome that leaves
-                        # us unable to tell a working guard from a broken one.
-                        raise
-                    except Exception as notice_err:  # noqa: BLE001 — never fail the turn over the notice
-                        self.log_warning(f"Failed to post mixed-path failed-files notice: {notice_err}")
-                    # Add the unsupported files warning to conversation
-                    formatted_content = self._format_user_content_with_username(f"[File(s) not processed: {files_str}]", message)
-                    self._add_message_with_token_management(thread_state, "user", formatted_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
-                    self._add_message_with_token_management(thread_state, "assistant", unsupported_msg, db=self.db, thread_key=thread_key)
+                    if channel_turn:
+                        failed_files_notice_owed = unsupported_msg
+                    else:
+                        await self._post_failed_files_notice(message, client, turn,
+                                                             unsupported_msg)
+                    # Add the unsupported files warning to conversation. DM/legacy only: a
+                    # channel turn's transcript is Slack, and this notice is a real message in it
+                    # — next turn's stream carries it with a finalized receipt. Writing it into
+                    # ThreadState.messages would put it in a list the channel request never sends.
+                    # The channel responder learns about the failure from the trigger supplement
+                    # instead (ChannelTurnContext.failed_attachment_names).
+                    if not channel_turn:
+                        formatted_content = self._format_user_content_with_username(f"[File(s) not processed: {files_str}]", message)
+                        self._add_message_with_token_management(thread_state, "user", formatted_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
+                        self._add_message_with_token_management(thread_state, "assistant", unsupported_msg, db=self.db, thread_key=thread_key)
                     # Continue processing if we have text or images
                 else:
                     # Only unsupported files were uploaded, nothing else to process
                     thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                     message_ts = message.metadata.get("ts") if message.metadata else None
-                    formatted_content = self._format_user_content_with_username(f"[File(s) not processed: {files_str}]", message)
-                    self._add_message_with_token_management(thread_state, "user", formatted_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
-                    self._add_message_with_token_management(thread_state, "assistant", unsupported_msg, db=self.db, thread_key=thread_key)
+                    if not channel_turn:
+                        formatted_content = self._format_user_content_with_username(f"[File(s) not processed: {files_str}]", message)
+                        self._add_message_with_token_management(thread_state, "user", formatted_content, db=self.db, thread_key=thread_key, message_ts=message_ts)
+                        self._add_message_with_token_management(thread_state, "assistant", unsupported_msg, db=self.db, thread_key=thread_key)
                     elapsed = time.time() - request_start_time
                     self.log_info("")
                     self.log_info("="*100)
@@ -403,7 +457,11 @@ class MessageProcessor(ThreadManagementMixin,
             enhanced_text = base_text_with_username
             file_inputs = []
             if document_inputs:
-                enhanced_text = self._build_message_with_documents(base_text_with_username, document_inputs)
+                # A channel turn's summaries do not exist yet (they wait for the admission
+                # estimate) and its trigger supplement is rendered by the assembler, from the
+                # SAME helper, once they do.
+                if not channel_turn:
+                    enhanced_text = self._build_message_with_documents(base_text_with_username, document_inputs)
                 # Native-eligible files additionally ride this turn as input_file parts:
                 # PDFs so the model sees text + rendered pages (Phase D2), and F32
                 # spreadsheets/CSVs so they auto-mount in the code-interpreter sandbox and
@@ -428,135 +486,183 @@ class MessageProcessor(ThreadManagementMixin,
 
             user_content = self._build_user_content(enhanced_text, image_inputs, file_inputs)
 
-            # Check if adding this message would exceed limits and trim if needed
-            # We temporarily add the message to check, then remove it
             thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
             message_ts = message.metadata.get("ts") if message.metadata else None
-            
-            # Determine what content to use for checking
-            content_to_check = enhanced_text if not image_inputs else (enhanced_text if enhanced_text else f"{username}: [uploaded image(s) for analysis]")
-            
-            # Check token count with the new message (WITHOUT adding it to thread yet)
-            model = thread_state.current_model or config.gpt_model
-            max_tokens = config.get_model_token_limit(model)
-
-            # Calculate what the tokens would be with the new message
-            temp_message = {"role": "user", "content": content_to_check}
-            new_message_tokens = self.thread_manager._token_counter.count_message_tokens(temp_message)
-            current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-            projected_tokens = current_tokens + new_message_tokens
-
-            # Debug logging for token counting
-            self.log_debug(f"Token calculation: current={current_tokens}, new_message={new_message_tokens}, projected={projected_tokens}")
-            self.log_debug(f"New message length: {len(content_to_check)} chars = {new_message_tokens} tokens")
-
-            # Apply smart trimming if needed - keep trimming until under limit
-            if projected_tokens > max_tokens:
-                self.log_info(f"Thread would exceed limit with new message ({projected_tokens}/{max_tokens} tokens), applying smart trim")
-
-                # Update status to show we're optimizing (routes to the composer
-                # status on status-only DMs where no indicator message exists)
-                self._update_status(
-                    client,
-                    message.channel_id,
-                    thinking_id,
-                    pipeline_status("optimizing_history", f"Optimizing conversation history ({projected_tokens:,}/{max_tokens:,} tokens)…"),
-                    emoji=config.circle_loader_emoji, thread_id=message.thread_id, turn=turn)
-
-                total_trimmed = 0
-
-                # Keep trimming until we're under the limit (accounting for the new message we'll add)
-                while projected_tokens > max_tokens:
-                    # Smart trim will work on existing messages only (not the temp one)
-                    trimmed_count = await self._smart_trim_with_summarization(thread_state)
-                    total_trimmed += trimmed_count
-                    
-                    if trimmed_count == 0:
-                        # No more messages to trim, we've done all we can
-                        self.log_warning(f"Cannot trim further - still at {projected_tokens} tokens")
-                        break
-
-                    # Recalculate tokens after trimming (including the message we'll add)
-                    current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-                    projected_tokens = current_tokens + new_message_tokens
-                    self.log_debug(f"After trimming {trimmed_count} messages, now at {projected_tokens}/{max_tokens} tokens (current: {current_tokens} + new: {new_message_tokens})")
-                
-                if total_trimmed > 0:
-                    self.log_info(f"Smart trim complete: {total_trimmed} total messages processed, final: {projected_tokens}/{max_tokens} tokens")
-
-                # Check if we're still over the limit after trimming
-                if projected_tokens > max_tokens:
-                    self.log_warning(f"Smart trim insufficient. Need {projected_tokens - max_tokens} more tokens. Dropping oldest messages...")
-
-                    # Keep dropping oldest messages until we fit
-                    messages_dropped = 0
-                    while projected_tokens > max_tokens and len(thread_state.messages) > 0:
-                        # Drop the oldest non-preserved message
-                        dropped = False
-                        for i in range(len(thread_state.messages)):
-                            if not self._should_preserve_message(thread_state.messages[i]):
-                                dropped_msg = thread_state.messages.pop(i)
-                                messages_dropped += 1
-                                dropped = True
-
-                                # Recalculate tokens
-                                current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
-                                projected_tokens = current_tokens + new_message_tokens
-                                self.log_debug(f"Dropped message {i}, now at {projected_tokens}/{max_tokens} tokens")
-                                break
-
-                        if not dropped:
-                            # No more droppable messages
-                            self.log_warning("No more messages can be dropped (all are preserved)")
-                            break
-
-                        # Safety check to prevent infinite loop
-                        if messages_dropped > 50:
-                            self.log_error("Dropped 50 messages but still over limit - something is wrong")
-                            break
-
-                    if messages_dropped > 0:
-                        self.log_info(f"Dropped {messages_dropped} oldest messages to make room. Final: {projected_tokens}/{max_tokens} tokens")
-                        # Mark that we've trimmed messages
-                        thread_state.has_trimmed_messages = True
-
-            # No need to remove temp message since we never added it to thread_state.messages
-            
-            # Check if this single message alone exceeds the model's context window
-            model = thread_state.current_model or config.gpt_model
-            max_model_tokens = config.get_model_token_limit(model)
-
-            # Check if this single message exceeds the model's context window
-            if new_message_tokens > max_model_tokens:
-                error_msg = (
-                    f"❌ Your message is too large for the model to process.\n\n"
-                    f"• Message size: {new_message_tokens:,} tokens\n"
-                    f"• Model limit: {max_model_tokens:,} tokens\n\n"
-                    f"Please reduce the size of your documents or split them into smaller requests."
-                )
-
-                # Log the issue
-                self.log_error(f"Message exceeds context window: {new_message_tokens} > {max_model_tokens}")
-                
-                # Add minimal breadcrumb to history
+            if channel_turn:
+                # A notice this turn owes is prose in the thread, so the answer belongs with it —
+                # which settles the destination. Settle it BEFORE the request is assembled, not
+                # after [r3-3]: admission pins the tool tuple and the suffix, so a destination
+                # settled afterwards would leave the admitted request advertising
+                # `set_reply_destination` and saying nothing about where the reply goes, while the
+                # request actually sent carries `reply_destination=thread` and refuses that tool at
+                # runtime. Bytes admitted == bytes sent only if the lock precedes the estimate.
+                #
+                # Settled unconditionally rather than on a confirmed send, because there is no send
+                # yet. The cost if the notice then fails to post is a reply in the thread rather
+                # than at top level; the cost of the other order is an estimate that measured a
+                # different request.
+                if (prior_timeout_owed or failed_files_notice_owed) and turn is not None:
+                    turn.settle_structural_thread()
+                # Steps 3 + 11 pre-flight. A channel turn does not trim: the request is the
+                # pinned window, and there is nothing in it a trim could drop without answering
+                # a different question. It is ADMITTED instead — measured whole, before the first
+                # API call, and refused outright if the worst case will not fit.
+                await self._admit_channel_request(
+                    message, client, turn, thread_state, thread_config, thinking_id,
+                    stream=stream, steering=steering, image_inputs=image_inputs,
+                    file_inputs=file_inputs, document_inputs=document_inputs,
+                    batched_image_inputs=batched_image_inputs,
+                    batched_images_omitted=batched_images_omitted,
+                    failed_attachment_names=tuple(
+                        str(f.get("name") or "") for f in (unsupported_files or [])))
+                # The window exists and the request fits. NOW the owed prose can be said: every
+                # fail-closed condition that would have contradicted it is behind us, so these are
+                # promises the turn is in a position to keep. Chronological order — the failure
+                # that already happened, then the work about to start.
+                if prior_timeout_owed:
+                    await self._post_prior_timeout_notice(message, client, turn, thread_key)
+                if failed_files_notice_owed:
+                    notice_ts = await self._post_failed_files_notice(
+                        message, client, turn, failed_files_notice_owed)
+                    # What the responder's evidence may CLAIM depends on this landing [r4-4]. The
+                    # request the model actually gets is assembled after this line, so it says
+                    # "the user has been told" only when Slack confirmed the notice, and otherwise
+                    # asks the reply to carry the acknowledgement itself. Admission already charged
+                    # the longer of the two wordings, so neither outcome exceeds what was paid.
+                    ctx = getattr(turn, "channel_turn_context", None)
+                    if ctx is not None:
+                        ctx.notice_delivery["failed_attachments"] = bool(notice_ts)
+            else:
+                # Check if adding this message would exceed limits and trim if needed
+                # We temporarily add the message to check, then remove it
                 thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
                 message_ts = message.metadata.get("ts") if message.metadata else None
-                formatted_error_breadcrumb = self._format_user_content_with_username(
-                    f"[Attempted to upload {len(document_inputs)} document(s) - exceeded context limit]", 
-                    message
-                )
-                self._add_message_with_token_management(
-                    thread_state, "user", 
-                    formatted_error_breadcrumb,
-                    db=self.db, thread_key=thread_key, message_ts=message_ts
-                )
-                self._add_message_with_token_management(
-                    thread_state, "assistant", error_msg,
-                    db=self.db, thread_key=thread_key
-                )
-                
-                return Response(type="error", content=error_msg)
             
+                # Determine what content to use for checking
+                content_to_check = enhanced_text if not image_inputs else (enhanced_text if enhanced_text else f"{username}: [uploaded image(s) for analysis]")
+            
+                # Check token count with the new message (WITHOUT adding it to thread yet)
+                model = thread_state.current_model or config.gpt_model
+                max_tokens = config.get_model_token_limit(model)
+
+                # Calculate what the tokens would be with the new message
+                temp_message = {"role": "user", "content": content_to_check}
+                new_message_tokens = self.thread_manager._token_counter.count_message_tokens(temp_message)
+                current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+                projected_tokens = current_tokens + new_message_tokens
+
+                # Debug logging for token counting
+                self.log_debug(f"Token calculation: current={current_tokens}, new_message={new_message_tokens}, projected={projected_tokens}")
+                self.log_debug(f"New message length: {len(content_to_check)} chars = {new_message_tokens} tokens")
+
+                # Apply smart trimming if needed - keep trimming until under limit
+                if projected_tokens > max_tokens:
+                    self.log_info(f"Thread would exceed limit with new message ({projected_tokens}/{max_tokens} tokens), applying smart trim")
+
+                    # Update status to show we're optimizing (routes to the composer
+                    # status on status-only DMs where no indicator message exists)
+                    self._update_status(
+                        client,
+                        message.channel_id,
+                        thinking_id,
+                        pipeline_status("optimizing_history", f"Optimizing conversation history ({projected_tokens:,}/{max_tokens:,} tokens)…"),
+                        emoji=config.circle_loader_emoji, thread_id=message.thread_id, turn=turn)
+
+                    total_trimmed = 0
+
+                    # Keep trimming until we're under the limit (accounting for the new message we'll add)
+                    while projected_tokens > max_tokens:
+                        # Smart trim will work on existing messages only (not the temp one)
+                        trimmed_count = await self._smart_trim_with_summarization(thread_state)
+                        total_trimmed += trimmed_count
+                    
+                        if trimmed_count == 0:
+                            # No more messages to trim, we've done all we can
+                            self.log_warning(f"Cannot trim further - still at {projected_tokens} tokens")
+                            break
+
+                        # Recalculate tokens after trimming (including the message we'll add)
+                        current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+                        projected_tokens = current_tokens + new_message_tokens
+                        self.log_debug(f"After trimming {trimmed_count} messages, now at {projected_tokens}/{max_tokens} tokens (current: {current_tokens} + new: {new_message_tokens})")
+                
+                    if total_trimmed > 0:
+                        self.log_info(f"Smart trim complete: {total_trimmed} total messages processed, final: {projected_tokens}/{max_tokens} tokens")
+
+                    # Check if we're still over the limit after trimming
+                    if projected_tokens > max_tokens:
+                        self.log_warning(f"Smart trim insufficient. Need {projected_tokens - max_tokens} more tokens. Dropping oldest messages...")
+
+                        # Keep dropping oldest messages until we fit
+                        messages_dropped = 0
+                        while projected_tokens > max_tokens and len(thread_state.messages) > 0:
+                            # Drop the oldest non-preserved message
+                            dropped = False
+                            for i in range(len(thread_state.messages)):
+                                if not self._should_preserve_message(thread_state.messages[i]):
+                                    dropped_msg = thread_state.messages.pop(i)
+                                    messages_dropped += 1
+                                    dropped = True
+
+                                    # Recalculate tokens
+                                    current_tokens = self.thread_manager._token_counter.count_thread_tokens(thread_state.messages)
+                                    projected_tokens = current_tokens + new_message_tokens
+                                    self.log_debug(f"Dropped message {i}, now at {projected_tokens}/{max_tokens} tokens")
+                                    break
+
+                            if not dropped:
+                                # No more droppable messages
+                                self.log_warning("No more messages can be dropped (all are preserved)")
+                                break
+
+                            # Safety check to prevent infinite loop
+                            if messages_dropped > 50:
+                                self.log_error("Dropped 50 messages but still over limit - something is wrong")
+                                break
+
+                        if messages_dropped > 0:
+                            self.log_info(f"Dropped {messages_dropped} oldest messages to make room. Final: {projected_tokens}/{max_tokens} tokens")
+                            # Mark that we've trimmed messages
+                            thread_state.has_trimmed_messages = True
+
+                # No need to remove temp message since we never added it to thread_state.messages
+            
+                # Check if this single message alone exceeds the model's context window
+                model = thread_state.current_model or config.gpt_model
+                max_model_tokens = config.get_model_token_limit(model)
+
+                # Check if this single message exceeds the model's context window
+                if new_message_tokens > max_model_tokens:
+                    error_msg = (
+                        f"❌ Your message is too large for the model to process.\n\n"
+                        f"• Message size: {new_message_tokens:,} tokens\n"
+                        f"• Model limit: {max_model_tokens:,} tokens\n\n"
+                        f"Please reduce the size of your documents or split them into smaller requests."
+                    )
+
+                    # Log the issue
+                    self.log_error(f"Message exceeds context window: {new_message_tokens} > {max_model_tokens}")
+                
+                    # Add minimal breadcrumb to history
+                    thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+                    message_ts = message.metadata.get("ts") if message.metadata else None
+                    formatted_error_breadcrumb = self._format_user_content_with_username(
+                        f"[Attempted to upload {len(document_inputs)} document(s) - exceeded context limit]", 
+                        message
+                    )
+                    self._add_message_with_token_management(
+                        thread_state, "user", 
+                        formatted_error_breadcrumb,
+                        db=self.db, thread_key=thread_key, message_ts=message_ts
+                    )
+                    self._add_message_with_token_management(
+                        thread_state, "assistant", error_msg,
+                        db=self.db, thread_key=thread_key
+                    )
+
+                    return Response(type="error", content=error_msg)
+
+
             # F34: image generation and editing are TOOLS, so there is nothing left for a
             # pre-flight router to decide. The model sees uploaded images directly (they ride
             # the turn as input_image parts) and calls generate_image / create_image_asset /
@@ -576,6 +682,15 @@ class MessageProcessor(ThreadManagementMixin,
                 self._schedule_async_call(image_catalog.catalog_uploads(
                     self, thread_key, image_inputs,
                     (message.metadata or {}).get("ts")))
+            # [r5-2] The earlier queued messages' images, on a CHANNEL catch-up. The drain staged
+            # them instead of describing them, because a description is a Responses call and this
+            # turn was not admitted yet — here it is, past admission, at the same point the
+            # trigger's own images are catalogued. Grouped per source message so each description
+            # is still stored against the ts that actually carried the image.
+            for carried_ts, carried_images in (message.metadata
+                                               or {}).get("batched_catalog_uploads") or ():
+                self._schedule_async_call(image_catalog.catalog_uploads(
+                    self, thread_key, carried_images, carried_ts))
 
             response = await self._handle_text_response(
                 user_content, thread_state, client, message, thinking_id, retry_count=0,
@@ -660,7 +775,12 @@ class MessageProcessor(ThreadManagementMixin,
                 # (text.py:361/376) before the API call timed out. Pop it before retrying so the
                 # retry doesn't append a second copy and duplicate the user turn — mirrors the
                 # context-length cleanup in text.py:612-613.
-                if thread_state.messages and thread_state.messages[-1].get("role") == "user":
+                #
+                # DM/legacy only. A channel turn never appends its input here (the stream is the
+                # input), so this pop would take somebody's actual last message off a reused or
+                # pre-P2 ThreadState — a mutation of demoted state that nothing would replace.
+                if (not channel_turn and thread_state.messages
+                        and thread_state.messages[-1].get("role") == "user"):
                     thread_state.messages.pop()
 
                 try:
@@ -706,7 +826,9 @@ class MessageProcessor(ThreadManagementMixin,
                         message.channel_id, thinking_id,
                         f"{config.error_emoji} {TIMEOUT_STATUS}",
                         lease=getattr(turn, "send_lease", None),
-                        surface="timeout_notice")
+                        surface="timeout_notice",
+                        receipts=getattr(turn, "receipt_ledger", None),
+                        receipt_kind="finalized")
                     self.log_debug("Updated thinking message to show timeout")
                 except StaleSendSuppressed:
                     raise  # the conversation moved on; a "stopped waiting" notice is noise now
@@ -735,6 +857,9 @@ class MessageProcessor(ThreadManagementMixin,
             self.log_info("=" * 100)
             self.log_info("")
 
+            if turn is not None:
+                turn.turn_error = "history_fetch_failed"
+
             if thinking_id and hasattr(client, 'update_message'):
                 try:
                     await client.update_message(
@@ -742,6 +867,8 @@ class MessageProcessor(ThreadManagementMixin,
                         f"{config.error_emoji} Couldn't load this conversation's history from Slack.",
                         lease=getattr(turn, "send_lease", None),
                         surface="history_error_notice",
+                        receipts=getattr(turn, "receipt_ledger", None),
+                        receipt_kind="finalized",
                     )
                 except StaleSendSuppressed:
                     raise      # no notice, and the suppression is the record — see update_message
@@ -756,6 +883,44 @@ class MessageProcessor(ThreadManagementMixin,
                     "rate-limiting). Your message wasn't processed — please try again in a moment."
                 )
             )
+        except ChannelStreamError as e:
+            # The channel window could not be built, or could not be sent. Every branch here is
+            # FAIL-CLOSED by design: the alternative is answering a room we cannot see, which
+            # reads to everyone in it as a bot that has lost the thread of the conversation.
+            #
+            # Five distinct conditions, five distinct things worth saying. They differ in what the
+            # user can do — wait, say less, or nothing at all — so a shared "something went wrong"
+            # would withhold the only actionable part. `HistoryFetchError` is caught above, before
+            # this, keeping the DM notice it has always had; its channel sibling
+            # `StreamTimestampError` is NOT a Slack failure and must not borrow that notice.
+            code, notice = self._channel_stream_failure(e)
+            if turn is not None:
+                turn.turn_error = code
+            self.log_error(f"Channel stream unavailable for {thread_key} ({code}): {e}")
+            elapsed = time.time() - request_start_time
+            self.log_info("")
+            self.log_info("=" * 100)
+            self.log_info(f"REQUEST END | Thread: {thread_key} | Status: {code.upper()} | "
+                          f"Time: {elapsed:.2f}s")
+            self.log_info("=" * 100)
+            self.log_info("")
+
+            if thinking_id and hasattr(client, 'update_message'):
+                try:
+                    await client.update_message(
+                        message.channel_id, thinking_id,
+                        f"{config.error_emoji} {notice['status']}",
+                        lease=getattr(turn, "send_lease", None),
+                        surface="channel_stream_error_notice",
+                        receipts=getattr(turn, "receipt_ledger", None),
+                        receipt_kind="finalized",
+                    )
+                except StaleSendSuppressed:
+                    raise      # the conversation moved on; the suppression is the record
+                except Exception:
+                    pass
+
+            return Response(type="error", content=notice["message"])
         except StaleSendSuppressed:
             # A suppression that reached process_message's boundary is still control flow.
             # Converting it into an error Response here would put "something went wrong" in a
@@ -793,7 +958,9 @@ class MessageProcessor(ThreadManagementMixin,
                         await client.update_message(
                             message.channel_id, thinking_id, timeout_msg,
                             lease=getattr(turn, "send_lease", None),
-                            surface="timeout_notice")
+                            surface="timeout_notice",
+                            receipts=getattr(turn, "receipt_ledger", None),
+                            receipt_kind="finalized")
                     except StaleSendSuppressed:
                         raise  # the conversation moved on; a timeout notice would be noise
                     except Exception:
@@ -814,7 +981,9 @@ class MessageProcessor(ThreadManagementMixin,
                         await client.update_message(
                             message.channel_id, thinking_id, error_msg,
                             lease=getattr(turn, "send_lease", None),
-                            surface="error_notice")
+                            surface="error_notice",
+                            receipts=getattr(turn, "receipt_ledger", None),
+                            receipt_kind="finalized")
                     except StaleSendSuppressed:
                         raise  # "something went wrong" about a turn where nothing did
                     except Exception:
@@ -844,6 +1013,17 @@ class MessageProcessor(ThreadManagementMixin,
                 content=error_message
             )
         finally:
+            # §1m paths 1 and the fixed-headroom revalidation, POST-TURN. Everything this turn
+            # was going to do has happened by now, so a background crawl started here cannot
+            # race the answer it is cleanup for.
+            if channel_turn:
+                try:
+                    await self._post_turn_compaction(
+                        message, turn,
+                        team_id=getattr(client, "self_team_id", None) or "")
+                except Exception as compaction_error:  # noqa: BLE001
+                    self.log_debug(f"Post-turn compaction skipped: {compaction_error}")
+
             # Phase Q drain hook — runs while we STILL HOLD the lock so that (a) no new
             # message can jump ahead of the queued backlog and (b) stragglers arriving
             # during the linger enqueue (lock held) and join the same batch. Must never
@@ -863,6 +1043,476 @@ class MessageProcessor(ThreadManagementMixin,
                 # Even if release fails, log it but don't crash
                 self.log_error(f"Error releasing thread lock for {thread_key}: {lock_error}", exc_info=True)
 
+    @staticmethod
+    def _channel_stream_failure(error: ChannelStreamError):
+        """The error code and the honest user notice for one fail-closed channel condition.
+
+        Honest means: say what we cannot do, say whether waiting helps, and do not invent a cause.
+        None of these is "something went wrong" — each is a specific state the runtime is in, two
+        of them are things the user can act on, and two say outright that retrying will not help.
+        """
+        from message_processor.channel_stream import (CoverageNotReady, SnapshotUnsupportedError,
+                                                     StreamOverBudgetError, StreamTimestampError)
+        if isinstance(error, StreamTimestampError):
+            # NOT a Slack problem, so it must not wear the Slack notice: a timestamp we cannot
+            # parse means a record — in a payload or in one of our own rows — is malformed, and
+            # retrying reads the same bad value. Saying "try again in a moment" would send the
+            # user back for a second helping of the same failure.
+            return "stream_data_invalid", {
+                "status": "A timestamp in this channel's records doesn't parse.",
+                "message": (f"{config.error_emoji} **Can't Place This Channel's History**\n\n"
+                            "A timestamp in this channel's records doesn't parse, so I can't tell "
+                            "which messages belong in view — and I won't answer from a picture "
+                            "with an unexplained hole in it. Retrying won't clear this one; it "
+                            "needs a fix on my side."),
+            }
+        if isinstance(error, CoverageNotReady):
+            return "coverage_not_ready", {
+                "status": "Still reading this channel's history.",
+                "message": (f"{config.error_emoji} **Still Catching Up On This Channel**\n\n"
+                            "I'm still reading this channel's history, so I can't answer from a "
+                            "complete picture yet — and I'd rather say that than guess. Try again "
+                            "in a few minutes."),
+            }
+        if isinstance(error, SnapshotUnsupportedError):
+            return "snapshot_unsupported", {
+                "status": "This channel's history is compacted; I can't read it yet.",
+                "message": (f"{config.error_emoji} **Can't Read This Channel Right Now**\n\n"
+                            "This channel's history has been compacted into a summary that this "
+                            "version of me can't read from, so I can't see the conversation. "
+                            "Nothing is lost — this needs a fix on my side, not on yours."),
+            }
+        if isinstance(error, StreamOverBudgetError):
+            return "stream_over_budget", {
+                "status": "That's more than I can fit in one request.",
+                "message": (f"{config.error_emoji} **Too Much For One Request**\n\n"
+                            "This channel's history plus what's attached here is larger than I "
+                            "can send in one go, so I stopped rather than answer from part of it. "
+                            "A smaller attachment, or asking in a thread with fewer files, will "
+                            "get through."),
+            }
+        return "history_fetch_failed", {
+            "status": "Couldn't load this channel from Slack.",
+            "message": (f"{config.error_emoji} **Couldn't Load This Channel**\n\n"
+                        "Slack didn't give me this channel's recent history, so I can't answer "
+                        "from a complete picture. Please try again in a moment."),
+        }
+
+    # ------------------------------------------------------------------ channel turn (spec §3)
+
+    async def _build_channel_turn_stream(self, message: Message, client: BaseClient, turn,
+                                         h_pin, thread_config: dict, thread_state):
+        """Steps 3-10: pin the capability profile, build the stream, ingest the origin's side state.
+
+        Steps 4-9 belong to `build_channel_stream` (the snapshot fail-close, the index drain, the
+        one sidecar transaction, the fetch, the serialization, the actor-tail reconcile). What is
+        left here is what a turn knows and the stream builder does not: which capability profile
+        and which tool schemas this build was made against, and where the origin thread's files
+        and people should be registered afterwards.
+        """
+        from message_processor.channel_request import (capability_profile_hash,
+                                                       origin_participants_from_slice,
+                                                       origin_slice_messages, tool_schema_version)
+        from message_processor.channel_snapshots import (PATH_PAGE_CEILING,
+                                                         PATH_SELECTION_REFUSED,
+                                                         REFUSED_RESULTS, RENDERED_RESULTS,
+                                                         SERIALIZER_VERSION)
+        from message_processor.channel_stream import PROD_NAMESPACE, build_channel_stream
+        from slack_client.history_fetch import FetchBudget
+
+        team_id = getattr(client, "self_team_id", None) or ""
+        coordinator = getattr(self, "snapshot_coordinator", None)
+
+        # ---- plan §1a, in this exact order, and all of it BEFORE any Slack fetch --------------
+        # 1. H and the admission frontier are already pinned by the caller.
+        # 2. Drain mutation and index tickets TO THAT FRONTIER. THE ACTIVE POINTER IS NEVER
+        #    CONSULTED BEFORE THIS DRAIN: an observation still in flight would otherwise reach the
+        #    pointer after the turn had already read it, and the turn would render from a
+        #    generation a durable decision had condemned a moment earlier. `build_channel_stream`
+        #    drains again as its own step 5 — a drain that has already completed is a no-op wait.
+        # 3. Resolve pending invalidation, so those observations ARE on the pointer.
+        # 4. select_and_pin.
+        # Steps 5 (the one sidecar transaction) and 6 (the fetch) belong to the builder.
+        snapshot = None
+        selection: dict = {"result": "genesis"}
+        if coordinator is not None:
+            await admission_watermark.drain(
+                message.channel_id, h_pin.frontier,
+                timeout=getattr(config, "index_drain_timeout_seconds", None))
+            await coordinator.resolve_pending_invalidation(
+                team_id, message.channel_id, namespace=PROD_NAMESPACE)
+            selection = await coordinator.select_and_pin(
+                team_id, message.channel_id, SERIALIZER_VERSION, max_boundary=h_pin.h,
+                namespace=PROD_NAMESPACE)
+            turn.snapshot_selection = selection.get("result")
+            if selection.get("result") in RENDERED_RESULTS:
+                snapshot = selection.get("snapshot")
+                # The pin the outer finally releases. Set ONLY for a result we render from:
+                # select_and_pin pins nothing else, so a lease here would be an unbalanced unpin.
+                turn.snapshot_lease = selection.get("snapshot_id")
+            elif selection.get("result") in REFUSED_RESULTS:
+                # NEVER handed to the builder. These two retain their identity for telemetry and
+                # for the publication CAS, and they trigger recompaction — they are not something
+                # to render, and the turn below fails closed on the unresolved pointer.
+                self._trigger_compaction(message, turn, team_id=team_id,
+                                         path=PATH_SELECTION_REFUSED,
+                                         reason=selection.get("result"), h=h_pin.h)
+            # `no_eligible_generation` and `genesis` both render with NO summary block: the
+            # channel's generations all sit above THIS turn's ceiling, which is a fact about H,
+            # not about the snapshots. Nothing is recompacted — nothing here is invalid.
+
+        registry = getattr(client, "tool_registry", None)
+        # Held by the caller so a page-ceiling failure is distinguishable from any other fetch
+        # failure by the BUDGET rather than by a string match on the error.
+        budget = FetchBudget()
+        try:
+            stream = await self._channel_stream_call(
+                build_channel_stream, message, client, turn, h_pin, thread_config, registry,
+                team_id=team_id, snapshot=snapshot, budget=budget,
+                capability_profile_hash=capability_profile_hash,
+                tool_schema_version=tool_schema_version, namespace=PROD_NAMESPACE)
+        except HistoryFetchError:
+            # §1m PATH 3 — the page ceiling, before any estimate exists. Distinguished by the
+            # BUDGET this caller holds, not by the error text: every other HistoryFetchError is a
+            # Slack problem a background crawl cannot fix, and enqueueing one for those would spend
+            # a crawl per rate-limit. This turn fails closed either way; the crawl is what makes
+            # the NEXT one able to succeed, and it is also how C05 recovery starts (R0-5).
+            if budget.pages_used >= int(getattr(config, "history_page_ceiling", 0) or 0) > 0:
+                self._trigger_compaction(message, turn, team_id=team_id,
+                                         path=PATH_PAGE_CEILING, reason="page_ceiling",
+                                         h=h_pin.h)
+            raise
+        turn.channel_stream = stream
+        turn.stream_build_present = True
+        self.log_info(
+            f"Channel stream for {message.channel_id}: {stream.message_count} message(s), "
+            f"{stream.byte_count} bytes, H={stream.pinned.H}, "
+            f"floor={stream.pinned.floor_ts} (inclusive={stream.pinned.floor_inclusive})")
+
+        # Step 10 — the origin thread's side state, from the pinned stream rather than a refetch.
+        slice_messages = origin_slice_messages(stream, message.thread_id)
+        actor_names = stream.pinned.actor_names
+        await self.ingest_channel_origin_slice(
+            thread_state, slice_messages, pinned_sidecars=stream.pinned.sidecars, db=self.db,
+            actor_names=actor_names)
+        turn.channel_origin_participants = origin_participants_from_slice(
+            slice_messages, actor_names)
+        return stream
+
+    async def _channel_stream_call(self, build_channel_stream, message: Message,
+                                   client: BaseClient, turn, h_pin, thread_config: dict,
+                                   registry, *, team_id: str, snapshot, budget,
+                                   capability_profile_hash, tool_schema_version,
+                                   namespace: str):
+        """The builder call itself, kept whole so the page-ceiling guard above stays readable."""
+        return await build_channel_stream(
+            client=client, db=self.db,
+            team_id=team_id,
+            channel_id=message.channel_id,
+            h=h_pin.h, frontier=h_pin.frontier,
+            namespace=namespace, snapshot=snapshot, budget=budget,
+            capability_profile_hash=capability_profile_hash(thread_config),
+            # The MCP manager is part of the effective tool surface, so the digest that claims to
+            # identify this build's tools has to see it.
+            tool_schema_version=tool_schema_version(registry, thread_config,
+                                                    mcp_manager=getattr(self, "mcp_manager", None)),
+            drain_timeout=getattr(config, "index_drain_timeout_seconds", None),
+            barrier_context={"turn_id": getattr(turn, "turn_id", None),
+                             "trigger_ts": (message.metadata or {}).get("ts")},
+            # CV8 stream_render joins to its turn by these three; the builder knows the window
+            # and the hashes, and nothing else about whose turn it is.
+            turn_id=getattr(turn, "turn_id", None),
+            origin_thread_ts=message.thread_id,
+            trigger_ts=(message.metadata or {}).get("ts"),
+            selection_result=getattr(turn, "snapshot_selection", None))
+
+    # ------------------------------------------------------ compaction triggers (plan §1m)
+
+    def _trigger_compaction(self, message: Message, turn, *, team_id: str, path: int,
+                            reason: Optional[str] = None, h: Optional[str] = None,
+                            evidence=None) -> None:
+        """Hand ONE trigger to the coordinator. Background, and it returns immediately.
+
+        SAME-TURN COMPACTION DOES NOT EXIST: no turn awaits a compaction, re-pins a winner under
+        its original H, or rebuilds its stream. The guarantee is the first turn AFTER SUCCESSFUL
+        PUBLICATION, not "the next turn" — a turn admitted while the crawl is still running fails
+        exactly as the triggering one did, and on a large channel that may be several turns.
+        """
+        coordinator = getattr(self, "snapshot_coordinator", None)
+        if coordinator is None:
+            return
+        try:
+            payload = {"reason": reason, "h": h}
+            if evidence is not None:
+                # Path 2 carries REAL admission components, so its crawl records
+                # headroom_source='measured' and owes no revalidation. Path 3 has none and falls
+                # back to the fixed heuristic, which is made safe by a recorded obligation.
+                payload["headroom_tokens"] = int(evidence.fixed_tokens)
+                payload["sizing_profile"] = evidence.sizing_profile
+            coordinator.trigger(team_id=team_id, channel_id=message.channel_id, path=path,
+                                **payload)
+        except Exception as e:  # noqa: BLE001 — a trigger never costs the turn that raised it
+            self.log_warning(f"Compaction trigger {path} not enqueued for "
+                             f"{message.channel_id}: {e}")
+
+    @staticmethod
+    def _compaction_evidence(estimate, *, model: str, h: Optional[str]):
+        """This turn's admission components in the ONE currency (R0-1), frozen onto the turn."""
+        from message_processor.turn_runtime import CompactionEvidence
+        window = int(config.get_model_token_limit(model))
+        return CompactionEvidence(
+            model=str(model), window=window,
+            trigger_tokens=int(window * config.compaction_trigger_ratio),
+            target_tokens=int(window * config.compaction_target_ratio),
+            sizing_profile=(f"{model}:{window}:{int(window * config.compaction_trigger_ratio)}"
+                            f":{int(window * config.compaction_target_ratio)}"),
+            total_tokens=int(estimate.total_tokens), limit_tokens=int(estimate.limit_tokens),
+            compactable_tokens=int(estimate.compactable_tokens),
+            fixed_tokens=int(estimate.fixed_tokens), admitted=bool(estimate.fits), h=h)
+
+    async def _post_turn_compaction(self, message: Message, turn, *, team_id: str) -> None:
+        """§1m PATH 1, and the fixed-headroom REVALIDATION, once the turn is over.
+
+        The triggering turn has ALREADY COMPLETED NORMALLY — the enqueue is cleanup for next time,
+        which is why it lives here rather than at admission: firing mid-turn would put a background
+        crawl in flight against the very channel the turn is still answering from.
+
+        Revalidation runs here too, and only here: MEASUREMENT HAPPENS UNDER THE CLAIM, and this
+        turn's real admission components are the measurement. A publication made under
+        `headroom_source='fixed'` owes exactly this, and an over-target result — including the band
+        between target and trigger, where the ordinary paths would enqueue nothing — enqueues the
+        recompaction DURABLY before the obligation is closed.
+        """
+        from message_processor.channel_snapshots import PATH_NEAR_TRIGGER
+        coordinator = getattr(self, "snapshot_coordinator", None)
+        evidence = getattr(turn, "compaction_evidence", None)
+        if coordinator is None or evidence is None:
+            return
+        try:
+            pinned = getattr(turn, "snapshot_lease", None)
+            if pinned:
+                snapshot = await coordinator.db.get_snapshot_row_async(pinned)
+                if snapshot:
+                    await coordinator.revalidate(team_id, message.channel_id, snapshot=snapshot,
+                                                 evidence=evidence)
+            if evidence.near_trigger:
+                self._trigger_compaction(message, turn, team_id=team_id,
+                                         path=PATH_NEAR_TRIGGER, reason="near_trigger",
+                                         h=evidence.h, evidence=evidence)
+        except Exception as e:  # noqa: BLE001 — never let cleanup break a turn that succeeded
+            self.log_warning(f"Post-turn compaction step skipped for {message.channel_id}: {e}")
+
+    async def _admit_channel_request(self, message: Message, client: BaseClient, turn,
+                                     thread_state, thread_config: dict,
+                                     thinking_id: Optional[str], *, stream, steering,
+                                     image_inputs: list, file_inputs: list,
+                                     document_inputs: list, batched_image_inputs: list,
+                                     batched_images_omitted: int,
+                                     failed_attachment_names: tuple = ()) -> None:
+        """Step 11's pre-flight: pin the turn's context, ADMIT the request, then summarize.
+
+        The ordering is the whole point [r3-4]. The estimate is the last thing that happens before
+        the first Responses API call of the turn — and the document summarizer IS a Responses API
+        call, so it has to come after. Otherwise a turn that could never have been sent still
+        spends a utility-model call per attached document to find that out.
+
+        Each summary is then capped to what the estimate reserved for that document's raw text: the
+        request was admitted at a size, and a summary is not allowed to exceed it afterwards.
+
+        A catch-up turn's carried documents are finalized here too [r5-2], for the same reason and
+        under the same gate: the queue drain that staged them could not summarize them, because it
+        runs before this turn exists.
+        """
+        from message_processor.channel_request import (ChannelTurnContext, RequesterFacts,
+                                                       build_rehydration_item,
+                                                       canonical_files_from_stream,
+                                                       cohort_sources_from_message,
+                                                       merge_absent_source_files,
+                                                       raise_if_over_budget)
+        from message_processor.channel_snapshots import PATH_OVER_BUDGET
+        from message_processor.channel_stream import StreamOverBudgetError
+
+        meta = message.metadata or {}
+        cohort = cohort_sources_from_message(message)
+        canonical = merge_absent_source_files(
+            canonical_files_from_stream(stream), cohort, message.channel_id)
+        root_author = getattr(thread_state, "root_author", None)
+        root_uid = root_author[0] if isinstance(root_author, (tuple, list)) and root_author else None
+        num_members = None
+        peek = getattr(client, "get_cached_channel_context", None)
+        if callable(peek):
+            try:
+                num_members = (peek(message.channel_id) or {}).get("num_members")
+            except Exception:  # noqa: BLE001 — a member count never costs a turn
+                num_members = None
+
+        # §1k — the origin thread's PRE-BOUNDARY tail, built BEFORE the context because the
+        # context is frozen and the assembler is synchronous: this needs its own bounded fetch,
+        # and the assembler only renders what it is handed. Its receipt/chrome evidence rides on
+        # the stream, from the SAME sidecar transaction the stream was pinned in.
+        #
+        # Only when a snapshot is pinned (there is no pre-boundary tail at genesis) and only for a
+        # threaded origin. Every failure inside is an honest omission item rather than a turn
+        # failure, so the one thing that must hold here is that nothing escapes into the turn.
+        rehydration_item = None
+        if getattr(stream, "boundary_ts", None) and message.thread_id:
+            try:
+                rehydration_item = await build_rehydration_item(
+                    client=client, db=self.db, stream=stream,
+                    origin_thread_ts=message.thread_id,
+                    preboundary_receipts=getattr(stream, "preboundary_receipts", None) or None)
+            except Exception as e:  # noqa: BLE001 — context is never worth a turn
+                self.log_warning(
+                    f"Rehydration for {message.channel_id}/{message.thread_id} not built: {e}")
+
+        ctx = ChannelTurnContext(
+            stream=stream,
+            steering=steering,
+            thread_config=thread_config,
+            channel_id=message.channel_id,
+            team_id=getattr(client, "self_team_id", None) or "",
+            trigger_ts=meta.get("ts"),
+            origin_thread_ts=message.thread_id,
+            trigger_text=message.text or "",
+            trigger_attachment_names=tuple(
+                str(a.get("name") or a.get("filename") or "")
+                for a in (message.attachments or []) if a),
+            failed_attachment_names=tuple(n for n in (failed_attachment_names or ()) if n),
+            image_parts=tuple(image_inputs or ()),
+            file_parts=tuple(file_inputs or ()),
+            document_inputs=tuple(document_inputs or ()),
+            batched_image_parts=tuple(batched_image_inputs or ()),
+            batched_images_omitted=int(batched_images_omitted or 0),
+            cohort_sources=cohort,
+            canonical_files=canonical,
+            origin_participants=dict(getattr(turn, "channel_origin_participants", None) or {}),
+            requester=RequesterFacts(
+                user_id=message.user_id,
+                real_name=meta.get("user_real_name") or meta.get("username"),
+                email=meta.get("user_email"),
+                timezone=meta.get("user_timezone") or "UTC",
+                tz_label=meta.get("user_tz_label"),
+                sender_type=meta.get("sender_type"),
+                is_root_author=(None if not root_uid or not message.user_id
+                                else message.user_id == root_uid)),
+            channel_info=await self._build_channel_info(client, message.channel_id),
+            num_members=num_members,
+            wake_source=meta.get("wake_source"),
+            queued_batch_size=meta.get("queued_batch_size"),
+            rehydration_item=rehydration_item,
+        )
+        turn.channel_turn_context = ctx
+
+        model = effective_request_model(thread_config)
+        request, *_ = await self._assemble_channel_attempt(
+            client, message, thread_state, turn, thread_config, model,
+            thread_key=f"{thread_state.channel_id}:{thread_state.thread_ts}",
+            with_estimate=True)
+        estimate = request.estimate
+        self.log_info(
+            f"Channel request admission for {message.channel_id}: ~{estimate.total_tokens:,} of "
+            f"{estimate.limit_tokens:,} usable input tokens {estimate.breakdown}")
+        # Plan §1m: this turn's own admission components, frozen for the trigger paths. Recorded
+        # BEFORE the refusal below, because the refusal is exactly the case that needs them.
+        turn.compaction_evidence = self._compaction_evidence(estimate, model=model, h=turn.H)
+        try:
+            raise_if_over_budget(estimate, channel_id=str(message.channel_id),
+                                 counted_text=("" if estimate.fits else request.countable_text))
+        except StreamOverBudgetError:
+            # §1m PATH 2 — over budget after a COMPLETE fetch. The turn FAILS CLOSED, honestly,
+            # and the crawl runs in the background with `headroom_source='measured'`: this turn
+            # HAS real admission components, so no heuristic is involved and no revalidation is
+            # owed. Guarded by R0-1: a request pushed over by a 300k-token attachment must not
+            # induce a compaction loop for a cause compaction cannot touch.
+            if estimate.compaction_indicated:
+                self._trigger_compaction(
+                    message, turn, team_id=ctx.team_id, path=PATH_OVER_BUDGET,
+                    reason="over_budget", h=turn.H, evidence=turn.compaction_evidence)
+            raise
+        await self.finalize_deferred_documents(
+            list(document_inputs or []), client, message, thinking_id,
+            reserves=estimate.document_reserves,
+            # CV8: attach-time summarization is a Responses call on this turn, so it needs the
+            # turn's attempt sink or "one model_response per attempt" is false for it.
+            turn=turn,
+        )
+        # [r5-2] And the documents an earlier queued message brought, which the drain staged rather
+        # than summarizing. NO reserve: they are not in this request — the estimate never charged
+        # them — so there is no room to cap their summaries against. What they are here for is the
+        # ledger row that makes read_document/mount_file able to reach them.
+        carried_documents = (message.metadata or {}).get("batched_deferred_documents") or []
+        if carried_documents:
+            await self.finalize_deferred_documents(
+                list(carried_documents), client, message, thinking_id, turn=turn)
+
+    async def _post_failed_files_notice(self, message: Message, client: BaseClient, turn,
+                                        text: str) -> Optional[str]:
+        """"These files failed; I'll do the rest now" — the mixed-attachment notice.
+
+        GUARDED like any first surface: it promises work that takes time, and a newer message
+        during that window must not leave the promise standing on its own.
+
+        Returns the notice's ts, or None if it did not land — which the channel caller feeds to the
+        responder's evidence, since what that evidence may claim depends on it [r4-4].
+        """
+        try:
+            notice_ts = await client.send_message(
+                channel_id=message.channel_id,
+                text=text,
+                thread_id=message.thread_id,
+                lease=getattr(turn, "send_lease", None),
+                surface="failed_files_notice",
+                receipts=getattr(turn, "receipt_ledger", None),
+            )
+            # A notice that LANDED is a visible surface, so the answer belongs with it. Only on a
+            # confirmed send: send_message swallows SlackApiError and returns None. A channel turn
+            # has already settled this before its request was measured [r3-3], and settling is
+            # idempotent, so this is the DM/legacy rule surviving unchanged.
+            if notice_ts and turn is not None:
+                turn.settle_structural_thread()
+            return notice_ts
+        except StaleSendSuppressed:
+            # Not a notice failure: the guard declined to post it. Swallowed here the turn carries
+            # on, and if the responder then ends silently the suppression is never recorded
+            # anywhere — the one outcome that leaves us unable to tell a working guard from a
+            # broken one.
+            raise
+        except Exception as notice_err:  # noqa: BLE001 — never fail the turn over the notice
+            self.log_warning(f"Failed to post mixed-path failed-files notice: {notice_err}")
+            return None
+
+    async def _post_prior_timeout_notice(self, message: Message, client: BaseClient, turn,
+                                         thread_key: str) -> None:
+        """"My last answer never finished" — the recovery notice, wherever the caller runs it.
+
+        GUARDED like any first surface. This notice is the turn's first visible words and real work
+        follows it, so without the lease a newer message could leave "picking up from here" sitting
+        alone in the thread. Notices were never exempt: the exemption is for CHROME (a thinking
+        bubble), and this is prose.
+        """
+        notice_ts = await client.send_message(
+            channel_id=message.channel_id,
+            text="⚠️ Heads up — my last answer in this thread never finished. Picking up from here.",
+            thread_id=message.thread_id,
+            lease=getattr(turn, "send_lease", None),
+            surface="prior_timeout_notice",
+            receipts=getattr(turn, "receipt_ledger", None),
+        )
+        # A notice that LANDED is a visible surface in the thread, so the answer belongs with it —
+        # settle the destination there. Only on a confirmed send: send_message swallows
+        # SlackApiError and returns None, and settling on a notice nobody saw would silently
+        # withhold the destination choice and force the reply into a thread for no reason the user
+        # could observe.
+        if notice_ts and turn is not None:
+            turn.settle_structural_thread()
+        if notice_ts:
+            self.log_info(f"Notified user about previous timeout in thread {thread_key}")
+        else:
+            # send_message swallows SlackApiError and returns None. Logging the send as a
+            # notification hid the one path where the user is told nothing at all [r4-7].
+            self.log_warning(f"Prior-timeout notice for thread {thread_key} did not post; the turn "
+                             "continues, but nobody was told the last answer never finished")
+
     async def _notify_drain_failure(self, message: Message, client: BaseClient, thread_key: str):
         """Queued messages were silently accepted — their senders must not get
         silence when the catch-up turn dies. Flag a transcript refetch so context
@@ -874,7 +1524,8 @@ class MessageProcessor(ThreadManagementMixin,
         try:
             await client.send_message_async(
                 message.channel_id, message.thread_id,
-                "⚠️ I hit an error catching up on the last few messages — please re-send."
+                "⚠️ I hit an error catching up on the last few messages — please re-send.",
+                receipt_kind="finalized",
             )
         except Exception as notify_error:
             self.log_error(f"Failed to post drain-failure notice for {thread_key}: {notify_error}")
@@ -1065,6 +1716,14 @@ class MessageProcessor(ThreadManagementMixin,
         # their catalogued description), failures so a dropped file is acknowledged.
         batched_image_inputs: list = []
         batched_unsupported_files: list = []
+        # [r5-2] A CHANNEL catch-up may not spend a single Responses call before its turn is
+        # admitted, and BOTH of the batch's attachment side effects are Responses calls: the
+        # document summary and the image description. So on a channel batch they are staged here
+        # and carried into the admitted turn, which runs them once the request has been measured
+        # and accepted. A DM has no admission step, so it keeps running both inline, verbatim.
+        channel_batch = TextHandlerMixin._turn_surface(finished_message) == SURFACE_CHANNEL
+        batched_deferred_documents: list = []
+        batched_catalog_groups: list = []
         if len(batch) > 1:
             # Append the earlier messages to warm state now (we hold the lock, the
             # state is current). The trigger message is NOT appended — its own turn
@@ -1086,6 +1745,7 @@ class MessageProcessor(ThreadManagementMixin,
                         user_id=finished_message.user_id,
                         db=self.db,
                         channel_id=finished_message.channel_id,
+                        channel_turn=channel_batch,
                     )
                     batch_ci_enabled = batch_thread_config.get(
                         'enable_code_interpreter', config.enable_code_interpreter)
@@ -1099,15 +1759,29 @@ class MessageProcessor(ThreadManagementMixin,
                         if queued_msg.attachments:
                             q_image_inputs, q_document_inputs, q_unsupported = await self._process_attachments(
                                 queued_msg, client,
-                                code_interpreter_enabled=batch_ci_enabled)
+                                code_interpreter_enabled=batch_ci_enabled,
+                                defer_document_summaries=channel_batch)
                             if q_document_inputs:
-                                content = self._build_message_with_documents(content, q_document_inputs)
+                                if channel_batch:
+                                    # Staged, not summarized [r5-2]. The fold is skipped with it:
+                                    # what it would render now is an excerpt (there is no summary
+                                    # yet), into ThreadState.messages — a list the channel request
+                                    # never sends. The document's real destination is its ledger
+                                    # row, and that is written when the turn finalizes it.
+                                    batched_deferred_documents.extend(q_document_inputs)
+                                else:
+                                    content = self._build_message_with_documents(content, q_document_inputs)
                             if q_image_inputs:
                                 # Catalogue a durable description AND carry the raw parts to the
                                 # trigger turn so the model actually sees the images (T2-10).
-                                self._schedule_async_call(image_catalog.catalog_uploads(
-                                    self, thread_key, q_image_inputs,
-                                    (queued_msg.metadata or {}).get("ts")))
+                                if channel_batch:
+                                    batched_catalog_groups.append(
+                                        ((queued_msg.metadata or {}).get("ts"),
+                                         list(q_image_inputs)))
+                                else:
+                                    self._schedule_async_call(image_catalog.catalog_uploads(
+                                        self, thread_key, q_image_inputs,
+                                        (queued_msg.metadata or {}).get("ts")))
                                 batched_image_inputs.extend(q_image_inputs)
                             if q_unsupported:
                                 batched_unsupported_files.extend(q_unsupported)
@@ -1129,6 +1803,24 @@ class MessageProcessor(ThreadManagementMixin,
             trigger.metadata["batched_image_inputs"] = batched_image_inputs
         if batched_unsupported_files:
             trigger.metadata["batched_unsupported_files"] = batched_unsupported_files
+        # [r5-2] The two Responses calls this drain refused to make. The catch-up turn runs them
+        # once its request has been admitted; if admission refuses it, they never run at all —
+        # which is the contract, not a gap: a refused turn must not have spent anything.
+        if batched_deferred_documents:
+            trigger.metadata["batched_deferred_documents"] = batched_deferred_documents
+        if batched_catalog_groups:
+            trigger.metadata["batched_catalog_uploads"] = batched_catalog_groups
+        # [r6-3] The FILE payloads of the absorbed messages. Slack may not have propagated them
+        # into the window this turn fetches, and a cohort member the fetch missed would then have
+        # its question answered with its own attachment unreadable — so the ids are carried off the
+        # live events we are already holding and merged into the turn's canonical files. Channel
+        # only: nothing on a DM turn reads them.
+        if channel_batch and len(batch) > 1:
+            from message_processor.channel_request import stage_cohort_file_payloads
+            stage_cohort_file_payloads(
+                trigger.metadata,
+                [((queued_msg.metadata or {}).get("ts"), queued_msg.attachments or [])
+                 for queued_msg in batch[:-1]])
 
         self.log_info(f"Draining {len(batch)} queued message(s) on {thread_key} into one catch-up turn")
         self._schedule_async_call(handler(trigger, client))
@@ -1136,6 +1828,13 @@ class MessageProcessor(ThreadManagementMixin,
     async def cleanup(self):
         """Clean up resources and close clients."""
         self.log_info("Cleaning up MessageProcessor resources...")
+        # Spec §5: the generic background set holds receipt-producing work (image share
+        # resolution), so it goes first — and main.py drains it again, earlier, so that work
+        # cannot outlive the receipt service. Idempotent: a drained set is a no-op.
+        try:
+            await self.drain_background_tasks()
+        except Exception as e:  # noqa: BLE001
+            self.log_debug(f"Background task drain error: {e}")
         # F51: drain the ambient service FIRST — its workers call the OpenAI client + DB, so it
         # must finish (or be cancelled) before the client is closed under it.
         if getattr(self, "ambient_service", None):

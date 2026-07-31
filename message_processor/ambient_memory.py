@@ -144,8 +144,8 @@ def _fresh_after(days: int) -> Optional[str]:
 
 
 def render_artifact_note(art: Dict[str, Any], *, max_chars: int = 400) -> str:
-    """Deterministic, sanitized inline note for a READY artifact — the same string used in the
-    pulse and in thread-history context. Contains NO volatile fetched_at text (cache stability)."""
+    """Deterministic, sanitized inline note for a READY artifact — the same string the channel
+    stream and thread-history context render. NO volatile fetched_at text (cache stability)."""
     kind = art.get("kind")
     title = sanitize_summary(art.get("title"), max_chars=120)
     summary = sanitize_summary(art.get("summary"), max_chars=max_chars)
@@ -187,10 +187,9 @@ class AmbientArtifactService:
     """Bounded-queue ingestion service for ambient artifacts. Loop-affine (single asyncio loop);
     all shared state is plain dict/set touched only on that loop."""
 
-    def __init__(self, *, db, openai_client, channel_pulse=None, cfg=config):
+    def __init__(self, *, db, openai_client, cfg=config):
         self.db = db
         self.openai_client = openai_client
-        self.channel_pulse = channel_pulse
         self.config = cfg
         self._client = None                      # Slack client, captured at first offer
         self._queues: Dict[str, asyncio.Queue] = {}
@@ -305,8 +304,6 @@ class AmbientArtifactService:
             if not self.config.enable_ambient_memory:
                 return
             self._client = client or self._client
-            if self.channel_pulse is None and client is not None:
-                self.channel_pulse = getattr(client, "channel_pulse", None)
             if not self._started:
                 self.start()
                 if not self._started:
@@ -807,11 +804,10 @@ class AmbientArtifactService:
                 logger.debug(f"ambient image catalog dual-write failed: {e}")
         art = {"kind": kind, "title": title, "summary": summary,
                "derivation_source": derivation_source}
-        self._patch_pulse(job, art)
-        # F51c: if this artifact's source message was ALREADY folded into the thread's
-        # compaction summary, the pulse patch above is not enough — the thread's rebuilt
-        # context can never see it (the message is gone from the tail, the summary was
-        # written without this note). Persist a late addendum the rebuild folds onto the head.
+        # F51c: if this artifact's source message was ALREADY folded into the thread's compaction
+        # summary, the stream's own sidecar render can never reach it (the message is gone from
+        # the tail, the summary was written without this note). Persist a late addendum the
+        # rebuild folds onto the head.
         await self._record_late_addendum(job, art)
 
     async def _fail(self, job: _Job, kind: str, error_code: str, *, status: str = "failed",
@@ -830,7 +826,7 @@ class AmbientArtifactService:
 
         No-op when the message is still in the live tail (source_ts > boundary): the normal
         batch-load renders the note there, so adding an addendum too would double-describe it.
-        Parity with the pulse/batch-load dedupe: an unfurl-sourced note is F48's Slack preview,
+        Parity with the batch-load dedupe: an unfurl-sourced note is F48's Slack preview,
         already owned by that path — never re-describe it here. Idempotent + bounded in the DB
         layer, so a race with the compaction-time capture can't double-record or bloat."""
         if not self.db or not hasattr(self.db, "get_thread_summary_async"):
@@ -881,19 +877,3 @@ class AmbientArtifactService:
                 tm.mark_needs_refresh(thread_key)
         except Exception as e:  # noqa: BLE001
             logger.debug(f"ambient thread refresh mark failed for {thread_key}: {e}")
-
-    def _patch_pulse(self, job: _Job, art: Dict[str, Any]) -> None:
-        pulse = self.channel_pulse
-        if pulse is None or not hasattr(pulse, "upsert_artifacts"):
-            return
-        # Dedupe against F48: an unfurl fallback is the SAME Slack preview F48 already rendered
-        # into this message's pulse text (extract_supplementary_text). Rendering it again as an
-        # artifact double-describes the link, so an unfurl-sourced note is not patched in.
-        if art.get("derivation_source") == "unfurl":
-            return
-        try:
-            note = render_artifact_note(art)
-            if note:
-                pulse.upsert_artifacts(job.channel_id, job.source_ts, [note])
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"ambient pulse upsert failed: {e}")

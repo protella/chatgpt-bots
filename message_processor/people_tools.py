@@ -4,8 +4,8 @@ Two thin, read-only tools over Slack's own profile data — Slack is the source 
 truth for who people are (no new people table; see the F29 design notes):
 
 - ``lookup_user`` — resolve a workspace member from a Slack id, an @name, or a
-  display/real name seen ANYWHERE in context (chat, the "Channel people" line, a
-  roster, channel memory), then return FRESH profile facts from users.info.
+  display/real name seen ANYWHERE in context (chat, the mention roster, channel
+  memory), then return FRESH profile facts from users.info.
 - ``list_channel_members`` — the CURRENT channel's roster (names + total count),
   capped with a LOUD truncation note so a big channel never silently lies.
 
@@ -59,9 +59,9 @@ def get_lookup_user_schema() -> Dict[str, Any]:
             "Look up a workspace member's profile — real name, title, status, timezone, email, "
             "and whether they're a bot. Use it whenever someone asks who a person is, "
             "or about their role, title, timezone, or status. You do NOT need a Slack id: ANY "
-            "name you've seen is enough — a name in chat, in the 'Channel people' line, in a "
-            "participant roster, or in channel memory. Pass what you have as `user` (a Slack id "
-            "like U012ABC, an @name, or a display/real name) and this resolves it to FRESH data."
+            "name you've seen is enough — a name in chat, in the mention roster, or in channel "
+            "memory. Pass what you have as `user` (a Slack id like U012ABC, an @name, or a "
+            "display/real name) and this resolves it to FRESH data."
         ),
         "parameters": {
             "type": "object",
@@ -69,7 +69,7 @@ def get_lookup_user_schema() -> Dict[str, Any]:
                 "user": {
                     "type": "string",
                     "description": "A Slack user id (U012ABC), an @name, or a display/real name "
-                                   "seen anywhere in chat, a people line, a roster, or channel memory.",
+                                   "seen anywhere in chat, the mention roster, or channel memory.",
                 },
             },
             "required": ["user"],
