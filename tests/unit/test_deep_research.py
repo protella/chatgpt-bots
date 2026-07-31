@@ -25,6 +25,7 @@ class _FakeClient:
         self.fail_username = fail_username
 
     async def send_message(self, channel_id, thread_id, text, blocks=None, lease=None, surface=None,
+                           receipts=None, receipt_kind=None,
                            meta_out=None, username=None):
         if username and self.fail_username:
             return None  # simulate missing_scope → send_message returns None
@@ -108,13 +109,14 @@ class _CardClient(_FakeClient):
         self.card_username_fails = card_username_fails
         self._card_ts = card_ts
 
-    async def post_status_card(self, channel_id, thread_id, text, blocks, username=None):
+    async def post_status_card(self, channel_id, thread_id, text, blocks, username=None,
+                               receipts=None):
         if username and self.card_username_fails:
             return None
         self.card_posts.append((channel_id, thread_id, text, blocks, username))
         return self._card_ts
 
-    async def update_status_card(self, channel_id, ts, text, blocks):
+    async def update_status_card(self, channel_id, ts, text, blocks, receipts=None):
         self.card_updates.append((channel_id, ts, text, blocks))
         return True
 
@@ -445,6 +447,7 @@ async def test_failed_findings_post_posts_failure_note(monkeypatch):
 
     class _FailingThenNoteClient(_FakeClient):
         async def send_message(self, channel_id, thread_id, text, blocks=None, lease=None, surface=None,
+                               receipts=None, receipt_kind=None,
                                meta_out=None, username=None):
             if "hit a wall" not in text:
                 return None  # the findings post itself fails
@@ -1542,6 +1545,7 @@ async def test_a_published_chart_does_not_count_as_the_findings(monkeypatch):
 
     class _ReportFailsOnce(_CardClient):
         async def send_message(self, channel_id, thread_id, text, blocks=None, lease=None, surface=None,
+                               receipts=None, receipt_kind=None,
                                meta_out=None, username=None):
             if "# Findings" in text:
                 posts["n"] += 1
@@ -1574,6 +1578,7 @@ async def test_a_cheerful_reply_cannot_mask_a_lost_report(monkeypatch):
 
     class _ReportAlwaysFails(_CardClient):
         async def send_message(self, channel_id, thread_id, text, blocks=None, lease=None, surface=None,
+                               receipts=None, receipt_kind=None,
                                meta_out=None, username=None):
             if "# Findings" in text:
                 return None

@@ -473,6 +473,7 @@ async def publish_artifacts(
     ledger_key: Optional[str] = None,
     suppress_digests: Optional[Iterable[str]] = None,
     expect_filenames: Optional[Iterable[str]] = None,
+    receipts: Any = None,
 ) -> List[Dict[str, Any]]:
     """Publish everything the model wrote THIS turn. Returns the published descriptors.
 
@@ -509,7 +510,8 @@ async def publish_artifacts(
                 thread_id=thread_id, thread_key=thread_key, container_ids=container_ids,
                 db=db, message_ts=message_ts, container_manager=container_manager,
                 ledger_key=ledger, suppress_digests=set(suppress_digests or ()),
-                expect_filenames=[f.lower() for f in (expect_filenames or ())])
+                expect_filenames=[f.lower() for f in (expect_filenames or ())],
+                receipts=receipts)
     finally:
         release_publication_lock(ledger)
 
@@ -869,6 +871,7 @@ async def _upload_candidates(
     message_ts: Optional[str],
     container_manager: Any,
     ledger_key: str,
+    receipts: Any = None,
     skipped: int = 0,
 ) -> List[Dict[str, Any]]:
     """Phase 3: upload the selected files to Slack and persist their refs.
@@ -892,6 +895,7 @@ async def _upload_candidates(
             upload = await client.send_file(
                 channel_id=channel_id, thread_id=thread_id,
                 file_data=io.BytesIO(data), filename=filename,
+                receipts=receipts,
             )
         except Exception as e:  # noqa: BLE001 — publish_artifacts must never raise
             logger.warning(f"Artifact upload raised for {filename}: {e}")
@@ -944,6 +948,7 @@ async def _publish_locked(
     ledger_key: str,
     suppress_digests: set,
     expect_filenames: List[str],
+    receipts: Any = None,
 ) -> List[Dict[str, Any]]:
     """The publication body — gather, select, upload. Runs under the publication latch."""
     candidates, skipped = await _gather_candidates(
@@ -957,7 +962,8 @@ async def _publish_locked(
     return await _upload_candidates(
         accepted, client=client, channel_id=channel_id, thread_id=thread_id,
         thread_key=thread_key, db=db, message_ts=message_ts,
-        container_manager=container_manager, ledger_key=ledger_key, skipped=skipped)
+        container_manager=container_manager, ledger_key=ledger_key, receipts=receipts,
+        skipped=skipped)
 
 
 # --- F37: staged publication (background jobs) ----------------------------------------------
@@ -1056,6 +1062,7 @@ async def publish_staged(
     message_ts: Optional[str] = None,
     container_manager: Any = None,
     ledger_key: str,
+    receipts: Any = None,
 ) -> List[Dict[str, Any]]:
     """Upload the staged artifacts the model asked for, in the order it asked for them.
 
@@ -1088,7 +1095,8 @@ async def publish_staged(
             return await _upload_candidates(
                 chosen, client=client, channel_id=channel_id, thread_id=thread_id,
                 thread_key=thread_key, db=db, message_ts=message_ts,
-                container_manager=container_manager, ledger_key=ledger_key)
+                container_manager=container_manager, ledger_key=ledger_key,
+                receipts=receipts)
     except Exception as e:  # noqa: BLE001
         logger.error(f"Staged publication failed for {ledger_key}: {e}", exc_info=True)
         return []

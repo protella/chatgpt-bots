@@ -20,6 +20,7 @@ import pytest
 
 from config import config
 from message_processor.base import MessageProcessor
+from message_processor.handlers.text import is_dm_channel
 from message_processor.turn_runtime import TurnRuntime
 from streaming import NativeStreamCoordinator  # noqa: F401  (imported by the handler)
 
@@ -112,7 +113,8 @@ class FakeSlack:
         return FakeNativeSession(self, channel, thread)
 
     # -- writes
-    async def send_message_get_ts(self, channel, thread, text, lease=None, surface=None):
+    async def send_message_get_ts(self, channel, thread, text, lease=None, surface=None,
+                                  receipts=None, receipt_kind=None):
         if lease is not None:
             lease.authorize(surface or "legacy_seed")
         if self.refuse_post:
@@ -125,35 +127,48 @@ class FakeSlack:
     MAX_MESSAGE_LENGTH = 3900
 
     async def send_message(self, channel, thread, text, blocks=None, meta_out=None,
-                           username=None, lease=None, surface=None):
+                           username=None, lease=None, surface=None, receipts=None,
+                           receipt_kind=None, on_first_accept=None):
         """Splits like the real client, and returns the FIRST chunk's ts (or None on failure —
         the real one swallows SlackApiError, which is exactly the silent-loss hole).
 
         The stale guard runs BEFORE the post and OUTSIDE the failure path, exactly as the real
-        one does: a suppression is not a failed send."""
+        one does: a suppression is not a failed send. `on_first_accept` and the delivery report
+        also mirror it, so a caller's destination bookkeeping is exercised here rather than only
+        against the real transport."""
         if lease is not None:
             lease.authorize(surface or "final_post")
         if self.refuse_post:
             return None   # a real failure leaves the lease PENDING, so a retry rechecks
         first = None
+        parts = 0
         for i in range(0, len(text), self.MAX_MESSAGE_LENGTH):
             ts = self._mint("post")
             self.calls.append(("postMessage", ts))
             self._write(ts, text[i:i + self.MAX_MESSAGE_LENGTH])
+            parts += 1
             if first is None:
                 first = ts
                 if lease is not None:
                     lease.commit()   # mirrors the real client: commit on the FIRST landed chunk
+                if on_first_accept is not None:
+                    on_first_accept(ts)
+        if first and meta_out is not None:
+            from slack_client.messaging import Delivery
+            meta_out["delivery"] = Delivery(
+                first_ts=first, text=text, complete=True, parts_delivered=parts,
+                parts_total=parts, split=parts > 1)
         return first
 
-    async def update_message(self, channel, ts, text):
+    async def update_message(self, channel, ts, text, receipts=None, receipt_kind=None):
         if ts not in self.live:
             return False
         self.calls.append(("update", ts))
         self._write(ts, text)
         return True
 
-    async def update_message_streaming(self, channel, ts, text, lease=None, surface=None):
+    async def update_message_streaming(self, channel, ts, text, lease=None, surface=None,
+                                       receipts=None):
         if lease is not None:
             lease.authorize(surface or "legacy_update")
         if ts not in self.live:
@@ -177,9 +192,6 @@ class FakeSlack:
 
     async def set_assistant_status(self, channel, thread, status=""):
         self.calls.append(("setStatus", status))
-
-    def _record_own_reply_pulse(self, *a, **k):
-        pass
 
     # -- assertions
     @property
@@ -294,7 +306,28 @@ def _channel_turn(message):
     return turn
 
 
+def _pin_channel(processor, message, turn):
+    """What base.py pins before a CHANNEL turn reaches the handlers (spec §3).
+
+    The assembler refuses an unpinned channel turn, so every test that drives a handler on a C*
+    id has to supply the window Slack and the DB would have supplied. The tools half is taken
+    from whatever this test's `_materialize_request_tools` mock returns, so a plain processor
+    still gets no local tools and `_processor_tools` still gets its registry.
+    """
+    from tests.unit.channel_turn_harness import pin_channel_turn
+
+    if is_dm_channel(message.channel_id):
+        return None
+    prepared = (*processor._materialize_request_tools(None, {}, message, False, turn), None)
+    meta = message.metadata or {}
+    return pin_channel_turn(
+        turn, channel_id=message.channel_id, trigger_ts=meta.get("ts"),
+        origin_thread_ts=message.thread_id, trigger_text=message.text or "",
+        prepared=prepared)
+
+
 async def _run(processor, slack, message, thread_state, turn, thinking_id=None):
+    _pin_channel(processor, message, turn)
     return await processor._handle_streaming_text_response(
         "hi", thread_state, slack, message, thinking_id, None, turn=turn)
 
@@ -566,11 +599,14 @@ class _FooterSlack(FakeSlack):
              "text": {"type": "plain_text", "text": f"⚙️ {model}"}}]}]
 
     async def send_message(self, channel, thread, text, blocks=None, meta_out=None,
-                           username=None, lease=None, surface=None):
+                           username=None, lease=None, surface=None, receipts=None,
+                           receipt_kind=None, on_first_accept=None):
         if meta_out is not None:
             meta_out["footer_attached"] = bool(blocks)
         return await FakeSlack.send_message(self, channel, thread, text, blocks=blocks,
-                                            lease=lease, surface=surface)
+                                            meta_out=meta_out, lease=lease, surface=surface,
+                                            receipts=receipts, receipt_kind=receipt_kind,
+                                            on_first_accept=on_first_accept)
 
 
 @pytest.mark.asyncio

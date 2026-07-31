@@ -148,6 +148,22 @@ def catalog_lines(entries: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+EVIDENCE_HEADER = "Images in this thread (edit_image / view_image ids):"
+
+
+def catalog_evidence_lines(entries: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+    """The image section of a channel turn's tool-evidence block, one entry per line.
+
+    Same text the edit/view schemas used to carry, moved out of the cached prefix. An empty
+    catalog is stated rather than omitted: the tools are on the channel surface either way, and
+    "there are none" is the fact that stops the model naming one.
+    """
+    entries = entries or []
+    if not entries:
+        return [EVIDENCE_HEADER, "(none)"]
+    return [EVIDENCE_HEADER] + catalog_lines(entries).split("\n")
+
+
 async def catalog_uploads(processor, thread_key: str, image_inputs: List[Dict[str, Any]],
                           message_ts: Optional[str] = None) -> None:
     """Store a canonical visual description for each image the user just uploaded.

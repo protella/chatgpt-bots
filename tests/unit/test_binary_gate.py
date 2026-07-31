@@ -504,51 +504,136 @@ class TestGateCaller:
 # --------------------------------------------------------------------------- responder input
 
 class TestCohortBecomesInput:
-    def _proc(self):
-        from message_processor.utilities import MessageUtilitiesMixin
+    """The cohort still reaches the model — as evidence, not as forged history.
 
-        proc = MessageUtilitiesMixin.__new__(type("P", (MessageUtilitiesMixin,), {}))
-        proc.log_debug = lambda *a, **k: None
-        added = []
-        proc._add_message_with_token_management = (
-            lambda state, role, content, **kw: added.append((role, content, kw)))
-        return proc, added
+    It used to be written into `ThreadState.messages` as synthetic user turns. A channel turn does
+    not send that list any more: every burst member Slack propagated is in the stream with its own
+    real header, and only the ones that arrived too late to be fetched are quoted back."""
 
-    def _state(self, messages=None):
-        return SimpleNamespace(messages=list(messages or []))
+    def _ctx(self, msg, *, stream_has=()):
+        from message_processor import channel_request
+        from tests.unit.channel_turn_harness import normalized, pin_channel_turn
+        from message_processor.turn_runtime import TurnRuntime
 
-    def test_earlier_sources_become_real_user_messages(self):
-        proc, added = self._proc()
+        turn = TurnRuntime()
+        messages = [normalized(ts, f"stream copy of {ts}") for ts in stream_has]
+        return pin_channel_turn(
+            turn, messages=messages or [normalized("3.0", "anyone looking?")],
+            trigger_ts="3.0",
+            cohort_sources=channel_request.cohort_sources_from_message(msg))
+
+    def test_earlier_sources_are_quoted_as_awaiting_stream_evidence(self):
+        from message_processor.channel_request import build_cohort_fallback
+
         msg = SimpleNamespace(metadata={"ts": "3.0", "gate_sources": (
             _source(ts="1.0", text="the build is red", sender_name="Peter"),
             _source(ts="3.0", text="anyone looking?", sender_name="Peter"))})
-        assert proc._merge_gate_cohort(msg, self._state()) == 1
-        role, content, kw = added[0]
-        assert role == "user"
-        assert "Peter: the build is red" in content
-        assert kw["message_ts"] == "1.0"
-        # The trigger itself is NOT merged — it is this turn's own user message.
-        assert all("anyone looking?" not in c for _, c, _ in added)
+        block = build_cohort_fallback(self._ctx(msg))
+        assert block["role"] == "user"          # somebody's words, never developer voice
+        assert "Peter (ts=1.0): the build is red" in block["content"]
+        # The trigger itself is not "also" anything — it is what this turn is answering.
+        assert "anyone looking?" not in block["content"]
 
-    def test_a_source_already_in_history_is_not_shown_twice(self):
-        proc, added = self._proc()
-        state = self._state([{"role": "user", "content": "x", "metadata": {"ts": "1.0"}}])
+    def test_a_source_the_stream_already_contains_is_not_quoted_twice(self):
+        from message_processor.channel_request import build_cohort_fallback
+
         msg = SimpleNamespace(metadata={"ts": "3.0", "gate_sources": (
-            _source(ts="1.0", text="already rebuilt"),)})
-        assert proc._merge_gate_cohort(msg, state) == 0
-        assert added == []
+            _source(ts="1.0", text="already fetched"),)})
+        assert build_cohort_fallback(self._ctx(msg, stream_has=("1.0", "3.0"))) is None
 
-    def test_attachments_are_named_in_the_merged_content(self):
-        proc, added = self._proc()
+    def test_attachments_are_named_in_the_quoted_source(self):
+        from message_processor.channel_request import build_cohort_fallback
+
         msg = SimpleNamespace(metadata={"ts": "3.0", "gate_sources": (
             _source(ts="1.0", text="", sender_name="Peter",
                     attachments=("chart.png (image)",)),)})
-        proc._merge_gate_cohort(msg, self._state())
-        assert "[attached: chart.png (image)]" in added[0][1]
+        assert "[attached: chart.png (image)]" in build_cohort_fallback(self._ctx(msg))["content"]
 
     def test_no_cohort_is_a_noop(self):
-        proc, added = self._proc()
-        assert proc._merge_gate_cohort(SimpleNamespace(metadata={}), self._state()) == 0
+        from message_processor.channel_request import build_cohort_fallback
+
+        assert build_cohort_fallback(self._ctx(SimpleNamespace(metadata={}))) is None
+
+    def test_the_reader_turns_a_staged_payload_into_an_authorized_file(self):
+        """[r4-4] The READER half, with the metadata hand-written: given a staged payload, the
+        FileRef is built and the id lands in the turn's canonical catalog. Who stages it is a
+        separate question, answered on the production path — the gate stamps its own cohort's
+        payloads (`test_a_superseded_arrivals_file_is_staged_by_the_gate_itself` below) and the
+        queue drain stages the batch's (test_conversational_queue.py)."""
+        from message_processor.channel_request import (canonical_files_from_stream,
+                                                       cohort_sources_from_message,
+                                                       merge_absent_source_files)
+        from tests.unit.channel_turn_harness import normalized, build_stream
+
+        msg = SimpleNamespace(metadata={
+            "ts": "3.0",
+            "gate_sources": (_source(ts="1.0", text="numbers",
+                                     attachments=("data.csv (file)",)),),
+            "batched_file_refs": [{"ts": "1.0", "attachments": [
+                {"id": "F9", "name": "data.csv", "mimetype": "text/csv",
+                 "url": "https://files.slack.com/files-pri/T1-F9/data.csv", "size": 12}]}]})
+        stream = build_stream([normalized("3.0", "what do the numbers say?")])
+        merged = merge_absent_source_files(
+            canonical_files_from_stream(stream), cohort_sources_from_message(msg), "C1")
+        assert merged["F9"]["filename"] == "data.csv"
+        assert merged["F9"]["message_ts"] == "1.0"
+
+    async def test_a_superseded_arrivals_file_is_staged_by_the_gate_itself(self, monkeypatch):
+        """[r6-3] The WRITER, on the production path: the live failure that started this.
+
+        Someone drops a CSV and immediately asks about it. The CSV's own dispatch loses its debounce
+        to the question and ends at the gate — so that dispatch is the last holder of the file's
+        payload. The gate keeps it with the enrolled record and stamps it on the survivor, and the
+        survivor's turn can authorize the id even though Slack's window never returned the message.
+
+        The test never writes `batched_file_refs`; it asserts that the gate did.
+        """
+        from message_processor.channel_request import (canonical_files_from_stream,
+                                                       cohort_sources_from_message,
+                                                       merge_absent_source_files)
+        from tests.unit.channel_turn_harness import build_stream, normalized
+
+        monkeypatch.setattr(config, "participation_debounce_seconds", 0.2, raising=False)
+        for name in ("finish_attempt", "gate_decision", "gate_declined", "begin_attempt",
+                     "attempt_id_for"):
+            monkeypatch.setattr(participation_telemetry, name, lambda *a, **k: None)
+        engine, _ = _engine(True)
+        app, client = _gate_app(None, None)
+        app.participation_engine = engine
+
+        csv = {"type": "file", "name": "data.csv", "id": "F9", "mimetype": "text/csv",
+               "url": "https://files.slack.com/files-pri/T1-F9/data.csv", "size": 12}
+        with_file = _gate_msg(ts="15.0", participation_attachments=("data.csv (file)",))
+        with_file.text = "here are the numbers"
+        with_file.attachments = [csv]
+        question = _gate_msg(ts="20.0")
+        question.text = "what do the numbers say?"
+        question.attachments = []
+
+        superseded = asyncio.ensure_future(app._gate_verdict(with_file, client))
+        for _ in range(400):                      # enrolled and asleep in its own debounce
+            if engine._cohorts:
+                break
+            await asyncio.sleep(0.005)
+        assert engine._cohorts, "the file's dispatch never enrolled"
+
+        decision = await asyncio.wait_for(app._gate_verdict(question, client), timeout=5)
+        assert decision.wake is True
+        assert await asyncio.wait_for(superseded, timeout=5) is None
+
+        assert question.metadata["batched_file_refs"] == [{"ts": "15.0", "attachments": [csv]}]
+        # And the far end: the window Slack returned has no trace of ts 15.0, and the id is
+        # authorized anyway.
+        stream = build_stream([normalized("20.0", "what do the numbers say?")])
+        merged = merge_absent_source_files(
+            canonical_files_from_stream(stream), cohort_sources_from_message(question), "C1")
+        assert merged["F9"]["message_ts"] == "15.0"
+        assert engine._cohort_files == {}, "the payload map must not outlive the cohort"
+
+    def test_the_cohort_never_touches_thread_state(self):
+        """The tripwire for the whole change: the helper that wrote synthetic history is gone."""
+        from message_processor.utilities import MessageUtilitiesMixin
+        assert not hasattr(MessageUtilitiesMixin, "_merge_gate_cohort")
 
     def test_the_burst_prose_is_gone(self):
         # It used to arrive as a metadata line quoting the earlier texts inside a block the prompt
@@ -558,11 +643,15 @@ class TestCohortBecomesInput:
         assert not hasattr(MessageUtilitiesMixin, "_reacted_already_note")
 
 
-# --------------------------------------------------------------------------- telemetry v7
+# --------------------------------------------------------------------------- telemetry v8
 
-class TestTelemetryV7:
+class TestTelemetryV8:
     def test_contract_and_gate_name(self):
-        assert participation_telemetry.CONTRACT_VERSION == 7
+        """CV8 added the single-stream events and a second population keyed by turn_id, so the
+        event set an attempt can produce changed. GATE_CONTRACT did NOT move: the gate is the
+        same one bit it was under v7, and pooling its rows across the version boundary is
+        legitimate in a way that pooling rich-gate rows never was."""
+        assert participation_telemetry.CONTRACT_VERSION == 8
         assert participation_telemetry.GATE_CONTRACT == "binary-v1"
 
     def test_gate_decision_writes_exactly_the_v7_field_set(self, monkeypatch):
@@ -700,43 +789,57 @@ def test_the_prompt_forbids_the_gate_from_doing_the_responders_job():
 class TestQueueBatchAndCohortInterop:
     """Two different coalescing mechanisms, and they must not double-count each other.
 
-    The debounce cohort merges arrivals that landed BEFORE the responder started; the Phase-Q
-    queue drain batches arrivals that landed while it was running and appends them to the thread
-    itself. A message can legitimately be in both paths' sights, and the model must see it once.
+    The debounce cohort holds arrivals that landed BEFORE the responder started; the Phase-Q queue
+    drain holds arrivals that landed while it was running. A message can legitimately be in both
+    paths' sights, and the model must see it once. Under one stream the dedup key is no longer
+    "already in ThreadState" — it is "already in the pinned window", which is the stronger fact.
     """
 
-    def _proc(self):
-        from message_processor.utilities import MessageUtilitiesMixin
+    def _absent(self, msg, stream_has):
+        from message_processor import channel_request
+        from tests.unit.channel_turn_harness import normalized, pin_channel_turn
+        from message_processor.turn_runtime import TurnRuntime
 
-        proc = MessageUtilitiesMixin.__new__(type("P", (MessageUtilitiesMixin,), {}))
-        proc.log_debug = lambda *a, **k: None
-        added = []
-        proc._add_message_with_token_management = (
-            lambda state, role, content, **kw: added.append(kw.get("message_ts")))
-        return proc, added
+        ctx = pin_channel_turn(
+            TurnRuntime(), messages=[normalized(ts, "fetched") for ts in stream_has],
+            trigger_ts="4.0",
+            cohort_sources=channel_request.cohort_sources_from_message(msg))
+        block = channel_request.build_cohort_fallback(ctx)
+        return block["content"] if block else ""
 
-    def test_a_source_the_queue_drain_already_appended_is_not_added_twice(self):
-        proc, added = self._proc()
-        # The drain appended 1.0 and 2.0 to the thread; the cohort also holds 1.0.
-        state = SimpleNamespace(messages=[
-            {"role": "user", "content": "a", "metadata": {"ts": "1.0"}},
-            {"role": "user", "content": "b", "metadata": {"ts": "2.0"}}])
+    def test_a_source_the_window_already_fetched_is_not_quoted(self):
         msg = SimpleNamespace(metadata={"ts": "4.0", "gate_sources": (
             _source(ts="1.0", text="a"), _source(ts="3.0", text="c"),
             _source(ts="4.0", text="trigger"))})
-        assert proc._merge_gate_cohort(msg, state) == 1
-        assert added == ["3.0"]          # only the one nobody had
+        quoted = self._absent(msg, stream_has=("1.0", "2.0", "4.0"))
+        assert "ts=3.0" in quoted                 # only the one nobody had
+        assert "ts=1.0" not in quoted and "ts=4.0" not in quoted
 
-    def test_merging_is_idempotent_within_a_turn(self):
-        # The merge runs once per turn by construction, but a retry path re-entering it must not
-        # duplicate: the second pass sees its own additions in the thread. Simulated by feeding
-        # the first pass's ts back into the state.
-        proc, added = self._proc()
-        state = SimpleNamespace(messages=[])
+    def test_the_gate_cohort_and_the_carried_batch_are_deduplicated(self):
+        """A queue drain hands its absorbed batch on as `carried_gate_sources`, and the gate may
+        have judged the same message. One quote, not two."""
+        from message_processor.channel_request import cohort_sources_from_message
+
+        msg = SimpleNamespace(metadata={
+            "ts": "4.0",
+            "gate_sources": (_source(ts="1.0", text="a"),),
+            "carried_gate_sources": (_source(ts="1.0", text="a"),
+                                     _source(ts="2.0", text="b"))})
+        sources = cohort_sources_from_message(msg)
+        assert [s.ts for s in sources] == ["1.0", "2.0"]
+
+    def test_assembling_twice_is_idempotent(self):
+        """A retry re-assembles from the same pins, so the quoted set cannot grow."""
+        from message_processor import channel_request
+        from tests.unit.channel_turn_harness import normalized, pin_channel_turn
+        from message_processor.turn_runtime import TurnRuntime
+
         msg = SimpleNamespace(metadata={"ts": "2.0", "gate_sources": (_source(ts="1.0"),)})
-        assert proc._merge_gate_cohort(msg, state) == 1
-        state.messages.append({"role": "user", "content": "x", "metadata": {"ts": "1.0"}})
-        assert proc._merge_gate_cohort(msg, state) == 0
+        ctx = pin_channel_turn(
+            TurnRuntime(), messages=[normalized("2.0", "trigger")], trigger_ts="2.0",
+            cohort_sources=channel_request.cohort_sources_from_message(msg))
+        first = channel_request.build_cohort_fallback(ctx)["content"]
+        assert channel_request.build_cohort_fallback(ctx)["content"] == first
 
 
 async def test_ambient_images_are_admitted_immediately():
@@ -783,45 +886,57 @@ def test_attachment_descriptors_are_names_and_types_only():
     ]) == ("food.png (image)", "report.pdf (file)")
 
 
-async def test_process_message_actually_merges_the_cohort_before_the_handler_runs():
+async def test_process_message_puts_the_cohort_in_front_of_the_handler():
     """The other half of the contract, and the half that has been silently broken before: a helper
     that builds context correctly is worthless if no call site invokes it. (The channel-memory
     block was assembled into an attribute nothing read, for months.) So this drives the real
-    process_message and inspects the thread state the handler was actually handed."""
+    process_message and inspects the request the handler was actually handed — and asserts the
+    thing that used to happen instead: nothing was written into ThreadState."""
     from message_processor.base import MessageProcessor
+    from message_processor.channel_request import to_input_items
+    from tests.unit.channel_turn_harness import item_texts, normalized, build_stream
 
     with patch("message_processor.base.AsyncThreadStateManager"), \
          patch("message_processor.base.OpenAIClient"):
         p = MessageProcessor()
 
-    class _State(SimpleNamespace):
-        """Just enough ThreadState: the real _add_message_with_token_management appends through
-        `add_message`, so a bare namespace would fail before the merge could be observed."""
-
-        def add_message(self, role, content, metadata=None, **kw):
-            self.messages.append({"role": role, "content": content, "metadata": metadata or {}})
-
-    state = _State(had_timeout=False, messages=[], thread_ts="10.0", channel_id="C1",
-                   root_author=("U1", "human"), config_overrides={}, participants={},
-                   current_model=None, has_trimmed_messages=False)
+    state = SimpleNamespace(had_timeout=False, messages=[], thread_ts="10.0", channel_id="C1",
+                            root_author=("U1", "human"), config_overrides={}, participants={},
+                            current_model=None, has_trimmed_messages=False)
     p.db = MagicMock()
     p.db.get_channel_memory_async = AsyncMock(return_value=[])
     p.db.get_channel_policy_async = AsyncMock(return_value=None)
     p.thread_manager.acquire_thread_lock = AsyncMock(return_value=True)
     p.thread_manager.release_thread_lock = AsyncMock()
-    p.thread_manager._token_counter.count_thread_tokens = MagicMock(return_value=0)
-    p.thread_manager._token_counter.count_message_tokens = MagicMock(return_value=0)
 
     async def _state_for(*a, **k):
         return state
 
-    p._get_or_rebuild_thread_state = _state_for
+    p.get_or_create_channel_thread_state = _state_for
     p._process_attachments = AsyncMock(return_value=([], [], []))
+    p._build_channel_info = AsyncMock(return_value=None)
+    p._build_tools_array = MagicMock(return_value=None)
+    p._get_system_prompt = MagicMock(return_value="sys")
+    p._prepare_channel_turn_tools = AsyncMock(return_value=(None, {}, False, None, None))
+    p.ingest_channel_origin_slice = AsyncMock()
 
-    class _Stop(Exception):
+    # The stream fetched the trigger but not the earlier send — the propagation lag this exists for.
+    stream = build_stream([normalized("3.0", "anyone looking?", sender_id="U1")], h="3.0")
+    p._build_channel_turn_stream = AsyncMock(return_value=stream)
+
+    captured = {}
+
+    async def _handler(user_content, thread_state, client, message, thinking_id, **kw):
+        request, *_ = await p._assemble_channel_attempt(
+            client, message, thread_state, kw["turn"], {"model": "gpt-5.6-sol"}, "gpt-5.6-sol",
+            thread_key="C1:10.0")
+        captured["texts"] = item_texts(to_input_items(request))
+        raise _CohortStop()
+
+    class _CohortStop(Exception):
         pass
 
-    p._handle_text_response = AsyncMock(side_effect=_Stop())
+    p._handle_text_response = AsyncMock(side_effect=_handler)
 
     msg = Message(text="anyone looking?", user_id="U1", channel_id="C1", thread_id="10.0",
                   metadata={"ts": "3.0", "gate_required": True, "gate_sources": (
@@ -829,14 +944,15 @@ async def test_process_message_actually_merges_the_cohort_before_the_handler_run
                       _source(ts="3.0", text="anyone looking?", sender_name="Peter"))})
     client = MagicMock()
     client.send_message = AsyncMock()
+    client.self_team_id = "T1"
     with patch.object(config, "enable_channel_memory", True):
         await p.process_message(msg, client, None)
 
     p._handle_text_response.assert_awaited()
-    merged = [m for m in state.messages if "the build is red" in str(m.get("content", ""))]
-    assert merged, "the earlier send of the burst never reached the model's input"
-    assert all("anyone looking?" not in str(m.get("content", "")) for m in state.messages), \
-        "the trigger is this turn's own user message and must not be merged as history too"
+    blob = "\n".join(captured["texts"])
+    assert "the build is red" in blob, "the earlier send of the burst never reached the model"
+    # …and NOTHING was written into the thread state to get it there.
+    assert state.messages == []
 
 
 # --------------------------------------------------------------------------- review round fixes

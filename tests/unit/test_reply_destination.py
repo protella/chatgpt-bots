@@ -68,7 +68,7 @@ def test_only_an_open_turn_shows_the_tool():
 def test_a_settled_route_is_never_offered_the_tool(mock_env, message, allowed):
     from message_processor.handlers.text import TextHandlerMixin
     host = SimpleNamespace(
-        _get_tool_registry=lambda client, cfg: None,
+        _get_tool_registry=lambda client, cfg, surface="dm": None,
         _materialize_request_tools=None)
     host._materialize_request_tools = TextHandlerMixin._materialize_request_tools.__get__(host)
     turn = TurnRuntime.for_message(message, channel_post_allowed=allowed)
@@ -574,7 +574,6 @@ async def test_a_non_streamed_reply_locks_its_destination_when_it_goes_out():
 
     app.processor.process_message = AsyncMock(side_effect=_process)
     client = MagicMock()
-    client.channel_pulse = None
     client.send_thinking_indicator = AsyncMock(return_value=None)
     client.delete_message = AsyncMock()
     client.send_message = AsyncMock(return_value="99.9")
@@ -600,17 +599,13 @@ def _notice_processor():
 
     class _Proc:
         process_message = MessageProcessor.process_message
+        # The real notice helper, so this still exercises the send it is about.
+        _post_prior_timeout_notice = MessageProcessor._post_prior_timeout_notice
 
         def __init__(self):
             from thread_manager import AsyncThreadStateManager
             self.thread_manager = AsyncThreadStateManager(db=None)
             self.db = None
-
-        # process_message folds the gate's coalesced cohort into the turn's input before it reads
-        # the thread. This bare harness carries only process_message, so the real mixin method is
-        # absent and the AttributeError was swallowed by the suppress() below — surfacing as "the
-        # notice never sent". A message with no cohort merges nothing.
-        def _merge_gate_cohort(self, message, thread_state): return 0
 
         def log_info(self, *a, **k): pass
         def log_debug(self, *a, **k): pass
@@ -621,15 +616,21 @@ def _notice_processor():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("notice_ts, expect_settled", [
-    ("99.9", True),     # Slack took it: a visible surface now exists in the thread
-    (None, False),      # send_message swallowed a SlackApiError — nobody saw anything
-])
-async def test_a_prior_timeout_notice_settles_only_when_it_actually_posts(notice_ts,
-                                                                          expect_settled):
-    """`send_message` returns None on failure. Settling on a notice nobody saw would withhold
-    the destination choice — the tool is hidden on a settled turn — and force the reply into a
-    thread for a reason the user could never observe."""
+@pytest.mark.parametrize("notice_ts", ["99.9", None])
+async def test_a_channel_prior_timeout_notice_settles_before_the_request_is_measured(notice_ts):
+    """[r3-3] A CHANNEL turn that owes this notice settles the destination BEFORE assembly, whether
+    or not the notice then lands.
+
+    It used to settle only on a confirmed send, which is the right rule when the settle FOLLOWS the
+    send. Deferring the notice past admission (r2-11) inverted that: admission now pins the tool
+    tuple and the suffix, so a settle afterwards left the measured request exposing
+    `set_reply_destination` and saying nothing about the destination, while the request actually
+    sent said `reply_destination=thread` and refused that tool at runtime — different bytes, and a
+    prompt that contradicted its own lock.
+
+    The cost of settling early is that a notice Slack drops still forces the reply into the thread.
+    That is a reply in a slightly less convenient place; the alternative was an estimate that
+    measured a request nobody sent."""
     import contextlib
     from base_client import Message
 
@@ -645,19 +646,47 @@ async def test_a_prior_timeout_notice_settles_only_when_it_actually_posts(notice
     async def _state(*a, **k):
         return SimpleNamespace(had_timeout=True, messages=[], channel_id="C1",
                                thread_ts="10.0", root_author=("U1", "human"),
-                               config_overrides={}, current_model="gpt-5.6-sol")
+                               config_overrides={}, current_model="gpt-5.6-sol",
+                               participants={}, has_trimmed_messages=False)
 
+    # A channel turn CREATES its state rather than rebuilding one, so both entry points answer
+    # with the timed-out thread — the notice fires before either path is left behind.
     proc._get_or_rebuild_thread_state = _state
+    proc.get_or_create_channel_thread_state = _state
+    # r2-11: the notice now waits for the window and the admission, so the two steps in front of
+    # it have to succeed for this test to reach it.
+    proc._build_channel_turn_stream = AsyncMock(return_value=None)
+    proc._admit_channel_request = AsyncMock()
+    proc._process_attachments = AsyncMock(return_value=([], [], []))
+    proc._build_user_content = MagicMock(return_value="q")
     with contextlib.suppress(Exception):   # the bare harness dies past the notice
         await proc.process_message(message, client=client, thinking_id=None, turn=turn)
 
     client.send_message.assert_awaited()                     # the notice was attempted
-    assert turn.destination_selected is expect_settled
-    assert turn.destination_locked is expect_settled
-    if expect_settled:
-        assert turn.reply_destination == "thread"
-        assert turn.destination_source == "structural"
-    else:
-        # Still open: the model is offered the choice exactly as it would have been.
-        assert turn.reply_destination == "thread"            # the default, unsettled
-        assert turn.destination_source == "default"
+    assert turn.destination_selected is True
+    assert turn.destination_locked is True
+    assert turn.reply_destination == "thread"
+    assert turn.destination_source == "structural"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("notice_ts,expected", [("99.9", "info"), (None, "warning")])
+async def test_a_prior_timeout_notice_is_logged_as_what_it_did(notice_ts, expected):
+    """[r4-7] `send_message` swallows a SlackApiError and returns None, and the line said "Notified
+    user" either way — so the one path where nobody is told anything read exactly like the one where
+    they were."""
+    from base_client import Message
+
+    proc = _notice_processor()
+    logged = []
+    proc.log_info = lambda msg, *a, **k: logged.append(("info", msg))
+    proc.log_warning = lambda msg, *a, **k: logged.append(("warning", msg))
+    client = MagicMock()
+    client.send_message = AsyncMock(return_value=notice_ts)
+    message = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
+                      metadata={"ts": "10.0"})
+
+    await proc._post_prior_timeout_notice(message, client, None, "C1:10.0")
+
+    assert [level for level, _ in logged] == [expected], logged
+    assert "C1:10.0" in logged[0][1]

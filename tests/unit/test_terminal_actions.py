@@ -316,7 +316,10 @@ def test_the_settings_tool_is_registered_even_with_the_engine_off(mock_env, monk
                          ("get_react_tool_schema", "react_to_message"),
                          ("get_search_tool_schema", "search_slack"),
                          ("get_post_to_thread_tool_schema", "post_to_thread"),
-                         ("get_no_reply_tool_schema", "no_response_needed")):
+                         ("get_no_reply_tool_schema", "no_response_needed"),
+                         ("get_emoji_search_tool_schema", "search_workspace_emoji"),
+                         ("get_lookup_channel_tool_schema", "lookup_channel"),
+                         ("get_resolve_channel_name_tool_schema", "resolve_channel_name")):
         schema = {"type": "function", "name": name, "parameters": {}}
         getattr(host, getter).return_value = (
             [{"type": "function", "name": "fetch_channel_history", "parameters": {}}]
@@ -355,7 +358,6 @@ def _terminal_processor(loop_result, *, background=False, sandbox_assets=(), art
     host._inject_image_analyses = _passthru
     host._pre_trim_messages_for_api = _passthru
     host._build_channel_info = _empty
-    host._build_channel_summary_block = _none
     host._drop_dead_containers = _none
     host._resolve_ci_container = _none
     host._prepare_sandbox_tools = _none
@@ -598,3 +600,382 @@ def test_a_queued_turn_never_claims_a_reaction():
     queued = MagicMock(type="queued", content="", metadata={})
     assert TurnRuntime().reaction_committed is False
     assert ChatBotV2._produced_visible_output(queued, TurnRuntime()) is False
+
+
+# ------------------------------------- the executor, not the schema, authorizes the silence
+
+class _TerminalRegistry:
+    """Dispatches through the REAL no-reply executor, so the loop's terminal contract is tested
+    against the thing that actually decides it."""
+
+    def __init__(self, turn, dispatched=None, failing=()):
+        from slack_client.messaging import SlackMessagingMixin
+        self.turn = turn
+        self.dispatched = dispatched if dispatched is not None else []
+        self.failing = set(failing)
+        self._executor = SlackMessagingMixin.execute_no_reply_tool.__get__(MagicMock())
+
+    async def dispatch_all(self, ctx, calls):
+        results = []
+        for c in calls:
+            name = c.get("name")
+            self.dispatched.append(name)
+            if name == "no_response_needed":
+                results.append(await self._executor(
+                    SimpleNamespace(turn=self.turn), {}))
+            else:
+                results.append({"ok": name not in self.failing})
+        return results
+
+
+def _turn(silence_capable):
+    return SimpleNamespace(silence_capable=silence_capable)
+
+
+@pytest.mark.asyncio
+async def test_the_executor_refuses_on_an_owed_words_turn(mock_env):
+    """The channel surface exposes the tool statically, so the schema can no longer say which
+    routes may be quiet. The executor does, and it fails CLOSED."""
+    from slack_client.messaging import SlackMessagingMixin
+    executor = SlackMessagingMixin.execute_no_reply_tool.__get__(MagicMock())
+    owed = await executor(SimpleNamespace(turn=_turn(False)), {})
+    assert owed["ok"] is False and owed["error"] == "reply_owed"
+    # An absent turn is refused too — a context that never derived the fact cannot authorize it.
+    assert (await executor(SimpleNamespace(turn=None), {}))["ok"] is False
+    assert (await executor(SimpleNamespace(turn=_turn(True)), {}))["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_the_executor_refuses_when_the_feature_is_off(mock_env, monkeypatch):
+    from config import config as cfg
+    from slack_client.messaging import SlackMessagingMixin
+    monkeypatch.setattr(cfg, "enable_no_reply_tool", False)
+    executor = SlackMessagingMixin.execute_no_reply_tool.__get__(MagicMock())
+    out = await executor(SimpleNamespace(turn=_turn(True)), {})
+    assert out["ok"] is False and out["error"] == "disabled"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_terminal_continues_the_loop_and_keeps_its_siblings(mock_env, monkeypatch):
+    """The refusal is fed back as this call's output, the siblings keep theirs, and the model
+    gets another round to write the reply it owes. Silencing the turn on a refused call would
+    swallow an answer somebody is waiting for."""
+    from openai_client.api import tool_loop
+    monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools",
+                        _scripted([[_fc("no_response_needed", "1", '{"reason": "nothing_to_add"}'),
+                                    _fc("remember_fact", "2", "{}")], []],
+                                  texts=("", "here you go")))
+    registry = _TerminalRegistry(_turn(False))
+    result = await tool_loop.create_text_response_with_tool_loop(
+        _LoopSelf(), messages=[], tools=[], registry=registry, tool_context=None)
+    assert result.get("terminal_action") is None
+    assert result.get("silence_reason") is None
+    assert result["text"] == "here you go"
+    assert registry.dispatched.count("remember_fact") == 1      # the sibling ran, once
+    terminal = [c for c in result["local_tool_calls"] if c["name"] == "no_response_needed"]
+    assert terminal and terminal[0]["ok"] is False              # recorded as the refusal it is
+
+
+@pytest.mark.asyncio
+async def test_a_refused_terminal_replays_every_call_with_an_output(mock_env, monkeypatch):
+    """The Responses API 400s on a function_call with no matching function_call_output, and the
+    budget skips calls the terminal round would otherwise leave unanswered."""
+    from openai_client.api import tool_loop
+    monkeypatch.setattr(tool_loop.config, "max_tool_calls_per_turn", 2)
+    calls = [_fc("no_response_needed", "1", '{"reason": "nothing_to_add"}'),
+             _fc("react_to_message", "2", '{"emoji": "eyes"}'),
+             _fc("react_to_message", "3", '{"emoji": "tada"}'),
+             _fc("remember_fact", "4", "{}")]
+    scripted = _scripted([list(calls), []], texts=("", "done"))
+    rounds_seen = []
+
+    async def _capture(client, messages, tools, return_metadata, function_call_sink,
+                       tool_choice=None, **kw):
+        rounds_seen.append(list(messages))
+        return await scripted(client, messages, tools, return_metadata,
+                              function_call_sink, tool_choice=tool_choice, **kw)
+
+    monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools", _capture)
+    result = await tool_loop.create_text_response_with_tool_loop(
+        _LoopSelf(), messages=[], tools=[], registry=_TerminalRegistry(_turn(False)),
+        tool_context=None)
+    assert result.get("terminal_action") is None
+    second_round = rounds_seen[1]
+    call_ids = {i["call_id"] for i in second_round if i.get("type") == "function_call"}
+    output_ids = {i["call_id"] for i in second_round
+                  if i.get("type") == "function_call_output"}
+    assert call_ids == output_ids == {"1", "2", "3", "4"}
+
+
+@pytest.mark.asyncio
+async def test_a_refused_terminal_charges_the_round_and_forces_the_answer_at_the_cap(
+        mock_env, monkeypatch):
+    """A refusal that cost nothing would let the model loop on the tool forever."""
+    from openai_client.api import tool_loop
+    monkeypatch.setattr(tool_loop.config, "max_tool_rounds", 1)
+    monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools",
+                        _scripted([[_fc("no_response_needed", "1", '{"reason": "duplicate"}')],
+                                   [_fc("no_response_needed", "9", '{"reason": "duplicate"}')]],
+                                  texts=("", "forced answer")))
+    result = await tool_loop.create_text_response_with_tool_loop(
+        _LoopSelf(), messages=[], tools=[], registry=_TerminalRegistry(_turn(False)),
+        tool_context=None)
+    assert result.get("terminal_action") is None
+    assert result["text"] == "forced answer"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_terminal_replays_the_streamed_preamble(mock_env, monkeypatch):
+    """Streaming: whatever the model said before calling the tool is already on screen. Without
+    the replay the next round has no record of having spoken and says it again, into the same
+    message."""
+    from openai_client.api import tool_loop
+    rounds = [("Sure — one sec.",
+               [_fc("no_response_needed", "1", '{"reason": "nothing_to_add"}')]),
+              (" here it is.", [])]
+    seen = []
+    state = {"n": 0}
+
+    async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                             function_call_sink=None, tool_choice=None, **params):
+        seen.append(list(messages))
+        text, calls = rounds[min(state["n"], len(rounds) - 1)]
+        state["n"] += 1
+        if tool_choice != "none" and function_call_sink is not None:
+            function_call_sink.extend([dict(c) for c in calls])
+        return text
+
+    monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                        fake_streaming)
+    out = await tool_loop.create_streaming_response_with_tool_loop(
+        _LoopSelf(), messages=[], tools=[], registry=_TerminalRegistry(_turn(False)),
+        tool_context=None, stream_callback=lambda c: None)
+    assert out.get("terminal_action") is None
+    assert {"role": "assistant", "content": "Sure — one sec."} in seen[1]
+
+
+@pytest.mark.asyncio
+async def test_a_permitted_turn_still_ends_in_silence(mock_env, monkeypatch):
+    """The other half of the same contract: an authorized executor success is still terminal."""
+    from openai_client.api import tool_loop
+    monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools",
+                        _scripted([[_fc("no_response_needed", "1", '{"reason": "not_relevant"}'),
+                                    _fc("react_to_message", "2", '{"emoji": "eyes"}')]]))
+    registry = _TerminalRegistry(_turn(True))
+    result = await tool_loop.create_text_response_with_tool_loop(
+        _LoopSelf(), messages=[], tools=[], registry=registry, tool_context=None)
+    assert result["terminal_action"] == "no_reply"
+    assert result["silence_reason"] == "not_relevant"
+    assert result["text"] == ""
+    assert "react_to_message" in registry.dispatched
+    # An ACCEPTED terminal is the turn's ending, not one of its actions.
+    assert [c["name"] for c in result["local_tool_calls"]] == ["react_to_message"]
+
+
+# --------------------------------------- moved from test_no_reply_tool.py (spec §14)
+
+@pytest.mark.asyncio
+async def test_the_terminal_reserves_a_slot_of_the_call_budget(monkeypatch):
+    from openai_client.api import tool_loop
+    monkeypatch.setattr(tool_loop.config, "max_tool_calls_per_turn", 2)
+    monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools",
+                        _scripted([[_fc("no_response_needed", "1", '{"reason": "nothing_to_add"}'),
+                                    _fc("react_to_message", "2", '{"emoji": "eyes"}'),
+                                    _fc("react_to_message", "3", '{"emoji": "tada"}'),
+                                    _fc("react_to_message", "4", '{"emoji": "thumbsup"}')]]))
+    dispatched = []
+    result = await tool_loop.create_text_response_with_tool_loop(
+        _LoopSelf(), messages=[], tools=[], registry=_Registry(dispatched), tool_context=None)
+    assert result["terminal_action"] == "no_reply"
+    assert dispatched.count("react_to_message") == 1
+    assert dispatched.count("no_response_needed") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arguments", [
+    '{"reason": "it is not really for me"}',   # prose, the old contract
+    '{"reason": ""}',                          # empty
+    '{}',                                      # absent
+    '{"reason": 7}',                           # not a string
+    'not json at all',                         # unparseable
+])
+async def test_an_unrecognized_reason_is_rejected_never_coerced(monkeypatch, arguments):
+    """The turn is NOT silenced and the reason is NOT rewritten to `other`."""
+    from openai_client.api import tool_loop
+    monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools",
+                        _scripted([[_fc("no_response_needed", "1", arguments)], []],
+                                  texts=("", "fine, here you go")))
+    dispatched = []
+    result = await tool_loop.create_text_response_with_tool_loop(
+        _LoopSelf(), messages=[], tools=[], registry=_Registry(dispatched), tool_context=None)
+    assert result.get("terminal_action") is None
+    assert result.get("silence_reason") is None
+    assert result["text"] == "fine, here you go"
+    assert "no_response_needed" not in dispatched
+    rejected = [c for c in result["local_tool_calls"] if c["name"] == "no_response_needed"]
+    assert rejected and all(c["ok"] is False for c in rejected)
+
+
+@pytest.mark.asyncio
+async def test_streaming_silence_is_honored_only_before_visible_text(monkeypatch):
+    from openai_client.api import tool_loop
+
+    def _fake(rounds):
+        state = {"n": 0}
+
+        async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                                 function_call_sink=None, tool_choice=None, **params):
+            text, calls = rounds[min(state["n"], len(rounds) - 1)]
+            state["n"] += 1
+            if tool_choice != "none" and function_call_sink is not None:
+                function_call_sink.extend([dict(c) for c in calls])
+            return text
+
+        return fake_streaming
+
+    terminal = [_fc("no_response_needed", "1", '{"reason": "addressed_to_other"}')]
+    monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                        _fake([("", terminal)]))
+    quiet = await tool_loop.create_streaming_response_with_tool_loop(
+        _LoopSelf(), messages=[], tools=[], registry=_Registry([]), tool_context=None,
+        stream_callback=lambda c: None)
+    assert quiet["terminal_action"] == "no_reply" and quiet["text"] == ""
+
+    # ...and once a reply has begun, the same call is invalid and the model completes it.
+    monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                        _fake([("Sure, here's the answer", terminal), (" — all done.", [])]))
+    dispatched = []
+    committed = await tool_loop.create_streaming_response_with_tool_loop(
+        _LoopSelf(), messages=[], tools=[], registry=_Registry(dispatched), tool_context=None,
+        stream_callback=lambda c: None)
+    assert committed.get("terminal_action") is None
+    assert committed["text"] == " — all done."
+    assert "no_response_needed" not in dispatched
+
+
+@pytest.mark.asyncio
+async def test_prior_committed_text_rejects_silence_on_both_loops(monkeypatch):
+    """F8: a partial reply from an EARLIER attempt must never be orphaned as fake silence."""
+    from openai_client.api import tool_loop
+    terminal = [_fc("no_response_needed", "1", '{"reason": "nothing_to_add"}')]
+
+    monkeypatch.setattr(tool_loop.responses_api, "create_text_response_with_tools",
+                        _scripted([list(terminal), []], texts=("", "finished reply")))
+    plain = await tool_loop.create_text_response_with_tool_loop(
+        _LoopSelf(), messages=[], tools=[], registry=_Registry([]), tool_context=None,
+        prior_committed=True)
+    assert plain.get("terminal_action") is None and plain["text"] == "finished reply"
+
+    state = {"n": 0}
+    rounds = [("", terminal), ("recovered reply", [])]
+
+    async def fake_streaming(client, messages, tools, stream_callback, tool_callback=None,
+                             function_call_sink=None, tool_choice=None, **params):
+        text, calls = rounds[min(state["n"], len(rounds) - 1)]
+        state["n"] += 1
+        if tool_choice != "none" and function_call_sink is not None:
+            function_call_sink.extend([dict(c) for c in calls])
+        return text
+
+    monkeypatch.setattr(tool_loop.responses_api, "create_streaming_response_with_tools",
+                        fake_streaming)
+    streamed = await tool_loop.create_streaming_response_with_tool_loop(
+        _LoopSelf(), messages=[], tools=[], registry=_Registry([]), tool_context=None,
+        stream_callback=lambda c: None, prior_committed=True)
+    assert streamed.get("terminal_action") is None and streamed["text"] == "recovered reply"
+
+
+@pytest.mark.asyncio
+async def test_a_result_override_is_keyed_by_identity_not_call_id():
+    """A degenerate round where a sibling shares the terminal's call_id must not misroute the
+    override onto the sibling."""
+    from openai_client.api import tool_loop
+    terminal = _fc("no_response_needed", "dup", '{"reason": "nothing_to_add"}')
+    sibling = _fc("react_to_message", "dup", '{"emoji": "eyes"}')
+    sink = [terminal, sibling]
+    local, dispatched = [], []
+    await tool_loop._run_tool_round(
+        _LoopSelf(), _Registry(dispatched), None, sink, [], local,
+        result_overrides={id(terminal): tool_loop._INVALID_NO_REPLY_RESULT})
+    assert dispatched == ["react_to_message"]
+    assert local[0]["name"] == "no_response_needed" and local[0]["ok"] is False
+    assert local[1]["name"] == "react_to_message" and local[1]["ok"] is True
+
+
+# ------------------------------- the contract paragraphs (moved from test_no_reply_tool.py)
+
+def test_channel_activity_paragraph_wording():
+    from prompts import CHANNEL_ACTIVITY_NO_REPLY_SUFFIX as s
+    assert "uninvited" not in s
+    assert "Silence is the DEFAULT here" in s
+    assert "could not easily get themselves" in s
+    assert "no_response_needed" in s
+    assert 'consist only of "I haven\'t tried it,"' in s
+    assert "do not suppress a substantive answer merely because it includes a limitation" in s
+    assert "addressed by name, prefer a brief honest answer over silence" in s
+    assert "ends your words, not your other actions" in s
+    assert "wait for work you started yourself" in s
+    assert s.startswith("[") and s.endswith("]")
+
+
+def test_thread_activity_paragraph_wording():
+    from prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX,
+                         THREAD_ACTIVITY_NO_REPLY_SUFFIX as s)
+    assert "check its addressee yourself" in s
+    assert "STICKS" in s
+    assert "silence means silence" in s
+    assert "no_response_needed" in s
+    assert "ends your words, not your other actions" in s
+    assert "wait for work you started yourself" in s
+    assert s != CHANNEL_ACTIVITY_NO_REPLY_SUFFIX
+    assert s.startswith("[") and s.endswith("]")
+
+
+def test_neither_paragraph_restates_the_silence_vocabulary():
+    """The eight values live in the tool schema. Two copies of one vocabulary drift."""
+    from prompts import (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX,
+                         THREAD_ACTIVITY_NO_REPLY_SUFFIX)
+    identifiers = [v for v in SILENCE_REASONS if "_" in v]
+    for paragraph in (CHANNEL_ACTIVITY_NO_REPLY_SUFFIX, THREAD_ACTIVITY_NO_REPLY_SUFFIX):
+        assert not [v for v in identifiers if v in paragraph]
+
+
+# ------------------------- silent-stream teardown (moved from test_no_reply_tool.py)
+
+def _cleanup_host():
+    from message_processor.handlers.text import TextHandlerMixin
+    host = SimpleNamespace(warnings=[], debugs=[])
+    host._cleanup_silent_stream = TextHandlerMixin._cleanup_silent_stream.__get__(host)
+    host.log_warning = lambda m, *a, **k: host.warnings.append(str(m))
+    host.log_debug = lambda m, *a, **k: host.debugs.append(str(m))
+    return host
+
+
+@pytest.mark.asyncio
+async def test_cleanup_silent_stream_deletes_both_distinct_messages():
+    host = _cleanup_host()
+    deleted = []
+
+    async def _del(ch, ts):
+        deleted.append(ts)
+        return True
+    client = SimpleNamespace(delete_message=AsyncMock(side_effect=_del))
+    native = SimpleNamespace(started=True, abandon=AsyncMock(return_value=True))
+    await host._cleanup_silent_stream(client, "C1", native, "placeholder.1", "stream.2", "no_reply")
+    native.abandon.assert_awaited_once()
+    assert set(deleted) == {"placeholder.1", "stream.2"}
+
+
+@pytest.mark.asyncio
+async def test_cleanup_silent_stream_reports_abandon_failure_and_skips_none():
+    host = _cleanup_host()
+    deleted = []
+
+    async def _del(ch, ts):
+        deleted.append(ts)
+        return True
+    client = SimpleNamespace(delete_message=AsyncMock(side_effect=_del))
+    native = SimpleNamespace(started=True, abandon=AsyncMock(return_value=False))
+    await host._cleanup_silent_stream(client, "C1", native, None, "stream.2", "reaction-only")
+    assert deleted == ["stream.2"]
+    assert any("abandon failed" in w for w in host.warnings)

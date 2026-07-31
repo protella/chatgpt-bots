@@ -1,9 +1,11 @@
 """Participation tuning + 3 bug fixes (2026-07-21).
 
 Covers the surviving prompt-wording contracts (C1 mid-flight escape, C2 truthfulness sentence),
-the C1 real-event composition, and the three bug fixes: BF1 (search_slack gated on the event's
-action_token), BF2 (username resolution in rebuilt history and tool-returned histories), and BF3
-(pulse envelope observability).
+the C1 real-event composition, and two bug fixes: BF1 (search_slack gated on the event's
+action_token) and BF2 (username resolution in rebuilt history and tool-returned histories). BF3
+(pulse envelope observability) covered `render_envelope_with_meta` / `_build_pulse_envelope`,
+both retired with `slack_client/channel_pulse.py` — the channel stream replaced the pulse ring
+entirely, so that section is gone with no successor to re-point it at.
 
 MOST OF THE PROMPT SECTION IS GONE, and it went with the prompt it described. Four tests here
 (A1 value floor, A1's direct-summons exemption, A2's open-question rule, B's banter reversal) each
@@ -37,11 +39,17 @@ from tool_registry import ToolContext, ToolRegistry
 
 
 def test_c1_mid_flight_escape_present():
+    """C1 survived the P2 §9 rewrite. That rewrite recast the whole paragraph around full channel
+    visibility, and this escape is orthogonal to it — how honest a real answer has to be, not
+    whether this turn is yours. The rest of the paragraph's contract lives in
+    tests/unit/test_channel_restraint_prompts.py."""
     s = CHANNEL_ACTIVITY_NO_REPLY_SUFFIX
     assert 'consist only of "I haven\'t tried it,"' in s
     assert "do not suppress a substantive answer merely because it includes a limitation" in s
     assert "addressed by name, prefer a brief honest answer over silence" in s
     assert s.endswith("]")  # still one bracketed paragraph
+    # ...and it coexists with the full-visibility framing rather than having replaced it.
+    assert "The stream is the room, not an invitation." in s
 
 
 def test_c2_truthfulness_sentence_present():
@@ -160,6 +168,12 @@ def _slack_tool_mock():
         "type": "function", "name": "post_to_thread", "parameters": {}}
     s.get_no_reply_tool_schema.return_value = {
         "type": "function", "name": "no_response_needed", "parameters": {}}
+    s.get_emoji_search_tool_schema.return_value = {
+        "type": "function", "name": "search_workspace_emoji", "parameters": {}}
+    s.get_lookup_channel_tool_schema.return_value = {
+        "type": "function", "name": "lookup_channel", "parameters": {}}
+    s.get_resolve_channel_name_tool_schema.return_value = {
+        "type": "function", "name": "resolve_channel_name", "parameters": {}}
     return s
 
 
@@ -482,61 +496,6 @@ async def test_rebuild_always_sets_username_key():
     assert all("username" in m.metadata for m in result)   # key present on every message
     assert result[0].metadata["username"] == "bob"
     assert result[1].metadata["username"] is None          # bot author -> None, key still present
-
-
-# ============================================================ BF3 — pulse envelope observability
-
-def _pulse_entry(ts, text="hello", thread_ts=None, name="Alice", sender="human"):
-    return dict(ts=ts, thread_ts=thread_ts, user_id="U1", display_name=name,
-                sender_type=sender, text=text, is_bot=sender != "human")
-
-
-def test_render_envelope_with_meta_counts_survivors(monkeypatch):
-    from slack_client.channel_pulse import ChannelPulse
-    monkeypatch.setattr(config, "enable_message_timestamps", False)
-    p = ChannelPulse(size=10)
-    p.record("C1", **_pulse_entry("1.0"))
-    p.record("C1", **_pulse_entry("2.0"))
-    p.record("C1", **_pulse_entry("3.0", thread_ts="T"))  # excluded by exclude_thread_ts
-    p.record("C1", **_pulse_entry("4.0"))
-    p.record("C1", **_pulse_entry("5.0"))
-    text, count, first_ts, last_ts = p.render_envelope_with_meta(
-        "C1", exclude_thread_ts="T", max_lines=2)
-    # span/count reflect exactly the entries that survive exclusion AND max_lines truncation
-    assert count == 2
-    assert (first_ts, last_ts) == ("4.0", "5.0")
-    # timestamps are config-off, so the span could NOT have been parsed from the text
-    assert "4.0" not in text and "5.0" not in text
-    # the thin wrapper returns exactly the meta variant's text
-    assert p.render_envelope("C1", exclude_thread_ts="T", max_lines=2) == text
-
-
-def test_render_envelope_with_meta_empty_channel():
-    from slack_client.channel_pulse import ChannelPulse
-    assert ChannelPulse(size=5).render_envelope_with_meta("C1") == ("", 0, None, None)
-
-
-def test_build_pulse_envelope_logs_span(monkeypatch):
-    from message_processor.utilities import MessageUtilitiesMixin
-    from slack_client.channel_pulse import ChannelPulse
-    monkeypatch.setattr(config, "enable_message_timestamps", False)
-    monkeypatch.setattr(config, "channel_pulse_envelope_max", 5)
-    pulse = ChannelPulse(size=10)
-    pulse.record("C1", **_pulse_entry("1.0"))
-    pulse.record("C1", **_pulse_entry("2.0"))
-
-    class _Host:
-        def __init__(self):
-            self._build_pulse_envelope = MessageUtilitiesMixin._build_pulse_envelope.__get__(self)
-            self.logs = []
-
-        def log_debug(self, msg, *a, **k):
-            self.logs.append(msg)
-
-    h = _Host()
-    env = h._build_pulse_envelope(SimpleNamespace(channel_pulse=pulse), "C1", None)
-    assert env  # non-empty envelope injected
-    assert any("Pulse envelope injected: channel=C1 lines=2 span=1.0→2.0" in m for m in h.logs)
 
 
 @pytest.mark.asyncio

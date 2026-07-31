@@ -7,6 +7,10 @@ from typing import TYPE_CHECKING, Any
 from slack_sdk.errors import SlackApiError
 
 from config import config
+from message_processor.outbound_receipts import channel_post_admission
+# Every callback below is ingress-tracked: they do substantial DB work, and shutdown's claim to
+# have quiesced "Slack ingress" is only honest if it covers them too. See _IngressTracker.
+from slack_client.event_handlers.registration import track_ingress
 from slack_client.formatting.blocks import extract_supplementary_text
 
 
@@ -20,6 +24,56 @@ class SlackSettingsHandlersMixin:
         log_error: Any
         log_info: Any
         log_debug: Any
+
+    async def _register_settings_receipt(self, channel_id, message_ts,
+                                         thread_root_ts=None) -> None:
+        """Spec §5 for a raw settings confirmation. FINALIZED, not chrome: "Settings saved,
+        send it again" is an answer to something the user did, and a later turn that cannot see
+        it would ask them for the same thing twice. DM targets no-op by themselves."""
+        if not message_ts:
+            return
+        from message_processor.outbound_receipts import record_transport_post
+        try:
+            await record_transport_post(
+                team_id=getattr(self, "self_team_id", None), channel_id=channel_id,
+                message_ts=message_ts, receipts=None, receipt_kind="finalized",
+                thread_root_ts=thread_root_ts, site="settings_confirmation")
+        except Exception as e:  # noqa: BLE001
+            self.log_debug(f"Settings confirmation receipt failed: {e}")
+
+    async def _post_settings_notice(self, client, *, site, channel, text,
+                                    thread_ts=None):
+        """Post one settings confirmation and register it, as one uninterruptible unit.
+
+        These run inside Bolt callbacks, and Socket Mode stays connected until the very end of
+        shutdown. Admission stops a notice that would land after the receipt queue closes;
+        `post_then_register` stops a drain cancelling this callback BETWEEN Slack accepting the
+        message and the row that accounts for it. Returns None when it was never sent.
+        """
+        from message_processor.outbound_receipts import post_then_register
+
+        async with channel_post_admission(site) as admitted:
+            if not admitted:
+                return None
+
+            async def _post_and_register():
+                resp = await client.chat_postMessage(
+                    channel=channel, thread_ts=thread_ts, text=text)
+                await self._register_settings_receipt(
+                    channel, resp.get("ts") if resp else None, thread_root_ts=thread_ts)
+                return resp
+
+            return await post_then_register(_post_and_register())
+
+    async def _drop_settings_receipt(self, channel_id, message_ts,
+                                     site: str = "settings_cleanup") -> None:
+        """The message is gone from Slack and we saw it go. Its receipt goes too."""
+        from message_processor.outbound_receipts import delete_receipt_for
+        try:
+            await delete_receipt_for(team_id=getattr(self, "self_team_id", None),
+                                     channel_id=channel_id, message_ts=message_ts, site=site)
+        except Exception as e:  # noqa: BLE001
+            self.log_debug(f"Settings receipt deletion failed: {e}")
 
     async def _get_session_data(self, body) -> dict:
         """
@@ -185,6 +239,7 @@ class SlackSettingsHandlersMixin:
     def _register_settings_handlers(self):
         # Register slash command handler
         @self.app.command(config.settings_slash_command)
+        @track_ingress
         async def handle_settings_command(ack, body, client):
             """Handle the settings slash command"""
             await ack()  # Acknowledge command receipt immediately
@@ -244,6 +299,7 @@ class SlackSettingsHandlersMixin:
         
         # --- Phase H+: USER settings modal, opened from the DM strip's "⚙️ <model>" button ---
         @self.app.action("open_user_settings")
+        @track_ingress
         async def handle_open_user_settings(ack, body, client):
             """DM feedback strip's '⚙️ <model>' button → open the global user settings
             modal (same flow as the slash command).
@@ -290,6 +346,7 @@ class SlackSettingsHandlersMixin:
         # --- Phase 7: per-channel settings modal, opened from the response footer button ---
         # ANY channel member may open Configure and save — no admin gating, no membership lookups.
         @self.app.action("open_channel_settings")
+        @track_ingress
         async def handle_open_channel_settings(ack, body, client):
             """Footer '⚙️ Configure' button → open the per-channel settings modal.
 
@@ -328,6 +385,7 @@ class SlackSettingsHandlersMixin:
         # One-gear design: the channel modal carries a "My personal settings" button
         # that stacks the personal modal on top (views_push) — no second button in chat.
         @self.app.action("open_user_settings_push")
+        @track_ingress
         async def handle_open_user_settings_push(ack, body, client):
             await ack()
             trigger_id = body.get('trigger_id')
@@ -355,6 +413,7 @@ class SlackSettingsHandlersMixin:
                 self.log_error(f"Error pushing user settings modal: {e}")
 
         @self.app.view("channel_settings_modal")
+        @track_ingress
         async def handle_channel_settings_submission(ack, body, view, client):
             """Persist per-channel settings. 'inherit' clears the override (NULL → global default)."""
             await ack()
@@ -532,6 +591,7 @@ class SlackSettingsHandlersMixin:
                 self.log_error(f"Error saving channel settings for {channel_id}: {e}")
 
         @self.app.action("channel_model")
+        @track_ingress
         async def handle_channel_model_change(ack, body, client):
             """Rebuild the channel modal when the model changes so the effort ladder
             matches the selected model (gpt-5.5 has no `max`). Live form selections
@@ -572,6 +632,7 @@ class SlackSettingsHandlersMixin:
         # Register modal submission handlers
         @self.app.view("settings_modal")
         @self.app.view("welcome_settings_modal")
+        @track_ingress
         async def handle_settings_submission(ack, body, view, client):
             """Handle settings modal submission"""
 
@@ -770,7 +831,11 @@ class SlackSettingsHandlersMixin:
                                 ts=msg_info['ts']
                             )
                         except Exception:
-                            pass  # Best effort
+                            continue  # Best effort; an undeleted message keeps its row
+                        # The delete is confirmed (chat_delete raises otherwise), so the
+                        # chrome row this reminder registered goes with it.
+                        await self._drop_settings_receipt(msg_info['channel'], msg_info['ts'],
+                                                          site="settings_reminder_cleanup")
                     del self._reminder_messages[user_id]
                     self.log_debug(f"Cleaned up reminder messages for user {user_id}")
                 
@@ -820,11 +885,13 @@ class SlackSettingsHandlersMixin:
                         self.log_info(f"Original message was too long for new user {user_id}")
                         # Notify the user to resend their message IN THE THREAD
                         try:
-                            await client.chat_postMessage(
+                            # Conversational state, not chrome: it tells the user what happened
+                            # to the message they sent, and the room keeps that.
+                            await self._post_settings_notice(
+                                client, site="settings_too_long_notice",
                                 channel=pending_message.get('channel_id', user_id),
                                 thread_ts=pending_message.get('thread_id'),  # Send to thread if it exists
-                                text="✅ Settings saved! I couldn't save your initial message during setup (too long). Please send it again and I'll process it normally."
-                            )
+                                text="✅ Settings saved! I couldn't save your initial message during setup (too long). Please send it again and I'll process it normally.")
                         except Exception:
                             pass
                     elif pending_message.get('original_message'):
@@ -862,11 +929,11 @@ class SlackSettingsHandlersMixin:
                             self.log_error(f"Error processing pending message: {e}")
                             # Send error message to user
                             try:
-                                await client.chat_postMessage(
+                                await self._post_settings_notice(
+                                    client, site="settings_ready_notice",
                                     channel=pending_message['channel_id'],
                                     thread_ts=pending_message.get('thread_id'),
-                                    text="I'm ready now! Could you please repeat your question?"
-                                )
+                                    text="I'm ready now! Could you please repeat your question?")
                             except Exception:
                                 pass
                             
@@ -882,6 +949,7 @@ class SlackSettingsHandlersMixin:
         
         # Handler for custom instructions confirmation modal submission
         @self.app.view("confirm_global_custom_instructions")
+        @track_ingress
         async def handle_custom_instructions_confirmation(ack, body, view, client):
             """Handle confirmation for overwriting global custom instructions"""
             # Clear all modals when confirmed
@@ -944,6 +1012,7 @@ class SlackSettingsHandlersMixin:
         # Register modal action handlers (for dynamic updates)
         @self.app.action("model_select")
         @self.app.action("image_model")  # Reshapes modal (filters background options, hides input_fidelity on v2)
+        @track_ingress
         async def handle_model_change(ack, body, client):
             """Handle model selection changes for dynamic modal updates"""
             await ack()
@@ -1015,6 +1084,7 @@ class SlackSettingsHandlersMixin:
         
         # Register handler for features checkbox (needs modal rebuild for web search and MCP)
         @self.app.action("features_with_mcp")
+        @track_ingress
         async def handle_features_change(ack, body, client):
             """Handle feature checkbox changes, especially web search and model-specific features"""
             await ack()
@@ -1155,6 +1225,7 @@ class SlackSettingsHandlersMixin:
         
         # Register handler for settings scope toggle
         @self.app.action("settings_scope")
+        @track_ingress
         async def handle_scope_change(ack, body, client):
             """Handle scope toggle between thread and global settings"""
             await ack()
@@ -1216,6 +1287,7 @@ class SlackSettingsHandlersMixin:
         
         # GPT-5.4 reasoning level change needs modal rebuild (to show/hide temp/top_p)
         @self.app.action("reasoning_level_gpt54")
+        @track_ingress
         async def handle_reasoning_level_gpt54_change(ack, body, client):
             """Handle GPT-5.4 reasoning level change - rebuilds modal to show/hide temp/top_p"""
             await ack()
@@ -1286,12 +1358,14 @@ class SlackSettingsHandlersMixin:
         @self.app.action("image_size")
         @self.app.action("image_quality")
         @self.app.action("image_background")
+        @track_ingress
         async def handle_modal_actions(ack):
             """Acknowledge modal actions that don't need processing"""
             await ack()  # Just acknowledge - values are captured on submission
         
         # Handler for global settings button in DM
         @self.app.action("open_global_settings_dm")
+        @track_ingress
         async def handle_open_global_settings_dm(ack, body, client):
             """Handle button click to open global settings from DM"""
             # ALWAYS acknowledge first, no matter what
@@ -1334,6 +1408,7 @@ class SlackSettingsHandlersMixin:
         
         # Handler for welcome settings button
         @self.app.action("open_welcome_settings")
+        @track_ingress
         async def handle_open_welcome_settings(ack, body, client):
             """Handle button click to open welcome settings modal"""
             # ALWAYS acknowledge first, no matter what
@@ -1512,6 +1587,7 @@ class SlackSettingsHandlersMixin:
         # Register message shortcut for thread-specific settings
         @self.app.shortcut("configure_thread_settings_dev")  # Dev callback ID
         @self.app.shortcut("configure_thread_settings")  # Prod callback ID (when configured)
+        @track_ingress
         async def handle_thread_settings_shortcut(ack, shortcut, client):
             """Handle the thread settings message shortcut"""
             # ALWAYS acknowledge first, no matter what

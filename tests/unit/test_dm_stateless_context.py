@@ -1,4 +1,4 @@
-"""Phase S — Slack-native context: retire the message mirror.
+"""Phase S — Slack-native context: retire the message mirror. DM/LEGACY path.
 
 Covers: rebuild-always-fetches, the edited-message staleness regression, summary
 head + tail composition with boundary dedup, refs preserved through compaction,
@@ -6,6 +6,14 @@ chunky compaction, the mirror-drop migration, image injection via metadata ts,
 deterministic rebuild serialization (prompt-cache hygiene), date-only prefix +
 minute-time suffix, the summary-aware system-prompt note, reactions annotations,
 and prompt_cache_key plumbing.
+
+WHY THE FILE IS NAMED FOR DMs NOW. Every mechanism here — the rebuild from
+conversations.replies, the rolling thread summary, the boundary, the trim, the
+per-thread cache key — is what a DM turn does. A CHANNEL turn renders the whole
+channel as one pinned stream instead: it never rebuilds, never trims, never
+touches ThreadState.messages, and keys its cache per channel
+(tests/unit/test_channel_request_layout.py). This file is therefore the DM
+contract, and its passing unchanged is the byte-identity guarantee for that half.
 """
 import json
 import os
@@ -768,3 +776,159 @@ async def test_save_thread_summary_distinguishes_empty_list_from_null(temp_db):
     # None -> unknown (round-trips as None).
     temp_db.save_thread_summary(thread_key, "s", "100.0", refs=None, preserved_ts=None)
     assert temp_db.get_thread_summary(thread_key)["preserved_ts"] is None
+
+
+# ------------------------------------------- P2: the DM attachment pipeline is untouched
+
+@pytest.mark.asyncio
+async def test_dm_attachment_processing_keeps_its_combined_sequencing(temp_db):
+    """[r4-8] A CHANNEL turn splits this pipeline in two — local extraction now, the utility-model
+    summary after the admission estimate. A DM keeps the shipped order: extract, summarize, and
+    write the `documents` row, all inside `_process_attachments`, before the caller sees anything.
+
+    Proven by the ORDER of the calls and by the row existing on return, because that is what a DM
+    turn's next line depends on: `_build_message_with_documents` renders a summary the entry must
+    already carry."""
+    proc = _Proc(db=temp_db)
+    order = []
+
+    class _Handler:
+        max_document_size = 50 * 1024 * 1024
+
+        def is_document_file(self, name, mimetype):
+            return True
+
+        async def safe_extract_content_async(self, data, mimetype, name, **kw):
+            order.append("extract")
+            return {"content": "the whole report", "total_pages": 2}
+
+    proc.document_handler = _Handler()
+    proc.openai_client = MagicMock()
+    proc.image_url_handler = MagicMock(max_image_size=20 * 1024 * 1024)
+    proc.image_url_handler.process_urls_from_text = AsyncMock(return_value=([], []))
+    proc._update_status = MagicMock()
+
+    async def _summarize(extracted, filename, mimetype, **kwargs):
+        # **kwargs: the summarizer now takes the channel turn's CV8 attempt_sink, which a DM
+        # passes as None. Nothing about the DM REQUEST changes — see the sink-free assertion in
+        # test_model_response_telemetry.
+        order.append("summarize")
+        return "two pages of numbers"
+
+    proc._summarize_document_for_attach = _summarize
+
+    client = MagicMock()
+    client.download_file = AsyncMock(return_value=b"%PDF-1.4 data")
+    message = Message(text="have a look", user_id="U1", channel_id="D1", thread_id="100.0",
+                      attachments=[{"type": "file", "name": "q3.pdf", "id": "F1",
+                                    "mimetype": "application/pdf", "url": "https://x/q3.pdf",
+                                    "size": 13}],
+                      metadata={"ts": "100.0", "username": "Peter"})
+
+    _images, documents, unsupported = await proc._process_attachments(message, client)
+
+    assert not unsupported
+    assert order == ["extract", "summarize"]
+    # The summary is ON the entry when the caller gets it — a channel turn's would still be None.
+    assert documents[0]["summary"] == "two pages of numbers"
+    assert "_persist" not in documents[0]
+    rows = await temp_db.get_thread_documents_async("D1:100.0")
+    assert [r["filename"] for r in rows] == ["q3.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_channel_document_leaves_the_summary_for_later(temp_db):
+    """The other side of the same seam: nothing is summarized and NO row is written until
+    `finalize_deferred_documents` runs, which is what lets the estimate sit between them."""
+    proc = _Proc(db=temp_db)
+
+    class _Handler:
+        max_document_size = 50 * 1024 * 1024
+
+        def is_document_file(self, name, mimetype):
+            return True
+
+        async def safe_extract_content_async(self, data, mimetype, name, **kw):
+            return {"content": "the whole report", "total_pages": 2}
+
+    proc.document_handler = _Handler()
+    proc.openai_client = MagicMock()
+    proc.image_url_handler = MagicMock(max_image_size=20 * 1024 * 1024)
+    proc.image_url_handler.process_urls_from_text = AsyncMock(return_value=([], []))
+    proc._update_status = MagicMock()
+    proc._summarize_document_for_attach = AsyncMock(return_value="a summary")
+
+    client = MagicMock()
+    client.download_file = AsyncMock(return_value=b"%PDF-1.4 data")
+    message = Message(text="have a look", user_id="U1", channel_id="C1", thread_id="100.0",
+                      attachments=[{"type": "file", "name": "q3.pdf", "id": "F1",
+                                    "mimetype": "application/pdf", "url": "https://x/q3.pdf",
+                                    "size": 13}],
+                      metadata={"ts": "100.0", "username": "Peter"})
+
+    _images, documents, _unsupported = await proc._process_attachments(
+        message, client, defer_document_summaries=True)
+
+    proc._summarize_document_for_attach.assert_not_awaited()
+    assert documents[0]["summary"] is None and "_persist" in documents[0]
+    assert await temp_db.get_thread_documents_async("C1:100.0") == []
+
+    await proc.finalize_deferred_documents(documents, client, message,
+                                          reserves=(("F1", 10_000),))
+    assert documents[0]["summary"] == "a summary"
+    rows = await temp_db.get_thread_documents_async("C1:100.0")
+    assert [r["filename"] for r in rows] == ["q3.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_two_documents_with_one_file_id_each_get_their_own_reserve(temp_db):
+    """[r4-3] Slack will deliver the same file twice in one message, and both copies key to the same
+    file_id. Admission charges both; a key-to-reserve MAPPING then granted the single surviving
+    reserve to each of them, so the second summary spent room bought once and a request admitted at
+    the door could exceed its budget on the way out. Each document takes the charge admission made
+    for it, in order — the second one's small reserve must still bite."""
+    from message_processor.channel_request import TRUNCATION_NOTE
+
+    proc = _Proc(db=temp_db)
+    proc._update_status = MagicMock()
+    proc._summarize_document_for_attach = AsyncMock(return_value="s" * 500)
+
+    def _entry():
+        return {"filename": "q3.pdf", "file_id": "F1", "mimetype": "application/pdf",
+                "_persist": {"extracted": {"content": "the whole report"}, "thread_id": "C1:100.0",
+                             "message_ts": "100.0", "url_private": "https://x/q3.pdf",
+                             "size_bytes": 13}}
+
+    documents = [_entry(), _entry()]
+    message = Message(text="have a look", user_id="U1", channel_id="C1", thread_id="100.0",
+                      metadata={"ts": "100.0", "username": "Peter"})
+
+    await proc.finalize_deferred_documents(documents, MagicMock(), message,
+                                           reserves=(("F1", 10_000), ("F1", 60)))
+
+    assert documents[0]["summary"] == "s" * 500, "the first document's own reserve was not granted"
+    assert documents[1]["summary"].endswith(TRUNCATION_NOTE), \
+        "the second document was granted the first one's reserve"
+    assert len(documents[1]["summary"].encode("utf-8")) <= 60
+
+
+@pytest.mark.asyncio
+async def test_the_channel_ingesters_idempotent_write_leaves_dm_rows_alone(temp_db):
+    """[r6-2] The channel ingester runs on EVERY turn in a thread, so its write must do nothing
+    the second time. `save_document` must keep INSERTing for DMs, where a re-attach genuinely is a
+    new observation — and the partial index that makes the first true is scoped to C/G thread keys
+    so it can never refuse a DM write."""
+    assert await temp_db.save_document_if_absent_async(
+        "C1:100.0", "runbook.pdf", "application/pdf", file_id="F1",
+        url_private="u", message_ts="100.0") is True
+    assert await temp_db.save_document_if_absent_async(
+        "C1:100.0", "runbook.pdf", "application/pdf", file_id="F1",
+        url_private="u", message_ts="100.0") is False
+    assert len(await temp_db.get_thread_documents_async("C1:100.0")) == 1
+
+    # The DM path is a plain INSERT and stays one: two attaches, two rows.
+    for _ in range(2):
+        temp_db.save_document(thread_id="D1:100.0", filename="runbook.pdf",
+                              mime_type="application/pdf", summary="s", file_id="F1",
+                              url_private="u", message_ts="100.0")
+    assert len(await temp_db.get_thread_documents_async("D1:100.0")) == 2

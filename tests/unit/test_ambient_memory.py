@@ -59,15 +59,6 @@ class FakeOpenAI:
         return "A chart showing benchmark scores."
 
 
-class FakePulse:
-    def __init__(self):
-        self.calls = []
-
-    def upsert_artifacts(self, channel_id, source_ts, notes):
-        self.calls.append((channel_id, source_ts, list(notes)))
-        return True
-
-
 class FakeClient:
     def __init__(self, data=PNG):
         self.data = data
@@ -88,9 +79,8 @@ class FakeDocHandler:
         return {"content": "Extracted document body text."}
 
 
-def _svc(db, pulse=None, openai=None, client=None):
-    s = AmbientArtifactService(db=db, openai_client=openai or FakeOpenAI(),
-                               channel_pulse=pulse or FakePulse())
+def _svc(db, openai=None, client=None):
+    s = AmbientArtifactService(db=db, openai_client=openai or FakeOpenAI())
     s._client = client or FakeClient()
     return s
 
@@ -193,9 +183,8 @@ async def test_db_pending_recovery_list(db):
 
 # ------------------------------------------------------------------- link worker
 
-async def test_link_fetch_success_persists_and_upserts_pulse(db, monkeypatch):
-    pulse = FakePulse()
-    s = _svc(db, pulse=pulse)
+async def test_link_fetch_success_persists_summary(db, monkeypatch):
+    s = _svc(db)
 
     async def fake_fetch(url, **kw):
         return ambient_fetch.FetchResult(kind="text", final_url=url, title="Title", text="body")
@@ -206,7 +195,6 @@ async def test_link_fetch_success_persists_and_upserts_pulse(db, monkeypatch):
     rows = await db.get_ambient_artifacts_for_messages("C1", ["1.1"])
     art = rows["1.1"][0]
     assert art["status"] == "ready" and art["summary"] == "A concise factual summary."
-    assert pulse.calls and "link content" in pulse.calls[0][2][0]
 
 
 async def test_link_ssrf_blocked_persists_blocked(db, monkeypatch):
@@ -378,7 +366,7 @@ async def test_channel_opt_out_skips_processing(db):
 # ------------------------------------------------------------------- queue / overflow
 
 async def test_enqueue_overflow_persists_omitted(db):
-    s = AmbientArtifactService(db=db, openai_client=FakeOpenAI(), channel_pulse=FakePulse())
+    s = AmbientArtifactService(db=db, openai_client=FakeOpenAI())
     s._started = True
     s._queues[am.KIND_LINK] = asyncio.Queue(maxsize=1)
     s._queues[am.KIND_LINK].put_nowait(object())  # fill it
@@ -514,25 +502,22 @@ async def test_claim_persist_failure_means_job_not_accepted(db, monkeypatch):
 # ------------------------------------------------------------------- production wiring (MUST-FIX 1)
 
 async def test_ambient_ingest_hands_service_the_facade_not_raw_client(db):
-    """The service needs download_file() + channel_pulse — both live on the SlackBot FACADE, not
-    the raw Bolt AsyncWebClient. If _ambient_ingest ever hands the raw client (the shipped bug),
-    every image/file job AttributeErrors into download_failed and link summaries never patch the
-    pulse. This pins that the object the service captures satisfies the contract."""
+    """The service needs download_file() — it lives on the SlackBot FACADE, not the raw Bolt
+    AsyncWebClient. If _ambient_ingest ever hands the raw client (the shipped bug), every
+    image/file job AttributeErrors into download_failed. This pins that the object the service
+    captures satisfies the contract."""
     from types import SimpleNamespace
 
     from slack_client.event_handlers.message_events import SlackMessageEventsMixin
 
-    svc = AmbientArtifactService(db=db, openai_client=FakeOpenAI(), channel_pulse=None)
+    svc = AmbientArtifactService(db=db, openai_client=FakeOpenAI())
     svc._started = True
     for kind in am._KINDS:
         svc._queues[kind] = asyncio.Queue(maxsize=64)
 
-    pulse = FakePulse()
-
     class _Facade(SlackMessageEventsMixin):
         def __init__(self):
             self.processor = SimpleNamespace(ambient_service=svc)
-            self.channel_pulse = pulse
             self.db = db
 
         async def download_file(self, url, fid=None, max_bytes=None, **kw):
@@ -545,25 +530,21 @@ async def test_ambient_ingest_hands_service_the_facade_not_raw_client(db):
             pass
 
     facade = _Facade()
-    raw_client = object()  # a raw AsyncWebClient stand-in: NO download_file, NO channel_pulse
+    raw_client = object()  # a raw AsyncWebClient stand-in: NO download_file
     await facade._ambient_ingest({"channel": "C1", "ts": "1.1", "text": "hi <https://a.com/x>"},
                                  raw_client)
 
     assert svc._client is facade, "service captured the raw client instead of the facade"
-    assert svc.channel_pulse is pulse
-    assert hasattr(svc._client, "download_file") and hasattr(svc._client, "channel_pulse")
+    assert hasattr(svc._client, "download_file")
     await asyncio.gather(*list(svc._bg_tasks))  # drain the scheduled admission task cleanly
 
 
 def test_production_slackbot_satisfies_service_contract():
     """Type-level guard: the object _ambient_ingest passes is `self` (the SlackBot facade), so
-    SlackBot ITSELF must own download_file and assign channel_pulse — asserted against the real
-    class, never a bespoke fake."""
-    import inspect
-
+    SlackBot ITSELF must own download_file — asserted against the real class, never a bespoke
+    fake."""
     from slack_client.base import SlackBot
     assert callable(getattr(SlackBot, "download_file", None)), "SlackBot lost download_file"
-    assert "self.channel_pulse" in inspect.getsource(SlackBot.__init__)
 
 
 # ------------------------------------------------------------------- recovery
@@ -573,7 +554,7 @@ async def test_recover_pending_reenqueues_links_fails_images(db):
         channel_id="C1", source_ts="1.1", conversation_ts="1.1", kind="link", ref="https://a/x")
     await db.insert_pending_ambient_artifact(
         channel_id="C1", source_ts="1.1", conversation_ts="1.1", kind="image", ref="F1")
-    s = AmbientArtifactService(db=db, openai_client=FakeOpenAI(), channel_pulse=FakePulse())
+    s = AmbientArtifactService(db=db, openai_client=FakeOpenAI())
     s._started = True
     for kind in am._KINDS:
         s._queues[kind] = asyncio.Queue(maxsize=64)
@@ -584,53 +565,6 @@ async def test_recover_pending_reenqueues_links_fails_images(db):
 
 
 # ------------------------------------------------------------------- the incident
-
-async def test_incident_ambient_image_visible_across_threads(db):
-    """The forensic incident, END TO END through a REAL renderer (not just a SQLite query):
-    an ambient image summarized at capture time must reappear in the channel-activity envelope a
-    reply in a DIFFERENT thread produces — live, AND after a restart wiped the in-memory ring.
-    Artifacts are CHANNEL+source-ts keyed, so the render seam finds them regardless of thread."""
-    from slack_client.channel_pulse import ChannelPulse
-
-    pulse = ChannelPulse(size=30)
-    s = _svc(db, pulse=pulse)
-
-    # The image lands top-level at 100.0; the pulse first records the bare message (as the live
-    # feed would), then the ambient worker summarizes it and patches the entry.
-    pulse.record("C1", ts="100.0", thread_ts=None, user_id="U1", display_name="Alice",
-                 sender_type="human", text="check this out", is_bot=False,
-                 files=[{"id": "F1", "mimetype": "image/png", "name": "kimi.png"}])
-    await s._process(_Job(kind="image", channel_id="C1", source_ts="100.0", conversation_ts="100.0",
-                          ref="F1", url="https://files/f1", filename="kimi.png",
-                          mimetype="image/png"))
-
-    # LIVE: a reply arrives in a DIFFERENT thread (root 200.0); the envelope for that turn
-    # excludes thread 200.0 but includes 100.0 WITH its rendered image summary.
-    env = pulse.render_envelope("C1", exclude_thread_ts="200.0")
-    assert "benchmark scores" in env, env
-
-    # RESTART: a fresh process has an empty ring. ensure_backfill rebuilds it from Slack history
-    # AND batch-loads the persisted artifact, so the summary survives the restart.
-    class _Bot:
-        def __init__(self, dbm):
-            self.db = dbm  # the real DatabaseManager, NOT the module-level `db` fixture function
-            self.user_cache: dict = {}
-
-        def classify_sender(self, m):
-            return "human"
-
-    class _HistClient:
-        async def conversations_history(self, channel, limit):
-            return {"messages": [
-                {"ts": "100.0", "user": "U1", "text": "check this out",
-                 "files": [{"id": "F1", "mimetype": "image/png", "name": "kimi.png"}]},
-            ]}
-
-    fresh = ChannelPulse(size=30)
-    await fresh.ensure_backfill("C1", _HistClient(), _Bot(db))
-    env2 = fresh.render_envelope("C1", exclude_thread_ts="200.0")
-    assert "benchmark scores" in env2, env2
-
 
 async def test_incident_artifact_survives_only_via_channel_key(db):
     """Guard the DB contract the renderer relies on: the artifact is reachable by (channel,
@@ -670,8 +604,8 @@ def _img_event(fid="F1", ts="1.1", text="look at this"):
                        "name": f"{fid}.png", "size": 10}]}
 
 
-def _started_svc(db, pulse=None, openai=None):
-    s = _svc(db, pulse=pulse, openai=openai)
+def _started_svc(db, openai=None):
+    s = _svc(db, openai=openai)
     s._started = True
     for kind in am._KINDS:
         s._queues[kind] = asyncio.Queue(maxsize=64)
@@ -684,8 +618,8 @@ async def test_an_ambient_image_is_admitted_immediately_and_analyzed_exactly_onc
     Admission is asserted BEFORE anything resolves the message — nothing is waited for — and the
     resulting job is then processed to show the vision call happens once and lands as an ordinary
     worker-sourced artifact (not the retired `gate_vision` provenance)."""
-    openai, pulse = FakeOpenAI(), FakePulse()
-    s = _started_svc(db, pulse=pulse, openai=openai)
+    openai = FakeOpenAI()
+    s = _started_svc(db, openai=openai)
 
     s.offer_event(_img_event(), FakeClient())
     await asyncio.gather(*list(s._bg_tasks), return_exceptions=True)
@@ -701,7 +635,6 @@ async def test_an_ambient_image_is_admitted_immediately_and_analyzed_exactly_onc
     art = (await db.get_ambient_artifacts_for_messages("C1", ["1.1"]))["1.1"][0]
     assert art["status"] == "ready"
     assert art["derivation_source"] == "vision_worker"
-    assert pulse.calls and "benchmark" in pulse.calls[-1][2][0]
     # dual-written into the image ledger so read/edit paths see it
     imgs = await db.get_images_by_message_async("C1:1.1", "1.1")
     assert imgs and imgs[0]["analysis"]

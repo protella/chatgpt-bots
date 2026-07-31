@@ -141,7 +141,8 @@ async def _publish(processor, client, provenance_tool=None, checklist=None):
 def _client(resolve=None, file_id="F123"):
     c = MagicMock()
 
-    async def send_image(channel_id, thread_id, data, filename, caption, meta_out=None):
+    async def send_image(channel_id, thread_id, data, filename, caption, meta_out=None,
+                         receipts=None):
         if meta_out is not None and file_id is not None:
             meta_out["file_id"] = file_id
         return "https://files.slack.com/img.png"

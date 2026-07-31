@@ -47,6 +47,23 @@ def _ctx(*, channels=("C1",), groups=(), filetype="quip", channel_canvas=None):
     return ToolContext(channel_id="C1", thread_ts="1.0", client=client), web
 
 
+def _delete_ctx(*, sender_type="human", authorized=True, with_message=True, **kw):
+    """A context that can actually reach a delete.
+
+    The channel surface has no per-turn schema gate, so the EXECUTOR carries the whole
+    authorization: `canvas_delete_authorized` plus a human sender on ctx.message. Both fail
+    closed, so every delete test has to say which one it is exercising.
+    """
+    from base_client import Message
+    ctx, web = _ctx(**kw)
+    ctx.canvas_delete_authorized = authorized
+    if with_message:
+        meta = {"sender_type": sender_type} if sender_type is not None else {}
+        ctx.message = Message(text="delete it", user_id="U07PETER", channel_id="C1",
+                              thread_id="1.0", metadata=meta)
+    return ctx, web
+
+
 @pytest.mark.unit
 class TestCreate:
     async def test_creates_the_channel_canvas_not_a_standalone_one(self):
@@ -731,7 +748,7 @@ class TestDelete:
                                    "_canvas_delete_authorized": True}) is False
 
     async def test_deletes_and_invalidates_the_catalog(self):
-        ctx, web = _ctx()
+        ctx, web = _delete_ctx()
         web.canvases_delete = AsyncMock(return_value={"ok": True})
         ct._catalog_cache["C1"] = {"at": 0.0, "entries": [{"canvas_id": "F123", "title": "x"}]}
 
@@ -743,7 +760,7 @@ class TestDelete:
         assert "C1" not in ct._catalog_cache
 
     async def test_a_canvas_from_another_channel_is_refused(self):
-        ctx, web = _ctx(channels=("C_OTHER",))
+        ctx, web = _delete_ctx(channels=("C_OTHER",))
         web.canvases_delete = AsyncMock()
         out = await ct.execute_delete_canvas(ctx, {"canvas_id": "F123"})
 
@@ -751,33 +768,74 @@ class TestDelete:
         web.canvases_delete.assert_not_awaited()
 
     async def test_a_bot_authored_delete_is_refused_by_the_executor(self):
-        # Defense-in-depth (mirrors participation_tools): `_delete_enabled` already withholds the
-        # tool from a non-human sender, but the executor re-reads the raw sender classification off
-        # ctx.message and refuses a NON-human author BEFORE any Slack call — belt and suspenders for
-        # the one irreversible canvas op.
-        from base_client import Message
-        ctx, web = _ctx()
-        ctx.message = Message(text="delete it", user_id="B1", channel_id="C1",
-                              thread_id="1.0", metadata={"sender_type": "other_bot"})
+        # A non-human author is refused BEFORE any Slack call, even carrying the authorization
+        # flag: an @mention from another bot is dispatched to the main handler un-gated.
+        ctx, web = _delete_ctx(sender_type="other_bot")
         out = await ct.execute_delete_canvas(ctx, {"canvas_id": "F123"})
 
         assert out["ok"] is False and out["error"] == "not_human_sender"
         web.canvases_delete.assert_not_awaited()
 
-    async def test_a_human_authored_delete_passes_the_executor_check(self):
-        # The mirror: a human author on ctx.message clears the defense-in-depth check and the
-        # delete proceeds. (Absent sender classification also proceeds — the check never fails
-        # closed on paths that omit it; the schema gate is the primary authorization.)
-        from base_client import Message
-        ctx, web = _ctx()
+    async def test_a_human_authored_authorized_delete_proceeds(self):
+        # The mirror: an authorized turn with a human author on ctx.message is the ONE shape that
+        # deletes anything.
+        ctx, web = _delete_ctx()
         web.canvases_delete = AsyncMock(return_value={"ok": True})
         ct._catalog_cache["C1"] = {"at": 0.0, "entries": [{"canvas_id": "F123", "title": "x"}]}
-        ctx.message = Message(text="delete it", user_id="U07PETER", channel_id="C1",
-                              thread_id="1.0", metadata={"sender_type": "human"})
         out = await ct.execute_delete_canvas(ctx, {"canvas_id": "F123"})
 
         assert out["ok"] is True and out["deleted"] is True
         web.canvases_delete.assert_awaited_once_with(canvas_id="F123")
+
+    # -------------------------------------------------- fail-closed matrix (channel + DM surface)
+    #
+    # On the channel surface the schema is static: the tool is ON THE TABLE for every turn, so
+    # every guard that used to live in `_delete_enabled` now has to hold in the executor. Each of
+    # these was previously stopped by a gate that no longer exists there.
+
+    async def test_absent_sender_classification_fails_closed(self):
+        # Was: "absent classification → fall through and rely on the schema gate". There is no
+        # schema gate on the channel surface, so an unclassified sender is refused.
+        ctx, web = _delete_ctx(sender_type=None)
+        out = await ct.execute_delete_canvas(ctx, {"canvas_id": "F123"})
+
+        assert out["ok"] is False and out["error"] == "not_human_sender"
+        web.canvases_delete.assert_not_awaited()
+
+    async def test_no_message_at_all_fails_closed(self):
+        ctx, web = _delete_ctx(with_message=False)
+        out = await ct.execute_delete_canvas(ctx, {"canvas_id": "F123"})
+
+        assert out["ok"] is False and out["error"] == "not_human_sender"
+        web.canvases_delete.assert_not_awaited()
+
+    async def test_unauthorized_turn_is_refused_even_with_a_human_sender(self):
+        # A human ambient turn nobody addressed the bot in: the human authored it, but they did
+        # not ask the bot for anything, so the delete is not theirs to have triggered.
+        ctx, web = _delete_ctx(authorized=False)
+        out = await ct.execute_delete_canvas(ctx, {"canvas_id": "F123"})
+
+        assert out["ok"] is False and out["error"] == "not_authorized"
+        web.canvases_delete.assert_not_awaited()
+
+    async def test_a_context_without_the_authorization_field_fails_closed(self):
+        # The field is read with getattr(..., False): a ToolContext built by a path that never
+        # derives it — a background agent's registry, an older caller — cannot delete.
+        ctx, web = _ctx()
+        assert not hasattr(ctx, "canvas_delete_authorized") or not ctx.canvas_delete_authorized
+        out = await ct.execute_delete_canvas(ctx, {"canvas_id": "F123"})
+
+        assert out["ok"] is False and out["error"] == "not_authorized"
+        web.canvases_delete.assert_not_awaited()
+
+    async def test_the_authorization_check_runs_before_any_slack_call(self):
+        # Cheap and total: an unauthorized delete must not even look the canvas up.
+        ctx, web = _delete_ctx(authorized=False)
+        await ct.execute_delete_canvas(ctx, {"canvas_id": "F123"})
+
+        web.files_info.assert_not_awaited()
+        web.files_list.assert_not_awaited()
+        web.conversations_info.assert_not_awaited()
 
 
 @pytest.mark.unit
@@ -813,7 +871,7 @@ class TestFindability:
     async def test_the_channel_canvas_cannot_be_deleted_even_if_asked_by_id(self):
         # The enum leaves it out, but an id is not authorization — the catalog behind that enum
         # can be stale, and Slack itself would happily delete it and strand the tab.
-        ctx, web = _ctx(channel_canvas="F123")
+        ctx, web = _delete_ctx(channel_canvas="F123")
         out = await ct.execute_delete_canvas(ctx, {"canvas_id": "F123"})
 
         assert out["ok"] is False
@@ -821,7 +879,7 @@ class TestFindability:
         web.canvases_delete.assert_not_awaited()
 
     async def test_a_failed_channel_canvas_check_does_not_licence_a_delete(self):
-        ctx, web = _ctx()
+        ctx, web = _delete_ctx()
         web.conversations_info = AsyncMock(side_effect=RuntimeError("slack down"))
         out = await ct.execute_delete_canvas(ctx, {"canvas_id": "F123"})
 
@@ -1293,3 +1351,123 @@ class TestTheConfirmationLinksTheCanvas:
         flat = " ".join(CANVAS_GUIDANCE.lower().split())
         assert "link it" in flat
         assert "never invent or guess one" in flat
+
+
+@pytest.mark.unit
+class TestStaticChannelSchemas:
+    """The channel surface trades the per-turn enums for a cacheable prefix.
+
+    A canvas schema built from this turn's catalog changes whenever anyone in the channel makes,
+    renames or deletes a canvas — and the tools array sits inside the cached prefix, so every
+    such change invalidates it for the whole channel. The static variants are a pure function of
+    (channel, channel config, bot version): same bytes from any thread, any requester, any
+    catalog state. What they stop saying, the evidence block says instead, and the executors
+    (which already re-check live against files.info) hold the authorization.
+    """
+
+    STATICS = ("create_channel_canvas", "read_canvas", "edit_canvas", "delete_canvas")
+
+    def _all(self, cfg=None):
+        return {
+            "create_channel_canvas": ct.get_create_channel_canvas_schema_static(cfg),
+            "read_canvas": ct.get_read_canvas_schema_static(cfg),
+            "edit_canvas": ct.get_edit_canvas_schema_static(cfg),
+            "delete_canvas": ct.get_delete_canvas_schema_static(cfg),
+        }
+
+    def test_byte_stable_across_thread_configs_and_requesters(self):
+        import json
+        # Two turns that would produce four DIFFERENT dynamic schemas each: one with no canvases,
+        # one with a channel canvas plus a standalone, different requesters, different models.
+        empty = {"user_id": "U_A", "model": "gpt-5.6-sol"}
+        stocked = {
+            "user_id": "U_B", "model": "gpt-5.5",
+            ct.CATALOG_KEY: [{"canvas_id": "F1", "title": "Agenda", "is_channel_canvas": True},
+                             {"canvas_id": "F2", "title": "Old notes"}],
+            "_canvas_delete_authorized": True,
+        }
+        for name in self.STATICS:
+            assert json.dumps(self._all(empty)[name], sort_keys=True) == \
+                   json.dumps(self._all(stocked)[name], sort_keys=True), name
+        # …and with no config at all, which is how a background agent's registry would call it.
+        for name in self.STATICS:
+            assert json.dumps(self._all(None)[name], sort_keys=True) == \
+                   json.dumps(self._all(empty)[name], sort_keys=True), name
+
+    def test_no_canvas_ids_and_no_enums_leak_into_the_static_schemas(self):
+        import json
+        stocked = {ct.CATALOG_KEY: [{"canvas_id": "F_SECRET", "title": "Someone's doc"}]}
+        for name, schema in self._all(stocked).items():
+            blob = json.dumps(schema)
+            assert "F_SECRET" not in blob and "Someone's doc" not in blob, name
+        for name in ("read_canvas", "edit_canvas", "delete_canvas"):
+            assert "enum" not in self._all(stocked)[name][
+                "parameters"]["properties"]["canvas_id"], name
+        # `operation` is the one legitimate enum: it is a closed set of verbs, not per-turn data.
+        assert ct.get_edit_canvas_schema_static()["parameters"]["properties"]["operation"]["enum"]
+
+    def test_every_static_variant_is_offered_unconditionally(self):
+        # The factories returned None to hide a tool; a static schema never can — the executor
+        # refuses instead, which is what keeps the tools array channel-stable.
+        for cfg in (None, {}, {ct.CATALOG_KEY: []},
+                    {ct.CATALOG_KEY: [{"canvas_id": "F1", "is_channel_canvas": True}]}):
+            for name, schema in self._all(cfg).items():
+                assert schema is not None and schema["name"] == name
+
+    def test_create_static_warns_that_a_second_canvas_is_refused(self):
+        # The factory encoded "create disappears once one exists". The static schema has to SAY it,
+        # because the executor's live check is now the only thing enforcing it.
+        desc = ct.get_create_channel_canvas_schema_static()["description"]
+        assert "exactly ONE canvas per channel" in desc
+        assert "refused" in desc and "edit_canvas" in desc
+
+    def test_the_static_schemas_point_at_the_evidence_for_ids(self):
+        for name in ("read_canvas", "edit_canvas", "delete_canvas"):
+            assert "evidence" in self._all()[name]["description"], name
+
+    def test_delete_static_still_says_the_channel_canvas_is_undeletable(self):
+        desc = ct.get_delete_canvas_schema_static()["description"]
+        assert "channel canvas cannot be deleted" in desc
+        assert "IRREVERSIBLE" in desc
+
+    def test_the_dynamic_factories_are_untouched_by_the_static_ones(self):
+        # DM turns keep materializing dynamically: the ids must still be a literal enum there.
+        cfg = {ct.CATALOG_KEY: [{"canvas_id": "F1", "title": "Agenda"}]}
+        assert ct.get_read_canvas_schema(cfg)["parameters"]["properties"]["canvas_id"]["enum"] \
+            == ["F1"]
+        assert ct.get_read_canvas_schema({}) is None
+
+
+@pytest.mark.unit
+class TestCatalogEvidence:
+    """What leaves the schema has to arrive somewhere: the evidence block A3b assembles."""
+
+    def test_lines_carry_the_ids_and_titles(self):
+        lines = ct.catalog_evidence_lines(
+            [{"canvas_id": "F1", "title": "Agenda", "is_channel_canvas": True},
+             {"canvas_id": "F2", "title": "Old notes"}])
+
+        assert lines[0] == ct.EVIDENCE_HEADER
+        body = "\n".join(lines)
+        assert "F1" in body and "Agenda" in body
+        assert "F2" in body and "Old notes" in body
+        # The create tool no longer vanishes, so the model is told the channel canvas exists.
+        assert "create_channel_canvas will refuse" in lines[-1]
+
+    def test_an_empty_catalog_is_stated_not_omitted(self):
+        lines = ct.catalog_evidence_lines([])
+        assert lines[0] == ct.EVIDENCE_HEADER
+        assert "none" in lines[1]
+        assert ct.catalog_evidence_lines(None) == lines
+
+    def test_no_channel_canvas_says_create_is_available(self):
+        lines = ct.catalog_evidence_lines([{"canvas_id": "F2", "title": "Old notes"}])
+        assert "no channel canvas yet" in lines[-1]
+
+    def test_every_entry_is_its_own_line(self):
+        entries = [{"canvas_id": f"F{i}", "title": f"Doc {i}"} for i in range(5)]
+        lines = ct.catalog_evidence_lines(entries)
+        # Header + one line per canvas + the channel-canvas line: whole-line truncation upstream
+        # can drop entries without shredding one.
+        assert len(lines) == 7
+        assert all("\n" not in line for line in lines)

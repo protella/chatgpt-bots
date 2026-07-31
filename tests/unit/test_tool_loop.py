@@ -653,6 +653,7 @@ def _react_self():
         ok = await s.react(channel_id, ts, emoji)
         return ok, ok
     s._react_add = _react_add
+    s._react_tool_schema = SlackMessagingMixin._react_tool_schema.__get__(s)
     s.get_react_tool_schema = SlackMessagingMixin.get_react_tool_schema.__get__(s)
     s.execute_react_tool = SlackMessagingMixin.execute_react_tool.__get__(s)
     s._reserve_and_react = SlackMessagingMixin._reserve_and_react.__get__(s)
@@ -958,6 +959,12 @@ def _slack_tool_mock(history=None):
         "type": "function", "name": "post_to_thread", "parameters": {}}
     s.get_no_reply_tool_schema.return_value = {
         "type": "function", "name": "no_response_needed", "parameters": {}}
+    s.get_emoji_search_tool_schema.return_value = {
+        "type": "function", "name": "search_workspace_emoji", "parameters": {}}
+    s.get_lookup_channel_tool_schema.return_value = {
+        "type": "function", "name": "lookup_channel", "parameters": {}}
+    s.get_resolve_channel_name_tool_schema.return_value = {
+        "type": "function", "name": "resolve_channel_name", "parameters": {}}
     return s
 
 

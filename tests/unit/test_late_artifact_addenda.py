@@ -75,7 +75,7 @@ def temp_db(tmp_path, monkeypatch):
 
 
 def _svc(db):
-    return AmbientArtifactService(db=db, openai_client=_mock_openai(), channel_pulse=None)
+    return AmbientArtifactService(db=db, openai_client=_mock_openai())
 
 
 def _link_art(summary="S", src="fetch"):

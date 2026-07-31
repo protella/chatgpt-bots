@@ -89,7 +89,6 @@ async def test_a_silent_ambient_turn_posts_nothing_at_all(monkeypatch):
     client.clear_assistant_status = AsyncMock()
     client.delete_message = AsyncMock()
     client.send_message = AsyncMock()
-    client.channel_pulse = None
 
     await handler.handle_message(
         _message(gate_required=True, silence_capable=True, wake_source="ambient"), client)
@@ -117,7 +116,6 @@ async def test_an_addressed_turn_still_gets_its_indicator(monkeypatch):
     client.delete_message = AsyncMock()
     client.send_message = AsyncMock()
     client.format_text = MagicMock(side_effect=lambda t: t)
-    client.channel_pulse = None
 
     await handler.handle_message(_message(wake_source="app_mention"), client)
     client.send_thinking_indicator.assert_awaited_once()
@@ -340,7 +338,8 @@ async def _timeout_notice_shown_for(turn, monkeypatch):
         p = MessageProcessor()
 
     state = SimpleNamespace(had_timeout=True, messages=[], thread_ts="10.0", channel_id="C1",
-                            root_author=("U1", "human"), config_overrides={})
+                            root_author=("U1", "human"), config_overrides={}, participants={},
+                            current_model=None, has_trimmed_messages=False)
     p.thread_manager.acquire_thread_lock = AsyncMock(return_value=True)
     p.thread_manager.release_thread_lock = AsyncMock()
 
@@ -348,6 +347,11 @@ async def _timeout_notice_shown_for(turn, monkeypatch):
         return state
 
     p._get_or_rebuild_thread_state = _state
+    # P2: the channel turn's create-only state + its pinned stream (test_channel_request_layout
+    # owns both); this file is about what the turn SHOWS.
+    p.get_or_create_channel_thread_state = _state
+    p._build_channel_turn_stream = AsyncMock(return_value=None)
+    p._admit_channel_request = AsyncMock()
     # Stop the turn the moment the notice decision is behind us.
     p._handle_text_response = AsyncMock(return_value=Response(type="text", content="ok"))
     p._build_channel_memory_text = AsyncMock(return_value="")

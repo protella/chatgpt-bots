@@ -47,12 +47,27 @@ class Response:
         return cls(type="reaction", content=emoji, metadata={"react_ts": target_ts} if target_ts else {})
 
 
-class HistoryFetchError(Exception):
+class ChannelStreamError(Exception):
+    """A turn cannot see the conversation it was asked about.
+
+    The base of every FAIL-CLOSED context failure: the turn says honestly that it cannot see
+    the room rather than answering from a partial view. It lives HERE, not beside its channel
+    subclasses, because `HistoryFetchError` below is one of them and predates all of them —
+    base_client sits under message_processor in the import graph, so this is the only place a
+    single hierarchy can be rooted (message_processor/channel_stream.py imports it).
+    """
+
+
+class HistoryFetchError(ChannelStreamError):
     """Platform history could not be fetched (e.g. persistent rate limiting).
 
     Distinct from an empty thread: raised so the processor can fail the turn
     loudly instead of answering with amnesia — since Phase S the platform is
     the ONLY transcript, so a failed fetch means we have no context at all.
+
+    A `ChannelStreamError` since P2: on a channel turn a thread-activity index that has not
+    caught up is the same class of failure as a missing coverage floor. DM callers catch it by
+    its own name and are unaffected.
     """
 
 
@@ -76,7 +91,9 @@ class BaseClient(ABC, LoggerMixin):
     @abstractmethod
     def send_message(self, channel_id: str, thread_id: str, text: str,
                      blocks: Optional[list] = None,
-                     meta_out: Optional[dict] = None) -> Optional[str]:
+                     meta_out: Optional[dict] = None,
+                     receipts: Any = None,
+                     receipt_kind: Optional[str] = None) -> Optional[str]:
         """Send a text message. Returns the posted message ts (truthy on success) or None
         on failure.
 
@@ -93,14 +110,17 @@ class BaseClient(ABC, LoggerMixin):
     async def send_message_async(self, channel_id: str, thread_id: str, text: str,
                                  blocks: Optional[list] = None,
                                  meta_out: Optional[dict] = None,
-                                 lease: Any = None) -> Optional[str]:
+                                 lease: Any = None,
+                                 receipts: Any = None,
+                                 receipt_kind: Optional[str] = None) -> Optional[str]:
         """Send a text message (async version). See send_message for the blocks/meta_out
         contract and for `lease` (the stale-send guard)."""
         pass
 
     @abstractmethod
     async def send_image(self, channel_id: str, thread_id: str, image_data: bytes, filename: str,
-                         caption: str = "", meta_out: Optional[dict] = None) -> Optional[str]:
+                         caption: str = "", meta_out: Optional[dict] = None,
+                         receipts: Any = None) -> Optional[str]:
         """Send an image. Returns the posted image's URL (truthy on success) or None.
 
         `meta_out`: optional caller-provided dict a platform MAY populate with delivery facts
@@ -111,13 +131,15 @@ class BaseClient(ABC, LoggerMixin):
 
     @abstractmethod
     async def send_image_async(self, channel_id: str, thread_id: str, image_data: bytes, filename: str,
-                               caption: str = "", meta_out: Optional[dict] = None) -> Optional[str]:
+                               caption: str = "", meta_out: Optional[dict] = None,
+                               receipts: Any = None) -> Optional[str]:
         """Send an image (async version). See send_image for the return/meta_out contract."""
         pass
 
     async def send_file(self, channel_id: str, thread_id: str, file_data,
                         filename: str, title: Optional[str] = None,
-                        initial_comment: str = "") -> Optional[Dict[str, Any]]:
+                        initial_comment: str = "",
+                        receipts: Any = None) -> Optional[Dict[str, Any]]:
         """F32: upload an arbitrary file, returning its platform identity
         ({"file_id", "url_private", "permalink"}) or None.
 
@@ -130,12 +152,14 @@ class BaseClient(ABC, LoggerMixin):
         return None
 
     @abstractmethod
-    def send_thinking_indicator(self, channel_id: str, thread_id: str) -> Optional[str]:
+    def send_thinking_indicator(self, channel_id: str, thread_id: str,
+                                receipts: Any = None) -> Optional[str]:
         """Send a thinking/processing indicator"""
         pass
 
     @abstractmethod
-    async def send_thinking_indicator_async(self, channel_id: str, thread_id: str) -> Optional[str]:
+    async def send_thinking_indicator_async(self, channel_id: str, thread_id: str,
+                                            receipts: Any = None) -> Optional[str]:
         """Send a thinking/processing indicator (async version)"""
         pass
 
@@ -149,11 +173,14 @@ class BaseClient(ABC, LoggerMixin):
         """Delete a message (async version)"""
         pass
 
-    def update_message(self, channel_id: str, message_id: str, text: str) -> bool:
+    def update_message(self, channel_id: str, message_id: str, text: str,
+                       receipts: Any = None, receipt_kind: Optional[str] = None) -> bool:
         """Update a message (optional - not all platforms support this)"""
         return False
 
-    async def update_message_async(self, channel_id: str, message_id: str, text: str) -> bool:
+    async def update_message_async(self, channel_id: str, message_id: str, text: str,
+                                   receipts: Any = None,
+                                   receipt_kind: Optional[str] = None) -> bool:
         """Update a message (async version - optional)"""
         return False
 
@@ -194,7 +221,7 @@ class BaseClient(ABC, LoggerMixin):
         pass
     
     async def handle_error(self, channel_id: str, thread_id: str, error: str,
-                           lease: Any = None):
+                           lease: Any = None, receipts: Any = None):
         """Default error handler.
 
         `lease` (stale guard): an error notice is TERMINAL — on a turn with no thinking surface
@@ -210,7 +237,8 @@ class BaseClient(ABC, LoggerMixin):
 
         # Format error message for better readability
         formatted_error = self.format_error_message(error)
-        await self.send_message_async(channel_id, thread_id, formatted_error, lease=lease)
+        await self.send_message_async(channel_id, thread_id, formatted_error, lease=lease,
+                                      receipts=receipts)
     
     def format_error_message(self, error: str) -> str:
         """Format error messages for display (can be overridden by platform-specific clients)"""

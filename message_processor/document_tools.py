@@ -4,8 +4,8 @@ Documents are never at rest (CLAUDE.md pitfall 6a): the DB row holds
 summary + metadata + the Slack CDN ref, and this tool re-derives the full
 text ON DEMAND — authenticated download into memory, BytesIO extraction,
 return the requested slice. A process-lifetime bounded LRU of extracted
-text (never persisted, gone on restart — same lifecycle class as
-ChannelPulse) makes iterating on one document cheap.
+text (never persisted, gone on restart) makes iterating on one document
+cheap.
 
 Deleted Slack file ⇒ download fails ⇒ ``{"ok": False, "error": "file_deleted"}``
 — a privacy feature: deleting a file in Slack genuinely removes its content
@@ -55,6 +55,15 @@ class ExtractionCache:
         self._entries.move_to_end(file_id)
         while len(self._entries) > self.max_entries:
             self._entries.popitem(last=False)
+
+    def clear(self) -> None:
+        """Drop everything. The cache is a process-wide singleton keyed by file id ALONE — no
+        thread and no channel — which is correct because a Slack file id is globally unique and
+        because `read_document` authorizes against the turn's own catalog BEFORE it ever consults
+        this. Nothing here is a permission. But that global key means the entries outlive whatever
+        put them there, so anything that needs a clean process (a test file, a privacy purge) needs
+        a way to say so rather than reaching into `_entries`."""
+        self._entries.clear()
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -125,6 +134,34 @@ def _resolve_document(docs: List[Dict[str, Any]], file_id: Optional[str],
     return None
 
 
+def _resolve_canonical_file(canonical: Optional[Dict[str, Dict[str, Any]]],
+                            file_id: Optional[str],
+                            filename: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Resolve against the pinned channel window's file catalog.
+
+    Only IMAGES are excluded — `read_document` extracts text, and an image has none to extract;
+    `view_image` is the tool for those. Filename matching is exact-then-suffix-then-substring, the
+    same ladder `_resolve_document` uses, so a model that read a name out of a stream item's file
+    marker gets the same behavior it would get from a summary header.
+    """
+    entries = [e for e in (canonical or {}).values() if e.get("kind") != "image"]
+    if not entries:
+        return None
+    if file_id:
+        for entry in entries:
+            if entry.get("file_id") == file_id:
+                return entry
+    if filename:
+        want = filename.strip().lower()
+        for match in (lambda have: have == want,
+                      lambda have: have.endswith("/" + want),
+                      lambda have: want in have):
+            for entry in entries:
+                if match((entry.get("filename") or "").lower()):
+                    return entry
+    return None
+
+
 def _query_slices(text: str, query: str) -> List[Dict[str, Any]]:
     """Case-insensitive search returning up to QUERY_MAX_MATCHES context windows."""
     matches: List[Dict[str, Any]] = []
@@ -174,7 +211,20 @@ async def execute_read_document(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
         if doc:
             origin = "shared in another conversation in this channel"
     if not doc:
+        # Last resort, and the one that makes "[+1 file: report.pdf]" in another thread's stream
+        # item into a real offer: the pinned channel window's own file catalog. There is no
+        # `documents` row yet — nobody has read this file — so the summary/page fields simply do
+        # not exist, and the fields that matter (the CDN ref and the mimetype) come straight off
+        # the FileRef the fetch normalized. Fetch-on-demand into memory, no DB write: cataloguing
+        # here would persist a row for a file the model may not even end up using.
+        doc = _resolve_canonical_file(getattr(ctx, "canonical_files", None), file_id, filename)
+        if doc:
+            origin = "shared elsewhere in this channel"
+    if not doc:
         known = [d.get("filename") for d in (channel_docs or docs or [])][-5:]
+        known += [entry.get("filename")
+                  for entry in (getattr(ctx, "canonical_files", None) or {}).values()
+                  if entry.get("filename") not in known][:5]
         return {"ok": False, "error": "document_not_found",
                 "known_documents": known,
                 "hint": "Pass a filename from known_documents, an attachment note, or fetched "

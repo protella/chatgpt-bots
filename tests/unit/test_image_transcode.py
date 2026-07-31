@@ -41,11 +41,6 @@ class _Client:
         return self.data
 
 
-class _Pulse:
-    def upsert_artifacts(self, channel_id, source_ts, notes):
-        return True
-
-
 @pytest.fixture
 def db():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -59,7 +54,7 @@ def db():
 
 async def test_ambient_worker_transcodes_bmp_before_vision(db):
     openai = _CapturingOpenAI()
-    svc = AmbientArtifactService(db=db, openai_client=openai, channel_pulse=_Pulse())
+    svc = AmbientArtifactService(db=db, openai_client=openai)
     svc._client = _Client(_bmp())
 
     await svc._process(_Job(kind="image", channel_id="C1", source_ts="1.1", conversation_ts="1.1",

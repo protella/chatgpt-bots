@@ -56,8 +56,13 @@ class NativeStreamCoordinator:
     """
 
     def __init__(self, client, channel_id: str, thread_ts: Optional[str],
-                 char_limit: int, logger=None, user_id: Optional[str] = None):
+                 char_limit: int, logger=None, user_id: Optional[str] = None,
+                 receipts=None):
         self._client = client
+        # chat.startStream MINTS a message, so every part is a durable post this turn owns.
+        # Registered as it is minted, never at lease-commit time: the lease says the turn may
+        # speak, the receipt says the room has words it will keep (spec §5).
+        self._receipts = receipts
         self.channel = channel_id
         self.thread_ts = thread_ts
         # Triggering user's id — chat.startStream needs it as recipient_user_id for
@@ -107,9 +112,19 @@ class NativeStreamCoordinator:
             ok = False
         if ok and self.session.ts:
             self.part_ts.append(self.session.ts)
+            await self._note_part(self.session.ts)
         else:
             self.failed = True
         return not self.failed
+
+    async def _note_part(self, ts: str) -> None:
+        """Claim one native part. Never raises — the message is already in the room."""
+        if self._receipts is None:
+            return
+        try:
+            await self._receipts.note_post(ts, thread_root_ts=self.thread_ts)
+        except Exception as e:  # noqa: BLE001
+            self._log(f"native part receipt failed: {e}")
 
     async def update(self, raw_text: str) -> Tuple[bool, Optional[str]]:
         """Append the tail of the current part's cumulative raw text; roll on overflow."""
@@ -157,6 +172,7 @@ class NativeStreamCoordinator:
             ok = False
         if ok and self.session.ts:
             self.part_ts.append(self.session.ts)
+            await self._note_part(self.session.ts)
             self._log(f"native stream rolled to part {self.part} (fence reopened: {in_block})")
             return True, overflow
         self.failed = True

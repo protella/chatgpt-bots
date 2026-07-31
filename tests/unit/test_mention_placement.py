@@ -51,7 +51,6 @@ def _make_bot(cs, sender_type="human"):
     bot.message_handler = AsyncMock()
     bot.app = MagicMock()
     bot.app.client = MagicMock()
-    bot.channel_pulse = None  # skip the pulse feed/backfill branch
     bot.db = MagicMock()
     # Existing user with completed settings → no onboarding modal; message dispatches.
     bot.db.get_user_preferences_async = AsyncMock(return_value={"settings_completed": True})
@@ -183,7 +182,6 @@ def _place_app(resp_meta=None, content="answer", chooses=None):
     app.processor.process_message = AsyncMock(side_effect=_process)
     app.processor.thread_manager = MagicMock(spec=[])  # no in-flight/upload-latch attrs
     client = MagicMock()
-    client.channel_pulse = None
     client.send_thinking_indicator = AsyncMock(return_value="think.1")
     client.delete_message = AsyncMock()
     client.send_message = AsyncMock()

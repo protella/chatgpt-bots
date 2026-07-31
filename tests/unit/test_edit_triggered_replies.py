@@ -1,7 +1,7 @@
 """F52 — an EDIT to a recent human message can also drive a reply.
 
-Today a message_changed event reconciles the pulse and re-offers content to ambient memory but
-NEVER drives a reply: "@mention the bot, then edit to add the question" gets silence, and a
+Before F52 a message_changed event only reconciled derived artifacts and re-offered content to
+ambient memory; it never drove a reply: "@mention the bot, then edit to add the question" gets silence, and a
 meaningful edit to an already-answered message never gets a correction. F52 adds that — behind
 ENABLE_EDIT_TRIGGERED_REPLIES — through a chain of zero-cost pre-gates and two routes: a mention
 ADDED by the edit takes the addressed wake path (Slack fires no app_mention for edits); every
@@ -76,8 +76,6 @@ def _make_bot():
     bot.message_handler = AsyncMock()
     bot.app = MagicMock()
     bot.app.client = MagicMock()
-    bot.channel_pulse = MagicMock()
-    bot.channel_pulse.ensure_backfill = AsyncMock()
     bot._event_to_message = _fake_event_to_message
     bot._get_channel_settings = AsyncMock(return_value=None)
     bot._thread_participation = AsyncMock(return_value=(False, 1, 0))
@@ -247,6 +245,61 @@ async def test_mention_added_routes_to_addressed_path(flag_on):
 
 
 @pytest.mark.asyncio
+async def test_the_outer_event_ts_rides_the_addressed_route(flag_on):
+    """An edit keeps its ORIGINAL message ts, which may be hours old. The listeners admitted the
+    OUTER message_changed event_ts into the watermark, so that is what this turn must pin H
+    against — pinned at the message ts, the stream would stop before the edit that woke it."""
+    bot = _make_bot()
+    bot._handle_slack_message = AsyncMock()
+    event = _changed(old="what's up", new="<@UBOT> what's up")
+    event["event_ts"] = "1900.000500"
+    await bot._run_edit_triggered_reply(
+        event, bot.app.client, "C1", event["message"]["ts"],
+        "what's up", "<@UBOT> what's up", is_dm=False, mention_added=True)
+    assert bot._handle_slack_message.await_args.kwargs["admission_ts"] == "1900.000500"
+
+
+@pytest.mark.asyncio
+async def test_the_outer_event_ts_rides_the_engine_route(flag_on):
+    bot = _make_bot()
+    bot._dispatch_edit_to_engine = AsyncMock()
+    event = _changed()
+    event["event_ts"] = "1900.000500"
+    await bot._run_edit_triggered_reply(
+        event, bot.app.client, "C1", event["message"]["ts"],
+        "please review", "please review the numbers", is_dm=False, mention_added=False)
+    assert bot._dispatch_edit_to_engine.await_args.kwargs["admission_ts"] == "1900.000500"
+
+
+@pytest.mark.asyncio
+async def test_the_engine_dispatch_stamps_the_admission_ts_it_was_given(flag_on):
+    bot = _make_bot()
+    bot._get_channel_settings = AsyncMock(return_value={"participation_level": "on"})
+    msg_ts = _recent_ts()
+    synthetic = {"channel": "C1", "ts": msg_ts, "user": "UHUMAN", "text": "please review these"}
+    await bot._dispatch_edit_to_engine(
+        bot.app.client, synthetic, "C1", msg_ts, "please review", "please review these",
+        marker="E1", admission_ts="1900.000500")
+    msg = bot.message_handler.await_args.args[0]
+    assert msg.metadata["trigger_admission_ts"] == "1900.000500"
+    assert msg.metadata["ts"] == msg_ts          # the message is still identified by its own ts
+
+
+@pytest.mark.asyncio
+async def test_the_admission_ts_falls_back_to_the_message_ts(flag_on):
+    """A synthetic dispatch assembled without an outer event ts (a replay) must still stamp
+    something honest rather than an empty string."""
+    bot = _make_bot()
+    bot._get_channel_settings = AsyncMock(return_value={"participation_level": "on"})
+    msg_ts = _recent_ts()
+    synthetic = {"channel": "C1", "ts": msg_ts, "user": "UHUMAN", "text": "please review these"}
+    await bot._dispatch_edit_to_engine(
+        bot.app.client, synthetic, "C1", msg_ts, "please review", "please review these",
+        marker="E1")
+    assert bot.message_handler.await_args.args[0].metadata["trigger_admission_ts"] == msg_ts
+
+
+@pytest.mark.asyncio
 async def test_dm_edit_routes_to_dm_addressed_path(flag_on):
     bot = _make_bot()
     bot._handle_slack_message = AsyncMock()
@@ -279,7 +332,7 @@ async def test_edit_burst_on_one_message_collapses(flag_on):
     dispatched = []
 
     async def _record_engine(client, synthetic, channel_id, msg_ts, old_text, new_text,
-                             marker=None):
+                             marker=None, admission_ts=None):
         dispatched.append(new_text)
 
     bot._dispatch_edit_to_engine = _record_engine

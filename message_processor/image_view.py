@@ -93,8 +93,49 @@ def get_view_image_schema(thread_config: Optional[Dict[str, Any]] = None) -> Opt
     }
 
 
-def _err(error: str, message: str) -> Dict[str, Any]:
-    return {"ok": False, "error": error, "message": message}
+def get_view_image_schema_static(thread_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Channel-surface view_image: no id enum, no catalog text, always offered.
+
+    ``thread_config`` is accepted and IGNORED so the registry can call it like a factory; the
+    output never varies. The ids live in the turn's evidence block and the executor resolves
+    against the live catalog, so an empty catalog is an honest refusal rather than a missing tool.
+    """
+    return {
+        "type": "function",
+        "name": "view_image",
+        "description": (
+            "Look again, properly, at an image from EARLIER in this conversation — it comes "
+            "back as a real picture you can see, before you answer.\n\n"
+            "You can already see any image attached to the message you are answering right "
+            "now; do NOT call this for those. Call it when you only have a written description "
+            "of an image and the question actually turns on the pixels: what a screenshot says, "
+            "whether it looks genuine, reading a number or a label off it, comparing two of "
+            "them. Guessing from the description instead is how you get it wrong.\n\n"
+            "This posts NOTHING to the channel and does not touch the sandbox — it just puts "
+            "the picture in front of you. Looking is all it does; to CHANGE a picture (crop, "
+            "restyle, combine) use edit_image, and to use one as an ingredient in computed work "
+            "(charting numbers out of it, embedding it in a document) mount_file it into the "
+            "sandbox. Never render an image in the sandbox merely to see it.\n\n"
+            f"You may look at up to {MAX_VIEWS_PER_TURN} earlier images per turn.\n\n"
+            "Ids come from the image catalog in this turn's evidence; an id that is not listed "
+            "there does not resolve."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "image_id": {
+                    "type": "string",
+                    "description": "Which earlier image to look at, by id from the catalog.",
+                },
+            },
+            "required": ["image_id"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def _err(error: str, message: str, **extra: Any) -> Dict[str, Any]:
+    return {"ok": False, "error": error, "message": message, **extra}
 
 
 # A produced image (one the bot just generated or edited) does NOT spend the view budget above:
@@ -165,11 +206,17 @@ async def execute_view_image(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str
     if not image_id:
         return _err("missing_image_id", "Name which image to look at.")
 
-    entry = image_catalog.resolve(getattr(ctx, "image_catalog", None), image_id)
+    entries = getattr(ctx, "image_catalog", None) or []
+    entry = image_catalog.resolve(entries, image_id)
     if not entry:
         # Covers an invented id AND one from another thread: the catalog is thread-scoped, so
-        # anything outside it simply has no entry here.
-        return _err("unknown_image", f"{image_id} is not an image in this conversation.")
+        # anything outside it simply has no entry here. On the channel surface the tool is
+        # offered with no enum, so an empty catalog reaches here too and must say so plainly.
+        valid = image_catalog.valid_ids(entries)
+        return _err("unknown_image",
+                    (f"{image_id} is not an image in this conversation."
+                     if valid else "There are no images in this conversation to look at."),
+                    valid_image_ids=valid)
 
     url = entry.get("url")
     if not url:
@@ -263,4 +310,5 @@ async def execute_view_image(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str
 def register_image_view_tools(registry: ToolRegistry) -> None:
     """Register view_image. A schema FACTORY (the legal ids depend on the thread), so it needs
     an explicit name."""
-    registry.register(get_view_image_schema, execute_view_image, name="view_image")
+    registry.register(get_view_image_schema, execute_view_image, name="view_image",
+                      dynamic=True, channel_schema=get_view_image_schema_static)

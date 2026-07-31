@@ -6,6 +6,7 @@ policy row the steering is built around:
 
   * lifecycle — who reads, when, how many times, and what a redispatch/retry/failure does;
   * rendering — deterministic bytes, policy always first, ids exposed only where a tool may act;
+  * the P2 split — two addressable halves, and the flattened forms derived from them;
   * storage — the reserved row's uniqueness, replace-or-delete semantics, authorship;
   * authorization — the only two writers, and every generic path that must NOT reach it;
   * migration — the legacy directives column, moved once and never read again.
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import pathlib
 import sqlite3
 import tempfile
 from types import SimpleNamespace
@@ -31,11 +33,17 @@ from settings_modal import SettingsModal
 from message_processor import channel_steering
 from message_processor.channel_steering import (
     CHANNEL_FACT_HEADING, EMPTY_SNAPSHOT, POLICY_HEADING, POLICY_MAX_CHARS,
-    WORKSPACE_FACT_HEADING, ChannelSteeringSnapshot, is_ordinary_fact, is_policy_row, is_pref_row,
-    load_snapshot, render_snapshot, stamp, stamped,
+    STEERING_SNAPSHOT_VERSION, WORKSPACE_FACT_HEADING, ChannelSteeringSnapshot, is_ordinary_fact,
+    is_policy_row, is_pref_row, load_snapshot, render_snapshot, stamp, stamped,
 )
 
 MARK = "participation_engine:pref:reactions"
+
+
+def _snap(text: str) -> ChannelSteeringSnapshot:
+    """A snapshot whose flattened bytes are exactly ``text``. The lifecycle tests below care only
+    about WHICH string reaches the responder, not how it was composed."""
+    return ChannelSteeringSnapshot(developer_policy=text)
 
 
 def _fact(mid, content, scope="channel", author="U1"):
@@ -139,6 +147,98 @@ class TestRendering:
         assert text is None
 
 
+# ------------------------------------------------------------- the P2 split (spec §3)
+#
+# One read, one version, two addressable halves: the policy is a directive and rides the
+# developer suffix; the facts are background and ride the post-breakpoint user evidence. The
+# flattened forms are DERIVED from those halves, which is what keeps the split from drifting away
+# from the bytes the gate judged the message against.
+
+GOLDEN = json.loads(
+    (pathlib.Path(__file__).resolve().parents[1] / "fixtures"
+     / "channel_steering_golden.json").read_text(encoding="utf-8"))
+
+
+class TestFlattenedBytesAreUnchanged:
+    """The golden file was captured from the PRE-SPLIT renderer. Both flattened accessors must
+    reproduce it byte for byte: `gate_text` because the wake classifier's prompt is those bytes,
+    and `.text` because the DM path and every intermediate caller still ask for it by that name.
+    A split that changed the rendering would have quietly re-tuned the gate."""
+
+    @pytest.mark.parametrize("case", GOLDEN["cases"], ids=lambda c: c["name"])
+    def test_gate_text_matches_the_pre_split_bytes(self, case):
+        snap = render_snapshot(case["policy_row"], case["memory_rows"])
+        assert snap.gate_text == case["text"]
+
+    @pytest.mark.parametrize("case", GOLDEN["cases"], ids=lambda c: c["name"])
+    def test_the_legacy_text_property_matches_too(self, case):
+        snap = render_snapshot(case["policy_row"], case["memory_rows"])
+        assert snap.text == case["text"]
+        assert snap.text == snap.gate_text          # one string, two names, never two renderings
+
+    @pytest.mark.parametrize("case", GOLDEN["cases"], ids=lambda c: c["name"])
+    def test_the_policy_fields_match_too(self, case):
+        snap = render_snapshot(case["policy_row"], case["memory_rows"])
+        assert snap.policy_hash == case["policy_hash"]
+        assert snap.policy_present is case["policy_present"]
+
+    def test_the_golden_file_covers_every_section_combination(self):
+        # A golden that only ever exercised one shape would prove nothing about the join.
+        names = {c["name"] for c in GOLDEN["cases"]}
+        assert {"everything", "policy_only", "channel_facts_only", "workspace_facts_only",
+                "policy_and_workspace", "multiline_policy", "empty"} <= names
+
+
+class TestTheTwoHalves:
+    def test_the_policy_half_carries_its_heading_and_nothing_else(self):
+        snap = render_snapshot({"content": "only deploys"},
+                               [_fact(1, "Pat owns billing"),
+                                _fact(2, "ships Thursdays", scope="workspace")])
+        assert snap.developer_policy == f"{POLICY_HEADING}\nonly deploys"
+        assert "Pat owns billing" not in snap.developer_policy
+
+    def test_the_facts_half_carries_both_fact_sections_and_no_policy(self):
+        snap = render_snapshot({"content": "only deploys"},
+                               [_fact(1, "Pat owns billing"),
+                                _fact(2, "ships Thursdays", scope="workspace")])
+        assert snap.user_facts.startswith(CHANNEL_FACT_HEADING)
+        assert WORKSPACE_FACT_HEADING in snap.user_facts
+        # The directive must not reach the user-role half: that is the whole point of the split.
+        assert "only deploys" not in snap.user_facts
+        assert POLICY_HEADING not in snap.user_facts
+
+    def test_a_policy_with_no_facts_leaves_the_facts_half_empty(self):
+        snap = render_snapshot({"content": "only deploys"}, [])
+        assert snap.user_facts is None and snap.developer_policy
+
+    def test_facts_with_no_policy_leave_the_policy_half_empty(self):
+        snap = render_snapshot(None, [_fact(1, "Pat owns billing")])
+        assert snap.developer_policy is None and snap.user_facts
+
+    def test_the_flattened_form_is_the_two_halves_policy_first(self):
+        snap = render_snapshot({"content": "only deploys"}, [_fact(1, "Pat owns billing")])
+        assert snap.gate_text == f"{snap.developer_policy}\n\n{snap.user_facts}"
+
+    def test_an_empty_snapshot_is_empty_on_every_accessor(self):
+        assert EMPTY_SNAPSHOT.developer_policy is None
+        assert EMPTY_SNAPSHOT.user_facts is None
+        assert EMPTY_SNAPSHOT.gate_text is None
+        assert EMPTY_SNAPSHOT.text is None
+        assert EMPTY_SNAPSHOT.is_empty
+
+    def test_every_snapshot_states_its_grammar_version(self):
+        # It travels into the request-cache tuple, so a consumer can say which grammar it obeyed.
+        assert render_snapshot({"content": "p"}, []).version == STEERING_SNAPSHOT_VERSION
+        assert EMPTY_SNAPSHOT.version == STEERING_SNAPSHOT_VERSION
+
+    async def test_a_loaded_snapshot_is_split_the_same_way(self):
+        db = _steering_db([_fact(1, "Pat owns billing")], policy={"content": "only deploys"})
+        snap = await load_snapshot(db, "C1")
+        assert snap.developer_policy and "only deploys" in snap.developer_policy
+        assert snap.user_facts and "Pat owns billing" in snap.user_facts
+        assert snap.gate_text == snap.text
+
+
 # --------------------------------------------------------------------------- loading
 
 class TestLoadSnapshot:
@@ -172,7 +272,7 @@ class TestLoadSnapshot:
 class TestStamp:
     def test_stamp_then_read_back(self):
         msg = SimpleNamespace(metadata={})
-        snap = ChannelSteeringSnapshot(text="x")
+        snap = _snap("x")
         assert stamp(msg, snap) is snap
         assert stamped(msg) is snap
 
@@ -183,13 +283,16 @@ class TestStamp:
     def test_a_second_stamp_overwrites(self):
         # A new gate attempt judges a new moment; it must not inherit the previous attempt's view.
         msg = SimpleNamespace(metadata={})
-        stamp(msg, ChannelSteeringSnapshot(text="old"))
-        stamp(msg, ChannelSteeringSnapshot(text="new"))
+        stamp(msg, _snap("old"))
+        stamp(msg, _snap("new"))
         assert stamped(msg).text == "new"
 
     def test_the_snapshot_is_frozen(self):
+        snap = _snap("x")
         with pytest.raises(Exception):
-            ChannelSteeringSnapshot(text="x").text = "y"   # type: ignore[misc]
+            snap.developer_policy = "y"   # type: ignore[misc]
+        with pytest.raises(Exception):
+            snap.text = "y"               # type: ignore[misc]  — derived, so not settable either
 
     def test_a_foreign_value_on_the_key_is_ignored(self):
         msg = SimpleNamespace(metadata={channel_steering.STEERING_KEY: "not a snapshot"})
@@ -537,7 +640,14 @@ def _responder(db, handler=None):
     async def _state_for(*a, **k):
         return state
 
+    # A channel turn CREATES its state (P2) and a DM still rebuilds one; the steering lifecycle
+    # under test is the same either way, so both entry points answer with the same object.
     p._get_or_rebuild_thread_state = _state_for
+    p.get_or_create_channel_thread_state = _state_for
+    # …and it renders a pinned stream and admits its request. Neither is what this file is about;
+    # the ONE steering read and the string base.py hands down sit either side of them.
+    p._build_channel_turn_stream = AsyncMock(return_value=None)
+    p._admit_channel_request = AsyncMock()
     p._process_attachments = AsyncMock(return_value=([], [], []))
     p._handle_text_response = handler or AsyncMock(side_effect=_Stop())
     return p
@@ -588,7 +698,7 @@ class TestResponderReads:
         db = _steering_db([_fact(1, "a fact")], policy={"content": "only deploys"})
         p = _responder(db)
         msg = _turn_msg(gate_required=True)
-        stamp(msg, ChannelSteeringSnapshot(text="what the gate saw"))
+        stamp(msg, _snap("what the gate saw"))
         await _run_turn(p, msg)
         assert _passed_steering(p) == "what the gate saw"
         db.get_channel_memory_async.assert_not_awaited()
@@ -600,7 +710,7 @@ class TestResponderReads:
         db = _steering_db([], policy={"content": "the policy the responder must not see"})
         p = _responder(db)
         msg = _turn_msg(gate_required=True)
-        stamp(msg, ChannelSteeringSnapshot(text="the policy the gate saw"))
+        stamp(msg, _snap("the policy the gate saw"))
         await _run_turn(p, msg)
         assert _passed_steering(p) == "the policy the gate saw"
 
@@ -660,13 +770,20 @@ class _GateSpy:
 
 
 class _ResponderSpy:
-    """Records the system prompt handed to the responding model."""
+    """Records the whole payload handed to the responding model — instructions AND input items.
+
+    Both, since the steering split: the standing policy leaves in the developer suffix and the
+    remembered facts leave as user evidence, so a spy that only kept the system prompt could no
+    longer see either of them.
+    """
 
     def __init__(self):
         self.prompts = []
+        self.inputs = []
 
     async def create_text_response(self, messages=None, system_prompt=None, **kw):
         self.prompts.append(system_prompt)
+        self.inputs.append(list(messages or []))
         return "ok"
 
     async def _create_text_response_with_timeout(self, **kw):
@@ -712,7 +829,13 @@ class _FakeSlack:
 
 
 def _api_spy_processor(db, openai):
-    """A real MessageProcessor that reaches the API with the REAL system prompt."""
+    """A real MessageProcessor that reaches the API with the REAL prompt AND the real assembler.
+
+    Only the world is faked — the stream is synthetic and the tools are absent. Everything that
+    decides where the two halves of the snapshot end up is the production code.
+    """
+    from tests.unit.channel_turn_harness import no_tools_prepared, normalized, build_stream
+
     p = _responder(db, handler=None)
     p.openai_client = openai
     p._handle_text_response = p.__class__._handle_text_response.__get__(p)
@@ -728,16 +851,21 @@ def _api_spy_processor(db, openai):
     p._pre_trim_messages_for_api = _passthru
     p._build_participant_roster = MagicMock(return_value="")
     p._build_suffix_context = MagicMock(return_value="")
-    p._build_pulse_envelope = MagicMock(return_value=None)
     p._build_tools_array = MagicMock(return_value=[])
     p._materialize_request_tools = MagicMock(return_value=(None, {}, False, ""))
+    p._prepare_channel_turn_tools = AsyncMock(return_value=no_tools_prepared())
     p._persist_tool_provenance = MagicMock()
     p._update_status = MagicMock()
     p._build_channel_info = _none
-    p._build_channel_summary_block = _none
     p._async_post_response_cleanup = _none
     p._drop_dead_containers = _none
     p._resolve_ci_container = _none
+    p.ingest_channel_origin_slice = AsyncMock()
+    p._build_channel_turn_stream = AsyncMock(
+        return_value=build_stream([normalized("10.0", "deploy failed")], h="10.0"))
+    # The REAL admission: it is what pins the turn context the assembler reads, and it is also
+    # where the snapshot the gate stamped becomes the two halves this test is checking.
+    p._admit_channel_request = p.__class__._admit_channel_request.__get__(p)
 
     def _discard(coro, *a, **k):
         if hasattr(coro, "close"):
@@ -793,7 +921,26 @@ async def test_the_gate_and_the_responder_receive_the_IDENTICAL_snapshot_bytes(m
     assert responder_spy.prompts, "the responder must have reached the API"
 
     assert expected in gate_prompt, "the gate's payload lost the canonical block"
-    assert expected in responder_spy.prompts[0], "the responder's payload lost the canonical block"
+
+    # THE RESPONDER HALF, post-split. The gate reads the block flattened, because a wake verdict
+    # is one judgment against the whole of it. The responder reads it in two, because the two
+    # halves are different KINDS of thing: the standing policy is a directive and rides the
+    # developer suffix, the remembered facts are background and ride user-role evidence. The
+    # invariant is unchanged and is what this asserts — both halves came from the ONE stamped
+    # snapshot, so neither can describe a different moment than the gate judged.
+    payload = "\n".join(
+        str(part) for item in responder_spy.inputs[0]
+        for part in ([item.get("content")] if isinstance(item.get("content"), str)
+                     else [p.get("text") for p in (item.get("content") or [])
+                           if isinstance(p, dict)]))
+    assert policy["content"] in payload, "the responder's payload lost the standing policy"
+    for row in rows:
+        if row is not rows[-1]:      # the gate's own preference row is steering, not a fact
+            assert row["content"] in payload, f"the responder lost the fact {row['content']!r}"
+    developer = [i["content"] for i in responder_spy.inputs[0] if i.get("role") == "developer"]
+    assert developer and policy["content"] in developer[-1]
+    assert not any(policy["content"] in str(i.get("content"))
+                   for i in responder_spy.inputs[0] if i.get("role") == "user")
     # One read for the whole turn, both halves.
     assert db.get_channel_memory_async.await_count == 1
     assert db.get_channel_policy_async.await_count == 1
@@ -1490,10 +1637,16 @@ class TestStartupRefusesToRunWithUnmigratedRules:
         # Startup runs THREE state migrations, each fatal on failure for the same reason. This
         # class drives the directives one; the other two must succeed so the abort under test is
         # unambiguously the one being injected.
+        # Startup also establishes the outbound-receipts epoch and reconciles dead-session
+        # rows; both must succeed or the abort under test would be the wrong one.
         fake_db = SimpleNamespace(
             migrate_channel_directives_to_policy_async=migrate,
             migrate_participation_levels_to_binary_async=AsyncMock(return_value=(0, 0)),
-            migrate_participation_prefs_to_policy_async=AsyncMock(return_value=(0, 0)))
+            migrate_participation_prefs_to_policy_async=AsyncMock(return_value=(0, 0)),
+            set_meta_if_absent_async=AsyncMock(return_value=True),
+            get_meta_async=AsyncMock(return_value="1000.000000"),
+            finalize_dead_session_receipts_async=AsyncMock(return_value=0),
+            get_pending_shares_async=AsyncMock(return_value=[]))
         fake_client = SimpleNamespace(db=fake_db, processor=None)
 
         import slack_client

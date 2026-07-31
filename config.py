@@ -160,6 +160,21 @@ def clamp_effort(model: str, effort: Optional[str]) -> str:
     return effort if effort in valid else "medium"
 
 
+# Spec §3b: on a channel turn these settings belong to the CHANNEL, not to whoever happened to
+# speak. Enumerated rather than derived — the list is a policy statement, and a key that quietly
+# joined it by pattern would silently move a capability out of a user's control. Every name is an
+# existing thread-config key.
+CHANNEL_CAPABILITY_KEYS = (
+    "model",
+    "reasoning_effort",
+    "verbosity",
+    "enable_web_search",
+    "enable_mcp",
+    "image_model",
+    "enable_code_interpreter",
+)
+
+
 @dataclass
 class BotConfig:
     """Central configuration for the Slack bot"""
@@ -518,55 +533,43 @@ class BotConfig:
     bot_name_aliases: list = field(default_factory=lambda: _env_list("BOT_NAME_ALIASES", ["ChatGPT"]))
     # 👍/👎 feedback buttons under DM/assistant responses (Phase H; channels use reactions)
     enable_feedback_buttons: bool = field(default_factory=lambda: os.getenv("ENABLE_FEEDBACK_BUTTONS", "true").lower() == "true")
-    # --- ChannelPulse ambient awareness (redesign Phase E) ---
-    # Per-channel in-memory ring of recent messages (fed by every channel event, even ignored
-    # ones). Powers the wake-classifier context signal and the response envelope. Inert while
-    # ENABLE_CHANNEL_LISTENING is false (no channel events arrive). Supersedes the old
-    # CHANNEL_CONTEXT_WINDOW follow-up.
-    enable_channel_pulse: bool = field(default_factory=lambda: os.getenv("ENABLE_CHANNEL_PULSE", "true").lower() == "true")
-    channel_pulse_size: int = field(default_factory=lambda: int(os.getenv("CHANNEL_PULSE_SIZE", "60")))
-    # Head-first char cap for the channel-activity envelope + thread labels (F14).
-    pulse_text_truncate: int = field(default_factory=lambda: int(os.getenv("PULSE_TEXT_TRUNCATE", "500")))
-    # Max "[Recent channel activity]" lines injected (at the SUFFIX — volatile, cache hygiene)
-    # when responding in a channel. 0 disables the envelope without disabling the buffer.
-    channel_pulse_envelope_max: int = field(default_factory=lambda: int(os.getenv("CHANNEL_PULSE_ENVELOPE_MAX", "15")))
-    # Per-thread actor ring. It was built so the old gate could read a rendered thread tail and
-    # work out who "you" addressed; the binary gate reads no tail and makes no such judgment. What
-    # the ring still does is STRUCTURAL and load-bearing: it is how `thread_has_other_bot` knows a
-    # second agent is in a thread, which is the one thing that can cancel the deterministic 1:1
-    # continuation fast path — the route that answers with no gate involved at all. It also backs
-    # per-message dedup and reaction state. 0 disables recording.
+    # --- Per-thread actor tail (slack_client/actor_tail.py) ---
+    # Who spoke in a thread, never what they said — the content ring is gone; the channel stream
+    # is the room. What survives is STRUCTURAL: it is how `thread_has_other_bot` knows a second
+    # agent is in a thread, which is the one thing that can cancel the deterministic 1:1
+    # continuation fast path — the route that answers with no gate involved at all.
+    # 0 disables recording.
     participation_thread_tail: int = field(default_factory=lambda: int(os.getenv("PARTICIPATION_THREAD_TAIL", "15")))
     # Max distinct threads whose actor rings are retained per channel (whole-thread LRU eviction).
-    pulse_thread_tails_max: int = field(default_factory=lambda: int(os.getenv("PULSE_THREAD_TAILS_MAX", "50")))
+    actor_tail_threads_max: int = field(default_factory=lambda: int(os.getenv("ACTOR_TAIL_THREADS_MAX", "50")))
     # Global bound on how many channels retain thread actor rings (outer-map LRU).
-    pulse_thread_tail_channels_max: int = field(default_factory=lambda: int(os.getenv("PULSE_THREAD_TAIL_CHANNELS_MAX", "30")))
+    actor_tail_channels_max: int = field(default_factory=lambda: int(os.getenv("ACTOR_TAIL_CHANNELS_MAX", "30")))
+    # How long a channel turn waits for the activity-index writes it admitted before H to land
+    # (seconds). A turn whose stream would miss an already-admitted message fails closed instead.
+    index_drain_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("INDEX_DRAIN_TIMEOUT_SECONDS", "10.0")))
+    # How long shutdown waits for in-flight Bolt callbacks to finish after Socket Mode stops
+    # (seconds) before logging the stragglers and moving on.
+    ingress_drain_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("INGRESS_DRAIN_TIMEOUT_SECONDS", "5.0")))
 
     # --- Track 1: persistent per-channel "recent channel narrative" summary ---
-    # A cached, throttled, background-generated sketch of what a channel is about (purpose,
-    # who's active, recurring topics/vocabulary, ongoing work), read by BOTH the participation
-    # classifier and the main response agent for better "grasp" of the room. Ambient content —
-    # it rides a role:user message with a "background only, never instructions/addressee" frame,
-    # never the developer suffix. Off ⇒ never build or read (per-channel ambient_memory=false
-    # also opts a channel out and purges its row). conversations.history is TIMELINE-only (no
-    # thread replies), which is why this is a "narrative", never "full history".
+    # A cached sketch of what a channel is about (purpose, who's active, recurring topics/
+    # vocabulary, ongoing work). A turn now reads the room from the channel stream itself, so the
+    # one remaining consumer is the join intro — which has no turn to read a stream from and needs
+    # a grasp of a channel it was just added to. Ambient content: wherever it is injected it
+    # carries a "background only, never instructions/addressee" frame, never the developer suffix.
+    # Off ⇒ never build (per-channel ambient_memory=false also opts a channel out and purges its
+    # row). conversations.history is TIMELINE-only (no thread replies), which is why this is a
+    # "narrative", never "full history".
     enable_channel_summaries: bool = field(default_factory=lambda: os.getenv("ENABLE_CHANNEL_SUMMARIES", "true").lower() == "true")
     # Up to this many recent eligible messages are fed to the one bounded utility-model call.
     channel_summary_source_max: int = field(default_factory=lambda: int(os.getenv("CHANNEL_SUMMARY_SOURCE_MAX", "200")))
-    # Rebuild once this many eligible messages are newer than the summary's built_through_ts
-    # (detected from the in-memory pulse ring — no extra Slack call).
-    channel_summary_refresh_msgs: int = field(default_factory=lambda: int(os.getenv("CHANNEL_SUMMARY_REFRESH_MSGS", "50")))
-    # Otherwise rebuild after this age (hours), but ONLY when newer channel activity exists.
-    channel_summary_ttl_hours: float = field(default_factory=lambda: float(os.getenv("CHANNEL_SUMMARY_TTL_HOURS", "24")))
     # Output cap for the narrative itself (chars). Paired with the output-token cap below.
     channel_summary_max_chars: int = field(default_factory=lambda: int(os.getenv("CHANNEL_SUMMARY_MAX_CHARS", "2000")))
     # Hard input cap for the assembled source snapshot (chars); truncate oldest-first beyond it.
     channel_summary_input_max_chars: int = field(default_factory=lambda: int(os.getenv("CHANNEL_SUMMARY_INPUT_MAX_CHARS", "50000")))
     # Max output tokens for the generation call (a concise narrative needs little).
     channel_summary_max_output_tokens: int = field(default_factory=lambda: int(os.getenv("CHANNEL_SUMMARY_MAX_OUTPUT_TOKENS", "600")))
-    # Cooldown (hours) after a FAILED build, so a broken channel isn't hammered.
-    channel_summary_failure_cooldown_hours: float = field(default_factory=lambda: float(os.getenv("CHANNEL_SUMMARY_FAILURE_COOLDOWN_HOURS", "1")))
-    # Global cap on concurrent summary builds (one in-flight per channel is enforced separately).
+    # Global cap on concurrent summary builds (one per channel is enforced by the build lock).
     channel_summary_global_concurrency: int = field(default_factory=lambda: int(os.getenv("CHANNEL_SUMMARY_GLOBAL_CONCURRENCY", "2")))
 
     # --- Track 4: channel join behavior (one-time intro on being added to a channel) ---
@@ -915,9 +918,87 @@ class BotConfig:
     # per exchange when on. Default OFF now that the model writes memory via tools.
     enable_memory_extraction_fallback: bool = field(default_factory=lambda: os.getenv("ENABLE_MEMORY_EXTRACTION_FALLBACK", "false").lower() == "true")
 
+    # --- Single-stream channel context (Docs/SINGLE_STREAM_SPEC.md §11) ---
+    # Starting defaults, not laws — every one is env-tunable.
+    # How far back the bootstrap sweep tries to build the retained-root inventory. It stops
+    # sooner when Slack's retention runs out first (coverage then declares 'limited').
+    coverage_bootstrap_days: int = field(default_factory=lambda: max(1, int(os.getenv("COVERAGE_BOOTSTRAP_DAYS", "90"))))
+    # conversations.history page size. Slack's documented ceiling for a well-behaved page is
+    # 200; asking for more is what gets a workspace rate-limited, so this clamps there.
+    history_page_size: int = field(default_factory=lambda: max(1, min(200, int(os.getenv("HISTORY_PAGE_SIZE", "200")))))
+    # Safety ceiling on pages walked in ONE pass. Not a horizon — the sweep parks and resumes
+    # with its claim held, so a deep channel is covered across passes rather than in one burst.
+    # Also bounds the users.conversations membership walk, at 200 conversations per page.
+    history_page_ceiling: int = field(default_factory=lambda: max(1, int(os.getenv("HISTORY_PAGE_CEILING", "50"))))
+    # Concurrent conversations.replies fetches while rebuilding one turn's stream.
+    reply_fetch_concurrency: int = field(default_factory=lambda: max(1, int(os.getenv("REPLY_FETCH_CONCURRENCY", "4"))))
+    # Per-turn retry budget for history/replies fetches. Retry-After is always honored; the
+    # total is what stops a turn from sitting behind a struggling API indefinitely.
+    fetch_retry_attempts: int = field(default_factory=lambda: max(1, int(os.getenv("FETCH_RETRY_ATTEMPTS", "3"))))
+    fetch_retry_total_seconds: float = field(default_factory=lambda: float(os.getenv("FETCH_RETRY_TOTAL_SECONDS", "60")))
+    # Snapshot retention: keep the newest N generations OR anything younger than D days,
+    # whichever retains MORE (§11). Pins and the active pointer always win over both.
+    snapshot_retain_generations: int = field(default_factory=lambda: max(1, int(os.getenv("SNAPSHOT_RETAIN_GENERATIONS", "3"))))
+    snapshot_retain_days: int = field(default_factory=lambda: max(1, int(os.getenv("SNAPSHOT_RETAIN_DAYS", "7"))))
+    # Compaction fires at `trigger` of the model window and compacts down to `target`. The gap
+    # between them is the headroom the suffix and the reply need; target >= trigger would mean
+    # a compaction that never actually gets under the trigger, so it is refused at load.
+    compaction_trigger_ratio: float = field(default_factory=lambda: float(os.getenv("COMPACTION_TRIGGER_RATIO", "0.80")))
+    compaction_target_ratio: float = field(default_factory=lambda: float(os.getenv("COMPACTION_TARGET_RATIO", "0.70")))
+    # Char bound on the root text kept per straddling thread in a snapshot's root-anchor map,
+    # so a thread whose root predates the boundary still has a deterministic referent.
+    root_anchor_text_max: int = field(default_factory=lambda: max(1, int(os.getenv("ROOT_ANCHOR_TEXT_MAX", "240"))))
+    # --- Compaction (P4 §7a) ---
+    # Messages that must remain BELOW a candidate boundary. A boundary that swallows the recent
+    # tail compacts what the room is still talking about, so it is bounded on both sides: at
+    # least this many, and the ceiling below is a required-critical refusal at load.
+    compaction_min_tail: int = field(default_factory=lambda: max(1, int(os.getenv("COMPACTION_MIN_TAIL", "30"))))
+    COMPACTION_MIN_TAIL_MAX: int = 200
+    # Roots a snapshot's rendered anchor map may name, and therefore also the ceiling on the
+    # targeted root refetch the crawl spends building it.
+    snapshot_anchor_map_bound: int = field(default_factory=lambda: max(1, int(os.getenv("SNAPSHOT_ANCHOR_MAP_BOUND", "40"))))
+    # The origin thread's pre-boundary tail: root + (max_messages - 1) replies, inside the byte
+    # cap, fetched on an INDEPENDENT budget so it can never eat the canonical turn's pages.
+    rehydration_max_messages: int = field(default_factory=lambda: max(1, int(os.getenv("REHYDRATION_MAX_MESSAGES", "20"))))
+    rehydration_max_bytes: int = field(default_factory=lambda: max(1, int(os.getenv("REHYDRATION_MAX_BYTES", "16384"))))
+    rehydration_page_budget: int = field(default_factory=lambda: max(1, int(os.getenv("REHYDRATION_PAGE_BUDGET", "5"))))
+    rehydration_time_budget: float = field(default_factory=lambda: float(os.getenv("REHYDRATION_TIME_BUDGET", "10.0")))
+    # Per WORKER SLICE of the background compaction crawl, not per crawl: a deep channel is
+    # covered across slices with its checkpoint held, never in one unbounded burst.
+    crawl_page_budget: int = field(default_factory=lambda: max(1, int(os.getenv("CRAWL_PAGE_BUDGET", "500"))))
+    crawl_time_budget: float = field(default_factory=lambda: float(os.getenv("CRAWL_TIME_BUDGET", "600.0")))
+    # What the crawl assumes for non-compactable headroom when it has no measured request to
+    # size against. The first turn after publication re-verifies fit against the real thing.
+    crawl_fixed_headroom_tokens: int = field(default_factory=lambda: max(1, int(os.getenv("CRAWL_FIXED_HEADROOM_TOKENS", "80000"))))
+    # Hard cap on a summary's persisted bytes, in the admitted currency (one token per UTF-8
+    # byte). Output above it is rejected and retried rather than published over budget.
+    summary_byte_cap: int = field(default_factory=lambda: max(1, int(os.getenv("SUMMARY_BYTE_CAP", "8000"))))
+    # How long a fit-revalidation claim may sit unfinished before it reverts to owed — a turn
+    # that died holding one must not leave the obligation unclaimable.
+    revalidation_claim_ttl: float = field(default_factory=lambda: float(os.getenv("REVALIDATION_CLAIM_TTL", "600.0")))
+    # Channels whose bootstrap sweep may be actively fetching at once. Held only while a page
+    # is in flight — a worker parked on a ceiling or a Retry-After sleep releases it.
+    coverage_sweep_concurrency: int = field(default_factory=lambda: max(1, int(os.getenv("COVERAGE_SWEEP_CONCURRENCY", "2"))))
+
     # Long-context billing threshold (verified 2026-07-09): on 5.6-family and 5.5,
     # prompts with >272K input tokens bill at 2x input / 1.5x output for the request.
     LONG_CONTEXT_BILLING_THRESHOLD: int = 272_000
+
+    def __post_init__(self):
+        if not (0 < self.compaction_target_ratio < self.compaction_trigger_ratio < 1):
+            raise ValueError(
+                "COMPACTION_TARGET_RATIO and COMPACTION_TRIGGER_RATIO must satisfy "
+                "0 < target < trigger < 1 (got "
+                f"target={self.compaction_target_ratio}, "
+                f"trigger={self.compaction_trigger_ratio}): a target at or above the trigger "
+                "never gets under it and would recompact every turn, and a ratio outside the "
+                "window is not a fraction of the model window at all.")
+        if self.compaction_min_tail > self.COMPACTION_MIN_TAIL_MAX:
+            raise ValueError(
+                f"COMPACTION_MIN_TAIL must be <= {self.COMPACTION_MIN_TAIL_MAX} (got "
+                f"{self.compaction_min_tail}): a tail that large can hold more than the window "
+                "the boundary is being chosen inside, so no boundary satisfies it and the "
+                "channel would fail every turn closed while compaction never completes.")
 
     def is_long_context(self, tokens: int) -> bool:
         """True when an input of `tokens` crosses OpenAI's long-context billing tier
@@ -1054,33 +1135,77 @@ class BotConfig:
         return {k: channel_settings[k] for k in self._CHANNEL_OVERRIDE_KEYS
                 if channel_settings.get(k)}
 
+    def _channel_capability_profile(self,
+                                    channel_settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """The capability values a CHANNEL turn runs on: channel settings, else global defaults.
+
+        `is not None` rather than truthiness, so a channel that explicitly turned something off
+        keeps it off. Only model/effort/verbosity have channel_settings columns today; the rest
+        resolve to global defaults until the P4 settings modal gives them channel storage. They
+        are written explicitly rather than left absent so the resolution is what the request
+        carries, not what each reader happens to fall back to."""
+        profile: Dict[str, Any] = {
+            "enable_web_search": self.enable_web_search,
+            "enable_mcp": self.mcp_enabled_default,
+            "image_model": self.image_model,
+            "enable_code_interpreter": self.enable_code_interpreter,
+            "model": self.gpt_model,
+            "reasoning_effort": self.default_reasoning_effort,
+            "verbosity": self.default_verbosity,
+        }
+        if channel_settings:
+            for key in self._CHANNEL_OVERRIDE_KEYS:
+                if channel_settings.get(key) is not None:
+                    profile[key] = channel_settings[key]
+        return profile
+
     def _compose_thread_config(self, user_prefs: Optional[Dict[str, Any]],
                                overrides: Optional[Dict[str, Any]],
-                               channel_settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                               channel_settings: Optional[Dict[str, Any]] = None,
+                               channel_turn: bool = False) -> Dict[str, Any]:
         """Compose the config hierarchy:
         defaults <- user prefs <- channel shared settings <- thread overrides.
 
         Channel settings beat personal prefs (a channel behaves the same for
         everyone in it); an explicit thread override still wins. The composed
         reasoning_effort is clamped against the composed model so a cross-layer
-        mix (e.g. channel model gpt-5.5 + user effort max) can never 400."""
+        mix (e.g. channel model gpt-5.5 + user effort max) can never 400.
+
+        On a channel turn (spec §3b) the capability keys leave the hierarchy entirely: they are
+        stripped from the requester's prefs AND from the thread overrides, then resolved from
+        the channel. Two people asking the same channel the same question must get the same
+        machine — otherwise the shared stream's answers depend on who spoke last. Cosmetic
+        image prefs (size/quality/background/…) stay user-scoped."""
         config = self._default_thread_config()
         if user_prefs:
-            config.update(self._map_user_prefs(user_prefs))
-        config.update(self._map_channel_settings(channel_settings))
+            mapped = self._map_user_prefs(user_prefs)
+            if channel_turn:
+                mapped = {k: v for k, v in mapped.items() if k not in CHANNEL_CAPABILITY_KEYS}
+            config.update(mapped)
+        if channel_turn:
+            config.update(self._channel_capability_profile(channel_settings))
+        else:
+            config.update(self._map_channel_settings(channel_settings))
         if overrides:
+            if channel_turn:
+                overrides = {k: v for k, v in overrides.items()
+                             if k not in CHANNEL_CAPABILITY_KEYS}
             config.update(overrides)
         config["reasoning_effort"] = clamp_effort(config.get("model", self.gpt_model),
                                                   config.get("reasoning_effort"))
         return config
 
     def get_thread_config(self, overrides: Optional[Dict[str, Any]] = None, user_id: Optional[str] = None,
-                          db = None, channel_id: Optional[str] = None) -> Dict[str, Any]:
+                          db = None, channel_id: Optional[str] = None,
+                          channel_turn: bool = False) -> Dict[str, Any]:
         """Get configuration for a specific thread with settings hierarchy:
         1. System defaults (from .env)
         2. User preferences (from database)
         3. Channel shared settings (model/effort/verbosity — anyone in the channel can set them)
         4. Thread overrides (passed as parameter)
+
+        `channel_turn=True` swaps the capability keys onto the channel profile (§3b). The
+        default is the DM/legacy path, unchanged.
         """
         user_prefs = None
         channel_settings = None
@@ -1094,11 +1219,12 @@ class BotConfig:
                 channel_settings = db.get_channel_settings(channel_id)
             except Exception as e:
                 logging.getLogger("bot.config").warning(f"Error fetching channel settings: {e}")
-        return self._compose_thread_config(user_prefs, overrides, channel_settings)
+        return self._compose_thread_config(user_prefs, overrides, channel_settings, channel_turn)
 
     async def get_thread_config_async(self, overrides: Optional[Dict[str, Any]] = None,
                                       user_id: Optional[str] = None, db = None,
-                                      channel_id: Optional[str] = None) -> Dict[str, Any]:
+                                      channel_id: Optional[str] = None,
+                                      channel_turn: bool = False) -> Dict[str, Any]:
         """Async get_thread_config — awaits the aiosqlite reads instead of
         blocking the event loop with sync sqlite on every message."""
         user_prefs = None
@@ -1113,7 +1239,7 @@ class BotConfig:
                 channel_settings = await db.get_channel_settings_async(channel_id)
             except Exception as e:
                 logging.getLogger("bot.config").warning(f"Error fetching channel settings: {e}")
-        return self._compose_thread_config(user_prefs, overrides, channel_settings)
+        return self._compose_thread_config(user_prefs, overrides, channel_settings, channel_turn)
 
 
 # Global config instance

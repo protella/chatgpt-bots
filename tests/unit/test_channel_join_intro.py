@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import tempfile
-from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -65,7 +64,6 @@ def _make_bot(temp_db, *, summary=None, compose="This channel is about X. I can 
     bot = _JoinBot.__new__(_JoinBot)
     bot.bot_user_id = "UBOT"
     bot.db = temp_db
-    bot.channel_pulse = None
 
     app = MagicMock()
     app.client = MagicMock()
@@ -80,7 +78,7 @@ def _make_bot(temp_db, *, summary=None, compose="This channel is about X. I can 
 
     oc = SimpleNamespace(create_text_response=AsyncMock(return_value=compose))
 
-    async def _build_for_intro(channel_id, *, client=None, pulse=None):
+    async def _build_for_intro(channel_id, *, client=None):
         return summary
 
     svc = SimpleNamespace(build_for_intro=_build_for_intro, openai_client=oc)
@@ -520,15 +518,6 @@ class _SummaryClient:
         return self._classify
 
 
-class _Pulse:
-    """Minimal ChannelPulse stand-in: count_since(None)=total, count_since(ts)=newer."""
-    def __init__(self, newer, total):
-        self._n, self._t = newer, total
-
-    def count_since(self, cid, after=None, *, exclude_self=False, top_level_only=False):
-        return self._t if after is None else self._n
-
-
 @pytest.mark.asyncio
 async def test_posted_intro_excluded_from_next_summary_build(temp_db):
     # Bug 6: the bot's own join intro carries the metadata marker and must NOT be ingested into the
@@ -548,7 +537,8 @@ async def test_posted_intro_excluded_from_next_summary_build(temp_db):
          "text": "Here is what this channel is about and how I can help",
          "metadata": {"event_type": CHANNEL_INTRO_METADATA_EVENT_TYPE, "event_payload": {}}},
     ])
-    await svc._build("C1", client, None, 0)
+    lines, newest_ts, count = await svc._collect_source("C1", client)
+    await svc._build("C1", lines, newest_ts, count)
 
     user_block = captured["messages"][1]["content"]
     assert "roadmap planning" in user_block            # real content ingested
@@ -566,7 +556,8 @@ async def test_build_returns_none_when_save_rejected_by_optout(temp_db):
     svc = ChannelSummaryService(db=temp_db, openai_client=stub, config=_summary_cfg())
     client = _SummaryClient([{"ts": "1700.0", "user": "UALICE", "text": "some real content"}])
 
-    result = await svc._build("C1", client, None, 0)
+    lines, newest_ts, count = await svc._collect_source("C1", client)
+    result = await svc._build("C1", lines, newest_ts, count)
     assert result is None
     assert await temp_db.get_channel_summary_async("C1") is None  # nothing persisted either
 
@@ -587,37 +578,45 @@ async def test_build_for_intro_serializes_concurrent_builds(temp_db):
     client = _SummaryClient([{"ts": "1700.0", "user": "UALICE", "text": "roadmap chatter"}])
 
     r1, r2 = await asyncio.gather(
-        svc.build_for_intro("C1", client=client, pulse=None),
-        svc.build_for_intro("C1", client=client, pulse=None),
+        svc.build_for_intro("C1", client=client),
+        svc.build_for_intro("C1", client=client),
     )
     assert r1 == "NARRATIVE" and r2 == "NARRATIVE"
     assert calls["n"] == 1
 
 
 @pytest.mark.asyncio
-async def test_detached_refresh_skips_rebuild_when_fresh_summary_appears_under_lock(temp_db):
-    # Gap 2: _decide_and_build decides pre-lock, but must RE-READ + RE-DECIDE after acquiring the
-    # build lock — a join-intro build that saved a fresh summary while the refresh waited on the
-    # lock makes the rebuild redundant. Simulate that by returning "no row" at the pre-lock decide
-    # and a fresh row under the lock; the rebuild must be skipped.
-    stub = SimpleNamespace(create_text_response=AsyncMock(return_value="X"))
+async def test_build_for_intro_rebuilds_when_stored_row_is_stale(temp_db):
+    # The freshness rule build_for_intro now applies via _is_fresh: a stored row whose
+    # built_through_ts is OLDER than the newest eligible history line is stale and must trigger a
+    # rebuild (a model call), not a reuse.
+    await temp_db.save_channel_summary_async("C1", "STALE NARRATIVE", "1600.0", 3)
+    stub = SimpleNamespace(create_text_response=AsyncMock(return_value="FRESH NARRATIVE"))
     svc = ChannelSummaryService(db=temp_db, openai_client=stub, config=_summary_cfg())
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    fresh_row = {"summary_text": "already-fresh", "built_through_ts": "1700.0",
-                 "generated_at": now, "invalidated_at": None}
-    reads = {"n": 0}
+    client = _SummaryClient([{"ts": "1700.0", "user": "UALICE", "text": "newer than the row"}])
 
-    async def fake_get(cid):
-        reads["n"] += 1
-        return None if reads["n"] == 1 else fresh_row  # absent pre-lock, fresh once under the lock
+    result = await svc.build_for_intro("C1", client=client)
 
-    temp_db.get_channel_summary_async = fake_get
-    svc._build = AsyncMock()
+    assert result == "FRESH NARRATIVE"
+    stub.create_text_response.assert_awaited_once()
+    row = await temp_db.get_channel_summary_async("C1")
+    assert row["summary_text"] == "FRESH NARRATIVE"
+    assert row["built_through_ts"] == "1700.0"
 
-    await svc._decide_and_build("C1", client=None, pulse=_Pulse(newer=1, total=5))
 
-    svc._build.assert_not_called()   # redundant rebuild skipped
-    assert reads["n"] == 2           # decided pre-lock (None) then RE-decided under the lock (fresh)
+@pytest.mark.asyncio
+async def test_build_for_intro_reuses_fresh_row_with_no_model_call(temp_db):
+    # The mirror case: a stored row whose built_through_ts already COVERS the newest eligible
+    # history line is fresh and must be reused verbatim — no model call at all.
+    await temp_db.save_channel_summary_async("C1", "ALREADY FRESH", "1700.0", 3)
+    stub = SimpleNamespace(create_text_response=AsyncMock(return_value="SHOULD NOT BE CALLED"))
+    svc = ChannelSummaryService(db=temp_db, openai_client=stub, config=_summary_cfg())
+    client = _SummaryClient([{"ts": "1700.0", "user": "UALICE", "text": "already covered"}])
+
+    result = await svc.build_for_intro("C1", client=client)
+
+    assert result == "ALREADY FRESH"
+    stub.create_text_response.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -631,3 +630,139 @@ async def test_mark_failed_does_not_steal_a_concurrent_pending_lease(temp_db):
     # The true owner can still fail its own lease.
     await temp_db.mark_channel_intro_failed_async("C1", live["owner_token"])
     assert (await temp_db.get_channel_intro_async("C1"))["status"] == "failed"
+
+
+# ------------------------------------------------------------------ coverage reactivation
+
+def _coverage_reset_spy(monkeypatch):
+    from slack_client.event_handlers import activity_index
+    seen = []
+
+    async def _reset(client, channel_id):
+        seen.append(channel_id)
+        return True
+
+    monkeypatch.setattr(activity_index, "reset_channel_coverage", _reset)
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_rejoin_resets_coverage_even_with_the_intro_flag_off(monkeypatch):
+    """A re-invite is the only signal that an unreachable channel is back; tying it to the intro
+    switch would mean a workspace with intros off never reclaims one."""
+    monkeypatch.setattr(config, "enable_channel_join_intro", False)
+    seen = _coverage_reset_spy(monkeypatch)
+    bot = _trigger_bot()
+
+    await bot._handle_member_joined_channel({"user": "UBOT", "channel": "C1"}, client=None)
+
+    assert seen == ["C1"]
+    bot._spawn_channel_intro.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_another_members_join_never_resets_coverage(monkeypatch):
+    seen = _coverage_reset_spy(monkeypatch)
+    bot = _trigger_bot()
+
+    await bot._handle_member_joined_channel({"user": "UHUMAN", "channel": "C1"}, client=None)
+    await bot._handle_member_joined_channel({"user": "UBOT", "channel": "D9"}, client=None)
+
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_a_failing_coverage_reset_still_posts_the_intro(monkeypatch):
+    from slack_client.event_handlers import activity_index
+
+    async def _boom(client, channel_id):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(activity_index, "reset_channel_coverage", _boom)
+    bot = _trigger_bot()
+
+    await bot._handle_member_joined_channel(
+        {"user": "UBOT", "channel": "C1", "event_ts": "1.1"}, client=None)
+
+    bot._spawn_channel_intro.assert_called_once()
+
+
+# --------------------------------------------------------------- shutdown quiescence
+
+
+class _IntroDrainBot(SlackChannelJoinMixin):
+    def __init__(self):
+        self.bot_user_id = "UBOT"
+        self.logged = []
+
+    def log_debug(self, *a, **k): pass
+    def log_info(self, *a, **k): self.logged.append(a[0] if a else "")
+    def log_warning(self, *a, **k): self.logged.append(a[0] if a else "")
+    def log_error(self, *a, **k): pass
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_an_intro_that_is_still_posting():
+    """Spec §5: the intro is real prose that registers its OWN receipt, and it is detached off
+    the Slack ingress side — which stops long after the receipt queue closes. Without this drain
+    an intro landing in that window has its registration refused and the bot's own introduction
+    sits in the channel, permanently outside the rebuilt stream."""
+    bot = _IntroDrainBot()
+    posted = []
+    running = asyncio.Event()
+
+    async def _intro():
+        running.set()
+        await asyncio.sleep(0.05)
+        posted.append("hello")
+
+    task = asyncio.create_task(_intro())
+    bot._channel_intro_tasks = {task}
+    task.add_done_callback(bot._channel_intro_tasks.discard)
+    await running.wait()
+
+    await bot.drain_channel_intros()
+
+    assert posted == ["hello"], "receipts would have closed under a live intro"
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_an_intro_that_overruns_the_drain_is_cancelled():
+    bot = _IntroDrainBot()
+    running = asyncio.Event()
+    outcome = []
+
+    async def _wedged():
+        running.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            outcome.append("cancelled")
+            raise
+
+    task = asyncio.create_task(_wedged())
+    bot._channel_intro_tasks = {task}
+    await running.wait()
+
+    await asyncio.wait_for(bot.drain_channel_intros(timeout=0.05), timeout=5)
+
+    assert outcome == ["cancelled"]
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_a_join_arriving_during_shutdown_starts_no_intro():
+    bot = _IntroDrainBot()
+    await bot.drain_channel_intros()
+
+    bot._spawn_channel_intro("C1", client=None, event_id="1.1")
+
+    assert not (getattr(bot, "_channel_intro_tasks", None) or set())
+
+
+@pytest.mark.asyncio
+async def test_draining_with_nothing_in_flight_is_a_noop():
+    bot = _IntroDrainBot()
+    await bot.drain_channel_intros()
+    assert bot._intro_admitting is False

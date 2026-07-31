@@ -33,9 +33,10 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Default per-message supplementary budget. Callers that serialize into a tighter
-# surface (the ChannelPulse ring) pass their own; everything else uses this, so a live
-# message and the same message rebuilt from history serialize IDENTICALLY.
+# Per-message supplementary budget. One value for every caller, which is the point: a live
+# message and the same message rebuilt from history must serialize IDENTICALLY, and a
+# surface-specific budget is how those two drift apart. `budget=` stays a parameter for the tests
+# that exercise the truncation itself.
 SUPPLEMENTARY_CHAR_BUDGET = 12000
 
 # Slack's own legal maxima for a table block; the aggregate cell cap bounds the rendered
