@@ -57,7 +57,6 @@ def _make_bot(cs=None, sender_type="human"):
     bot.message_handler = AsyncMock()
     bot.app = MagicMock()
     bot.app.client = MagicMock()
-    bot.channel_pulse = None
     bot.db = MagicMock()
     bot.db.get_user_preferences_async = AsyncMock(return_value={"settings_completed": True})
     bot._get_channel_settings = AsyncMock(return_value=cs)

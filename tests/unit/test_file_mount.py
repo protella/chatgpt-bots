@@ -218,3 +218,101 @@ class TestSafeName:
     ])
     def test_cannot_escape_mnt_data(self, raw, expected):
         assert file_mount._safe_name(raw) == expected
+
+
+@pytest.mark.unit
+class TestStaticChannelSchema:
+    """On the channel surface the tools array must not move when a thread gains a file or a
+    sandbox — both are per-thread facts, and the array sits in the cached prefix. So the schema
+    stops gating on them and the executor answers instead."""
+
+    def _cfgs(self):
+        return [
+            None, {},
+            {CI_CONTAINER_KEY: "cntr_abc", file_mount.FILES_KEY: [_entry()]},
+            {CI_CONTAINER_KEY: None, file_mount.FILES_KEY: []},
+            {CI_CONTAINER_KEY: "cntr_other",
+             file_mount.FILES_KEY: [_entry(file_id="file_doc_9", filename="q3.xlsx")],
+             "user_id": "U_B"},
+        ]
+
+    def test_byte_stable_across_containers_files_and_requesters(self):
+        import json
+        rendered = {json.dumps(file_mount.get_mount_file_schema_static(cfg), sort_keys=True)
+                    for cfg in self._cfgs()}
+        assert len(rendered) == 1
+
+    def test_no_file_ids_or_enum_leak_in(self):
+        import json
+        schema = file_mount.get_mount_file_schema_static(
+            {CI_CONTAINER_KEY: "cntr_abc", file_mount.FILES_KEY: [_entry()]})
+        assert "enum" not in schema["parameters"]["properties"]["file_id"]
+        blob = json.dumps(schema)
+        assert "file_doc_1" not in blob and "sales.csv" not in blob
+        assert "evidence" in schema["description"]
+        # The steering that made the tool used correctly has to survive the trim.
+        assert "INGREDIENT" in schema["description"]
+        assert "idempotent" in schema["description"]
+
+    def test_never_hidden(self):
+        for cfg in self._cfgs():
+            assert file_mount.get_mount_file_schema_static(cfg)["name"] == "mount_file"
+
+    def test_the_dynamic_factory_is_untouched(self):
+        cfg = {CI_CONTAINER_KEY: "cntr_abc", file_mount.FILES_KEY: [_entry()]}
+        assert file_mount.get_mount_file_schema(cfg)["parameters"]["properties"][
+            "file_id"]["enum"] == ["file_doc_1"]
+        assert file_mount.get_mount_file_schema({CI_CONTAINER_KEY: "cntr_abc",
+                                                 file_mount.FILES_KEY: []}) is None
+
+
+@pytest.mark.unit
+class TestHonestEmptyAnswers:
+    """Everything the static schema stopped gating on becomes an executor answer the model can
+    act on — never a silent success and never a guess."""
+
+    async def test_no_files_in_the_thread_says_so(self):
+        ctx, raw = _ctx(entries=[])
+        result = await file_mount.execute_mount_file(ctx, {"file_id": "file_doc_1"})
+
+        assert result["ok"] is False and result["error"] == "unknown_file_id"
+        assert result["valid_file_ids"] == []
+        assert "no files in this thread" in result["message"]
+        raw.containers.files.create.assert_not_awaited()
+
+    async def test_an_unknown_id_lists_the_ids_that_would_have_worked(self):
+        ctx, _ = _ctx()
+        result = await file_mount.execute_mount_file(ctx, {"file_id": "file_doc_999"})
+
+        assert result["valid_file_ids"] == ["file_doc_1"]
+        assert "not a file in this thread" in result["message"]
+
+    async def test_no_sandbox_says_sandbox_unavailable(self):
+        ctx, raw = _ctx(container=None)
+        result = await file_mount.execute_mount_file(ctx, {"file_id": "file_doc_1"})
+
+        assert result["ok"] is False and result["error"] == "sandbox_unavailable"
+        raw.containers.files.create.assert_not_awaited()
+
+
+@pytest.mark.unit
+class TestFileEvidenceLines:
+    def test_lines_carry_the_ids_names_and_types(self):
+        from message_processor import thread_files
+
+        lines = thread_files.catalog_evidence_lines(
+            [_entry(), _entry(file_id="file_img_2", filename="shot.png",
+                              mime_type="image/png", description="a screenshot")])
+
+        assert lines[0] == thread_files.EVIDENCE_HEADER
+        assert len(lines) == 3
+        assert "file_doc_1" in lines[1] and "sales.csv" in lines[1]
+        assert "file_img_2" in lines[2] and "a screenshot" in lines[2]
+        assert all("\n" not in line for line in lines)
+
+    def test_an_empty_catalog_is_stated_not_omitted(self):
+        from message_processor import thread_files
+
+        assert thread_files.catalog_evidence_lines([]) == \
+               thread_files.catalog_evidence_lines(None)
+        assert "none" in thread_files.catalog_evidence_lines([])[1]

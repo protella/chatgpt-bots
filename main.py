@@ -8,18 +8,24 @@ import signal
 import asyncio
 import argparse
 import time
-from typing import Optional
+from typing import Any, Optional
 from config import config
 from logger import log_session_start, log_session_end, main_logger
 from message_processor.base import MessageProcessor
-from message_processor import channel_steering, participation_telemetry, routing_facts
+from message_processor import (channel_steering, outbound_receipts, participation_telemetry,
+                               routing_facts)
 from message_processor.participation import (ParticipationEngine,
                                              resolve_participation_level)
 from message_processor.stale_send_guard import (ConversationWatermarks,
                                                 StaleSendSuppressed)
-from message_processor.turn_runtime import TurnRuntime
+from message_processor import turn_runtime
+from message_processor.turn_runtime import (DEST_KIND_POST_TO_THREAD, DEST_KIND_RECONCILED,
+                                            DEST_KIND_REPLY, DEST_KIND_SPLIT, TurnRuntime)
 from message_processor import thread_files
+import token_counter
 from base_client import BaseClient, Message
+from slack_client import admission_watermark
+from slack_client.event_handlers import registration
 
 # Terminals whose visible surface is the RESPONDER'S OWN reply, and which therefore have a
 # destination worth recording. `destination` means where that reply actually went (on
@@ -33,10 +39,145 @@ from base_client import BaseClient, Message
 # nowhere at all.
 _DELIVERED_KINDS = frozenset({"reply", "delivery_failed", "interrupted"})
 
+# How long shutdown lets an already-admitted turn finish before cancelling it. Generous, because
+# the cost of cutting one short is a reply the room never sees; bounded, because a wedged model
+# call must not hold the process open.
+TURN_QUIESCE_TIMEOUT_SECONDS = 30.0
+# Plan §1l: the final compaction-telemetry drain is ONE bounded attempt. Shutdown must stay
+# bounded; the backlog is durable, so a missed final drain costs ledger latency, not data.
+SNAPSHOT_OUTBOX_DRAIN_TIMEOUT = 30.0
+
+
+async def _finalize_turn_effects(turn: Any) -> None:
+    """Settle what this turn CAUSED, then what it POSTED — as one indivisible sequence.
+
+    Order is the invariant, not a preference. `finish_tool_flights` drains the flights that
+    outran their bound, then CANCELS the stragglers, waits for that cancellation to land, and
+    REVOKES the permission of anything that survived it. Only then may the receipts settle: a
+    task that can still post must be stopped (or forbidden) before the ledger says the turn's
+    words are all accounted for. `settle_ledger` closes the other half, waiting out any effect
+    lease still held — an accepted post whose receipt is mid-write.
+
+    Runs as its own task so a cancellation aimed at the turn cannot land BETWEEN these two.
+
+    If the drain itself FAILS — not a tool failing, which it absorbs, but the bookkeeping that
+    proves quiescence — the sequence does not simply carry on to the settle. Effect permission is
+    withdrawn FIRST. Settling receipts while unknown tasks may still be alive is the receiptless
+    post this whole mechanism exists to prevent, and revocation is what makes "unknown" safe: it
+    cannot be made known any more, but it can be made unable to act.
+
+    And if the REVOCATION fails too, nothing settles. That is the one state where finalizing is
+    strictly worse than not: the turn cannot say what is running and cannot stop it, so a settle
+    would record as accounted-for words a live task may still be adding to. Left in flight, those
+    rows are exactly what boot's dead-session reconcile picks up — the sole reason it exists.
+    """
+    revoked = True
+    if turn is not None:
+        finish_flights = getattr(turn, "finish_tool_flights", None)
+        if finish_flights is not None:
+            try:
+                pending = finish_flights()
+                if hasattr(pending, "__await__"):
+                    await pending
+            except Exception as e:  # noqa: BLE001 — revoked below, then settled
+                main_logger.error(
+                    f"Tool flights did not settle: {e!r} — revoking this turn's effects before "
+                    "its receipts settle")
+                revoked = turn_runtime.revoke_turn_effects(turn, "tool flight settlement failed")
+    if not revoked:
+        main_logger.critical(
+            "Turn %s: the flight drain FAILED and its effects could not be revoked — leaving "
+            "this turn's receipts deliberately UNSETTLED for the next boot's dead-session "
+            "reconcile. Something this turn started may still be running and may still post.",
+            getattr(turn, "turn_id", None))
+        return
+    # Spec §5: the turn's own words stop being in-flight HERE, outside every inner handler, so a
+    # cancellation or an unexpected raise cannot strand rows this session will never touch again
+    # — dead-session reconcile only runs at boot, and a live process is not a dead session.
+    await outbound_receipts.settle_ledger(
+        getattr(turn, "receipt_ledger", None) if turn is not None else None, turn=turn)
+
+
+async def _await_finalizer(finalizer: "asyncio.Task") -> None:
+    """Wait for that unit to FINISH, through any number of cancellations aimed at us.
+
+    A CancelledError here is OUR await being cancelled, never the unit's: the unit owns itself.
+    It is not re-raised — everything the finalizer does is what keeps a delivered message from
+    being stranded, and the turn is ending either way — and it is not a reason to walk away
+    before the unit finishes either.
+
+    COMPLETION-BOUND, deliberately without an attempt cap. A cap is a promise to abandon the unit
+    on the Nth cancellation, and "the caller returned while the finalizer was still revoking and
+    settling" is the exact state the shielded unit exists to make impossible — the turn goes on to
+    release its state and remove itself, and whatever the finalizer had not reached yet belongs to
+    nobody. The wait terminates on its own: the finalizer's own steps are each bounded (the flight
+    grace, the lease bodies' transports), so a repeat-canceller can only make this loop spin as
+    long as it keeps cancelling, and it stops the moment the unit is done.
+    """
+    while not finalizer.done():
+        try:
+            await asyncio.shield(finalizer)
+        except asyncio.CancelledError:
+            main_logger.warning(
+                "Turn finalizer outlived a cancellation of its caller — waiting for it to "
+                "finish revoking and settling")
+        except Exception as e:  # noqa: BLE001 — it reports its own failures
+            main_logger.warning(f"Turn finalizer ended with: {e!r}")
+    if not finalizer.cancelled():
+        finalizer.exception()  # consumed
+
+
+async def channel_identity_ready(client: BaseClient, message: Message) -> bool:
+    """Whether a CHANNEL turn may run at all (spec §5).
+
+    Every durable word a channel turn says needs a receipt, and a receipt needs the bot's team
+    id. Without one the ledger builds itself INACTIVE and writes nothing — the turn looks
+    perfectly healthy, and its replies are simply missing from every rebuilt stream afterwards.
+    Silence on that is the one failure nobody would ever notice, so a channel turn that cannot
+    establish identity is refused loudly instead of served quietly.
+
+    DMs keep no receipts and are never blocked. Clients that are not the receipts transport
+    (test doubles, other platforms) are not held to a contract they do not implement.
+    """
+    if not outbound_receipts.receipts_apply(getattr(message, "channel_id", None)):
+        return True
+    if getattr(client, "self_team_id", None) and getattr(client, "bot_user_id", None):
+        return True
+    ensure = getattr(client, "ensure_receipt_identity", None)
+    if ensure is None:
+        return True
+    try:
+        if await ensure():
+            return True
+    except Exception as e:  # noqa: BLE001 — reported by the refusal below
+        main_logger.warning(f"Identity re-resolution raised: {e}")
+    main_logger.error(
+        f"Refusing a channel turn in {getattr(message, 'channel_id', None)}: the bot's own "
+        "team/user identity is unresolved (auth.test), so nothing this turn said could be "
+        "recorded as ours and it would vanish from the channel stream. Check the bot token "
+        "and scopes.")
+    return False
+
 
 class ChatBotV2:
     """Main application class for multi-platform chat bot"""
-    
+
+    # Admission (spec §5): False once shutdown starts, so no NEW turn opens a lease or a receipt
+    # ledger behind a queue that is closing. Turns already admitted are tracked in `active_turns`
+    # and are finished — or cancelled and awaited — before receipts close.
+    #
+    # Class-level, and the task set is lazy, because handle_message is also driven against
+    # instances built with `ChatBotV2.__new__` (tests that skip the heavy __init__). An admission
+    # gate that only exists after __init__ would raise on the first message those send.
+    _admitting: bool = True
+
+    @property
+    def active_turns(self) -> set:
+        turns = self.__dict__.get("_active_turns")
+        if turns is None:
+            turns = self.__dict__["_active_turns"] = set()
+        return turns
+
     def __init__(self, platform: str = "slack"):
         self.platform = platform.lower()
         self.client: Optional[BaseClient] = None
@@ -44,9 +185,32 @@ class ChatBotV2:
         self.participation_engine = None  # Phase F; set in initialize()
         self._watermarks = ConversationWatermarks()
         self.cleanup_task = None
+        self.coverage_bootstrap = None  # spec §4 background coverage sweep
+        self.snapshot_coordinator = None  # spec §7, injected into the processor
+        self.receipt_service = None  # spec §5 outbound receipts
+        self.pending_share_recovery = False
+        self._pending_share_task = None
         self.running = False
+        self._admitting = True
         self.sigint_count = 0  # Track number of SIGINT received
         self.last_sigint_time = 0  # Track time of last SIGINT
+        # THE shutdown, as one task both paths await. A signal used to start its own, while `run()`
+        # went on to finish and let the loop close — which cancelled that task partway, so the
+        # telemetry ledger's `session_end` was never written and every restart read as a crash in
+        # the one file that exists to tell those apart. Now the signal starts it and run()'s finally
+        # awaits the same object, so the drain always completes before the process leaves.
+        self._shutdown_task: Optional[asyncio.Task] = None
+        # A shutdown was ASKED FOR. Durable, and deliberately separate from the task above: a
+        # signal can land after the handlers are installed (inside `initialize`) but before the
+        # run loop exists, and `shutdown()` on a bot that is not yet `running` correctly does
+        # nothing — so the task it cached completed having stopped nothing, and every later
+        # request was handed that finished task. A SIGTERM during startup left the bot running
+        # and unstoppable. The REQUEST outlives the attempt to serve it.
+        self._shutdown_requested = False
+        # ...and a shutdown actually RAN to completion. Tells the finished-because-there-was-
+        # nothing-to-do task apart from the finished-because-it-shut-the-bot-down one.
+        self._shutdown_completed = False
+        self._run_task: Optional[asyncio.Task] = None
         
     async def initialize(self):
         """Initialize the bot components"""
@@ -56,6 +220,21 @@ class ChatBotV2:
         # have put a mkdir and a file open inside the first gate call — on the hot path of the
         # decision the whole turn is waiting for — and retried it after every failure.
         participation_telemetry.initialize()
+
+        # Same reasoning for the o200k tokenizer, though what rides on it is smaller than it looks:
+        # admission is decided by the utf-8 byte bound, which needs no vocabulary at all, and this
+        # counter's one production job is the REFUSAL diagnostic — the real token count logged
+        # beside the charged bound so an operator can tell "this window needs compacting" from "the
+        # bound refused something that would have fit". On a cold tiktoken cache `get_encoding`
+        # fetches the vocabulary over the network, and a refusal is the worst place to discover
+        # that. Started here so the fetch overlaps the rest of boot.
+        #
+        # timeout=0 is the point: this STARTS the loader (it runs in its own daemon thread) and
+        # does not wait for it. Waiting would put a network round trip in front of the socket
+        # connecting, and a blackholed egress would hold the process down for the TCP timeout — so
+        # the head start is taken and nothing depends on it having finished. A load that fails logs
+        # its own warning from that thread.
+        token_counter.wait_for_admission_encoder(timeout=0)
 
         # Validate configuration
         try:
@@ -121,16 +300,106 @@ class ChatBotV2:
                         f"and restart.")
                     sys.exit(1)
                     return  # sys.exit is stubbed in some harnesses; never fall through to a live bot
+
+            await self._start_outbound_receipts()
+
+            # Spec §7: ONE snapshot coordinator for the process, injected rather than reached
+            # for. Its pins are in-memory refcounts, so a second instance would happily delete
+            # a snapshot the first one has pinned.
+            #
+            # FATAL if it cannot be built. Nothing consumes it yet, so this costs nothing today
+            # — and that is exactly why it has to be loud now: once compaction reads it, a bot
+            # that started without one would publish snapshots nobody pins and delete them out
+            # from under a live rebuild, with no boot log to say the coordinator was missing.
+            try:
+                from message_processor.channel_snapshots import ChannelSnapshotCoordinator
+                self.snapshot_coordinator = ChannelSnapshotCoordinator(
+                    self.client.db, client=self.client,
+                    openai_client=getattr(self.processor, "openai_client", None))
+                self.processor.snapshot_coordinator = self.snapshot_coordinator
+            except Exception as e:  # noqa: BLE001 — reported, then fatal
+                main_logger.error(
+                    f"Snapshot coordinator could not be constructed ({e}). Refusing to start: "
+                    "snapshot retention has no owner without it. Fix the installation and "
+                    "restart.")
+                sys.exit(1)
+                return
         else:
             main_logger.error(f"Unknown platform: {self.platform}")
             sys.exit(1)
         
+        if self.pending_share_recovery:
+            # After the client is constructed (it owns resolve_file_share_ts) but off the boot
+            # path: a Slack poll per leftover file must not hold the bot back from serving.
+            # TRACKED, and cancelled+awaited in shutdown() before the receipt service and the
+            # client go away — it writes receipts through both, and a leftover row it never
+            # reaches is simply retried at the next boot, which is what those rows are for.
+            self.pending_share_recovery = False
+            self._pending_share_task = asyncio.create_task(
+                outbound_receipts.recover_pending_shares(self.client.db, self.client))
+            self._pending_share_task.add_done_callback(
+                lambda t: t.cancelled() or (t.exception() and main_logger.warning(
+                    f"Pending share recovery error: {t.exception()}")))
+
         # Set up signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         
         main_logger.info("Initialization complete")
     
+    async def _start_outbound_receipts(self):
+        """Spec §5 boot order: epoch, then dead-session reconciliation, then pending shares.
+
+        The epoch is FATAL on failure. Without it the rebuild has no way to tell an own-message
+        that predates this feature from one this build simply failed to register — it would
+        either replay old chrome forever or drop real replies, silently, and the operator would
+        see a bot that misremembers its own words rather than a bot that refused to start.
+        """
+        db = self.client.db
+        try:
+            epoch = await outbound_receipts.establish_epoch(db)
+        except Exception as e:  # noqa: BLE001 — reported, then fatal
+            main_logger.error(
+                f"Outbound receipts epoch could not be established ({e}). Refusing to start: "
+                "without it the channel stream cannot tell legacy own-messages from unregistered "
+                "ones. Fix the database and restart.")
+            sys.exit(1)
+            return
+        main_logger.info(f"Outbound receipts epoch: {epoch}")
+
+        self.receipt_service = outbound_receipts.install_service(db)
+
+        # Bounded retry, then FATAL. A reconcile that never ran leaves the previous session's
+        # in_flight rows in_flight for this whole process, and every message behind them stays
+        # out of the rebuilt stream — the bot would answer all day about a conversation it
+        # cannot see its own half of, with one warning line at boot to explain it.
+        last_error = None
+        for attempt in range(3):
+            try:
+                # Through the wrapper, not the accessor: the reconcile writes one CV8
+                # outbound_receipt row per receipt it finalizes, and boot is the only place those
+                # transitions are visible at all.
+                await outbound_receipts.reconcile_dead_sessions(db, outbound_receipts.SESSION_ID)
+                last_error = None
+                break
+            except Exception as e:  # noqa: BLE001 — retried, then fatal
+                last_error = e
+                main_logger.warning(
+                    f"Dead-session receipt reconciliation failed (attempt {attempt + 1}/3): {e}")
+                await asyncio.sleep(0.5 * (attempt + 1))
+        if last_error is not None:
+            main_logger.error(
+                f"Dead-session receipt reconciliation failed ({last_error}). Refusing to start: "
+                "the previous session's replies would stay excluded from the channel stream for "
+                "this entire run. Fix the database and restart.")
+            sys.exit(1)
+            return
+
+        # Deferred to initialize()'s tail — it needs the Slack client to resolve share ts.
+        # A FLAG, not a coroutine: anything can raise between here and there, and a coroutine
+        # that is built and never scheduled is a warning from the GC with no context attached.
+        self.pending_share_recovery = True
+
     @property
     def watermarks(self) -> ConversationWatermarks:
         """THE process-wide owner of "what is the newest message this conversation has seen".
@@ -270,22 +539,28 @@ class ChatBotV2:
                 memory_enabled=bool(getattr(config, "enable_channel_memory", True))))
 
             # NOTHING ELSE IS GATHERED HERE, and the absence is the commit. The rich gate built a
-            # pulse envelope, a thread tail, an addressee tail, a channel topic, a member count, a
-            # recent-speakers line, a canvas catalogue, a capability inventory, a custom-emoji
-            # shortlist and a channel narrative — half a dozen API calls and cache reads on the hot
-            # path of a decision the whole turn waits for — to support judgments about addressee,
-            # answerability and which emoji to place. The gate makes none of those judgments now,
-            # so every one of those inputs was work spent on a question nobody asks.
+            # recent-activity envelope, a thread tail, an addressee tail, a channel topic, a member
+            # count, a recent-speakers line, a canvas catalogue, a capability inventory, a
+            # custom-emoji shortlist and a channel narrative — half a dozen API calls and cache
+            # reads on the hot path of a decision the whole turn waits for — to support judgments
+            # about addressee, answerability and which emoji to place. The gate makes none of those
+            # judgments now, so every one of those inputs was work spent on a question nobody
+            # asks.
             evaluation = await engine.evaluate(
                 channel_id=channel_id, ts=ts, text=message.text,
                 sender_id=message.user_id,
                 sender_name=(message.metadata.get("user_real_name")
                              or message.metadata.get("username")),
                 sender_type=message.metadata.get("sender_type"),
-                channel_steering_text=steering.text,
+                channel_steering_text=steering.gate_text,
                 # Names and types, already summarized at dispatch. No pixels: the binary gate
                 # does not look at images, so nothing is downloaded for it and nothing waits on it.
                 attachments=message.metadata.get("participation_attachments"),
+                # The raw file payload behind those names, carried UNREAD. The gate never opens it;
+                # it is retained because a cohort member's own dispatch ends here, and the turn that
+                # survives needs the ids to stay authorizable when Slack's fetch has not yet caught
+                # up to the message that carried them.
+                file_payloads=message.attachments or (),
                 client=client,
                 thread_root_ts=message.thread_id,
                 # The edit's OWN marker, so only the edit's attempt can claim the stashed
@@ -340,6 +615,12 @@ class ChatBotV2:
             # metadata describing messages it cannot see.
             if isinstance(message.metadata, dict) and evaluation.sources:
                 message.metadata["gate_sources"] = evaluation.sources
+                # And their files, so a burst that dropped a CSV and then asked about it can READ
+                # it on this turn even if the fetch window has not seen that message yet. Merges
+                # with whatever a queue drain already staged; neither writer erases the other's.
+                if evaluation.source_files:
+                    from message_processor.channel_request import stage_cohort_file_payloads
+                    stage_cohort_file_payloads(message.metadata, evaluation.source_files)
             return decision
 
         except Exception as e:
@@ -504,7 +785,7 @@ class ChatBotV2:
         return "empty"
 
     async def _rescue_sandbox_images(self, response, client: BaseClient, message: Message,
-                                     post_thread_id: str) -> int:
+                                     post_thread_id: str, receipts=None) -> int:
         """Post images the model made as sandbox ingredients but never turned into anything.
 
         create_image_asset deliberately does not publish: its image is a component of some
@@ -539,11 +820,23 @@ class ChatBotV2:
                     thread_manager=self.processor.thread_manager,
                     message_ts=(message.metadata or {}).get("ts"),
                     provenance_tool="create_image_asset",
+                    receipts=receipts,
                 )
                 posted += 1
             except Exception as e:
                 main_logger.error(f"Sandbox image rescue failed: {e}", exc_info=True)
         return posted
+
+    @staticmethod
+    async def _drop_chrome(client, turn, channel_id: str, ts: str) -> bool:
+        """Delete a chrome surface and drop its receipt — but only once Slack CONFIRMS the
+        delete. A row removed for a message still sitting in the channel would let that
+        message back into the stream as an own-message nobody claims."""
+        gone = await client.delete_message(channel_id, ts)  # unleased-ok: teardown — removing a surface can never be a stale answer
+        ledger = getattr(turn, "receipt_ledger", None) if turn is not None else None
+        if gone and ledger is not None:
+            await ledger.abort(ts)
+        return bool(gone)
 
     async def handle_message(self, message: Message, client: BaseClient):
         """Handle incoming message from any platform.
@@ -560,11 +853,41 @@ class ChatBotV2:
         leave a window where this turn is already running and the conversation's watermark does
         not know it. It is released in the same finally.
         """
+        # Shutdown closes admission BEFORE it quiesces (see `shutdown`), and this is the same
+        # boundary the lease defines: refused here, the message never becomes a turn, never
+        # moves the watermark, and never opens a receipt ledger the closing queue would refuse.
+        #
+        # Read off `self` rather than assumed: this method is also driven unbound against plain
+        # stand-in hosts, which have no lifecycle to close and are always admitting.
+        if not getattr(self, "_admitting", True):
+            main_logger.info(
+                "Shutting down — message in %s refused before admission",
+                getattr(message, "channel_id", None))
+            return
         # Also records this message as its conversation's newest inbound (message_processor.
         # stale_send_guard). Nothing is dropped after this point, so the watermark and the set
         # of turns that exist stay in step.
         lease = self.watermarks.begin_turn(message)
+        turn = None
+        # Bound here, not at the inner try: the outer finally reports this turn's outcome, and it
+        # is reachable from the early returns above that point. `outcome_kind` is whatever label
+        # the path that ENDED the turn chose, so the turn row and the gate terminal can never
+        # disagree about what the room saw; None means "derive it from the Response".
+        response = None
+        outcome_kind = None
+        # A STRONG ref on the running turn, so shutdown can wait for what it already admitted
+        # rather than closing the receipt queue underneath a reply that is still being written.
+        # None for a stand-in host — nothing there is ever going to quiesce it.
+        active_turns = getattr(self, "active_turns", None)
+        turn_task = asyncio.current_task()
+        if turn_task is not None and active_turns is not None:
+            active_turns.add(turn_task)
         try:
+            # Before the gate, because a turn that cannot be accounted for should not run at
+            # all — not even to decide whether to speak.
+            if not await channel_identity_ready(client, message):
+                return
+
             # The binary wake gate: for UNPROMPTED channel messages (every ordinary message at
             # level `on`, a bare-name message at `mentions_only`) it decides whether the responder
             # runs at all. Nothing is posted before it, and nothing is decided by it beyond that bit.
@@ -597,6 +920,15 @@ class ChatBotV2:
             # The turn carries the lease from here on: it is already threaded to every path
             # that can post, including ToolContext.turn.
             turn.send_lease = lease
+            # ...and its receipt ledger, opened here so the FIRST thing this turn can post is
+            # already covered. Settled in the outer finally below, under a shield.
+            turn.bind_receipts(client, message)
+            # getattr, like the two calls in the outer finally: this method is also driven
+            # unbound against plain stand-in hosts, and a ledger line must never be the reason a
+            # turn fails to run.
+            emit_start = getattr(self, "_emit_turn_start", None)
+            if emit_start is not None:
+                emit_start(message, turn, gate_required=gate_required)
             post_thread_id = turn.resolve_reply_target(message)
 
             # Phase Q: if this conversation is mid-processing, the message is about to be
@@ -621,7 +953,8 @@ class ChatBotV2:
             if not already_processing and turn.progress_enabled:
                 thinking_id = await client.send_thinking_indicator(
                     message.channel_id,
-                    post_thread_id
+                    post_thread_id,
+                    receipts=turn.receipt_ledger,
                 )
                 # Batched catch-up turn (drained queue): make the status say so.
                 batch_size = message.metadata.get("queued_batch_size", 0)
@@ -651,8 +984,8 @@ class ChatBotV2:
 
                 # The model may have chosen the destination DURING the turn (an eligible
                 # top-level trigger starts unselected). Re-read it from the turn — the one place
-                # that knows — so the fallback send, the footer guard and the pulse below all
-                # agree with where the handler actually posted.
+                # that knows — so the fallback send, the footer guard and the artifact upload
+                # below all agree with where the handler actually posted.
                 post_thread_id = turn.resolve_reply_target(message)
 
                 # Delete thinking indicator (but not if streaming was used — it's already the
@@ -660,9 +993,9 @@ class ChatBotV2:
                 if (thinking_id and response
                         and not response.metadata.get("streamed")
                         and response.metadata.get("checklist") is None):
-                    await client.delete_message(message.channel_id, thinking_id)  # unleased-ok: teardown — removing a surface can never be a stale answer
+                    await self._drop_chrome(client, turn, message.channel_id, thinking_id)
                 elif thinking_id and not response:
-                    await client.delete_message(message.channel_id, thinking_id)  # unleased-ok: teardown — removing a surface can never be a stale answer
+                    await self._drop_chrome(client, turn, message.channel_id, thinking_id)
 
                 # Handle the response
                 if response:
@@ -701,6 +1034,17 @@ class ChatBotV2:
                             # paths lock when they bind their surface; this is the same moment
                             # for a non-streamed reply, which main.py posts itself.
                             turn.lock_destination()
+
+                            def _observe_reply(ts: str, _turn=turn, _thread=post_thread_id
+                                               ) -> None:
+                                """Slack took the first part. Recorded at THAT instant rather
+                                than after the send returns: a cancellation between the first
+                                accepted chunk and the last would otherwise leave visible text
+                                and receipts with nothing in the ledger claiming them."""
+                                _turn.note_destination_observed(
+                                    channel_id=message.channel_id, first_ts=ts,
+                                    kind=DEST_KIND_REPLY, thread_root_ts=_thread)
+
                             # The stale guard's last chance on this path: the lease refuses
                             # rather than posting if the conversation moved on while the model
                             # was writing. Raises StaleSendSuppressed, caught below.
@@ -711,6 +1055,8 @@ class ChatBotV2:
                                 blocks=footer_blocks,
                                 meta_out=send_meta,
                                 lease=lease,
+                                receipts=turn.receipt_ledger,
+                                on_first_accept=_observe_reply,
                             )
                             # Honest accounting: the ACTUAL send result decides `posted` (a
                             # failed send must not burn the hourly unprompted quota).
@@ -721,6 +1067,29 @@ class ChatBotV2:
                                 # the separate footer post must still happen).
                                 if sent_ts and send_meta.get("footer_attached"):
                                     response.metadata["footer_attached"] = True
+                            # Destination record, COMMITTED from the transport's own account of
+                            # what Slack accepted — never from the text we handed it. A reply
+                            # that split and then failed partway commits its delivered prefix
+                            # and carries the flag saying so, which is what stops channel
+                            # memory remembering an answer the room never fully saw.
+                            # A ts recovered by the uncertain-post reconcile is labelled as such:
+                            # the words are in the room, but nobody watched them land.
+                            delivery = send_meta.get("delivery")
+                            if sent_ts and turn is not None:
+                                if send_meta.get("reconciled"):
+                                    kind = DEST_KIND_RECONCILED
+                                elif delivery is not None and delivery.split:
+                                    kind = DEST_KIND_SPLIT
+                                else:
+                                    kind = DEST_KIND_REPLY
+                                turn.mark_destination_committed(
+                                    first_ts=sent_ts, kind=kind,
+                                    text=(delivery.text if delivery is not None
+                                          else response.content or ""),
+                                    complete=(delivery.complete if delivery is not None
+                                              else True),
+                                    channel_id=message.channel_id,
+                                    thread_root_ts=post_thread_id)
                             # F7: persist tool-use provenance keyed on the reply's real ts.
                             if sent_ts:
                                 self.processor._persist_tool_provenance(
@@ -744,7 +1113,8 @@ class ChatBotV2:
                                 and (response.content or "").strip()
                                 and (response.metadata or {}).get("posted") is not False):
                             try:
-                                await client.maybe_post_response_footer(message, response)
+                                await client.maybe_post_response_footer(
+                                    message, response, receipts=turn.receipt_ledger)
                             except Exception as e:
                                 main_logger.debug(f"Response footer skipped: {e}")
 
@@ -785,6 +1155,7 @@ class ChatBotV2:
                                         # already owns — never publish them back, even byte-copied.
                                         suppress_digests=(response.metadata or {}).get(
                                             "mounted_digests") or [],
+                                        receipts=turn.receipt_ledger,
                                     ),
                                     timeout=config.artifact_publish_timeout,
                                 )
@@ -815,8 +1186,9 @@ class ChatBotV2:
                         if not published:
                             # B2: rescued sandbox images always thread — pass message.thread_id, not
                             # post_thread_id (None on a top-level channel reply).
-                            rescued = await self._rescue_sandbox_images(response, client, message,
-                                                                        message.thread_id)
+                            rescued = await self._rescue_sandbox_images(
+                                response, client, message, message.thread_id,
+                                receipts=turn.receipt_ledger)
                             if rescued:
                                 turn.visible_action_committed = True  # F38: an image did land
                     elif response.type == "error":
@@ -829,12 +1201,13 @@ class ChatBotV2:
                             message.channel_id,
                             message.thread_id,
                             response.content,
-                            lease=lease
+                            lease=lease,
+                            receipts=turn.receipt_ledger,
                         )
 
                 # Close the attempt with what the room actually SAW. Deliberately not folded into
-                # the contract check below, which is additionally gated on a live pulse — a
-                # delivery-side condition that has nothing to do with whether the outcome is worth
+                # the contract check below, which asks a narrower question — is this channel one we
+                # speak in at all — that has nothing to do with whether the outcome is worth
                 # counting. `finish_attempt` is a no-op unless this turn came from the gate and is
                 # still open, which is what keeps mentions, DMs and direct continuations out of a
                 # ledger documented as gate attempts — and what keeps a turn the gate already
@@ -842,7 +1215,7 @@ class ChatBotV2:
                 meta = (response.metadata or {}) if response is not None else {}
                 # No gate reaction to account for any more: the gate places nothing in the room, so
                 # every reaction on this message came from this turn.
-                kind = self._classify_visible_action(response, turn)
+                kind = outcome_kind = self._classify_visible_action(response, turn)
                 # A destination is reported only for a delivered reply on a turn that actually
                 # settled one. Computed once — three fields read it, and they must agree.
                 _records_destination = bool(
@@ -904,8 +1277,13 @@ class ChatBotV2:
                 # reply TALLY that used to live here is gone with the unprompted counter; what
                 # remains is the contract check — a turn that posted nothing and did not call the
                 # terminal no-reply tool is a violation worth catching.
-                if (response and message.channel_id and not message.channel_id.startswith("D")
-                        and getattr(client, "channel_pulse", None) is not None):
+                # The old form of this check also required a live ChannelPulse — a delivery-side
+                # object with nothing to do with whether an outcome is worth counting. With the
+                # pulse retired the condition would have been permanently false, silently
+                # switching off the one check that catches a turn which posted nothing and never
+                # called the terminal tool.
+                if (response and message.channel_id
+                        and not message.channel_id.startswith("D")):
                     terminal = (response.metadata or {}).get("terminal_action")
                     if terminal == "no_reply":
                         main_logger.info(
@@ -921,9 +1299,11 @@ class ChatBotV2:
                                      or (response.content or "").strip()))
                         if (not posted and response.type == "text"
                                 and not (response.content or "").strip()
-                                and not response.metadata.get("reaction_only")):
+                                and not response.metadata.get("reaction_only")
+                                and not getattr(turn, "visible_action_committed", False)):
                             # Bare empty text without the terminal tool: contract violation.
-                            # Fail-safe silence, no re-prompt this phase.
+                            # Fail-safe silence, no re-prompt this phase. A turn whose words
+                            # landed elsewhere (committed cross-thread post) is NOT this case.
                             main_logger.warning(
                                 "Empty text response without a terminal action — posting nothing")
 
@@ -947,7 +1327,7 @@ class ChatBotV2:
                 # either outcome on its own.
                 if thinking_id:
                     try:
-                        await client.delete_message(message.channel_id, thinking_id)  # unleased-ok: teardown — removing a surface can never be a stale answer
+                        await self._drop_chrome(client, turn, message.channel_id, thinking_id)
                     except Exception as cleanup_error:  # noqa: BLE001
                         main_logger.debug(f"Stale-suppression cleanup failed: {cleanup_error}")
                 if hasattr(client, "clear_assistant_status"):
@@ -955,13 +1335,14 @@ class ChatBotV2:
                         await client.clear_assistant_status(message.channel_id, post_thread_id)
                     except Exception as cleanup_error:  # noqa: BLE001
                         main_logger.debug(f"Stale-suppression status clear failed: {cleanup_error}")
+                outcome_kind = self._stale_terminal_kind(response, turn, message)
                 participation_telemetry.finish_attempt(
                     message,
                     # Something else may still be visible: a reaction the gate or the responder
                     # placed, or a detached producer's own surface. Those turns are not silent,
                     # and the suppression rides as a separate fact rather than overwriting the
                     # louder one.
-                    self._stale_terminal_kind(response, turn, message),
+                    outcome_kind,
                     ended_by="stale_guard",
                     last_seen_ts=stale.last_seen_ts,
                     observed_latest_ts=stale.observed_latest_ts,
@@ -984,11 +1365,12 @@ class ChatBotV2:
                 # room saw the reply; the ledger says so, and says the turn was not clean.
                 delivered = response is not None and (response.metadata or {}).get("posted")
                 if delivered:
+                    outcome_kind = self._classify_visible_action(response, turn)
                     participation_telemetry.finish_attempt(
-                        message,
-                        self._classify_visible_action(response, turn),
+                        message, outcome_kind,
                         ended_by="responder", post_delivery_error=type(e).__name__)
                 else:
+                    outcome_kind = "error_unhandled"
                     participation_telemetry.finish_attempt(
                         message, "error_unhandled", ended_by="responder",
                         detail=type(e).__name__)
@@ -997,7 +1379,7 @@ class ChatBotV2:
                 # must never swallow the user-facing notice below.
                 if thinking_id:
                     try:
-                        await client.delete_message(message.channel_id, thinking_id)  # unleased-ok: teardown — removing a surface can never be a stale answer
+                        await self._drop_chrome(client, turn, message.channel_id, thinking_id)
                     except Exception as delete_error:
                         main_logger.error(f"Failed to delete thinking indicator: {delete_error}")
 
@@ -1008,7 +1390,8 @@ class ChatBotV2:
                         message.thread_id,
                         "⚠️ **Something Went Wrong**\n\n"
                         "I hit a snag finishing that response. Please try again in a moment.",
-                        lease=lease
+                        lease=lease,
+                        receipts=turn.receipt_ledger if turn is not None else None,
                     )
                 except StaleSendSuppressed as stale:
                     # Nothing goes out. The turn already failed; posting an apology into a
@@ -1056,11 +1439,137 @@ class ChatBotV2:
                     except Exception as clear_error:
                         main_logger.debug(f"Assistant status clear failed: {clear_error}")
         finally:
+            # Everything this turn CAUSED is settled before anything it POSTED is, and the whole
+            # sequence — drain, cancel, revoke, wait out the live effects, settle the receipts —
+            # is ONE unit that owns itself. Awaited through a shield for exactly that reason: a
+            # cancellation landing on this await used to be caught and stepped over, which
+            # skipped revocation and then settled anyway, and a shielded straggler could take a
+            # lease and post AFTER settlement. The unit is not something a cancellation may
+            # interleave with; it is the thing that makes the cancellation safe.
+            await _await_finalizer(asyncio.ensure_future(_finalize_turn_effects(turn)))
+            # Spec §7: release any compaction snapshot this turn pinned. Always None in P2 — a
+            # pointer fails the turn closed before anything is pinned, so there is nothing to
+            # release and the double-release that would follow a partial pin cannot happen.
+            # Wired here rather than in P4 so the release lives in the same finally as the
+            # ledger settle, which is the ordering the pin depends on.
+            # getattr, like `_admitting` above: this method is also driven unbound against plain
+            # stand-in hosts that have neither of these, and a turn must not fail in its finally.
+            release = getattr(self, "_release_snapshot_lease", None)
+            if release is not None:
+                await release(turn)
+            # Channel memory reads what the room actually SAW — the COMMITTED destination records
+            # — and is therefore scheduled from HERE, after every commit point by construction.
+            # A silent turn, a suppressed one, and one that died mid-stream all commit nothing and
+            # write nothing. The in-handler scheduling (handlers/text.py) stays DM-only, where the
+            # exchange is in ThreadState.messages and nothing else knows it.
+            # The turn's own row, exactly once, from the turn's accumulated state. It sits after
+            # every commit point by construction — this finally cannot run before the handlers
+            # returned — and BEFORE the memory scheduling below, which reads the committed subset
+            # of the same destination records.
+            emit_outcome = getattr(self, "_emit_turn_outcome", None)
+            if emit_outcome is not None:
+                emit_outcome(message, turn, response, kind=outcome_kind)
+            schedule_memory = getattr(self, "_schedule_channel_memory", None)
+            if schedule_memory is not None:
+                schedule_memory(message, turn)
             participation_telemetry.abort_attempt(message)
+            if turn_task is not None and active_turns is not None:
+                active_turns.discard(turn_task)
             # Release the scope hold LAST. An entry survives while any lease in its scope is
             # open, so a newer turn that finishes early cannot erase the watermark an older,
             # still-running turn is about to read.
             lease.close()
+
+    async def _release_snapshot_lease(self, turn) -> None:
+        """Give back the compaction snapshot this turn was rendering from, if any."""
+        # NOT named `lease`: a turn already carries a send lease and a reaction lease, and a
+        # third thing called one next to them reads as the same kind of object. This is a
+        # refcount on a compaction snapshot.
+        snapshot_pin = getattr(turn, "snapshot_lease", None) if turn is not None else None
+        if snapshot_pin is None:
+            return
+        coordinator = self.snapshot_coordinator
+        if coordinator is None:
+            return
+        try:
+            await coordinator.unpin(snapshot_pin)
+        except Exception as e:  # noqa: BLE001 — a stuck pin is a retention problem, not a turn one
+            main_logger.warning(f"Snapshot pin {snapshot_pin} not released: {e}")
+
+    @staticmethod
+    def _turn_telemetry_scope(message: Message, turn) -> bool:
+        """Do this turn's rows belong in the CV8 turn population? Channel turns only.
+
+        The same discriminator receipts use, not a prefix test: the turn population is the one
+        answering from a channel stream, and a DM has neither a stream nor a receipt to describe.
+        """
+        return turn is not None and outbound_receipts.receipts_apply(
+            getattr(message, "channel_id", None))
+
+    def _emit_turn_start(self, message: Message, turn, *, gate_required: bool) -> None:
+        """The turn population's denominator. Written before anything can be posted."""
+        if not self._turn_telemetry_scope(message, turn):
+            return
+        meta = message.metadata or {}
+        participation_telemetry.turn_start(
+            message.channel_id, meta.get("ts"),
+            turn_id=getattr(turn, "turn_id", None),
+            origin_thread_ts=message.thread_id,
+            surface="channel",
+            gated=bool(gate_required),
+            attempt_id=participation_telemetry.attempt_id_for(message),
+            wake_source=meta.get("wake_source"))
+
+    def _emit_turn_outcome(self, message: Message, turn, response, *,
+                           kind: Optional[str] = None) -> None:
+        """Close the turn's row. `kind` is the label the path that ended the turn already chose —
+        an unhandled raise is `error_unhandled`, not the `empty` a missing Response would imply —
+        and it falls back to the same classifier the gate terminal uses.
+
+        `detached_started` means a producer owned its own surface this turn — a picture, a status
+        card — which is a delivery the destination records cannot see."""
+        if not self._turn_telemetry_scope(message, turn):
+            return
+        meta = (response.metadata or {}) if response is not None else {}
+        participation_telemetry.emit_turn_outcome(
+            turn, channel_id=message.channel_id,
+            trigger_ts=(message.metadata or {}).get("ts"),
+            kind=kind or self._classify_visible_action(response, turn),
+            detached_started=bool(meta.get("background_job_started")
+                                  or getattr(turn, "visible_action_committed", False)),
+            attempt_id=participation_telemetry.attempt_id_for(message))
+
+    def _schedule_channel_memory(self, message: Message, turn) -> None:
+        """Extract a durable channel fact from what this turn COMMITTED, if it committed anything.
+
+        Reads the committed destination records rather than the intended reply, because those are
+        the two facts a memory has to be about: somebody said something, and we answered. A turn
+        that produced words and then failed to deliver them has no exchange to remember, and
+        recording one would have the bot remember a conversation the room never had.
+        """
+        if turn is None or not getattr(turn, "stream_build_present", False):
+            return
+        if not getattr(config, "enable_memory_extraction_fallback", False):
+            return
+        # A FOREIGN post is not this exchange. post_to_thread lands in another thread of the
+        # channel (its executor refuses the current one outright), so the pairing "what was asked
+        # HERE" + "what we said THERE" is not an exchange that happened anywhere — and storing it
+        # as one would have the bot remember a conversation in the wrong room. The post stays
+        # observable in turn_outcome's destinations; grouping it with its own thread's evidence is
+        # P4's, where the target's side of the exchange is available to group it with.
+        committed = [r for r in turn.committed_destinations
+                     if (r.text or "").strip() and r.kind != DEST_KIND_POST_TO_THREAD]
+        if not committed:
+            return
+        processor = self.processor
+        if processor is None or not hasattr(processor, "extract_channel_memory_from_exchange"):
+            return
+        try:
+            processor._schedule_async_call(processor.extract_channel_memory_from_exchange(
+                message.channel_id, getattr(message, "text", "") or "",
+                "\n\n".join(r.text or "" for r in committed)))
+        except Exception as e:  # noqa: BLE001 — memory is never worth a turn
+            main_logger.debug(f"Channel memory extraction not scheduled: {e}")
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals - double Ctrl-C for force exit"""
@@ -1093,15 +1602,16 @@ class ChatBotV2:
             if self.sigint_count == 1:
                 main_logger.info(f"Received signal {signum}, attempting graceful shutdown...")
                 main_logger.info("Press Ctrl-C again within 2 seconds to force exit")
-                # Schedule shutdown on the event loop
-                asyncio.create_task(self.shutdown())
+                # Schedule THE shutdown on the event loop (run()'s finally awaits the same one)
+                self.begin_shutdown()
             else:
                 main_logger.warning("Shutdown already in progress... Press Ctrl-C again to force exit")
         else:
             # Handle other signals normally
             main_logger.info(f"Received signal {signum}, shutting down...")
-            # Schedule shutdown on the event loop
-            asyncio.create_task(self.shutdown())
+            # Schedule THE shutdown on the event loop (run()'s finally awaits the same one), so a
+            # SIGTERM's ledger drain is never cut short by the loop closing under it.
+            self.begin_shutdown()
     
     async def start_cleanup_task(self):
         """Start background task for periodic cleanup"""
@@ -1228,14 +1738,46 @@ class ChatBotV2:
         self.cleanup_task = asyncio.create_task(cleanup_worker())
         main_logger.info("Started cleanup task")
     
+    def begin_shutdown(self) -> asyncio.Task:
+        """Start the one shutdown, or hand back the one already running. Idempotent.
+
+        Never called from the raw signal handler's own frame for anything but this: the handler
+        runs between bytecodes with no loop of its own, so all it may do is schedule.
+
+        The REQUEST is recorded first and durably, because a request can arrive before there is
+        anything to stop — a SIGTERM between installing the handlers and the run loop starting.
+        The task that request created returns immediately (nothing is running yet) and is NOT
+        allowed to stand as the shutdown: a later caller gets a fresh one, and `run()` checks the
+        flag the moment it comes up so the signal is honored rather than lost.
+        """
+        self._shutdown_requested = True
+        task = self._shutdown_task
+        if task is not None and task.done() and not self._shutdown_completed:
+            task = self._shutdown_task = None
+        if task is None:
+            task = self._shutdown_task = asyncio.create_task(self.shutdown())
+        return task
+
     async def run(self):
         """Run the bot"""
         log_session_start()
+        self._run_task = asyncio.current_task()
 
         fatal = False
         try:
             await self.initialize()
             self.running = True
+
+            # A signal that arrived DURING initialization is honored here, at the first moment
+            # there is something to stop. The handlers are installed inside `initialize`, so this
+            # window is real: without this check the bot would come up and serve, having been
+            # told to stop, and the finally below would await the no-op task that request left
+            # behind. `begin_shutdown` refuses to hand that task back, so this starts a real one.
+            if self._shutdown_requested:
+                main_logger.info(
+                    "A shutdown was requested during initialization — stopping without starting")
+                await self.begin_shutdown()
+                return
 
             # Start cleanup task
             await self.start_cleanup_task()
@@ -1253,6 +1795,39 @@ class ChatBotV2:
                             f"Ambient recover error: {t.exception()}"))
                 except Exception as e:
                     main_logger.warning(f"Ambient service start skipped: {e}")
+
+            # Spec §4: extend per-channel coverage backward in the background. Waits for the
+            # bot's identity itself, so it starts before auth.test has landed.
+            if self.client is not None and getattr(self.client, "db", None) is not None:
+                try:
+                    from slack_client.event_handlers.activity_index import ChannelCoverageBootstrap
+                    self.coverage_bootstrap = ChannelCoverageBootstrap(self.client)
+                    self.coverage_bootstrap.start()
+                except Exception as e:
+                    main_logger.warning(f"Coverage bootstrap start skipped: {e}")
+
+            # Plan §1l/§1m: the compaction coordinator. The outbox is DRAINED FIRST, so a replayed
+            # event does not interleave with the fresh ones the coordinator is about to produce —
+            # and AN UNAVAILABLE SINK NEVER BLOCKS STARTUP. A failure here is a WARNING and the
+            # bot comes up anyway: the rows are a durable backlog and the drainer retries in the
+            # background, so a strict "must drain before starting" rule would trade a logging
+            # problem for an outage.
+            if self.snapshot_coordinator is not None:
+                try:
+                    drained = await self.snapshot_coordinator.drain_outbox(bounded=True)
+                    if drained:
+                        main_logger.info(
+                            f"Replayed {drained} compaction telemetry row(s) from the outbox")
+                except Exception as e:  # noqa: BLE001
+                    main_logger.warning(
+                        f"Compaction telemetry outbox not drained at boot ({e}); the rows are "
+                        "retained and the coordinator is starting anyway")
+                try:
+                    # Boot hydration is NOT a trigger: an expired dormant obligation stays
+                    # dormant, so a crash-looping process cannot revive it for free.
+                    await self.snapshot_coordinator.start()
+                except Exception as e:  # noqa: BLE001
+                    main_logger.warning(f"Compaction coordinator start skipped: {e}")
 
             # MCP startup health probe (informational; runs in the background so
             # a slow server can't delay boot). Strong ref so it can't be GC'd.
@@ -1282,10 +1857,42 @@ class ChatBotV2:
             main_logger.critical(f"Fatal error — bot is exiting: {e}", exc_info=True)
             fatal = True
         finally:
-            await self.shutdown()
+            # The SAME task a signal would have started — awaited to completion, so the telemetry
+            # drain and its `session_end` finish before this coroutine returns and the loop closes.
+            try:
+                await self.begin_shutdown()
+            except asyncio.CancelledError:
+                main_logger.warning("Shutdown was cancelled before it finished draining")
+                raise
+            except Exception as e:  # noqa: BLE001 — shutdown reports its own failures
+                main_logger.warning(f"Shutdown ended with: {e}")
 
         if fatal:
             sys.exit(1)
+
+    async def _quiesce_turns(self, timeout: float = TURN_QUIESCE_TIMEOUT_SECONDS) -> None:
+        """Close admission, then let the turns already running finish.
+
+        Spec §5: a receipt row can only be written while the queue is open, so a turn that is
+        still posting when the queue closes has its registration AND its settle refused — the
+        message sits in Slack with nothing claiming it, and the rebuilt stream will never
+        contain it. Bounded, because a wedged model call must not hold shutdown open forever: a
+        turn that overruns is cancelled, and its `finally` still settles the ledger (shielded)
+        while the queue is open.
+        """
+        self._admitting = False
+        pending = [t for t in list(self.active_turns)
+                   if t is not asyncio.current_task() and not t.done()]
+        if not pending:
+            return
+        main_logger.info(f"Waiting for {len(pending)} in-flight turn(s) to finish...")
+        _done, still_running = await asyncio.wait(pending, timeout=timeout)
+        if still_running:
+            main_logger.warning(
+                f"{len(still_running)} turn(s) did not finish in {timeout:.0f}s — cancelling")
+            for task in still_running:
+                task.cancel()
+            await asyncio.gather(*still_running, return_exceptions=True)
 
     async def shutdown(self):
         """Shutdown the bot gracefully"""
@@ -1294,6 +1901,41 @@ class ChatBotV2:
 
         self.running = False
         main_logger.info(f"Shutting down {self.platform} bot...")
+
+        # First, before anything is torn down: stop admitting new turns and quiesce the ones
+        # already running. Everything below — background drains, the receipt queue, the client,
+        # the database — is machinery a live turn is still using.
+        #
+        # Ticket issuance stays OPEN through all of it, deliberately, and closes far below only
+        # once Slack ingress is provably quiet. Closing it any earlier — while Socket Mode can
+        # still dispatch — leaves an interval in which an event enters `_admit`, gets no ticket,
+        # and if its index write then fails there is nothing to retain it and nothing to fail: a
+        # loss that can only be logged (codex r7, r3-8). Nothing is gained by closing early
+        # either, because the retry worker and the database both outlive this phase.
+        try:
+            await self._quiesce_turns()
+        except Exception as e:  # noqa: BLE001
+            main_logger.warning(f"Error quiescing in-flight turns: {e}")
+
+        # Spec §5: a turn is not the only thing that puts our own prose in a channel. The channel
+        # intro is detached off the Slack ingress side — which stops far below, AFTER the receipt
+        # queue closes — so an intro landing in that window would have its registration refused
+        # and the bot's own introduction would sit in the room, permanently outside the stream.
+        if self.client is not None and hasattr(self.client, "drain_channel_intros"):
+            try:
+                await self.client.drain_channel_intros()
+            except Exception as e:  # noqa: BLE001
+                main_logger.warning(f"Error draining channel intros: {e}")
+
+        # …and the same for the callbacks Bolt is still dispatching. Socket Mode stays connected
+        # until `client.stop()` at the very bottom of this method, so a settings confirmation or
+        # an onboarding notice can land long after the receipt queue has closed. Admission shuts
+        # here and the callbacks already inside are waited out; anything arriving later is
+        # refused BEFORE it posts, because an unsent notice costs less than an unaccounted one.
+        try:
+            await outbound_receipts.drain_channel_post_callbacks()
+        except Exception as e:  # noqa: BLE001
+            main_logger.warning(f"Error draining channel-posting callbacks: {e}")
 
         # Cancel cleanup task
         if self.cleanup_task and not self.cleanup_task.done():
@@ -1329,12 +1971,139 @@ class ChatBotV2:
             except Exception as e:
                 main_logger.warning(f"Error draining ambient workers: {e}")
 
-        # Stop the client (this should interrupt any stuck operations)
+        # Spec §5: the boot recovery polls Slack and writes receipts, so it stops before both.
+        # A row it never got to is retained by contract and retried at the next boot.
+        task = getattr(self, "_pending_share_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:  # noqa: BLE001
+                main_logger.warning(f"Pending share recovery stopped with: {e}")
+
+        # Spec §5: the generic background set produces receipts too (image share resolution),
+        # and it is the ONLY producer nothing else here waits on. It must be off the field
+        # before the queue below is declared final, or its rows land in a closed queue.
+        if self.processor is not None and hasattr(self.processor, "drain_background_tasks"):
+            try:
+                await self.processor.drain_background_tasks()
+            except Exception as e:  # noqa: BLE001
+                main_logger.warning(f"Error draining background tasks: {e}")
+
+        # Spec §5: producers are done by now, so drain what the receipt queue still holds and
+        # stop its worker BEFORE the database goes away. Anything left after this is logged as
+        # permanently omitted rather than lost quietly.
+        if self.receipt_service is not None:
+            try:
+                await self.receipt_service.shutdown()
+            except Exception as e:
+                main_logger.warning(f"Error draining outbound receipts: {e}")
+
+        # Spec §4: the coverage sweep has Slack calls in flight — stop it before the client.
+        if self.coverage_bootstrap is not None:
+            try:
+                await self.coverage_bootstrap.stop()
+            except Exception as e:
+                main_logger.warning(f"Error stopping coverage bootstrap: {e}")
+
+        # Spec §1 shutdown contract, and the ORDER below is the whole of it. Issuance stays open
+        # until ingress is quiet, so the ticketless interval is closed: every event a callback
+        # admits while Bolt is still winding down gets a ticket, and a failed index write is
+        # therefore retained and repaired rather than logged as a loss nobody can undo. The one
+        # residual is a callback that resists cancellation at the barrier's deadline, which is
+        # CRITICAL-logged by name below rather than papered over.
+        #
+        #   stop the client → prove ingress quiet → close issuance → drain the retry worker →
+        #   drain late receipts → (below) tear down the database.
         if self.client:
             try:
                 await self.client.stop()
             except Exception as e:
                 main_logger.warning(f"Error stopping client: {e}")
+
+        # `client.stop()` returning is NOT quiescence. Bolt dispatches each event as its own task,
+        # production stop force-marks sessions closed and abandons the handler's own close, and the
+        # close it walks away from can still deliver events. The barrier waits out everything that
+        # could dispatch, then drains the callbacks themselves and re-proves the zero — see
+        # `_IngressTracker`. Bounded, and the three outcomes are told apart here rather than
+        # collapsed into one number: quiet was granted, quiet was taken by cancelling stragglers at
+        # the deadline (nothing can dispatch now, but a callback cancelled mid-write may not have
+        # persisted what it saw), or something refused to be cancelled at all.
+        try:
+            drain = await registration.drain_ingress_callbacks(
+                timeout=float(getattr(config, "ingress_drain_timeout_seconds", 5.0)))
+            if drain.survived:
+                main_logger.critical(
+                    f"Slack ingress teardown gave up and {', '.join(drain.survived)} survived "
+                    "cancellation; an observation made from here on has no worker to persist it")
+            elif drain.gave_up:
+                main_logger.critical(
+                    "Slack ingress did not go quiet within the drain deadline; every straggler was "
+                    "cancelled, so nothing can dispatch from here — but a callback cancelled "
+                    "mid-write may have left its observation unpersisted")
+            else:
+                main_logger.info("Slack ingress is quiet: no callback running, nothing left that "
+                                 "could start one")
+        except Exception as e:  # noqa: BLE001
+            main_logger.warning(f"Error draining Slack ingress callbacks: {e}")
+
+        # Ingress is quiet, so nothing can take a ticket any more. NOW issuance closes — and it
+        # closes before the worker is drained, so no repair can be enqueued behind the drain.
+        try:
+            admission_watermark.close_issuance()
+        except Exception as e:  # noqa: BLE001
+            main_logger.warning(f"Error closing admission-ticket issuance: {e}")
+
+        # Drain and stop the index retry worker HERE, while the database it repairs through is
+        # still open — after this the pending set is empty or each residual is logged CRITICAL with
+        # its channel and ts, which is the only honest end state for an in-memory retry queue.
+        try:
+            await admission_watermark.shutdown()
+        except Exception as e:  # noqa: BLE001
+            main_logger.warning(f"Error draining the admission-index retry worker: {e}")
+
+        # The `file_deleted` listener is a receipt producer that stays registered long after the
+        # queue closes, and ingress being quiet means it has definitely returned. Anything it
+        # retained on a transient DB failure is sitting in a closed queue with no worker; this is
+        # the one moment when it can still be written (the database is open) and nothing else can
+        # add to it.
+        if self.receipt_service is not None:
+            try:
+                await self.receipt_service.drain_late_arrivals()
+            except Exception as e:  # noqa: BLE001
+                main_logger.warning(f"Error draining late receipt rows: {e}")
+
+        # Plan §1l/§1m: the coordinator stops HERE — after ingress is provably quiet, so nothing
+        # can trigger it, and while the database it writes through is still open. A task cancelled
+        # here takes crash semantics deliberately: the in-flight chunk is refetched after restart,
+        # which costs one chunk instead of holding shutdown open for a chunk that may be minutes
+        # long.
+        if self.snapshot_coordinator is not None:
+            try:
+                await self.snapshot_coordinator.stop()
+            except Exception as e:  # noqa: BLE001
+                main_logger.warning(f"Error stopping the compaction coordinator: {e}")
+
+            # THEN the final outbox drain: after the coordinator stops (nothing is still
+            # producing) and before telemetry shutdown and DB teardown (it needs both stores
+            # alive). ONE BOUNDED ATTEMPT with a 30-second timeout — no retry loop, no waiting out
+            # an unavailable sink. On failure or timeout the rows are RETAINED for the next boot,
+            # because the backlog is durable and a missed final drain costs latency in the ledger,
+            # not data.
+            try:
+                await asyncio.wait_for(
+                    self.snapshot_coordinator.drain_outbox(bounded=True),
+                    timeout=SNAPSHOT_OUTBOX_DRAIN_TIMEOUT)
+            except asyncio.TimeoutError:
+                main_logger.warning(
+                    f"Compaction telemetry outbox did not drain within "
+                    f"{SNAPSHOT_OUTBOX_DRAIN_TIMEOUT:.0f}s; the remaining rows are retained for "
+                    "the next boot")
+            except Exception as e:  # noqa: BLE001
+                main_logger.warning(
+                    f"Final compaction telemetry drain failed ({e}); the rows are retained")
 
         # Clean up resources
         try:
@@ -1350,15 +2119,38 @@ class ChatBotV2:
         await asyncio.sleep(0.5)
 
         # Cancel any remaining tasks that might be lingering
-        tasks = [t for t in asyncio.all_tasks() if t != asyncio.current_task()]
+        # …but never the two tasks that ARE this shutdown: the one running it and the one
+        # awaiting it. When a signal starts the shutdown, `run()` is a plain pending task from
+        # here — cancelling it would cancel the await that is keeping the loop open for this very
+        # drain, and the last thing to be written (session_end) would be the thing lost.
+        protected = {asyncio.current_task(), self._shutdown_task, self._run_task}
+        tasks = [t for t in asyncio.all_tasks() if t not in protected]
         if tasks:
             main_logger.warning(f"Cancelling {len(tasks)} remaining tasks...")
             for task in tasks:
                 task.cancel()
-            # Wait briefly for cancellation
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # BOUNDED, and the bound is not about slow cleanup. Cancelling a task that is itself
+            # WAITING on this shutdown walks CPython's Task.cancel() down the await chain and back
+            # into the gather below — the two cancel each other until the recursion limit, the
+            # gather never completes, and the shutdown hangs with `session_end` unwritten, which is
+            # the exact failure this whole ordering exists to prevent. The set above keeps the two
+            # tasks we KNOW are in that chain out of it; this makes any other one survivable.
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
+            except asyncio.TimeoutError:
+                names = ", ".join(t.get_name() for t in tasks if not t.done())
+                main_logger.warning(
+                    f"Leftover task(s) did not finish cancelling: {names or 'unnamed'}")
+            except RecursionError:
+                main_logger.error(
+                    "A leftover task was waiting on this shutdown; its cancellation was abandoned")
 
         log_session_end()
+        # This shutdown STOPPED something, so the task that ran it is the shutdown and every
+        # later request may be handed it. A run that returned early because there was nothing
+        # running never sets this, and cannot stand in for the real one.
+        self._shutdown_completed = True
         main_logger.info("Shutdown complete")
 
 

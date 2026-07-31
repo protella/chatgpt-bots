@@ -150,6 +150,21 @@ class TestChannelContextPromptSection:
         prompt = message_processor._get_system_prompt(_slack_client_stub())
         assert "--- CHANNEL CONTEXT ---" not in prompt
 
+    def test_an_empty_dict_means_a_channel_whose_furniture_is_described_elsewhere(
+            self, message_processor, monkeypatch):
+        """The channel layout's deliberate `{}` (channel_request._channel_instructions). The
+        topic and the settings are per-room volatile text and render below the cache breakpoint
+        instead — but the canvas etiquette keys off "is this a channel at all", so None and {}
+        cannot mean the same thing."""
+        from config import config as cfg
+        monkeypatch.setattr(cfg, "enable_canvas_tools", True, raising=False)
+        prompt = message_processor._get_system_prompt(_slack_client_stub(), channel_info={},
+                                                     tools_available=True)
+        assert "--- CHANNEL CONTEXT ---" not in prompt
+        assert "canvas" in prompt.lower()
+        assert "canvas" not in message_processor._get_system_prompt(
+            _slack_client_stub(), channel_info=None, tools_available=True).lower()
+
 
 # ---------------- _build_channel_info bridge ----------------
 

@@ -1,3 +1,3 @@
-from .base import OpenAIClient, ImageData
+from .base import OpenAIClient, ImageData, attach_cache_breakpoint
 
-__all__ = ["OpenAIClient", "ImageData"]
+__all__ = ["OpenAIClient", "ImageData", "attach_cache_breakpoint"]

@@ -7,11 +7,20 @@ shortlist it chose from. Unreachable code is not harmless: it reads as live to a
 nearby code, it keeps its config keys documented as if they did something, and the hold in
 particular kept a resolver contract alive that nothing was going to call.
 
+The same file now also guards the SECOND retirement, ChannelPulse. The pulse was the responder's
+answer to "what is happening in this channel" — an in-memory ring of recent message text, a
+rendered "[Recent channel activity]" envelope, a people line, per-message reaction counts, a
+one-page backfill per channel per process. The channel stream replaced all of it by rebuilding
+from Slack and the database on every turn, which is both current and complete where the ring was
+neither. The danger in a retirement like that is a half-return: one envelope injection, one
+`getattr(client, "channel_pulse", None)`, and the stream is quietly competing with a stale ring
+for the same job.
+
 These tests are absence assertions, which are usually a smell. They earn their place here because
 each of these things came back at least once during the rewrite as somebody "restored" an input
-the gate no longer had a use for. What the file does NOT assert is equally deliberate: everything
-the RESPONDER still uses — the pulse envelope, the people summary, per-message reactions, the
-custom-emoji catalog and its search tool — is covered by its own tests and must keep working.
+that no longer had a use. What the file does NOT assert is equally deliberate: everything that
+survives — the actor tail, the people summary, the custom-emoji catalog and its search tool — is
+covered by its own tests and must keep working.
 """
 from __future__ import annotations
 
@@ -99,12 +108,6 @@ def test_the_rich_gates_eval_harness_is_gone():
     "defer_images",
     "handle_response",           # the dead alternate delivery path
     "pulse_tail_text_truncate",
-    "participation_custom_emoji_cap",
-    "emoji_usage_flush_seconds",
-    "gate_vision_detail",
-    "gate_vision_max_images",
-    "gate_vision_max_bytes",
-    "enable_multimodal_gate",
 ])
 def test_no_source_file_still_names_it(symbol):
     # Word-boundary matched: `handle_response` is a substring of the live
@@ -114,6 +117,68 @@ def test_no_source_file_still_names_it(symbol):
     pattern = re.compile(rf"\b{re.escape(symbol)}\b")
     offenders = [f"{rel}" for rel, src in _sources() if pattern.search(src)]
     assert not offenders, f"{symbol} still appears in: {', '.join(offenders)}"
+
+
+# The pulse's names, which must not be REACHED — a retirement note that says what was retired is
+# good practice, so unlike the gate symbols above these are swept structurally (attribute access
+# and calls in the AST) rather than textually. Prose may say "channel_pulse"; code may not.
+_RETIRED_PULSE_NAMES = frozenset({
+    "channel_pulse",                 # the attribute
+    "_build_pulse_envelope",         # the responder's injection site
+    "render_envelope", "render_envelope_with_meta",
+    "recent_speakers",               # the people line (membership count moved to the suffix)
+    "recent_taggable_speakers",      # superseded by the stream's taggable roster
+    "count_since", "snapshot_pulse", "upsert_artifacts",
+    "ensure_backfill",               # the one-page-per-channel-per-process seed
+    "_feed_channel_pulse", "note_reaction_pulse",
+    "_record_own_reply_pulse", "_record_own_reaction_pulse",
+    "record_own_reaction", "remove_own_reaction",
+    "pulse_supplementary_budget",
+    # the narrative's retired refresh path (the stream is the room now)
+    "render_for_channel", "maybe_refresh", "_ring_counts", "_decide_build",
+})
+
+
+def test_no_source_file_still_reaches_the_pulse():
+    offenders = []
+    for rel, src in _sources():
+        tree = ast.parse(src, filename=str(rel))
+        for node in ast.walk(tree):
+            name = None
+            if isinstance(node, ast.Attribute):
+                name = node.attr
+            elif isinstance(node, ast.Name):
+                name = node.id
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = node.name
+            if name in _RETIRED_PULSE_NAMES:
+                offenders.append(f"{rel}:{node.lineno} ({name})")
+    assert not offenders, "the pulse is still reached at: " + ", ".join(offenders)
+
+
+def test_the_pulse_config_keys_are_gone():
+    """A key nobody reads still documents itself in .env.example and still looks tunable."""
+    from config import BotConfig
+
+    fields = set(BotConfig.__dataclass_fields__)
+    for gone in ("enable_channel_pulse", "channel_pulse_size", "pulse_text_truncate",
+                 "channel_pulse_envelope_max", "pulse_thread_tails_max",
+                 "pulse_thread_tail_channels_max",
+                 # the narrative's refresh cadence went with the refresh path
+                 "channel_summary_refresh_msgs", "channel_summary_ttl_hours",
+                 "channel_summary_failure_cooldown_hours"):
+        assert gone not in fields, gone
+    for renamed in ("actor_tail_threads_max", "actor_tail_channels_max",
+                    "participation_thread_tail", "index_drain_timeout_seconds"):
+        assert renamed in fields, renamed
+    env = (ROOT / ".env.example").read_text(encoding="utf-8")
+    for gone_env in ("ENABLE_CHANNEL_PULSE", "CHANNEL_PULSE_SIZE", "PULSE_TEXT_TRUNCATE",
+                     "CHANNEL_PULSE_ENVELOPE_MAX", "PULSE_THREAD_TAILS_MAX",
+                     "PULSE_THREAD_TAIL_CHANNELS_MAX"):
+        assert gone_env not in env, gone_env
+    for kept_env in ("ACTOR_TAIL_THREADS_MAX", "ACTOR_TAIL_CHANNELS_MAX",
+                     "INDEX_DRAIN_TIMEOUT_SECONDS"):
+        assert kept_env in env, kept_env
 
 
 def test_thread_state_no_longer_carries_a_dead_system_prompt():
@@ -126,33 +191,66 @@ def test_thread_state_no_longer_carries_a_dead_system_prompt():
 
 # --------------------------------------------------------------------------- what must remain
 
-def test_the_responders_context_helpers_survive():
-    """The deletions above are about the GATE's inputs. Everything here feeds the responder, which
-    still renders a channel envelope, a people line and per-message reactions."""
+def test_the_context_helpers_that_survive_the_pulse_survive():
+    """The deletions above are about inputs nothing reads any more. The people summary still
+    renders a roster for the responder, and the actor tail still answers the one structural
+    question the ring was kept for."""
     from message_processor.people_tools import format_people_summary
-    from message_processor.utilities import MessageUtilitiesMixin
-    from slack_client.channel_pulse import ChannelPulse
+    from slack_client import actor_tail
 
     assert callable(format_people_summary)
-    assert hasattr(MessageUtilitiesMixin, "_build_pulse_envelope")
-    for kept in ("render_envelope", "recent_speakers", "thread_has_other_bot"):
-        assert hasattr(ChannelPulse, kept), kept
+    for kept in ("record", "remove", "thread_has_other_bot", "reconcile_window", "generation"):
+        assert hasattr(actor_tail.actor_tail, kept), kept
 
 
-def test_thread_has_other_bot_still_defeats_the_one_to_one_fast_path():
-    """The one piece of thread actor state that is NOT gate machinery. A deterministic 1:1
-    continuation answers without asking the gate at all, so a second bot in the thread has to be
-    able to cancel that — otherwise the bot replies into another agent's conversation with no
-    judgment applied anywhere."""
-    from slack_client.channel_pulse import ChannelPulse
+def test_the_channel_pulse_module_is_gone():
+    """Structural, not textual: the module file and every import of it. The NAME survives in
+    honest prose — the actor tail's own docstring says where it was extracted from — and this test
+    must not chase that."""
+    assert not (ROOT / "slack_client" / "channel_pulse.py").exists()
+    assert not (ROOT / "tests" / "unit" / "test_channel_pulse.py").exists()
+    assert not (ROOT / "tests" / "unit" / "test_thread_tail_context.py").exists()
 
-    pulse = ChannelPulse()
-    pulse.record("C1", ts="2.0", thread_ts="1.0", user_id="UHUMAN", display_name="Peter",
-                 sender_type="human", text="mine", is_bot=False)
-    assert pulse.thread_has_other_bot("C1", "1.0") is False
-    pulse.record("C1", ts="3.0", thread_ts="1.0", user_id="UBOT", display_name="Other Bot",
-                 sender_type="other_bot", text="theirs", is_bot=True)
-    assert pulse.thread_has_other_bot("C1", "1.0") is True
+    offenders = []
+    for rel, src in _sources():
+        tree = ast.parse(src, filename=str(rel))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                if any(a.name.split(".")[-1] == "channel_pulse" for a in node.names):
+                    offenders.append(f"{rel}:{node.lineno}")
+            elif isinstance(node, ast.ImportFrom):
+                if (node.module or "").endswith("channel_pulse"):
+                    offenders.append(f"{rel}:{node.lineno}")
+    assert not offenders, "channel_pulse is still imported at: " + ", ".join(offenders)
+
+
+def test_the_narrative_no_longer_reaches_a_turn():
+    """The channel narrative was injected as a role:user block on every channel turn. The stream
+    carries the room now, so the ONE surviving consumer is the join intro, which has no turn to
+    read a stream from. What must stay: the neutralizing frame (identical bytes wherever it is
+    injected), the mutation invalidation, and the build itself."""
+    import inspect
+
+    from message_processor.channel_summary import ChannelSummaryService
+
+    for gone in ("render_for_channel", "maybe_refresh", "_decide_and_build", "_decide_build",
+                 "_ring_counts", "_in_cooldown", "_age_hours"):
+        assert not hasattr(ChannelSummaryService, gone), gone
+    for kept in ("render_block", "note_message_mutation", "build_for_intro", "shutdown"):
+        assert hasattr(ChannelSummaryService, kept), kept
+    assert "pulse" not in inspect.signature(ChannelSummaryService.build_for_intro).parameters
+
+
+def test_the_reaction_lease_carries_no_pulse_receipt():
+    """The receipt existed so a taken-back reaction could take its synthetic ring entry back with
+    it. There is no ring entry, and the stream re-reads reactions from Slack — a receipt now would
+    be a key nothing consumes."""
+    import inspect
+
+    from slack_client.messaging import SlackMessagingMixin
+
+    assert "pulse" not in inspect.getsource(SlackMessagingMixin._reserve_and_react)
+    assert "pulse" not in inspect.getsource(SlackMessagingMixin._settle_removal_slot)
 
 
 def test_the_custom_emoji_catalog_and_search_survive():

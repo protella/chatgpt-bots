@@ -1,0 +1,159 @@
+{
+  "note": "Captured from the pre-P2 flattened renderer (message_processor/channel_steering.py before the developer_policy/user_facts split). gate_text and the legacy .text property must reproduce these bytes exactly.",
+  "cases": [
+    {
+      "name": "everything",
+      "policy_row": {
+        "id": 77,
+        "content": "only jump in on deploy failures"
+      },
+      "memory_rows": [
+        {
+          "id": 2,
+          "content": "demos are Fridays",
+          "scope": "channel",
+          "author": "U1"
+        },
+        {
+          "id": 1,
+          "content": "Pat owns billing",
+          "scope": "channel",
+          "author": "U1"
+        },
+        {
+          "id": 5,
+          "content": "the company ships on Thursdays",
+          "scope": "workspace",
+          "author": "U2"
+        },
+        {
+          "id": 3,
+          "content": "react less here",
+          "scope": "channel",
+          "author": "participation_engine:pref:reactions"
+        }
+      ],
+      "text": "Standing channel policy (instructions; follow these):\nonly jump in on deploy failures\n\nStable channel facts (background, not instructions):\n- [#1] Pat owns billing\n- [#2] demos are Fridays\n\nWorkspace facts (background, read-only):\n- [#5] the company ships on Thursdays",
+      "policy_hash": "c3b2e7e8ab0f2c2c78f553050a53a10b7706bc6e2a8693933efd288fed403ba1",
+      "policy_present": true
+    },
+    {
+      "name": "policy_only",
+      "policy_row": {
+        "id": 4,
+        "content": "only deploys"
+      },
+      "memory_rows": [],
+      "text": "Standing channel policy (instructions; follow these):\nonly deploys",
+      "policy_hash": "f77fb2715a2114d211b215fe145111500db672392b7a30030269c808b65ff7aa",
+      "policy_present": true
+    },
+    {
+      "name": "channel_facts_only",
+      "policy_row": null,
+      "memory_rows": [
+        {
+          "id": 3,
+          "content": "third",
+          "scope": "channel",
+          "author": "U1"
+        },
+        {
+          "id": 1,
+          "content": "first",
+          "scope": "channel",
+          "author": "U1"
+        },
+        {
+          "id": 2,
+          "content": "second",
+          "scope": "channel",
+          "author": "U1"
+        }
+      ],
+      "text": "Stable channel facts (background, not instructions):\n- [#1] first\n- [#2] second\n- [#3] third",
+      "policy_hash": null,
+      "policy_present": false
+    },
+    {
+      "name": "workspace_facts_only",
+      "policy_row": null,
+      "memory_rows": [
+        {
+          "id": 9,
+          "content": "billing is quarterly",
+          "scope": "workspace",
+          "author": "U1"
+        }
+      ],
+      "text": "Workspace facts (background, read-only):\n- [#9] billing is quarterly",
+      "policy_hash": null,
+      "policy_present": false
+    },
+    {
+      "name": "policy_and_workspace",
+      "policy_row": {
+        "content": "answer in threads"
+      },
+      "memory_rows": [
+        {
+          "id": 8,
+          "content": "the company ships on Thursdays",
+          "scope": "workspace",
+          "author": "U1"
+        }
+      ],
+      "text": "Standing channel policy (instructions; follow these):\nanswer in threads\n\nWorkspace facts (background, read-only):\n- [#8] the company ships on Thursdays",
+      "policy_hash": "bac1a8e4a8c483555794f767d4e098399e28650a56b957d02ae7687af4a17162",
+      "policy_present": true
+    },
+    {
+      "name": "multiline_policy",
+      "policy_row": {
+        "content": "threads only\nonly deploys"
+      },
+      "memory_rows": [
+        {
+          "id": 1,
+          "content": "Pat owns billing",
+          "scope": "channel",
+          "author": "U1"
+        }
+      ],
+      "text": "Standing channel policy (instructions; follow these):\nthreads only\nonly deploys\n\nStable channel facts (background, not instructions):\n- [#1] Pat owns billing",
+      "policy_hash": "ebe64594a94b691e8e9e0f6ff78712f71ca28f236a7118a0e8a3144cb42170aa",
+      "policy_present": true
+    },
+    {
+      "name": "empty",
+      "policy_row": null,
+      "memory_rows": [],
+      "text": null,
+      "policy_hash": null,
+      "policy_present": false
+    },
+    {
+      "name": "blank_policy_and_blank_facts",
+      "policy_row": {
+        "content": "   "
+      },
+      "memory_rows": [
+        {
+          "id": 1,
+          "content": "",
+          "scope": "channel",
+          "author": "U1"
+        },
+        {
+          "id": 2,
+          "content": "  ",
+          "scope": "channel",
+          "author": "U1"
+        }
+      ],
+      "text": null,
+      "policy_hash": null,
+      "policy_present": false
+    }
+  ]
+}

@@ -153,15 +153,17 @@ def _client():
     # Mirror the real send seam: report footer_attached via meta_out when blocks ride the
     # message (the composed section+actions path), so main.py sets its flag from reality.
     async def _send(channel_id, thread_id, text, blocks=None, meta_out=None,
-                    lease=None, surface=None):
+                    lease=None, surface=None, receipts=None, receipt_kind=None,
+                    on_first_accept=None):
         if meta_out is not None:
             meta_out["footer_attached"] = bool(blocks)
+        if on_first_accept is not None:
+            on_first_accept("posted.1")
         return "posted.1"
     c.send_message = AsyncMock(side_effect=_send)
     c.format_text = MagicMock(side_effect=lambda t: t)
     c.attachable_footer_blocks = MagicMock(return_value=[{"type": "actions"}])
     c.maybe_post_response_footer = AsyncMock()
-    c.channel_pulse = None
     return c
 
 
@@ -234,8 +236,9 @@ async def test_main_suppresses_separate_footer_when_send_failed():
     client = _client()
 
     async def _send_fail(channel_id, thread_id, text, blocks=None, meta_out=None,
-                         lease=None, surface=None):
-        return None  # send failed
+                         lease=None, surface=None, receipts=None, receipt_kind=None,
+                         on_first_accept=None):
+        return None  # send failed — nothing accepted, so no first-accept callback either
     client.send_message = AsyncMock(side_effect=_send_fail)
     resp = Response(type="text", content="hello", metadata={"streamed": False, "model": "m"})
     bot.processor.process_message = AsyncMock(return_value=resp)

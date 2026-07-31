@@ -48,7 +48,7 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from config import config
 from message_processor import participation_telemetry
@@ -229,6 +229,11 @@ class GateEvaluation:
     `sources` is the cohort this evaluation actually judged, oldest first. It is returned (not
     just consumed) because the caller stamps it on the surviving Message so the responder answers
     the whole burst rather than only its newest fragment.
+
+    `source_files` rides alongside it: (ts, attachment payloads) for the cohort members that
+    arrived carrying files. The gate never looks at them — they are here because the members' own
+    dispatches ended at the gate, so this is the last place their live payloads exist, and the turn
+    that survives needs them to authorize a file whose message Slack has not propagated yet.
     """
 
     decision: Optional[WakeDecision] = None
@@ -236,6 +241,7 @@ class GateEvaluation:
     # The model call alone, in ms. NOT the gate's wall time, which is mostly debounce.
     classifier_ms: Optional[int] = None
     sources: Tuple[SourceMessage, ...] = ()
+    source_files: Tuple[Tuple[str, Tuple[Dict[str, Any], ...]], ...] = ()
 
 
 class ParticipationEngine:
@@ -263,6 +269,15 @@ class ParticipationEngine:
         # newest ts of any cohort survives its own debounce unless a newer one takes over as
         # survivor.
         self._cohorts: "OrderedDict[str, OrderedDict[str, SourceMessage]]" = OrderedDict()
+        # The enrolled messages' live FILE payloads, conversation key -> {ts: attachment dicts}.
+        # Kept beside the cohort rather than on the record: a SourceMessage carries names and types
+        # only (see the class), and nothing in this module reads these. They exist for the survivor,
+        # whose turn needs a file id to be authorizable even when Slack's fetch has not caught up to
+        # the message that carried it — and the carrying message's own dispatch ends here, so if the
+        # gate drops the payload nothing downstream can recover it. Lifecycle follows `_cohorts`
+        # exactly: written on enrollment, taken on drain, withdrawn on cancellation. Only messages
+        # that actually carried files get an entry.
+        self._cohort_files: Dict[str, Dict[str, Tuple[Dict[str, Any], ...]]] = {}
         # F52: messages whose in-flight evaluation an EDIT has explicitly cancelled. An edit
         # keeps the SAME ts, so a newer arrival can never supersede the original the ordinary
         # way (note_arrival is monotonic on ts); supersede() marks it here and evaluate() drops
@@ -331,18 +346,26 @@ class ParticipationEngine:
             return True
         return False
 
-    def _enroll_source(self, key: str, source: SourceMessage) -> None:
+    def _enroll_source(self, key: str, source: SourceMessage,
+                       file_payloads: Sequence[Dict[str, Any]] = ()) -> None:
         """Record a source in its conversation's cohort so a later survivor carries it.
 
         No cap and no eviction: see `self._cohorts`. Re-enrolling the same ts (an edit keeps its
         original timestamp) REPLACES the record, so the cohort holds the current text rather than
-        two versions of one message."""
+        two versions of one message — and replaces its file payloads with it, for the same reason."""
         bucket = self._cohorts.get(key)
         if bucket is None:
             bucket = OrderedDict()
             self._cohorts[key] = bucket
         bucket[source.ts] = source
         self._cohorts.move_to_end(key)
+        if file_payloads:
+            self._cohort_files.setdefault(key, {})[source.ts] = tuple(file_payloads)
+        elif key in self._cohort_files:
+            remaining = self._cohort_files[key]
+            remaining.pop(source.ts, None)
+            if not remaining:
+                del self._cohort_files[key]
 
     def _drain_cohort(self, key: str, own_ts: str) -> Tuple[SourceMessage, ...]:
         """Called by the survivor of a debounce window: take every source in this stream up to and
@@ -367,6 +390,26 @@ class ParticipationEngine:
             self._cohorts.pop(key, None)
         taken.sort(key=lambda pair: pair[0])   # oldest first: the order they were said in
         return tuple(source for _, source in taken)
+
+    def _take_cohort_files(self, key: str, sources: Sequence[SourceMessage]
+                           ) -> Tuple[Tuple[str, Tuple[Dict[str, Any], ...]], ...]:
+        """The live file payloads of the sources just drained, and only those.
+
+        Called with what `_drain_cohort` returned, so the two structures come apart in step. It also
+        drops any payload whose ts is no longer enrolled: this map hangs off an unbounded cohort, so
+        it must never be able to keep alive a payload nobody is coming back for.
+        """
+        held = self._cohort_files.get(key)
+        if not held:
+            self._cohort_files.pop(key, None)
+            return ()
+        taken = tuple((source.ts, held.pop(source.ts)) for source in sources if source.ts in held)
+        enrolled: Dict[str, SourceMessage] = self._cohorts.get(key) or OrderedDict()
+        for orphan in [ts for ts in held if ts not in enrolled]:
+            held.pop(orphan, None)
+        if not held:
+            self._cohort_files.pop(key, None)
+        return taken
 
     def discard_source(self, channel_id: str, ts: Optional[str],
                        thread_root: Optional[str] = None,
@@ -399,6 +442,11 @@ class ParticipationEngine:
             bucket.pop(str(ts), None)
             if not bucket:
                 self._cohorts.pop(key, None)
+        held = self._cohort_files.get(key)
+        if held is not None:
+            held.pop(str(ts), None)
+            if not held:
+                self._cohort_files.pop(key, None)
         if self._latest.get(key) != ts:
             return                      # somebody newer is already the survivor; nothing to hand on
         remaining = self._cohorts.get(key)
@@ -415,6 +463,7 @@ class ParticipationEngine:
                        sender_type: Optional[str] = None,
                        channel_steering_text: Optional[str] = None,
                        attachments: Optional[List[str]] = None,
+                       file_payloads: Optional[Sequence[Dict[str, Any]]] = None,
                        client: Any = None,
                        thread_root_ts: Optional[str] = None,
                        edit_marker: Optional[str] = None,
@@ -451,8 +500,10 @@ class ParticipationEngine:
             ts=str(ts), text=text or "", sender_id=sender_id, sender_name=sender_name,
             sender_type=sender_type, thread_root_ts=thread_root_ts,
             attachments=tuple(attachments or ()), edit=edit_context)
-        # Enrolled BEFORE the await, so a survivor that arrives during our debounce finds us.
-        self._enroll_source(key, source)
+        # Enrolled BEFORE the await, so a survivor that arrives during our debounce finds us. The
+        # raw payload rides along unread: this dispatch is the last holder of it, and if we lose our
+        # own debounce the survivor's turn is the only place those files can still be authorized.
+        self._enroll_source(key, source, file_payloads or ())
 
         # Messages a Phase-Q queue drain folded into this turn. They never got a debounce window of
         # their own — they arrived while an earlier turn held the lock — so the gate would
@@ -500,6 +551,7 @@ class ParticipationEngine:
             # Defensive: our own enrollment is always in there. An empty drain would mean the
             # cohort was cleared underneath us, and judging nothing is not a judgment.
             sources = (source,)
+        source_files = self._take_cohort_files(key, sources)
 
         # A cohort of nothing but captionless IMAGES. Someone dropped pictures into the channel and
         # said nothing — there is no question, no addressee and no text to judge, so there is
@@ -522,7 +574,8 @@ class ParticipationEngine:
             participation_telemetry.gate_declined(
                 channel_id, ts, cause="image_only", attempt_id=attempt_id,
                 source_count=len(sources))
-            return GateEvaluation(decline_cause="image_only", sources=sources)
+            return GateEvaluation(decline_cause="image_only", sources=sources,
+                                  source_files=source_files)
 
         # Timed around the model call and NOTHING else. The gate's own wall time is dominated by
         # the debounce sleep, so reading it as classifier latency blames the provider for a delay
@@ -549,10 +602,12 @@ class ParticipationEngine:
                 # failure rate is the half that decides whether the swap was worth it.
                 model=getattr(config, "utility_model", None))
             return GateEvaluation(decline_cause="classifier_error",
-                                  classifier_ms=classifier_ms, sources=sources)
+                                  classifier_ms=classifier_ms, sources=sources,
+                                  source_files=source_files)
 
         return GateEvaluation(decision=WakeDecision(wake=bool(raw)),
-                              classifier_ms=classifier_ms, sources=sources)
+                              classifier_ms=classifier_ms, sources=sources,
+                              source_files=source_files)
 
     @staticmethod
     def _take_edit_context(client: Any, channel_id: str, ts: str,

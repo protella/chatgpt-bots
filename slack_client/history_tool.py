@@ -9,6 +9,8 @@ from slack_sdk.errors import SlackApiError
 
 from config import config
 from slack_client.formatting.blocks import extract_supplementary_text
+from slack_client.normalizer import ORIGIN_HISTORY, normalize_slack_message
+from slack_client.utilities import is_dm_conversation
 
 
 # Safety ceiling on how many conversations_replies pages a single thread fetch will
@@ -749,22 +751,44 @@ class SlackHistoryToolMixin:
         except (TypeError, ValueError):
             return cap
 
-    def _text_with_supplementary(self, msg: Dict[str, Any]) -> str:
+    def _text_with_supplementary(self, msg: Dict[str, Any],
+                                 channel_id: Optional[str] = None) -> str:
         """F48: a fetched message's text PLUS whatever Slack delivered outside it —
         table blocks, unfurls, quoted messages, webhook attachment fields. Without this,
         a message the model fetches by tool reads as empty when its content was never in
         `text`. Mentions are left as Slack sent them (this surface never cleaned them).
-        Skipped for our own messages — our cards live in these fields (F47)."""
-        text = msg.get("text", "") or ""
-        try:
-            if self.classify_sender(msg) == "self":
+        Skipped for our own messages — our cards live in these fields (F47).
+
+        CHANNEL SURFACES ONLY use the canonical normalizer, so a message read by this tool and
+        the same message rendered into the channel stream cannot disagree about what it said.
+
+        A DM (or a conversation we cannot identify) keeps the pre-P2 path VERBATIM: raw text plus
+        `extract_supplementary_text`, no control-stripping, and no subtype or timestamp that can
+        make the content vanish. DM bytes are frozen by contract, and the normalizer route is not
+        byte-identical here — it strips control characters and declines whole subtypes, which
+        turns a readable message into an empty one.
+        """
+        if not channel_id or is_dm_conversation(channel_id):
+            text = msg.get("text", "") or ""
+            try:
+                if self.classify_sender(msg) == "self":
+                    return text
+            except Exception:  # noqa: BLE001
+                pass  # identity not wired -> fall through; extraction is still fail-open
+            supplementary = extract_supplementary_text(msg, primary_text=text)
+            if not supplementary:
                 return text
-        except Exception:
-            pass  # identity not wired -> fall through; extraction is still fail-open
-        supplementary = extract_supplementary_text(msg, primary_text=text)
-        if not supplementary:
-            return text
-        return f"{text}\n\n{supplementary}" if text.strip() else supplementary
+            return f"{text}\n\n{supplementary}" if text.strip() else supplementary
+        try:
+            normalized = normalize_slack_message(self, msg, channel_id=channel_id,
+                                                 origin=ORIGIN_HISTORY)
+        except ValueError:
+            normalized = None
+        if normalized is not None:
+            return normalized.text
+        # A subtype the normalizer declines to represent (a join notice, say) stays readable
+        # rather than blank.
+        return msg.get("text", "") or ""
 
     async def fetch_history_tool(
         self, channel_id: Optional[str], limit: Optional[int] = None,
@@ -860,7 +884,7 @@ class SlackHistoryToolMixin:
                 entry = {
                     "user": author,
                     "ts": m.get("ts"),
-                    "text": self._text_with_supplementary(m),
+                    "text": self._text_with_supplementary(m, channel_id),
                 }
                 # A thread hangs off this message: without it, a parent with forty replies
                 # reads exactly like a dead one-liner and the model can't tell there is
@@ -972,7 +996,7 @@ class SlackHistoryToolMixin:
                 pins.append({
                     "user": msg.get("user") or msg.get("username") or ("bot" if msg.get("bot_id") else "unknown"),
                     "ts": msg.get("ts"),
-                    "text": self._text_with_supplementary(msg),
+                    "text": self._text_with_supplementary(msg, channel_id),
                     "permalink": msg.get("permalink"),
                 })
             return {"ok": True, "channel": channel_id, "count": len(pins), "pins": pins}

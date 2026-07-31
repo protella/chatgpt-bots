@@ -37,6 +37,11 @@ _RECON_FOUND = "found"
 _RECON_NOT_FOUND = "not_found"
 _RECON_UNAVAILABLE = "unavailable"
 
+# How long shutdown lets an in-flight intro finish before cancelling it. The workflow makes a
+# model call, so it needs real room; an intro that overruns is cancelled and its lease stays
+# retryable for the next boot.
+INTRO_DRAIN_TIMEOUT_SECONDS = 20.0
+
 # The deterministic top-level HELLO (no model call). It is the thread ROOT + the reconcile anchor
 # (it carries the metadata marker), and it sets the expectation that the substantive rundown lands
 # in the thread beneath it — matching how Claude's Slack agent introduces itself.
@@ -55,7 +60,7 @@ _TUNE_LINE = (
 
 class SlackChannelJoinMixin:
     """member_joined_channel → one-time public intro. Mixed into SlackBot (has self.app,
-    self.db, self.bot_user_id, self.processor, self.channel_pulse, and the log_* helpers)."""
+    self.db, self.bot_user_id, self.processor, and the log_* helpers)."""
 
     # -- event entry point (synchronous; detaches immediately) --------------------------
 
@@ -63,9 +68,7 @@ class SlackChannelJoinMixin:
         """Cheap guards + DETACH. Fires the intro ONLY when the BOT itself joined a real channel;
         everything past here runs in a background task so the event handler never blocks and the
         best-effort workflow can never raise into Bolt."""
-        if not config.enable_channel_join_intro:
-            return
-        # Only OUR OWN join triggers the intro — ignore every other member's join.
+        # Only OUR OWN join matters — ignore every other member's join.
         bot_user_id = getattr(self, "bot_user_id", None)
         if not bot_user_id or event.get("user") != bot_user_id:
             return
@@ -74,11 +77,29 @@ class SlackChannelJoinMixin:
         # the "G"/"C" id space with real channels) are told apart asynchronously via conversations.info.
         if not channel_id or str(channel_id).startswith("D"):
             return
+        # Coverage reactivation is not an intro concern, so it runs BEFORE the intro switch: a
+        # re-invite is the one signal that a channel written off as unreachable is back.
+        await self._reactivate_channel_coverage(channel_id)
+        if not config.enable_channel_join_intro:
+            return
         self._spawn_channel_intro(channel_id, client, event.get("event_ts"))
 
+    async def _reactivate_channel_coverage(self, channel_id: str) -> None:
+        """Clear the `unavailable` coverage verdict so the sweep can claim the channel again.
+        Never raises — a failure here must not cost the intro."""
+        try:
+            from slack_client.event_handlers.activity_index import reset_channel_coverage
+            if await reset_channel_coverage(self, channel_id):
+                self.log_info(f"Coverage reactivated for {channel_id} after rejoin")
+        except Exception as e:  # noqa: BLE001
+            self.log_debug(f"Coverage reactivation failed for {channel_id}: {e}")
+
     def _spawn_channel_intro(self, channel_id: str, client: Any, event_id: Optional[str]) -> None:
-        """Schedule the detached intro workflow, keeping a strong ref so it isn't GC'd mid-flight
-        (mirrors ChannelSummaryService.maybe_refresh's fire-and-forget pattern)."""
+        """Schedule the detached intro workflow, keeping a strong ref so it isn't GC'd
+        mid-flight."""
+        if not getattr(self, "_intro_admitting", True):
+            self.log_info(f"Shutting down — no channel intro started for {channel_id}")
+            return
         tasks = getattr(self, "_channel_intro_tasks", None)
         if tasks is None:
             tasks = self._channel_intro_tasks = set()
@@ -90,6 +111,32 @@ class SlackChannelJoinMixin:
         except RuntimeError:
             # No running loop (shouldn't happen on the async event path) — best-effort, drop it.
             self.log_debug("No running loop to schedule channel join intro")
+
+    async def drain_channel_intros(self, timeout: float = INTRO_DRAIN_TIMEOUT_SECONDS) -> None:
+        """Spec §5: finish the detached intros before the receipt queue closes.
+
+        The intro is not chrome. It posts the bot's own hello and findings with a raw
+        chat.postMessage and registers the receipt itself — and it runs on the Slack ingress
+        side, which shuts down long after receipts do. Left alone, an intro landing in that
+        window has its registration refused, and real bot prose is permanently outside the
+        rebuilt stream.
+
+        The door closes first: a `member_joined_channel` arriving during shutdown must not start
+        a workflow there is nothing left to account for.
+        """
+        self._intro_admitting = False
+        tasks = [t for t in (getattr(self, "_channel_intro_tasks", None) or ()) if not t.done()]
+        if not tasks:
+            return
+        self.log_info(f"Draining {len(tasks)} channel intro(s)...")
+        _done, pending = await asyncio.wait(tasks, timeout=max(0.0, timeout))
+        if pending:
+            self.log_warning(
+                f"Cancelling {len(pending)} channel intro(s) that did not finish in "
+                f"{timeout:.0f}s")
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
     # -- detached workflow --------------------------------------------------------------
 
@@ -176,18 +223,25 @@ class SlackChannelJoinMixin:
             # chat_postMessage returns a slack_sdk SlackResponse (Mapping-like, NOT a dict), so an
             # isinstance(resp, dict) guard would always miss and store intro_ts=None. Use .get().
             hello_ts = hello_resp.get("ts") if hello_resp is not None else None
+            # Raw chat.postMessage bypasses transport, so the intro registers itself: the hello
+            # and its findings ARE conversation (they say what this bot is and offer to help),
+            # and nobody's turn made them — hence the sys owner (spec §5).
+            await self._register_intro_receipt(channel_id, hello_ts)
 
             # 8. Post the FINDINGS as a threaded reply UNDER the hello — best-effort. The hello is
             #    the durable anchor + reconcile marker, so a findings failure must NOT repost it:
             #    log and move on (the hello stands, and reconcile keys off the hello's marker).
             if hello_ts:
                 try:
-                    await self.app.client.chat_postMessage(
+                    findings_resp = await self.app.client.chat_postMessage(
                         channel=channel_id,
                         thread_ts=hello_ts,
                         text=findings_text,
                         blocks=findings_blocks,
                     )
+                    await self._register_intro_receipt(
+                        channel_id, findings_resp.get("ts") if findings_resp else None,
+                        thread_root_ts=hello_ts)
                 except Exception as e:  # noqa: BLE001
                     self.log_warning(
                         f"Channel intro findings reply failed for {channel_id} (hello stands): {e}")
@@ -211,6 +265,20 @@ class SlackChannelJoinMixin:
                     pass
 
     # -- composition --------------------------------------------------------------------
+
+    async def _register_intro_receipt(self, channel_id: str, message_ts: Optional[str],
+                                      thread_root_ts: Optional[str] = None) -> None:
+        """Spec §5 for a raw post: lifecycle words, sys owner, finalized on arrival."""
+        if not message_ts:
+            return
+        from message_processor.outbound_receipts import record_transport_post
+        try:
+            await record_transport_post(
+                team_id=getattr(self, "self_team_id", None), channel_id=channel_id,
+                message_ts=message_ts, receipts=None, receipt_kind="finalized",
+                thread_root_ts=thread_root_ts, site="channel_intro")
+        except Exception as e:  # noqa: BLE001
+            self.log_debug(f"Channel intro receipt failed: {e}")
 
     async def _compose_channel_intro(self, channel_id: str, summary_text: Optional[str],
                                      level: str) -> Tuple[str, List[Dict[str, Any]]]:
@@ -300,9 +368,8 @@ class SlackChannelJoinMixin:
         svc = getattr(proc, "channel_summary_service", None) if proc else None
         if svc is None:
             return None
-        pulse = getattr(self, "channel_pulse", None)
         try:
-            return await svc.build_for_intro(channel_id, client=client, pulse=pulse)
+            return await svc.build_for_intro(channel_id, client=client)
         except Exception as e:  # noqa: BLE001
             self.log_debug(f"Channel intro summary build failed for {channel_id}: {e}")
             return None

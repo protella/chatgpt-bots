@@ -1,0 +1,1734 @@
+{
+  "_provenance": {
+    "captured_from": "openai_client/api/responses.py, pre-_build_request_params",
+    "git_head": "6b60c2ec4a12025717ff3ea4b5b81a707cb85228",
+    "note": "FROZEN. A mismatch means a caller's request shape moved."
+  },
+  "scenarios": {
+    "plain__defaults": {
+      "input": [
+        {
+          "content": "what's the total?",
+          "role": "user"
+        },
+        {
+          "content": "56,088",
+          "role": "assistant"
+        }
+      ],
+      "max_output_tokens": 32768,
+      "model": "gpt-5.6-sol",
+      "reasoning": {
+        "effort": "medium"
+      },
+      "store": false,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "medium"
+      }
+    },
+    "plain__gpt-5.5__medium": {
+      "input": [
+        {
+          "content": "You are a helpful assistant.\nBe brief.",
+          "role": "developer"
+        },
+        {
+          "content": "what's the total?",
+          "role": "user"
+        },
+        {
+          "content": "56,088",
+          "role": "assistant"
+        }
+      ],
+      "max_output_tokens": 1234,
+      "model": "gpt-5.5",
+      "prompt_cache_key": "T123:C456",
+      "prompt_cache_retention": "24h",
+      "reasoning": {
+        "effort": "medium"
+      },
+      "store": false,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "low"
+      }
+    },
+    "plain__gpt-5.5__none": {
+      "input": [
+        {
+          "content": "You are a helpful assistant.\nBe brief.",
+          "role": "developer"
+        },
+        {
+          "content": "what's the total?",
+          "role": "user"
+        },
+        {
+          "content": "56,088",
+          "role": "assistant"
+        }
+      ],
+      "max_output_tokens": 1234,
+      "model": "gpt-5.5",
+      "prompt_cache_key": "T123:C456",
+      "prompt_cache_retention": "24h",
+      "reasoning": {
+        "effort": "none"
+      },
+      "store": false,
+      "temperature": 0.4,
+      "text": {
+        "verbosity": "low"
+      },
+      "top_p": 0.85
+    },
+    "plain__gpt-5.6-sol__medium": {
+      "input": [
+        {
+          "content": "You are a helpful assistant.\nBe brief.",
+          "role": "developer"
+        },
+        {
+          "content": "what's the total?",
+          "role": "user"
+        },
+        {
+          "content": "56,088",
+          "role": "assistant"
+        }
+      ],
+      "max_output_tokens": 1234,
+      "model": "gpt-5.6-sol",
+      "prompt_cache_key": "T123:C456",
+      "reasoning": {
+        "effort": "medium"
+      },
+      "store": false,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "low"
+      }
+    },
+    "plain__gpt-5.6-sol__none": {
+      "input": [
+        {
+          "content": "You are a helpful assistant.\nBe brief.",
+          "role": "developer"
+        },
+        {
+          "content": "what's the total?",
+          "role": "user"
+        },
+        {
+          "content": "56,088",
+          "role": "assistant"
+        }
+      ],
+      "max_output_tokens": 1234,
+      "model": "gpt-5.6-sol",
+      "prompt_cache_key": "T123:C456",
+      "reasoning": {
+        "effort": "none"
+      },
+      "store": false,
+      "temperature": 0.4,
+      "text": {
+        "verbosity": "low"
+      },
+      "top_p": 0.85
+    },
+    "plain__no_system_prompt": {
+      "input": [
+        {
+          "content": "what's the total?",
+          "role": "user"
+        },
+        {
+          "content": "56,088",
+          "role": "assistant"
+        }
+      ],
+      "max_output_tokens": 32768,
+      "model": "gpt-5.6-sol",
+      "reasoning": {
+        "effort": "medium"
+      },
+      "store": false,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "medium"
+      }
+    },
+    "plain_stream__gpt-5.5__medium": {
+      "input": [
+        {
+          "content": "You are a helpful assistant.\nBe brief.",
+          "role": "developer"
+        },
+        {
+          "content": "what's the total?",
+          "role": "user"
+        },
+        {
+          "content": "56,088",
+          "role": "assistant"
+        }
+      ],
+      "max_output_tokens": 1234,
+      "model": "gpt-5.5",
+      "prompt_cache_key": "T123:C456",
+      "prompt_cache_retention": "24h",
+      "reasoning": {
+        "effort": "medium"
+      },
+      "store": false,
+      "stream": true,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "low"
+      }
+    },
+    "plain_stream__gpt-5.5__none": {
+      "input": [
+        {
+          "content": "You are a helpful assistant.\nBe brief.",
+          "role": "developer"
+        },
+        {
+          "content": "what's the total?",
+          "role": "user"
+        },
+        {
+          "content": "56,088",
+          "role": "assistant"
+        }
+      ],
+      "max_output_tokens": 1234,
+      "model": "gpt-5.5",
+      "prompt_cache_key": "T123:C456",
+      "prompt_cache_retention": "24h",
+      "reasoning": {
+        "effort": "none"
+      },
+      "store": false,
+      "stream": true,
+      "temperature": 0.4,
+      "text": {
+        "verbosity": "low"
+      },
+      "top_p": 0.85
+    },
+    "plain_stream__gpt-5.6-sol__medium": {
+      "input": [
+        {
+          "content": "You are a helpful assistant.\nBe brief.",
+          "role": "developer"
+        },
+        {
+          "content": "what's the total?",
+          "role": "user"
+        },
+        {
+          "content": "56,088",
+          "role": "assistant"
+        }
+      ],
+      "max_output_tokens": 1234,
+      "model": "gpt-5.6-sol",
+      "prompt_cache_key": "T123:C456",
+      "reasoning": {
+        "effort": "medium"
+      },
+      "store": false,
+      "stream": true,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "low"
+      }
+    },
+    "plain_stream__gpt-5.6-sol__none": {
+      "input": [
+        {
+          "content": "You are a helpful assistant.\nBe brief.",
+          "role": "developer"
+        },
+        {
+          "content": "what's the total?",
+          "role": "user"
+        },
+        {
+          "content": "56,088",
+          "role": "assistant"
+        }
+      ],
+      "max_output_tokens": 1234,
+      "model": "gpt-5.6-sol",
+      "prompt_cache_key": "T123:C456",
+      "reasoning": {
+        "effort": "none"
+      },
+      "store": false,
+      "stream": true,
+      "temperature": 0.4,
+      "text": {
+        "verbosity": "low"
+      },
+      "top_p": 0.85
+    },
+    "plain_timeout__gpt-5.5__medium": {
+      "input": [
+        {
+          "content": "You are a helpful assistant.\nBe brief.",
+          "role": "developer"
+        },
+        {
+          "content": "what's the total?",
+          "role": "user"
+        },
+        {
+          "content": "56,088",
+          "role": "assistant"
+        }
+      ],
+      "max_output_tokens": 1234,
+      "model": "gpt-5.5",
+      "reasoning": {
+        "effort": "medium"
+      },
+      "store": false,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "low"
+      }
+    },
+    "plain_timeout__gpt-5.5__none": {
+      "input": [
+        {
+          "content": "You are a helpful assistant.\nBe brief.",
+          "role": "developer"
+        },
+        {
+          "content": "what's the total?",
+          "role": "user"
+        },
+        {
+          "content": "56,088",
+          "role": "assistant"
+        }
+      ],
+      "max_output_tokens": 1234,
+      "model": "gpt-5.5",
+      "reasoning": {
+        "effort": "none"
+      },
+      "store": false,
+      "temperature": 0.4,
+      "text": {
+        "verbosity": "low"
+      },
+      "top_p": 0.85
+    },
+    "plain_timeout__gpt-5.6-sol__medium": {
+      "input": [
+        {
+          "content": "You are a helpful assistant.\nBe brief.",
+          "role": "developer"
+        },
+        {
+          "content": "what's the total?",
+          "role": "user"
+        },
+        {
+          "content": "56,088",
+          "role": "assistant"
+        }
+      ],
+      "max_output_tokens": 1234,
+      "model": "gpt-5.6-sol",
+      "reasoning": {
+        "effort": "medium"
+      },
+      "store": false,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "low"
+      }
+    },
+    "plain_timeout__gpt-5.6-sol__none": {
+      "input": [
+        {
+          "content": "You are a helpful assistant.\nBe brief.",
+          "role": "developer"
+        },
+        {
+          "content": "what's the total?",
+          "role": "user"
+        },
+        {
+          "content": "56,088",
+          "role": "assistant"
+        }
+      ],
+      "max_output_tokens": 1234,
+      "model": "gpt-5.6-sol",
+      "reasoning": {
+        "effort": "none"
+      },
+      "store": false,
+      "temperature": 0.4,
+      "text": {
+        "verbosity": "low"
+      },
+      "top_p": 0.85
+    },
+    "tools__defaults": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "max_output_tokens": 32768,
+      "model": "gpt-5.6-sol",
+      "reasoning": {
+        "effort": "medium"
+      },
+      "store": false,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "medium"
+      },
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "tools__gpt-5.5__loop": {
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "instructions": "You are a helpful assistant.\nBe brief.",
+      "max_output_tokens": 32768,
+      "model": "gpt-5.5",
+      "prompt_cache_key": "T123:C456",
+      "prompt_cache_retention": "24h",
+      "reasoning": {
+        "effort": "high"
+      },
+      "store": false,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "medium"
+      },
+      "tool_choice": "none",
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "tools__gpt-5.5__medium": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "instructions": "You are a helpful assistant.\nBe brief.",
+      "max_output_tokens": 1234,
+      "model": "gpt-5.5",
+      "prompt_cache_key": "T123:C456",
+      "prompt_cache_retention": "24h",
+      "reasoning": {
+        "effort": "medium"
+      },
+      "store": false,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "low"
+      },
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "tools__gpt-5.5__none": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "instructions": "You are a helpful assistant.\nBe brief.",
+      "max_output_tokens": 1234,
+      "model": "gpt-5.5",
+      "prompt_cache_key": "T123:C456",
+      "prompt_cache_retention": "24h",
+      "reasoning": {
+        "effort": "none"
+      },
+      "store": false,
+      "temperature": 0.4,
+      "text": {
+        "verbosity": "low"
+      },
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ],
+      "top_p": 0.85
+    },
+    "tools__gpt-5.6-sol__loop": {
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "instructions": "You are a helpful assistant.\nBe brief.",
+      "max_output_tokens": 32768,
+      "model": "gpt-5.6-sol",
+      "prompt_cache_key": "T123:C456",
+      "reasoning": {
+        "effort": "high"
+      },
+      "store": false,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "medium"
+      },
+      "tool_choice": "none",
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "tools__gpt-5.6-sol__medium": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "instructions": "You are a helpful assistant.\nBe brief.",
+      "max_output_tokens": 1234,
+      "model": "gpt-5.6-sol",
+      "prompt_cache_key": "T123:C456",
+      "reasoning": {
+        "effort": "medium"
+      },
+      "store": false,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "low"
+      },
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "tools__gpt-5.6-sol__none": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "instructions": "You are a helpful assistant.\nBe brief.",
+      "max_output_tokens": 1234,
+      "model": "gpt-5.6-sol",
+      "prompt_cache_key": "T123:C456",
+      "reasoning": {
+        "effort": "none"
+      },
+      "store": false,
+      "temperature": 0.4,
+      "text": {
+        "verbosity": "low"
+      },
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ],
+      "top_p": 0.85
+    },
+    "tools__no_system_prompt": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "max_output_tokens": 32768,
+      "model": "gpt-5.6-sol",
+      "reasoning": {
+        "effort": "medium"
+      },
+      "store": false,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "medium"
+      },
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "tools_stream__gpt-5.5__loop": {
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "instructions": "You are a helpful assistant.\nBe brief.",
+      "max_output_tokens": 32768,
+      "model": "gpt-5.5",
+      "parallel_tool_calls": true,
+      "prompt_cache_key": "T123:C456",
+      "prompt_cache_retention": "24h",
+      "reasoning": {
+        "effort": "high"
+      },
+      "store": false,
+      "stream": true,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "medium"
+      },
+      "tool_choice": "none",
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "tools_stream__gpt-5.5__medium": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "instructions": "You are a helpful assistant.\nBe brief.",
+      "max_output_tokens": 1234,
+      "model": "gpt-5.5",
+      "parallel_tool_calls": true,
+      "prompt_cache_key": "T123:C456",
+      "prompt_cache_retention": "24h",
+      "reasoning": {
+        "effort": "medium"
+      },
+      "store": false,
+      "stream": true,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "low"
+      },
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "tools_stream__gpt-5.5__none": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "instructions": "You are a helpful assistant.\nBe brief.",
+      "max_output_tokens": 1234,
+      "model": "gpt-5.5",
+      "parallel_tool_calls": true,
+      "prompt_cache_key": "T123:C456",
+      "prompt_cache_retention": "24h",
+      "reasoning": {
+        "effort": "none"
+      },
+      "store": false,
+      "stream": true,
+      "temperature": 0.4,
+      "text": {
+        "verbosity": "low"
+      },
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ],
+      "top_p": 0.85
+    },
+    "tools_stream__gpt-5.6-sol__loop": {
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "instructions": "You are a helpful assistant.\nBe brief.",
+      "max_output_tokens": 32768,
+      "model": "gpt-5.6-sol",
+      "parallel_tool_calls": true,
+      "prompt_cache_key": "T123:C456",
+      "reasoning": {
+        "effort": "high"
+      },
+      "store": false,
+      "stream": true,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "medium"
+      },
+      "tool_choice": "none",
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "tools_stream__gpt-5.6-sol__medium": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "instructions": "You are a helpful assistant.\nBe brief.",
+      "max_output_tokens": 1234,
+      "model": "gpt-5.6-sol",
+      "parallel_tool_calls": true,
+      "prompt_cache_key": "T123:C456",
+      "reasoning": {
+        "effort": "medium"
+      },
+      "store": false,
+      "stream": true,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "low"
+      },
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "tools_stream__gpt-5.6-sol__none": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "instructions": "You are a helpful assistant.\nBe brief.",
+      "max_output_tokens": 1234,
+      "model": "gpt-5.6-sol",
+      "parallel_tool_calls": true,
+      "prompt_cache_key": "T123:C456",
+      "reasoning": {
+        "effort": "none"
+      },
+      "store": false,
+      "stream": true,
+      "temperature": 0.4,
+      "text": {
+        "verbosity": "low"
+      },
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ],
+      "top_p": 0.85
+    },
+    "tools_timeout__gpt-5.5__loop": {
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "instructions": "You are a helpful assistant.\nBe brief.",
+      "max_output_tokens": 32768,
+      "model": "gpt-5.5",
+      "prompt_cache_key": "T123:C456",
+      "prompt_cache_retention": "24h",
+      "reasoning": {
+        "effort": "high"
+      },
+      "store": false,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "medium"
+      },
+      "tool_choice": "none",
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "tools_timeout__gpt-5.5__medium": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "instructions": "You are a helpful assistant.\nBe brief.",
+      "max_output_tokens": 1234,
+      "model": "gpt-5.5",
+      "prompt_cache_key": "T123:C456",
+      "prompt_cache_retention": "24h",
+      "reasoning": {
+        "effort": "medium"
+      },
+      "store": false,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "low"
+      },
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "tools_timeout__gpt-5.5__none": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "instructions": "You are a helpful assistant.\nBe brief.",
+      "max_output_tokens": 1234,
+      "model": "gpt-5.5",
+      "prompt_cache_key": "T123:C456",
+      "prompt_cache_retention": "24h",
+      "reasoning": {
+        "effort": "none"
+      },
+      "store": false,
+      "temperature": 0.4,
+      "text": {
+        "verbosity": "low"
+      },
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ],
+      "top_p": 0.85
+    },
+    "tools_timeout__gpt-5.6-sol__loop": {
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "instructions": "You are a helpful assistant.\nBe brief.",
+      "max_output_tokens": 32768,
+      "model": "gpt-5.6-sol",
+      "prompt_cache_key": "T123:C456",
+      "reasoning": {
+        "effort": "high"
+      },
+      "store": false,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "medium"
+      },
+      "tool_choice": "none",
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "tools_timeout__gpt-5.6-sol__medium": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "instructions": "You are a helpful assistant.\nBe brief.",
+      "max_output_tokens": 1234,
+      "model": "gpt-5.6-sol",
+      "prompt_cache_key": "T123:C456",
+      "reasoning": {
+        "effort": "medium"
+      },
+      "store": false,
+      "temperature": 1.0,
+      "text": {
+        "verbosity": "low"
+      },
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "tools_timeout__gpt-5.6-sol__none": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "look at this",
+              "type": "input_text"
+            },
+            {
+              "detail": "high",
+              "image_url": "data:image/png;base64,AAAA",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "encrypted_content": "enc",
+          "id": "rs_1",
+          "summary": [],
+          "type": "reasoning"
+        },
+        {
+          "arguments": "{}",
+          "call_id": "call_1",
+          "name": "mount_file",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "mounted",
+          "type": "function_call_output"
+        },
+        {
+          "content": "Mounting that now.",
+          "role": "assistant"
+        }
+      ],
+      "instructions": "You are a helpful assistant.\nBe brief.",
+      "max_output_tokens": 1234,
+      "model": "gpt-5.6-sol",
+      "prompt_cache_key": "T123:C456",
+      "reasoning": {
+        "effort": "none"
+      },
+      "store": false,
+      "temperature": 0.4,
+      "text": {
+        "verbosity": "low"
+      },
+      "tools": [
+        {
+          "type": "web_search"
+        },
+        {
+          "name": "mount_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ],
+      "top_p": 0.85
+    }
+  }
+}

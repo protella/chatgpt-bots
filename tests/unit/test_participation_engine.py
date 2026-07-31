@@ -117,11 +117,17 @@ class TestWakeDecisionShape:
     def test_the_evaluation_reports_which_kind_of_nothing(self):
         """`evaluate()` returning verdict-or-None left the caller unable to tell a cohort collapse
         from an edit cancellation from a provider outage — it could only find out by reading the
-        engine's log lines, and the caller owns the turn's single terminal event."""
+        engine's log lines, and the caller owns the turn's single terminal event.
+
+        `source_files` is pinned here too, and it is not a reopening of the rich verdict: it carries
+        no judgment and nothing branches on it. It is the cohort members' live file payloads, which
+        exist nowhere else once their own dispatches end at the gate — the survivor's turn needs
+        them to authorize a file id Slack has not propagated yet [r6-3]."""
         assert set(GateEvaluation.__dataclass_fields__) == {
-            "decision", "decline_cause", "classifier_ms", "sources"}
+            "decision", "decline_cause", "classifier_ms", "sources", "source_files"}
         empty = GateEvaluation()
         assert empty.decision is None and empty.decline_cause is None and empty.sources == ()
+        assert empty.source_files == ()
 
     def test_a_source_knows_its_own_topology(self):
         # A thread ROOT is not a thread reply: its root ts is its own ts. This is what decides
@@ -400,6 +406,21 @@ class TestCohortDelivery:
         assert _texts(carried) == ["ancient", "recent", "survivor"]
         assert key not in eng._cohorts          # bucket removed once drained
 
+    def test_a_fileless_replacement_leaves_no_empty_payload_bucket(self):
+        """[r7-4] Re-enrolling the same ts without files (an edit that removed the attachment)
+        must remove the whole bucket when its last payload goes — a leftover `{key: {}}` would
+        outlive the drained cohort forever, because the empty mapping short-circuits the taker."""
+        eng = ParticipationEngine(MagicMock())
+        key = "C1|top|U1"
+        payload = {"type": "file", "id": "F9", "name": "data.csv"}
+        eng._enroll_source(key, SourceMessage(ts="1.0", text="with file"),
+                           file_payloads=(payload,))
+        eng._enroll_source(key, SourceMessage(ts="1.0", text="file removed"))
+        assert key not in eng._cohort_files
+        carried = eng._drain_cohort(key, "1.0")
+        assert eng._take_cohort_files(key, carried) == ()
+        assert eng._cohorts == {} and eng._cohort_files == {}
+
     def test_a_newer_enrollment_is_left_for_its_own_survivor(self):
         # Strictly-newer entries belong to a later survivor: taking one would judge a message whose
         # own debounce has not finished.
@@ -640,7 +661,6 @@ class TestPlacement:
         app.processor.process_message = AsyncMock(return_value=response)
         app.processor.thread_manager = MagicMock(spec=[])  # no upload latch attrs
         client = MagicMock()
-        client.channel_pulse = None
         client.send_thinking_indicator = AsyncMock(return_value="think.1")
         client.delete_message = AsyncMock()
         client.send_message = AsyncMock()
@@ -679,7 +699,9 @@ class TestPlacement:
         msg = Message(text="q", user_id="U1", channel_id="C1", thread_id="10.0",
                       metadata={"ts": "10.0"})
         await app.handle_message(msg, client)
-        client.send_thinking_indicator.assert_awaited_once_with("C1", "10.0")
+        # The turn's receipt ledger rides the indicator (spec §5); assert the destination.
+        client.send_thinking_indicator.assert_awaited_once()
+        assert client.send_thinking_indicator.await_args.args == ("C1", "10.0")
         assert client.send_message.await_args.args[1] == "10.0"
         client.maybe_post_response_footer.assert_awaited_once()
 

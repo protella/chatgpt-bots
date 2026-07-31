@@ -22,7 +22,6 @@ from config import config
 from message_processor.turn_runtime import TurnRuntime
 from message_processor.handlers.text import _claims_work, _reaction_committed
 from slack_client.messaging import SlackMessagingMixin
-from slack_client.channel_pulse import ChannelPulse
 
 
 def _msg(channel="C1", ts="100.0"):
@@ -35,7 +34,7 @@ class _Host(SlackMessagingMixin):
     """A real messaging mixin over a fake Slack client, so the guard/lease code is exercised
     for real rather than mocked away."""
 
-    def __init__(self, pulse=None, add_error=None, remove_error=None):
+    def __init__(self, add_error=None, remove_error=None):
         self.added, self.removed = [], []
 
         async def reactions_add(channel, name, timestamp):
@@ -50,7 +49,6 @@ class _Host(SlackMessagingMixin):
 
         self.app = SimpleNamespace(client=SimpleNamespace(
             reactions_add=reactions_add, reactions_remove=reactions_remove))
-        self.channel_pulse = pulse
 
     def log_debug(self, *a, **k):
         pass
@@ -111,24 +109,15 @@ async def test_duplicate_call_in_the_same_turn_yields_no_second_lease(monkeypatc
 # --------------------------------------------------------------- removal
 
 @pytest.mark.asyncio
-async def test_removing_an_owned_reaction_cleans_slack_guard_and_pulse(monkeypatch):
+async def test_removing_an_owned_reaction_cleans_the_slack_guard(monkeypatch):
     monkeypatch.setattr(config, "enable_reactions", True)
-    pulse = ChannelPulse(size=10)
-    pulse.record("C1", ts="100.0", thread_ts=None, user_id="U1",
-                 display_name="Peter", sender_type="human", text="build me a deck", is_bot=False)
-    host = _Host(pulse=pulse)
+    host = _Host()
 
     _result, lease = await host._reserve_and_react_owned("C1", "100.0", "eyes")
-    # The synthetic "[reacted :eyes: ...]" history entry is in the ring...
-    assert any("reacted :eyes:" in (e.get("text") or "")
-               for e in pulse._buffers["C1"])
+    assert host.added == [("C1", "eyes", "100.0")]
 
     assert await host.remove_owned_reaction(lease) is True
     assert host.removed == [("C1", "eyes", "100.0")]
-    # ...and gone again. Leave it and the classifier reads a phantom reaction on the next
-    # message and reasons from a thing that is no longer on screen.
-    assert not any("reacted :eyes:" in (e.get("text") or "")
-                   for e in pulse._buffers["C1"])
     # The F6 slot is freed too, so a later deliberate re-add can land.
     assert host._reaction_guard.get(("C1", "100.0")) in (None, {})
 
@@ -412,7 +401,7 @@ async def test_even_a_killed_removal_task_settles_the_slot(monkeypatch):
 
     # Exactly what remove_owned_reaction sets up, then the task gets killed under it.
     inner = asyncio.ensure_future(host._run_reaction_removal(
-        "C1", "100.0", "eyes", lease["token"], lease))
+        "C1", "100.0", "eyes", lease["token"]))
     host._reaction_guard[("C1", "100.0")]["eyes"] = {
         "token": lease["token"], host._REMOVING: inner}
     await asyncio.sleep(0)

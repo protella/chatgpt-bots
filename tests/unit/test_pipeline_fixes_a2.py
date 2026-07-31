@@ -124,12 +124,6 @@ class _TimeoutHarness:
     def log_warning(self, *a, **k): pass
     def log_error(self, *a, **k): pass
 
-    # process_message folds the gate's coalesced cohort into the turn's input before anything reads
-    # the thread. This harness stubs its collaborators one by one, so the new call needs a stub too;
-    # a message with no cohort merges nothing.
-    def _merge_gate_cohort(self, message, thread_state):
-        return 0
-
     # collaborators
     async def _get_or_rebuild_thread_state(self, message, client, thinking_id):
         return self._thread_state
@@ -146,7 +140,8 @@ class _TimeoutHarness:
     async def _build_channel_info(self, client, channel_id):
         return None
 
-    async def _process_attachments(self, message, client, thinking_id, code_interpreter_enabled=None):
+    async def _process_attachments(self, message, client, thinking_id, code_interpreter_enabled=None,
+                                   defer_document_summaries=False):
         # one image, no documents, no unsupported files
         return ([{"type": "input_image", "image_url": "data:image/png;base64,AAAA",
                   "source": "attachment", "filename": "shot.png", "url": "u", "file_id": "f"}], [], [])
@@ -187,8 +182,11 @@ def manager():
 def _img_msg():
     # attachments=[] so the async image-catalog schedule is skipped (keeps the test coroutine-free);
     # _process_attachments still yields an image so user_content is genuinely multipart.
-    return Message(text="hi", user_id="U1", channel_id="C1", thread_id="T1",
-                   attachments=[], metadata={"ts": "T1", "username": "Alice"})
+    # A DM: the multipart user_content and the ThreadState append this asserts on are the DM/legacy
+    # request path. A channel turn assembles its request from the pinned stream instead, and its
+    # carried images are covered in test_channel_request_layout.
+    return Message(text="hi", user_id="U1", channel_id="D1", thread_id="1000.0",
+                   attachments=[], metadata={"ts": "1000.0", "username": "Alice"})
 
 
 class TestTimeoutRetryPreservesMultipart:
@@ -291,6 +289,8 @@ class _MergeHarness:
 
     process_message = MessageProcessor.process_message
     _dispatch_pending_batch = MessageProcessor._dispatch_pending_batch
+    # The real sender, so "the notice genuinely reaches the user" is still what these assert.
+    _post_failed_files_notice = MessageProcessor._post_failed_files_notice
 
     def __init__(self, manager, thread_state, attach_result):
         self.thread_manager = manager
@@ -307,12 +307,6 @@ class _MergeHarness:
     def log_warning(self, *a, **k): pass
     def log_error(self, *a, **k): pass
 
-    # process_message folds the gate's coalesced cohort into the turn's input before anything reads
-    # the thread. This harness stubs its collaborators one by one, so the new call needs a stub too;
-    # a message with no cohort merges nothing.
-    def _merge_gate_cohort(self, message, thread_state):
-        return 0
-
     async def _get_or_rebuild_thread_state(self, message, client, thinking_id):
         return self._thread_state
 
@@ -328,7 +322,8 @@ class _MergeHarness:
     async def _build_channel_info(self, client, channel_id):
         return None
 
-    async def _process_attachments(self, message, client, thinking_id, code_interpreter_enabled=None):
+    async def _process_attachments(self, message, client, thinking_id, code_interpreter_enabled=None,
+                                   defer_document_summaries=False):
         return self._attach_result
 
     def _build_user_content(self, text, image_inputs, file_inputs):
@@ -364,12 +359,14 @@ def _mk_image(i):
 
 
 def _trigger(batched_images=None, batched_unsupported=None, text="catch up"):
-    md = {"ts": "T1", "username": "Alice"}
+    md = {"ts": "1000.0", "username": "Alice"}
     if batched_images is not None:
         md["batched_image_inputs"] = batched_images
     if batched_unsupported is not None:
         md["batched_unsupported_files"] = batched_unsupported
-    return Message(text=text, user_id="U1", channel_id="C1", thread_id="T1",
+    # A DM, for the same reason as _img_msg above: this fold IS the legacy one. The channel
+    # equivalent rides post-breakpoint (channel_request.build_batched_images).
+    return Message(text=text, user_id="U1", channel_id="D1", thread_id="1000.0",
                    attachments=[], metadata=md)
 
 
@@ -431,8 +428,8 @@ class TestBatchedImageMerge:
         proc = _MergeHarness(manager, _TState(), (own, [], [fail]))
         client = Mock()
         client.send_message = AsyncMock()
-        msg = Message(text="here you go", user_id="U1", channel_id="C1", thread_id="T1",
-                      attachments=[], metadata={"ts": "T1", "username": "Alice"})
+        msg = Message(text="here you go", user_id="U1", channel_id="D1", thread_id="1000.0",
+                      attachments=[], metadata={"ts": "1000.0", "username": "Alice"})
         await proc.process_message(msg, client=client, thinking_id=None)
 
         # The notice was POSTED to the user, not merely recorded in-memory.
@@ -450,8 +447,8 @@ class TestBatchedImageMerge:
         own = [_mk_image(0)]
         proc = _MergeHarness(manager, _TState(), (own, [], []))
         # a plain message — no batched_* keys
-        msg = Message(text="hi", user_id="U1", channel_id="C1", thread_id="T1",
-                      attachments=[], metadata={"ts": "T1", "username": "Alice"})
+        msg = Message(text="hi", user_id="U1", channel_id="D1", thread_id="1000.0",
+                      attachments=[], metadata={"ts": "1000.0", "username": "Alice"})
         await proc.process_message(msg, client=Mock(spec=[]), thinking_id=None)
         uc = proc.captured["user_content"]
         assert len(_image_parts(uc)) == 1

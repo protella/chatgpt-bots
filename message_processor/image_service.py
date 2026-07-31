@@ -33,6 +33,8 @@ NAMED_SIZES: List[str] = ["1024x1024", "1024x1536", "1536x1024", "auto"]
 QUALITIES: List[str] = ["auto", "low", "medium", "high"]
 FORMATS: List[str] = ["png", "jpeg", "webp"]
 FIDELITIES: List[str] = ["low", "high"]
+# Every background any family accepts — the superset the static channel schema advertises.
+ALL_BACKGROUNDS: List[str] = ["auto", "transparent", "opaque"]
 
 _WXH_RE = re.compile(r"^(\d{2,4})x(\d{2,4})$")
 
@@ -42,6 +44,13 @@ _V2_MIN_EDGE = 256
 _V2_STEP = 16
 _V2_MAX_ASPECT = 3.0
 
+_COMPRESSION_RULE = "an integer 0-100 (jpeg/webp only; png is always 100)"
+_V1_SIZE_RULE = f"one of {', '.join(NAMED_SIZES)}"
+_V2_SIZE_RULE = (
+    f"one of {', '.join(NAMED_SIZES)}, or a custom WxH with both sides divisible by 16 "
+    f"({_V2_MIN_EDGE}-{_V2_MAX_W} wide, {_V2_MIN_EDGE}-{_V2_MAX_H} tall, no more extreme "
+    "than 3:1)")
+
 
 def is_v2(model_id: Optional[str]) -> bool:
     """gpt-image-2 family — a different param surface than gpt-image-1."""
@@ -50,12 +59,46 @@ def is_v2(model_id: Optional[str]) -> bool:
 
 def backgrounds_for(model_id: Optional[str]) -> List[str]:
     """gpt-image-2 cannot do transparent, so it must not be offered."""
-    return ["auto", "opaque"] if is_v2(model_id) else ["auto", "transparent", "opaque"]
+    return ["auto", "opaque"] if is_v2(model_id) else list(ALL_BACKGROUNDS)
 
 
 def supports_input_fidelity(model_id: Optional[str]) -> bool:
     """gpt-image-2 auto-handles fidelity; the param is omitted from its edit calls."""
     return not is_v2(model_id)
+
+
+def legal_options(model_id: Optional[str]) -> Dict[str, Any]:
+    """The PINNED option allowlist for an image model.
+
+    On the channel surface the schema is a static superset — every option is advertised for
+    every model — so the option space is no longer expressed by the schema and this is the only
+    place that says what a given model will actually accept. ``resolve_settings`` enforces it
+    and names these values back to the model when it rejects an override.
+    """
+    v2 = is_v2(model_id)
+    return {
+        "size": list(NAMED_SIZES),
+        "size_rule": _V2_SIZE_RULE if v2 else _V1_SIZE_RULE,
+        "quality": list(QUALITIES),
+        "background": backgrounds_for(model_id),
+        "format": list(FORMATS),
+        "compression_rule": _COMPRESSION_RULE,
+        "input_fidelity": list(FIDELITIES) if supports_input_fidelity(model_id) else [],
+    }
+
+
+def _legal_note(model_id: Optional[str], option: str) -> str:
+    """One clause naming what ``option`` may legally be on ``model_id``."""
+    legal = legal_options(model_id)
+    if option == "size":
+        values = legal["size_rule"]
+    elif option == "compression":
+        values = legal["compression_rule"]
+    elif option == "input_fidelity" and not legal["input_fidelity"]:
+        values = "not an option on this model (fidelity is auto-handled)"
+    else:
+        values = ", ".join(legal.get(option) or [])
+    return f"legal {option} for {model_id}: {values}"
 
 
 def _snap(value: int, lo: int, hi: int) -> int:
@@ -223,14 +266,14 @@ def resolve_settings(
             if note:  # snapped to the 16px grid — say so rather than quietly resizing
                 rejected.append(note)
         else:
-            rejected.append(note or "size is not valid")
+            rejected.append(f"{note or 'size is not valid'}. {_legal_note(model, 'size')}")
 
     if "quality" in overrides:
         quality = str(overrides["quality"])
         if quality in QUALITIES:
             effective["quality"] = quality
         else:
-            rejected.append(f"quality={quality!r} is not one of {QUALITIES}")
+            rejected.append(f"quality={quality!r} is not usable. {_legal_note(model, 'quality')}")
 
     if "background" in overrides:
         background = str(overrides["background"])
@@ -238,34 +281,39 @@ def resolve_settings(
         if background in allowed:
             effective["background"] = background
         else:
-            rejected.append(f"background={background!r} is not supported by {model}")
+            rejected.append(f"background={background!r} is not supported by {model}. "
+                            f"{_legal_note(model, 'background')}")
 
     if "format" in overrides:
         fmt = str(overrides["format"])
         if fmt in FORMATS:
             effective["format"] = fmt
         else:
-            rejected.append(f"format={fmt!r} is not one of {FORMATS}")
+            rejected.append(f"format={fmt!r} is not usable. {_legal_note(model, 'format')}")
 
     if "compression" in overrides:
         try:
             comp = int(overrides["compression"])
         except (TypeError, ValueError):
-            rejected.append("compression must be an integer 0-100")
+            rejected.append(f"compression must be {_COMPRESSION_RULE}. "
+                            f"{_legal_note(model, 'compression')}")
         else:
             if 0 <= comp <= 100:
                 effective["compression"] = comp
             else:
-                rejected.append("compression must be between 0 and 100")
+                rejected.append(f"compression must be between 0 and 100. "
+                                f"{_legal_note(model, 'compression')}")
 
     if "input_fidelity" in overrides:
         fidelity = str(overrides["input_fidelity"])
         if not supports_input_fidelity(model):
-            rejected.append(f"input_fidelity is auto-handled by {model}")
+            rejected.append(f"input_fidelity is auto-handled by {model}. "
+                            f"{_legal_note(model, 'input_fidelity')}")
         elif fidelity in FIDELITIES:
             effective["input_fidelity"] = fidelity
         else:
-            rejected.append(f"input_fidelity={fidelity!r} is not one of {FIDELITIES}")
+            rejected.append(f"input_fidelity={fidelity!r} is not usable. "
+                            f"{_legal_note(model, 'input_fidelity')}")
 
     # PNG is always full-quality; carrying a lower number would be a lie in the log.
     if effective["format"] == "png":
@@ -285,3 +333,32 @@ def defaults_sentence(thread_config: Optional[Dict[str, Any]]) -> str:
     d = user_defaults(thread_config)
     return (f"size={d['size']}, quality={d['quality']}, "
             f"background={d['background']}, format={d['format']}")
+
+
+SETTINGS_EVIDENCE_HEADER = "Image settings in force:"
+
+
+def settings_evidence_lines(thread_config: Optional[Dict[str, Any]] = None) -> List[str]:
+    """The image-settings half of the channel turn's tool-evidence block.
+
+    The static schema no longer carries the model's option space or the requester's saved
+    defaults, so both have to reach the model as evidence instead: what model will run, what it
+    will legally accept, and what an omitted override resolves to.
+    """
+    model = image_model_for(thread_config)
+    legal = legal_options(model)
+    d = user_defaults(thread_config)
+    fidelity = ", ".join(legal["input_fidelity"]) or "auto-handled (not selectable)"
+    return [
+        SETTINGS_EVIDENCE_HEADER,
+        f"image model: {model} (fixed by settings — not selectable in a tool call)",
+        f"legal size: {legal['size_rule']}",
+        f"legal quality: {', '.join(legal['quality'])}",
+        f"legal background: {', '.join(legal['background'])}",
+        f"legal format: {', '.join(legal['format'])}",
+        f"legal compression: {legal['compression_rule']}",
+        f"legal input_fidelity: {fidelity}",
+        (f"defaults applied when you omit overrides: size={d['size']}, quality={d['quality']}, "
+         f"background={d['background']}, format={d['format']}, compression={d['compression']}, "
+         f"input_fidelity={d['input_fidelity']}"),
+    ]

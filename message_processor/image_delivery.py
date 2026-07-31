@@ -70,7 +70,8 @@ _REVIEW_LABEL = (
 
 
 async def review_produced_image(*, processor, client, channel_id: str, thread_id: str,
-                                conversation_history, image_data, ask: str) -> None:
+                                conversation_history, image_data, ask: str,
+                                receipts=None) -> None:
     """Show the model the image it just generated and post its one-line take. Never raises.
 
     Best-effort by construction: the picture is already posted and the user already has it, so a
@@ -114,7 +115,7 @@ async def review_produced_image(*, processor, client, channel_id: str, thread_id
         processor.log_debug("Produced-image review: model had nothing to add")
         return
     try:
-        await client.send_message(channel_id, thread_id, text)
+        await client.send_message(channel_id, thread_id, text, receipts=receipts)
         processor.log_info(f"Produced-image review posted ({len(text)} chars)")
     except Exception as e:  # noqa: BLE001
         processor.log_debug(f"produced-image review not posted: {e}")
@@ -155,6 +156,7 @@ async def publish_image(
     message_ts: Optional[str] = None,
     image_type: str = "generated",
     provenance_tool: Optional[str] = None,
+    receipts=None,
 ) -> Optional[str]:
     """Single owner of image delivery for both the background job and the sync path:
     checklist "Uploading…" transition, upload, falsey-URL = failure, persistence,
@@ -203,6 +205,7 @@ async def publish_image(
             f"generated_image.{image_data.format}",
             _enhanced_prompt_caption(image_data, prompt),
             meta_out=upload_meta,
+            receipts=receipts,
         )
     except Exception as e:  # noqa: BLE001
         processor.log_error(f"Image upload failed for {thread_key}: {e}", exc_info=True)
@@ -274,9 +277,13 @@ async def publish_image(
 
     # Two consumers, one question ("has Slack actually SHARED the file yet?"), one resolve.
     holding = checklist is not None and checklist.surface != "none"
+    # Spec §5: an image posted into a channel needs its share ts to earn a receipt, so the
+    # resolve runs whether or not the indicator or provenance wants it. Without it the picture
+    # is an own-message the stream can never account for.
+    needs_receipt = receipts is not None and getattr(receipts, "active", False)
     share_task = _start_share_resolve(
         client, channel_id, upload_meta.get("file_id"),
-        wanted=holding or _wants_provenance(provenance_tool))
+        wanted=holding or needs_receipt or _wants_provenance(provenance_tool))
 
     try:
         if checklist is not None:
@@ -291,9 +298,13 @@ async def publish_image(
         # In a finally because the resolve is SHIELDED: nothing else will stop it, so every
         # exit — including a cancel landing in complete() above — has to hand it to the only
         # code that either owns it or kills it.
+        _schedule_share_receipt(
+            processor=processor, share_task=share_task, receipts=receipts,
+            db=db, channel_id=channel_id, file_id=upload_meta.get("file_id"))
         _schedule_image_provenance(
             processor=processor, share_task=share_task, thread_key=thread_key,
-            channel_id=channel_id, provenance_tool=provenance_tool)
+            channel_id=channel_id, provenance_tool=provenance_tool,
+            keep_running=needs_receipt)
 
     return file_url
 
@@ -366,8 +377,38 @@ async def _wait_for_share(processor, share_task, uploaded_at: float) -> None:
         processor.log_debug(f"image share wait failed: {e}")
 
 
+def _schedule_share_receipt(*, processor, share_task, receipts, db, channel_id, file_id) -> None:
+    """Turn the resolved share ts into a finalized receipt (A1's atomic finalize-then-delete).
+
+    Detached: the picture is already posted. A failure RETAINS the pending row so boot recovery
+    retries it — the one thing that must never happen is dropping the row without the receipt.
+    """
+    if not (receipts is not None and getattr(receipts, "active", False)
+            and share_task is not None and db is not None and file_id):
+        return
+    from message_processor.outbound_receipts import resolve_pending_share
+
+    async def _resolve() -> None:
+        share_ts = await share_task
+        if not share_ts:
+            processor.log_warning(
+                f"Image share ts never resolved for {file_id} — its pending row is retained "
+                "for boot recovery")
+            return
+        await resolve_pending_share(db, team_id=receipts.team_id, channel_id=channel_id,
+                                    file_id=file_id, message_ts=share_ts)
+
+    coro = _resolve()
+    try:
+        processor._schedule_async_call(coro)
+    except Exception as e:  # noqa: BLE001
+        coro.close()
+        processor.log_debug(f"image share receipt not scheduled: {e}")
+
+
 def _schedule_image_provenance(*, processor, share_task, channel_id: Optional[str],
-                               thread_key: str, provenance_tool: Optional[str]) -> None:
+                               thread_key: str, provenance_tool: Optional[str],
+                               keep_running: bool = False) -> None:
     """Fire-and-forget the F7 provenance row for the image message itself.
 
     Detached because the resolve may still be running: the indicator stops WATCHING it at
@@ -386,7 +427,7 @@ def _schedule_image_provenance(*, processor, share_task, channel_id: Optional[st
         # Nobody wants the answer: don't leave the poll running for its full budget. Only
         # reachable when the indicator started it and provenance is off — with both off,
         # _start_share_resolve never made a task at all.
-        if share_task is not None:
+        if share_task is not None and not keep_running:
             share_task.cancel()
         return
     coro = _persist_image_provenance(

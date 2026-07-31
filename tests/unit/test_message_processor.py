@@ -136,7 +136,7 @@ class TestMessageProcessor:
 
         # Mock thread state
         thread_state = MagicMock(
-            thread_ts="T789",
+            thread_ts="1000.0",
             channel_id="C456",
             messages=[],
             had_timeout=False,
@@ -167,11 +167,14 @@ class TestMessageProcessor:
         """Test handling of timeout during processing"""
         from unittest.mock import AsyncMock
 
+        # A real Slack ts: a channel turn pins H from it, and a malformed one fails the turn
+        # closed before it can reach the timeout-flag clearing this asserts on.
         message = Message(
             text="Hello",
             user_id="U123",
             channel_id="C456",
-            thread_id="T789"
+            thread_id="1000.0",
+            metadata={"ts": "1000.0"},
         )
 
         # Mock all async methods
@@ -183,7 +186,7 @@ class TestMessageProcessor:
 
         # Mock thread state with previous timeout
         thread_state = MagicMock(
-            thread_ts="T789",
+            thread_ts="1000.0",
             channel_id="C456",
             messages=[],
             add_message=MagicMock()

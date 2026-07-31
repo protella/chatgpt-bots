@@ -126,6 +126,17 @@ codex alignment, sub-agent build, codex review, capped tests, live pass — is t
 skill. Codex is a second model, not a sub-agent: consider a round for any substantial
 implementation or decision, and it never counts against delegation.
 
+## Spec workflow
+
+Specs are **authored by Claude** as Markdown files in `Docs/specs/` (gitignored) — never only in
+session scratchpads. Codex is the adversarial sounding board, not the author or final say: its
+findings are input, and what's built is Claude's rulings plus the owner's decisions, recorded in
+the spec. A spec maps requirements to tech design anchored in the actual code (files,
+functions, config names, schemas) so the Opus 5 implementer has zero room to invent; gaps go back
+to the spec, not to the implementer's judgment. Limits/defaults come from existing tuned values or
+an owner decision, never made up. Review rounds compare the diff against the spec first, then go
+adversarial. Details in `AGENTS.md` (codex reads that file every run).
+
 ## Git workflow
 
 **Do not decide to commit on your own — wait to be asked.** When asked:

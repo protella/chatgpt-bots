@@ -61,7 +61,14 @@ class TestDatabaseManager:
         # Check users table exists
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
         assert cursor.fetchone() is not None
-    
+
+        # Single-stream P1 tables (Docs/SINGLE_STREAM_SPEC.md §4/§5/§7)
+        tables = {row[0] for row in cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert {"bot_meta", "outbound_receipts", "pending_share_receipts",
+                "channel_thread_activity", "channel_coverage", "channel_snapshots",
+                "channel_snapshot_pointer"} <= tables
+
     def test_get_or_create_thread_new(self, temp_db):
         """Test creating a new thread"""
         thread_id = "C123:456.789"
@@ -940,3 +947,64 @@ class TestMigrationStepIsolation:
             "SELECT model FROM user_preferences WHERE slack_user_id='U1'"
         ).fetchone()[0] == "gpt-5.6-sol"  # normalizer still ran
         db.conn.close()
+
+
+class TestSingleStreamSchema:
+    """Shape of the P1 tables (Docs/SINGLE_STREAM_SPEC.md §4/§5/§7)."""
+
+    @pytest.fixture
+    def temp_db(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATABASE_DIR", str(tmp_path))
+        from database import DatabaseManager
+        db = DatabaseManager("slack")
+        yield db
+        db.conn.close()
+
+    def _columns(self, db, table):
+        return {row[1] for row in db.conn.execute(f"PRAGMA table_info({table})")}
+
+    def test_receipt_columns_and_primary_key(self, temp_db):
+        assert self._columns(temp_db, "outbound_receipts") == {
+            "team_id", "channel_id", "message_ts", "turn_id", "state", "thread_root_ts",
+            "created_ts", "finalized_ts"}
+        pk = [row[1] for row in temp_db.conn.execute("PRAGMA table_info(outbound_receipts)")
+              if row[5]]
+        assert pk == ["team_id", "channel_id", "message_ts"]
+
+    def test_receipt_state_is_constrained(self, temp_db):
+        with pytest.raises(sqlite3.IntegrityError):
+            temp_db.conn.execute(
+                "INSERT INTO outbound_receipts (team_id, channel_id, message_ts, turn_id, "
+                "state) VALUES ('T', 'C', '1.0', 'x', 'sent')")
+
+    def test_bootstrap_status_is_constrained(self, temp_db):
+        with pytest.raises(sqlite3.IntegrityError):
+            temp_db.conn.execute(
+                "INSERT INTO channel_coverage (team_id, channel_id, coverage_start_ts, "
+                "bootstrap_status) VALUES ('T', 'C', '1.0', 'done')")
+
+    def test_activity_and_coverage_columns(self, temp_db):
+        assert self._columns(temp_db, "channel_thread_activity") == {
+            "team_id", "channel_id", "root_ts", "last_observed_reply_ts",
+            "advisory_reply_count", "last_index_event_ts", "dirty", "updated_ts"}
+        assert self._columns(temp_db, "channel_coverage") == {
+            "team_id", "channel_id", "coverage_start_ts", "bootstrap_status",
+            "coverage_reason", "sweep_token", "heartbeat_ts", "updated_ts"}
+
+    def test_snapshot_columns_and_indexes(self, temp_db):
+        # Subset, not equality: P4a extends this table (payload/provenance columns), and the
+        # P1 contract here is only that its own columns survive that.
+        assert {
+            "snapshot_id", "team_id", "channel_id", "serializer_version", "generation",
+            "boundary_ts", "summary_text", "root_anchors_json", "created_ts", "invalidated_at"
+        } <= self._columns(temp_db, "channel_snapshots")
+        indexes = {row[0] for row in temp_db.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'")}
+        assert {"idx_channel_snapshot_generation", "idx_outbound_receipts_state",
+                "idx_outbound_receipts_channel_state"} <= indexes
+
+    def test_init_schema_is_idempotent(self, temp_db):
+        temp_db.conn.execute(
+            "INSERT INTO bot_meta (key, value) VALUES ('k', 'v')")
+        temp_db.init_schema()  # second boot
+        assert temp_db.get_meta("k") == "v"

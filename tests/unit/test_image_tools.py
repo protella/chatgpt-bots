@@ -917,3 +917,211 @@ async def test_no_executor_raises_into_the_tool_loop():
         assert res["ok"] is False, (name, res)
         assert res["error"] != "execution_error", (name, res)   # never an escaped exception
         assert res["message"]
+
+
+# ====================================================================== static channel schemas
+
+@pytest.mark.unit
+class TestStaticChannelSchemas:
+    """The channel surface pins the tools array to (channel, channel config, bot version).
+
+    The dynamic factories shape three things per request — the legal option space for the
+    requester's image model, the requester's saved defaults in the description, and the edit
+    tool's id enum — and all three change from turn to turn and from person to person. Inside a
+    cached prefix that is a guaranteed miss, and worse, the SAME channel would send two different
+    tool arrays depending on who spoke. The static variants say the same thing to everyone; the
+    per-turn facts move to the evidence block, and `resolve_settings` enforces the option space.
+    """
+
+    STATICS = ("generate_image", "create_image_asset", "edit_image")
+
+    def _all(self, cfg=None):
+        return {
+            "generate_image": it.get_generate_image_schema_static(cfg),
+            "create_image_asset": it.get_create_image_asset_schema_static(cfg),
+            "edit_image": it.get_edit_image_schema_static(cfg),
+        }
+
+    def test_byte_stable_across_models_requesters_and_catalogs(self):
+        # Two turns whose DYNAMIC schemas differ in every way they can: different image model
+        # (so different background/size/fidelity options), different saved defaults, catalog
+        # present vs absent, container present vs absent.
+        a = _cfg(image_model="gpt-image-1", image_size="1024x1536", image_quality="high",
+                 image_background="transparent", user_id="U_A")
+        b = _cfg(image_model="gpt-image-2", image_size="auto", image_quality="low",
+                 image_background="opaque", user_id="U_B",
+                 **{it.CATALOG_KEY: CATALOG, it.CI_CONTAINER_KEY: "cntr_abc123"})
+        for name in self.STATICS:
+            assert json.dumps(self._all(a)[name], sort_keys=True) == \
+                   json.dumps(self._all(b)[name], sort_keys=True), name
+            assert json.dumps(self._all(None)[name], sort_keys=True) == \
+                   json.dumps(self._all(a)[name], sort_keys=True), name
+
+    def test_no_saved_defaults_and_no_catalog_text_leak_in(self):
+        cfg = _cfg(image_size="1024x1536", image_quality="high", **{it.CATALOG_KEY: CATALOG})
+        for name, schema in self._all(cfg).items():
+            blob = json.dumps(schema)
+            assert "size=1024x1536" not in blob, name
+            assert "img_7" not in blob and "A red cat on a blue sofa" not in blob, name
+
+    def test_the_edit_ids_are_a_free_string_not_an_enum(self):
+        items = it.get_edit_image_schema_static(
+            _cfg(**{it.CATALOG_KEY: CATALOG}))["parameters"]["properties"][
+                "source_image_ids"]["items"]
+        assert items == {"type": "string"}
+
+    def test_overrides_are_the_superset_of_every_model(self):
+        # One schema for both families: transparent (v1-only) and input_fidelity (v1-only) are
+        # advertised, and resolve_settings drops them with a reason when the model is v2.
+        for name in self.STATICS:
+            props = self._all()[name]["parameters"]["properties"]["overrides"]["properties"]
+            assert props["background"]["enum"] == ["auto", "transparent", "opaque"], name
+            assert props["input_fidelity"]["enum"] == ["low", "high"], name
+            assert props["quality"]["enum"] == list(it.QUALITIES), name
+            assert props["format"]["enum"] == list(it.FORMATS), name
+            assert props["compression"]["type"] == "integer", name
+            assert (props["compression"]["minimum"], props["compression"]["maximum"]) == (0, 100)
+            # Size cannot be an enum: one family takes named sizes, the other free WxH.
+            assert "enum" not in props["size"], name
+            assert "DIVISIBLE BY 16" in props["size"]["description"], name
+            assert "1024x1024" in props["size"]["description"], name
+
+    def test_the_static_schemas_still_never_offer_the_image_model(self):
+        for name, schema in self._all(_cfg()).items():
+            assert not ({"model", "image_model"} & _prop_names(schema)), name
+
+    def test_the_static_schemas_are_never_hidden(self):
+        # No catalog, no container, no config — every one is still offered. The executors answer
+        # honestly instead (unknown_image_id / sandbox_unavailable).
+        for cfg in (None, {}, _cfg(), _cfg(**{it.CATALOG_KEY: []})):
+            for name, schema in self._all(cfg).items():
+                assert schema is not None and schema["name"] == name
+
+    def test_the_dynamic_factories_are_untouched(self):
+        # DM turns keep the enum and the saved-defaults sentence, verbatim.
+        cfg = _cfg(**{it.CATALOG_KEY: CATALOG})
+        assert it.get_edit_image_schema(cfg)["parameters"]["properties"][
+            "source_image_ids"]["items"]["enum"] == ["img_7", "img_3"]
+        assert it.get_edit_image_schema(_cfg()) is None
+        assert "size=" in it.get_generate_image_schema(cfg)["description"]
+
+    def test_a_returned_schema_is_not_shared_mutable_state(self):
+        first = it.get_generate_image_schema_static()
+        first["parameters"]["properties"]["overrides"]["properties"].pop("size")
+        assert "size" in it.get_generate_image_schema_static()[
+            "parameters"]["properties"]["overrides"]["properties"]
+
+
+# ====================================================================== executor legality
+
+@pytest.mark.unit
+class TestSupersetLegality:
+    """The superset schema advertises options a given image model cannot honor, so the executor
+    is now the only thing that says no — and it has to say WHICH values are legal, or the model
+    has no way to correct itself. It re-tries with the same illegal value otherwise."""
+
+    def _reject(self, cfg, overrides):
+        _settings, rejected, _ = it._effective_config(cfg, overrides)
+        return " | ".join(rejected)
+
+    def test_a_v2_transparent_background_names_the_legal_values(self):
+        note = self._reject(_cfg(image_model="gpt-image-2"), {"background": "transparent"})
+        assert "gpt-image-2" in note
+        assert "legal background for gpt-image-2: auto, opaque" in note
+
+    def test_a_v2_input_fidelity_says_it_is_not_an_option_there(self):
+        note = self._reject(_cfg(image_model="gpt-image-2"), {"input_fidelity": "low"})
+        assert "auto-handled" in note and "gpt-image-2" in note
+
+    def test_a_v1_custom_size_names_the_named_sizes(self):
+        note = self._reject(_cfg(image_model="gpt-image-1"), {"size": "1536x864"})
+        assert "legal size for gpt-image-1" in note
+        assert "1024x1536" in note
+        # v1 has no custom-size rule to offer, so it must not be advertised in the refusal.
+        assert "divisible by 16" not in note
+
+    def test_a_v2_impossible_size_still_names_the_v2_rule(self):
+        note = self._reject(_cfg(image_model="gpt-image-2"), {"size": "5000x100"})
+        assert "3:1" in note and "divisible by 16" in note
+
+    def test_quality_format_and_compression_all_name_their_legal_values(self):
+        note = self._reject(_cfg(), {"quality": "ultra", "format": "tiff", "compression": 500})
+        assert "legal quality" in note and "auto, low, medium, high" in note
+        assert "legal format" in note and "png, jpeg, webp" in note
+        assert "legal compression" in note and "0-100" in note
+
+    def test_a_legal_override_on_the_same_call_still_lands(self):
+        settings, rejected, _ = it._effective_config(
+            _cfg(image_model="gpt-image-2"), {"background": "transparent", "quality": "high"})
+        assert settings["quality"] == "high"
+        assert settings["background"] == "auto"      # the saved default, not the illegal value
+        assert rejected
+
+    @pytest.mark.asyncio
+    async def test_the_rejection_reaches_the_model_through_the_tool_result(self):
+        # The whole chain: superset schema offers it, executor drops it, the model is told.
+        proc = _FakeProcessor(openai_client=_openai())
+        res = await it.execute_create_image_asset(
+            _ctx(proc, container_id="cntr_abc123",
+                 thread_config=_cfg(image_model="gpt-image-2")),
+            {"prompt": "a cover", "filename": "cover.png", "overrides": {"background": "transparent"}})
+
+        assert res["ok"] is True
+        assert any("legal background for gpt-image-2" in n for n in res["ignored_overrides"])
+
+    def test_the_pinned_allowlist_is_what_resolution_enforces(self):
+        from message_processor import image_service as svc
+        for model in ("gpt-image-1", "gpt-image-2"):
+            legal = svc.legal_options(model)
+            for background in legal["background"]:
+                effective, rejected = svc.resolve_settings(
+                    _cfg(image_model=model), {"background": background})
+                assert effective["background"] == background and rejected == [], (model, background)
+            for quality in legal["quality"]:
+                _, rejected = svc.resolve_settings(_cfg(image_model=model), {"quality": quality})
+                assert rejected == [], (model, quality)
+
+
+@pytest.mark.unit
+class TestEvidenceHelpers:
+    """What the static schemas stopped saying, the turn's evidence block says instead."""
+
+    def test_image_settings_evidence_names_model_legality_and_defaults(self):
+        from message_processor import image_service as svc
+        lines = svc.settings_evidence_lines(
+            _cfg(image_model="gpt-image-2", image_size="1024x1536", image_quality="high"))
+        body = "\n".join(lines)
+
+        assert lines[0] == svc.SETTINGS_EVIDENCE_HEADER
+        assert "gpt-image-2" in body and "not selectable" in body
+        assert "auto, opaque" in body                     # its legal backgrounds
+        assert "transparent" not in body                  # …and only its own
+        assert "divisible by 16" in body                  # its size rule
+        assert "size=1024x1536" in body and "quality=high" in body
+        assert all("\n" not in line for line in lines)
+
+    def test_v1_settings_evidence_offers_transparent_and_fidelity(self):
+        from message_processor import image_service as svc
+        body = "\n".join(svc.settings_evidence_lines(_cfg(image_model="gpt-image-1")))
+        assert "transparent" in body
+        assert "legal input_fidelity: low, high" in body
+
+    def test_v2_settings_evidence_says_fidelity_is_not_selectable(self):
+        from message_processor import image_service as svc
+        body = "\n".join(svc.settings_evidence_lines(_cfg(image_model="gpt-image-2")))
+        assert "legal input_fidelity: auto-handled (not selectable)" in body
+
+    def test_image_catalog_evidence_lines_carry_the_ids(self):
+        from message_processor import image_catalog
+        lines = image_catalog.catalog_evidence_lines(CATALOG)
+
+        assert lines[0] == image_catalog.EVIDENCE_HEADER
+        assert len(lines) == 1 + len(CATALOG)
+        assert "img_7" in lines[1] and "A red cat on a blue sofa" in lines[1]
+        assert all("\n" not in line for line in lines)
+
+    def test_an_empty_image_catalog_is_stated_not_omitted(self):
+        from message_processor import image_catalog
+        assert image_catalog.catalog_evidence_lines([]) == \
+               image_catalog.catalog_evidence_lines(None)
+        assert "none" in image_catalog.catalog_evidence_lines([])[1]

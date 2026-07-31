@@ -207,12 +207,14 @@ def test_the_contract_version_says_the_event_set_changed():
     for `destination` + `destination_source`; v6 added the `stale_suppressed` terminal kind and
     the `stale_send` diagnostic; v7 is the binary gate — `gate_decision` loses action, emoji,
     placement, reason, the staged findings, the overrules and the backoff taxonomy, and carries
-    one bool plus four facts about the call. Each is a change an analysis written against the
+    one bool plus four facts about the call; v8 adds the single-stream events and with them a
+    SECOND population keyed by turn_id. Each is a change an analysis written against the
     older contract must be able to refuse.
 
     GATE_CONTRACT is asserted beside it because the two move independently — v2–v6 rows remain
-    valid under their own contracts, and a reader has to be able to tell which one a row obeys."""
-    assert pt.CONTRACT_VERSION == 7
+    valid under their own contracts, and a reader has to be able to tell which one a row obeys.
+    It deliberately did NOT move at v8: the gate is unchanged, so its rows still pool."""
+    assert pt.CONTRACT_VERSION == 8
     assert pt.GATE_CONTRACT == "binary-v1"
 
 
@@ -1245,3 +1247,378 @@ async def test_an_aborted_turn_still_closes_its_attempt(sink, instant_gate):
 
     terminals = _terminals(sink)
     assert len(terminals) == 1 and terminals[0]["kind"] == "aborted"
+
+
+# ------------------------------------------------------- v8: the turn population (CV8, §10)
+
+def _turn(**kwargs):
+    from message_processor.turn_runtime import TurnRuntime
+    return TurnRuntime(**kwargs)
+
+
+def test_a_turn_start_is_the_turn_populations_denominator_not_the_gates(sink):
+    """Written for every channel turn, gated or not. That is the whole reason it exists beside
+    `gate_start`: a mention and a thread continuation are turns nobody judged, and a ledger that
+    could only count judged messages could never say what share of the bot's channel output the
+    gate is responsible for."""
+    pt.turn_start("C1", "10.0", turn_id="s:1", origin_thread_ts="9.0", surface="channel",
+                  gated=False, wake_source="mention")
+    row = sink("turn_start")[0]
+    assert row["turn_id"] == "s:1" and row["gated"] is False
+    assert (row["channel_id"], row["trigger_ts"], row["origin_thread_ts"]) == ("C1", "10.0", "9.0")
+    assert row["surface"] == "channel" and row["wake_source"] == "mention"
+    assert "attempt_id" not in row          # an ungated turn has none to name
+
+
+def test_a_turn_outcome_reports_what_the_turn_accumulated(sink):
+    """Assembled from the TurnRuntime rather than from a payload the caller composed, so the
+    outer finally cannot report a destination set that disagrees with the handlers'."""
+    from message_processor.turn_runtime import DEST_KIND_REPLY
+
+    turn = _turn(turn_id="s:2", H="99.0", stream_build_present=True)
+    turn.mark_destination_committed(first_ts="50.0", kind=DEST_KIND_REPLY, text="hello there",
+                                   channel_id="C1", thread_root_ts="9.0")
+    assert pt.emit_turn_outcome(turn, channel_id="C1", trigger_ts="10.0", kind="reply") is True
+
+    row = sink("turn_outcome")[0]
+    assert row["turn_id"] == "s:2" and row["kind"] == "reply"
+    assert row["H"] == "99.0" and row["stream_build_present"] is True
+    assert row["chars"] == len("hello there")
+    assert row["destinations"] == [{"channel_id": "C1", "thread_root_ts": "9.0",
+                                   "first_ts": "50.0", "state": "committed",
+                                   "chars": 11, "kind": "reply"}]
+    assert "text" not in row["destinations"][0]   # the ledger records a length, never the reply
+
+
+def test_a_turn_outcome_is_emitted_exactly_once(sink):
+    """The same guard `finish_attempt` has, for the same reason: two emitters each believing they
+    own the end of a turn is how the gate population came to be double-counted."""
+    turn = _turn(turn_id="s:3")
+    assert pt.emit_turn_outcome(turn, channel_id="C1", trigger_ts="10.0", kind="silence") is True
+    assert pt.emit_turn_outcome(turn, channel_id="C1", trigger_ts="10.0", kind="reply") is False
+    assert [r["kind"] for r in sink("turn_outcome")] == ["silence"]
+
+
+def test_an_interrupted_stream_stays_observed_only_and_is_still_reported(sink):
+    """[r4-6] A stream Slack accepted and that never finished is genuinely both facts: the room
+    saw it, and it is not the answer. Reporting only committed records would hide the delivery;
+    reporting it as committed would claim an answer that was never written."""
+    from message_processor.turn_runtime import DEST_KIND_STREAM
+
+    turn = _turn(turn_id="s:4", stream_build_present=True)
+    turn.note_destination_observed(channel_id="C1", first_ts="50.0", kind=DEST_KIND_STREAM,
+                                  thread_root_ts="9.0")
+    pt.emit_turn_outcome(turn, channel_id="C1", trigger_ts="10.0", kind="interrupted")
+
+    row = sink("turn_outcome")[0]
+    assert [d["state"] for d in row["destinations"]] == ["observed"]
+    assert row["destinations"][0]["chars"] is None
+    assert "chars" not in row                      # nothing committed, so no total to report
+    assert turn.committed_destinations == []       # ...and memory extraction sees nothing
+
+
+def test_a_fail_closed_turn_names_its_code_and_says_no_stream_was_built(sink):
+    turn = _turn(turn_id="s:5", turn_error="coverage_not_ready", stream_build_present=False)
+    pt.emit_turn_outcome(turn, channel_id="C1", trigger_ts="10.0", kind="error")
+    row = sink("turn_outcome")[0]
+    assert row["error"] == "coverage_not_ready" and row["stream_build_present"] is False
+    assert row["destinations"] == []               # written empty: silence and lost records differ
+
+
+def test_a_turn_outcome_is_not_a_terminal_event(sink):
+    """The two populations answer different questions. A turn_outcome counted as a terminal would
+    put every ungated mention into a ledger documented as gate decisions."""
+    message = _msg()
+    pt.begin_attempt(message)
+    pt.finish_attempt(message, "reply")
+    pt.emit_turn_outcome(_turn(turn_id="s:6"), channel_id="C1", trigger_ts="10.0", kind="reply")
+    assert len(sink("visible_action")) == 1
+    assert len(sink("turn_outcome")) == 1
+
+
+def test_emit_turn_outcome_never_raises_on_a_broken_turn(sink):
+    """It runs in the outer finally of every turn. A raise there would turn one lost line into
+    a turn that never released its lease."""
+    assert pt.emit_turn_outcome(None, channel_id="C1", trigger_ts="1.0", kind="reply") is False
+    # No __dict__, so even the once-only stamp fails: reported False, nothing written, no raise.
+    assert pt.emit_turn_outcome(object(), channel_id="C1", trigger_ts="1.0", kind="reply") is False
+    assert sink("turn_outcome") == []
+
+
+# --------------------------------------------------------------------------- stream_render
+
+def test_stream_render_carries_the_builders_own_fields(sink):
+    """The payload is ChannelStream.stream_render_fields() passed through verbatim — the
+    serializer owns what identifies a build, and restating those keys here would be a second
+    thing to keep in step with it."""
+    fields = {"channel_id": "C1", "snapshot_id": None, "generation": None, "boundary": "5.0",
+              "floor_inclusive": True, "H": "99.0", "coverage_start_ts": "5.0",
+              "serializer_version": 1, "serializer_config_hash": "cfg", "actor_map_hash": "am",
+              "sidecar_versions_hash": "sc", "capability_profile_hash": "cp", "byte_count": 120,
+              "message_count": 3, "stream_sha256": "deadbeef", "receipts_included_count": 1,
+              "receipts_excluded_count": 2, "receipts_membership_hash": "mh"}
+    pt.stream_render(turn_id="s:7", origin_thread_ts="9.0", trigger_ts="10.0", **fields)
+
+    row = sink("stream_render")[0]
+    assert row["turn_id"] == "s:7" and row["channel_id"] == "C1"
+    assert (row["boundary"], row["floor_inclusive"], row["H"]) == ("5.0", True, "99.0")
+    assert row["stream_sha256"] == "deadbeef" and row["message_count"] == 3
+    assert row["receipts_membership_hash"] == "mh"
+    # P2 pins no snapshot, and a None field is OMITTED rather than written as null — so a
+    # group-by never gets an "absent" and a "null" bucket meaning the same thing.
+    assert "snapshot_id" not in row and "generation" not in row
+
+
+def test_a_real_build_emits_one_stream_render_that_matches_its_own_fields(sink):
+    from tests.unit.channel_turn_harness import build_stream, normalized
+    from message_processor.channel_stream import _emit_stream_render
+
+    stream = build_stream([normalized("10.0", "hello")])
+    _emit_stream_render(stream, turn_id="s:8", origin_thread_ts="10.0", trigger_ts="10.0")
+    row = sink("stream_render")[0]
+    for key, value in stream.stream_render_fields().items():
+        if value is None:
+            assert key not in row
+        else:
+            assert row[key] == value
+
+
+# ------------------------------------------------------------------- receipts and snapshots
+
+def test_an_outbound_receipt_row_records_the_refusal_not_the_intent(sink):
+    """`applied=false` with a reason is the interesting row: a register the lattice absorbed, a
+    finalize a foreign turn owns and a demote with nothing to demote are identical from the call
+    site and three different facts about the stream."""
+    pt.outbound_receipt(channel_id="C1", message_ts="50.0", owner_turn_id="s:1", op="register",
+                        prior_state="finalized", new_state="finalized", applied=False,
+                        reason="absorbed_finalized")
+    row = sink("outbound_receipt")[0]
+    assert row["applied"] is False               # False is WRITTEN; only None is omitted
+    assert row["reason"] == "absorbed_finalized"
+    assert (row["op"], row["prior_state"], row["new_state"]) == (
+        "register", "finalized", "finalized")
+    assert row["owner_turn_id"] == "s:1" and row["message_ts"] == "50.0"
+
+
+def test_a_compaction_pointer_read_is_observable(sink):
+    """P2's fail-closed path leaves no other trace: the turn refuses before it renders anything."""
+    pt.compaction_snapshot(op="read", channel_id="C1", snapshot_id="snap-1", generation=3,
+                           boundary_ts="40.0", serializer_version=1)
+    row = sink("compaction_snapshot")[0]
+    assert (row["op"], row["snapshot_id"], row["generation"]) == ("read", "snap-1", 3)
+    assert row["boundary_ts"] == "40.0" and row["serializer_version"] == 1
+
+
+def test_a_failed_generation_is_never_invisible(sink):
+    """MANDATED TEST 13. One `op=build` per GENERATION ATTEMPT, success or failure, and its
+    `call_count` aggregates a multi-call map+reduce — an attempt that burned nine calls and then
+    failed is exactly the row cost analysis needs, and the one a success-only event would drop."""
+    pt.compaction_snapshot(op="build", channel_id="C1", model="gpt-5.6-luna", tokens_in=90_000,
+                           tokens_out=4_200, cached_input_tokens=61_000, call_count=9,
+                           attempt_seq=1, status="failed", reason="reduce_call_failed")
+    row = sink("compaction_snapshot")[0]
+    assert (row["op"], row["status"], row["reason"]) == ("build", "failed", "reduce_call_failed")
+    assert (row["call_count"], row["attempt_seq"]) == (9, 1)
+    # THE AUTHORITATIVE NAMES. `input_tokens`/`output_tokens` belong to model_response and its
+    # per-call turn population; one vocabulary here, no aliases.
+    assert (row["tokens_in"], row["tokens_out"]) == (90_000, 4_200)
+    assert row["cached_input_tokens"] == 61_000
+    assert "input_tokens" not in row and "output_tokens" not in row
+
+
+def test_a_resumed_attempt_reports_the_calls_it_made_before_the_restart(sink):
+    """MANDATED TEST 41. An attempt spanning a restart emits ONE build carrying the checkpoint's
+    ACCUMULATED totals; a mutation discard ends that attempt with its own build, and the next
+    attempt starts at attempt_seq+1 with the accumulators zeroed."""
+    pt.compaction_snapshot(op="build", channel_id="C1", model="gpt-5.6-luna", tokens_in=140_000,
+                           tokens_out=6_000, cached_input_tokens=90_000, call_count=12,
+                           attempt_seq=2, status="discarded", reason="mutation_observed")
+    pt.compaction_snapshot(op="build", channel_id="C1", model="gpt-5.6-luna", tokens_in=0,
+                           tokens_out=0, cached_input_tokens=0, call_count=0, attempt_seq=3,
+                           status="ok")
+    discarded, resumed = sink("compaction_snapshot")
+    assert (discarded["attempt_seq"], discarded["status"]) == (2, "discarded")
+    assert discarded["call_count"] == 12          # the pre-restart calls are still on the record
+    assert (resumed["attempt_seq"], resumed["status"]) == (3, "ok")
+    assert resumed["call_count"] == 0             # zeroed accumulators, not the old attempt's
+    assert "reason" not in resumed                # nothing failed; nothing to explain
+
+
+def test_a_stale_copy_publication_still_records_a_build(sink):
+    """MANDATED TEST 64. A stale-retained copy IS a publication — it puts a new generation on the
+    pointer — so it emits the pair like any other, and its build says no model call was made.
+    Without it the checker's build-before-publish rule fails a perfectly correct copy."""
+    pt.compaction_snapshot(op="build", channel_id="C1", model="gpt-5.6-luna", tokens_in=0,
+                           tokens_out=0, cached_input_tokens=0, call_count=0, attempt_seq=1,
+                           status="copied")
+    row = sink("compaction_snapshot")[0]
+    assert (row["status"], row["call_count"]) == ("copied", 0)
+    assert "reason" not in row                    # a copy is not a failure
+
+
+def test_an_odd_build_status_is_written_and_warned_about(sink):
+    """Same rule as every other vocabulary here: the odd line is written, because losing the
+    record is worse than recording an odd label — the drift is made audible, not fatal."""
+    pt._warned_vocabulary.clear()
+    with patch.object(pt, "logger") as log:
+        pt.compaction_snapshot(op="build", channel_id="C1", status="succeeded", attempt_seq=1)
+        assert log.warning.call_count == 1
+    assert sink("compaction_snapshot")[0]["status"] == "succeeded"
+    pt._warned_vocabulary.clear()
+
+
+# --------------------------------------------------------------------------- model_response
+
+def test_model_attempts_are_sequenced_per_turn_not_per_process(sink):
+    """The question is "how many calls did THIS turn cost", which a process-wide counter cannot
+    answer. Each tool-loop round is its own attempt: the loop issues one API call per round."""
+    turn = _turn(turn_id="s:9")
+    first = pt.ModelAttemptSink(turn=turn)
+    first.close(first.open("gpt-5.6-sol"), status="ok", input_tokens=100, output_tokens=20,
+                cached_input_tokens=64)
+    forked = pt.ModelAttemptSink(turn=turn, fork_reason="mcp_retry")
+    forked.close(forked.open("gpt-5.6-sol"), status="error", detail="APITimeoutError")
+
+    rows = sink("model_response")
+    assert [r["attempt_seq"] for r in rows] == [1, 2]
+    assert rows[0]["status"] == "ok" and rows[0]["cached_input_tokens"] == 64
+    assert rows[0]["input_tokens"] == 100 and rows[0]["output_tokens"] == 20
+    assert "fork_reason" not in rows[0]                    # the first attempt is not a fork
+    assert rows[1]["status"] == "error" and rows[1]["fork_reason"] == "mcp_retry"
+    assert rows[1]["detail"] == "APITimeoutError"
+    assert [a.attempt_seq for a in turn.model_attempts] == [1, 2]
+
+
+def test_a_model_attempt_sink_never_raises_into_the_api_layer(sink):
+    """It runs inside the request wrappers. A telemetry failure there would turn one lost line
+    into a lost answer."""
+    broken = pt.ModelAttemptSink(turn=object())
+    assert broken.open("gpt-5.6-sol") is None
+    broken.close(None, status="ok")          # nothing to close
+    broken.close(object(), status="ok")      # an attempt whose fields cannot be written
+    assert sink("model_response") == []
+
+
+def test_the_v8_vocabularies_cover_what_the_code_writes():
+    assert {"register", "promote", "finalize", "demote", "transfer", "delete",
+            "reconcile_finalize", "pending_resolve"} == pt.RECEIPT_OPS
+    assert {"absent", "in_flight", "finalized", "chrome"} == pt.RECEIPT_STATES
+    assert {"read", "build", "publish", "invalidate", "stale_retained"} == pt.SNAPSHOT_OPS
+    # Only these two carry an identity and a cardinality contract; the rest are direct writes.
+    assert pt.OUTBOX_OPS == {"build", "publish"}
+    assert pt.BUILD_STATUSES == {"ok", "failed", "discarded", "copied"}
+    assert pt.MODEL_RESPONSE_STATUSES == {"ok", "error"}
+    assert pt.TURN_SURFACES == {"channel", "dm"}
+    # turn_outcome reuses the terminal vocabulary on purpose: a turn and its gate attempt
+    # describe the same room, and two vocabularies for one question make the rows uncomparable.
+    assert {"reply", "silence", "interrupted", "error", "queued"} <= pt.KINDS
+
+
+# --------------------------------------------------- one stream_render per BUILD, joined to it
+
+class _StreamClient:
+    """The narrowest client build_channel_stream needs: one history page, no replies."""
+
+    def __init__(self):
+        self.self_team_id = "T1"
+        self.bot_user_id = "U_BOT"
+        self.bot_id = "B_BOT"
+        self.app = MagicMock()
+        self.app.client.conversations_history = AsyncMock(return_value={
+            "ok": True, "messages": [{"ts": "10.0", "text": "hi", "user": "U1"}],
+            "has_more": False})
+        self.app.client.conversations_replies = AsyncMock(return_value={"ok": True,
+                                                                       "messages": []})
+
+    def is_own_message(self, msg):
+        return bool(msg) and msg.get("user") == self.bot_user_id
+
+    def classify_sender(self, msg):
+        return "self" if self.is_own_message(msg) else "human"
+
+    async def resolve_usernames(self, ids, api_client, max_remote_lookups=25):
+        return {uid: f"name-{uid}" for uid in ids}
+
+
+def _stream_db(snapshot=None):
+    db = MagicMock()
+    db.read_channel_sidecars_async = AsyncMock(return_value={
+        "window": ("5.0", True),
+        "coverage": {"coverage_start_ts": "5.0", "bootstrap_status": "complete",
+                     "reason": "genesis"},
+        "receipt_feature_epoch_ts": None, "receipts": [], "activity": [],
+        "image_analyses": [], "document_extractions": [], "ambient_artifacts": [],
+        "tool_usage": {}, "versions_hash": "h"})
+    db.get_active_snapshot_async = AsyncMock(return_value=snapshot)
+    db.clear_thread_dirty_async = AsyncMock(return_value=True)
+    return db
+
+
+@pytest.fixture
+def _stream_singletons():
+    from slack_client import actor_tail as actor_tail_module
+    from slack_client import admission_watermark
+    admission_watermark.watermark.reset()
+    actor_tail_module.actor_tail.reset()
+    yield
+    admission_watermark.watermark.reset()
+    actor_tail_module.actor_tail.reset()
+
+
+@pytest.mark.asyncio
+async def test_a_build_writes_one_stream_render_naming_its_turn(sink, _stream_singletons):
+    """Once per BUILD, joined to the turn by turn_id — that join is the only way to ask which
+    window an answer was written from."""
+    from message_processor.channel_stream import build_channel_stream
+
+    stream = await build_channel_stream(
+        client=_StreamClient(), db=_stream_db(), team_id="T1", channel_id="C1", h="99.0",
+        turn_id="s:10", origin_thread_ts="10.0", trigger_ts="10.0")
+
+    rows = sink("stream_render")
+    assert len(rows) == 1
+    assert rows[0]["turn_id"] == "s:10" and rows[0]["channel_id"] == "C1"
+    assert rows[0]["origin_thread_ts"] == "10.0" and rows[0]["trigger_ts"] == "10.0"
+    assert rows[0]["stream_sha256"] == stream.stream_sha256
+    assert rows[0]["H"] == "99.0"
+
+
+@pytest.mark.asyncio
+async def test_a_fail_closed_snapshot_read_is_written_and_no_stream_is_rendered(
+        sink, _stream_singletons):
+    """The only two facts P2 can report about a compacted channel: the pointer was read, and
+    nothing was built. A stream_render here would claim a window this turn never had."""
+    from message_processor.channel_stream import (SnapshotUnsupportedError,
+                                                 build_channel_stream)
+
+    pointer = {"snapshot_id": "snap-1", "generation": 2, "boundary_ts": "40.0"}
+    with pytest.raises(SnapshotUnsupportedError):
+        await build_channel_stream(
+            client=_StreamClient(), db=_stream_db(snapshot=pointer), team_id="T1",
+            channel_id="C1", h="99.0", turn_id="s:11")
+
+    assert sink("stream_render") == []
+    row = sink("compaction_snapshot")[0]
+    assert (row["op"], row["snapshot_id"], row["channel_id"]) == ("read", "snap-1", "C1")
+
+
+def test_base_py_hands_the_builder_the_turn_it_is_building_for():
+    """Source-level, because the wiring is what breaks silently: a stream_render with no turn_id
+    joins to nothing and the whole event stops answering the question it exists for."""
+    import inspect
+
+    from message_processor.base import MessageProcessor
+
+    # BOTH frames: P4 moved the builder call itself into `_channel_stream_call` so the §1a
+    # ordering above it stays readable. Following the call is the point — a module-wide substring
+    # search would let a genuine future disconnection pass, which is the failure this test exists
+    # to catch.
+    source = (inspect.getsource(MessageProcessor._build_channel_turn_stream)
+              + inspect.getsource(MessageProcessor._channel_stream_call))
+    for kwarg in ("turn_id=", "origin_thread_ts=", "trigger_ts="):
+        assert kwarg in source
+    # And the kwargs are on the BUILDER CALL, not merely somewhere in the two functions.
+    call = inspect.getsource(MessageProcessor._channel_stream_call)
+    assert call.count("build_channel_stream(") == 1
+    for kwarg in ("turn_id=", "origin_thread_ts=", "trigger_ts="):
+        assert kwarg in call.split("build_channel_stream(", 1)[1]

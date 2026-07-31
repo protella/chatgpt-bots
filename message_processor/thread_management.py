@@ -14,6 +14,7 @@ from message_processor.tool_provenance import (
     render_provenance_annotations,
     strip_used_tools_footer,
 )
+from slack_client.normalizer import parse_ts
 
 
 class ThreadManagementMixin:
@@ -607,7 +608,7 @@ class ThreadManagementMixin:
         from message_processor.ambient_memory import render_artifact_note
         for source_ts, arts in by_ts.items():
             for art in arts:
-                # Parity with the batch-load / pulse dedupe: unfurl notes are F48's preview.
+                # Parity with the batch-load dedupe: unfurl notes are F48's preview.
                 if art.get("derivation_source") == "unfurl" or not art.get("summary"):
                     continue
                 try:
@@ -783,27 +784,131 @@ class ThreadManagementMixin:
             return " ".join(parts)
         return str(content) if content is not None else ""
 
+    # ---------------------------------------------------------------- channel origin side-state
+
+    async def get_or_create_channel_thread_state(self, message: Message):
+        """Step 2 of a channel turn: the ThreadState, CREATED and never rebuilt.
+
+        The legacy rebuild exists to reconstruct a transcript from `conversations.replies`. A
+        channel turn already has the whole channel pinned, so a rebuild here would fetch the same
+        thread a second time and write it into a list the request does not send. What the state is
+        still FOR is the things that are not a transcript: the config overrides the capability
+        profile resolves from, the participants the roster renders, the root author the coordinates
+        report, and the timeout flag.
+        """
+        return await self.thread_manager.get_or_create_thread_async(
+            message.thread_id, message.channel_id)
+
+    async def ingest_channel_origin_slice(self, thread_state, origin_slice, pinned_sidecars=None,
+                                          db=None, actor_names=None) -> None:
+        """Register the ORIGIN THREAD's files and people from the pinned stream (spec §3 step 10).
+
+        A channel turn has no rebuild, so nothing walks the thread appending messages and writing
+        the rows that walk used to produce as side effects. The tools still need them: an image is
+        only editable if it has an `images` row, a document is only readable if it has a
+        `documents` row, and the roster is only taggable if `participants` knows the names.
+
+        Reads NormalizedMessages — a FileRef already carries id, name, mimetype, size and url, so
+        nothing is downloaded, extracted or summarized here. Writes are idempotent by construction
+        (`save_document_if_absent_async`, and an image row keyed by url), because this runs on
+        EVERY turn in the thread and a plain insert would grow a row per turn per file.
+
+        Best-effort per row: a side-state write that fails costs one tool its target, never the
+        turn. `pinned_sidecars` is accepted for P4's use (a row we already read need not be
+        re-checked) and deliberately unused here rather than absent, so the seam exists.
+        """
+        db = db if db is not None else getattr(self, "db", None)
+        messages = list(origin_slice or [])
+        if not messages:
+            return
+        thread_key = f"{thread_state.channel_id}:{thread_state.thread_ts}"
+
+        # Root author + participants: the wake/coordinates block reports whether the requester
+        # started the thread, and the roster needs ids to render mentions.
+        # The shared numeric comparator, not a lexical min: "999.9" sorts above "1000.1" as a
+        # string, so the oldest message and the first-sorting one are not always the same message.
+        root = min(messages, key=lambda m: parse_ts(m.ts))
+        if getattr(thread_state, "root_author", None) is None and root.sender_id:
+            thread_state.root_author = (root.sender_id, root.sender_type)
+        names = actor_names or {}
+        for message in messages:
+            if message.sender_id and message.sender_type != "self":
+                thread_state.participants.setdefault(
+                    message.sender_id, names.get(message.sender_id) or message.sender_id)
+
+        if db is None:
+            return
+        for message in messages:
+            for ref in message.files:
+                try:
+                    await self._register_origin_file(db, thread_key, ref, message)
+                except Exception as e:  # noqa: BLE001 — one file, not the turn
+                    self.log_debug(f"Origin-slice file {ref.name} not registered: {e}")
+
+    async def _register_origin_file(self, db, thread_key: str, ref, message) -> None:
+        """One file from the origin slice, into whichever side table addresses it."""
+        if not ref.url_private:
+            return
+        if ref.kind == "image":
+            known = await db.find_thread_images_async(thread_key)
+            if any((row or {}).get("url") == ref.url_private for row in (known or [])):
+                return
+            await db.save_image_metadata_async(
+                thread_id=thread_key, url=ref.url_private, image_type="uploaded",
+                prompt=None, analysis=None,
+                metadata={"file_id": ref.id, "filename": ref.name, "source": "channel_stream"},
+                message_ts=message.ts)
+            return
+        handler = getattr(self, "document_handler", None)
+        if handler is not None and not handler.is_document_file(ref.name, ref.mimetype):
+            return
+        from database import UNATTENDED_SUMMARY_TEMPLATE
+        await db.save_document_if_absent_async(
+            thread_key, ref.name, ref.mimetype or "application/octet-stream",
+            summary=UNATTENDED_SUMMARY_TEMPLATE.format(name=ref.name),
+            file_id=ref.id, url_private=ref.url_private, size_bytes=ref.size,
+            metadata={"source": "channel_stream"}, message_ts=message.ts)
+
     async def _async_extract_channel_memory(self, thread_state):
         """Phase 9: after a response is sent, run ONE lightweight utility-model call to decide whether
         the latest exchange holds a durable channel fact, and persist/update it. Best-effort, runs
-        post-response (never blocks the reply), only writes channel-scope rows, enforces the row cap."""
+        post-response (never blocks the reply), only writes channel-scope rows, enforces the row cap.
+
+        DM/legacy path: the exchange is read off ThreadState.messages. A channel turn never writes
+        that list, so main.py's outer finally calls `extract_channel_memory_from_exchange` with the
+        text of what it actually committed.
+        """
         if not config.enable_channel_memory:
             return
         channel_id = getattr(thread_state, "channel_id", None)
-        db = getattr(self, "db", None)
-        openai_client = getattr(self, "openai_client", None)
-        if not channel_id or not db or not openai_client:
-            return
-
         msgs = getattr(thread_state, "messages", None) or []
         last_user = next((m for m in reversed(msgs) if m.get("role") == "user"), None)
         last_assistant = next((m for m in reversed(msgs) if m.get("role") == "assistant"), None)
         if not last_user or not last_assistant:
             return
-        exchange = (
-            f"User: {self._content_to_text(last_user.get('content'))}\n"
-            f"Assistant: {self._content_to_text(last_assistant.get('content'))}"
-        )
+        await self.extract_channel_memory_from_exchange(
+            channel_id,
+            self._content_to_text(last_user.get("content")),
+            self._content_to_text(last_assistant.get("content")))
+
+    async def extract_channel_memory_from_exchange(self, channel_id: Optional[str],
+                                                   user_text: str, assistant_text: str) -> None:
+        """The extractor itself, given the exchange rather than asked to find it.
+
+        Split out so a channel turn can supply what it COMMITTED — the words Slack accepted — and
+        a silent, suppressed or failed turn supplies nothing at all. Reading the intended reply
+        instead of the delivered one is how a turn that never spoke came to write a memory about
+        having spoken.
+        """
+        if not config.enable_channel_memory:
+            return
+        db = getattr(self, "db", None)
+        openai_client = getattr(self, "openai_client", None)
+        if not channel_id or not db or not openai_client:
+            return
+        if not (user_text or "").strip() or not (assistant_text or "").strip():
+            return
+        exchange = f"User: {user_text}\nAssistant: {assistant_text}"
 
         try:
             existing = await db.get_channel_memory_async(channel_id)

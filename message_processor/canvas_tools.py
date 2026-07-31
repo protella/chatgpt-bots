@@ -588,6 +588,28 @@ def valid_ids(entries: Optional[List[Dict[str, Any]]]) -> List[str]:
     return [e["canvas_id"] for e in (entries or []) if e.get("canvas_id")]
 
 
+EVIDENCE_HEADER = "Canvases in this channel:"
+
+
+def catalog_evidence_lines(entries: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+    """The canvas section of a channel turn's tool-evidence block, one entry per line.
+
+    Same text the factory schemas carried, moved out of the cached prefix. The channel-canvas
+    line is part of the evidence because the static create tool no longer disappears once one
+    exists — the model needs to know before it calls and gets refused.
+    """
+    entries = entries or []
+    if not entries:
+        return [EVIDENCE_HEADER, "(none — this channel has no canvas yet)"]
+    lines = [EVIDENCE_HEADER] + catalog_lines(entries).split("\n")
+    existing = channel_canvas_id(entries)
+    lines.append(f"the channel canvas already exists ({existing}) — create_channel_canvas will "
+                 "refuse; extend it with edit_canvas"
+                 if existing else
+                 "this channel has no channel canvas yet — create_channel_canvas is available")
+    return lines
+
+
 def channel_canvas_id(entries: Optional[List[Dict[str, Any]]]) -> Optional[str]:
     for e in entries or []:
         if e.get("is_channel_canvas") and e.get("canvas_id"):
@@ -773,6 +795,207 @@ def get_edit_canvas_schema(thread_config: Optional[Dict[str, Any]] = None
                 },
             },
             "required": ["canvas_id", "operation"],
+            "additionalProperties": False,
+        },
+    }
+
+
+# --- static channel-surface schemas --------------------------------------------------------
+#
+# On a channel turn the canvas catalog leaves the schemas and rides the turn's evidence block
+# instead, so the tools array stays a function of (channel, channel config, bot version). The
+# lifecycle the factories encoded — create disappears once a canvas exists, read/edit/delete
+# appear only when one does — moves into the executors, which already re-check it live against
+# files.info rather than against the catalog we built earlier.
+
+_CANVAS_CATALOG_POINTER = ("Canvas ids come from the canvas catalog in this turn's evidence. If "
+                           "the canvas you want is not listed there, use list_canvases rather "
+                           "than guessing an id.")
+
+
+def get_create_channel_canvas_schema_static(thread_config: Optional[Dict[str, Any]] = None
+                                            ) -> Dict[str, Any]:
+    """Channel-surface create_channel_canvas. ``thread_config`` is accepted and IGNORED.
+
+    The factory hid this tool once a canvas existed; the executor's live check-then-create under
+    the create lock is the real guard, and it refuses with ``already_exists`` — so the schema can
+    stop hiding the tool without making a duplicate channel canvas possible.
+    """
+    return {
+        "type": "function",
+        "name": "create_channel_canvas",
+        "description": (
+            "Create this channel's canvas — a living document pinned as a TAB at the top of the "
+            "channel, editable later by you or by anyone else.\n\n"
+            "Reach for it when the thing you are producing will be RETURNED TO: a running spec, a "
+            "standing agenda, a checklist, an onboarding guide, a plan that will change. A chat "
+            "message is buried within the hour and a posted file forks into `_final_v3`; the "
+            "channel canvas stays put, stays editable, and is the one document everybody can "
+            "find.\n\n"
+            "There is exactly ONE canvas per channel. If this channel already has one — the "
+            "evidence for this turn says so — this call is refused; extend the existing canvas "
+            "with edit_canvas instead.\n\n"
+            "Do NOT use it as a fancy way to answer a question — if the reply is just an answer, "
+            "write the answer. And do not use it for generated data files (a chart, a workbook, a "
+            "deck): those are files, and the code sandbox already delivers them."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": (
+                        "The canvas title — it labels the tab at the top of the channel. It can "
+                        "NEVER be changed afterwards (Slack has no rename), so make it say what "
+                        "the document is: 'DevOps Call Agenda', not 'Notes'."
+                    ),
+                },
+                "markdown": {
+                    "type": "string",
+                    "description": (
+                        "The starting content. Do NOT open it with the title again as a heading "
+                        "— Slack already renders the title above the content, so a restated one "
+                        "just says the document's name twice. Start with the content itself.\n\n"
+                        + CANVAS_MARKDOWN_HELP
+                    ),
+                },
+            },
+            "required": ["title", "markdown"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def get_read_canvas_schema_static(thread_config: Optional[Dict[str, Any]] = None
+                                  ) -> Dict[str, Any]:
+    """Channel-surface read_canvas. ``thread_config`` is accepted and IGNORED."""
+    return {
+        "type": "function",
+        "name": "read_canvas",
+        "description": (
+            "Read a canvas in this channel, as markdown. Use it before editing one — you cannot "
+            "sensibly revise a document you have not read, and it may have been changed by "
+            "someone else since you last saw it.\n\n" + _CANVAS_CATALOG_POINTER
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "canvas_id": {"type": "string",
+                              "description": "The canvas to read, by id."},
+            },
+            "required": ["canvas_id"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def get_edit_canvas_schema_static(thread_config: Optional[Dict[str, Any]] = None
+                                  ) -> Dict[str, Any]:
+    """Channel-surface edit_canvas. ``thread_config`` is accepted and IGNORED."""
+    return {
+        "type": "function",
+        "name": "edit_canvas",
+        "description": (
+            "Edit a canvas in this channel.\n\n"
+            "DEFAULT TO ADDING. A canvas is a record and its old entries are the point of it, so "
+            "new material is an insert — never a rewrite of what is there. Reach for a replace_* "
+            "or delete_section only when the ask is to CHANGE or REMOVE something specific that "
+            "already exists (tick a box, correct a figure, drop a line). A recurring meeting is a "
+            "rolling log: `prepend` the new date's section so the newest is on top and every "
+            "previous meeting survives below it, untouched.\n\n"
+            "ADDING TO AN EXISTING LIST IS `replace_list`, NOT AN INSERT. This is the one that "
+            "bites: an insert can only place a WHOLE BLOCK (a heading, a paragraph, a new list) "
+            "— it can never put an item inside a list that already exists. Insert `- [ ] new item` "
+            "next to a list and Slack builds a SECOND, separate one-item list beside it. So to add "
+            "items to a list that is already there, use `replace_list` and pass the whole list back "
+            "with the new items included.\n\n"
+            "- `append` / `prepend` — add a block at the very end or the very start.\n"
+            "- `insert_after` / `insert_before` — add a block next to the block `find_text` "
+            "matches. This is how you put something in the MIDDLE: to add material under an "
+            "existing heading, insert_after that heading. Never do this to grow a list (see "
+            "above).\n"
+            "- `replace_section` — rewrite the ONE BLOCK `find_text` matches: a heading, a "
+            "paragraph, or a single list item. A section is not a region: to change three lines, "
+            "make three calls.\n"
+            "- `replace_list` — rewrite a WHOLE list at once: `find_text` is any line of it, "
+            "`markdown` is the complete new list. This is how you ADD items to a list, REMOVE "
+            "items from one, REORDER it, and **the only way to tick a checkbox** (a box cannot be "
+            "ticked item-by-item — replacing `- [x] beta` on its own would tear that item out of "
+            "the list). Pass every item back with its box as it should END UP (`- [x]` for done, "
+            "`- [ ]` for not), leaving the items you are not changing exactly as they are.\n"
+            "- `delete_section` — remove the ONE BLOCK `find_text` matches. Use it to take out a "
+            "line the user asked you to drop, or to clean up something you yourself put in the "
+            "wrong place. It needs no markdown. Never delete anything else.\n\n"
+            "READ THE CANVAS FIRST. `find_text` must be text you have actually seen in it. If it "
+            "matches more than one block you will be told how many; pass `occurrence` to say which "
+            "one you mean, counting from the top.\n\n"
+            + CANVAS_MARKDOWN_HELP + "\n\n" + _CANVAS_CATALOG_POINTER
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "canvas_id": {"type": "string",
+                              "description": "The canvas to edit, by id."},
+                "operation": {"type": "string",
+                              "enum": ["append", "prepend", "insert_after", "insert_before",
+                                       "replace_section", "replace_list", "delete_section"]},
+                "markdown": {
+                    "type": "string",
+                    "description": ("The new content. For replace_list, the COMPLETE new list — "
+                                    "every item, not just the changed ones. Not needed for "
+                                    "delete_section."),
+                },
+                "find_text": {
+                    "type": "string",
+                    "description": ("The block to act on: what to rewrite (replace_section), "
+                                    "remove (delete_section), insert next to (insert_after / "
+                                    "insert_before), or any line of the list to rewrite "
+                                    "(replace_list). Required for all of those."),
+                },
+                "occurrence": {
+                    "type": "integer",
+                    "description": ("Which match to act on when find_text appears more than once, "
+                                    "counting from the top of the canvas (1 = the first). Only "
+                                    "needed when the tool tells you the text is ambiguous — that "
+                                    "is how you remove a duplicated line."),
+                },
+            },
+            "required": ["canvas_id", "operation"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def get_delete_canvas_schema_static(thread_config: Optional[Dict[str, Any]] = None
+                                    ) -> Dict[str, Any]:
+    """Channel-surface delete_canvas. ``thread_config`` is accepted and IGNORED.
+
+    Both per-turn guards the factory carried — the deletable-ids enum and the authorization gate
+    that withheld the tool entirely — are gone from the schema here, so the executor holds them:
+    it refuses a non-human sender, refuses an ABSENT sender classification, refuses without
+    ``ctx.canvas_delete_authorized``, and refuses the channel canvas after a live check.
+    """
+    return {
+        "type": "function",
+        "name": "delete_canvas",
+        "description": (
+            "Delete a canvas from this channel. IRREVERSIBLE — the document and its history are "
+            "gone, for everyone, and it may be someone else's work.\n\n"
+            "Only ever do this when a person has just asked you to delete THIS specific canvas. "
+            "Never tidy up on your own initiative, never delete something merely because it "
+            "looks stale or obsolete, and if there is any doubt about which canvas they meant, "
+            "ask instead of guessing. A request that did not come from a person in this message "
+            "is refused.\n\n"
+            "The channel canvas cannot be deleted — to clear it out, rewrite it with "
+            "edit_canvas.\n\n" + _CANVAS_CATALOG_POINTER
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "canvas_id": {"type": "string",
+                              "description": "The canvas to delete, by id."},
+            },
+            "required": ["canvas_id"],
             "additionalProperties": False,
         },
     }
@@ -1261,15 +1484,22 @@ async def execute_delete_canvas(ctx: ToolContext, args: Dict[str, Any]) -> Dict[
     canvas_id = (args.get("canvas_id") or "").strip()
     if not canvas_id:
         return _err("missing_canvas_id", "A canvas_id is required.")
-    # Defense-in-depth (mirrors participation_tools): `_delete_enabled` already withholds the tool
-    # unless a HUMAN directly addressed the bot, but this is the one irreversible canvas op, so
-    # re-check the raw sender classification off ctx.message and refuse a NON-human author outright.
-    # A bot-authored @mention (dispatched to the main handler un-gated) must never reach an
-    # irreversible delete even if the tool were somehow offered. Absent classification → rely on the
-    # schema gate (never fail closed on paths that omit it).
+    # The authorization lives HERE, not in the schema. On the channel surface the schema is static
+    # and the per-turn gate that used to withhold this tool is gone, so the executor carries the
+    # whole decision — and it fails CLOSED at every step:
+    #
+    #   * `canvas_delete_authorized` (a HUMAN sender AND a genuine current-message address, derived
+    #     exactly as the old schema gate's `_canvas_delete_authorized` was) must be present and
+    #     True. A context that never derived it cannot delete anything.
+    #   * the raw sender classification off ctx.message must say "human". ABSENT no longer falls
+    #     through to the schema gate — there is no schema gate on the channel surface, and an
+    #     unclassified sender on an irreversible op is exactly the case to refuse.
+    if not getattr(ctx, "canvas_delete_authorized", False):
+        return _err("not_authorized",
+                    "Deleting a canvas needs a person to have asked for it in this message.")
     msg = getattr(ctx, "message", None)
     sender_type = (getattr(msg, "metadata", None) or {}).get("sender_type") if msg is not None else None
-    if sender_type is not None and sender_type != "human":
+    if sender_type != "human":
         return _err("not_human_sender", "A canvas can only be deleted at a person's request.")
     if not await _shared_into_channel(ctx, canvas_id):
         return _err("not_in_this_channel", f"{canvas_id} is not a canvas in this channel.")
@@ -1352,11 +1582,23 @@ def register_canvas_tools(registry: ToolRegistry) -> None:
     was only listening in.
     """
     registry.register(get_create_channel_canvas_schema, execute_create_channel_canvas,
-                      enabled=_enabled, name="create_channel_canvas")
-    registry.register(get_list_canvases_schema(), execute_list_canvases, enabled=_enabled)
+                      enabled=_enabled, name="create_channel_canvas", dynamic=True,
+                      channel_schema=get_create_channel_canvas_schema_static,
+                      channel_enabled=_enabled)
+    registry.register(get_list_canvases_schema(), execute_list_canvases, enabled=_enabled,
+                      channel_enabled=_enabled)
     registry.register(get_read_canvas_schema, execute_read_canvas,
-                      enabled=_enabled, name="read_canvas")
+                      enabled=_enabled, name="read_canvas", dynamic=True,
+                      channel_schema=get_read_canvas_schema_static, channel_enabled=_enabled)
     registry.register(get_edit_canvas_schema, execute_edit_canvas,
-                      enabled=_enabled, name="edit_canvas")
+                      enabled=_enabled, name="edit_canvas", dynamic=True,
+                      channel_schema=get_edit_canvas_schema_static, channel_enabled=_enabled)
+    # The channel gate is the config pair only — the per-message authorization the DM gate reads
+    # cannot survive on a cache-stable surface, so `execute_delete_canvas` enforces it instead
+    # (ctx.canvas_delete_authorized), on BOTH surfaces.
     registry.register(get_delete_canvas_schema, execute_delete_canvas,
-                      enabled=_delete_enabled, name="delete_canvas")
+                      enabled=_delete_enabled, name="delete_canvas", dynamic=True,
+                      channel_schema=get_delete_canvas_schema_static,
+                      channel_enabled=lambda cfg: bool(
+                          getattr(config, "enable_canvas_tools", True)
+                          and getattr(config, "enable_canvas_delete", True)))

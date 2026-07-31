@@ -6,8 +6,8 @@ from typing import Any, Callable, Dict, List, Optional
 import aiohttp
 from openai import AsyncOpenAI
 
-from config import config
-from logger import LoggerMixin
+from config import clamp_effort, config
+from logger import LoggerMixin, setup_logger
 from openai_client.container_errors import is_container_gone
 
 from .api import images as image_api
@@ -15,6 +15,188 @@ from .api import responses as responses_api
 from .api import tool_loop as tool_loop_api
 from .api import vision as vision_api
 from .utilities import ImageData
+
+_request_log = setup_logger(name="slack_bot.request_builder")
+
+# What a channel-layout request may carry. Typed items are the tool loop's own round-trip
+# records; the content parts are the only ones the Responses API accepts inside a role message.
+_CHANNEL_TYPED_ITEMS = ("function_call", "function_call_output", "reasoning")
+
+# The keys each content part may keep, from the SDK's own param types
+# (openai.types.responses.response_input_{text,image,file}_param). Our part dicts do double duty
+# — API part AND DB metadata — so `source`, `url`, `original_url` and friends ride along and one
+# of them is a 400 for the whole turn. Type alone is not enough: the keys have to be picked off.
+#
+# `file_id` is excluded on both image and file parts even though the SDK accepts it. It means an
+# OPENAI file id and ours is Slack's (`F0BGSHE3JGJ`), which earns its own 400. Same rule as
+# message_processor.utilities._API_PART_KEYS, which sanitizes upstream.
+_CHANNEL_PART_KEYS: Dict[Any, tuple] = {
+    "input_text": ("type", "text", "prompt_cache_breakpoint"),
+    "input_image": ("type", "image_url", "detail", "prompt_cache_breakpoint"),
+    "input_file": ("type", "filename", "file_data", "file_url", "detail",
+                   "prompt_cache_breakpoint"),
+}
+
+
+def attach_cache_breakpoint(part: Dict[str, Any], model: Optional[str]) -> Dict[str, Any]:
+    """Mark a content part as an explicit prompt-cache breakpoint.
+
+    Explicit breakpoints exist only on the 5.6 family; on anything else the marker is an
+    unknown parameter, so the part comes back unchanged and the miss is logged. Returns a NEW
+    dict when it marks — never mutates the caller's part.
+    """
+    if not str(model or "").startswith("gpt-5.6"):
+        _request_log.debug(
+            f"prompt_cache_breakpoint unsupported on {model}; part left unmarked")
+        return part
+    return {**part, "prompt_cache_breakpoint": {"mode": "explicit"}}
+
+
+def _channel_input_items(input_items: List[Dict[str, Any]],
+                         model: str) -> List[Dict[str, Any]]:
+    """The channel stream, allowlisted.
+
+    Anything the API would reject is dropped rather than passed on: our own dicts do double
+    duty (API part AND DB metadata), and one stray key is a 400 for the whole turn. Every part
+    is rebuilt from `_CHANNEL_PART_KEYS` rather than forwarded, so the caller's dict is never
+    mutated and a 5.5 retry never edits an input a later 5.6 retry reuses.
+    """
+    keep_breakpoints = model.startswith("gpt-5.6")
+    items: List[Dict[str, Any]] = []
+    for item in input_items or []:
+        if not isinstance(item, dict):
+            _request_log.debug("channel layout dropped a non-dict input item")
+            continue
+        item_type = item.get("type")
+        if item_type is not None:
+            if item_type in _CHANNEL_TYPED_ITEMS:
+                items.append(item)
+            else:
+                _request_log.debug(f"channel layout dropped input item type {item_type!r}")
+            continue
+        role, content = item.get("role"), item.get("content")
+        if not role:
+            _request_log.debug("channel layout dropped an input item with no role")
+            continue
+        if isinstance(content, str):
+            items.append({"role": role, "content": content})
+            continue
+        if not isinstance(content, list):
+            _request_log.debug(f"channel layout dropped {role} item with unusable content")
+            continue
+        parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            allowed = _CHANNEL_PART_KEYS.get(part.get("type"))
+            if allowed is None:
+                continue
+            clean = {k: v for k, v in part.items() if k in allowed and v is not None}
+            if not keep_breakpoints:
+                clean.pop("prompt_cache_breakpoint", None)
+            parts.append(clean)
+        if not parts:
+            _request_log.debug(f"channel layout dropped {role} item with no usable parts")
+            continue
+        items.append({"role": role, "content": parts})
+    return items
+
+
+def _build_request_params(
+    *,
+    model: Optional[str],
+    input_items: List[Dict[str, Any]],
+    system_prompt: Optional[str] = None,
+    max_output_tokens: Optional[int] = None,
+    reasoning_effort: Optional[str] = None,
+    verbosity: Optional[str] = None,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    stream: bool = False,
+    store: bool = False,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    tool_choice: Optional[str] = None,
+    parallel_tool_calls: Optional[bool] = None,
+    include: Optional[List[str]] = None,
+    prompt_cache_key: Optional[str] = None,
+    prompt_cache_options: Optional[Dict[str, Any]] = None,
+    layout: str = "legacy",
+    legacy_kind: str = "plain",
+    legacy_cache_params: bool = True,
+) -> Dict[str, Any]:
+    """Assemble one Responses-API request.
+
+    ``layout="legacy"`` reproduces what each caller built for itself: ``legacy_kind="plain"``
+    prepends the system prompt as a developer input item, ``"tools"`` promotes it to top-level
+    ``instructions``. DM turns stay on it, byte for byte, including the plain timeout twin's
+    missing cache params (``legacy_cache_params=False``) — that gap is a bug, but it is a
+    SHIPPED request shape and only the channel layout fixes it.
+
+    ``layout="channel"`` is the one canonical shape (spec §3): instructions for every path,
+    allowlisted input items, cache policy applied everywhere.
+    """
+    model = model or config.gpt_model
+    temperature = temperature if temperature is not None else config.default_temperature
+    max_output_tokens = max_output_tokens or config.default_max_tokens
+    top_p = top_p if top_p is not None else config.default_top_p
+    # Clamp guards against stored/legacy efforts the model rejects (`minimal` on 5.6,
+    # `max` on 5.5).
+    effort = clamp_effort(model, reasoning_effort or config.default_reasoning_effort)
+    channel = layout == "channel"
+
+    if channel:
+        items = _channel_input_items(input_items, model)
+    elif legacy_kind == "tools":
+        # Raw Responses-API items (function_call / function_call_output from the tool loop)
+        # carry a "type" and pass through as-is.
+        items = [msg if "type" in msg else {"role": msg["role"], "content": msg["content"]}
+                 for msg in input_items]
+    else:
+        items = [{"role": "developer", "content": system_prompt}] if system_prompt else []
+        items += [{"role": msg["role"], "content": msg["content"]} for msg in input_items]
+
+    params: Dict[str, Any] = {"model": model, "input": items}
+    if tools is not None or legacy_kind == "tools":
+        params["tools"] = tools
+    params["temperature"] = temperature
+    params["max_output_tokens"] = max_output_tokens
+    params["store"] = store
+    if stream:
+        params["stream"] = True
+    if parallel_tool_calls is not None:
+        params["parallel_tool_calls"] = parallel_tool_calls
+    if tool_choice is not None:
+        params["tool_choice"] = tool_choice
+    if include is not None:
+        params["include"] = include
+    if system_prompt and (channel or legacy_kind == "tools"):
+        params["instructions"] = system_prompt
+
+    params["reasoning"] = {"effort": effort}
+    params["text"] = {"verbosity": verbosity or config.default_verbosity}
+
+    # gpt-5.5 and the 5.6 family allow temperature/top_p when reasoning=none
+    # (5.6 verified live 2026-07-09: effort=none + temperature/top_p -> 200)
+    if (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")) and effort == "none":
+        params["top_p"] = top_p
+    else:
+        params["temperature"] = 1.0  # MUST be 1.0 for reasoning models
+
+    if channel or legacy_cache_params:
+        # gpt-5.5 keeps the explicit 24h retention param; the 5.6 family caches implicitly
+        # (retention is deprecated there) and takes explicit breakpoints instead. The
+        # per-thread key routes repeat calls to the same cache shard on both.
+        if model.startswith("gpt-5.5"):
+            params["prompt_cache_retention"] = "24h"
+        if prompt_cache_key and (model.startswith("gpt-5.5") or model.startswith("gpt-5.6")):
+            params["prompt_cache_key"] = prompt_cache_key
+        if prompt_cache_options:
+            if model.startswith("gpt-5.6"):
+                params["prompt_cache_options"] = prompt_cache_options
+            else:
+                _request_log.debug(
+                    f"prompt_cache_options dropped: unsupported on {model}")
+    return params
 
 
 class OpenAIClient(LoggerMixin):
@@ -227,7 +409,10 @@ class OpenAIClient(LoggerMixin):
         verbosity: Optional[str] = None,
         store: bool = False,
         prompt_cache_key: Optional[str] = None,
+        prompt_cache_options: Optional[Dict[str, Any]] = None,
         usage_sink: Optional[Dict[str, Any]] = None,
+        attempt_sink: Optional[Any] = None,
+        layout: str = "legacy",
     ) -> str:
         return await responses_api.create_text_response(
             self,
@@ -241,7 +426,10 @@ class OpenAIClient(LoggerMixin):
             verbosity=verbosity,
             store=store,
             prompt_cache_key=prompt_cache_key,
+            prompt_cache_options=prompt_cache_options,
             usage_sink=usage_sink,
+            attempt_sink=attempt_sink,
+            layout=layout,
         )
 
     async def create_text_response_with_tools(
@@ -258,7 +446,9 @@ class OpenAIClient(LoggerMixin):
         store: bool = False,
         return_metadata: bool = False,
         prompt_cache_key: Optional[str] = None,
+        prompt_cache_options: Optional[Dict[str, Any]] = None,
         usage_sink: Optional[Dict[str, Any]] = None,
+        attempt_sink: Optional[Any] = None,
         mcp_tools_sink: Optional[Dict[str, Any]] = None,
         # Pre-existing gap found while wiring F32: handlers/text.py has always passed
         # mcp_results_sink here, but this wrapper never accepted it — so the no-tool-loop
@@ -267,6 +457,7 @@ class OpenAIClient(LoggerMixin):
         mcp_results_sink: Optional[List[Dict[str, Any]]] = None,
         artifacts_sink: Optional[List[Dict[str, Any]]] = None,
         container_gone_sink: Optional[List[str]] = None,
+        layout: str = "legacy",
     ) -> str:
         return await responses_api.create_text_response_with_tools(
             self,
@@ -282,11 +473,14 @@ class OpenAIClient(LoggerMixin):
             store=store,
             return_metadata=return_metadata,
             prompt_cache_key=prompt_cache_key,
+            prompt_cache_options=prompt_cache_options,
             usage_sink=usage_sink,
+            attempt_sink=attempt_sink,
             mcp_tools_sink=mcp_tools_sink,
             mcp_results_sink=mcp_results_sink,
             artifacts_sink=artifacts_sink,
             container_gone_sink=container_gone_sink,
+            layout=layout,
         )
 
     async def create_streaming_response(
@@ -303,7 +497,10 @@ class OpenAIClient(LoggerMixin):
         store: bool = False,
         tool_callback: Optional[Callable[[str, str], Any]] = None,
         prompt_cache_key: Optional[str] = None,
+        prompt_cache_options: Optional[Dict[str, Any]] = None,
         usage_sink: Optional[Dict[str, Any]] = None,
+        attempt_sink: Optional[Any] = None,
+        layout: str = "legacy",
     ) -> str:
         return await responses_api.create_streaming_response(
             self,
@@ -319,7 +516,10 @@ class OpenAIClient(LoggerMixin):
             store=store,
             tool_callback=tool_callback,
             prompt_cache_key=prompt_cache_key,
+            prompt_cache_options=prompt_cache_options,
             usage_sink=usage_sink,
+            attempt_sink=attempt_sink,
+            layout=layout,
         )
 
     async def create_streaming_response_with_tools(
@@ -337,7 +537,9 @@ class OpenAIClient(LoggerMixin):
         store: bool = False,
         tool_callback: Optional[Callable[[str, str], Any]] = None,
         prompt_cache_key: Optional[str] = None,
+        prompt_cache_options: Optional[Dict[str, Any]] = None,
         usage_sink: Optional[Dict[str, Any]] = None,
+        attempt_sink: Optional[Any] = None,
         mcp_tools_sink: Optional[Dict[str, Any]] = None,
         # Same pre-existing gap as the non-streaming wrapper above — handlers/text.py passes
         # this on the no-tool-loop branch and it was never accepted here.
@@ -345,6 +547,7 @@ class OpenAIClient(LoggerMixin):
         tool_event_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
         artifacts_sink: Optional[List[Dict[str, Any]]] = None,
         container_gone_sink: Optional[List[str]] = None,
+        layout: str = "legacy",
     ) -> str:
         return await responses_api.create_streaming_response_with_tools(
             self,
@@ -361,12 +564,15 @@ class OpenAIClient(LoggerMixin):
             store=store,
             tool_callback=tool_callback,
             prompt_cache_key=prompt_cache_key,
+            prompt_cache_options=prompt_cache_options,
             usage_sink=usage_sink,
+            attempt_sink=attempt_sink,
             mcp_tools_sink=mcp_tools_sink,
             mcp_results_sink=mcp_results_sink,
             tool_event_callback=tool_event_callback,
             artifacts_sink=artifacts_sink,
             container_gone_sink=container_gone_sink,
+            layout=layout,
         )
 
     async def create_text_response_with_tool_loop(
@@ -613,6 +819,10 @@ class OpenAIClient(LoggerMixin):
         verbosity: Optional[str] = None,
         store: bool = False,
         timeout_seconds: float = 60.0,
+        prompt_cache_key: Optional[str] = None,
+        prompt_cache_options: Optional[Dict[str, Any]] = None,
+        attempt_sink: Optional[Any] = None,
+        layout: str = "legacy",
     ) -> str:
         return await responses_api._create_text_response_with_timeout(
             self,
@@ -626,6 +836,10 @@ class OpenAIClient(LoggerMixin):
             verbosity=verbosity,
             store=store,
             timeout_seconds=timeout_seconds,
+            prompt_cache_key=prompt_cache_key,
+            prompt_cache_options=prompt_cache_options,
+            attempt_sink=attempt_sink,
+            layout=layout,
         )
 
     async def _create_text_response_with_tools_with_timeout(
@@ -635,7 +849,7 @@ class OpenAIClient(LoggerMixin):
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
-        top_p: Optional[str] = None,
+        top_p: Optional[float] = None,
         system_prompt: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
         verbosity: Optional[str] = None,
@@ -643,11 +857,14 @@ class OpenAIClient(LoggerMixin):
         timeout_seconds: float = 60.0,
         return_metadata: bool = False,
         prompt_cache_key: Optional[str] = None,
+        prompt_cache_options: Optional[Dict[str, Any]] = None,
         usage_sink: Optional[Dict[str, Any]] = None,
+        attempt_sink: Optional[Any] = None,
         mcp_tools_sink: Optional[Dict[str, Any]] = None,
         mcp_results_sink: Optional[List[Dict[str, Any]]] = None,
         artifacts_sink: Optional[List[Dict[str, Any]]] = None,
         container_gone_sink: Optional[List[str]] = None,
+        layout: str = "legacy",
     ) -> str:
         return await responses_api._create_text_response_with_tools_with_timeout(
             self,
@@ -664,12 +881,15 @@ class OpenAIClient(LoggerMixin):
             timeout_seconds=timeout_seconds,
             return_metadata=return_metadata,
             prompt_cache_key=prompt_cache_key,
+            prompt_cache_options=prompt_cache_options,
             usage_sink=usage_sink,
+            attempt_sink=attempt_sink,
             mcp_tools_sink=mcp_tools_sink,
             mcp_results_sink=mcp_results_sink,
             artifacts_sink=artifacts_sink,
             container_gone_sink=container_gone_sink,
+            layout=layout,
         )
 
 
-__all__ = ["OpenAIClient", "ImageData"]
+__all__ = ["OpenAIClient", "ImageData", "attach_cache_breakpoint"]

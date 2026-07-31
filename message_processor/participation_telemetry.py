@@ -18,18 +18,26 @@ WHAT THIS IS NOT. It changes no behaviour and gates nothing. Every entry point s
 exceptions and returns None: a telemetry failure must never cost a verdict, a reply or a
 reaction. Nothing here is read back by the bot at runtime — the file is for us.
 
-THE POPULATION IS GATE ATTEMPTS, and only those. An attempt begins when `_run_participation_gate`
-mints an `attempt_id`; mentions, DMs and direct thread continuations mint none and are NOT IN THIS
-POPULATION — no gate_start, no decision, no terminal, no reactions, no work claims. The one place
-an ungated turn is named at all is `queue_link`, and only ever as the DESTINATION of somebody
-else's queued work (`batched_into_channel_id` / `batched_into_trigger_ts`, with
-`batched_into_gate_required=false` and no attempt id, because there is none). That names a turn;
-it does not enrol it. Every count here still has gated attempts as its denominator. Neither do the
-messages dropped BEFORE dispatch (level=off, own message, non-semantic subtype, and the
-engine-off short-circuit in message_events) — they never reach the gate, so any rate computed
-here has "messages that entered the gate" as its denominator and nothing wider. The
-`gate_declined(cause=engine_off)` event covers only the OTHER engine-off path, the one inside
-the gate itself.
+TWO POPULATIONS, NEVER ONE. Since v8 this file records both, and they must never be divided into
+each other (the split is spelled out at `turn_start` below).
+
+The GATE-ATTEMPT population is keyed by `attempt_id` and covers `gate_start`, `gate_decision`,
+`gate_declined`, `reaction`, `visible_action` and the `stale_send`/`queue_link` diagnostics. An
+attempt begins when `_run_participation_gate` mints an id; mentions, DMs and direct thread
+continuations mint none and are NOT IN IT — no gate_start, no decision, no terminal, no reactions,
+no work claims. The one place an ungated turn is named at all is `queue_link`, and only ever as the
+DESTINATION of somebody else's queued work (`batched_into_channel_id` / `batched_into_trigger_ts`,
+with `batched_into_gate_required=false` and no attempt id, because there is none). That names a
+turn; it does not enrol it. Neither do the messages dropped BEFORE dispatch (level=off, own
+message, non-semantic subtype, and the engine-off short-circuit in message_events) — they never
+reach the gate, so any rate over this population has "messages that entered the gate" as its
+denominator and nothing wider. The `gate_declined(cause=engine_off)` event covers only the OTHER
+engine-off path, the one inside the gate itself.
+
+The CHANNEL-TURN population is keyed by `turn_id` and covers `turn_start`, `turn_outcome`,
+`stream_render`, `model_response`, `outbound_receipt` and `compaction_snapshot`. EVERY channel
+turn is in it, gated or not — a mention and a continuation write turn rows while writing no gate
+rows at all — so its denominator is `turn_start` and is strictly wider than `gate_start`.
 
 EVENTS.
   session_start   the sink opened. A health marker and a restart boundary, NOT an attempt: it
@@ -65,6 +73,21 @@ EVENTS.
                   answered on its behalf. See the linkage rule below.
   reaction        one attempt at one emoji: operation (add/remove) x result (added /
                   already_present / refused / failed / removed / remove_failed).
+  turn_start      a CHANNEL turn opened (v8). Keyed by `turn_id`, not `attempt_id`: every channel
+                  turn writes one, including the mentions and continuations no gate judged. It is
+                  the denominator of the TURN population, which is not the gate population — the
+                  two must never be divided into each other.
+  turn_outcome    what that turn ended up doing, exactly once per turn_start, assembled in the
+                  outer finally from the turn's own accumulated state. NOT a terminal event in the
+                  `visible_action` sense; it describes a turn, not a gate attempt.
+  stream_render   one channel stream BUILD: the pinned window, the hashes that identify it, and
+                  what it cost in bytes. Joins to its turn by `turn_id`.
+  model_response  one Responses API attempt on a channel turn, success or failure.
+  outbound_receipt one receipt state transition (spec §5), from the transition's own result rather
+                  than from what the caller intended.
+  compaction_snapshot
+                  a compaction snapshot pointer was read, published or invalidated. In P2 only
+                  `op=read` is emitted, and it means the turn is about to fail closed.
   visible_action  THE SOLE TERMINAL EVENT. Exactly one per attempt in a HEALTHY EMITTED LEDGER,
                   guaranteed by `finish_attempt`, which flips a flag on the message and no-ops
                   on any second call.
@@ -127,16 +150,20 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import queue
 import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Mapping
+from dataclasses import dataclass
 from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from config import config
+from runtime_identity import SESSION_ID
 from logger import (LOG_ROTATION_BACKUP_COUNT, LOG_ROTATION_MAX_BYTES,
                     USE_CONCURRENT_HANDLER, setup_logger)
 
@@ -170,7 +197,15 @@ logger = setup_logger(name="slack_bot.ParticipationTelemetry")
 #     terminal `silence` with NO `silence_reason`: that enum belongs to the responder, which can
 #     say why it chose quiet after seeing everything, where the gate knows only that it did not
 #     open. `classifier_error` no longer arrives with a manufactured decision beside it.
-CONTRACT_VERSION = 7
+# v8: the SINGLE STREAM (Docs/SINGLE_STREAM_SPEC.md §10). Six new events — turn_start,
+#     turn_outcome, stream_render, model_response, outbound_receipt, compaction_snapshot — and
+#     with them a SECOND population keyed by `turn_id` rather than `attempt_id`, covering every
+#     CHANNEL turn including the ungated ones the gate population deliberately excludes. Event
+#     cardinality per attempt therefore changed, which is what earns the bump; `visible_action`
+#     itself is untouched, keeps its vocabulary, and remains the sole terminal of a gate attempt.
+#     A `turn_outcome` is NOT a terminal event and must never be counted as one: the two
+#     populations answer different questions and their rows join, at most, by attempt_id.
+CONTRACT_VERSION = 8
 
 # WHICH gate produced these lines. The rich multi-signal classifier was "rich-v1"; the one-bit
 # wake gate is "binary-v1". A different gate is a different population even at the same
@@ -179,9 +214,9 @@ CONTRACT_VERSION = 7
 # nothing about the rate of the other. v2–v6 rows stay valid under their own contracts.
 GATE_CONTRACT = "binary-v1"
 
-# One per process. Restarts lose all in-memory participation state, so a line's session is what
+# One per process (runtime_identity), so a ledger line and a receipt row from the same run name
+# the same session. Restarts lose all in-memory participation state, so a line's session is what
 # tells a burst of odd verdicts after a deploy apart from a genuine change in the room.
-SESSION_ID = uuid.uuid4().hex
 
 # A RESTART IS NOT A DEPLOYMENT. `session` separates two runs; it cannot say whether the second
 # run is the same code as the first, and the interesting comparisons here — did the prompt change
@@ -224,6 +259,30 @@ REACTION_RESULTS = frozenset({
 # vocabulary because v2–v6 history is full of them and a reader of those rows must not be told
 # they are invalid.
 REACTION_ORIGINS = frozenset({"gate", "responder", "work_claim", "backoff_ack"})
+
+# v8 vocabularies. Same rule as above: an odd value is written and warned about, never dropped.
+# `turn_outcome.kind` deliberately reuses KINDS — a turn and its gate attempt describe the same
+# room, and two vocabularies for one question would make the rows uncomparable.
+TURN_SURFACES = frozenset({"channel", "dm"})
+# The receipt ops, matching outbound_receipts' lattice plus the two that have no lattice op:
+# `reconcile_finalize` (boot, per row) and `pending_resolve` (an upload's share ts arriving).
+RECEIPT_OPS = frozenset({
+    "register", "promote", "finalize", "demote", "transfer", "delete", "reconcile_finalize",
+    "pending_resolve",
+})
+# `absent` is a real prior state: a finalize may insert a row that was never registered.
+RECEIPT_STATES = frozenset({"absent", "in_flight", "finalized", "chrome"})
+# `build` is the compaction MODEL-CALL accounting: exactly ONE per generation attempt, success or
+# failure, aggregating every map call and every level of the hierarchical reduce (§1l).
+SNAPSHOT_OPS = frozenset({"read", "publish", "invalidate", "stale_retained", "build"})
+# The two ops that ride the telemetry OUTBOX. The rest are direct writes and best-effort.
+OUTBOX_OPS = frozenset({"build", "publish"})
+# `copied` is a real build status: a stale-retained copy IS a publication, and its build records
+# that no model call was made.
+BUILD_STATUSES = frozenset({"ok", "failed", "discarded", "copied"})
+BUILD_REASON_STATUSES = frozenset({"failed", "discarded"})
+FIT_RESULTS = frozenset({"under_target", "under_trigger"})
+MODEL_RESPONSE_STATUSES = frozenset({"ok", "error"})
 
 # Warn once per unknown value, not once per line: a typo in a hot path would otherwise fill
 # app.log with the same sentence and bury whatever else is happening.
@@ -912,3 +971,458 @@ def visible_action(channel_id: Optional[str], trigger_ts: Optional[str], *,
                        show, the other is the responder contract breaking
     """
     record("visible_action", channel_id=channel_id, trigger_ts=trigger_ts, kind=kind, **fields)
+
+
+# --------------------------------------------------------------- v8: the turn population
+
+# The exactly-once guard for turn_outcome, stamped on the TurnRuntime itself. main.py's outer
+# finally cannot run twice, so this is insurance against a second emitter appearing later — the
+# same reason `finish_attempt` flips a flag rather than trusting its callers.
+TURN_OUTCOME_KEY = "_pt_turn_outcome_emitted"
+
+
+def turn_start(channel_id: Optional[str], trigger_ts: Optional[str], *, turn_id: Optional[str],
+               origin_thread_ts: Optional[str] = None, surface: Optional[str] = None,
+               gated: bool = False, attempt_id: Optional[str] = None,
+               wake_source: Optional[str] = None) -> None:
+    """A channel turn opened. THE DENOMINATOR OF THE TURN POPULATION.
+
+    Emitted for every channel turn, gated or not, which is exactly what makes it a different
+    denominator from `gate_start`: a mention and a thread continuation are turns with no attempt,
+    and a ledger that could only count judged messages could never say what share of the bot's
+    channel output the gate is responsible for. `gated` is that split, on the row.
+    """
+    _soft_check(surface, TURN_SURFACES, "turn surface")
+    record("turn_start", channel_id=channel_id, trigger_ts=trigger_ts, turn_id=turn_id,
+           origin_thread_ts=origin_thread_ts, surface=surface, gated=bool(gated),
+           attempt_id=attempt_id, wake_source=wake_source)
+
+
+def turn_outcome(channel_id: Optional[str], trigger_ts: Optional[str], *,
+                 turn_id: Optional[str], kind: str, destinations: Optional[List[Dict]] = None,
+                 chars: Optional[int] = None, detached_started: bool = False,
+                 error: Optional[str] = None, H: Optional[str] = None,
+                 stream_build_present: bool = False,
+                 attempt_id: Optional[str] = None) -> None:
+    """What one channel turn ended up doing. Exactly one per `turn_start`.
+
+    `destinations` is the OBSERVED set — every surface Slack accepted, whether or not it reached
+    its final text — because that is what the room saw. Memory extraction reads the COMMITTED
+    subset instead (main.py), and the difference between the two lists is precisely an interrupted
+    reply. It is written even when empty: a silent turn and a turn whose records were lost are not
+    the same fact.
+
+    `error` is one of the five fail-closed codes (coverage_not_ready, snapshot_unsupported,
+    stream_over_budget, history_fetch_failed, stream_data_invalid), absent on a turn that did not
+    fail that way.
+    `stream_build_present` says whether the room was actually rendered — a turn that failed before
+    the fetch answered from nothing, and its `kind` must not be read as a judgment.
+    """
+    _soft_check(kind, KINDS, "turn_outcome kind")
+    record("turn_outcome", channel_id=channel_id, trigger_ts=trigger_ts, turn_id=turn_id,
+           attempt_id=attempt_id, kind=kind,
+           destinations=list(destinations or []),
+           chars=chars, detached_started=bool(detached_started), error=error, H=H,
+           stream_build_present=bool(stream_build_present))
+
+
+def emit_turn_outcome(turn: Any, *, channel_id: Optional[str], trigger_ts: Optional[str],
+                      kind: str, detached_started: bool = False,
+                      attempt_id: Optional[str] = None) -> bool:
+    """Assemble a turn's outcome from the turn itself. True when this call emitted it.
+
+    Reads the TurnRuntime rather than being handed a payload, so the outer finally cannot report
+    a destination set that disagrees with the one the handlers actually recorded. Duck-typed on
+    purpose: this module must not import turn_runtime, which imports it.
+    """
+    try:
+        if turn is None or getattr(turn, TURN_OUTCOME_KEY, False):
+            return False
+        setattr(turn, TURN_OUTCOME_KEY, True)
+        records = list(getattr(turn, "destinations", None) or [])
+        payloads = [r.as_payload() for r in records if hasattr(r, "as_payload")]
+        sizes = [p.get("chars") for p in payloads if p.get("chars") is not None]
+        turn_outcome(
+            channel_id, trigger_ts,
+            turn_id=getattr(turn, "turn_id", None), kind=kind, destinations=payloads,
+            chars=sum(sizes) if sizes else None, detached_started=detached_started,
+            error=getattr(turn, "turn_error", None), H=getattr(turn, "H", None),
+            stream_build_present=bool(getattr(turn, "stream_build_present", False)),
+            attempt_id=attempt_id)
+        return True
+    except Exception as e:  # noqa: BLE001 — a lost line is never worth a lost turn
+        logger.debug(f"Participation turn outcome not written: {e}")
+        return False
+
+
+def stream_render(*, turn_id: Optional[str], origin_thread_ts: Optional[str] = None,
+                  trigger_ts: Optional[str] = None, **fields: Any) -> None:
+    """One channel stream build, identified by its hashes.
+
+    `**fields` is ChannelStream.stream_render_fields() verbatim — the pinned window, the four
+    hashes that make two builds comparable, and the byte/message cost. Passing the dict through
+    rather than restating its keys here is deliberate: the serializer owns what identifies a
+    build, and a second enumeration of those keys is a second thing to keep in step.
+    """
+    channel_id = fields.pop("channel_id", None)
+    record("stream_render", channel_id=channel_id, trigger_ts=trigger_ts, turn_id=turn_id,
+           origin_thread_ts=origin_thread_ts, **fields)
+
+
+def model_response(*, turn_id: Optional[str], attempt_seq: Optional[int],
+                   model: Optional[str] = None, fork_reason: Optional[str] = None,
+                   status: Optional[str] = None, cached_input_tokens: Optional[int] = None,
+                   input_tokens: Optional[int] = None, output_tokens: Optional[int] = None,
+                   detail: Any = None) -> None:
+    """One Responses API attempt on a channel turn — the call, not the turn.
+
+    Written on failure as well as success, because the question this answers is "how many calls
+    did this turn cost and why", and an attempt that raised is exactly the expensive kind. Each
+    tool-loop round is its own attempt: the loop issues one API call per round.
+
+    `cached_input_tokens` is the provider's own `input_tokens_details.cached_tokens`, which is the
+    only evidence that the pinned-prefix cache key is doing anything at all.
+    """
+    _soft_check(status, MODEL_RESPONSE_STATUSES, "model_response status")
+    record("model_response", turn_id=turn_id, attempt_seq=attempt_seq, model=model,
+           fork_reason=fork_reason, status=status, cached_input_tokens=cached_input_tokens,
+           input_tokens=input_tokens, output_tokens=output_tokens, detail=detail)
+
+
+@dataclass
+class ModelAttemptSink:
+    """The per-turn carrier that gets `model_response` out of the API layer.
+
+    Threaded alongside `usage_sink` through the five request-issuing wrappers, so the layer that
+    knows a call happened does not also have to know what a turn is. `turn` sequences the attempts
+    (TurnRuntime.next_model_attempt); `fork_reason` says why this handler entry is issuing calls at
+    all and is fixed for every call it makes. None of these methods raise.
+    """
+
+    turn: Any
+    fork_reason: Optional[str] = None
+
+    def open(self, model: Optional[str] = None) -> Any:
+        try:
+            return self.turn.next_model_attempt(model=model, fork_reason=self.fork_reason)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Model attempt not opened: {e}")
+            return None
+
+    def close(self, attempt: Any, *, status: str, input_tokens: Optional[int] = None,
+              output_tokens: Optional[int] = None, cached_input_tokens: Optional[int] = None,
+              detail: Any = None) -> None:
+        try:
+            if attempt is None:
+                return
+            attempt.status = status
+            attempt.input_tokens = input_tokens
+            attempt.output_tokens = output_tokens
+            attempt.cached_input_tokens = cached_input_tokens
+            model_response(
+                turn_id=getattr(self.turn, "turn_id", None),
+                attempt_seq=getattr(attempt, "attempt_seq", None),
+                model=getattr(attempt, "model", None),
+                fork_reason=getattr(attempt, "fork_reason", None),
+                status=status, cached_input_tokens=cached_input_tokens,
+                input_tokens=input_tokens, output_tokens=output_tokens, detail=detail)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Model attempt not closed: {e}")
+
+
+def outbound_receipt(*, channel_id: Optional[str], message_ts: Optional[str],
+                     owner_turn_id: Optional[str], op: str,
+                     prior_state: Optional[str] = None, new_state: Optional[str] = None,
+                     applied: bool = False, reason: Optional[str] = None) -> None:
+    """One receipt state transition (spec §5), as the DATABASE resolved it.
+
+    Written from the transition's own result rather than from the caller's intent, which is the
+    whole point: a register the lattice absorbed, a finalize a foreign turn already owns and a
+    demote that found nothing to demote all look identical from the call site and are three
+    different facts about the stream. `applied=false` with a `reason` is the interesting row.
+    """
+    _soft_check(op, RECEIPT_OPS, "outbound_receipt op")
+    _soft_check(prior_state, RECEIPT_STATES, "outbound_receipt prior_state")
+    _soft_check(new_state, RECEIPT_STATES, "outbound_receipt new_state")
+    record("outbound_receipt", channel_id=channel_id, message_ts=message_ts,
+           owner_turn_id=owner_turn_id, op=op, prior_state=prior_state, new_state=new_state,
+           applied=bool(applied), reason=reason)
+
+
+def compaction_snapshot(*, op: str, channel_id: Optional[str] = None,
+                        snapshot_id: Any = None, generation: Any = None,
+                        boundary_ts: Optional[str] = None,
+                        serializer_version: Optional[int] = None,
+                        model: Optional[str] = None,
+                        tokens_in: Optional[int] = None,
+                        tokens_out: Optional[int] = None,
+                        cached_input_tokens: Optional[int] = None,
+                        call_count: Optional[int] = None,
+                        attempt_seq: Optional[int] = None,
+                        status: Optional[str] = None,
+                        reason: Optional[str] = None,
+                        **fields: Any) -> None:
+    """A compaction snapshot pointer was read, built, published, invalidated or retained stale.
+
+    `op=read` is the observable half of a fail-closed turn: a pointer exists, so the raw window is
+    not what this channel's history means any more, and the turn refuses rather than rendering a
+    contradiction.
+
+    `op=build` is the MODEL-CALL accounting of one GENERATION ATTEMPT — exactly one per attempt,
+    success or failure. An attempt may make many map calls plus every level of the hierarchical
+    reduce, so `tokens_in` / `tokens_out` / `cached_input_tokens` AGGREGATE all of them and
+    `call_count` says how many there were. THE TOKEN NAMES ARE AUTHORITATIVE: `tokens_in` and
+    `tokens_out`, never `input_tokens` / `output_tokens`, which belong to `model_response` and its
+    per-call turn population. One vocabulary, no aliases — the payload validator, the ledger
+    checker and this emitter all spell them the same way.
+
+    A compaction call NEVER rides `model_response`: that event joins `turn_start` by `turn_id`, and
+    a background compaction has no live turn, so it would either orphan the row or distort
+    responder cost accounting.
+
+    `reason` is written on a `failed` or `discarded` build and on nothing else — an outcome that
+    needs no explanation must not carry an empty one.
+    """
+    _soft_check(op, SNAPSHOT_OPS, "compaction_snapshot op")
+    if op == "build":
+        _soft_check(status, BUILD_STATUSES, "compaction_snapshot build status")
+    record("compaction_snapshot", channel_id=channel_id, op=op, snapshot_id=snapshot_id,
+           generation=generation, boundary_ts=boundary_ts,
+           serializer_version=serializer_version, model=model, tokens_in=tokens_in,
+           tokens_out=tokens_out, cached_input_tokens=cached_input_tokens,
+           call_count=call_count, attempt_seq=attempt_seq, status=status, reason=reason,
+           **fields)
+
+
+# ================================================ the compaction telemetry outbox (plan §1l)
+#
+# TWO LAYERS, and conflating them is what makes a single self-contained payload unsatisfiable.
+#
+#   THE CANONICAL BODY is REPLAY-STABLE IDENTITY. It is SESSIONLESS, serialized ONCE at outbox-row
+#   creation from PERSISTED terminal facts (the checkpoint's accumulated totals, the published
+#   snapshot's own columns), and byte-identical on every reconstruction. An uncertain commit is
+#   retried by REBUILDING the body, not by holding the original bytes across the failure, so a
+#   fresh `now()` or a session id inside it would turn a routine retry into a contract failure.
+#
+#   THE CV8 ENVELOPE is EMISSION PROVENANCE. At emission EXACTLY THREE fields are added — `v`,
+#   `session`, `gate_contract` — and nothing else. The other two envelope fields, `at` and `event`,
+#   come FROM THE BODY, because both must survive a replay. `at` stays NUMERIC (Unix seconds as a
+#   float, the same type `record()` writes) and IS the outbox row's `created_ts`, never a fresh
+#   now(): rendering it as a string would be a silent type change on a graded field.
+#
+# A WRAPPER COLLISION IS REFUSED, NEVER MERGED — at insert, again on read, and again at emission.
+# There is deliberately NO merge-precedence rule: with validation at all three points no collision
+# can reach a merge, and a precedence fallback would, if ever reached, let a persisted body
+# overwrite the emission provenance of the process actually writing the line.
+
+# The three wrapper keys, named for removal. `extract_canonical_body` strips exactly these.
+CANONICAL_BODY_KEYS: Tuple[str, ...] = ("v", "session", "gate_contract")
+
+OUTBOX_EVENT = "compaction_snapshot"
+
+# THE LITERAL PER-OP SCHEMAS. `build` and `publish` do not share a field set, so "the event fields"
+# is not a specification. `at` is deliberately absent from these maps: clause 6 owns it, because
+# its check is finiteness plus equality with the row's own column, not a type.
+_COMMON_BODY_FIELDS: Dict[str, type] = {
+    "event": str, "crawl_id": str, "attempt_seq": int, "event_seq": int,
+    "team_id": str, "channel_id": str, "namespace": str, "op": str,
+}
+_BUILD_BODY_FIELDS: Dict[str, type] = {
+    "model": str, "tokens_in": int, "tokens_out": int, "cached_input_tokens": int,
+    "call_count": int, "status": str,
+}
+# NO TOKEN FIELDS ON `publish`: the cost belongs to the attempt that produced the summary, and
+# duplicating it here would double-count any aggregate that sums the ledger.
+_PUBLISH_BODY_FIELDS: Dict[str, type] = {
+    "snapshot_id": str, "generation": int, "boundary_ts": str, "fit_result": str,
+    "serializer_version": int,
+}
+
+
+def canonical_body_bytes(body: Mapping[str, Any]) -> bytes:
+    """THE ONE SERIALIZER. Used in three places — the bytes stored in the outbox row, the
+    insert-conflict comparison, and the checker's extraction from a flattened JSONL line.
+
+    Any two of those using different serializations would make identical bodies compare unequal
+    over key order, whitespace or `\\uXXXX` escaping alone, which is the whole comparison.
+    """
+    return json.dumps(dict(body), sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
+
+
+def extract_canonical_body(line: str) -> bytes:
+    """Recover the canonical body from an emitted JSONL line. Raises ValueError on a bad line.
+
+    The body is FLATTENED into the emitted object, so its original bytes are not recoverable by
+    parsing alone: remove exactly the three wrapper keys and RE-SERIALIZE canonically. A comparison
+    that skips the re-serialization differs on key order or escaping alone.
+    """
+    obj = json.loads(line)
+    if not isinstance(obj, dict):
+        raise ValueError(f"ledger line is not a JSON object: {type(obj).__name__}")
+    return canonical_body_bytes({k: v for k, v in obj.items() if k not in CANONICAL_BODY_KEYS})
+
+
+def _typed(value: Any, kind: type) -> bool:
+    """Present and of the declared type. `bool` is refused where an int is required — it is an int
+    to Python and a different fact to every reader of the ledger."""
+    if kind is int:
+        return isinstance(value, int) and not isinstance(value, bool)
+    return isinstance(value, kind)
+
+
+def validate_outbox_body(body: Mapping[str, Any], *, crawl_id: str, attempt_seq: int,
+                         event_seq: int, created_ts: float) -> Optional[str]:
+    """THE SIX-CLAUSE CHECKLIST. None when the body may be emitted, else the FAILING CLAUSE NAME:
+    `not_object` | `event` | `identity` | `fields` | `routing` | `wrapper`.
+
+    Validation is not "parses as JSON": a payload can be perfectly well-formed and still be unsafe
+    to acknowledge and DELETE. Clauses 3 and 5 are the ones that matter most — valid JSON carrying
+    the wrong identity, or a `publish` stored at sequence 0, would be emitted and deleted,
+    permanently violating the ordering guarantee with nothing left to inspect afterwards.
+
+    Run at INSERT (a failure fails the transaction, so the row never lands) and again ON READ (a
+    row can be corrupted after it landed — which is exactly what insert-time validation cannot see,
+    and a corrupted-but-finite `at` passes every other clause).
+    """
+    # 1. a JSON object.
+    if not isinstance(body, Mapping):
+        return "not_object"
+    # 2. the one event this table carries.
+    if body.get("event") != OUTBOX_EVENT:
+        return "event"
+    # 3. the embedded identity is the ROW'S OWN identity. The row is deleted after acknowledgement
+    #    and the checker reads only the ledger, so an identity living in dropped columns is an
+    #    identity the checker cannot see.
+    if (not _typed(body.get("crawl_id"), str) or body.get("crawl_id") != crawl_id
+            or not _typed(body.get("attempt_seq"), int) or body.get("attempt_seq") != attempt_seq
+            or not _typed(body.get("event_seq"), int) or body.get("event_seq") != event_seq):
+        return "identity"
+    # 4. every required field present and correctly typed FOR THAT OP, and nothing else. The schema
+    #    is CLOSED: `input_tokens` alongside `tokens_in` is the alias this vocabulary exists to
+    #    refuse, and an unexpected key on a replay-stable identity is a defect at its source.
+    op = body.get("op")
+    if op not in OUTBOX_OPS:
+        return "fields"
+    schema = dict(_COMMON_BODY_FIELDS)
+    schema.update(_BUILD_BODY_FIELDS if op == "build" else _PUBLISH_BODY_FIELDS)
+    for name, kind in schema.items():
+        if not _typed(body.get(name), kind):
+            return "fields"
+    allowed = set(schema) | {"at"}
+    if op == "build":
+        if body.get("status") not in BUILD_STATUSES:
+            return "fields"
+        # `reason` is REQUIRED iff the attempt failed or was discarded, and ABSENT otherwise: an
+        # outcome that needs no explanation must not carry an empty one.
+        needs_reason = body.get("status") in BUILD_REASON_STATUSES
+        has_reason = "reason" in body
+        if needs_reason != has_reason:
+            return "fields"
+        if has_reason and not _typed(body.get("reason"), str):
+            return "fields"
+        allowed.add("reason")
+    elif body.get("fit_result") not in FIT_RESULTS:
+        return "fields"
+    # Wrapper keys are excluded here so their own clause reports them.
+    if set(body) - allowed - set(CANONICAL_BODY_KEYS):
+        return "fields"
+    # 5. op / event_seq consistent with the ROUTING TABLE: `op=build` is ALWAYS at 0, `op=publish`
+    #    is NEVER at 0. The build must reach the ledger before the publish it paid for.
+    if op == "build" and event_seq != 0:
+        return "routing"
+    if op == "publish" and event_seq == 0:
+        return "routing"
+    # 6. no wrapper key in the body, and `at` is a FINITE number EXACTLY EQUAL to the row's own
+    #    `created_ts`. Finiteness alone is not enough: a post-landing corruption can replace `at`
+    #    with a DIFFERENT finite float and pass every other clause.
+    for key in CANONICAL_BODY_KEYS:
+        if key in body:
+            return "wrapper"
+    at = body.get("at")
+    if not isinstance(at, (int, float)) or isinstance(at, bool) or not math.isfinite(at):
+        return "wrapper"
+    if float(at) != float(created_ts):
+        return "wrapper"
+    return None
+
+
+def flush_sync(timeout: float = 30.0) -> bool:
+    """THE ACKNOWLEDGED FLUSH SEAM. True only once everything enqueued so far is in the file.
+
+    `record()` ENQUEUES to a daemon QueueListener and says nothing about whether the bytes were
+    written — so deleting an outbox row after a plain `record()` loses the event whenever the
+    process dies with the write still queued, the exact failure the outbox exists to prevent.
+    THE TURN PATH IS NOT CHANGED: this is an additional entry point, used by the drainer alone.
+
+    Bounded by `timeout`, and False on anything short of acknowledgement (sink closed, listener
+    dead, timed out, flush raised) — no acknowledgement means the caller keeps its row.
+    """
+    try:
+        event_queue, listener = _queue, _listener
+        if event_queue is None or listener is None:
+            return False
+        worker = getattr(listener, "_thread", None)
+        if worker is None or not worker.is_alive():
+            return False   # nothing will ever drain it; waiting would just burn the timeout
+        deadline = time.monotonic() + max(0.0, timeout)
+        # Queue.join() with a deadline. The listener calls task_done() AFTER handling each record,
+        # so an empty backlog means the handler has seen every line.
+        with event_queue.all_tasks_done:
+            while event_queue.unfinished_tasks:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                event_queue.all_tasks_done.wait(remaining)
+        for handler in listener.handlers:
+            handler.flush()
+            stream = getattr(handler, "stream", None)
+            try:
+                os.fsync(stream.fileno())   # survives the machine, not just the process
+            except Exception:  # noqa: BLE001 — a closed or unsyncable stream is not a failed flush
+                pass
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Participation telemetry flush not acknowledged: {e}")
+        return False
+
+
+def emit_outbox_body(body: Mapping[str, Any], *, timeout: float = 30.0) -> bool:
+    """Wrap one canonical body in the CV8 envelope, write it, and return True ONLY once the bytes
+    are durable. The drainer deletes its row on a True and on nothing else.
+
+    Adds EXACTLY `v`, `session` and `gate_contract`; `at` and `event` come from the body, because
+    both must be stable across a replay. A body carrying a wrapper key is REFUSED — the row takes
+    the poison path — and there is no merge-precedence rule to fall back on.
+    """
+    try:
+        if not getattr(config, "enable_participation_telemetry", True):
+            return False
+        if not isinstance(body, Mapping):
+            return False
+        collisions = [key for key in CANONICAL_BODY_KEYS if key in body]
+        if collisions:
+            logger.critical(
+                f"Compaction telemetry body carries envelope key(s) {collisions} — REFUSED, not "
+                f"merged (crawl_id={body.get('crawl_id')!r} "
+                f"attempt_seq={body.get('attempt_seq')!r} event_seq={body.get('event_seq')!r})")
+            return False
+        sink = _sink
+        if sink is None:
+            return False   # telemetry off or unavailable: the row is a durable backlog, not a loss
+        payload: dict = {
+            "v": CONTRACT_VERSION,
+            "at": body.get("at"),
+            "session": SESSION_ID,
+            "gate_contract": GATE_CONTRACT,
+        }
+        # Verbatim, including any False or 0: the emitted line must strip back to these exact
+        # bytes, so record()'s omit-None convenience would break the replay comparison.
+        payload.update({key: value for key, value in body.items() if key != "at"})
+        # ensure_ascii here, unlike the canonical serializer: the file handler writes in the
+        # locale's encoding. The checker re-serializes canonically, so the escaping never matters.
+        sink.info(json.dumps(payload))
+        return flush_sync(timeout)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Compaction telemetry body not emitted: {e}")
+        return False
