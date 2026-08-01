@@ -371,3 +371,172 @@ async def test_pending_shares_scope_filter(temp_db):
     await temp_db.record_pending_share_async("T2", CH, "F2", "s1:1", None)
     assert len(await temp_db.get_pending_shares_async()) == 2
     assert [r["file_id"] for r in await temp_db.get_pending_shares_async(TEAM)] == ["F1"]
+
+
+# =============================== THE RENDER PIN: its subject is CANDIDATES (T47-T49)
+
+async def test_the_render_pin_covers_candidates_not_selections(temp_db):
+    """T47. RULING-4's circularity, dissolved. Eligibility needs receipt state and the receipt
+    epoch, which live in the pin — so a pin restricted to already-SELECTED ids could never be
+    built at all: selection could not precede the pin that selection was said to determine.
+
+    The pin is therefore read over every CANDIDATE, and the selected set is a strict subset."""
+    await temp_db.set_meta_if_absent_async(OUTBOUND_RECEIPTS_EPOCH_KEY, "1000.000000")
+    candidates = [f"{2000 + i}.000000" for i in range(6)]
+    # Half are our own posts with NO finalized receipt — ineligible, and only the pin can say so.
+    await temp_db.register_receipt_async(TEAM, CH, candidates[0], "t1", "finalized")
+    await temp_db.register_receipt_async(TEAM, CH, candidates[1], "t2", "in_flight")
+
+    pin = await temp_db.read_channel_sidecars_for_async(TEAM, CH, candidates)
+
+    assert pin["ids"] == sorted(candidates), "the pin's subject is every candidate"
+    states = {r["message_ts"]: r["state"] for r in pin["receipts"]}
+    assert states == {candidates[0]: "finalized", candidates[1]: "in_flight"}
+    # The epoch is what grandfathers a pre-feature message; without it in the pin, eligibility
+    # could not be computed for ANY of our own messages.
+    assert pin["receipt_feature_epoch_ts"] == "1000.000000"
+
+
+async def test_the_pin_reads_only_the_candidate_identities(temp_db):
+    """T48. Artifact rows outside the candidate set are not returned, the `IN` chunking is
+    exercised past SQLite's variable limit, and MULTI-ROW GROUPS survive.
+
+    One message can carry three images — the accessor selects the row `id` and orders by
+    `(ts, id)` precisely because of it. A merge that keyed those lists by timestamp would
+    collapse each group to one row and silently drop the rest."""
+    inside, outside = "5000.000000", "9000.000000"
+    for i in range(3):
+        temp_db.conn.execute(
+            "INSERT INTO images (thread_id, message_ts, url, image_type, analysis) "
+            "VALUES (?,?,?,?,?)", (f"{CH}:1.0", inside, f"u{i}", "generated", f"a{i}"))
+    for i in range(2):
+        temp_db.conn.execute(
+            "INSERT INTO documents (thread_id, message_ts, filename, mime_type, summary) "
+            "VALUES (?,?,?,?,?)", (f"{CH}:1.0", inside, f"d{i}.pdf", "application/pdf", "s"))
+    for i in range(2):
+        temp_db.conn.execute(
+            "INSERT INTO ambient_artifacts (channel_id, source_ts, conversation_ts, kind, ref, "
+            "status) VALUES (?,?,?,?,?,?)", (CH, inside, "1.0", "link", f"r{i}", "ready"))
+    temp_db.conn.execute(
+        "INSERT INTO images (thread_id, message_ts, url, image_type, analysis) "
+        "VALUES (?,?,?,?,?)", (f"{CH}:1.0", outside, "OUTSIDE", "generated", "x"))
+    temp_db.conn.commit()
+
+    pin = await temp_db.read_channel_sidecars_for_async(TEAM, CH, [inside])
+    assert len(pin["image_analyses"]) == 3
+    assert len(pin["document_extractions"]) == 2
+    assert len(pin["ambient_artifacts"]) == 2
+    assert all(r["message_ts"] == inside for r in pin["image_analyses"])
+
+    # CHUNKED past the variable limit: same rows, same `(ts, id)` order as a single-chunk read.
+    padded = [f"8{i}.5" for i in range(600)] + [inside]
+    chunked = await temp_db.read_channel_sidecars_for_async(TEAM, CH, padded)
+    assert [(r["message_ts"], r["id"]) for r in chunked["image_analyses"]] == [
+        (r["message_ts"], r["id"]) for r in pin["image_analyses"]]
+
+
+async def test_the_merge_recomputes_its_hash_over_the_merged_material(temp_db):
+    """T48's merge half. READ 2a and READ 2b over DISJOINT id sets merge into one pin whose
+    hash equals what a SINGLE read over the union would have produced — never a hash of the two
+    hashes, which would move whenever the periphery/origin split moved even though the rendered
+    rows were identical, and would break the cache for nothing."""
+    from message_processor.channel_stream import _freeze_sidecars, merge_sidecar_pins
+
+    a, b = "5000.000000", "6000.000000"
+    for ts, url in ((a, "peri"), (b, "orig")):
+        temp_db.conn.execute(
+            "INSERT INTO images (thread_id, message_ts, url, image_type, analysis) "
+            "VALUES (?,?,?,?,?)", (f"{CH}:1.0", ts, url, "generated", "x"))
+    temp_db.conn.commit()
+
+    shared = _freeze_sidecars(await temp_db.read_channel_sidecars_for_async(TEAM, CH, [a]))
+    origin = _freeze_sidecars(await temp_db.read_channel_sidecars_for_async(TEAM, CH, [b]))
+    union = await temp_db.read_channel_sidecars_for_async(TEAM, CH, [a, b])
+
+    merged = merge_sidecar_pins(shared, origin, ids=[a, b])
+    assert len(merged.image_analyses) == 2
+    assert merged.versions_hash == union["versions_hash"]
+
+
+async def test_a_divergent_receipt_epoch_fails_the_turn_closed(temp_db):
+    """T48's mismatch half. `receipt_feature_epoch_ts` is a property of the CHANNEL, not of an id
+    list, so two reads in one turn against one database must agree. A difference means something
+    is racing the epoch write and the two halves describe two different worlds."""
+    from message_processor.channel_stream import (SidecarPinMismatch, _freeze_sidecars,
+                                                  merge_sidecar_pins)
+
+    base = await temp_db.read_channel_sidecars_for_async(TEAM, CH, [])
+    shared = _freeze_sidecars({**base, "receipt_feature_epoch_ts": "1000.000000"})
+    origin = _freeze_sidecars({**base, "receipt_feature_epoch_ts": "2000.000000"})
+
+    with pytest.raises(SidecarPinMismatch):
+        merge_sidecar_pins(shared, origin, ids=[])
+
+
+async def test_the_pinned_anchor_and_inventory_are_what_render(temp_db):
+    """T49. Mutate BOTH rows between READ 1 and serialization: the rendered floor and index
+    clause are the PINNED values. They are frozen at the moment they are read and never re-read,
+    which is what makes two builds of one turn comparable."""
+    await temp_db.seed_channel_coverage_async(TEAM, CH, "100.000000")
+    await temp_db.advance_channel_window_anchor_async(TEAM, CH, "500.000000", 1)
+
+    pinned = await temp_db.read_channel_window_anchor_async(TEAM, CH)
+    assert pinned["anchor"]["floor_ts"] == "500.000000"
+    assert pinned["inventory"]["bootstrap_status"] == "pending"
+
+    # The world moves underneath the turn…
+    await temp_db.advance_channel_window_anchor_async(TEAM, CH, "900.000000", 1)
+    await temp_db.acquire_coverage_sweep_async(TEAM, CH, "tok")
+    await temp_db.advance_channel_coverage_async(TEAM, CH, "tok", None, "complete", "genesis")
+
+    # …and the PINNED payload is unchanged, because it was read once.
+    assert pinned["anchor"]["floor_ts"] == "500.000000"
+    assert pinned["inventory"]["bootstrap_status"] == "pending"
+    # A fresh read sees the new world — proving the mutation really landed.
+    assert (await temp_db.read_channel_window_anchor_async(
+        TEAM, CH))["anchor"]["floor_ts"] == "900.000000"
+
+
+async def test_the_versions_hash_material_is_the_pinned_grammar(temp_db):
+    """#8. The hash covers the epoch, the id list and the rows that RENDER — and nothing else.
+
+    `coverage`, `window` and `activity` left with the window-form accessor: all three were
+    discovery, and discovery moved to READ 1. They were inert in this payload, so removing them
+    changed no value — but a hash whose material still named fields its contract had removed
+    would be one edit away from meaning something nobody intended.
+
+    Asserted against an INDEPENDENT recomputation rather than against the function itself, which
+    is the gap codex named: comparing merged output to the same implementation is self-consistent
+    without proving the specified material.
+    """
+    import hashlib
+    import json
+
+    payload = await temp_db.read_channel_sidecars_for_async(TEAM, CH, ["1.0", "2.0"])
+
+    expected_material = {
+        "epoch": payload.get("receipt_feature_epoch_ts"),
+        "ids": list(payload["ids"]),
+        "receipts": [[r.get("message_ts"), r.get("state"), r.get("turn_id"),
+                      r.get("thread_root_ts")] for r in payload["receipts"]],
+        "images": [[r.get("message_ts"), r.get("url"), r.get("analysis"),
+                    (r.get("metadata") or {}).get("filename")
+                    if isinstance(r.get("metadata"), dict) else None]
+                   for r in payload["image_analyses"]],
+        "documents": [[r.get("message_ts"), r.get("filename"), r.get("file_id"),
+                       r.get("summary")] for r in payload["document_extractions"]],
+        "ambient": [[r.get("source_ts"), r.get("kind"), r.get("ref"), r.get("status"),
+                     r.get("derivation_source"), r.get("title"), r.get("summary")]
+                    for r in payload["ambient_artifacts"]],
+        "tools": sorted((ts, json.dumps(tools, sort_keys=True))
+                        for ts, tools in payload["tool_usage"].items()),
+    }
+    blob = json.dumps(expected_material, sort_keys=True, separators=(",", ":"), default=str)
+    assert payload["versions_hash"] == hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    # And the retired members are not merely absent from the payload — feeding them in changes
+    # NOTHING, which is what "no longer part of the grammar" has to mean.
+    polluted = dict(payload)
+    polluted.update({"coverage": {"inventory_start_ts": "5.0"}, "window": ("5.0", True),
+                     "activity": [{"root_ts": "9.9", "dirty": 1}]})
+    assert temp_db._sidecar_versions_hash(polluted) == payload["versions_hash"]

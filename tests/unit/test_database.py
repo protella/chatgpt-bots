@@ -66,8 +66,7 @@ class TestDatabaseManager:
         tables = {row[0] for row in cursor.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         assert {"bot_meta", "outbound_receipts", "pending_share_receipts",
-                "channel_thread_activity", "channel_coverage", "channel_snapshots",
-                "channel_snapshot_pointer"} <= tables
+                "channel_thread_activity", "channel_coverage"} <= tables
 
     def test_get_or_create_thread_new(self, temp_db):
         """Test creating a new thread"""
@@ -980,7 +979,7 @@ class TestSingleStreamSchema:
     def test_bootstrap_status_is_constrained(self, temp_db):
         with pytest.raises(sqlite3.IntegrityError):
             temp_db.conn.execute(
-                "INSERT INTO channel_coverage (team_id, channel_id, coverage_start_ts, "
+                "INSERT INTO channel_coverage (team_id, channel_id, inventory_start_ts, "
                 "bootstrap_status) VALUES ('T', 'C', '1.0', 'done')")
 
     def test_activity_and_coverage_columns(self, temp_db):
@@ -988,20 +987,8 @@ class TestSingleStreamSchema:
             "team_id", "channel_id", "root_ts", "last_observed_reply_ts",
             "advisory_reply_count", "last_index_event_ts", "dirty", "updated_ts"}
         assert self._columns(temp_db, "channel_coverage") == {
-            "team_id", "channel_id", "coverage_start_ts", "bootstrap_status",
-            "coverage_reason", "sweep_token", "heartbeat_ts", "updated_ts"}
-
-    def test_snapshot_columns_and_indexes(self, temp_db):
-        # Subset, not equality: P4a extends this table (payload/provenance columns), and the
-        # P1 contract here is only that its own columns survive that.
-        assert {
-            "snapshot_id", "team_id", "channel_id", "serializer_version", "generation",
-            "boundary_ts", "summary_text", "root_anchors_json", "created_ts", "invalidated_at"
-        } <= self._columns(temp_db, "channel_snapshots")
-        indexes = {row[0] for row in temp_db.conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index'")}
-        assert {"idx_channel_snapshot_generation", "idx_outbound_receipts_state",
-                "idx_outbound_receipts_channel_state"} <= indexes
+            "team_id", "channel_id", "inventory_start_ts", "bootstrap_status",
+            "inventory_reason", "sweep_token", "heartbeat_ts", "updated_ts"}
 
     def test_init_schema_is_idempotent(self, temp_db):
         temp_db.conn.execute(

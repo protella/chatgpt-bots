@@ -183,7 +183,7 @@ async def test_a_ticket_is_completed_by_the_feed(client, monkeypatch):
     from slack_client.event_handlers import activity_index
     client.db = MagicMock()
     client.db.seed_channel_coverage_async = AsyncMock(return_value=True)
-    client.db.record_activity_and_mutation_async = AsyncMock(return_value=None)
+    client.db.record_thread_activity_async = AsyncMock(return_value=None)
     client.classify_sender = lambda msg: "human"
     ticket = _admit(client, _msg("1700000200.000000", thread_ts="1700000100.000000"))
     await activity_index.feed_thread_activity_index(client, _msg(
@@ -197,7 +197,7 @@ async def test_a_failed_feed_degrades_the_channel_and_the_turn_fails_closed(clie
     monkeypatch.setattr(activity_index, "_FEED_RETRY_BASE_SECONDS", 0)
     client.db = MagicMock()
     client.db.seed_channel_coverage_async = AsyncMock(return_value=True)
-    client.db.record_activity_and_mutation_async = AsyncMock(side_effect=RuntimeError("disk"))
+    client.db.record_thread_activity_async = AsyncMock(side_effect=RuntimeError("disk"))
     client.classify_sender = lambda msg: "human"
     event = _msg("1700000200.000000", thread_ts="1700000100.000000")
     ticket = _admit(client, event)
@@ -235,7 +235,7 @@ async def test_a_cancelled_feed_never_leaves_its_ticket_pending(client):
     from slack_client.event_handlers import activity_index
     client.db = MagicMock()
     client.db.seed_channel_coverage_async = AsyncMock(return_value=True)
-    client.db.record_activity_and_mutation_async = AsyncMock(side_effect=asyncio.CancelledError)
+    client.db.record_thread_activity_async = AsyncMock(side_effect=asyncio.CancelledError)
     client.classify_sender = lambda msg: "human"
     event = _msg("1700000200.000000", thread_ts="1700000100.000000")
     ticket = _admit(client, event)

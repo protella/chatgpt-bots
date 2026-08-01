@@ -164,6 +164,30 @@ def clamp_effort(model: str, effort: Optional[str]) -> str:
 # speak. Enumerated rather than derived — the list is a policy statement, and a key that quietly
 # joined it by pattern would silently move a capability out of a user's control. Every name is an
 # existing thread-config key.
+# The dev-only epoch fence's enable flag, and THE ONE DEFINITION of what "enabled" means.
+#
+# It lives here rather than in `message_processor/epoch_fence.py` because its whole job is to
+# decide whether that module gets IMPORTED — by `main.py`, `slack_client/messaging.py` and
+# `database.py`. A predicate cannot gate its own import, and three private copies would be three
+# chances to drift. `config` is a leaf that imports nothing from this project and that all three
+# already import, so it costs them nothing. `epoch_fence.fence_enabled()` delegates here.
+#
+# Empty means DISABLED, and that is the production reading: with this unset, the fence module is
+# never imported at all, so nothing in it can run and no defect in it can reach a production boot.
+DEV_EPOCH_FENCE_ENV = "DEV_EPOCH_FENCE_ENABLE"
+_DEV_EPOCH_FENCE_OFF = ("", "0", "false", "no", "off")
+
+
+def dev_epoch_fence_requested() -> bool:
+    """True when DEV_EPOCH_FENCE_ENABLE asks for a fence.
+
+    Read from `os.environ` on every call rather than cached: the flag is set before the process
+    starts in real use, but the harness and its demonstrations flip it in-process, and a value
+    frozen at import time would answer for the wrong one.
+    """
+    return (os.getenv(DEV_EPOCH_FENCE_ENV) or "").strip().lower() not in _DEV_EPOCH_FENCE_OFF
+
+
 CHANNEL_CAPABILITY_KEYS = (
     "model",
     "reasoning_effort",
@@ -929,6 +953,12 @@ class BotConfig:
     # Safety ceiling on pages walked in ONE pass. Not a horizon — the sweep parks and resumes
     # with its claim held, so a deep channel is covered across passes rather than in one burst.
     # Also bounds the users.conversations membership walk, at 200 conversations per page.
+    # AND IT BOUNDS THE TURN PATH'S HISTORY WALK, which is the tuning seam that matters most:
+    # a busy channel whose window sits far below its recent traffic walks back page by page, and
+    # this is where that walk stops. The shallow window's early stop normally ends it sooner
+    # (CEILING+1 guaranteed-eligible roots), so raising this is the lever for a channel that
+    # fails to build rather than one that merely builds slowly. The reply fan-out and the origin
+    # fetch are UNBOUNDED by design and answer to the wall clock instead.
     history_page_ceiling: int = field(default_factory=lambda: max(1, int(os.getenv("HISTORY_PAGE_CEILING", "50"))))
     # Concurrent conversations.replies fetches while rebuilding one turn's stream.
     reply_fetch_concurrency: int = field(default_factory=lambda: max(1, int(os.getenv("REPLY_FETCH_CONCURRENCY", "4"))))
@@ -936,69 +966,38 @@ class BotConfig:
     # total is what stops a turn from sitting behind a struggling API indefinitely.
     fetch_retry_attempts: int = field(default_factory=lambda: max(1, int(os.getenv("FETCH_RETRY_ATTEMPTS", "3"))))
     fetch_retry_total_seconds: float = field(default_factory=lambda: float(os.getenv("FETCH_RETRY_TOTAL_SECONDS", "60")))
-    # Snapshot retention: keep the newest N generations OR anything younger than D days,
-    # whichever retains MORE (§11). Pins and the active pointer always win over both.
-    snapshot_retain_generations: int = field(default_factory=lambda: max(1, int(os.getenv("SNAPSHOT_RETAIN_GENERATIONS", "3"))))
-    snapshot_retain_days: int = field(default_factory=lambda: max(1, int(os.getenv("SNAPSHOT_RETAIN_DAYS", "7"))))
-    # Compaction fires at `trigger` of the model window and compacts down to `target`. The gap
-    # between them is the headroom the suffix and the reply need; target >= trigger would mean
-    # a compaction that never actually gets under the trigger, so it is refused at load.
-    compaction_trigger_ratio: float = field(default_factory=lambda: float(os.getenv("COMPACTION_TRIGGER_RATIO", "0.80")))
-    compaction_target_ratio: float = field(default_factory=lambda: float(os.getenv("COMPACTION_TARGET_RATIO", "0.70")))
-    # Char bound on the root text kept per straddling thread in a snapshot's root-anchor map,
-    # so a thread whose root predates the boundary still has a deterministic referent.
-    root_anchor_text_max: int = field(default_factory=lambda: max(1, int(os.getenv("ROOT_ANCHOR_TEXT_MAX", "240"))))
-    # --- Compaction (P4 §7a) ---
-    # Messages that must remain BELOW a candidate boundary. A boundary that swallows the recent
-    # tail compacts what the room is still talking about, so it is bounded on both sides: at
-    # least this many, and the ceiling below is a required-critical refusal at load.
-    compaction_min_tail: int = field(default_factory=lambda: max(1, int(os.getenv("COMPACTION_MIN_TAIL", "30"))))
-    COMPACTION_MIN_TAIL_MAX: int = 200
-    # Roots a snapshot's rendered anchor map may name, and therefore also the ceiling on the
-    # targeted root refetch the crawl spends building it.
-    snapshot_anchor_map_bound: int = field(default_factory=lambda: max(1, int(os.getenv("SNAPSHOT_ANCHOR_MAP_BOUND", "40"))))
-    # The origin thread's pre-boundary tail: root + (max_messages - 1) replies, inside the byte
-    # cap, fetched on an INDEPENDENT budget so it can never eat the canonical turn's pages.
-    rehydration_max_messages: int = field(default_factory=lambda: max(1, int(os.getenv("REHYDRATION_MAX_MESSAGES", "20"))))
-    rehydration_max_bytes: int = field(default_factory=lambda: max(1, int(os.getenv("REHYDRATION_MAX_BYTES", "16384"))))
-    rehydration_page_budget: int = field(default_factory=lambda: max(1, int(os.getenv("REHYDRATION_PAGE_BUDGET", "5"))))
-    rehydration_time_budget: float = field(default_factory=lambda: float(os.getenv("REHYDRATION_TIME_BUDGET", "10.0")))
-    # Per WORKER SLICE of the background compaction crawl, not per crawl: a deep channel is
-    # covered across slices with its checkpoint held, never in one unbounded burst.
-    crawl_page_budget: int = field(default_factory=lambda: max(1, int(os.getenv("CRAWL_PAGE_BUDGET", "500"))))
-    crawl_time_budget: float = field(default_factory=lambda: float(os.getenv("CRAWL_TIME_BUDGET", "600.0")))
-    # What the crawl assumes for non-compactable headroom when it has no measured request to
-    # size against. The first turn after publication re-verifies fit against the real thing.
-    crawl_fixed_headroom_tokens: int = field(default_factory=lambda: max(1, int(os.getenv("CRAWL_FIXED_HEADROOM_TOKENS", "80000"))))
-    # Hard cap on a summary's persisted bytes, in the admitted currency (one token per UTF-8
-    # byte). Output above it is rejected and retried rather than published over budget.
-    summary_byte_cap: int = field(default_factory=lambda: max(1, int(os.getenv("SUMMARY_BYTE_CAP", "8000"))))
-    # How long a fit-revalidation claim may sit unfinished before it reverts to owed — a turn
-    # that died holding one must not leave the obligation unclaimable.
-    revalidation_claim_ttl: float = field(default_factory=lambda: float(os.getenv("REVALIDATION_CLAIM_TTL", "600.0")))
     # Channels whose bootstrap sweep may be actively fetching at once. Held only while a page
     # is in flight — a worker parked on a ceiling or a Retry-After sleep releases it.
     coverage_sweep_concurrency: int = field(default_factory=lambda: max(1, int(os.getenv("COVERAGE_SWEEP_CONCURRENCY", "2"))))
+
+    # --- Shallow stream window (SHALLOW_STREAM_RESPEC §2d) ---
+    # BOTH COUNT TOP-LEVEL ROOTS, never events: replies posted inside the window's span ride
+    # along uncounted, so a busy thread can never evict a root and the room view stays whole.
+    # The window GROWS from TARGET roots to CEILING roots before the floor jumps forward, so a
+    # channel re-cuts its cached prefix once per (CEILING - TARGET) roots instead of once per
+    # message. Raising the ceiling buys cache life directly. Neither value is a law and nothing
+    # may assume the ratio between them.
+    # RAW int, deliberately NOT max(1, ...): clamping turns an owner's "0" into "1" and calls
+    # it validated. __post_init__ rejects out-of-range values loudly instead.
+    channel_window_target: int = field(default_factory=lambda: int(
+        os.getenv("CHANNEL_WINDOW_TARGET", "50")))
+    channel_window_ceiling: int = field(default_factory=lambda: int(
+        os.getenv("CHANNEL_WINDOW_CEILING", "100")))
 
     # Long-context billing threshold (verified 2026-07-09): on 5.6-family and 5.5,
     # prompts with >272K input tokens bill at 2x input / 1.5x output for the request.
     LONG_CONTEXT_BILLING_THRESHOLD: int = 272_000
 
     def __post_init__(self):
-        if not (0 < self.compaction_target_ratio < self.compaction_trigger_ratio < 1):
+        # A non-integer env value raises ValueError out of int() at construction, which is the
+        # loud failure we want; the check below covers everything int() accepts.
+        if not (0 < self.channel_window_target < self.channel_window_ceiling):
             raise ValueError(
-                "COMPACTION_TARGET_RATIO and COMPACTION_TRIGGER_RATIO must satisfy "
-                "0 < target < trigger < 1 (got "
-                f"target={self.compaction_target_ratio}, "
-                f"trigger={self.compaction_trigger_ratio}): a target at or above the trigger "
-                "never gets under it and would recompact every turn, and a ratio outside the "
-                "window is not a fraction of the model window at all.")
-        if self.compaction_min_tail > self.COMPACTION_MIN_TAIL_MAX:
-            raise ValueError(
-                f"COMPACTION_MIN_TAIL must be <= {self.COMPACTION_MIN_TAIL_MAX} (got "
-                f"{self.compaction_min_tail}): a tail that large can hold more than the window "
-                "the boundary is being chosen inside, so no boundary satisfies it and the "
-                "channel would fail every turn closed while compaction never completes.")
+                "CHANNEL_WINDOW_TARGET must be a positive ROOT count strictly below "
+                f"CHANNEL_WINDOW_CEILING (got target={self.channel_window_target}, "
+                f"ceiling={self.channel_window_ceiling}): a ceiling at or below the target "
+                "re-anchors on every new root, which throws away the cached prefix the "
+                "hysteresis exists to protect.")
 
     def is_long_context(self, tokens: int) -> bool:
         """True when an input of `tokens` crosses OpenAI's long-context billing tier

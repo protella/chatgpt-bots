@@ -318,42 +318,6 @@ class ModelAttempt:
     output_tokens: Optional[int] = None
 
 
-@dataclass(frozen=True)
-class CompactionEvidence:
-    """What ONE turn learned about its own size, in the ONE admission currency (plan R0-1).
-
-    The compaction trigger paths (§1m 1-3) read this and nothing else: the split between what a
-    summary could move (`compactable_tokens`) and what it never could (`fixed_tokens`) is what
-    keeps a 300k-token attachment from inducing a futile compaction loop, and `sizing_profile` is
-    what a later publication's dominance is compared against.
-
-    Frozen and carried on the turn rather than recomputed at the trigger site: the trigger fires
-    after the turn is over, when the estimate that measured it is gone.
-    """
-
-    model: str
-    window: int
-    trigger_tokens: int
-    target_tokens: int
-    sizing_profile: str
-    total_tokens: int
-    limit_tokens: int
-    compactable_tokens: int
-    fixed_tokens: int
-    admitted: bool
-    h: Optional[str] = None
-
-    @property
-    def near_trigger(self) -> bool:
-        """Path 1's predicate: admitted, but close enough that next time may not be.
-
-        Requires a non-zero compactable component for the R0-1 reason — a request pushed near the
-        trigger by attachments alone has nothing compaction could take away.
-        """
-        return (self.admitted and self.compactable_tokens > 0
-                and self.total_tokens >= self.trigger_tokens)
-
-
 @dataclass
 class TurnRuntime:
     """Per-turn presentation + work-claim state. Created in main.py, threaded to the handlers."""
@@ -442,21 +406,10 @@ class TurnRuntime:
     # Did a stream build actually happen? Distinguishes "channel turn that rendered the room"
     # from one that failed closed before the fetch — a distinction turn_outcome reports.
     stream_build_present: bool = False
-    # Which fail-closed condition ended this turn, as one of the four declared codes. None on a
-    # turn that did not fail that way.
+    # Which fail-closed condition ended this turn, as one of the three declared codes
+    # (stream_data_invalid, stream_over_budget, history_fetch_failed). None on a turn that did
+    # not fail that way.
     turn_error: Optional[str] = None
-    # P2 pins no compaction snapshot (any pointer fails the turn closed), so there is never a
-    # lease to release. Declared here because the outer finally releases it unconditionally, and
-    # a field that only appears in P4 would make that finally a P4 edit.
-    snapshot_lease: Any = field(default=None, repr=False)
-    # This turn's `CompactionEvidence`, set once admission has measured the request. Read by the
-    # post-turn path-1 trigger (§1m), which runs after everything that could produce it is gone.
-    compaction_evidence: Any = field(default=None, repr=False)
-    # The §1b selection result this turn resolved, verbatim — including the two results that are
-    # NEVER rendered (`raw_rebuild_required`, `payload_corrupt`) and the one that renders exactly
-    # as genesis (`no_eligible_generation`). Carried so telemetry and the trigger paths agree on
-    # what the turn actually saw.
-    snapshot_selection: Optional[str] = None
     # WHERE this turn's own words landed. Appended at the first Slack-accepted surface, marked
     # committed when that surface reaches its final text.
     destinations: List[DestinationRecord] = field(default_factory=list)

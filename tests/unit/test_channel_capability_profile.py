@@ -259,32 +259,3 @@ def test_is_dm_conversation_truth_table(channel_id, channel_type, expected):
 def test_is_dm_conversation_defaults_to_prefix_only():
     assert is_dm_conversation("C0123") is False
     assert is_dm_conversation("D0123") is True
-
-
-# --------------------------------------------------------------------- compaction ratios
-# Both ratios are fractions of the model window, so anything outside 0 < target < trigger < 1
-# is a misconfiguration that would either never compact or compact to nothing. It fails at
-# load rather than at the first channel that grows large enough to notice.
-
-@pytest.mark.parametrize("target,trigger", [
-    ("0.70", "0.70"),     # target at the trigger never gets under it
-    ("0.80", "0.70"),     # target above the trigger
-    ("-0.10", "0.70"),    # negative
-    ("0.0", "0.70"),      # nothing survives compaction
-    ("0.70", "1.0"),      # a trigger at the whole window never leaves room for the reply
-    ("0.70", "1.5"),      # above the window
-])
-def test_bad_compaction_ratios_fail_startup(monkeypatch, target, trigger):
-    monkeypatch.setenv("COMPACTION_TARGET_RATIO", target)
-    monkeypatch.setenv("COMPACTION_TRIGGER_RATIO", trigger)
-    with pytest.raises(ValueError):
-        BotConfig()
-
-
-@pytest.mark.parametrize("target,trigger", [("0.70", "0.80"), ("0.05", "0.95")])
-def test_valid_compaction_ratios_load(monkeypatch, target, trigger):
-    monkeypatch.setenv("COMPACTION_TARGET_RATIO", target)
-    monkeypatch.setenv("COMPACTION_TRIGGER_RATIO", trigger)
-    loaded = BotConfig()
-    assert loaded.compaction_target_ratio == float(target)
-    assert loaded.compaction_trigger_ratio == float(trigger)

@@ -16,8 +16,10 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from message_processor import channel_request, channel_stream
-from message_processor.channel_stream import (CoveragePin, PinnedTuple, ReceiptRec, SidecarPin,
-                                              serialize_stream)
+from message_processor.channel_stream import (InventoryPin, PinnedTuple, ReceiptRec,
+                                              SidecarPin, classify_chrome,
+                                              serialize_stream,
+                                              serializer_config_snapshot)
 from message_processor.channel_steering import ChannelSteeringSnapshot
 from slack_client.normalizer import FileRef, NormalizedMessage, ORIGIN_HISTORY, ReactionRec
 
@@ -63,8 +65,8 @@ def sidecars(*, window: Tuple[str, bool] = ("1.0", True),
     return SidecarPin(
         window=window, receipts=tuple(receipts),
         receipt_feature_epoch_ts=receipt_feature_epoch_ts,
-        coverage=CoveragePin(start_ts=coverage_start, status=coverage_status,
-                             reason=coverage_reason),
+        coverage=InventoryPin(start_ts=coverage_start, status=coverage_status,
+                              reason=coverage_reason),
         activity_roots=(), activity_event_ts=(),
         image_analyses=tuple(image_analyses), document_extractions=tuple(document_extractions),
         ambient_artifacts=tuple(ambient_artifacts), tool_usage=tuple(tool_usage),
@@ -74,19 +76,35 @@ def sidecars(*, window: Tuple[str, bool] = ("1.0", True),
 def build_stream(messages: Iterable[NormalizedMessage], *, h: str = "9999.0",
                  channel_id: str = DEFAULT_CHANNEL, team_id: str = DEFAULT_TEAM,
                  actor_map: Optional[Sequence[Tuple[str, str]]] = None,
-                 pinned_sidecars: Optional[SidecarPin] = None):
-    """A real ChannelStream over synthetic messages — the serializer actually runs."""
+                 pinned_sidecars: Optional[SidecarPin] = None,
+                 origin_root_ts: Optional[str] = None,
+                 origin_messages: Optional[Sequence[NormalizedMessage]] = None,
+                 reach_tools: Sequence[str] = ()):
+    """A real ChannelStream over synthetic messages — the serializer actually runs.
+
+    `origin_root_ts` + `origin_messages` build the POST-BREAKPOINT origin block. They default to
+    empty, so every existing caller gets the periphery-only stream it already had; a test that
+    wants the origin block asks for it explicitly rather than having one appear underneath it.
+    """
     ordered = tuple(sorted(messages, key=lambda m: float(m.ts)))
+    origin = tuple(sorted(origin_messages or (), key=lambda m: float(m.ts)))
     pins = pinned_sidecars if pinned_sidecars is not None else sidecars()
     if actor_map is None:
         names: Dict[str, str] = {}
-        for message in ordered:
+        for message in (*ordered, *origin):
             if message.sender_id:
                 names.setdefault(message.sender_id,
                                  message.raw_bot_name or f"user-{message.sender_id}")
         actor_map = tuple(sorted(names.items()))
+    floor = pins.window[0] if pins.window[0] != "0" else ""
+    # The chrome memo covers the DEDUPED UNION of both snapshots, preferring the periphery copy —
+    # exactly what `__post_init__` recomputes to validate against.
+    union = list(ordered) + [m for m in origin if m.ts not in {p.ts for p in ordered}]
     pinned = PinnedTuple(
-        team_id=team_id, channel_id=channel_id, snapshot=None, window=pins.window, H=h,
+        team_id=team_id, channel_id=channel_id, window=(floor, True), H=h,
+        periphery_floor_ts=floor, selection_version=1,
+        chrome_ts=classify_chrome(tuple(union),
+                                  chrome_markers=serializer_config_snapshot()["chrome_markers"]),
         fetch_snapshot=ordered, sidecar_versions_hash=pins.versions_hash,
         actor_map=tuple(actor_map), actor_map_hash="actor-hash",
         serializer_version=channel_stream.SERIALIZER_VERSION,
@@ -94,7 +112,9 @@ def build_stream(messages: Iterable[NormalizedMessage], *, h: str = "9999.0",
         capability_profile_hash="capability-hash", tool_schema_version="tools-v1",
         coverage=pins.coverage, receipt_feature_epoch_ts=pins.receipt_feature_epoch_ts,
         receipt_map=tuple((r.ts, r.state, r.turn_id, r.thread_root_ts) for r in pins.receipts),
-        sidecars=pins)
+        sidecars=pins,
+        origin_root_ts=origin_root_ts, origin_snapshot=origin,
+        reach_tools=tuple(reach_tools))
     return serialize_stream(pinned)
 
 
@@ -130,6 +150,7 @@ def pin_channel_turn(turn, *, messages: Optional[Sequence[NormalizedMessage]] = 
                      origin_participants: Optional[Dict[str, str]] = None,
                      wake_source: Optional[str] = None,
                      queued_batch_size: Optional[int] = None,
+                     origin_messages: Optional[Sequence[NormalizedMessage]] = None,
                      prepared: Any = None):
     """Pin everything a channel turn needs, exactly where base.py pins it.
 
@@ -140,7 +161,9 @@ def pin_channel_turn(turn, *, messages: Optional[Sequence[NormalizedMessage]] = 
     if stream is None:
         stream = build_stream(
             messages if messages is not None else [normalized(trigger_ts, trigger_text)],
-            h=h, channel_id=channel_id, team_id=team_id)
+            h=h, channel_id=channel_id, team_id=team_id,
+            origin_root_ts=origin_thread_ts if origin_messages else None,
+            origin_messages=origin_messages)
     ctx = channel_request.ChannelTurnContext(
         stream=stream,
         steering=steering_snapshot if steering_snapshot is not None else steering(),

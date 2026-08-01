@@ -9,11 +9,11 @@ import asyncio
 import argparse
 import time
 from typing import Any, Optional
-from config import config
+from config import config, dev_epoch_fence_requested
 from logger import log_session_start, log_session_end, main_logger
 from message_processor.base import MessageProcessor
-from message_processor import (channel_steering, outbound_receipts, participation_telemetry,
-                               routing_facts)
+from message_processor import (channel_steering, outbound_receipts,
+                               participation_telemetry, routing_facts)
 from message_processor.participation import (ParticipationEngine,
                                              resolve_participation_level)
 from message_processor.stale_send_guard import (ConversationWatermarks,
@@ -26,6 +26,28 @@ import token_counter
 from base_client import BaseClient, Message
 from slack_client import admission_watermark
 from slack_client.event_handlers import registration
+
+# The dev-only epoch fence. THE IMPORT ITSELF IS GATED ON THE FLAG, so "without
+# DEV_EPOCH_FENCE_ENABLE nothing happens" is literally true rather than nearly true: with the flag
+# empty this module is never imported, so no code in it runs and no defect in it can reach a
+# production boot.
+#
+# The two cases are NOT symmetric, and conflating them is what an earlier revision got wrong:
+#   * flag EMPTY  — nothing is imported; `epoch_fence` is None and the bot is simply a bot.
+#   * flag SET    — an import failure is FATAL, reported by `initialize()`. Someone asked for a
+#     fence; booting without one would run a battery against an unfenced channel and report the
+#     results as if they were isolated, which is worse than not booting.
+#
+# The predicate lives in `config` — a leaf this module already imports — because it must DECIDE
+# whether the fence module is imported, and a predicate cannot gate its own import.
+# `epoch_fence.fence_enabled()` delegates to the same function, so there is exactly one definition.
+epoch_fence = None
+_epoch_import_error = None
+if dev_epoch_fence_requested():
+    try:
+        from message_processor import epoch_fence
+    except Exception as _e:  # noqa: BLE001 — recorded here, fatal in initialize()
+        _epoch_import_error = _e
 
 # Terminals whose visible surface is the RESPONDER'S OWN reply, and which therefore have a
 # destination worth recording. `destination` means where that reply actually went (on
@@ -43,9 +65,6 @@ _DELIVERED_KINDS = frozenset({"reply", "delivery_failed", "interrupted"})
 # the cost of cutting one short is a reply the room never sees; bounded, because a wedged model
 # call must not hold the process open.
 TURN_QUIESCE_TIMEOUT_SECONDS = 30.0
-# Plan §1l: the final compaction-telemetry drain is ONE bounded attempt. Shutdown must stay
-# bounded; the backlog is durable, so a missed final drain costs ledger latency, not data.
-SNAPSHOT_OUTBOX_DRAIN_TIMEOUT = 30.0
 
 
 async def _finalize_turn_effects(turn: Any) -> None:
@@ -186,7 +205,7 @@ class ChatBotV2:
         self._watermarks = ConversationWatermarks()
         self.cleanup_task = None
         self.coverage_bootstrap = None  # spec §4 background coverage sweep
-        self.snapshot_coordinator = None  # spec §7, injected into the processor
+        self.epoch_fence_watcher = None  # dev-only; stays None unless DEV_EPOCH_FENCE_ENABLE
         self.receipt_service = None  # spec §5 outbound receipts
         self.pending_share_recovery = False
         self._pending_share_task = None
@@ -303,27 +322,8 @@ class ChatBotV2:
 
             await self._start_outbound_receipts()
 
-            # Spec §7: ONE snapshot coordinator for the process, injected rather than reached
-            # for. Its pins are in-memory refcounts, so a second instance would happily delete
-            # a snapshot the first one has pinned.
-            #
-            # FATAL if it cannot be built. Nothing consumes it yet, so this costs nothing today
-            # — and that is exactly why it has to be loud now: once compaction reads it, a bot
-            # that started without one would publish snapshots nobody pins and delete them out
-            # from under a live rebuild, with no boot log to say the coordinator was missing.
-            try:
-                from message_processor.channel_snapshots import ChannelSnapshotCoordinator
-                self.snapshot_coordinator = ChannelSnapshotCoordinator(
-                    self.client.db, client=self.client,
-                    openai_client=getattr(self.processor, "openai_client", None))
-                self.processor.snapshot_coordinator = self.snapshot_coordinator
-            except Exception as e:  # noqa: BLE001 — reported, then fatal
-                main_logger.error(
-                    f"Snapshot coordinator could not be constructed ({e}). Refusing to start: "
-                    "snapshot retention has no owner without it. Fix the installation and "
-                    "restart.")
-                sys.exit(1)
-                return
+            if not await self._start_epoch_fence():
+                return  # sys.exit is stubbed in some harnesses; never fall through to a live bot
         else:
             main_logger.error(f"Unknown platform: {self.platform}")
             sys.exit(1)
@@ -347,6 +347,60 @@ class ChatBotV2:
         
         main_logger.info("Initialization complete")
     
+    async def _start_epoch_fence(self) -> bool:
+        """Start the dev-only epoch fence watcher. False means REFUSE TO START.
+
+        Placed AFTER the receipts service and BEFORE the coverage bootstrap, so no channel work
+        runs against an unstamped fence.
+
+        WITHOUT the flag this does nothing at all — and the module was never even imported, so the
+        control file is never opened, the fence table is never created and no watcher task exists.
+        That is the whole of the production no-op contract, and it is why this returns True on the
+        very first line for every production process.
+
+        WITH the flag, EVERY failure here is FATAL, and that asymmetry is the point. A fence
+        exists to make a battery's results trustworthy. A bot that boots anyway — unfenced,
+        against the channel it was told to fence — produces results that LOOK isolated and are
+        not, and nobody reading them afterwards would have any way to tell. Refusing to start is
+        the only honest failure: the operator sees it immediately, and nothing has run yet.
+        """
+        if not dev_epoch_fence_requested():
+            return True
+
+        if epoch_fence is None:
+            main_logger.error(
+                f"DEV_EPOCH_FENCE_ENABLE is set but the epoch fence module could not be imported "
+                f"({type(_epoch_import_error).__name__}: {_epoch_import_error}). Refusing to "
+                f"start: a battery would run against an UNFENCED channel and report contaminated "
+                f"results as isolated. Fix the import, or clear the flag to run as an ordinary "
+                f"bot.")
+            sys.exit(1)
+            return False
+
+        from message_processor.epoch_fence_control import EpochFenceWatcher
+        main_logger.warning(
+            "DEV_EPOCH_FENCE_ENABLE is set — the epoch fence watcher is starting. This is test "
+            "infrastructure and must never be set in production.")
+        self.epoch_fence_watcher = EpochFenceWatcher(self.client)
+        self.epoch_fence_watcher.start()
+
+        # AWAITED, not fire-and-forget. Startup INVALIDATES any battery a restart interrupted and
+        # installs the deny-only fence that keeps that scope shut; if service began before that
+        # landed, the interrupted channel would answer normally — unfenced, mid-battery — in
+        # exactly the window the invalidation exists to close. One edge covers every way startup
+        # can fail: unresolved identity, a refused control directory, a raise inside `_boot`, and
+        # the timeout itself.
+        if not await self.epoch_fence_watcher.wait_ready():
+            main_logger.error(
+                "The epoch fence watcher did not finish initialising (the error above says which "
+                "step failed). Refusing to start: a battery a restart interrupted may not be "
+                "fenced shut, and a new one would run unfenced.")
+            await self.epoch_fence_watcher.stop()
+            self.epoch_fence_watcher = None
+            sys.exit(1)
+            return False
+        return True
+
     async def _start_outbound_receipts(self):
         """Spec §5 boot order: epoch, then dead-session reconciliation, then pending shares.
 
@@ -882,6 +936,12 @@ class ChatBotV2:
         turn_task = asyncio.current_task()
         if turn_task is not None and active_turns is not None:
             active_turns.add(turn_task)
+        # Dev-only epoch fence: THE one stamping site. A turn is its own task, so this marks that
+        # task's private context and everything it spawns inherits the mark. A no-op returning
+        # None on every unfenced channel, which in production is all of them.
+        if epoch_fence is not None:
+            epoch_fence.stamp_current_task(
+                getattr(client, "self_team_id", None), getattr(message, "channel_id", None))
         try:
             # Before the gate, because a turn that cannot be accounted for should not run at
             # all — not even to decide whether to speak.
@@ -1447,16 +1507,6 @@ class ChatBotV2:
             # lease and post AFTER settlement. The unit is not something a cancellation may
             # interleave with; it is the thing that makes the cancellation safe.
             await _await_finalizer(asyncio.ensure_future(_finalize_turn_effects(turn)))
-            # Spec §7: release any compaction snapshot this turn pinned. Always None in P2 — a
-            # pointer fails the turn closed before anything is pinned, so there is nothing to
-            # release and the double-release that would follow a partial pin cannot happen.
-            # Wired here rather than in P4 so the release lives in the same finally as the
-            # ledger settle, which is the ordering the pin depends on.
-            # getattr, like `_admitting` above: this method is also driven unbound against plain
-            # stand-in hosts that have neither of these, and a turn must not fail in its finally.
-            release = getattr(self, "_release_snapshot_lease", None)
-            if release is not None:
-                await release(turn)
             # Channel memory reads what the room actually SAW — the COMMITTED destination records
             # — and is therefore scheduled from HERE, after every commit point by construction.
             # A silent turn, a suppressed one, and one that died mid-stream all commit nothing and
@@ -1479,22 +1529,6 @@ class ChatBotV2:
             # open, so a newer turn that finishes early cannot erase the watermark an older,
             # still-running turn is about to read.
             lease.close()
-
-    async def _release_snapshot_lease(self, turn) -> None:
-        """Give back the compaction snapshot this turn was rendering from, if any."""
-        # NOT named `lease`: a turn already carries a send lease and a reaction lease, and a
-        # third thing called one next to them reads as the same kind of object. This is a
-        # refcount on a compaction snapshot.
-        snapshot_pin = getattr(turn, "snapshot_lease", None) if turn is not None else None
-        if snapshot_pin is None:
-            return
-        coordinator = self.snapshot_coordinator
-        if coordinator is None:
-            return
-        try:
-            await coordinator.unpin(snapshot_pin)
-        except Exception as e:  # noqa: BLE001 — a stuck pin is a retention problem, not a turn one
-            main_logger.warning(f"Snapshot pin {snapshot_pin} not released: {e}")
 
     @staticmethod
     def _turn_telemetry_scope(message: Message, turn) -> bool:
@@ -1668,7 +1702,7 @@ class ChatBotV2:
                             # Sweep aged document-extraction rows: SLIM (not delete) — the derived
                             # bulk (summary/page_structure/metadata) is nulled while the Slack ref
                             # row is kept, so read_document and rebuilds re-extract on demand and a
-                            # file behind a compaction boundary stays resolvable indefinitely.
+                            # file older than the window stays resolvable indefinitely.
                             try:
                                 self.processor.db.delete_old_documents(
                                     days=config.document_retention_days)
@@ -1806,29 +1840,6 @@ class ChatBotV2:
                 except Exception as e:
                     main_logger.warning(f"Coverage bootstrap start skipped: {e}")
 
-            # Plan §1l/§1m: the compaction coordinator. The outbox is DRAINED FIRST, so a replayed
-            # event does not interleave with the fresh ones the coordinator is about to produce —
-            # and AN UNAVAILABLE SINK NEVER BLOCKS STARTUP. A failure here is a WARNING and the
-            # bot comes up anyway: the rows are a durable backlog and the drainer retries in the
-            # background, so a strict "must drain before starting" rule would trade a logging
-            # problem for an outage.
-            if self.snapshot_coordinator is not None:
-                try:
-                    drained = await self.snapshot_coordinator.drain_outbox(bounded=True)
-                    if drained:
-                        main_logger.info(
-                            f"Replayed {drained} compaction telemetry row(s) from the outbox")
-                except Exception as e:  # noqa: BLE001
-                    main_logger.warning(
-                        f"Compaction telemetry outbox not drained at boot ({e}); the rows are "
-                        "retained and the coordinator is starting anyway")
-                try:
-                    # Boot hydration is NOT a trigger: an expired dormant obligation stays
-                    # dormant, so a crash-looping process cannot revive it for free.
-                    await self.snapshot_coordinator.start()
-                except Exception as e:  # noqa: BLE001
-                    main_logger.warning(f"Compaction coordinator start skipped: {e}")
-
             # MCP startup health probe (informational; runs in the background so
             # a slow server can't delay boot). Strong ref so it can't be GC'd.
             if getattr(self.processor, "mcp_manager", None) and self.processor.mcp_manager.has_mcp_servers():
@@ -1901,6 +1912,16 @@ class ChatBotV2:
 
         self.running = False
         main_logger.info(f"Shutting down {self.platform} bot...")
+
+        # Dev-only epoch fence: the watcher goes FIRST, ahead of everything below, so no fence
+        # transition lands against a process that is already tearing itself down. None in every
+        # production process — the flag is empty there and the task was never created.
+        if self.epoch_fence_watcher is not None:
+            try:
+                await self.epoch_fence_watcher.stop()
+            except Exception as e:  # noqa: BLE001
+                main_logger.warning(f"Error stopping epoch fence watcher: {e}")
+            self.epoch_fence_watcher = None
 
         # First, before anything is torn down: stop admitting new turns and quiesce the ones
         # already running. Everything below — background drains, the receipt queue, the client,
@@ -2074,36 +2095,6 @@ class ChatBotV2:
                 await self.receipt_service.drain_late_arrivals()
             except Exception as e:  # noqa: BLE001
                 main_logger.warning(f"Error draining late receipt rows: {e}")
-
-        # Plan §1l/§1m: the coordinator stops HERE — after ingress is provably quiet, so nothing
-        # can trigger it, and while the database it writes through is still open. A task cancelled
-        # here takes crash semantics deliberately: the in-flight chunk is refetched after restart,
-        # which costs one chunk instead of holding shutdown open for a chunk that may be minutes
-        # long.
-        if self.snapshot_coordinator is not None:
-            try:
-                await self.snapshot_coordinator.stop()
-            except Exception as e:  # noqa: BLE001
-                main_logger.warning(f"Error stopping the compaction coordinator: {e}")
-
-            # THEN the final outbox drain: after the coordinator stops (nothing is still
-            # producing) and before telemetry shutdown and DB teardown (it needs both stores
-            # alive). ONE BOUNDED ATTEMPT with a 30-second timeout — no retry loop, no waiting out
-            # an unavailable sink. On failure or timeout the rows are RETAINED for the next boot,
-            # because the backlog is durable and a missed final drain costs latency in the ledger,
-            # not data.
-            try:
-                await asyncio.wait_for(
-                    self.snapshot_coordinator.drain_outbox(bounded=True),
-                    timeout=SNAPSHOT_OUTBOX_DRAIN_TIMEOUT)
-            except asyncio.TimeoutError:
-                main_logger.warning(
-                    f"Compaction telemetry outbox did not drain within "
-                    f"{SNAPSHOT_OUTBOX_DRAIN_TIMEOUT:.0f}s; the remaining rows are retained for "
-                    "the next boot")
-            except Exception as e:  # noqa: BLE001
-                main_logger.warning(
-                    f"Final compaction telemetry drain failed ({e}); the rows are retained")
 
         # Clean up resources
         try:

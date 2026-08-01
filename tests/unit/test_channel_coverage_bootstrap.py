@@ -168,8 +168,8 @@ async def test_cursor_pagination_records_hints_and_completes(temp_db, sleeps):
 
     row = await _coverage(temp_db)
     assert row["bootstrap_status"] == "complete"
-    assert row["coverage_reason"] == "genesis"
-    assert row["coverage_start_ts"] == TS_C
+    assert row["inventory_reason"] == "genesis"
+    assert row["inventory_start_ts"] == TS_C
     assert (TEAM, CH) in boot._settled
 
 
@@ -206,7 +206,7 @@ async def test_a_page_that_fails_midway_never_advances_coverage(temp_db, sleeps)
     await boot._sweep_channel(TEAM, CH)
 
     row = await _coverage(temp_db)
-    assert row["coverage_start_ts"] == SEED
+    assert row["inventory_start_ts"] == SEED
     assert row["bootstrap_status"] == "running"
 
 
@@ -300,8 +300,8 @@ async def test_slack_retention_wall_declares_limited(temp_db, sleeps):
     await boot._sweep_channel(TEAM, CH)
 
     row = await _coverage(temp_db)
-    assert (row["bootstrap_status"], row["coverage_reason"]) == ("limited", "retention")
-    assert row["coverage_start_ts"] == TS_C
+    assert (row["bootstrap_status"], row["inventory_reason"]) == ("limited", "retention")
+    assert row["inventory_start_ts"] == TS_C
 
 
 async def test_exhausted_history_declares_complete(temp_db, sleeps):
@@ -312,7 +312,7 @@ async def test_exhausted_history_declares_complete(temp_db, sleeps):
     await boot._sweep_channel(TEAM, CH)
 
     row = await _coverage(temp_db)
-    assert (row["bootstrap_status"], row["coverage_reason"]) == ("complete", "genesis")
+    assert (row["bootstrap_status"], row["inventory_reason"]) == ("complete", "genesis")
 
 
 async def test_the_configured_depth_declares_limited(temp_db, sleeps):
@@ -324,8 +324,8 @@ async def test_the_configured_depth_declares_limited(temp_db, sleeps):
     await boot._sweep_channel(TEAM, CH)
 
     row = await _coverage(temp_db)
-    assert (row["bootstrap_status"], row["coverage_reason"]) == ("limited", "depth_config")
-    assert row["coverage_start_ts"] == old
+    assert (row["bootstrap_status"], row["inventory_reason"]) == ("limited", "depth_config")
+    assert row["inventory_start_ts"] == old
 
 
 async def test_an_empty_channel_completes_without_rows(temp_db, sleeps):
@@ -338,7 +338,7 @@ async def test_an_empty_channel_completes_without_rows(temp_db, sleeps):
     assert await temp_db.get_thread_activity_async(TEAM, CH) == []
     row = await _coverage(temp_db)
     assert row["bootstrap_status"] == "complete"
-    assert row["coverage_start_ts"] == SEED
+    assert row["inventory_start_ts"] == SEED
 
 
 # ------------------------------------------------------------------ failure handling
@@ -371,7 +371,7 @@ async def test_an_unreachable_channel_is_settled_in_the_database_too(temp_db, sl
     assert len(web.history_calls) == 1
     assert (TEAM, CH) in boot._settled
     row = await _coverage(temp_db)
-    assert (row["bootstrap_status"], row["coverage_reason"]) == ("limited", "unavailable")
+    assert (row["bootstrap_status"], row["inventory_reason"]) == ("limited", "unavailable")
 
 
 async def test_an_app_level_refusal_stays_retryable(temp_db, sleeps):
@@ -400,7 +400,7 @@ async def test_an_empty_page_promising_more_leaves_the_channel_retryable(temp_db
     assert (TEAM, CH) not in boot._settled
     row = await _coverage(temp_db)
     assert row["bootstrap_status"] == "running"
-    assert row["coverage_start_ts"] == SEED
+    assert row["inventory_start_ts"] == SEED
 
 
 async def test_a_client_without_a_history_method_never_settles(temp_db, sleeps):
@@ -606,10 +606,10 @@ async def test_a_rejoin_reactivates_an_unavailable_channel(temp_db, sleeps):
     assert await activity_index.reset_channel_coverage(client, CH) is True
 
     row = await _coverage(temp_db)
-    assert (row["bootstrap_status"], row["coverage_reason"], row["sweep_token"]) == \
+    assert (row["bootstrap_status"], row["inventory_reason"], row["sweep_token"]) == \
         ("pending", None, None)
     # The resume point is untouched, so the reclaimed walk picks up where it stopped.
-    assert row["coverage_start_ts"] == SEED
+    assert row["inventory_start_ts"] == SEED
     assert (TEAM, CH) not in boot._settled
     assert CH in activity_index._seeded_channels(client)
 
@@ -629,7 +629,7 @@ async def test_a_rejoin_never_reopens_a_genuinely_finished_channel(temp_db):
     assert await activity_index.reset_channel_coverage(client, CH) is False
 
     row = await _coverage(temp_db)
-    assert (row["bootstrap_status"], row["coverage_reason"]) == ("limited", "retention")
+    assert (row["bootstrap_status"], row["inventory_reason"]) == ("limited", "retention")
 
 
 async def test_a_rejoin_seeds_a_channel_the_bot_has_never_seen(temp_db):

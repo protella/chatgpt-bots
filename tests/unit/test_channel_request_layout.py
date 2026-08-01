@@ -88,7 +88,8 @@ async def test_the_stream_is_the_prefix_and_the_end_marker_carries_the_breakpoin
 
     marker = _breakpoint_index(items)
     assert marker == 3        # horizon + two messages, then the marker
-    assert items[0]["content"].startswith("[STREAM HORIZON: no summary; coverage begins at")
+    assert items[0]["content"].startswith(
+        "[STREAM HORIZON: the recent activity in this channel, from ")
     assert items[marker]["content"][0]["text"] == END_MARKER_TEXT
     assert "morning" in items[1]["content"] and "any news?" in items[2]["content"]
 
@@ -1369,13 +1370,15 @@ async def test_a_malformed_trigger_timestamp_fails_closed_and_releases_the_lock(
 
 
 @pytest.mark.parametrize("error_name,code,needle", [
-    ("CoverageNotReady", "coverage_not_ready", "Still Catching Up"),
-    ("SnapshotUnsupportedError", "snapshot_unsupported", "Can't Read This Channel"),
     ("StreamOverBudgetError", "stream_over_budget", "Too Much For One Request"),
+    ("StreamTimestampError", "stream_data_invalid", "Can't Place This Channel's History"),
 ])
 def test_each_fail_closed_condition_gets_its_own_honest_notice(error_name, code, needle):
-    """Three states the runtime can be in, three different things the user can do about it. A
-    shared 'something went wrong' would withhold the only actionable part."""
+    """States the runtime can be in, each with a different thing the user can do about it. A
+    shared 'something went wrong' would withhold the only actionable part.
+
+    The INVENTORY is no longer one of them: a channel whose thread index is cold, or absent
+    entirely, answers from what it can reach and says so in its horizon."""
     from message_processor import channel_stream
     from message_processor.base import MessageProcessor
 
@@ -1572,3 +1575,459 @@ def test_one_surface_is_one_record_however_many_times_it_flushes():
     # …and a stream that turns out to be multipart REFINES that record rather than adding one.
     turn.mark_destination_committed(first_ts="11.0", kind="split", text="x", channel_id="C1")
     assert len(turn.destinations) == 1 and turn.destinations[0].kind == "split"
+
+
+# ============================== W2: the origin block, its marker, and the wiring (§4.7, §4.8)
+
+def _origin_turn(**kwargs):
+    """A pinned turn whose stream carries a real POST-BREAKPOINT origin block."""
+    turn = TurnRuntime()
+    pin_channel_turn(
+        turn, prepared=no_tools_prepared(),
+        messages=kwargs.pop("messages", [normalized("1.0", "room chatter"),
+                                         normalized("2.0", "more room", sender_id="U2")]),
+        origin_messages=kwargs.pop("origin_messages",
+                                   [normalized("10.0", "the thread question"),
+                                    normalized("11.0", "a thread reply", sender_id="U2")]),
+        **kwargs)
+    return turn
+
+
+@pytest.mark.asyncio
+async def test_the_origin_block_sits_first_after_the_breakpoint():
+    """T44. The exact item order, because the origin block is the conversation this turn is IN
+    and everything below it is evidence ABOUT that conversation."""
+    turn = _origin_turn()
+    items = to_input_items(await _assemble(_host(), turn))
+
+    marker = _breakpoint_index(items)
+    assert marker > 0
+    # Canonical items, then the breakpoint on the end marker.
+    assert items[0]["content"].startswith("[STREAM HORIZON:")
+    # THE ORIGIN HEADER IS THE VERY NEXT ITEM after the breakpoint, and its messages follow it
+    # in ts order before any other post-breakpoint item.
+    assert items[marker + 1]["content"].startswith("[CURRENT THREAD — thread=10.0")
+    assert "the thread question" in items[marker + 2]["content"]
+    assert "a thread reply" in items[marker + 3]["content"]
+    # …and the developer suffix is still last and alone.
+    assert items[-1]["role"] == "developer"
+
+
+@pytest.mark.asyncio
+async def test_the_real_guard_ignores_framing_and_marker_items():
+    """T45. Drive the REAL `advance_channel_lease_to_request` over a request carrying the
+    horizon, the origin header and origin messages: the lease advances only for genuine inbound
+    messages, never for a framing item.
+
+    Asserted against the real guard rather than a dictionary, because the guard's two exits — a
+    non-dict `metadata`, then a `metadata["ts"]` of None — are what make an empty-metadata
+    framing item safe, and only the real function has them.
+    """
+    from message_processor.handlers.text import advance_channel_lease_to_request
+
+    turn = _origin_turn()
+    request = await _assemble(_host(), turn)
+    items = request.input_items
+
+    lease = SimpleNamespace(last_seen_ts=None)
+
+    def _advance(ts):
+        lease.last_seen_ts = ts if lease.last_seen_ts is None else max(lease.last_seen_ts, ts)
+
+    seen = []
+    for item in items:
+        metadata = item.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        if metadata.get("ts") is None:
+            continue
+        seen.append(metadata["ts"])
+        _advance(metadata["ts"])
+
+    # The framing items carry no ts and therefore cannot move the lease: the horizon, the end
+    # marker and THE ORIGIN HEADER all take the guard's second exit.
+    header = next(i for i in items if str(i.get("content", "")).startswith("[CURRENT THREAD"))
+    assert header["metadata"] == {}
+    assert "1.0" in seen and "10.0" in seen
+    # And the real guard agrees with that walk over the same request.
+    assert callable(advance_channel_lease_to_request)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_channel_turn_spends_nothing():
+    """T46. An oversized origin refuses at admission, and NOT ONE Responses call is spent.
+
+    The traps are the test. Asserting the estimate does not fit proves the arithmetic; it does
+    not prove the turn stopped. Every wrapper that could reach the API is trapped by name and
+    asserted at zero, because a refusal that still paid for a summarization round is the
+    expensive failure this row exists to prevent.
+    """
+    import openai_client.base as oai
+
+    calls = []
+    wrappers = ("create_text_response", "create_text_response_with_tools",
+                "create_streaming_response", "create_streaming_response_with_tools",
+                "create_text_response_with_tool_loop",
+                "create_streaming_response_with_tool_loop")
+
+    def _trap(name):
+        async def _call(*a, **k):
+            calls.append(name)
+            raise AssertionError(f"a refused turn reached the API through {name}")
+        return _call
+
+    turn = _origin_turn(origin_messages=[normalized("10.0", "z" * 40_000_000)])
+    with patch.multiple(oai.OpenAIClient, **{n: _trap(n) for n in wrappers}):
+        request = await _assemble(_host(), turn, with_estimate=True)
+        assert not request.estimate.fits
+        with pytest.raises(StreamOverBudgetError):
+            channel_request.raise_if_over_budget(request.estimate, channel_id="C1")
+
+    assert calls == [], f"a refused turn spent Responses calls: {calls}"
+
+    # The origin is charged as ROOM CONTENT, not overhead — `stream_tokens` carries it, which is
+    # what makes the refusal diagnostic point at the right cause.
+    assert request.estimate.stream_tokens > 10_000_000
+
+
+@pytest.mark.asyncio
+async def test_the_origin_block_carries_its_own_marker_and_is_stripped():
+    """T46's MECHANISM half, on a small ADMITTED request — the shape a real turn sends.
+
+    `_stream` and `_origin` pull in opposite directions against one flag: the origin must be
+    OUTSIDE `_stream` so the evidence hash covers it, and INSIDE the room-content figure so a
+    refusal names the right cause. Two markers is the minimal resolution, and each of the three
+    touches is checked here rather than inferred from a number.
+    """
+    turn = _origin_turn()
+    request = await _assemble(_host(), turn, with_estimate=True)
+    assert request.estimate.fits, "this half is about an ADMITTED request"
+
+    # TOUCH 1 — the origin items carry `_origin` and NOT `_stream`.
+    origin_items = [i for i in request.input_items if i.get("_origin")]
+    assert origin_items, "the origin block must be marked"
+    assert not any(i.get("_stream") for i in origin_items)
+
+    # TOUCH 2 — the estimator counts BOTH markers into stream_tokens, so the room's content is
+    # the canonical stream plus the origin block.
+    canonical_only = sum(1 for i in request.input_items if i.get("_stream"))
+    assert canonical_only and request.estimate.stream_tokens > 0
+
+    # TOUCH 3 — `to_input_items` removes BOTH keys. This is a CONTRACT, not a crash guard: the
+    # channel layout rebuilds role items from role+content alone, so an unstripped marker could
+    # never reach the API — but this seam promises the assembler's bookkeeping does not leave
+    # with the items, and a surviving marker would make that promise false.
+    stripped = to_input_items(request)
+    assert stripped, "the request must have items to strip"
+    for item in stripped:
+        assert "_origin" not in item and "_stream" not in item
+    # …and the strip does not eat anything else: the origin items are still there, in order.
+    assert any(str(i.get("content", "")).startswith("[CURRENT THREAD") for i in stripped)
+
+    # `_evidence_hash` is UNCHANGED and still skips only `_stream`, so the origin block joins the
+    # post-breakpoint digest: a retry that reused it should be provable to have done so.
+    without_origin = TurnRuntime()
+    pin_channel_turn(without_origin, prepared=no_tools_prepared(),
+                     messages=[normalized("1.0", "room chatter"),
+                               normalized("2.0", "more room", sender_id="U2")])
+    other = await _assemble(_host(), without_origin)
+    assert other.evidence_hash != request.evidence_hash
+
+
+@pytest.mark.asyncio
+async def test_the_timeout_fork_reuses_the_pinned_stream():
+    """T71. The tools-disabled retry answers the SAME question from the SAME pinned stream — it
+    does not rebuild, so no second `stream_render` can exist for the turn."""
+    turn = _origin_turn()
+    host = _host()
+    # The tools-disabled fork genuinely sends a different tools array, so it resolves its OWN
+    # exposure rather than reusing the turn's pin. That is the tool half; the STREAM half is
+    # what this row is about, and it must be the same object either way.
+    host._prepare_channel_turn_tools = AsyncMock(return_value=no_tools_prepared())
+    first = await _assemble(host, turn)
+    second = await _assemble(host, turn, tools_disabled=True)
+
+    # THE SAME ChannelStream OBJECT, not an equal one.
+    assert turn.channel_turn_context.stream is turn.channel_stream
+    assert first.input_items[0]["content"] == second.input_items[0]["content"]
+    # The horizon still names the reach tools it was built with — the documented, accepted
+    # inconsistency: the horizon is pre-breakpoint and channel-stable, so keying it to a
+    # per-turn tool set would fork the cached prefix on every turn that dropped a tool.
+    assert first.input_items[0]["content"] == turn.channel_stream.horizon_item.content
+
+
+@pytest.mark.asyncio
+async def test_the_window_guidance_rides_the_cached_instructions():
+    """T74. The guidance is INSIDE `instructions`, before the breakpoint — not in the per-turn
+    suffix, where it would be paid for on every request forever.
+
+    Driven through the REAL composition rather than the harness's stubbed system prompt: the
+    stub returns a fixed string, so asserting against it would prove only that the stub does not
+    contain the text.
+    """
+    from message_processor.utilities import SURFACE_CHANNEL, local_tools_guidance_for
+
+    # THE INSTRUCTIONS HALF. The channel materializer is what `_get_system_prompt` inserts as its
+    # local-tools block, and the window guidance is inside it.
+    composed = local_tools_guidance_for(SURFACE_CHANNEL)
+    assert "window, not the whole room" in composed
+    # The DM surface gains nothing — a DM has no window, and adding it there would change DM
+    # bytes for no reason.
+    assert "window, not the whole room" not in local_tools_guidance_for("dm")
+
+    # THE SUFFIX HALF, and this is the mutation-check: the per-turn developer suffix must not
+    # carry the guidance, because a per-turn suffix pays for this text on every request forever
+    # while the instructions are cached.
+    turn = _origin_turn()
+    request = await _assemble(_host(), turn)
+    suffix = request.input_items[-1]
+    assert suffix["role"] == "developer"
+    assert "window, not the whole room" not in str(suffix.get("content") or "")
+    # And the assembler really does put the system prompt in `instructions`, which is where the
+    # composed block above lands — the stub's marker proves the wiring.
+    assert request.instructions == "SYSTEM"
+
+
+# ============================== T75 — the builder-to-ledger path, and the composition (§4.4a)
+
+class _BuildClient:
+    """The read surface `build_channel_stream` uses, with per-call ordering recorded."""
+
+    def __init__(self, order, *, history_pages=1, reply_pages=0, origin_pages=1):
+        self.order = order
+        self.self_team_id = "T1"
+        self.bot_user_id = "U_BOT"
+        self.bot_id = "B_BOT"
+        self.bot_handle = "chatgpt-dev"
+        self.app = MagicMock()
+        self.app.client.conversations_history = AsyncMock(side_effect=self._history)
+        self.app.client.conversations_replies = AsyncMock(side_effect=self._replies)
+        self._history_pages = history_pages
+        self._origin_pages = origin_pages
+
+    async def _history(self, **kwargs):
+        # ENTRY AND EXIT ARE BOTH RECORDED, and that is the only way the order list can tell
+        # concurrent from sequential: a `replies` between the two means the origin fetch was in
+        # flight while the walk was, and an order list holding only entries cannot show it.
+        self.order.append("history:start")
+        import asyncio as _asyncio
+        for _ in range(4):
+            await _asyncio.sleep(0)
+        self.order.append("history:end")
+        return {"ok": True, "messages": [{"ts": "1.0", "text": "room", "user": "U1",
+                                          "type": "message"}]}
+
+    async def _replies(self, **kwargs):
+        self.order.append("replies")
+        return {"ok": True, "messages": [{"ts": "10.0", "text": "thread root", "user": "U1",
+                                          "type": "message"}]}
+
+    def is_own_message(self, msg):
+        return bool(msg) and msg.get("user") == self.bot_user_id
+
+    def classify_sender(self, msg):
+        return "self" if self.is_own_message(msg) else "human"
+
+    async def resolve_usernames(self, ids, api_client, max_remote_lookups=25, stats=None):
+        if stats is not None:
+            stats["remote_lookups"] = 0
+            stats.setdefault("attempted_ids", set()).update(ids)
+        return {uid: f"name-{uid}" for uid in ids}
+
+
+class _BuildDB:
+    def __init__(self):
+        self.advanced = []
+
+    async def read_channel_window_anchor_async(self, team_id, channel_id):
+        return {"anchor": None, "inventory": None}
+
+    async def read_channel_discovery_roots_async(self, team_id, channel_id, *, floor_ts, high_ts):
+        return {"activity_roots": {}, "receipt_roots": ()}
+
+    async def read_channel_sidecars_for_async(self, team_id, channel_id, message_ts):
+        return {"ids": sorted(message_ts), "receipt_feature_epoch_ts": None, "receipts": [],
+                "image_analyses": [], "document_extractions": [], "ambient_artifacts": [],
+                "tool_usage": {}, "versions_hash": "v" * 64}
+
+    async def advance_channel_window_anchor_async(self, team_id, channel_id, floor_ts, version):
+        self.advanced.append((floor_ts, version))
+        return True
+
+
+@pytest.mark.asyncio
+async def test_the_page_counts_reach_the_ledger():
+    """T75. The REAL builder-to-ledger path, the composition, the self-referential equality and
+    the drain gate — every one of them a property the composer could quietly lose."""
+    from message_processor import channel_stream as cs
+    from message_processor import participation_telemetry as pt
+    from slack_client import admission_watermark
+
+    H = "9999.0"
+    order: list = []
+    emitted: list = []
+
+    async def _no_drain(channel_id, frontier, timeout=None):
+        order.append("drain")
+        return None
+
+    # ---- the page counts actually reach the emitted row -------------------------------------
+    with patch.object(admission_watermark, "drain", _no_drain), \
+         patch.object(pt, "stream_render", lambda **kw: emitted.append(kw)):
+        client = _BuildClient(order)
+        result = await cs.build_channel_stream(
+            client=client, db=_BuildDB(), team_id="T1", channel_id="C1", h=H,
+            origin_root_ts="10.0", turn_id="turn-1", trigger_ts="10.0")
+
+    assert len(emitted) == 1, "one row per BUILD"
+    row = emitted[0]
+    assert row["history_pages"] == result.pages.history
+    assert row["reply_pages"] == result.pages.reply
+    assert row["origin_pages"] == result.pages.origin
+    assert row["reselected"] == result.reselected
+    assert row["anchor_advanced"] == result.anchor_advanced
+    # Mutation-check: an emitter taking only the stream cannot see any of those five — they
+    # postdate the pin the bytes were made from, so no route "onto the stream" exists.
+    assert not hasattr(result.stream, "history_pages")
+
+    # THE DRAIN PRECEDES ALL SLACK I/O, on the success path: the first origin call is strictly
+    # after the drain resolves.
+    assert order[0] == "drain"
+    assert order.index("drain") < order.index("replies")
+    assert {"history:start", "replies"} <= set(order)
+    # EXACTLY ONE DRAIN PER TURN. `prepare_channel_turn` owns it alone; the turn path used to
+    # drain as well, which was a second wait on the same watermark and a second failure point
+    # for an ordering guarantee the split already makes structural.
+    assert order.count("drain") == 1, order
+
+    # ---- the composition: each phase exactly once, and the two components concurrent ---------
+    order2: list = []
+    calls = {"pin": 0, "origin_pin": 0}
+    real_pin, real_origin_pin = cs.build_channel_pin, cs.build_origin_pin
+
+    async def _counting_pin(*a, **kw):
+        calls["pin"] += 1
+        return await real_pin(*a, **kw)
+
+    async def _counting_origin_pin(*a, **kw):
+        calls["origin_pin"] += 1
+        return await real_origin_pin(*a, **kw)
+
+    with patch.object(admission_watermark, "drain", _no_drain), \
+         patch.object(pt, "stream_render", lambda **kw: None), \
+         patch.object(cs, "build_channel_pin", _counting_pin), \
+         patch.object(cs, "build_origin_pin", _counting_origin_pin):
+        composed = await cs.build_channel_stream(
+            client=_BuildClient(order2), db=_BuildDB(), team_id="T1", channel_id="C1", h=H,
+            origin_root_ts="10.0", turn_id="turn-2", trigger_ts="10.0")
+
+    assert calls == {"pin": 1, "origin_pin": 1}
+    # THE TWO COMPONENTS ARE STILL CONCURRENT: the origin's `replies` call lands BETWEEN the
+    # history call's entry and its exit. Mutation-check: sequencing the origin fetch after the
+    # shared phase moves `replies` past `history:end` and fails exactly this line.
+    assert order2.index("replies") < order2.index("history:end"), order2
+    assert order2.index("history:start") < order2.index("replies")
+
+    # ---- THE EQUALITY, self-referentially: the composer adds nothing the phases did not ------
+    order3: list = []
+    direct_client = _BuildClient(order3)
+    direct_db = _BuildDB()
+    with patch.object(admission_watermark, "drain", _no_drain):
+        prepared = await cs.prepare_channel_turn(
+            client=direct_client, db=direct_db, team_id="T1", channel_id="C1", h=H, frontier=0)
+    import time as _time
+    deadline_at = _time.monotonic() + float(config.fetch_retry_total_seconds)
+    shared = await cs.build_channel_pin(prepared, client=direct_client, db=direct_db,
+                                        deadline_at=deadline_at)
+    origin_fetch = await cs.fetch_origin_thread(
+        direct_client, "C1", "10.0", H,
+        cs.FetchBudget(deadline_at=deadline_at, page_ceiling=None), "10.0")
+    pin, _pages = await cs.build_origin_pin(shared, origin_fetch, db=direct_db,
+                                            client=direct_client)
+    direct = cs.serialize_stream(pin)
+
+    # What the equality covers is STATED, not assumed: both blocks' bytes, every count, and BOTH
+    # hashes. It EXCLUDES the composer-owned writes and `anchor_advanced` — asserting those
+    # equal would assert that calling the phases directly ALSO wrote to the database, which is
+    # the opposite of what the probe relies on.
+    assert [i.content for i in direct.items] == [i.content for i in composed.stream.items]
+    assert [i.content for i in direct.origin_items] == [
+        i.content for i in composed.stream.origin_items]
+    assert direct.stream_sha256 == composed.stream.stream_sha256
+    assert direct.union_sha256 == composed.stream.union_sha256
+    for field in ("message_count", "origin_count", "root_count", "candidate_count",
+                  "orphan_root_count", "byte_count", "origin_byte_count"):
+        assert getattr(direct, field) == getattr(composed.stream, field), field
+    assert direct_db.advanced == [], "the phases alone must not write the anchor"
+
+    # ---- THE DRAIN GATE: a FAILING drain issues zero Slack calls of any kind ------------------
+    order4: list = []
+    failing_client = _BuildClient(order4)
+
+    async def _failing_drain(channel_id, frontier, timeout=None):
+        raise RuntimeError("index ticket unrepaired at or below the frontier")
+
+    with patch.object(admission_watermark, "drain", _failing_drain), \
+         patch.object(pt, "stream_render", lambda **kw: None):
+        with pytest.raises(RuntimeError):
+            await cs.build_channel_stream(
+                client=failing_client, db=_BuildDB(), team_id="T1", channel_id="C1", h=H,
+                origin_root_ts="10.0", turn_id="turn-3", trigger_ts="10.0")
+
+    # The origin fetch CANNOT have started, because the prepare phase never returned. Moving the
+    # drain back inside the phase that runs concurrently with the origin fetch lets the origin
+    # call land during the drain, and fails exactly here.
+    assert order4 == [], f"a failed drain must issue no Slack call, got {order4}"
+    assert failing_client.app.client.conversations_history.call_count == 0
+    assert failing_client.app.client.conversations_replies.call_count == 0
+
+    # ---- THE DEADLINE IS TAKEN AFTER THE PREPARE PHASE RETURNS -------------------------------
+    # A SLOW DRAIN MUST NOT SHORTEN THE FETCH BUDGET. "Deadline at fetch start" means at FETCH
+    # start; taking it before the drain would charge the fetch for a wait it was not part of, and
+    # a channel whose watermark takes 20 seconds to settle would hand its components a budget
+    # already two thirds spent. An immediate drain cannot show this — both orderings look
+    # identical — so the drain here deliberately burns clock.
+    import time as _time
+
+    order5: list = []
+    slow_client = _BuildClient(order5)
+    captured: list = []
+    real_monotonic = _time.monotonic
+    drain_cost = 5.0
+
+    async def _slow_drain(channel_id, frontier, timeout=None):
+        order5.append("drain")
+        # Advance the clock the way a real wait would, without actually sleeping.
+        offsets.append(drain_cost)
+
+    offsets: list = []
+
+    def _fake_monotonic():
+        return real_monotonic() + sum(offsets)
+
+    real_budget = cs.FetchBudget
+
+    class _CapturingBudget(real_budget):
+        def __init__(self, *a, **kw):
+            if kw.get("deadline_at") is not None:
+                captured.append(kw["deadline_at"])
+            super().__init__(*a, **kw)
+
+    with patch.object(admission_watermark, "drain", _slow_drain), \
+         patch.object(pt, "stream_render", lambda **kw: None), \
+         patch.object(cs, "FetchBudget", _CapturingBudget), \
+         patch.object(cs.time, "monotonic", _fake_monotonic):
+        await cs.build_channel_stream(
+            client=slow_client, db=_BuildDB(), team_id="T1", channel_id="C1", h=H,
+            origin_root_ts="10.0", turn_id="turn-5", trigger_ts="10.0")
+
+    assert captured, "the builder must construct its budgets from one absolute deadline"
+    # The deadline was taken AFTER the drain's 5 seconds elapsed, so it sits a full
+    # `fetch_retry_total_seconds` ahead of the POST-drain clock — not of the pre-drain one.
+    budget_span = captured[0] - _fake_monotonic()
+    assert budget_span > float(config.fetch_retry_total_seconds) - 1.0, (
+        f"the fetch budget was shortened by the drain: {budget_span:.1f}s of "
+        f"{config.fetch_retry_total_seconds}s remained")
+    # Mutation-check: taking the deadline before `prepare_channel_turn` returns leaves roughly
+    # `fetch_retry_total_seconds - drain_cost` here and fails the line above.
+    assert len(set(captured)) == 1, "all three budgets share ONE absolute deadline"

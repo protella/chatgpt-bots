@@ -5,13 +5,11 @@ import json
 import pytest
 
 from message_processor import dev_barriers
-from message_processor.dev_barriers import (POST_ADMISSION, POST_PARTIAL_POST,
-                                           PRE_RESUME_AFTER_COMPACTION, SEAMS)
+from message_processor.dev_barriers import POST_ADMISSION, POST_PARTIAL_POST, SEAMS
 
 _SEAM_FNS = {
     POST_ADMISSION: dev_barriers.post_admission,
     POST_PARTIAL_POST: dev_barriers.post_partial_post,
-    PRE_RESUME_AFTER_COMPACTION: dev_barriers.pre_resume_after_compaction,
 }
 
 
@@ -30,9 +28,14 @@ async def _await(coro, timeout=10):
     return await asyncio.wait_for(coro, timeout=timeout)
 
 
-def test_all_three_seams_are_declared():
-    assert SEAMS == (POST_ADMISSION, POST_PARTIAL_POST, PRE_RESUME_AFTER_COMPACTION)
+def test_only_the_two_turn_seams_remain():
+    """T11. The compaction seam went with the compaction. The keyed-barrier mechanism itself is
+    W5's and is unchanged — every case below still drives both survivors."""
+    assert SEAMS == (POST_ADMISSION, POST_PARTIAL_POST)
     assert set(_SEAM_FNS) == set(SEAMS)
+    assert not hasattr(dev_barriers, "pre_resume_after_compaction")
+    assert not hasattr(dev_barriers, "PRE_RESUME_AFTER_COMPACTION")
+    assert not hasattr(dev_barriers, "COMPACTION_SEAMS")
 
 
 @pytest.mark.parametrize("seam", SEAMS)
