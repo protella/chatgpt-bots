@@ -1,9 +1,9 @@
 """Dev-only turn barriers (spec §13 live checks, plan §4a).
 
-Named seams where a live battery can freeze a turn — or a background compaction — and look at the
-world before it moves on. Some claims are only checkable mid-flight: "the stream a turn renders is
-current as of admission" cannot be observed from the outside once the reply has landed, and neither
-can "an in-flight receipt is excluded from the very stream being built".
+Named seams where a live battery can freeze a turn and look at the world before it moves on. Some
+claims are only checkable mid-flight: "the stream a turn renders is current as of admission" cannot
+be observed from the outside once the reply has landed, and neither can "an in-flight receipt is
+excluded from the very stream being built".
 
 HARD no-op unless DEV_TURN_BARRIERS names the seam. Not a flag read behind a filesystem probe —
 nothing is touched at all, because this code sits on the production turn path.
@@ -11,8 +11,8 @@ nothing is touched at all, because this code sits on the production turn path.
 BARRIERS ARE KEYED `(seam, operation_id, test_epoch_id)` (§4a). Seam-only keying makes two
 concurrent turns collide on one pair of files: the first to arrive owns the `.waiting` announcement
 and the release frees BOTH, which is how P2's live battery lost a case and recovered only on
-timeout. The operation id is the `turn_id` at a turn seam and the `compaction_id` at a compaction
-seam, so two operations at one seam are two independent barriers.
+timeout. The operation id is the `turn_id`, so two operations at one seam are two independent
+barriers.
 
 Protocol: the barrier writes `<dir>/<seam>.<key>.waiting` (its context, one JSON object, key
 included) and waits for `<dir>/<seam>.<key>.release` — or for the unkeyed `<dir>/<seam>.release`,
@@ -34,11 +34,8 @@ logger = setup_logger(name="slack_bot.DevBarriers")
 
 POST_ADMISSION = "post_admission"
 POST_PARTIAL_POST = "post_partial_post"
-PRE_RESUME_AFTER_COMPACTION = "pre_resume_after_compaction"
 
-SEAMS = (POST_ADMISSION, POST_PARTIAL_POST, PRE_RESUME_AFTER_COMPACTION)
-# Which id names the operation at each seam. A compaction has no turn.
-COMPACTION_SEAMS = (PRE_RESUME_AFTER_COMPACTION,)
+SEAMS = (POST_ADMISSION, POST_PARTIAL_POST)
 
 _ENV_SEAMS = "DEV_TURN_BARRIERS"
 _ENV_DIR = "DEV_TURN_BARRIERS_DIR"
@@ -77,14 +74,12 @@ def _slug(value: Any) -> str:
 def operation_id(seam: str, context: Optional[Dict[str, Any]] = None) -> str:
     """WHICH operation this barrier belongs to (§4a).
 
-    `compaction_id` at a compaction seam, `turn_id` at a turn seam. The remaining fallbacks are
-    for seams whose caller carries neither: a per-message ts still identifies ONE operation, and
-    only a caller with no identifying field at all shares the unkeyed barrier.
+    The `turn_id` names it. The remaining fallbacks are for callers that carry none: a per-message
+    ts still identifies ONE operation, and only a caller with no identifying field at all shares
+    the unkeyed barrier.
     """
     ctx = context or {}
-    names = (("compaction_id", "crawl_id", "turn_id") if seam in COMPACTION_SEAMS
-             else ("turn_id", "compaction_id", "crawl_id"))
-    for name in (*names, "message_ts", "attempt_id"):
+    for name in ("turn_id", "message_ts", "attempt_id"):
         value = ctx.get(name)
         if value:
             return _slug(value)
@@ -139,9 +134,8 @@ async def barrier(seam: str, context: Optional[Dict[str, Any]] = None) -> bool:
 
 
 async def post_admission(**context: Any) -> bool:
-    """After H is pinned, the snapshot pointer is checked and the sidecars are read — and
-    BEFORE any Slack fetch. Freezing here lets a battery post a message and prove the stream
-    that follows does NOT contain it."""
+    """After H is pinned and the sidecars are read, and BEFORE any Slack fetch. Freezing here
+    lets a battery post a message and prove the stream that follows does NOT contain it."""
     return await barrier(POST_ADMISSION, context)
 
 
@@ -150,10 +144,3 @@ async def post_partial_post(**context: Any) -> bool:
     before any finalize. Freezing here lets a battery prove an in-flight surface is excluded
     from the stream a concurrent turn builds."""
     return await barrier(POST_PARTIAL_POST, context)
-
-
-async def pre_resume_after_compaction(**context: Any) -> bool:
-    """After a background compaction has published and BEFORE its task vacates the channel's
-    single-flight slot — the only window in which "the next turn selects the new generation" is
-    observable as a before/after rather than as a race. Keyed by `compaction_id`."""
-    return await barrier(PRE_RESUME_AFTER_COMPACTION, context)

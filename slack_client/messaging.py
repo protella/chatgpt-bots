@@ -14,7 +14,8 @@ from slack_sdk.errors import SlackApiError
 
 import prompts
 from base_client import HistoryFetchError, Message
-from config import SUPPORTED_CHAT_MODELS, config, pipeline_status_markers, valid_emoji_name
+from config import (SUPPORTED_CHAT_MODELS, config, dev_epoch_fence_requested,
+                    pipeline_status_markers, valid_emoji_name)
 from message_processor import participation_telemetry
 from message_processor.stale_send_guard import StaleSendSuppressed
 from message_markers import (
@@ -23,7 +24,6 @@ from message_markers import (
     fence_safe_chunks,
     is_checklist_status_text,
 )
-from slack_client.event_handlers.activity_index import feed_own_mutation
 from slack_client.event_handlers.feedback import (
     FEEDBACK_ACTION_ID,
     USER_SETTINGS_ACTION_ID,
@@ -35,6 +35,66 @@ from slack_client.formatting.blocks import extract_supplementary_text
 from slack_client.utilities import strip_citations
 
 import re as _re
+
+# The dev-only epoch fence. THE IMPORT IS GATED ON THE FLAG, exactly as in `main.py`: with
+# DEV_EPOCH_FENCE_ENABLE empty this module is never imported, so flag-off is import-inert and not
+# merely failure-inert, and no defect in the fence can reach a production send path.
+#
+# The predicate is `config.dev_epoch_fence_requested`, the single definition every import gate in
+# this codebase shares — it decides whether the fence module is imported, so it cannot live in it.
+#
+# With the flag SET, an import failure here is logged at ERROR and leaves the fence disabled, but
+# it is `main.initialize` that REFUSES TO START on it. This module is also imported by tools and
+# tests that have no boot sequence to abort, so the abort belongs where the boot is.
+_epoch_fence = None
+if dev_epoch_fence_requested():
+    try:
+        from message_processor import epoch_fence as _epoch_fence
+    except Exception as _e:  # noqa: BLE001 — reported here, fatal in main.initialize()
+        import logging as _logging
+        _logging.getLogger("slack_bot.Messaging").error(
+            f"DEV_EPOCH_FENCE_ENABLE is set but the epoch fence module could not be imported "
+            f"({type(_e).__name__}: {_e}); every send on this path is UNFENCED.")
+
+
+class _NeverRaised(Exception):
+    """Stands in for `EpochEffectRefused` when the fence module is unavailable, so the `except`
+    clauses below stay well-formed instead of branching on whether an import succeeded."""
+
+
+_EPOCH_REFUSED = (_epoch_fence.EpochEffectRefused if _epoch_fence is not None else _NeverRaised)
+
+
+# MODULE-LEVEL, not methods on the mixin, and that is deliberate. Several of the methods below are
+# driven UNBOUND against `MagicMock` stand-ins, where every attribute access invents a coroutine or
+# a truthy value — so an instance-method form would fabricate a refusal and silently skip a write
+# nothing was fencing. Whether an effect is allowed is not a question the receiver gets to answer.
+
+
+def _epoch_authorize(client: Any, channel_id: Optional[str], site: str) -> None:
+    """RAISE when a fence refuses this write. For the answer and upload paths, where a swallowed
+    refusal would look to the caller exactly like a successful post.
+
+    `team_id` comes off the client's authenticated identity, never an argument: the object making
+    the call already holds the real workspace, so it cannot be handed a guessed one. A stand-in
+    whose `self_team_id` is a mock simply matches no fence, which is the right answer.
+    """
+    if _epoch_fence is None:
+        return
+    _epoch_fence.authorize_effect(getattr(client, "self_team_id", None), channel_id, site=site)
+
+
+def _epoch_refused(client: Any, channel_id: Optional[str], site: str) -> bool:
+    """True when a fence refuses this write, logged at WARNING. For the best-effort helpers whose
+    documented contract is that they never raise — chrome, reactions, status, footers."""
+    try:
+        _epoch_authorize(client, channel_id, site)
+        return False
+    except _EPOCH_REFUSED as e:
+        log = getattr(client, "log_warning", None)
+        if callable(log):
+            log(f"Epoch fence refused {site}: {e}")
+        return True
 
 # Block action_ids that mark a message as one of our UI helpers (channel footer's
 # Configure button, Phase H feedback strip + its user-settings button). PURE-chrome
@@ -147,7 +207,7 @@ _SELF_STATUS_MARKERS = (
 )
 
 
-def is_self_chrome_message(text: str, msg: dict) -> bool:
+def is_self_chrome_message(text: str, msg: dict, *, markers=None) -> bool:
     """True when a message is our OWN transient UI chrome — a status/placeholder line
     (":emoji: Thinking…"), a progress checklist ("✓ …"), the legacy processing notice, the
     "Settings available" button, or a pure UI-helper block (Configure button / feedback strip)
@@ -157,7 +217,12 @@ def is_self_chrome_message(text: str, msg: dict) -> bool:
     Content-bearing replies — even ones carrying the Configure chrome attached on stopStream —
     are NOT chrome and return False. The caller decides ownership (only pass our own messages for
     the self-status checks to be meaningful); this only classifies the shape. Fail-open: any
-    error classifies as NOT chrome, so a real reply is never silently dropped."""
+    error classifies as NOT chrome, so a real reply is never silently dropped.
+
+    `markers` PINS the pipeline status-marker list for one caller. Omitted, it reads the LIVE
+    list exactly as it always has, so every existing call site is byte-identical. The channel
+    turn passes the list frozen into its pin instead: a marker-list change landing mid-turn would
+    otherwise silently alter the bytes an admitted turn was already committed to."""
     try:
         text = text or ""
         # F1 progress-checklist ("✓ …") — carries an invisible marker, not the ":emoji:" shape.
@@ -166,7 +231,8 @@ def is_self_chrome_message(text: str, msg: dict) -> bool:
         # Transient placeholders/status lines: ":emoji: Thinking..." and same-shaped updates.
         if _SELF_STATUS_RE.match(text) and (
             any(marker in text for marker in _SELF_STATUS_MARKERS)
-            or any(marker in text for marker in pipeline_status_markers())
+            or any(marker in text
+                   for marker in (pipeline_status_markers() if markers is None else markers))
         ):
             return True
         # Legacy busy/processing notice.
@@ -218,6 +284,18 @@ class NativeStreamSession:
         the answer follows it."""
         if lease is not None:
             lease.authorize("native_start")
+        # EPOCH FENCE: chat.startStream MINTS the reply message, so refusing here refuses the
+        # whole stream — appendStream and stopStream key off a ts that will never exist. The
+        # session goes inert exactly as it does on any other start failure.
+        try:
+            if _epoch_fence is not None:
+                _epoch_fence.authorize_effect(self._team_id, self._channel,
+                                              site="chat_startStream")
+        except _EPOCH_REFUSED as e:
+            if self._log:
+                self._log(f"epoch fence refused the native stream: {e}")
+            self.active = False
+            return False
         if not self._thread:
             # chat.startStream REQUIRES thread_ts (Slack: "missing required field"),
             # so top-level channel replies can never stream natively. Skip the
@@ -696,6 +774,17 @@ class SlackMessagingMixin:
         except Exception as e:  # noqa: BLE001
             self.log_debug(f"receipt record failed at {site}: {e}")
 
+    # --- the dev-only epoch fence's effect check ------------------------------------------
+    #
+    # SLIM SCOPE, stated once so the omissions are deliberate rather than forgotten. The check
+    # guards the sites that MINT something in the room — a post, an upload, a reaction, a status
+    # card, a footer, a native stream — and not the sites that update or delete what one of those
+    # already created. Refusing the create is enough to keep a fenced turn's work out of the
+    # channel, and fencing the follow-ups would strand a mid-flight turn's own cleanup. The spec's
+    # full design fences all seventeen methods here and has an AST tripwire proving the set is
+    # complete; slim has neither, so a posting site added later does NOT automatically inherit the
+    # fence. The helpers are `_epoch_authorize` / `_epoch_refused` at module scope above.
+
     async def send_message(self, channel_id: str, thread_id: str, text: str,
                            blocks: Optional[list] = None,
                            meta_out: Optional[dict] = None,
@@ -741,6 +830,9 @@ class SlackMessagingMixin:
         # welcome cards, a job's own status card) pass no lease and are unaffected.
         if lease is not None:
             lease.authorize(surface)
+        # EPOCH FENCE: beside the stale guard and for the same reason — the last check before
+        # Slack, and outside the try below, so a refusal is never laundered into "the send failed".
+        _epoch_authorize(self, channel_id, f"send_message:{surface}")
         try:
             # Strip MCP citations from text before sending to Slack
             text = strip_citations(text)
@@ -1049,6 +1141,7 @@ class SlackMessagingMixin:
         is a first answer surface and is checked like one."""
         if lease is not None:
             lease.authorize(surface)
+        _epoch_authorize(self, channel_id, f"send_message_get_ts:{surface}")
         try:
             # Strip MCP citations from text before sending to Slack
             text = strip_citations(text)
@@ -1144,6 +1237,9 @@ class SlackMessagingMixin:
         files_upload_v2 hands back no share ts: the file id is the only handle from which the
         image message's ts can later be resolved (see resolve_file_share_ts).
         """
+        # BEFORE the upload, never after: an upload is irreversible and visible, so authorizing
+        # it afterwards fences nothing.
+        _epoch_authorize(self, channel_id, "send_image")
         try:
             # Use files_upload_v2 for image upload
             result = await self.app.client.files_upload_v2(
@@ -1298,6 +1394,7 @@ class SlackMessagingMixin:
         Returns None on any failure — the caller decides whether that's fatal (for an
         artifact it never is: the text answer already landed).
         """
+        _epoch_authorize(self, channel_id, "send_file")
         try:
             result = await self.app.client.files_upload_v2(
                 channel=channel_id,
@@ -1348,6 +1445,8 @@ class SlackMessagingMixin:
         Only where setStatus FAILS (non-agent contexts, older surfaces) do we post
         the classic "Thinking..." placeholder and return its ts.
         """
+        if _epoch_refused(self, channel_id, "send_thinking_indicator"):
+            return None
         status_set = await self.set_assistant_status(channel_id, thread_id)
         if status_set:
             return None
@@ -1374,10 +1473,6 @@ class SlackMessagingMixin:
                 channel=channel_id,
                 ts=message_id
             )
-            # §1c: our own deletion is not channel activity (no watermark, no wake), but a
-            # snapshot that summarized this message is wrong from here on.
-            await feed_own_mutation(self, channel_id, message_id, "delete",
-                                    operation_id=f"delete:{channel_id}:{message_id}")
             return True
         except SlackApiError as e:
             self.log_debug(f"Could not delete message: {e}")
@@ -1407,11 +1502,6 @@ class SlackMessagingMixin:
                 text=text,
                 mrkdwn=True  # Enable markdown parsing for italics/bold
             )
-            # §1c: an edit of our own message, recorded non-wake. The id is fresh per call
-            # rather than derived from the ts — the same message edited twice is two mutations,
-            # and one identity for both would lose the second.
-            await feed_own_mutation(self, channel_id, message_id, "edit",
-                                    operation_id=f"update:{channel_id}:{message_id}:{uuid4().hex}")
             # An EDIT mints no ts, so there is nothing to register — only a state change, and
             # only when the caller names one (a terminal notice written into a chrome surface
             # is conversation from that moment on).
@@ -1438,6 +1528,8 @@ class SlackMessagingMixin:
         carry the visible card. `username` optionally labels the poster (needs the
         chat:write.customize scope; without it Slack raises missing_scope → None so the caller
         can retry unlabeled). Best-effort — never raises."""
+        if _epoch_refused(self, channel_id, "post_status_card"):
+            return None
         try:
             kwargs = dict(channel=channel_id, thread_ts=thread_id, text=text, blocks=blocks,
                           unfurl_links=False, unfurl_media=False)
@@ -1776,6 +1868,8 @@ class SlackMessagingMixin:
         name = (emoji or "").strip().strip(":")
         if not name:
             return False, False
+        if _epoch_refused(self, channel_id, "reactions_add"):
+            return False, False
         try:
             await self.app.client.reactions_add(channel=channel_id, name=name, timestamp=message_ts)
             return True, True
@@ -1807,6 +1901,8 @@ class SlackMessagingMixin:
             return False
         name = (emoji or "").strip().strip(":")
         if not name:
+            return False
+        if _epoch_refused(self, channel_id, "reactions_remove"):
             return False
         try:
             await self.app.client.reactions_remove(
@@ -2465,10 +2561,10 @@ class SlackMessagingMixin:
         # EMPTY set, and an empty set still enforces, the same as a turn whose stream genuinely
         # rendered no thread. Either way there is no thread to post into.
         #
-        # EXTENSION POINT (P4): when a turn can PIN a root it reached another way — a
-        # select_and_pin anchor, a search result the user asked us to answer — that root joins this
-        # set at pin time. It must never be widened here, at the moment of posting, because then
-        # "authorized" would mean "the model named it".
+        # EXTENSION POINT (W3): when a turn can PIN a root it reached another way — a search
+        # result Slack actually returned this turn — that root joins this set at pin time. It must
+        # never be widened here, at the moment of posting, because then "authorized" would mean
+        # "the model named it".
         trusted = getattr(ctx, "trusted_thread_roots", None)
         if trusted is not None and target not in trusted:
             return {"ok": False, "error": "unknown_thread",
@@ -2649,11 +2745,7 @@ class SlackMessagingMixin:
 
         `receipts`: passed by the ANSWER-bearing callers only. The edited surface stops being
         chrome at that moment, so it is promoted (same owner) and settles with the turn.
-        Status/phase callers pass nothing and the surface stays excluded.
-
-        Deliberately NOT wired to `feed_own_mutation` (§1c), unlike update_message: Slack
-        delivers an own-message `message_changed` for every streamed edit, and the listener feed
-        already records an observation for each one. A call here would only duplicate them."""
+        Status/phase callers pass nothing and the surface stays excluded."""
         if lease is not None:
             lease.authorize(surface)
         try:
@@ -2863,6 +2955,11 @@ class SlackMessagingMixin:
                 if not should_offer_feedback(channel_id, thread_ts):
                     return
                 model = (getattr(response, "metadata", None) or {}).get("model")
+                # A refusal must return, not raise: this whole method sits inside a broad
+                # `except Exception` that logs at DEBUG, so a raise here would be swallowed
+                # where nobody looks.
+                if _epoch_refused(self, channel_id, "feedback_footer"):
+                    return
                 posted = await self.app.client.chat_postMessage(  # unleased-ok: the settings footer, which only ever follows an answer already posted
                     channel=channel_id,
                     thread_ts=thread_ts,
@@ -2879,6 +2976,8 @@ class SlackMessagingMixin:
             model = (getattr(response, "metadata", None) or {}).get("model")
             blocks = self._build_response_footer_blocks(model)
             thread_ts = getattr(message, "thread_id", None)
+            if _epoch_refused(self, channel_id, "response_footer"):
+                return
             posted = await self.app.client.chat_postMessage(  # unleased-ok: the same footer on the fallback path
                 channel=channel_id,
                 thread_ts=thread_ts,

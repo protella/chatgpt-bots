@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+from typing import Optional
 
 import pytest
 
@@ -326,3 +327,407 @@ def test_the_streaming_background_return_carries_the_same_facts_as_the_terminal_
     for fact in ("artifact_containers", "sandbox_image_assets", "mounted_digests",
                  "response_reaction_committed"):
         assert fact in branch, f"the streaming background return still drops {fact}"
+
+
+# ======================================================================= P4a compaction (W1)
+#
+# The THIRD retirement, and the largest. P4a built a background compaction machine — eight
+# tables, a crawl with checkpoints, a summary generation pipeline, a telemetry outbox, a
+# dormancy state machine, a snapshot store with namespaces and a publication CAS — to answer
+# "what if the channel does not fit". The shallow window answers it instead, by not asking for
+# the whole channel in the first place. That makes every one of those parts unreachable at once,
+# which is exactly the condition under which pieces come back one plausible import at a time.
+
+_COMPACTION_TABLES = frozenset({
+    "snapshot_mutation_observations", "snapshot_capture_manifest", "snapshot_anchor_provenance",
+    "compaction_crawl_checkpoints", "compaction_event_skeleton", "compaction_telemetry_outbox",
+    "pending_recompaction", "compaction_cancellation_intent",
+    "channel_snapshots", "channel_snapshot_pointer",
+})
+
+# The ONE function allowed to name the dropped tables: the migration that drops them. Scoping the
+# allowance to `database.py` as a whole was too loose — a newly added accessor querying a dropped
+# table under any other name in that file would have passed.
+_TABLE_NAME_EXEMPT = frozenset({pathlib.Path("database.py")})
+_TABLE_NAME_EXEMPT_FUNCTION = "_migrate_drop_compaction_schema"
+
+_RETIRED_COMPACTION_NAMES = frozenset({
+    # the modules' own entry points
+    "ChannelSnapshotCoordinator", "snapshot_coordinator", "select_and_pin",
+    "resolve_pending_invalidation", "drain_outbox", "revalidate", "unpin",
+    # the turn's carriers
+    "snapshot_lease", "compaction_evidence", "snapshot_selection", "CompactionEvidence",
+    "_trigger_compaction", "_post_turn_compaction", "_compaction_evidence",
+    "_release_snapshot_lease",
+    # the database accessors
+    "insert_channel_snapshot_async", "publish_channel_snapshot_async", "get_active_snapshot_async",
+    "get_snapshot_async", "get_snapshot_row_async", "invalidate_snapshot_async",
+    "delete_snapshot_async", "select_snapshot_for_pin_async", "snapshot_manifest_async",
+    "snapshot_anchor_provenance_async", "insert_compaction_candidate_async",
+    "publish_compaction_candidate_async", "retire_snapshot_lineage_async",
+    "rollback_published_generation_async", "mutation_observations_after_async",
+    "affected_snapshot_ids_async", "sweep_mutation_observations_async",
+    "load_crawl_checkpoint_async", "upsert_crawl_checkpoint_async", "delete_crawl_state_async",
+    "commit_crawl_page_async", "seal_event_skeleton_async", "skeleton_slice_async",
+    "insert_outbox_rows_async", "read_outbox_batch_async", "delete_outbox_row_async",
+    "load_pending_recompaction_async", "merge_pending_recompaction_async",
+    "cas_pending_recompaction_async", "write_cancellation_intent_async",
+    "terminal_publish_nothing_async", "sweep_snapshots_async", "late_artifact_evidence_async",
+    "record_activity_and_mutation_async", "max_mutation_observation_id_async",
+    "_init_compaction_schema", "_migrate_snapshot_namespace", "_migrate_retire_v1_pointers",
+    # the serializer's v2 grammar
+    "render_summary_block", "_summary_item", "_snapshot_text", "stale_marked_payload",
+    "render_anchor_block", "anchor_roots_in", "anchor_is_eligible", "escape_anchor_text",
+    "render_late_artifact", "render_rehydration", "render_rehydration_omission",
+    "build_late_artifact_items", "build_rehydration_item", "rehydration_variant_headroom",
+    "SnapshotUnsupportedError", "CoverageNotReady", "CoveragePin", "StreamFloorUnknown",
+    # the telemetry vocabulary
+    "compaction_snapshot", "validate_outbox_body", "emit_outbox_body", "extract_canonical_body",
+    "canonical_body_bytes", "canonical_json",
+    # the mutation feed, and the normalizer machinery that fed only it
+    "mutation_from_event", "feed_own_mutation", "mutation_kind",
+    "mutation_observation_identity", "MUTATION_KIND_NAMES",
+    # the capture-manifest renderer and the coordinator's dormant field
+    "artifact_render_bytes", "AMBIENT_ARTIFACT_CHARS", "_malformed_pending_seen",
+    # the barrier seam
+    "pre_resume_after_compaction",
+})
+
+_RETIRED_CONFIG_KEYS = (
+    "snapshot_retain_generations", "snapshot_retain_days", "compaction_trigger_ratio",
+    "compaction_target_ratio", "root_anchor_text_max", "compaction_min_tail",
+    "COMPACTION_MIN_TAIL_MAX", "snapshot_anchor_map_bound", "rehydration_max_messages",
+    "rehydration_max_bytes", "rehydration_page_budget", "rehydration_time_budget",
+    "crawl_page_budget", "crawl_time_budget", "crawl_fixed_headroom_tokens",
+    "summary_byte_cap", "revalidation_claim_ttl",
+)
+
+# Appendix A7: the serializer-v2 template constants. Grep-driven, so a constant cannot survive by
+# merely being unreferenced — an unused template is exactly what gets "restored" later.
+_RETIRED_TEMPLATES = (
+    "SUMMARY_HEADER_TEMPLATE", "SUMMARY_PREAMBLE", "SUMMARY_END_TEXT", "ANCHOR_HEADER_TEXT",
+    "ANCHOR_NONE_LINE", "ANCHOR_OMITTED_TEMPLATE", "ANCHOR_UNAVAILABLE_TEXT",
+    "ANCHOR_TOMBSTONE_MARKER", "STALE_MARKER_TEMPLATE", "STATUS_PUBLISHED_STALE",
+    "LATE_ARTIFACT_TEMPLATE", "LATE_ARTIFACT_FAILURE_TEMPLATE", "LATE_ARTIFACT_KIND_LINES",
+    "REHYDRATION_HEADER", "REHYDRATION_BOUND_CLAUSE", "REHYDRATION_END_TEXT",
+    "REHYDRATION_OMISSION_TEMPLATE", "REHYDRATION_REASONS", "SUMMARY_CLAUSE_NONE",
+    "SUMMARY_CLAUSE_TEMPLATE", "REASON_CLAUSE_GENESIS", "REASON_CLAUSE_RETENTION",
+    "REASON_CLAUSE_DEPTH_TEMPLATE", "REASON_CLAUSE_UNKNOWN",
+)
+
+
+def test_no_module_imports_channel_compaction():
+    """T1. REACHES, not mentions: an `import` statement, not the word in a comment. A module
+    that still imports either one would fail at boot, but the point is to catch the import being
+    ADDED BACK — a plausible `from message_processor.channel_snapshots import ...` in a future
+    edit is how a deleted module gets resurrected as a stub."""
+    dead_leaves = ("channel_compaction", "channel_snapshots")
+
+    def _is_dead(dotted: str) -> bool:
+        return bool(dotted) and dotted.split(".")[-1] in dead_leaves
+
+    offenders = []
+    for rel, src in _sources():
+        for node in ast.walk(ast.parse(src, filename=str(rel))):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if _is_dead(alias.name):
+                        offenders.append(f"{rel}:{node.lineno} (import {alias.name})")
+            elif isinstance(node, ast.ImportFrom):
+                # `from message_processor.channel_compaction import X` names the module in
+                # `.module`; `from message_processor import channel_compaction` and
+                # `from . import channel_compaction` name it in the ALIASES, with `.module`
+                # holding the parent package (or None for a bare relative import). Both forms
+                # are how a deleted module comes back, so both are checked.
+                if _is_dead(node.module or ""):
+                    offenders.append(f"{rel}:{node.lineno} (from {node.module})")
+                for alias in node.names:
+                    if _is_dead(alias.name):
+                        offenders.append(
+                            f"{rel}:{node.lineno} (from {node.module or '.'} import "
+                            f"{alias.name})")
+    assert not offenders, "the retired modules are imported at: " + ", ".join(offenders)
+
+
+def test_the_compaction_modules_are_gone():
+    for name in ("channel_compaction.py", "channel_snapshots.py"):
+        assert not (ROOT / "message_processor" / name).exists()
+
+
+def test_no_compaction_symbol_survives_anywhere():
+    """T15. A SYMBOL inventory rather than an import check: an accessor, a turn field or a
+    coordinator attribute can outlive the module that used it and read as live to the next
+    person. Structural (AST attribute/name/def), so prose in a retirement note stays legal."""
+    offenders = []
+    for rel, src in _sources():
+        for node in ast.walk(ast.parse(src, filename=str(rel))):
+            name = None
+            if isinstance(node, ast.Attribute):
+                name = node.attr
+            elif isinstance(node, ast.Name):
+                name = node.id
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = node.name
+            if name in _RETIRED_COMPACTION_NAMES:
+                offenders.append(f"{rel}:{node.lineno} ({name})")
+    assert not offenders, "retired compaction machinery survives at: " + ", ".join(offenders)
+
+
+_IMPORT_CALLS = frozenset({"import_module", "__import__", "find_spec", "load_module",
+                           "module_from_spec"})
+_DEAD_MODULES = ("channel_compaction", "channel_snapshots")
+
+
+def _dead_leaf(text: str) -> bool:
+    return text.strip().split(".")[-1] in _DEAD_MODULES
+
+
+def _folded(node: ast.AST) -> Optional[str]:
+    """A string this expression provably IS, or None. Constants and `+` chains of them.
+
+    Folding matters because `"message_processor." + "channel_compaction"` is a complete module
+    path that no single Constant node contains — statically evaluable, so still fair game.
+    """
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _folded(node.left), _folded(node.right)
+        return None if left is None or right is None else left + right
+    return None
+
+
+def _import_aliases(tree: ast.AST) -> set:
+    """Names in this module that REFER to an import callable, so a bare-name call through one is
+    scanned like the real thing: `im = importlib.import_module`, `from importlib import
+    import_module as x`."""
+    aliases = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name in _IMPORT_CALLS:
+                    aliases.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Assign) and isinstance(node.value, (ast.Attribute, ast.Name)):
+            referent = (node.value.attr if isinstance(node.value, ast.Attribute)
+                        else node.value.id)
+            if referent in _IMPORT_CALLS:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        aliases.add(target.id)
+    return aliases
+
+
+def _dead_module_strings(tree: ast.AST) -> list:
+    """Every place this tree names a removed module as a string. THE ONE SCANNER — the repo-wide
+    test and its own regression suite below both run this, so the thing under test and the thing
+    proven cannot drift apart."""
+    callables = _IMPORT_CALLS | _import_aliases(tree)
+    found = []
+    flagged = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        callee = (node.func.attr if isinstance(node.func, ast.Attribute)
+                  else getattr(node.func, "id", ""))
+        if callee not in callables:
+            continue
+        for arg in ast.walk(node):
+            text = _folded(arg)
+            if text is not None and _dead_leaf(text):
+                flagged.add(id(arg))
+                found.append((getattr(arg, "lineno", 0), f"{callee}({text!r})"))
+    for node in ast.walk(tree):
+        if id(node) in flagged:
+            continue
+        text = _folded(node)
+        if text is not None and "." in text and _dead_leaf(text):
+            found.append((getattr(node, "lineno", 0), repr(text)))
+    return found
+
+
+def test_no_dynamic_import_reaches_a_removed_module():
+    """T15's second half. A `getattr`/`importlib` route around the AST check above is the one way
+    a deleted module comes back without any import statement naming it.
+
+    WHERE THIS STOPS, AND WHY IT STOPS THERE. A runtime-computed module name — one assembled from
+    a variable, a config value or a loop — cannot be recognized statically, and chasing it would
+    be an arms race this test cannot win. It does not need to win it: **the module files no longer
+    exist, so ANY route that actually reaches one raises `ModuleNotFoundError` loudly at the
+    call**, and `test_no_compaction_table_survives_a_boot` proves the schema those modules wrote
+    is gone too. This scanner exists to catch the PLAUSIBLE reintroduction — an import someone
+    adds back while reading nearby code — not to be a sandbox. Do not escalate it further.
+
+    NO FILE EXEMPTIONS — the check is made PRECISE instead. `database.py` legitimately names the
+    string "channel_snapshots" in its drop list, because a dropped TABLE happens to share a name
+    with a deleted MODULE, and exempting the whole file to cope with that would wave through a
+    dynamic import in exactly the file most likely to want one.
+    """
+    offenders = []
+    for rel, src in _sources():
+        for lineno, what in _dead_module_strings(ast.parse(src, filename=str(rel))):
+            offenders.append(f"{rel}:{lineno} ({what})")
+    assert not offenders, "a removed module is named as a string at: " + ", ".join(offenders)
+
+
+@pytest.mark.parametrize("source,why", [
+    ('import importlib\n'
+     'name = "message_processor." + "channel_compaction"\n'
+     'importlib.import_module(name)\n',
+     "a name assembled from adjacent literals"),
+    ('import importlib\n'
+     'importlib.import_module("message_processor." + "channel_snapshots")\n',
+     "the same concatenation, inline"),
+    ('from importlib import import_module as _load\n'
+     '_load("channel_compaction")\n',
+     "an ALIASED import callable called with a bare module name"),
+    ('import importlib\n'
+     'loader = importlib.import_module\n'
+     'loader("channel_snapshots")\n',
+     "a module-level alias assignment"),
+    ('X = "message_processor.channel_compaction"\n',
+     "a plain dotted literal with no call at all"),
+    ('import importlib\n'
+     'importlib.import_module("message_processor.channel_compaction")\n',
+     "the ordinary qualified form"),
+])
+def test_the_dynamic_import_scanner_catches_the_evasions_it_claims_to(source, why):
+    """The scanner's OWN regression suite. Every form here was a real hole at some point in this
+    wave, and each is cheap to keep because the subject is the scanner rather than the repo.
+
+    Deliberately absent: a name computed at RUNTIME (from config, from a loop). The docstring
+    above says why that one does not need catching."""
+    assert _dead_module_strings(ast.parse(source)), f"the scanner MISSES {why}: {source!r}"
+
+
+def test_the_scanner_does_not_fire_on_a_dropped_table_name():
+    """The other direction, and the reason the file exemption could be removed at all: the drop
+    list names `channel_snapshots` as a TABLE, which is not a module reference."""
+    drop_list = ('TABLES = ("compaction_event_skeleton", "channel_snapshot_pointer",\n'
+                 '          "channel_snapshots")\n')
+    assert _dead_module_strings(ast.parse(drop_list)) == []
+
+
+def test_no_compaction_table_name_survives_outside_the_cleanup_migration():
+    """T15's third half. The table names are the durable trace: an accessor written against one
+    would fail at runtime rather than at import, and only in the channel that hit it.
+
+    The allowance is ONE FUNCTION, not one file. `database.py` legitimately names all ten in the
+    migration that drops them; anywhere else in that same file — a new accessor, a stray helper —
+    is exactly the regression this exists to catch, and a file-wide exemption would wave it
+    through.
+    """
+    offenders = []
+    for rel, src in _sources():
+        tree = ast.parse(src, filename=str(rel))
+        allowed_lines = set()
+        if rel in _TABLE_NAME_EXEMPT:
+            for node in ast.walk(tree):
+                if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and node.name == _TABLE_NAME_EXEMPT_FUNCTION):
+                    allowed_lines = set(range(node.lineno, (node.end_lineno or node.lineno) + 1))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                continue
+            if node.lineno in allowed_lines:
+                continue
+            for table in _COMPACTION_TABLES:
+                if table in node.value:
+                    offenders.append(f"{rel}:{node.lineno} ({table})")
+    assert not offenders, "a dropped table is still named at: " + ", ".join(offenders)
+
+
+def test_the_normalized_event_carries_no_mutation_identity_field():
+    """Finding 5's regression rail. `event_id` existed ONLY to key a durable mutation
+    observation, and a dataclass FIELD is invisible to the symbol sweep above — it would come
+    back as a one-line addition that reads like ordinary Slack metadata."""
+    from slack_client.normalizer import NormalizedEvent
+
+    fields = set(NormalizedEvent.__dataclass_fields__)
+    assert "event_id" not in fields
+    # The live shape, stated so a removal here is as loud as an addition.
+    assert fields == {"kind", "team_id", "channel_id", "subject_ts", "activity_ts",
+                      "root_if_indexed", "owner_probe_ts", "deleted_ts", "message"}
+
+
+def test_the_database_module_defines_no_stray_ts_helper():
+    """Finding 7, SCOPED TO `database.py` DELIBERATELY. Its `_ts_key` existed only for the
+    snapshot accessors and went with them, but the name is generic and FOUR unrelated live ones
+    remain — `activity_index.py`, `channel_summary.py`, `thread_management.py`, and an alias in
+    `participation.py`. A repo-wide symbol tripwire on it would demand all four be deleted, so
+    the check names the one module the removal applies to."""
+    import database
+
+    assert not hasattr(database, "_ts_key")
+    assert not hasattr(database, "canonical_json")
+
+
+def test_no_retired_constant_survives():
+    """T7. Two name lists, both grep-driven so a constant cannot survive by being unreferenced:
+    the config keys (which would still read as tunable in `.env.example`) and Appendix A7's
+    serializer-v2 templates (which would still read as part of the grammar)."""
+    from config import BotConfig, config
+
+    loaded = BotConfig()
+    for key in _RETIRED_CONFIG_KEYS:
+        assert not hasattr(loaded, key), f"BotConfig still exposes {key}"
+        assert not hasattr(config, key), f"the live config still exposes {key}"
+
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    for key in _RETIRED_CONFIG_KEYS:
+        assert key.upper() not in env_example, f".env.example still documents {key.upper()}"
+
+    serializer = (ROOT / "message_processor" / "channel_stream.py").read_text(encoding="utf-8")
+    stream_module = __import__("message_processor.channel_stream", fromlist=["x"])
+    for template in _RETIRED_TEMPLATES:
+        assert template not in serializer, f"channel_stream.py still carries {template}"
+        assert not hasattr(stream_module, template)
+
+
+def test_nothing_depends_on_a_snapshot_or_crawl(tmp_path, monkeypatch):
+    """T58. W1's inventory tripwires, re-run as a W2 GATE.
+
+    W2 is the wave that rebuilds the window, and every part of it — the selector, the layout, the
+    re-anchor — sits exactly where the snapshot and the crawl used to sit. That is the shape of
+    edit under which a removed accessor, a dropped table name or a retired template comes back:
+    not as a deliberate restoration, but as a plausible line written while reading the code the
+    removal left behind.
+
+    THIS IS THE SAME INVENTORY, RE-RUN — not a second implementation of it. The name lists, the
+    scanners and the boot check all live above and are shared, deliberately: a parallel W2 copy
+    would be a second thing to keep in step, and the first time the two disagreed the gate would
+    be grading a list nobody had updated. What W2 adds is the OCCASION, not the content — the
+    ten table names, the symbol inventory (`StreamFloorUnknown`, `CoverageNotReady` and
+    `canonical_json` among them), `database.py`'s scoped `_ts_key`, the retired config keys and
+    Appendix A7's serializer-v2 templates are all asserted here through the W1 tests that own
+    them.
+    """
+    test_no_module_imports_channel_compaction()
+    test_the_compaction_modules_are_gone()
+    test_no_compaction_symbol_survives_anywhere()
+    test_no_dynamic_import_reaches_a_removed_module()
+    test_no_compaction_table_name_survives_outside_the_cleanup_migration()
+    test_the_database_module_defines_no_stray_ts_helper()
+    test_no_retired_constant_survives()
+    test_no_compaction_table_survives_a_boot(tmp_path, monkeypatch)
+
+
+def test_no_compaction_table_survives_a_boot(tmp_path, monkeypatch):
+    """T2. A REAL DatabaseManager brought all the way up on a fresh file — init_schema AND the
+    migrations — and none of the ten tables exists afterwards. Asserted against `sqlite_master`
+    rather than against the DDL source, because a CREATE TABLE reachable from any code path at
+    all is what matters, including one a migration adds back."""
+    import os
+
+    from database import DatabaseManager
+
+    monkeypatch.setitem(os.environ, "DATABASE_DIR", str(tmp_path))
+    db = DatabaseManager("boot")
+    try:
+        assert db.db_path.startswith(str(tmp_path)), "the test must not touch the real database"
+        db.init_schema()
+        tables = {row[0] for row in db.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        db.close()
+    assert not (tables & _COMPACTION_TABLES), sorted(tables & _COMPACTION_TABLES)
+    # And the ones that must still be there, so this cannot pass by creating no schema at all.
+    assert {"channel_thread_activity", "channel_coverage", "outbound_receipts"} <= tables

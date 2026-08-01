@@ -25,8 +25,36 @@ from prompts import (SLACK_SYSTEM_PROMPT, CLI_SYSTEM_PROMPT, LOCAL_TOOLS_GUIDANC
 from tool_registry import SURFACE_CHANNEL, SURFACE_DM
 
 
-def local_tools_guidance_for(surface: str) -> str:
-    """The tool etiquette this surface gets.
+REACH_TOOLS = prompts.REACH_TOOLS
+
+
+def reach_tools_for() -> Tuple[str, ...]:
+    """The reach tools a CHANNEL turn's schema set will contain, in REACH_TOOLS order.
+
+    Reads the SAME GLOBAL SWITCHES the registry reads — `slack_client/base.py` guards the search
+    schema on `config.enable_search_tool`, and `slack_client/history_tool.py` returns no schemas
+    at all when `config.enable_history_tools` is off — so the tuple and the schema set cannot
+    disagree. A hard-coded list could promise a tool the model cannot call.
+
+    TAKES NO ARGUMENTS: neither switch is per-channel, and accepting a thread_config would invite
+    a caller to think one of them were. Neither is in CHANNEL_CAPABILITY_KEYS.
+
+    `search_slack` is registered but per-turn HIDDEN when no action token is present. This tuple
+    deliberately follows REGISTRATION, not that visibility: the guidance it feeds is
+    pre-breakpoint and channel-stable, so keying it to a per-turn token would fork the cached
+    prefix on every unmentioned turn.
+    """
+    out = []
+    if config.enable_search_tool:
+        out.append("search_slack")
+    if config.enable_history_tools:
+        out.extend(("fetch_channel_history", "fetch_thread_messages"))
+    return tuple(t for t in REACH_TOOLS if t in out)
+
+
+def local_tools_guidance_for(surface: str,
+                             reach_tools: Tuple[str, ...] = REACH_TOOLS) -> str:
+    """The tool etiquette this surface gets, plus (on a channel) the window guidance.
 
     The two surfaces need to say different things about one tool: the DM text tells the model to
     post cross-thread and acknowledge in the current thread, and on a channel turn — where the
@@ -34,10 +62,20 @@ def local_tools_guidance_for(surface: str) -> str:
     contradicts the channel schema's post-once rule. So the channel surface reads its own
     constant, and an EMPTY constant means "nothing channel-specific yet" and keeps the DM text on
     both. Read off the module rather than bound at import, so filling the constant is enough.
+
+    THE CHANNEL BRANCH INTERPOLATES; it does not append a static constant. `reach_tools` DEFAULTS
+    to the full tuple so every existing DM caller — which passes only `surface` — gets
+    byte-identical output to today: the DM branch never reaches the channel composition at all,
+    and the default exists purely so the signature stays call-compatible.
+
+    THE DM SURFACE GAINS NOTHING. A DM has no window and no periphery; adding window guidance
+    there would change DM bytes for no reason.
     """
-    if surface == SURFACE_CHANNEL:
-        return getattr(prompts, "CHANNEL_LOCAL_TOOLS_GUIDANCE", "") or LOCAL_TOOLS_GUIDANCE
-    return LOCAL_TOOLS_GUIDANCE
+    if surface != SURFACE_CHANNEL:
+        return LOCAL_TOOLS_GUIDANCE
+    base = getattr(prompts, "CHANNEL_LOCAL_TOOLS_GUIDANCE", "") or LOCAL_TOOLS_GUIDANCE
+    window = prompts.render_window_guidance(reach_tools)
+    return f"{base}\n\n{window}" if window else base
 
 
 # How each participation level is DESCRIBED to the model. The wording tracks
@@ -1584,7 +1622,13 @@ class MessageUtilitiesMixin:
             tool_registry = getattr(client, "tool_registry", None)
             tools_available = bool(tool_registry is not None
                                    and tool_registry.has_tools(surface=tool_surface))
-        local_tools_context = (local_tools_guidance_for(tool_surface)
+        # THE DERIVED TUPLE, not the default. `reach_tools_for()` reads the same global switches
+        # the registry reads, so the guidance names exactly the reach tools this attempt's schema
+        # set will contain. Letting the default ride would promise `search_slack` or the history
+        # tools to a model that cannot call them whenever either switch is off — and a model that
+        # reports a failed tool call as its answer is worse off than one told about no tools at
+        # all. Channel-stable, so it stays inside the cached prefix.
+        local_tools_context = (local_tools_guidance_for(tool_surface, reach_tools_for())
                                if config.enable_tool_loop and tools_available else "")
 
         # F32: sandbox/artifact etiquette, included exactly when code_interpreter actually

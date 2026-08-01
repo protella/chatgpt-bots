@@ -37,18 +37,27 @@ def test_the_selector_hands_each_surface_its_own_etiquette():
     landing the selector byte-neutrally, and true only while the channel constant was empty. The
     invariant that outlives it: the channel text is the DM text MINUS the post_to_thread bullet
     (the one that tells the model to acknowledge in the origin thread), and the DM side is
-    untouched. The full derivation is pinned in test_channel_restraint_prompts.py."""
+    untouched. The full derivation is pinned in test_channel_restraint_prompts.py.
+
+    W2 added the second half of the channel composition — the window guidance is INTERPOLATED
+    onto the derived constant, because a shallow window is only safe if the model knows it is
+    looking at one. So the channel surface is no longer the bare constant; what is still
+    asserted here is that it CONTAINS it, and that the DM side did not move."""
     assert local_tools_guidance_for(SURFACE_DM) == prompts.LOCAL_TOOLS_GUIDANCE
     channel = local_tools_guidance_for(SURFACE_CHANNEL)
-    assert channel == prompts.CHANNEL_LOCAL_TOOLS_GUIDANCE
+    assert channel.startswith(prompts.CHANNEL_LOCAL_TOOLS_GUIDANCE)
     assert channel != prompts.LOCAL_TOOLS_GUIDANCE
     assert "post_to_thread" in prompts.LOCAL_TOOLS_GUIDANCE
     assert "post_to_thread" not in channel
 
 
 def test_a_filled_channel_constant_moves_only_the_channel_surface():
+    """The constant is read off the module rather than bound at import, so editing it moves the
+    channel surface and nothing else. The window guidance rides on top of whatever it holds."""
     with patch.object(prompts, "CHANNEL_LOCAL_TOOLS_GUIDANCE", "\n\n--- CHANNEL ETIQUETTE ---"):
-        assert local_tools_guidance_for(SURFACE_CHANNEL) == "\n\n--- CHANNEL ETIQUETTE ---"
+        channel = local_tools_guidance_for(SURFACE_CHANNEL)
+        assert channel.startswith("\n\n--- CHANNEL ETIQUETTE ---")
+        assert channel.endswith(prompts.render_window_guidance())
         assert local_tools_guidance_for(SURFACE_DM) == prompts.LOCAL_TOOLS_GUIDANCE
 
 
@@ -207,21 +216,32 @@ def _stream():
     return harness.build_stream([harness.normalized("10.0", "hello")])
 
 
+def _carrier(stream=None):
+    """The emitter takes the BUILD RESULT, not the stream: `reselected`, `anchor_advanced` and
+    the three page counts all postdate the bytes, so none of them can live on the stream."""
+    return channel_stream.StreamBuildResult(
+        stream=stream if stream is not None else _stream(),
+        reselected=False, anchor_advanced=False,
+        pages=channel_stream.PageCounts(history=1, reply=0, origin=0))
+
+
 def test_a_build_with_no_turn_id_emits_nothing():
     """The dev probes and the out-of-process rebuilds that verify a pinned stream all come through
     the same builder. Their rows join to nothing and cannot be told from a turn whose id went
     missing, so they emit no row at all."""
     with patch.object(participation_telemetry, "stream_render") as emit:
-        channel_stream._emit_stream_render(_stream(), turn_id=None, origin_thread_ts="10.0",
-                                          trigger_ts="10.0")
+        channel_stream._emit_stream_render(_carrier(), turn_id=None,
+                                           origin_root_ts="10.0",
+                                           trigger_ts="10.0")
     emit.assert_not_called()
 
 
 def test_an_admitted_channel_turn_emits_exactly_one_row():
     """The other half: the guard must not be able to swallow the production path silently."""
     with patch.object(participation_telemetry, "stream_render") as emit:
-        channel_stream._emit_stream_render(_stream(), turn_id="turn-1",
-                                           origin_thread_ts="10.0", trigger_ts="10.0")
+        channel_stream._emit_stream_render(_carrier(), turn_id="turn-1",
+                                           origin_root_ts="10.0",
+                                           trigger_ts="10.0")
     assert emit.call_count == 1
     fields = emit.call_args.kwargs
     assert fields["turn_id"] == "turn-1"

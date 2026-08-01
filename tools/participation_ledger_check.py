@@ -28,12 +28,6 @@ warning means the FILE is incomplete in a way the contract predicts:
   * a `gate_start` with no terminal — the emitter documents this as evidence about the SINK
     (a lost line, a crash with records queued), which analysis must count rather than fail on.
 
-DUPLICATES ARE NOT A DEFECT. Compaction telemetry is delivered from an outbox that deletes a row
-only after acknowledgement, so a crash between the two replays the line: the contract is
-EXACTLY-ONCE BY IDENTITY, AT-LEAST-ONCE BY DELIVERY. Those events are counted by DISTINCT
-`(crawl_id, attempt_seq, event_seq)`, and a replay differing only in its envelope is expected. One
-identity carrying two different CANONICAL BODIES is the defect, and that is what gets reported.
-
 Usage:
     python3 tools/participation_ledger_check.py logs/participation.jsonl [more.jsonl ...]
 
@@ -43,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
@@ -75,30 +70,7 @@ RECEIPT_OPS = frozenset({
     "pending_resolve",
 })
 RECEIPT_STATES = frozenset({"absent", "in_flight", "finalized", "chrome"})
-SNAPSHOT_OPS = frozenset({"read", "publish", "invalidate", "stale_retained", "build"})
 MODEL_RESPONSE_STATUSES = frozenset({"ok", "error"})
-
-# The two compaction ops that ride the TELEMETRY OUTBOX, and are therefore the only ones with an
-# identity, a cardinality contract and a delivery order. `read`, `invalidate` and stale-retained
-# copies are DIRECT WRITES and BEST-EFFORT BY DESIGN — a committed invalidation can still lose its
-# ledger line to a crash in the gap. NO COMPLETENESS RULE IS IMPOSED ON THEM, here or anywhere:
-# their durable truth is the database row, and a missing line costs a breadcrumb, not correctness.
-OUTBOX_OPS = frozenset({"build", "publish"})
-BUILD_STATUSES = frozenset({"ok", "failed", "discarded", "copied"})
-BUILD_REASON_STATUSES = frozenset({"failed", "discarded"})
-FIT_RESULTS = frozenset({"under_target", "under_trigger"})
-# The CV8 envelope keys, stripped to recover the canonical body. Emission adds EXACTLY these three;
-# `at` and `event` come from the body, because both must survive a replay.
-WRAPPER_KEYS = ("v", "session", "gate_contract")
-# The identity triple, in the PAYLOAD and not only in the outbox key — the row is deleted after
-# acknowledgement, so an identity in dropped columns is one this checker cannot see.
-IDENTITY_FIELDS = (("crawl_id", str), ("attempt_seq", int), ("event_seq", int))
-# THE AUTHORITATIVE TOKEN NAMES: tokens_in / tokens_out, never input_tokens / output_tokens.
-BUILD_FIELDS = (("model", str), ("tokens_in", int), ("tokens_out", int),
-                ("cached_input_tokens", int), ("call_count", int), ("status", str))
-# NO TOKEN FIELDS ON `publish` — the cost belongs to the attempt that produced the summary.
-PUBLISH_FIELDS = (("snapshot_id", str), ("generation", int), ("boundary_ts", str),
-                  ("fit_result", str), ("serializer_version", int))
 
 # THE TERMINAL POPULATION IS THIS AND NOTHING ELSE. `turn_outcome` is not a terminal event (see
 # the emitter's v8 note), so it must never reach the visible_action index — invariant 3 checks
@@ -132,26 +104,71 @@ MANDATORY: Dict[str, Tuple[Tuple[str, str], ...]] = {
         ("op", "required keyword on the emitter"),
         ("applied", "emitter writes bool(applied) unconditionally"),
     ),
-    "compaction_snapshot": (
-        ("op", "required keyword on the emitter"),
-        ("channel_id", "a pointer belongs to one channel; every emitter has it"),
-    ),
 }
 # Legal absences, stated so nobody re-adds them to MANDATORY without reading this:
 #   outbound_receipt.prior_state/new_state/reason — omitted when None; `absent` is a real state,
 #       so a missing one is "no transition recorded", checked only against the vocabulary.
-#   compaction_snapshot.snapshot_id/generation/boundary_ts/serializer_version — read off the
-#       pointer dict, which need not carry them on a DIRECT-WRITE op (`read`, `invalidate`,
-#       stale-retained). The OUTBOX-routed ops are the exception and are graded against their
-#       literal per-op schema: an outbox row is deleted once acknowledged, so a payload missing a
-#       field is a fact nothing can recover afterwards.
 #   turn_outcome.chars/error/H/attempt_id — chars is None on a turn that delivered no text,
-#       error only on the four fail-closed codes, attempt_id only on a GATED turn.
+#       error only on the four fail-closed codes (TURN_ERRORS below: stream_data_invalid,
+#       stream_over_budget, history_fetch_failed, origin_fetch_failed), attempt_id only on a
+#       GATED turn.
 #   model_response.model/token counts — a call that raised before the response has none.
 #   destinations[].thread_root_ts/chars — nullable INSIDE the list: nested nulls survive,
 #       because record() only strips top-level Nones.
 DESTINATION_FIELDS = ("channel_id", "thread_root_ts", "first_ts", "state", "chars", "kind")
 DESTINATION_NULLABLE = frozenset({"thread_root_ts", "chars"})
+
+# ---------------------------------------------------------------- the stream_render contract
+# Enumerated rather than inferred: a checker author who has to work these out from the emitter
+# will work out different ones, and the field set is the whole evidence base for how the room
+# was rendered.
+
+# THE HASH RULE — 64 lowercase hex, with ONE exception. `capability_profile_hash` may also be
+# empty: the builder's own signature defaults it that way, so every caller that does not resolve
+# a thread config — the diagnostic probe, any utility build — legitimately emits "". The other
+# six are computed from the stream itself and have no caller-omitted path, so empty is a defect.
+STREAM_RENDER_HASHES = ("stream_sha256", "union_sha256", "serializer_config_hash",
+                        "sidecar_versions_hash", "actor_map_hash", "receipts_membership_hash",
+                        "capability_profile_hash")
+HASH_MAY_BE_EMPTY = frozenset({"capability_profile_hash"})
+_HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
+
+# THE COUNT RULE — non-negative ints, and its scope is exact.
+STREAM_RENDER_COUNTS = ("byte_count", "origin_byte_count", "message_count", "origin_count",
+                        "candidate_count", "root_count", "orphan_root_count",
+                        "receipts_included_count", "receipts_excluded_count",
+                        "history_pages", "reply_pages", "origin_pages")
+# VERSION ints sit OUTSIDE it: they are identifiers that happen to be numbers, and a bound on
+# them would be a bound on how many times the format may change.
+STREAM_RENDER_VERSIONS = ("selection_version", "serializer_version")
+STREAM_RENDER_BOOLS = ("reselected", "anchor_advanced")
+# Strings whose EMPTY VALUE IS A VALUE, not an absence: "" is the empty-floor sentinel, and for
+# the inventory it means the row is absent.
+STREAM_RENDER_STRINGS = ("channel_id", "H", "periphery_floor_ts", "inventory_start_ts")
+INVENTORY_STATES = frozenset({"absent", "cold", "warm", "limited_retention", "limited_depth",
+                              "unavailable"})
+# Every field above is MANDATORY on every row. `origin_thread_ts` and `trigger_ts` are the only
+# optional ones — a turn with no origin root, or no trigger, emits neither. Absence and None are
+# ONE case here, because record() omits None-valued fields rather than writing null.
+STREAM_RENDER_MANDATORY = (STREAM_RENDER_STRINGS + STREAM_RENDER_HASHES
+                           + STREAM_RENDER_COUNTS + STREAM_RENDER_VERSIONS
+                           + STREAM_RENDER_BOOLS + ("inventory_state",))
+
+# THE FAIL-CLOSED VOCABULARY, by enumeration. Three survive W1's excision and W2 adds the
+# fourth. RETIRED CODES ARE VIOLATIONS, NOT GRANDFATHERED: `snapshot_unsupported` and
+# `coverage_not_ready` have no producer any more, so a fresh row carrying one means a producer
+# survived the excision — exactly the defect this check exists to catch. Validating a current
+# ledger and reading a historical one are different activities.
+TURN_ERRORS = frozenset({"stream_data_invalid", "stream_over_budget", "history_fetch_failed",
+                         "origin_fetch_failed"})
+
+# RETIRED FIELDS, rejected rather than ignored. Each described the compaction-era stream — a
+# boundary with an inclusivity flag, a snapshot id, a coverage floor, a single `reanchored`
+# boolean now split into two. A CURRENT row carrying one means a producer survived the excision,
+# which is exactly the defect worth failing on; tolerating them to stay readable against old
+# files would make the checker unable to detect the thing it exists to detect.
+STREAM_RENDER_RETIRED = ("snapshot_id", "generation", "boundary", "floor_inclusive",
+                         "coverage_start_ts", "selection_result", "reanchored")
 
 
 # ===========================================================================================
@@ -318,6 +335,11 @@ def _check_turn_outcome(row: Row, report: Report) -> None:
             and not isinstance(row.obj.get("stream_build_present"), bool):
         report.fail("turn_outcome_missing_field", row,
                     f"stream_build_present={row.obj.get('stream_build_present')!r} is not a bool")
+    # The fail-closed code, when one is present. Absence stays legal — most turns do not fail —
+    # but a code outside the enumerated four is either a typo inventing a bucket or a retired
+    # producer that survived the excision, and both are worth failing on.
+    _check_vocabulary(row, report, "error", TURN_ERRORS, "turn_outcome_bad_error",
+                      required=False)
     if "destinations" not in row.obj:
         return
     destinations = row.obj.get("destinations")
@@ -351,7 +373,72 @@ def _check_destination(row: Row, report: Report, index: int, destination: Any) -
 
 
 def _check_stream_render(row: Row, report: Report) -> None:
+    """The FULL field contract. This row is the only durable evidence of what the model was
+    shown, so a field that is quietly absent or the wrong type makes the record unreadable at
+    exactly the moment someone is trying to explain a bad answer."""
     _check_mandatory(row, report, "stream_render_missing_turn_id")
+
+    for field in STREAM_RENDER_MANDATORY:
+        # Absence and None are ONE case: record() omits None-valued fields rather than writing
+        # null, so a presence test is already a non-None test and must not also test for null.
+        if field not in row.obj:
+            report.fail("stream_render_missing_field", row,
+                        f"stream_render has no {field!r} — every §8 field is mandatory except "
+                        "origin_thread_ts and trigger_ts")
+
+    for field in STREAM_RENDER_RETIRED:
+        if field in row.obj:
+            report.fail("stream_render_retired_field", row,
+                        f"stream_render carries retired field {field!r} — it was removed with "
+                        "the compaction-era stream, so a fresh row holding one means a producer "
+                        "survived the excision")
+
+    for field in STREAM_RENDER_HASHES:
+        if field not in row.obj:
+            continue
+        value = row.obj.get(field)
+        if value == "" and field in HASH_MAY_BE_EMPTY:
+            continue
+        if not isinstance(value, str) or not _HEX64.match(value):
+            report.fail("stream_render_bad_hash", row,
+                        f"{field}={value!r} is not 64 lowercase hex characters")
+
+    for field in STREAM_RENDER_COUNTS:
+        if field not in row.obj:
+            continue
+        value = row.obj.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            report.fail("stream_render_bad_count", row,
+                        f"{field}={value!r} is not a non-negative int")
+
+    for field in STREAM_RENDER_VERSIONS:
+        if field not in row.obj:
+            continue
+        value = row.obj.get(field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            report.fail("stream_render_bad_count", row, f"{field}={value!r} is not an int")
+
+    for field in STREAM_RENDER_BOOLS:
+        if field in row.obj and not isinstance(row.obj.get(field), bool):
+            report.fail("stream_render_bad_bool", row,
+                        f"{field}={row.obj.get(field)!r} is not a bool")
+
+    for field in STREAM_RENDER_STRINGS:
+        if field in row.obj and not isinstance(row.obj.get(field), str):
+            report.fail("stream_render_bad_field", row,
+                        f"{field}={row.obj.get(field)!r} is not a string")
+
+    _check_vocabulary(row, report, "inventory_state", INVENTORY_STATES,
+                      "stream_render_bad_inventory_state", required=False)
+
+    # The rendered window can never hold more roots than it holds messages: roots are a SUBSET
+    # of the periphery's message items, so this catches a count computed over the wrong subject
+    # — the pre-filter root count, say — which no type check would notice.
+    included = row.obj.get("root_count")
+    total = row.obj.get("message_count")
+    if isinstance(included, int) and isinstance(total, int) and included > total:
+        report.fail("stream_render_bad_count", row,
+                    f"root_count={included} exceeds message_count={total}")
 
 
 def _check_model_response(row: Row, report: Report) -> None:
@@ -391,62 +478,12 @@ def _typed(value: Any, kind: type) -> bool:
     return isinstance(value, kind)
 
 
-def _check_compaction_snapshot(row: Row, report: Report) -> None:
-    _check_mandatory(row, report, "compaction_snapshot_missing_field")
-    _check_vocabulary(row, report, "op", SNAPSHOT_OPS, "compaction_snapshot_bad_op",
-                      required=False)
-    op = row.obj.get("op")
-    if op not in OUTBOX_OPS:
-        return   # a direct-write op: no identity, no schema beyond the pointer, no completeness
-    for field, kind in IDENTITY_FIELDS:
-        if not _typed(row.obj.get(field), kind):
-            report.fail("compaction_snapshot_missing_identity", row,
-                        f"op={op} has {field}={row.obj.get(field)!r} — the dedup key is the "
-                        f"payload's (crawl_id, attempt_seq, event_seq)")
-    for field, kind in (BUILD_FIELDS if op == "build" else PUBLISH_FIELDS):
-        if not _typed(row.obj.get(field), kind):
-            report.fail("compaction_snapshot_missing_field", row,
-                        f"op={op} has {field}={row.obj.get(field)!r}, expected {kind.__name__}")
-    event_seq = row.obj.get("event_seq")
-    # THE ROUTING TABLE: a build is ALWAYS at 0, a publish NEVER is. A publish emitted at 0 would
-    # be acknowledged and deleted, permanently breaking the order the sequence exists to keep.
-    if isinstance(event_seq, int) and not isinstance(event_seq, bool):
-        if op == "build" and event_seq != 0:
-            report.fail("compaction_snapshot_misplaced_op", row,
-                        f"op=build at event_seq={event_seq} (a build is always at 0)")
-        if op == "publish" and event_seq == 0:
-            report.fail("compaction_snapshot_misplaced_op", row,
-                        "op=publish at event_seq=0 (the build belongs there)")
-    if op == "build":
-        _check_vocabulary(row, report, "status", BUILD_STATUSES,
-                          "compaction_snapshot_bad_status", required=False)
-        needs_reason = row.obj.get("status") in BUILD_REASON_STATUSES
-        if needs_reason and "reason" not in row.obj:
-            report.fail("compaction_snapshot_reason_rule", row,
-                        f"status={row.obj.get('status')!r} with no reason — a failed generation "
-                        f"must not be invisible")
-        if not needs_reason and "reason" in row.obj and row.obj.get("status") in BUILD_STATUSES:
-            report.fail("compaction_snapshot_reason_rule", row,
-                        f"status={row.obj.get('status')!r} carries a reason")
-    else:
-        _check_vocabulary(row, report, "fit_result", FIT_RESULTS,
-                          "compaction_snapshot_bad_fit_result", required=False)
-        present = [f for f in ("tokens_in", "tokens_out", "cached_input_tokens", "call_count")
-                   if f in row.obj]
-        if present:
-            # Double-counting waiting to happen: any aggregate summing the ledger would charge
-            # the attempt's cost twice.
-            report.fail("compaction_publish_carries_tokens", row,
-                        f"op=publish carries {present} — the cost belongs to its build")
-
-
 PAYLOAD_CHECKS = {
     "turn_start": _check_turn_start,
     "turn_outcome": _check_turn_outcome,
     "stream_render": _check_stream_render,
     "model_response": _check_model_response,
     "outbound_receipt": _check_outbound_receipt,
-    "compaction_snapshot": _check_compaction_snapshot,
 }
 
 
@@ -570,6 +607,15 @@ def _check_stream_render_joins(joins: Joins, report: Report, *, fragments: set) 
     rendered and then reported that it had not. Either way the fail-closed accounting is wrong.
     """
     for turn_id, renders in sorted(joins.stream_renders.items()):
+        # EXACTLY ONE, and "exactly" is not enforced by a rule that only checks presence. The
+        # timeout tool-drop retry reuses the pinned stream and emits nothing, and no rebuild path
+        # exists that could produce a second row — so two rows for one turn means either a second
+        # build nobody intended or a duplicated write, and both make every count derived from
+        # this population wrong.
+        if len(renders) > 1:
+            report.fail("stream_render_duplicate", renders[1],
+                        f"turn_id={turn_id} has {len(renders)} stream_render rows; a turn "
+                        f"renders once (first at {_first_at(renders[1], renders[0])})")
         if turn_id in joins.turn_starts:
             continue
         row = renders[0]
@@ -620,92 +666,6 @@ def _check_model_attempts(joins: Joins, report: Report) -> None:
             report.fail("model_response_attempt_seq_not_contiguous", responses[0],
                         f"turn_id={turn_id} has attempt_seq {sorted(numbers)}, expected "
                         f"{expected}")
-
-
-# ===========================================================================================
-# invariant 6 — the compaction outbox: exactly-once BY IDENTITY, at-least-once BY DELIVERY
-# ===========================================================================================
-
-def canonical_body_bytes(body: Dict[str, Any]) -> bytes:
-    """THE ONE SERIALIZER, restated from message_processor/participation_telemetry.py — the same
-    call, byte for byte. Two serializations would make identical bodies compare unequal over key
-    order, whitespace or `\\uXXXX` escaping alone, which is the entire comparison."""
-    return json.dumps(body, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False).encode("utf-8")
-
-
-def extract_canonical_body(line: str) -> bytes:
-    """Recover the body from a flattened JSONL line: parse, remove EXACTLY the three wrapper keys,
-    re-serialize canonically. The body is flattened into the emitted object, so its original bytes
-    are not recoverable by parsing alone."""
-    obj = json.loads(line)
-    if not isinstance(obj, dict):
-        raise ValueError(f"ledger line is not a JSON object: {type(obj).__name__}")
-    return body_bytes(obj)
-
-
-def body_bytes(obj: Dict[str, Any]) -> bytes:
-    """The canonical body of an already-parsed line."""
-    return canonical_body_bytes({k: v for k, v in obj.items() if k not in WRAPPER_KEYS})
-
-
-def _check_compaction_outbox(rows: List[Row], report: Report) -> None:
-    """THE HONEST CONTRACT: EXACTLY-ONCE BY IDENTITY, AT-LEAST-ONCE BY DELIVERY.
-
-    A crash between emit and delete replays the row, so DUPLICATE LINES ARE EXPECTED and are not
-    an error — this counts DISTINCT `(crawl_id, attempt_seq, event_seq)` triples, not lines. The
-    replay's ENVELOPE legitimately differs (`session` above all: it is a different process), which
-    is why every comparison here is over the CANONICAL BODY. A checker comparing whole JSONL lines
-    would report every honest replay as a conflict.
-
-    BUT one triple mapping to DIFFERING BODIES IS A CONTRACT VIOLATION and is reported: two
-    different events wearing one identity — a payload rebuilt from changed state, or an identity
-    reused across attempts — is a real defect hiding inside the very mechanism that makes
-    duplicates safe.
-
-    And the cardinality rule the outbox exists for: AT LEAST ONE `build` PRECEDES ANY `publish` of
-    the same attempt. The drainer emits in `outbox_seq` order, so a publish that arrives first
-    means the ordering guarantee broke, not that the file is odd.
-    """
-    seen: Dict[Tuple[Any, Any, Any], Tuple[Row, bytes]] = {}
-    builds: Dict[Tuple[Any, Any], int] = {}
-    publishes: List[Tuple[int, Row, Tuple[Any, Any]]] = []
-    for order, row in enumerate(rows):
-        if row.event != "compaction_snapshot":
-            continue
-        op = row.obj.get("op")
-        if op not in OUTBOX_OPS:
-            continue
-        triple = tuple(row.obj.get(field) for field, _ in IDENTITY_FIELDS)
-        if not all(_typed(row.obj.get(f), k) for f, k in IDENTITY_FIELDS):
-            continue   # already failed as a missing identity; it cannot be deduped
-        body = body_bytes(row.obj)
-        first = seen.get(triple)
-        if first is None:
-            seen[triple] = (row, body)
-        elif first[1] != body:
-            report.fail("compaction_outbox_body_conflict", row,
-                        f"identity {triple} carries two different canonical bodies "
-                        f"(first at {_first_at(row, first[0])})")
-        else:
-            report.counts["compaction_outbox_replayed_lines"] += 1
-            continue   # an honest replay: same identity, same body, a different session
-        attempt = (triple[0], triple[1])
-        if op == "build":
-            builds.setdefault(attempt, order)
-        else:
-            publishes.append((order, row, attempt))
-    for order, row, attempt in publishes:
-        build_order = builds.get(attempt)
-        if build_order is None:
-            report.fail("compaction_publish_without_build", row,
-                        f"attempt {attempt} published with no op=build in the ledger")
-        elif build_order > order:
-            report.fail("compaction_publish_before_build", row,
-                        f"attempt {attempt} published before its build "
-                        f"(build at {_first_at(row, rows[build_order])})")
-    report.counts["compaction_outbox_events"] = len(seen)
-    report.counts["compaction_builds"] = len(builds)
 
 
 def _check_terminal_invariant(joins: Joins, report: Report, rows: List[Row], *,
@@ -805,7 +765,6 @@ def check_paths(paths: List[str]) -> Report:
     _check_stream_render_joins(joins, report, fragments=fragments)
     _check_model_attempts(joins, report)
     _check_terminal_invariant(joins, report, graded, fragments=fragments)
-    _check_compaction_outbox(graded, report)
 
     report.violations.sort(key=lambda f: (report.file_order(f.file), f.line, f.name))
     report.warnings.sort(key=lambda f: (report.file_order(f.file), f.line, f.name))
@@ -848,10 +807,6 @@ def human_report(report: Report, out) -> None:
           f"(visible_action: {counts['visible_action']})", file=out)
     print(f"      turn_start   {counts['turn_start']:>6}  channel turns  "
           f"(turn_outcome: {counts['turn_outcome']})", file=out)
-    if counts["compaction_outbox_events"]:
-        print(f"  compaction: {counts['compaction_outbox_events']} distinct outbox identities "
-              f"({counts['compaction_builds']} builds, "
-              f"{counts['compaction_outbox_replayed_lines']} replayed lines — expected)", file=out)
     if events:
         print("  events   : " + ", ".join(f"{name}={events[name]}"
                                           for name in sorted(events)), file=out)

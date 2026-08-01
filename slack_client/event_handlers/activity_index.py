@@ -26,7 +26,6 @@ from slack_client.history_fetch import (HistoryPageError, HistoryPageInvalid, Pa
                                         fetch_page, retry_after_seconds, slack_error_code)
 from slack_client.normalizer import (KIND_DELETE, KIND_EDIT, KIND_MESSAGE, KIND_TOMBSTONE,
                                      MUTATION_SUBTYPES, NormalizedEvent, TimestampError,
-                                     mutation_kind, mutation_observation_identity,
                                      mutation_subject_ts, normalize_slack_event, parse_ts,
                                      secondary_ts)
 from slack_client.utilities import is_dm_conversation
@@ -129,29 +128,6 @@ def observation_from_event(event: NormalizedEvent) -> Optional[ActivityObservati
     return ActivityObservation(event.team_id, event.channel_id, kind, root_ts, None,
                                event.activity_ts, True, sender_type, event.root_if_indexed,
                                event.owner_probe_ts)
-
-
-def mutation_from_event(event: NormalizedEvent, *,
-                        observed_at: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """NormalizedEvent → one durable snapshot-invalidation observation (spec §1c), or None.
-
-    EVERY `message_changed` and `message_deleted` in a channel produces one, including the
-    unthreaded top-level edit the activity index writes nothing for and including our own
-    messages: the record says a summarized message changed, and a snapshot covering it is wrong
-    from that moment whoever did it. `observed_at` is when WE saw it, so it is fixed once by the
-    caller and carried across every replay rather than re-read from the clock.
-    """
-    kind = mutation_kind(event)
-    if kind is None:
-        return None
-    return {
-        "team_id": event.team_id,
-        "channel_id": event.channel_id,
-        "subject_ts": event.subject_ts,
-        "kind": kind,
-        "observation_identity": mutation_observation_identity(event),
-        "observed_at": observed_at or f"{time.time():.6f}",
-    }
 
 
 def _event_channel(event: Any) -> Optional[str]:
@@ -269,10 +245,10 @@ async def _deletion_was_ours(db: Any, observation: ActivityObservation) -> bool:
 
 async def _index_row(db: Any, client: Any,
                      observation: ActivityObservation) -> Optional[Dict[str, Any]]:
-    """The index half of one feed, arbitrated: the row to upsert, or None to write nothing.
+    """One feed's row to upsert, arbitrated — or None to write nothing.
 
     The arbitration reads (the receipt oracle, the is-this-a-known-root probe) happen HERE,
-    outside the write, so the write itself stays the one transaction §1c requires.
+    outside the write, so the write itself stays a single statement.
     """
     await _seed_coverage(client, db, observation.team_id, observation.channel_id)
     if observation.root_ts is None:
@@ -294,24 +270,20 @@ async def _index_row(db: Any, client: Any,
     }
 
 
-async def _apply_observation(client: Any, observation: Optional[ActivityObservation],
-                             mutation: Optional[Dict[str, Any]] = None) -> None:
-    """The DB half of one feed: the index upsert and the mutation observation, ONE transaction.
+async def _apply_observation(client: Any,
+                             observation: Optional[ActivityObservation]) -> None:
+    """The DB half of one feed: the index upsert.
 
-    Raises on a write failure — the ticket needs to know. The two halves commit together because
-    a replay that re-ran only the index half would leave the snapshot store believing nothing
-    changed, and a snapshot published in that gap would summarize a message it no longer matches.
-
-    Either half may be absent and the other still writes: an unthreaded top-level edit records no
-    index row at all, and an ordinary reply is no mutation.
+    Raises on a write failure — the ticket needs to know. An unthreaded top-level edit resolves
+    to no index row at all, which is a legal no-op rather than a failure.
     """
     db = getattr(client, "db", None)
     if db is None:
         return
     index_row = await _index_row(db, client, observation) if observation is not None else None
-    if index_row is None and mutation is None:
+    if index_row is None:
         return
-    await db.record_activity_and_mutation_async(observation=index_row, mutation=mutation)
+    await db.record_thread_activity_async(**index_row)
 
 
 async def feed_thread_activity_index(client: Any, event: Any, *, ticket: Any = None) -> None:
@@ -324,17 +296,12 @@ async def feed_thread_activity_index(client: Any, event: Any, *, ticket: Any = N
     retrying beats degrading a channel), then the ticket is failed with the normalized event
     retained for the background repair worker.
 
-    OFFLINE RESIDUAL (§1c): this feed only sees what Slack delivers to a running process. A
-    mutation landing AFTER PUBLICATION while we are down leaves no observation and nothing later
-    re-reads that span — see the compaction module docstring for the scoped statement.
     """
     normalized = None
     observation = None
-    mutation = None
     try:
         normalized = normalize_slack_event(client, event)
         observation = observation_from_event(normalized) if normalized else None
-        mutation = mutation_from_event(normalized) if normalized else None
     except ValueError as e:
         # A ts the shared comparator cannot read, or a known mutation whose subject is missing.
         # Nothing can be recorded and nothing can be replayed, so completing this ticket OK would
@@ -357,15 +324,14 @@ async def feed_thread_activity_index(client: Any, event: Any, *, ticket: Any = N
             ticket, channel_id=_event_channel(event), ts=_event_subject_ts(event),
             reason=f"unexpected {type(e).__name__} while normalizing an indexable event: {e}")
         return
-    if observation is None and mutation is None:
+    if observation is None:
         admission_watermark.complete_ok(ticket)
         return
 
     async def _replay() -> bool:
-        # BOTH halves, always: a replay of the index half alone would complete the ticket while
-        # the mutation nobody recorded stayed unrecorded. Both writes are idempotent.
+        # The write is idempotent, so a replay of an observation that already landed is a no-op.
         try:
-            await _apply_observation(client, observation, mutation)
+            await _apply_observation(client, observation)
             return True
         except Exception as e:  # noqa: BLE001
             logger.warning(f"thread-activity index replay failed: {e}")
@@ -374,7 +340,7 @@ async def feed_thread_activity_index(client: Any, event: Any, *, ticket: Any = N
     last: Optional[BaseException] = None
     for attempt in range(_FEED_ATTEMPTS):
         try:
-            await _apply_observation(client, observation, mutation)
+            await _apply_observation(client, observation)
             admission_watermark.complete_ok(ticket)
             return
         except asyncio.CancelledError as e:
@@ -388,68 +354,6 @@ async def feed_thread_activity_index(client: Any, event: Any, *, ticket: Any = N
                 await asyncio.sleep(_FEED_RETRY_BASE_SECONDS * (2 ** attempt))
     logger.warning(f"thread-activity index feed failed: {last}")
     admission_watermark.complete_failed(ticket, event=normalized, retry=_replay)
-
-
-async def feed_own_mutation(client: Any, channel_id: Optional[str], subject_ts: Optional[str],
-                            kind: str, *, operation_id: Optional[str] = None) -> bool:
-    """Record a mutation WE performed (spec §1c own-message mutations). NON-WAKE.
-
-    It advances no watermark, takes no ticket and reaches no gate: our own edit is not channel
-    activity a turn may wait on, and H moving for it would let a turn wait on its own reply. What
-    it is, is evidence that a message a snapshot may have summarized no longer says what the
-    snapshot says it said.
-
-    `operation_id` must be UNIQUE PER OPERATION and stable only across RETRIES of that one
-    operation — it is the never-null observation identity, so a value reused by a later edit
-    would collapse into the first row and that later edit would invalidate nothing. Omitting it
-    mints one, which is correct for a one-shot call and wrong for a caller that retries.
-
-    Never raises: a chrome delete must not be able to break the turn that made it.
-    """
-    db = getattr(client, "db", None)
-    team_id = getattr(client, "self_team_id", None)
-    if db is None or not team_id or not channel_id or not subject_ts:
-        return False
-    if is_dm_conversation(channel_id):
-        return False
-    if kind not in ("edit", "delete"):
-        logger.warning(f"own mutation feed refused an unknown kind: {kind!r}")
-        return False
-    try:
-        parse_ts(subject_ts)
-    except TimestampError:
-        logger.warning(f"own mutation feed got an unreadable subject ts: {subject_ts!r}")
-        return False
-    mutation = {
-        "team_id": str(team_id),
-        "channel_id": str(channel_id),
-        "subject_ts": str(subject_ts),
-        "kind": kind,
-        # An EMPTY identity defeats the unique key exactly as a NULL one does, so a blank id
-        # mints a real one rather than being passed down.
-        "observation_identity": f"op:{(operation_id or '').strip() or uuid.uuid4().hex}",
-        "observed_at": f"{time.time():.6f}",
-    }
-    last: Optional[BaseException] = None
-    for attempt in range(_FEED_ATTEMPTS):
-        try:
-            await db.record_activity_and_mutation_async(observation=None, mutation=mutation)
-            return True
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            last = e
-            if attempt < _FEED_ATTEMPTS - 1:
-                await asyncio.sleep(_FEED_RETRY_BASE_SECONDS * (2 ** attempt))
-    # No ticket to fail — this path never took one, so nothing will retry it. CRITICAL for
-    # exactly that reason. Best-effort is defensible because the DELIVERY feed covers the same
-    # edit whenever the socket is up and repairs its own write failures through its ticket: for
-    # both to fail at once the delivery must never have arrived, which is the §1c OFFLINE
-    # RESIDUAL. This is a sibling of that documented residual, not an independent gap — do not
-    # "fix" it into something that can fail a turn.
-    logger.critical(
-        f"own mutation observation lost for {channel_id}/{subject_ts} ({kind}): {last}")
-    return False
 
 
 class _SweepTokenLost(Exception):
@@ -657,7 +561,7 @@ class ChannelCoverageBootstrap:
 
     async def _sweep_pass(self, team_id: str, channel_id: str, token: str) -> str:
         """One pass: up to `history_page_ceiling` pages walked backward from the persisted
-        coverage_start_ts. Returns terminal | gone | park | abandon | lost | retry."""
+        inventory_start_ts. Returns terminal | gone | park | abandon | lost | retry."""
         row = await self.db.get_channel_coverage_async(team_id, channel_id)
         if not row:
             return "retry"
@@ -666,7 +570,7 @@ class ChannelCoverageBootstrap:
         if row.get("sweep_token") != token:
             return "lost"
 
-        latest = row.get("coverage_start_ts")
+        latest = row.get("inventory_start_ts")
         # The depth wall as a comparator key, so the page's oldest ts is judged by the same
         # arithmetic the window predicate uses rather than by float rounding.
         floor = parse_ts(f"{time.time() - max(1, int(self.config.coverage_bootstrap_days)) * 86400:.6f}")
@@ -795,7 +699,7 @@ class ChannelCoverageBootstrap:
 
         `complete` is False when any record on the page could not be processed — not a dict, no
         ts, or a ts the comparator cannot read, in ANY of the timestamp-bearing fields. Coverage
-        may not move past a record we skipped: coverage_start_ts is the claim "everything at or
+        may not move past a record we skipped: inventory_start_ts is the claim "everything at or
         after this is in the index", and advancing over an unreadable record turns a gap into a
         horizon nothing will ever revisit.
 

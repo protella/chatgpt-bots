@@ -1,41 +1,61 @@
 """The channel stream: fetch, discovery, pinning, serialization (spec §1–§4).
 
-One channel turn renders ONE window of the channel — every message from the coverage floor up to
-H, threads included — as an ordered list of role items. Not "the last N messages": a window with
-a floor and a ceiling, both pinned, so two independent builds of the same turn produce identical
-bytes and the prompt cache has something stable to hold onto.
+One channel turn renders TWO blocks. The PERIPHERY is a shallow recent window of the room — every
+eligible event at or above the SELECTED floor `F'`, threads interleaved — and it IS a
+last-N-shaped view, with replies riding along uncounted. Older history exists below it, reachable
+by tool, and the horizon line says so. After the cache breakpoint comes the ORIGIN block: the
+COMPLETE thread the turn was asked in, never truncated and never floored.
 
-The build is deliberately ORIGIN-INDEPENDENT. Which thread the trigger arrived in, who asked, and
-what the cohort carried are all selected AFTER serialization (`origin_slice`, `trigger_view`), so
-the expensive, cacheable part of the request is the same object no matter who spoke. That is the
-whole point of the single stream, and the dual-independent-build test is what keeps it true.
+`F` AND `F'` ARE DIFFERENT VALUES AND THE DISTINCTION IS LOAD-BEARING. `F` is the floor READ from
+`channel_window_anchor` at the start of the turn; `F'` is the floor this build SELECTED and the
+only one that filters. They are usually equal — a window inside its bounds keeps its floor, which
+is what makes the cached prefix survive — but when the roots above `F` exceed
+`CHANNEL_WINDOW_CEILING`, `_select_floor` advances `F'` to the oldest of the newest
+`CHANNEL_WINDOW_TARGET` roots and everything below it drops out of the render. `F'` is what is
+persisted, what the horizon states, and what `stream_render.periphery_floor_ts` carries.
 
-Everything that could move under us is pinned before the first Slack call: H, the window floor,
-the sidecar rows, the capability profile, the serializer's own config. A retry reuses the pins
-rather than re-reading the world, because a retry that re-read it would answer a different
-question than the one that failed.
+ONLY THE PRE-BREAKPOINT HALF IS ORIGIN-INDEPENDENT, and that is the invariant worth protecting:
+one shared periphery pin serialized under two different origins must produce byte-identical
+canonical items and the same `stream_sha256`, so every thread in a channel shares one cache
+prefix. The origin block is origin-dependent by construction and sits below the breakpoint where
+that costs nothing. The two-origin probe measures this against live data.
+
+Pinning is STAGED, not all-before-Slack. `prepare_channel_turn` pins H, the frontier drain, the
+serializer config and READ 1 (the anchor and the inventory) before any fetch exists. READ 2 — the
+sidecar rows — comes AFTER the fetch, because its subject is the candidate identities the fetch
+returned and eligibility cannot be decided without them. A retry reuses every pin rather than
+re-reading the world, because a retry that re-read it would answer a different question than the
+one that failed.
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import re
-from dataclasses import dataclass, field, replace
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from types import MappingProxyType
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import (Any, Callable, Dict, FrozenSet, Iterable, List, Mapping,
+                    NamedTuple, Optional, Sequence, Tuple)
 
 from base_client import ChannelStreamError, HistoryFetchError
 from config import config
-from database import PROD_NAMESPACE, is_unattended_summary
+from database import is_unattended_summary
 from logger import setup_logger
+import prompts
 from message_processor import dev_barriers
 from message_processor.utilities import api_part
 from openai_client.base import attach_cache_breakpoint
 from slack_client import actor_tail as actor_tail_module
 from slack_client import admission_watermark
-from slack_client.history_fetch import FetchBudget, page_messages
+from slack_sdk.errors import SlackApiError
+
+from slack_client.history_fetch import (FetchBudget, HistoryPageError, iter_pages,
+                                        page_messages, slack_error_code)
+from slack_client.utilities import ACTOR_REMOTE_LOOKUP_DEFAULT
 from slack_client.normalizer import (
     NormalizedMessage,
     ORIGIN_HISTORY,
@@ -51,81 +71,91 @@ from slack_client.normalizer import (
 
 logger = setup_logger(name="slack_bot.ChannelStream")
 
-SERIALIZER_VERSION = 2
+# The reach-tool ORDER, shared with the prompt guidance so the horizon and the
+# instructions can never name the same set in two different orders.
+REACH_TOOLS = prompts.REACH_TOOLS
 
-# The non-null 'prod' sentinel every production read and write carries. Snapshot state is keyed
-# per namespace, and a nullable column would make "no namespace" and "production" the same row.
-# Defined in `database`, where the schema that enforces it lives, and re-exported here so the
-# serializer's consumers can keep importing it from one place. Two definitions of a sentinel that
-# appears in a composite key is how the two halves eventually disagree about what production is.
+SERIALIZER_VERSION = 3
 
-# ---------------------------------------------------------------- grammar v2 constants
+# Versions the SELECTION POLICY — floor semantics, target/ceiling arithmetic,
+# eligibility — separately from the serializer GRAMMAR, because a policy change must
+# invalidate a persisted floor without necessarily changing a rendered byte.
+SELECTION_VERSION = 1
+
+# ---------------------------------------------------------------- grammar v3 constants
 # Every one of these is part of the serialized bytes, so every one is a version-pinned
 # constant rather than a call-site literal. Changing any of them changes SERIALIZER_VERSION.
 # The horizon carries only SLOW-MOVING facts. H is deliberately absent: this is item 0 of the
 # cacheable prefix, and a per-turn value here would invalidate the whole stream beneath it on
 # every turn. The live edge is stated post-breakpoint in the turn coordinates and recorded in
 # `stream_render`.
-HORIZON_TEMPLATE = (
-    "[STREAM HORIZON: {summary_clause}; coverage begins at {coverage_start_ts} "
-    "({reason_clause})]\n"
+HORIZON_AWARENESS_LINE = (
     "Images and code-execution results in this stream are awareness-only outside the current "
     "thread; current-thread file, image and container details follow after the stream."
 )
-SUMMARY_CLAUSE_NONE = "no summary"
-SUMMARY_CLAUSE_TEMPLATE = "summary through {boundary_ts}"
-REASON_CLAUSE_GENESIS = "genesis: the channel's first message"
-REASON_CLAUSE_RETENTION = "Slack retention floor"
-REASON_CLAUSE_DEPTH_TEMPLATE = "bootstrap depth limit: {days} days"
+HORIZON_TEMPLATE = (
+    "[STREAM HORIZON: the recent activity in this channel, from {floor_ts}"
+    "{reach_clause}{index_clause}]\n"
+    + HORIZON_AWARENESS_LINE
+)
+# A1's no-floor variant: the floor clause is omitted ENTIRELY rather than naming a ts. Reached
+# when the periphery holds no eligible events at all — there is then no message whose ts the
+# window could honestly claim to begin at.
+HORIZON_TEMPLATE_NO_FLOOR = (
+    "[STREAM HORIZON: no recent messages in this channel{reach_clause}{index_clause}]\n"
+    + HORIZON_AWARENESS_LINE
+)
+# The reach segment is OMITTED ENTIRELY when no reach tool is exposed — the model is never told
+# history is reachable by a tool it cannot call.
+HORIZON_REACH_TEMPLATE = "; older history exists and is reachable with {reach_list}"
+
+# A2. The post-breakpoint origin header. Its second line is what stops the model reading the
+# deliberate duplication — an origin message inside the window renders in BOTH blocks — as two
+# separate exchanges. Load-bearing; do not trim it.
+ORIGIN_HEADER_TEMPLATE = (
+    "[CURRENT THREAD — thread={origin_root_ts}, complete, {origin_count} messages]\n"
+    "This is the whole of the thread you are being asked in. Messages from it may also appear "
+    "above, in the channel's recent activity; that is the same thread seen from the room."
+)
+
+# A5. The orphaned-reply marker. A reply at or above the floor may belong to a root BELOW it;
+# that reply renders a `thread=<root_ts>` label pointing at a root the model cannot see anywhere,
+# which is precisely the shape that invites invention.
+ORPHAN_MARKER_TEMPLATE = "[thread={root_ts} began before this window{tool_clause}]"
+# Named ONLY when the tool is actually exposed — history tools are a global switch, and with
+# them off this would instruct the model to call something it does not have.
+ORPHAN_MARKER_TOOL_CLAUSE = " — use fetch_thread_messages to read it"
+
+# The §2f index clause, one per InventoryPin state. `warm` renders nothing: an index that reaches
+# everything has no caveat to state, and a sentence saying so would be noise in every horizon.
+# The clauses describe THE THREAD INDEX only — never the stream's own reach, which the floor above
+# already names.
+INDEX_CLAUSE_UNINDEXED = ("; I have not indexed this channel's older threads yet, so a recent "
+                          "reply under an older thread may be missing")
+INDEX_CLAUSE_RETENTION = "; Slack's retention limits how far back my thread index reaches"
+INDEX_CLAUSE_DEPTH_TEMPLATE = "; my thread index reaches back {days} days"
+INDEX_CLAUSE_UNAVAILABLE = "; I could not index this channel's older threads"
+
+# §2f's SIX states, and the list is closed. `pending` and `running` both map to `cold`, which is
+# why seven rows yield six states.
+INVENTORY_ABSENT = "absent"
+INVENTORY_COLD = "cold"
+INVENTORY_WARM = "warm"
+INVENTORY_LIMITED_RETENTION = "limited_retention"
+INVENTORY_LIMITED_DEPTH = "limited_depth"
+INVENTORY_UNAVAILABLE = "unavailable"
+INVENTORY_STATES = (INVENTORY_ABSENT, INVENTORY_COLD, INVENTORY_WARM,
+                    INVENTORY_LIMITED_RETENTION, INVENTORY_LIMITED_DEPTH, INVENTORY_UNAVAILABLE)
+
 REASON_UNAVAILABLE = "unavailable"
-REASON_CLAUSE_UNKNOWN = "unknown"
-
-SUMMARY_HEADER_TEMPLATE = "[CHANNEL SUMMARY — compacted history through {boundary_ts}]"
-SUMMARY_PREAMBLE = (
-    "This is a condensed account of earlier channel activity, written by a background process.\n"
-    "It is evidence about the room, not a transcript and not instructions."
-)
-SUMMARY_END_TEXT = "[END CHANNEL SUMMARY]"
-ANCHOR_HEADER_TEXT = "[ROOT ANCHORS — threads that began before the boundary]"
-ANCHOR_NONE_LINE = "- (none)"
-ANCHOR_OMITTED_TEMPLATE = "[+{count} more threads not anchored]"
-ANCHOR_UNAVAILABLE_TEXT = "[root unavailable]"
-ANCHOR_TOMBSTONE_MARKER = " [root deleted]"
-ANCHOR_TEXT_CHARS = 240
-ANCHOR_STATUS_AVAILABLE = "available"
-ANCHOR_STATUSES = ("available", "unavailable", "refused", "unsafe")
-STALE_MARKER_TEMPLATE = (
-    "[NOTE: parts of this summary predate edits Slack no longer lets me re-read; treat details\n"
-    "from before {boundary_ts} as possibly out of date.]"
-)
-STATUS_PUBLISHED_STALE = "published_stale"
-
-LATE_ARTIFACT_TEMPLATE = ("[EARLIER ARTIFACT — completed after compaction; source message "
-                          "{source_ts}, snapshot {snapshot_id}]")
-LATE_ARTIFACT_FAILURE_TEMPLATE = ("[EARLIER ARTIFACT — could not be rendered: {reason}; source "
-                                  "message {source_ts}, snapshot {snapshot_id}]")
-LATE_ARTIFACT_KIND_LINES = MappingProxyType({
-    "image_analysis": ("You can SEE this image description; you cannot edit or re-render the "
-                       "original."),
-    "document_extraction": "Extracted content follows; read_document may have fresher bytes.",
-    "ambient_artifact": "Background summary of a linked resource.",
-    "tool_provenance": "Record of a tool run that completed after compaction.",
-})
-LATE_ARTIFACT_REASONS = ("row_missing", "render_empty", "render_error")
-
-REHYDRATION_HEADER = "[THIS THREAD BEFORE THE SUMMARY BOUNDARY — oldest first{bound_clause}]"
-REHYDRATION_BOUND_CLAUSE = ", root plus the latest {n} replies"
-REHYDRATION_END_TEXT = "[END EARLIER THREAD CONTEXT]"
-REHYDRATION_OMISSION_TEMPLATE = ("[THIS THREAD BEFORE THE SUMMARY BOUNDARY — "
-                                 "unavailable: {reason}]")
-REHYDRATION_REASONS = ("fetch_budget_exhausted", "fetch_error", "retention")
-ROOT_TRUNCATED_MARKER = "[root truncated]"
 
 END_MARKER_TEXT = "[end of channel stream]"
 
 # A7. Any payload LINE beginning with one of these is prefixed with "· " before it is persisted
 # and again before it is rendered, so nothing a model wrote can present itself as our structure.
 A2_RESERVED_PREFIXES: Tuple[str, ...] = (
+    "[CURRENT THREAD",
+    "[thread=",
     "[CHANNEL SUMMARY",
     "[ROOT ANCHORS",
     "[END CHANNEL SUMMARY",
@@ -150,8 +180,6 @@ MARKER_KIND_DOCUMENT = "document"
 MARKER_KIND_IMAGE = "image_analysis"
 MARKER_KIND_TOOL = "tool_provenance"
 
-TERMINAL_COVERAGE_STATUSES = ("complete", "limited")
-
 ROLE_USER = "user"
 ROLE_ASSISTANT = "assistant"
 
@@ -165,17 +193,29 @@ RECEIPT_FINALIZED = "finalized"
 # context failure with one clause.
 
 
-class CoverageNotReady(ChannelStreamError):
-    """The bootstrap sweep has not reached a terminal state, or its floor is newer than H."""
+class OriginFetchError(ChannelStreamError):
+    """The ORIGIN thread could not be read completely. Never answer from a partial origin.
+
+    NAMED, NOT STRING-MATCHED, and it CARRIES THE SLACK CODE — without that the §2e taxonomy is
+    unusable, because wrapping destroys the very string it branches on. `_channel_stream_failure`
+    branches on the TYPE and returns `origin_fetch_failed`; the periphery's own failures stay
+    `HistoryFetchError` and return `history_fetch_failed`.
+    """
+
+    def __init__(self, message: str, *, code: Optional[str] = None):
+        super().__init__(message)
+        # "" / None when the cause carried no Slack code. `None` is NOT a taxonomy match and
+        # therefore FAILS CLOSED, which is the allowlist's default.
+        self.code = code
 
 
-class SnapshotUnsupportedError(ChannelStreamError):
-    """A compaction snapshot pointer exists that this caller never resolved.
+class SidecarPinMismatch(ChannelStreamError):
+    """The two halves of the render pin describe two different worlds.
 
-    v2 renders a pinned snapshot: the caller runs selection (§1b) and hands the resolved row to
-    `build_channel_stream`. A caller that passed no snapshot while a pointer exists has skipped
-    that step, and rendering the raw window anyway would contradict a durable decision, so the
-    turn stops instead.
+    `receipt_feature_epoch_ts` is a property of the CHANNEL, not of an id list, so two reads in
+    one turn against one database must return the same value. A difference means something is
+    racing the feature-epoch write, and rendering half the stream under one epoch and half under
+    another would produce bytes no single read of the database supports.
     """
 
 
@@ -214,8 +254,7 @@ _FREEZE_SCALARS = (str, bytes, bytearray, bool, int, float, complex, type(None))
 
 
 def freeze_deep(value: Any) -> Any:
-    """§1p: the ONE recursive freeze, for snapshot payloads, root anchors, sidecar rows and item
-    metadata.
+    """§1p: the ONE recursive freeze, for sidecar rows and item metadata.
 
     Mappings become read-only proxies over frozen copies, sequences become tuples, sets become
     frozensets, scalars pass through. A CYCLE and an unsupported type are both BUILD ERRORS: a
@@ -257,13 +296,41 @@ def _frozen_config(payload: Mapping[str, Any]) -> Mapping[str, Any]:
         for key, value in payload.items()})
 
 
+def _frozen_config_deep(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    """`_frozen_config`, but recursively — a mapping member would otherwise stay mutable behind
+    a read-only proxy, which is a freeze that only looks like one."""
+    return freeze_deep(dict(payload))
+
+
 # ---------------------------------------------------------------- pinned records
 
 @dataclass(frozen=True)
-class CoveragePin:
+class InventoryPin:
+    """The thread-index row as the stream sees it: where the index starts, and §2f's ONE state.
+
+    `state` is DERIVED from `(status, reason)` rather than stored, so the six-value vocabulary
+    has exactly one definition and a consumer cannot re-derive it differently.
+    """
     start_ts: str
     status: str
     reason: Optional[str]
+
+    @property
+    def state(self) -> str:
+        status = str(self.status or "")
+        if status == "complete":
+            return INVENTORY_WARM
+        if status in ("pending", "running"):
+            return INVENTORY_COLD
+        if status != "limited":
+            return INVENTORY_COLD
+        reason = str(self.reason or "")
+        if reason == REASON_UNAVAILABLE:
+            return INVENTORY_UNAVAILABLE
+        if reason == "depth_config":
+            return INVENTORY_LIMITED_DEPTH
+        # NULL or unrecognised reads as retention — see index_clause's fail-safe note.
+        return INVENTORY_LIMITED_RETENTION
 
 
 @dataclass(frozen=True)
@@ -276,9 +343,17 @@ class ReceiptRec:
 
 @dataclass(frozen=True)
 class SidecarPin:
-    """Every DB row the stream renders from, read in ONE transaction that commits and closes
-    before the first Slack call. Discovery and rendering read the SAME rows: a root found from
-    an activity row the renderer never saw would be a thread fetched for nothing.
+    """Every DB row the stream renders from.
+
+    READ 2 FOLLOWS THE FETCH, and its subject is the CANDIDATE identities the fetch returned:
+    eligibility needs receipt state and the receipt epoch, so a pin restricted to already-selected
+    ids could never be built at all. Discovery moved to READ 1 and reads its own rows.
+
+    IT IS ONE TRANSACTION PER CALL, AND THE BUILDER MAKES TWO. READ 2a covers the periphery
+    candidate ids in the shared phase; READ 2b covers the origin-only ids per origin; and
+    `merge_sidecar_pins` combines them with the SHARED rows winning every overlap, so the
+    periphery's bytes are fixed before any origin is known. Each call is still one transaction
+    over an exact id list, which is the property that makes a pin a pin.
 
     Deeply immutable, and validated here rather than at first use. `__post_init__` is freeze time:
     the rows become read-only mappings (a frozen dataclass holding mutable dicts is a pin that can
@@ -289,7 +364,7 @@ class SidecarPin:
     window: Tuple[str, bool]
     receipts: Tuple[ReceiptRec, ...]
     receipt_feature_epoch_ts: Optional[str]
-    coverage: Optional[CoveragePin]
+    coverage: Optional[InventoryPin]
     activity_roots: Tuple[str, ...]
     activity_event_ts: Tuple[Tuple[str, Optional[str]], ...]
     image_analyses: Tuple[Mapping[str, Any], ...]
@@ -302,7 +377,7 @@ class SidecarPin:
         object.__setattr__(self, "window",
                            (_checked_ts(self.window[0], "window floor"), bool(self.window[1])))
         if self.coverage is not None:
-            _checked_ts(self.coverage.start_ts, "coverage_start_ts")
+            _checked_ts(self.coverage.start_ts, "inventory_start_ts")
         for rec in self.receipts:
             _checked_ts(rec.ts, "receipt message_ts")
             if rec.thread_root_ts:
@@ -348,22 +423,32 @@ class PinnedTuple:
     assembler's own evidence snapshot — otherwise two requesters in one channel could never
     share a cache prefix, which is the thing the single stream exists to make possible.
 
-    Two of these fields are DERIVED at pin time rather than passed in, and that is the point:
-    `sidecar_markers` and `chrome_ts` are the output of the two renderers that read live
-    configuration (the provenance/ambient annotation budgets, and the pipeline status-marker list
-    the chrome classifier matches on). Rendering them here, once, means the serializer reads
-    nothing but this tuple — so the same pin re-serialized after a config change still produces
-    the bytes the turn was admitted with, and a config change is a cache MISS via
-    `serializer_config_hash` rather than a silently different stream under the same hash.
-    Passing either one in is ignored: they are functions of the other fields and are always
-    computed here, so there is no way to hand the serializer markers its rows do not support.
+    `chrome_ts` is SUPPLIED and KEPT: the builder classified it as pages arrived, selection
+    already acted on that value, and `__post_init__` recomputes it only to VALIDATE — raising
+    on a mismatch rather than substituting its own answer, which would silently discard what
+    selection used and reintroduce the divergence pinning the candidates exists to prevent.
+
+    `sidecar_markers` is DERIVED at pin time rather than passed in, and that is the point: it is
+    the output of a renderer that reads live configuration (the provenance/ambient annotation
+    budgets). Rendering it here, once, means the serializer reads nothing but this tuple — so the
+    same pin re-serialized after a config change still produces the bytes the turn was admitted
+    with, and a config change is a cache MISS via `serializer_config_hash` rather than a silently
+    different stream under the same hash. Passing it in is ignored: it is a function of the other
+    fields and is always computed here, so there is no way to hand the serializer markers its
+    rows do not support.
+
+    `chrome_ts` IS THE EXCEPTION AND IT IS NOT IGNORED. It arrives from the builder, which
+    classified it as pages arrived and which SELECTION already acted on; `__post_init__`
+    recomputes it only to compare. The two acts differ on purpose — recompute-and-compare proves
+    the supplied value honest, while recompute-and-USE would discard what selection acted on and
+    reintroduce the divergence between selection and rendering that pinning the candidates exists
+    to prevent.
     """
     team_id: str
     channel_id: str
-    snapshot: Optional[Mapping[str, Any]]
     window: Tuple[str, bool]
     H: str
-    fetch_snapshot: Tuple[NormalizedMessage, ...]
+    fetch_snapshot: Tuple[NormalizedMessage, ...]          # PERIPHERY candidates
     sidecar_versions_hash: str
     actor_map: Tuple[Tuple[str, str], ...]
     actor_map_hash: str
@@ -371,27 +456,70 @@ class PinnedTuple:
     serializer_config_hash: str
     capability_profile_hash: str
     tool_schema_version: str
-    coverage: CoveragePin
+    coverage: Optional[InventoryPin]
     receipt_feature_epoch_ts: Optional[str]
     receipt_map: Tuple[Tuple[str, str, Optional[str], Optional[str]], ...]
     sidecars: SidecarPin
+    # --- the shallow window's own pins ------------------------------------------------------
+    origin_root_ts: Optional[str] = None
+    origin_snapshot: Tuple[NormalizedMessage, ...] = ()    # ORIGIN candidates, complete
+    periphery_floor_ts: str = ""                           # F' — "" is the empty-floor sentinel
+    selection_version: int = 0
+    reach_tools: Tuple[str, ...] = ()
     serializer_config: Mapping[str, Any] = field(default_factory=dict)
     sidecar_markers: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
-    chrome_ts: Tuple[str, ...] = ()
-    namespace: str = PROD_NAMESPACE
+    chrome_ts: FrozenSet[str] = frozenset()
 
     def __post_init__(self) -> None:
         _checked_ts(self.H, "H")
-        _checked_ts(self.window[0], "window floor")
+        # The empty-floor sentinel is NOT a timestamp and `_checked_ts` must never see it —
+        # `parse_ts("")` raises, and "this channel has no eligible events" is a legal state.
+        if self.window[0]:
+            _checked_ts(self.window[0], "window floor")
         object.__setattr__(self, "window", (str(self.window[0]), bool(self.window[1])))
-        if self.snapshot is not None:
-            object.__setattr__(self, "snapshot", freeze_deep(dict(self.snapshot)))
-            _checked_ts(self.snapshot.get("boundary_ts"), "snapshot boundary_ts")
+        object.__setattr__(self, "origin_snapshot", tuple(self.origin_snapshot))
+        object.__setattr__(self, "reach_tools", tuple(self.reach_tools))
         config_values = _frozen_config(self.serializer_config or serializer_config_snapshot())
         object.__setattr__(self, "serializer_config", config_values)
         object.__setattr__(self, "sidecar_markers", _render_sidecar_markers(
             self.sidecars, self.channel_id, config_values))
-        object.__setattr__(self, "chrome_ts", _classify_chrome(self.fetch_snapshot))
+
+        # ONE OPERATIONAL CLASSIFICATION PLUS ONE VALIDATION RECOMPUTATION. The builder classified
+        # chrome as pages arrived — the walk's stopping predicate needs it — and that SUPPLIED
+        # value is what selection already acted on and what the serializer renders. Recomputing
+        # and USING the result here would silently discard it, reintroducing the divergence
+        # between selection and rendering that pinning the candidates exists to prevent.
+        #
+        # The subject is the DEDUPED UNION of both snapshots: an origin-only message is subject to
+        # the same eligibility rule, so validating over the periphery alone would leave exactly
+        # the origin-only chrome unchecked — the own-output exclusion rule defeated by a gap in
+        # coverage rather than by a bad predicate.
+        supplied = frozenset(self.chrome_ts)
+        recomputed = classify_chrome(
+            _dedup(tuple(self.fetch_snapshot) + tuple(self.origin_snapshot)),
+            chrome_markers=config_values.get("chrome_markers", ()))
+        if supplied != recomputed:
+            raise FreezeError(
+                "the pinned chrome classification does not match a recomputation over the same "
+                f"messages and markers (supplied-only={sorted(supplied - recomputed)}, "
+                f"recomputed-only={sorted(recomputed - supplied)}); the pin and the selection "
+                "that acted on it disagree about which of our own messages are chrome")
+        object.__setattr__(self, "chrome_ts", supplied)
+
+    @property
+    def inventory_state(self) -> str:
+        """§2f's state, with `absent` covering the channel that has no row at all."""
+        return self.coverage.state if self.coverage is not None else INVENTORY_ABSENT
+
+    @property
+    def horizon_floor_ts(self) -> str:
+        """WHERE THE RENDERED WINDOW ACTUALLY STARTS, which is what the horizon may claim.
+
+        It is the SELECTED periphery floor `F'` — the policy decision this build made, not the
+        inventory's reach and not the oldest message that happened to be fetched. `""` is the
+        empty-floor sentinel and selects A1's no-floor variant; `parse_ts` is never called on it.
+        """
+        return self.periphery_floor_ts
 
     @property
     def floor_ts(self) -> str:
@@ -412,6 +540,225 @@ class PinnedTuple:
         return ()
 
 
+class SharedPageCounts(NamedTuple):
+    history: int
+    reply: int
+
+
+class PageCounts(NamedTuple):
+    history: int                  # each read from its own FetchBudget.pages_used
+    reply: int
+    origin: int
+
+
+@dataclass(frozen=True)
+class PreparedTurn:
+    """§4.4 steps 1-4: everything that must complete BEFORE any fetch starts.
+
+    It exists as its own awaited phase so the ordering is STRUCTURAL rather than merely
+    discouraged: the origin fetch runs concurrently with the periphery build, so if the drain
+    lived inside that build, Slack I/O could begin before the admission watermark had resolved —
+    the one ordering P1 established. There is no code path from the composer to a fetch that does
+    not first await this.
+    """
+    team_id: str
+    channel_id: str
+    h: str                                  # already through _checked_ts
+    frontier: int                           # the drained frontier
+    floor_read: Optional[str]               # F as READ (None when UNSET or a stale version)
+    coverage: Optional[InventoryPin]        # READ 1 stage 1's inventory; None means ABSENT
+    generation: int                         # actor-tail generation, captured BEFORE the fetch
+    selection_version: int
+    serializer_config: Mapping[str, Any]    # frozen at step 2a
+
+
+@dataclass(frozen=True)
+class OriginFetch:
+    """The result of ONE origin fetch, before any pin."""
+    origin_root_ts: Optional[str]
+    messages: Tuple[NormalizedMessage, ...]   # normalized, deduped, EVERY fetched message
+    pages: int                                # from its own FetchBudget.pages_used
+    empty_fallback: bool                      # §2e's ONE legal empty origin was taken
+    deadline_at: Optional[float]              # THE BUDGET'S deadline, carried forward so the pin
+                                              # that consumes it can prove one shared clock
+
+
+@dataclass(frozen=True)
+class StreamBuildResult:
+    """What the BUILD produced, as opposed to what the pin contains.
+
+    `reselected` and `anchor_advanced` are not on `ChannelStream` because neither is knowable at
+    serialization: `reselected` is a property of the SELECTION, and `anchor_advanced` is the
+    UPSERT's return value, which does not exist until after the bytes are already frozen.
+    """
+    stream: ChannelStream
+    reselected: bool              # this build chose a floor different from the one it read
+    anchor_advanced: bool         # the UPSERT moved the row; False on skip AND on failure
+    pages: PageCounts
+
+
+def merge_sidecar_pins(shared: SidecarPin, origin: SidecarPin, *,
+                       ids: Sequence[str]) -> SidecarPin:
+    """READ 2a + READ 2b -> the ONE pin the serializer renders from.
+
+    `ids` is the SORTED UNION of what the two reads asked for. It is a PARAMETER because
+    `SidecarPin` has no id field: the id list enters the HASH, not the pin's shape.
+
+    THE ONE SCALAR MUST AGREE. `receipt_feature_epoch_ts` is a property of the CHANNEL, not of an
+    id list, so two reads in one turn against one database must return the same value. A
+    difference means something is racing the feature-epoch write and the two halves describe two
+    different worlds — it RAISES and the turn fails closed, because rendering half the stream
+    under one epoch and half under another produces bytes no single read supports.
+
+    SHARED WINS PER GROUP, AND A GROUP IS EVERY ROW FOR ONE SUBJECT TS. `image_analyses`,
+    `document_extractions` and `ambient_artifacts` are NOT unique by timestamp — one message can
+    carry three images, and the accessor selects the row `id` and orders by `(ts, id)` precisely
+    because of it. Keying those lists by ts and merging `{**origin, **shared}` would collapse each
+    group to ONE row and silently drop the rest: an artifact marker vanishing from the render.
+
+    `window` and `coverage` are NOT merged and cannot diverge — both READ-2 pins carry the inert
+    values, and nothing reads them. The floor that renders lives on `PinnedTuple.window`; the
+    inventory that renders lives on `PinnedTuple.coverage`.
+    """
+    if shared.receipt_feature_epoch_ts != origin.receipt_feature_epoch_ts:
+        raise SidecarPinMismatch(
+            "the two halves of the render pin disagree about the receipt feature epoch "
+            f"({shared.receipt_feature_epoch_ts!r} vs {origin.receipt_feature_epoch_ts!r}); "
+            "something is racing the epoch write and the pin describes two different worlds")
+
+    def _grouped(rows: Sequence[Mapping[str, Any]], key: str) -> Dict[str, List[Mapping]]:
+        out: Dict[str, List[Mapping]] = {}
+        for row in rows:
+            out.setdefault(str(row.get(key)), []).append(row)
+        return out
+
+    def _merge_groups(shared_rows, origin_rows, key: str) -> Tuple[Mapping[str, Any], ...]:
+        groups = _grouped(origin_rows, key)
+        # THE SHARED GROUP WINS WHOLE — every row in it, not one row from it. The two id sets are
+        # disjoint by construction, so an overlap means a row came back for an id nobody asked
+        # for; resolving it to the shared group is right because a duplicate row is not the
+        # evidence of a race that a divergent scalar is.
+        groups.update(_grouped(shared_rows, key))
+        merged = [row for rows in groups.values() for row in rows]
+        # The accessor's OWN order, so a merged pin is byte-comparable with a single read's.
+        return tuple(sorted(merged, key=lambda r: (_ts_or_zero(r.get(key)),
+                                                   r.get("id") or 0)))
+
+    receipts = {rec.ts: rec for rec in origin.receipts}
+    receipts.update({rec.ts: rec for rec in shared.receipts})
+    tool_usage = dict(origin.tool_usage)
+    tool_usage.update(dict(shared.tool_usage))
+
+    return SidecarPin(
+        window=shared.window,
+        receipts=tuple(sorted(receipts.values(), key=lambda r: parse_ts(r.ts))),
+        receipt_feature_epoch_ts=shared.receipt_feature_epoch_ts,
+        coverage=shared.coverage,
+        activity_roots=(),
+        activity_event_ts=(),
+        image_analyses=_merge_groups(shared.image_analyses, origin.image_analyses,
+                                     "message_ts"),
+        document_extractions=_merge_groups(shared.document_extractions,
+                                           origin.document_extractions, "message_ts"),
+        ambient_artifacts=_merge_groups(shared.ambient_artifacts, origin.ambient_artifacts,
+                                        "source_ts"),
+        tool_usage=tuple(sorted(tool_usage.items(), key=lambda pair: parse_ts(pair[0]))),
+        # RECOMPUTED over the merged rows plus `ids` by the same function the accessor uses —
+        # never a hash of the two hashes, which would move whenever the periphery/origin split
+        # moved even though the rendered rows were identical, and would break the cache for
+        # nothing.
+        versions_hash=_merged_versions_hash(
+            receipts=receipts, tool_usage=tool_usage, ids=ids,
+            epoch=shared.receipt_feature_epoch_ts,
+            images=_merge_groups(shared.image_analyses, origin.image_analyses, "message_ts"),
+            documents=_merge_groups(shared.document_extractions, origin.document_extractions,
+                                    "message_ts"),
+            ambient=_merge_groups(shared.ambient_artifacts, origin.ambient_artifacts,
+                                  "source_ts")),
+    )
+
+
+def _ts_or_zero(raw: Any) -> float:
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _merged_versions_hash(*, receipts, tool_usage, ids, epoch, images, documents,
+                          ambient) -> str:
+    """The accessor's own hash, over merged material. Delegated so the merge and a single read
+    cannot produce different hashes for the same rendered rows."""
+    from database import DatabaseManager
+    return DatabaseManager._sidecar_versions_hash({
+        "ids": list(ids),
+        "receipt_feature_epoch_ts": epoch,
+        "receipts": [{"message_ts": r.ts, "state": r.state, "turn_id": r.turn_id,
+                      "thread_root_ts": r.thread_root_ts} for r in
+                     sorted(receipts.values(), key=lambda r: parse_ts(r.ts))],
+        "image_analyses": [dict(r) for r in images],
+        "document_extractions": [dict(r) for r in documents],
+        "ambient_artifacts": [dict(r) for r in ambient],
+        "tool_usage": {ts: [dict(t) for t in tools] for ts, tools in tool_usage.items()},
+    })
+
+
+@dataclass(frozen=True)
+class SharedChannelPin:
+    """Everything an ORIGIN-INDEPENDENT build produces — fetched and read ONCE per turn.
+
+    This is what makes one periphery serializable under N origins: the probe builds one of these
+    and two `PinnedTuple`s from it, and the two must render byte-identical pre-breakpoint bytes.
+    """
+    team_id: str
+    channel_id: str
+    h: str
+    deadline_at: float                               # the ONE shared deadline
+    serializer_config: Mapping[str, Any]
+    generation: int
+    floor_read: Optional[str]                        # F as READ (None when UNSET)
+    periphery_floor_ts: str                          # F' — "" is the empty-floor sentinel
+    reselected: bool
+    periphery_candidates: Tuple[NormalizedMessage, ...]
+    periphery: Tuple[NormalizedMessage, ...]         # the SELECTION: eligible, at/above F'
+    periphery_sidecars: SidecarPin                   # READ 2a, over PERIPHERY candidate ids
+    periphery_chrome_ts: FrozenSet[str]
+    actor_map: Tuple[Tuple[str, str], ...]           # THE PERIPHERY ACTOR MAP, frozen here
+    actor_ids_attempted: FrozenSet[str]              # every id the periphery TRIED to resolve
+    actor_lookups_remaining: int                     # remote budget left for origin-only actors
+    coverage: Optional[InventoryPin]                 # None means ABSENT
+    selection_version: int
+    reach_tools: Tuple[str, ...]
+    capability_profile_hash: str
+    tool_schema_version: str
+    pages: SharedPageCounts
+
+    def __post_init__(self) -> None:
+        """DEEP-FREEZE. `frozen=True` protects the ATTRIBUTE, not what it POINTS AT, and
+        `serializer_config_snapshot()` returns a mutable dict whose `chrome_markers` is a mutable
+        list. Without this, code between two `build_origin_pin` calls could mutate the marker
+        list and fork the very prefix those two calls exist to prove identical.
+        """
+        object.__setattr__(self, "serializer_config", _frozen_config_deep(
+            self.serializer_config))
+        object.__setattr__(self, "periphery_candidates", tuple(self.periphery_candidates))
+        object.__setattr__(self, "periphery", tuple(self.periphery))
+        object.__setattr__(self, "periphery_chrome_ts", frozenset(self.periphery_chrome_ts))
+        object.__setattr__(self, "actor_map", tuple(tuple(pair) for pair in self.actor_map))
+        object.__setattr__(self, "actor_ids_attempted", frozenset(self.actor_ids_attempted))
+        object.__setattr__(self, "reach_tools", tuple(self.reach_tools))
+
+    @property
+    def root_count(self) -> int:
+        """DISTINCT TOP-LEVEL ROOTS IN THE SELECTION — §2d's count subject.
+
+        Derived, never stored: it is a function of `periphery`, and a stored copy could disagree
+        with it. Equals `ChannelStream.root_count` by construction, because the serializer renders
+        from a pin carrying the same floor over the same candidates.
+        """
+        return len({m.ts for m in self.periphery if not m.is_reply})
+
+
 @dataclass(frozen=True)
 class StreamItem:
     role: str
@@ -425,43 +772,53 @@ class StreamItem:
 @dataclass(frozen=True)
 class ChannelStream:
     pinned: PinnedTuple
-    items: Tuple[StreamItem, ...]
+    items: Tuple[StreamItem, ...]          # CANONICAL, pre-breakpoint: horizon + periphery
     horizon_item: StreamItem
     end_marker_item: StreamItem
-    message_items: Tuple[StreamItem, ...]
-    stream_sha256: str
-    byte_count: int
-    message_count: int
+    message_items: Tuple[StreamItem, ...]  # the periphery MESSAGES only, markers excluded
+    origin_header_item: Optional[StreamItem]   # None only when the origin block is empty
+    origin_items: Tuple[StreamItem, ...]       # the COMPLETE origin thread, post-breakpoint
+    stream_sha256: str                     # over `items` — THE cross-origin equality value
+    union_sha256: str                      # `items`, then the origin header, then origin items
+    byte_count: int                        # ALL pre-breakpoint item content, markers included
+    origin_byte_count: int                 # the origin header + origin items
+    message_count: int                     # rendered periphery MESSAGE items only
+    origin_count: int                      # rendered origin MESSAGE items only, header excluded
+    candidate_count: int                   # periphery candidates BEFORE eligibility and the count
+    root_count: int                        # FINAL RENDERED roots, after the floor filter
+    orphan_root_count: int                 # A5 marker ITEMS rendered
+    periphery_floor_ts: str                # "" is the empty-floor sentinel
+    selection_version: int
+    inventory_state: str                   # one of §2f's SIX values
+    serializer_version: int
+    serializer_config_hash: str
+    sidecar_versions_hash: str
+    actor_map_hash: str
+    capability_profile_hash: str
     receipts_included: Tuple[str, ...]
     receipts_excluded: Tuple[str, ...]
     receipts_membership_hash: str
-    summary_item: Optional[StreamItem] = None
-    snapshot_id: Optional[str] = None
-    generation: Optional[int] = None
-    boundary_ts: Optional[str] = None
-    stale: bool = False
-    anchor_roots: frozenset = frozenset()
-    # §1k: the pre-boundary receipt/chrome evidence rehydration needs, read in THE SAME
-    # transaction as everything else this build is a function of. Post-serialization state, so it
-    # is NOT part of `stream_sha256` — it is origin-specific evidence, not canonical bytes.
-    preboundary_receipts: Tuple[Mapping[str, Any], ...] = ()
 
     # -- post-serialization selectors ------------------------------------------------------
 
     def origin_slice(self, origin_thread_ts: Optional[str]) -> Tuple[StreamItem, ...]:
-        """The items belonging to one thread. Selection only — the canonical build never saw
-        this argument."""
+        """The origin thread's items. RETAINED BY NAME AND SIGNATURE so existing callers keep
+        working, but ITS MEANING CHANGED: the origin is now FETCHED rather than selected out of
+        the window, so this returns `origin_items` when the argument matches the origin this
+        build was made for, and `()` otherwise."""
         if not origin_thread_ts:
             return ()
-        return tuple(item for item in self.message_items
-                     if item.metadata.get("thread_root_ts") == str(origin_thread_ts))
+        if self.pinned.origin_root_ts and str(origin_thread_ts) == str(
+                self.pinned.origin_root_ts):
+            return self.origin_items
+        return ()
 
     def trigger_view(self, trigger_ts: Optional[str]) -> Optional[StreamItem]:
         """The item for one ts, or None when Slack had not propagated it by the time we
         fetched — the caller then falls back to the verbatim trigger block."""
         if not trigger_ts:
             return None
-        for item in self.message_items:
+        for item in (*self.message_items, *self.origin_items):
             if item.metadata.get("ts") == str(trigger_ts):
                 return item
         return None
@@ -475,25 +832,23 @@ class ChannelStream:
         carries the messages the serializer excluded — chrome, another turn's in-flight surface —
         and a target the model was never shown is a target it is guessing at.
 
-        It is the set of `thread=<ts>` labels the rendered headers carry, UNION the rendered root
-        anchors — the summary names those threads too, so the model can read them — and every
-        anchor is REVALIDATED here against §1j's two conditions rather than trusted because it
-        was rendered. A top-level message with no replies is still NOT in it: no thread label was
-        rendered for it, and the schema promises only the labels.
+        It is the set of `thread=<ts>` labels the rendered headers carry, PLUS the origin root.
+        ORPHAN ROOTS ARE INCLUDED — a rendered `thread=<ts>` label is a rendered label whether or
+        not its root is inside the window, and the marker above it tells the model how to read
+        the thread before answering in it. A top-level message with no replies is still NOT in
+        it: no thread label was rendered for it, and the schema promises only the labels.
         """
-        labelled = frozenset(
-            str(root) for root in
-            (item.metadata.get("thread_root_ts") for item in self.message_items) if root)
-        anchored = frozenset(
-            root for root in self.anchor_roots
-            if anchor_is_eligible(root, boundary_ts=self.boundary_ts,
-                                  straddles=root in labelled))
-        return labelled | anchored
+        labelled = {str(root) for root in
+                    (item.metadata.get("thread_root_ts")
+                     for item in (*self.message_items, *self.origin_items)) if root}
+        if self.pinned.origin_root_ts:
+            labelled.add(str(self.pinned.origin_root_ts))
+        return frozenset(labelled)
 
     def normalized_for(self, ts: Optional[str]) -> Optional[NormalizedMessage]:
         if not ts:
             return None
-        for message in self.pinned.fetch_snapshot:
+        for message in (*self.pinned.fetch_snapshot, *self.pinned.origin_snapshot):
             if message.ts == str(ts):
                 return message
         return None
@@ -515,25 +870,56 @@ class ChannelStream:
         part = api_part({"type": "input_text", "text": END_MARKER_TEXT})
         return [attach_cache_breakpoint(part, model)]
 
+    def origin_input_items(self) -> List[Dict[str, Any]]:
+        """The origin block as API input items, header first. POST-BREAKPOINT.
+
+        Origin MESSAGE items carry their real metadata, so the stale-send guard keeps reading
+        `metadata.ts` off them exactly as it does the canonical ones. The HEADER carries
+        `metadata={}` like every other framing item: it has no message ts, and an invented one
+        would be a timestamp the guard could advance a lease to.
+
+        EVERY ITEM CARRIES `_origin`, AND DELIBERATELY NOT `_stream`. The origin block has to be
+        outside `_stream` so `_evidence_hash` includes it, and inside the admission estimator's
+        room-content figure so a refusal reports it as room content rather than overhead. One
+        flag cannot do both: `_stream` would buy the token accounting and lose the evidence
+        hash. So the estimator reads BOTH markers, and `to_input_items` removes both.
+
+        THE STRIP IS A CONTRACT, NOT A CRASH GUARD. `_channel_input_items`
+        (`openai_client/base.py:55`) rebuilds every role item from `role` + `content` alone, so
+        a stray marker could never reach the API even unstripped. `to_input_items` is the seam
+        that promises callers the assembler's own bookkeeping is gone; leaving a marker in its
+        output would make that promise false and hand the next reader a key with no owner.
+        """
+        sequence = ([self.origin_header_item] if self.origin_header_item else [])
+        return [{"role": item.role, "content": item.content, "metadata": dict(item.metadata),
+                 "_origin": True}
+                for item in (*sequence, *self.origin_items)]
+
     def stream_render_fields(self) -> Dict[str, Any]:
         """The stream_render telemetry payload, minus the per-turn identifiers the caller owns
         (turn_id, origin_thread_ts, trigger_ts)."""
         return {
             "channel_id": self.pinned.channel_id,
-            "snapshot_id": self.snapshot_id,
-            "generation": self.generation,
-            "boundary": self.pinned.floor_ts,
-            "floor_inclusive": self.pinned.floor_inclusive,
             "H": self.pinned.H,
-            "coverage_start_ts": self.pinned.coverage.start_ts,
-            "serializer_version": self.pinned.serializer_version,
-            "serializer_config_hash": self.pinned.serializer_config_hash,
-            "sidecar_versions_hash": self.pinned.sidecar_versions_hash,
-            "actor_map_hash": self.pinned.actor_map_hash,
-            "capability_profile_hash": self.pinned.capability_profile_hash,
+            "periphery_floor_ts": self.periphery_floor_ts,
+            "selection_version": self.selection_version,
+            "inventory_start_ts": (self.pinned.coverage.start_ts
+                                   if self.pinned.coverage else ""),
+            "inventory_state": self.inventory_state,
+            "serializer_version": self.serializer_version,
+            "serializer_config_hash": self.serializer_config_hash,
+            "sidecar_versions_hash": self.sidecar_versions_hash,
+            "actor_map_hash": self.actor_map_hash,
+            "capability_profile_hash": self.capability_profile_hash,
             "byte_count": self.byte_count,
+            "origin_byte_count": self.origin_byte_count,
             "message_count": self.message_count,
+            "origin_count": self.origin_count,
+            "candidate_count": self.candidate_count,
+            "root_count": self.root_count,
+            "orphan_root_count": self.orphan_root_count,
             "stream_sha256": self.stream_sha256,
+            "union_sha256": self.union_sha256,
             "receipts_included_count": len(self.receipts_included),
             "receipts_excluded_count": len(self.receipts_excluded),
             "receipts_membership_hash": self.receipts_membership_hash,
@@ -589,10 +975,8 @@ def _stable_hash(payload: Any) -> str:
 
 # ---------------------------------------------------------------- Appendix A render helpers
 #
-# The ONLY place Appendix A bytes are produced. The compaction builder writes them into the
-# snapshot, the assembler writes them into post-breakpoint evidence, and the serializer replays
-# the persisted ones — three callers, one grammar, so a template can never drift between the
-# bytes we wrote and the bytes we read back.
+# The ONLY place Appendix A bytes are produced, so a template can never drift between two
+# renderers of the same thing.
 
 # Everything except \n and \t. A control character inside a payload is either an accident or an
 # attempt to break a line where the grammar says there is none; neither is worth carrying.
@@ -620,248 +1004,79 @@ def escape_payload(text: str) -> str:
     return "\n".join(escape_payload_line(line) for line in str(text).split("\n"))
 
 
-def escape_anchor_text(text: Optional[str], *, limit: int = ANCHOR_TEXT_CHARS) -> str:
-    """A7's stricter rule for the quoted anchor field.
+def index_clause(state: Optional[str], *, depth_days: Optional[int] = None) -> str:
+    """§2f's index clause for one InventoryPin state. A COMPLETE function over the six states.
 
-    An anchor line is always ONE physical line whose quotes always close, so a newline becomes
-    the two characters `\\n` and a double quote is backslash-escaped. Truncation happens on the
-    SOURCE text: escaping afterwards can only lengthen the field, never smuggle characters past
-    the bound.
+    Every state renders exactly one clause and `warm` renders the empty string. `unavailable` is
+    a clause now rather than a refusal: under OWNER-7 the sweep builds a thread index, so failing
+    to build it degrades DISCOVERY — a recent reply under an old root may be missing — and says
+    so, where it used to fail the turn closed because it defined the stream's beginning.
     """
-    clean = _CONTROL_RE.sub("", str(text or ""))[:max(0, int(limit))]
-    return clean.replace('"', '\\"').replace("\n", "\\n")
-
-
-def _anchor_line(entry: Mapping[str, Any], *, limit: int) -> str:
-    root_ts = str(entry.get("root_ts") or "")
-    if str(entry.get("status") or "") != ANCHOR_STATUS_AVAILABLE:
-        return f"- thread={root_ts}: {ANCHOR_UNAVAILABLE_TEXT}"
-    author = str(entry.get("author_id") or "unknown")
-    # A tombstone has whatever text Slack left behind; quoting it would describe a message that
-    # is gone. The marker carries the evidence, which is the whole reason the anchor survives.
-    text = "" if entry.get("tombstone") else escape_anchor_text(entry.get("text"), limit=limit)
-    marker = ANCHOR_TOMBSTONE_MARKER if entry.get("tombstone") else ""
-    return f'- thread={root_ts} by {author}: "{text}"{marker}'
-
-
-def render_anchor_block(anchors: Sequence[Mapping[str, Any]], *, omitted: int,
-                        text_limit: Optional[int] = None) -> str:
-    """The A2 root-anchor block: header ALWAYS, then one line per anchored root.
-
-    Zero anchors still emit the header and the single `- (none)` line — "this snapshot anchored
-    nothing" is a fact about the room, and a missing block would read as a renderer that forgot.
-    The omission line appears only when the map bound was actually hit.
-    """
-    limit = int(text_limit if text_limit is not None
-                else getattr(config, "root_anchor_text_max", ANCHOR_TEXT_CHARS))
-    rows = sorted(anchors, key=lambda entry: parse_ts(str(entry.get("root_ts") or "0")))
-    lines = [ANCHOR_HEADER_TEXT]
-    lines.extend(_anchor_line(entry, limit=limit) for entry in rows)
-    if not rows:
-        lines.append(ANCHOR_NONE_LINE)
-    if int(omitted or 0) > 0:
-        lines.append(ANCHOR_OMITTED_TEMPLATE.format(count=int(omitted)))
-    return "\n".join(lines)
-
-
-_ANCHOR_ROOT_RE = re.compile(r"^- thread=(\d+\.\d+)(?=[: ])")
-
-
-def anchor_roots_in(anchor_block: str) -> Tuple[str, ...]:
-    """The root ts values a rendered anchor block actually names, in rendered order.
-
-    Read off the RENDERED bytes rather than a parallel list, because the rendered map is what
-    `trusted_thread_roots` is defined against: a root we recorded but did not render is a root
-    the model was never shown.
-    """
-    roots: List[str] = []
-    for line in (anchor_block or "").split("\n"):
-        match = _ANCHOR_ROOT_RE.match(line)
-        if match and match.group(1) not in roots:
-            roots.append(match.group(1))
-    return tuple(roots)
-
-
-def anchor_is_eligible(root_ts: str, *, boundary_ts: Optional[str], straddles: bool) -> bool:
-    """§1j's two conditions, in one place: at or below the boundary, AND straddling into rendered
-    evidence. Used to BUILD the map and again to revalidate it at consumption — a thread with
-    nothing in the rendered window needs no referent, and an unvalidated anchor would widen
-    `post_to_thread` authority on stale data."""
-    if not straddles or not boundary_ts or not root_ts:
-        return False
-    try:
-        return parse_ts(str(root_ts)) <= parse_ts(str(boundary_ts))
-    except TimestampError:
-        return False
-
-
-def _stale_marker_span(lines: Sequence[str]) -> Optional[Tuple[int, int]]:
-    """Where a stale marker sits in these lines, if one does. The marker is two physical lines,
-    and A7 guarantees a model-written `[NOTE:` line is prefixed, so an unprefixed one is ours."""
-    head = STALE_MARKER_TEMPLATE.split("\n")[0].split("{")[0]
-    tail_end = STALE_MARKER_TEMPLATE.split("\n")[1].split("{")[-1].split("}")[-1]
-    for index, line in enumerate(lines):
-        if line.startswith(head):
-            if index + 1 < len(lines) and lines[index + 1].endswith(tail_end):
-                return (index, index + 2)
-            return (index, index + 1)
-    return None
-
-
-def stale_marked_payload(payload_bytes: bytes, *, boundary_ts: str) -> bytes:
-    """§1f COPY semantics: the parent's payload bytes, carrying the stale marker.
-
-    IDEMPOTENT. A stale-retained generation may itself be superseded by another, and two stacked
-    markers would be a visible lie about how the summary degraded — so a payload that already
-    carries one is copied VERBATIM.
-    """
-    text = (payload_bytes.decode("utf-8") if isinstance(payload_bytes, (bytes, bytearray))
-            else str(payload_bytes or ""))
-    lines = text.split("\n")
-    if _stale_marker_span(lines) is not None:
-        return text.encode("utf-8")
-    marker = STALE_MARKER_TEMPLATE.format(boundary_ts=boundary_ts)
-    joined = marker if not text else (text + marker if text.endswith("\n")
-                                      else text + "\n" + marker)
-    return joined.encode("utf-8")
-
-
-def render_summary_block(*, boundary_ts: str, payload: str, anchor_block: str,
-                         stale: bool) -> str:
-    """The whole A2 item content.
-
-    The stale marker has ONE pinned position — after the anchor block, before the end marker —
-    and the copy path (§1f) leaves it inside the payload bytes, so it is lifted out here and
-    re-placed rather than rendered twice or rendered in the wrong place. Lifting happens BEFORE
-    escaping for the same reason A7 lists `[NOTE:` as reserved: an escape pass would prefix our
-    own marker and turn it into text.
-    """
-    lines = str(payload or "").split("\n")
-    span = _stale_marker_span(lines)
-    if span is not None:
-        lines = list(lines[:span[0]]) + list(lines[span[1]:])
-        stale = True
-    body = escape_payload("\n".join(lines)).strip("\n")
-    out = [SUMMARY_HEADER_TEMPLATE.format(boundary_ts=boundary_ts), SUMMARY_PREAMBLE]
-    if body:
-        out.append(body)
-    if anchor_block:
-        out.append(str(anchor_block).strip("\n"))
-    if stale:
-        out.append(STALE_MARKER_TEMPLATE.format(boundary_ts=boundary_ts))
-    out.append(SUMMARY_END_TEXT)
-    return "\n".join(out)
-
-
-def reason_clause(reason: Optional[str], *, depth_days: Optional[int] = None) -> str:
-    """A3's coverage-reason mapping, from the values the coverage store actually writes.
-
-    `unavailable` has no clause and never gets one: it means we do not know where coverage
-    begins, and a horizon that named a floor anyway would be the one lie this whole window
-    exists to prevent. It fails closed instead.
-    """
-    value = str(reason or "")
-    if value == REASON_UNAVAILABLE:
-        raise CoverageNotReady(
-            "coverage reason is 'unavailable': there is no honest horizon to render")
-    if value == "genesis":
-        return REASON_CLAUSE_GENESIS
-    if value == "retention":
-        return REASON_CLAUSE_RETENTION
-    if value == "depth_config":
+    value = str(state or "")
+    if value == INVENTORY_WARM:
+        return ""
+    if value in (INVENTORY_ABSENT, INVENTORY_COLD):
+        return INDEX_CLAUSE_UNINDEXED
+    if value == INVENTORY_UNAVAILABLE:
+        return INDEX_CLAUSE_UNAVAILABLE
+    if value == INVENTORY_LIMITED_DEPTH:
         days = int(depth_days if depth_days is not None
                    else getattr(config, "coverage_bootstrap_days", 90))
-        return REASON_CLAUSE_DEPTH_TEMPLATE.format(days=days)
-    return REASON_CLAUSE_UNKNOWN
+        return INDEX_CLAUSE_DEPTH_TEMPLATE.format(days=days)
+    # THE FAIL-SAFE (§2f): limited_retention, and so is any state this function does not know.
+    # Saying Slack's retention may be the limit is true whenever we cannot prove otherwise;
+    # claiming our configured depth was the limit asserts a cause we do not have.
+    return INDEX_CLAUSE_RETENTION
 
 
-def render_horizon(*, summary_clause: str, coverage_start_ts: str, reason: str,
+def render_reach_clause(reach_tools: Sequence[str]) -> str:
+    """A1's reach segment, or the EMPTY STRING when no reach tool is exposed.
+
+    Rendered in REACH_TOOLS order whatever order the caller supplied, so two turns with the same
+    exposed set produce the same cached bytes. Joined as `a`, `a and b`, or `a, b and c`.
+    """
+    names = [t for t in REACH_TOOLS if t in set(reach_tools or ())]
+    if not names:
+        return ""
+    if len(names) == 1:
+        joined = names[0]
+    elif len(names) == 2:
+        joined = f"{names[0]} and {names[1]}"
+    else:
+        joined = ", ".join(names[:-1]) + f" and {names[-1]}"
+    return HORIZON_REACH_TEMPLATE.format(reach_list=joined)
+
+
+def render_horizon(*, floor_ts: str, inventory_state: str,
+                   reach_tools: Sequence[str] = (),
                    depth_days: Optional[int] = None) -> str:
-    """The A3 horizon item content. `reason` is the STORED coverage reason, not a clause."""
-    return HORIZON_TEMPLATE.format(
-        summary_clause=summary_clause, coverage_start_ts=coverage_start_ts,
-        reason_clause=reason_clause(reason, depth_days=depth_days))
+    """The A1 horizon item content. `inventory_state` is one of §2f's SIX states.
 
+    An empty `floor_ts` selects the no-floor variant. `parse_ts` is never called on it — the
+    caller guards on truthiness first, exactly as §2d requires of the sentinel it becomes.
 
-def _render_bytes(entry: Mapping[str, Any]) -> str:
-    for key in ("render", "render_bytes", "body", "text", "summary"):
-        value = entry.get(key)
-        if value:
-            return value.decode("utf-8", "replace") if isinstance(value, (bytes, bytearray)) \
-                else str(value)
-    return ""
-
-
-def render_late_artifact(entry: Mapping[str, Any], *, snapshot_id: str) -> str:
-    """A5: one artifact that completed after the summary was written.
-
-    An entry with nothing to render becomes the honest one-line failure rather than a header
-    with an empty body — an artifact block that says nothing is worse than one that says why.
+    CARRIES NO COUNTS AND NO H. Item 0 is the head of the cached prefix, so a per-turn value here
+    would invalidate the whole stream beneath it on every turn; the counts and the live edge ride
+    the post-breakpoint turn-coordinates block instead, where they cost nothing.
     """
-    namespace = str(entry.get("artifact_namespace") or entry.get("namespace") or "")
-    source_ts = str(entry.get("source_ts") or "")
-    kind_line = LATE_ARTIFACT_KIND_LINES.get(namespace)
-    if kind_line is None:
-        raise ValueError(f"no A5 kind line is pinned for artifact namespace {namespace!r}")
-    body = escape_payload(_render_bytes(entry)).strip("\n")
-    if not body.strip():
-        return render_late_artifact_failure(reason="render_empty", source_ts=source_ts,
-                                            snapshot_id=snapshot_id)
-    header = LATE_ARTIFACT_TEMPLATE.format(source_ts=source_ts, snapshot_id=snapshot_id)
-    return "\n".join([header, kind_line, body])
+    clause = index_clause(inventory_state, depth_days=depth_days)
+    reach = render_reach_clause(reach_tools)
+    if not floor_ts:
+        return HORIZON_TEMPLATE_NO_FLOOR.format(reach_clause=reach, index_clause=clause)
+    return HORIZON_TEMPLATE.format(floor_ts=floor_ts, reach_clause=reach, index_clause=clause)
 
 
-def render_late_artifact_failure(*, reason: str, source_ts: str, snapshot_id: str) -> str:
-    """A5's failure item: ONE line, no body, no kind line, and a closed reason vocabulary."""
-    if reason not in LATE_ARTIFACT_REASONS:
-        raise ValueError(f"{reason!r} is not one of the A5 failure reasons "
-                         f"{LATE_ARTIFACT_REASONS}")
-    return LATE_ARTIFACT_FAILURE_TEMPLATE.format(reason=reason, source_ts=source_ts,
-                                                 snapshot_id=snapshot_id)
+def render_origin_header(*, origin_root_ts: str, origin_count: int) -> str:
+    """The A2 origin header item content."""
+    return ORIGIN_HEADER_TEMPLATE.format(origin_root_ts=origin_root_ts,
+                                         origin_count=int(origin_count))
 
 
-def truncate_utf8(text: str, max_bytes: int) -> Tuple[str, bool]:
-    """A byte-prefix of `text` cut at a VALID CHARACTER BOUNDARY, and whether it was cut.
-
-    Never mid-codepoint: a request carrying half a character is a request the API rejects, and
-    the point of the rehydration cap is to stay inside a budget, not to trade one failure for
-    another.
-    """
-    raw = str(text or "").encode("utf-8")
-    if len(raw) <= max(0, int(max_bytes)):
-        return str(text or ""), False
-    return raw[:max(0, int(max_bytes))].decode("utf-8", "ignore"), True
-
-
-def render_rehydration(items: Sequence[str], *, bounded_n: Optional[int],
-                       root_truncated: bool = False) -> str:
-    """A6: the origin thread's pre-boundary tail as ONE labeled evidence item.
-
-    The bounded clause names `REHYDRATION_MAX_MESSAGES - 1` replies because the root always
-    consumes a slot; calling it "the last N messages" would misdescribe what the model is
-    looking at.
-    """
-    rendered = [escape_payload(item).strip("\n") for item in items]
-    rendered = [item for item in rendered if item]
-    if not rendered:
-        raise ValueError("a rehydration block with no items claims context it does not carry")
-    clause = ("" if bounded_n is None
-              else REHYDRATION_BOUND_CLAUSE.format(n=int(bounded_n)))
-    if root_truncated:
-        rendered[0] = rendered[0] + "\n" + ROOT_TRUNCATED_MARKER
-    # The header and the end marker sit against the block, exactly as the A6 template prints
-    # them; the repeated message blocks INSIDE it are separated by one blank line, which is the
-    # only place the template leaves the separator open.
-    return (REHYDRATION_HEADER.format(bound_clause=clause) + "\n"
-            + "\n\n".join(rendered) + "\n" + REHYDRATION_END_TEXT)
-
-
-def render_rehydration_omission(reason: str) -> str:
-    """A6's omission item: ONE line, no end marker, closed reason vocabulary."""
-    if reason not in REHYDRATION_REASONS:
-        raise ValueError(f"{reason!r} is not one of the A6 omission reasons "
-                         f"{REHYDRATION_REASONS}")
-    return REHYDRATION_OMISSION_TEMPLATE.format(reason=reason)
+def render_orphan_marker(*, root_ts: str, reach_tools: Sequence[str] = ()) -> str:
+    """The A5 marker for one pre-window root. Names its tool ONLY when that tool is exposed."""
+    clause = (ORPHAN_MARKER_TOOL_CLAUSE if "fetch_thread_messages" in set(reach_tools or ())
+              else "")
+    return ORPHAN_MARKER_TEMPLATE.format(root_ts=root_ts, tool_clause=clause)
 
 
 # ---------------------------------------------------------------- serialization
@@ -1018,52 +1233,6 @@ def _tool_marker(tools: Sequence[Mapping[str, Any]]) -> Optional[Tuple[str, str]
     return ("", rendered)
 
 
-# Full-length, unlike the one-line ambient MARKER above: a late artifact is shown precisely
-# because the summary never saw it, so there is no earlier mention for a gist to point back at.
-AMBIENT_LATE_ARTIFACT_CHARS = 1200
-
-
-def artifact_render_bytes(namespace: str, row: Mapping[str, Any]) -> Optional[str]:
-    """One artifact row's FROZEN RENDER BYTES — the SINGLE producer, for both consumers.
-
-    THE SAME BYTES DO TWO JOBS AND MUST BE BYTE-IDENTICAL ACROSS THEM:
-      * the compaction projection embeds them, and their SHA-256 becomes the capture manifest's
-        `content_hash` (§1i);
-      * late-artifact evidence re-renders them and compares that hash to decide whether the row
-        CHANGED since capture (§1i late-evidence rules).
-
-    Suppression is therefore BY BYTE IDENTITY. Two producers drifting by a single character
-    would make every already-summarized artifact look changed, and it would be rendered a second
-    time as "late" evidence the summary in fact already contains. That is why this lives here,
-    beside the marker producers it shares its exclusions with, rather than in either caller.
-
-    Returns None when the row is not evidence worth an item at all.
-    """
-    if namespace == MARKER_KIND_IMAGE:
-        analysis = str(row.get("analysis") or "")
-        return None if is_unattended_summary(analysis) else analysis
-    if namespace == "document_extraction":
-        summary = str(row.get("summary") or "")
-        if is_unattended_summary(summary):
-            return None
-        name = str(row.get("filename") or "document")
-        return f"{name}: {summary}" if summary.strip() else ""
-    if namespace == "ambient_artifact":
-        # The same two exclusions the marker renderer applies: an unready row has nothing to say
-        # yet, and an unfurl-derived one is Slack's own preview rather than our reading of it.
-        if str(row.get("status") or "") != "ready":
-            return None
-        if str(row.get("derivation_source") or "") == "unfurl":
-            return None
-        from message_processor.ambient_memory import render_artifact_note
-        return render_artifact_note(dict(row), max_chars=AMBIENT_LATE_ARTIFACT_CHARS)
-    if namespace == MARKER_KIND_TOOL:
-        from message_processor.tool_provenance import render_provenance_annotations
-        tools = json.loads(str(row.get("tools_json") or "[]"))
-        return render_provenance_annotations(list(tools))
-    raise ValueError(f"no artifact renderer for namespace {namespace!r}")
-
-
 def _render_sidecar_markers(sidecars: SidecarPin, channel_id: str,
                             cfg: Mapping[str, Any]
                             ) -> Tuple[Tuple[str, Tuple[str, ...]], ...]:
@@ -1118,31 +1287,72 @@ def _render_sidecar_markers(sidecars: SidecarPin, channel_id: str,
     return tuple(sorted(frozen, key=lambda pair: parse_ts(pair[0])))
 
 
-def _is_chrome(message: NormalizedMessage) -> bool:
+def _is_chrome(message: NormalizedMessage, markers: Optional[Sequence[str]] = None) -> bool:
+    """Is THIS message one of our own transient UI chrome lines? Fail-open."""
     try:
         from slack_client.messaging import is_self_chrome_message
     except Exception:  # noqa: BLE001
         return False
     try:
-        return bool(is_self_chrome_message(message.text, {"text": message.text}))
+        return bool(is_self_chrome_message(message.text, {"text": message.text},
+                                           markers=markers))
     except Exception:  # noqa: BLE001
         return False
 
 
-def _classify_chrome(messages: Sequence[NormalizedMessage]) -> Tuple[str, ...]:
-    """Which of OUR OWN messages are transient UI chrome, decided once at pin time.
+def classify_chrome(messages: Sequence[NormalizedMessage], *,
+                    chrome_markers: Sequence[str]) -> FrozenSet[str]:
+    """OUR OWN transient UI chrome, decided from the FROZEN marker list.
 
-    The classifier matches against the live pipeline status-marker list, so the decision is
-    frozen here for the same reason the marker lines are: a serializer that asked again during
-    rendering would let a marker-list change alter an admitted turn's bytes. Only pre-epoch
-    messages can reach this decision (post-epoch inclusion needs a finalized receipt), and those
-    are historical by definition.
+    `chrome_markers` is `serializer_config["chrome_markers"]` — the list already frozen into the
+    pin. It is a REQUIRED keyword argument, never a default and never a live read: the classifier
+    delegates to `is_self_chrome_message`, which consults the LIVE marker list unless one is
+    supplied, so a marker-list change landing mid-turn could otherwise silently alter the bytes an
+    admitted turn was already committed to.
+
+    PURE, so the history walk can call it to evaluate its stopping predicate before any pin
+    exists — chrome classification needs no receipt and no database.
     """
-    return tuple(m.ts for m in messages if m.sender_type == "self" and _is_chrome(m))
+    return frozenset(m.ts for m in messages
+                     if m.sender_type == "self" and _is_chrome(m, chrome_markers))
+
+
+def eligible_for_stream(message: NormalizedMessage, pin: SidecarPin, *,
+                        receipt_feature_epoch_ts: Optional[str],
+                        chrome_ts: FrozenSet[str]) -> bool:
+    """§2a. THE ONE PREDICATE, and it takes THE PIN — that is the whole point.
+
+    Selection and rendering must agree by construction: a message the count admitted and the
+    serializer then dropped would make the rendered window smaller than the window the floor
+    claims, silently, with nothing anywhere saying so. Both callers pass the SAME pin, so they
+    cannot disagree.
+
+    It wraps the serializer's own self-role resolution rather than reimplementing it: a foreign
+    message is always eligible, and one of OUR OWN is eligible exactly when `_self_role` gives it
+    a role to render under.
+    """
+    if message.sender_type != "self":
+        return True
+    return _resolve_self_role(message, receipts=pin,
+                              receipt_feature_epoch_ts=receipt_feature_epoch_ts,
+                              chrome_ts=chrome_ts) is not None
 
 
 def _self_role(message: NormalizedMessage, pinned: "PinnedTuple") -> Optional[str]:
     """The role for one of OUR OWN messages, or None when it must not be in the stream at all.
+
+    A thin adapter over `_resolve_self_role` so the serializer keeps its landed call shape while
+    `eligible_for_stream` — which runs BEFORE a PinnedTuple exists — can reach the same rule.
+    """
+    return _resolve_self_role(message, receipts=pinned.sidecars,
+                              receipt_feature_epoch_ts=pinned.receipt_feature_epoch_ts,
+                              chrome_ts=frozenset(pinned.chrome_ts))
+
+
+def _resolve_self_role(message: NormalizedMessage, *, receipts: SidecarPin,
+                       receipt_feature_epoch_ts: Optional[str],
+                       chrome_ts: FrozenSet[str]) -> Optional[str]:
+    """THE RULE, with its inputs passed explicitly rather than read off a pin.
 
     A FINALIZED RECEIPT is the only thing that puts one of our own messages into the stream after
     the receipts epoch. An in_flight row is a reply still being written — showing the model its
@@ -1157,7 +1367,7 @@ def _self_role(message: NormalizedMessage, pinned: "PinnedTuple") -> Optional[st
     excludes too: the fail-closed direction is the one that omits a message we posted, not the one
     that hands the model chrome as its own past words.
     """
-    receipt = pinned.sidecars.receipt_for(message.ts)
+    receipt = receipts.receipt_for(message.ts)
     if receipt is not None:
         return ROLE_ASSISTANT if receipt.state == RECEIPT_FINALIZED else None
     if not message.text.strip() and not message.files:
@@ -1165,7 +1375,7 @@ def _self_role(message: NormalizedMessage, pinned: "PinnedTuple") -> Optional[st
         # strip) whose blocks the normalizer does not carry. There is no reply to replay.
         return None
 
-    epoch_ts = pinned.receipt_feature_epoch_ts
+    epoch_ts = receipt_feature_epoch_ts
     pre_epoch = False
     reason = "no receipts epoch is recorded"
     if epoch_ts:
@@ -1179,133 +1389,213 @@ def _self_role(message: NormalizedMessage, pinned: "PinnedTuple") -> Optional[st
             f"self message {message.channel_id}/{message.ts} has no receipt row and cannot be "
             f"grandfathered ({reason}); excluding it from the stream")
         return None
-    return None if message.ts in pinned.chrome_ts else ROLE_ASSISTANT
+    return None if message.ts in chrome_ts else ROLE_ASSISTANT
+
+
+def _render_message_item(message: NormalizedMessage, *, role: str, actor_names: Dict[str, str],
+                         root: Optional[NormalizedMessage], markers: Mapping[str, Any],
+                         files_limit: int, reactions_limit: int) -> StreamItem:
+    """A3's message item. BYTE-FOR-BYTE THE SAME in both blocks — the only thing that differs
+    between the periphery and the origin is which messages get rendered and where."""
+    lines = [render_header(message, actor_names=actor_names, root=root)]
+    lines.extend(render_body(message, actor_names))
+    files_marker = render_files_marker(message, limit=files_limit)
+    if files_marker:
+        lines.append(files_marker)
+    lines.extend(markers.get(message.ts, ()))
+    reactions_marker = render_reactions_marker(message, limit=reactions_limit)
+    if reactions_marker:
+        lines.append(reactions_marker)
+    return StreamItem(
+        role=role,
+        content="\n".join(lines),
+        metadata={
+            "channel_id": message.channel_id,
+            "sender_id": message.sender_id,
+            "ts": message.ts,
+            "thread_root_ts": message.thread_root_ts,
+            "sender_type": message.sender_type,
+        })
 
 
 def serialize_stream(pinned: PinnedTuple) -> ChannelStream:
-    """The pinned tuple → the exact bytes the model sees.
+    """The pinned tuple → the exact bytes the model sees, BOTH BLOCKS.
 
     A pure function of `pinned` and nothing else: no configuration read, no clock, no database,
     no Slack. Everything dynamic was resolved when the tuple was pinned, which is what makes two
     independent builds of one turn comparable and a retry a replay rather than a new question.
+
+    TWO BLOCKS, EACH ts-ORDERED INDEPENDENTLY, AND THEY ARE NEVER RE-INTERLEAVED. The canonical
+    pre-breakpoint block is the shallow periphery — byte-identical for every origin in the
+    channel, which is what buys the shared cache prefix. The origin block follows the breakpoint
+    and may be far older. Merging them would destroy the cache invariant and the origin's
+    completeness in one move.
     """
     actor_names = pinned.actor_names
     cfg = pinned.serializer_config
     files_limit = int(cfg.get("files_marker_limit", FILES_MARKER_LIMIT))
     reactions_limit = int(cfg.get("reactions_rendered", REACTIONS_RENDERED))
     markers = dict(pinned.sidecar_markers)
-    by_ts = {m.ts: m for m in pinned.fetch_snapshot}
+    epoch = pinned.receipt_feature_epoch_ts
+    chrome_ts = frozenset(pinned.chrome_ts)
+    floor = pinned.periphery_floor_ts
 
-    snapshot = pinned.snapshot or None
-    boundary_ts = str(snapshot.get("boundary_ts")) if snapshot else None
-    summary = _summary_item(snapshot) if snapshot else None
     horizon = StreamItem(
         role=ROLE_USER,
         content=render_horizon(
-            summary_clause=(SUMMARY_CLAUSE_TEMPLATE.format(boundary_ts=boundary_ts)
-                            if boundary_ts else SUMMARY_CLAUSE_NONE),
-            coverage_start_ts=pinned.coverage.start_ts,
-            reason=pinned.coverage.reason,
+            floor_ts=pinned.horizon_floor_ts,
+            inventory_state=pinned.inventory_state,
+            reach_tools=pinned.reach_tools,
             depth_days=cfg.get("coverage_bootstrap_days")),
         metadata={})
     end_marker = StreamItem(role=ROLE_USER, content=END_MARKER_TEXT, metadata={})
 
-    message_items: List[StreamItem] = []
     included: List[str] = []
     excluded: List[str] = []
-    for message in pinned.fetch_snapshot:
-        role = ROLE_USER
-        if message.sender_type == "self":
-            resolved = _self_role(message, pinned)
-            if resolved is None:
-                excluded.append(message.ts)
-                continue
-            role = resolved
-            included.append(message.ts)
-        root = by_ts.get(message.thread_root_ts or "") if message.is_reply else None
-        lines = [render_header(message, actor_names=actor_names, root=root)]
-        lines.extend(render_body(message, actor_names))
-        files_marker = render_files_marker(message, limit=files_limit)
-        if files_marker:
-            lines.append(files_marker)
-        lines.extend(markers.get(message.ts, ()))
-        reactions_marker = render_reactions_marker(message, limit=reactions_limit)
-        if reactions_marker:
-            lines.append(reactions_marker)
-        message_items.append(StreamItem(
-            role=role,
-            content="\n".join(lines),
-            metadata={
-                "channel_id": message.channel_id,
-                "sender_id": message.sender_id,
-                "ts": message.ts,
-                "thread_root_ts": message.thread_root_ts,
-                "sender_type": message.sender_type,
-            }))
 
-    # A1's canonical sequence. The summary leads when one is pinned, then the horizon, then the
-    # messages in their v1 roles, then the end marker — whose cache-breakpoint decoration is
-    # attached at assembly and is deliberately NOT part of these bytes.
-    items = tuple([item for item in (summary, horizon) if item] + [*message_items, end_marker])
-    digest = hashlib.sha256()
-    byte_count = 0
-    for item in items:
-        blob = f"{item.role}\n{item.content}\x00".encode("utf-8")
-        digest.update(blob)
-        byte_count += len(item.content.encode("utf-8"))
+    def _role_for(message: NormalizedMessage) -> Optional[str]:
+        """A foreign message renders `user`; one of ours renders `assistant` only with a
+        finalized receipt. Membership is recorded across BOTH blocks — a receipt decides an
+        origin message's role exactly as it decides a periphery one's."""
+        if message.sender_type != "self":
+            return ROLE_USER
+        resolved = _resolve_self_role(message, receipts=pinned.sidecars,
+                                      receipt_feature_epoch_ts=epoch, chrome_ts=chrome_ts)
+        (excluded if resolved is None else included).append(message.ts)
+        return resolved
+
+    # ---- the canonical block: eligible periphery events at or above the floor ---------------
+    # THE ONLY FILTER (§2d) is the floor. Roots and replies alike; replies ride along free. An
+    # empty floor filters nothing — `parse_ts("")` must never be called.
+    in_window = list(pinned.fetch_snapshot)
+    if floor:
+        in_window = [m for m in in_window if parse_ts(m.ts) >= parse_ts(floor)]
+    in_window.sort(key=lambda m: parse_ts(m.ts))
+
+    # TWO PASSES, because the orphan marker needs to know what WILL render before the first item
+    # is built. Pass one resolves every role and records receipt membership — including the
+    # exclusions, which is why eligibility is applied HERE rather than as a pre-filter: a message
+    # dropped before this loop would never reach `receipts_excluded` and the ledger would stop
+    # naming our own messages the stream withheld.
+    roles: Dict[str, str] = {}
+    for message in in_window:
+        role = _role_for(message)
+        if role is not None:
+            roles[message.ts] = role
+    periphery = [m for m in in_window if m.ts in roles]
+
+    by_ts = {m.ts: m for m in pinned.fetch_snapshot}
+    rendered_ts = set(roles)
+
+    message_items: List[StreamItem] = []
+    canonical: List[StreamItem] = [horizon]
+    marked_roots: set = set()
+    orphan_root_count = 0
+    for message in periphery:
+        role = roles[message.ts]
+        root_ts = message.thread_root_ts if message.is_reply else None
+        # A5: a reply whose root sits BELOW the floor is preceded, at its FIRST occurrence for
+        # that root, by its own marker item — a `thread=<ts>` label pointing at a root the model
+        # cannot see anywhere is precisely the shape that invites invention.
+        if root_ts and root_ts not in rendered_ts and root_ts not in marked_roots:
+            marked_roots.add(root_ts)
+            orphan_root_count += 1
+            canonical.append(StreamItem(
+                role=ROLE_USER,
+                content=render_orphan_marker(root_ts=root_ts, reach_tools=pinned.reach_tools),
+                metadata={}))
+        # THE ROOT SNIPPET ONLY WHEN THE ROOT IS RENDERED. `_root_snippet` reads neither receipts
+        # nor chrome, so an out-of-window root that is our own in-flight post would otherwise leak
+        # its text through this reply's header — the own-output exclusion rule defeated by a
+        # header. The marker above is what identifies the thread instead.
+        root = by_ts.get(root_ts or "") if (root_ts and root_ts in rendered_ts) else None
+        item = _render_message_item(message, role=role, actor_names=actor_names, root=root,
+                                    markers=markers, files_limit=files_limit,
+                                    reactions_limit=reactions_limit)
+        message_items.append(item)
+        canonical.append(item)
+    canonical.append(end_marker)
+    items = tuple(canonical)
+
+    # ---- the post-breakpoint origin block: the COMPLETE thread, never truncated -------------
+    origin_by_ts = {m.ts: m for m in pinned.origin_snapshot}
+    origin_ordered = sorted(pinned.origin_snapshot, key=lambda m: parse_ts(m.ts))
+    origin_items: List[StreamItem] = []
+    for message in origin_ordered:
+        role = _role_for(message)
+        if role is None:
+            continue
+        root = origin_by_ts.get(message.thread_root_ts or "") if message.is_reply else None
+        origin_items.append(_render_message_item(
+            message, role=role, actor_names=actor_names, root=root, markers=markers,
+            files_limit=files_limit, reactions_limit=reactions_limit))
+
+    origin_header = None
+    if origin_items:
+        origin_header = StreamItem(
+            role=ROLE_USER,
+            content=render_origin_header(origin_root_ts=str(pinned.origin_root_ts or ""),
+                                         origin_count=len(origin_items)),
+            metadata={})
+
+    # ---- the two hashes, on the LANDED v1 framing ------------------------------------------
+    def _feed(digest, sequence) -> int:
+        total = 0
+        for item in sequence:
+            digest.update(f"{item.role}\n{item.content}\x00".encode("utf-8"))
+            total += len(item.content.encode("utf-8"))
+        return total
+
+    stream_digest = hashlib.sha256()
+    byte_count = _feed(stream_digest, items)
+
+    # `union_sha256` CONTINUES the same running hash over the origin header and items. The header
+    # is INCLUDED: it carries the root ts and the origin count, so omitting it would let two
+    # origins with identical rendered messages but different headers collide on one hash.
+    union_digest = hashlib.sha256()
+    _feed(union_digest, items)
+    origin_sequence = ([origin_header] if origin_header else []) + origin_items
+    origin_byte_count = _feed(union_digest, origin_sequence)
+
+    # CANONICALIZED TO UNIQUE TIMESTAMPS BEFORE ANYTHING READS THEM. `_role_for` records a ts on
+    # every RENDER, and RULING-1 deliberately renders an origin message that also sits in the
+    # periphery TWICE — so the raw lists double-count exactly the messages the duplication is
+    # about. A receipt is a fact about a MESSAGE, not about how many times the message appeared,
+    # so the counts and the hash are per-ts: §8's "counted by UNIQUE ts". Doing it here, once,
+    # keeps the three consumers — the two counts and the membership hash — from disagreeing.
+    included_ts = sorted(set(included), key=parse_ts)
+    excluded_ts = sorted(set(excluded), key=parse_ts)
     membership = _sha256(
-        "included:" + ",".join(sorted(included, key=parse_ts))
-        + ";excluded:" + ",".join(sorted(excluded, key=parse_ts)))
+        "included:" + ",".join(included_ts) + ";excluded:" + ",".join(excluded_ts))
     return ChannelStream(
         pinned=pinned,
         items=items,
         horizon_item=horizon,
         end_marker_item=end_marker,
         message_items=tuple(message_items),
-        stream_sha256=digest.hexdigest(),
+        origin_header_item=origin_header,
+        origin_items=tuple(origin_items),
+        stream_sha256=stream_digest.hexdigest(),
+        union_sha256=union_digest.hexdigest(),
         byte_count=byte_count,
+        origin_byte_count=origin_byte_count,
         message_count=len(message_items),
-        receipts_included=tuple(included),
-        receipts_excluded=tuple(excluded),
+        origin_count=len(origin_items),
+        candidate_count=len(pinned.fetch_snapshot),
+        root_count=len({m.ts for m in periphery if not m.is_reply}),
+        orphan_root_count=orphan_root_count,
+        periphery_floor_ts=floor,
+        selection_version=pinned.selection_version,
+        inventory_state=pinned.inventory_state,
+        serializer_version=pinned.serializer_version,
+        serializer_config_hash=pinned.serializer_config_hash,
+        sidecar_versions_hash=pinned.sidecar_versions_hash,
+        actor_map_hash=pinned.actor_map_hash,
+        capability_profile_hash=pinned.capability_profile_hash,
+        receipts_included=tuple(included_ts),
+        receipts_excluded=tuple(excluded_ts),
         receipts_membership_hash=membership,
-        summary_item=summary,
-        snapshot_id=(str(snapshot.get("snapshot_id")) if snapshot else None),
-        generation=(snapshot.get("generation") if snapshot else None),
-        boundary_ts=boundary_ts,
-        stale=bool(summary is not None and _is_stale(snapshot)),
-        anchor_roots=frozenset(anchor_roots_in(_snapshot_text(snapshot,
-                                                              "anchor_payload_bytes"))
-                               if snapshot else ()),
     )
-
-
-def _snapshot_text(snapshot: Optional[Mapping[str, Any]], key: str) -> str:
-    value = (snapshot or {}).get(key)
-    if isinstance(value, (bytes, bytearray)):
-        return bytes(value).decode("utf-8", "replace")
-    return str(value or "")
-
-
-def _is_stale(snapshot: Optional[Mapping[str, Any]]) -> bool:
-    return str((snapshot or {}).get("status") or "") == STATUS_PUBLISHED_STALE
-
-
-def _summary_item(snapshot: Mapping[str, Any]) -> StreamItem:
-    """The A2 item, replayed from the PERSISTED EXACT BYTES (R0-2).
-
-    Nothing is regenerated here: the payload and the anchor block are read back verbatim, which
-    is what makes a snapshot's rendering identical on every turn that pins it. Metadata stays
-    empty for the same reason the horizon's does — the stale-send guard reads message items, and
-    a framing item is not one.
-    """
-    return StreamItem(
-        role=ROLE_USER,
-        content=render_summary_block(
-            boundary_ts=str(snapshot.get("boundary_ts") or ""),
-            payload=_snapshot_text(snapshot, "payload_bytes"),
-            anchor_block=_snapshot_text(snapshot, "anchor_payload_bytes"),
-            stale=_is_stale(snapshot)),
-        metadata={})
 
 
 # ---------------------------------------------------------------- fetch + discovery
@@ -1327,7 +1617,7 @@ def _normalize_page(client: Any, raw: Iterable[Dict[str, Any]], *, channel_id: s
 
     Slack's own boundary semantics are not trusted here: we fetch inclusive=true and decide
     membership ourselves with the numeric comparator, so a message exactly on the floor is kept
-    at genesis and dropped after a snapshot, which is what the two window kinds mean.
+    at an inclusive floor and dropped at an exclusive one, which is what the flag means.
 
     A payload the normalizer DECLINES (a join notice, a reply-count notification) is not a
     message and is skipped. A payload it cannot place in time is a different thing entirely: the
@@ -1350,19 +1640,6 @@ def _normalize_page(client: Any, raw: Iterable[Dict[str, Any]], *, channel_id: s
     return out
 
 
-async def _fetch_history(client: Any, *, channel_id: str, team_id: str, floor_ts: str,
-                         floor_inclusive: bool, high: str,
-                         budget: FetchBudget) -> List[NormalizedMessage]:
-    method = _web(client, "conversations_history")
-    if method is None:
-        raise HistoryFetchError("no conversations.history method on this client")
-    raw = await page_messages(method, channel_id=channel_id, oldest=floor_ts, latest=high,
-                              inclusive=True, budget=budget, label="channel history")
-    return _normalize_page(client, raw, channel_id=channel_id, team_id=team_id,
-                           origin=ORIGIN_HISTORY, floor_ts=floor_ts,
-                           floor_inclusive=floor_inclusive, high=high)
-
-
 async def _fetch_replies(client: Any, *, channel_id: str, team_id: str, root_ts: str,
                          floor_ts: str, floor_inclusive: bool, high: str,
                          budget: FetchBudget) -> List[NormalizedMessage]:
@@ -1375,50 +1652,6 @@ async def _fetch_replies(client: Any, *, channel_id: str, team_id: str, root_ts:
     return _normalize_page(client, raw, channel_id=channel_id, team_id=team_id,
                            origin=ORIGIN_REPLIES, floor_ts=floor_ts,
                            floor_inclusive=floor_inclusive, high=high)
-
-
-def _root_inventory(history: Sequence[NormalizedMessage], sidecars: SidecarPin,
-                    high: str) -> List[str]:
-    """Every thread that might hold a message in this window.
-
-    Four independent sources, because no single one is complete: a page parent advertises its
-    own replies; a reply seen on a page names a root the page may not contain; the activity
-    index remembers roots older than the floor (which `history(oldest=floor)` can never
-    surface, since the parent keeps its original ts); and our own receipts name threads we
-    posted into — those receipts are the ones the sidecar read admitted, i.e. the ones whose own
-    message sits inside this window, so a post-H receipt can never add work to this turn.
-
-    A root ts that cannot be parsed raises: discarding it would drop a whole thread from the
-    window silently, which is the one outcome this inventory exists to prevent.
-    """
-    roots: List[str] = []
-    seen: set = set()
-    high_key = parse_ts(high)
-    floor_ts, floor_inclusive = sidecars.window
-
-    def add(candidate: Optional[str], what: str) -> None:
-        if not candidate:
-            return
-        value = str(candidate)
-        if value in seen:
-            return
-        if parse_ts(_checked_ts(value, what)) > high_key:
-            return
-        seen.add(value)
-        roots.append(value)
-
-    for message in history:
-        if message.reply_count or message.latest_reply:
-            add(message.root_ts, "page parent root_ts")
-        if message.is_reply:
-            add(message.thread_root_ts, "page reply thread_root_ts")
-    for root in sidecars.activity_roots:
-        add(root, "activity root_ts")
-    for receipt in sidecars.receipts:
-        if not in_window(receipt.ts, floor_ts, floor_inclusive, high):
-            continue
-        add(receipt.thread_root_ts, "receipt thread_root_ts")
-    return roots
 
 
 def _dedup(messages: Iterable[NormalizedMessage]) -> List[NormalizedMessage]:
@@ -1437,12 +1670,23 @@ def _dedup(messages: Iterable[NormalizedMessage]) -> List[NormalizedMessage]:
     return sorted(chosen.values(), key=lambda m: parse_ts(m.ts))
 
 
-async def _build_actor_map(client: Any,
-                           messages: Sequence[NormalizedMessage]) -> Tuple[Tuple[str, str], ...]:
-    """Names for every actor the stream mentions or attributes.
+async def _build_actor_map(client: Any, messages: Sequence[NormalizedMessage], *,
+                           skip_ids: FrozenSet[str] = frozenset(),
+                           max_remote_lookups: Optional[int] = None,
+                           stats: Optional[Dict[str, Any]] = None,
+                           ) -> Tuple[Tuple[str, str], ...]:
+    """Names for every actor these messages mention or attribute.
 
     Read-only by contract: resolving a name for a message we are merely READING must not create
     a user row or bump anyone's last_seen.
+
+    `skip_ids` are ids ANOTHER phase already ATTEMPTED — the ids it TRIED, not merely the ones it
+    succeeded at. An id the periphery attempted and failed renders raw in both blocks; retrying
+    it here would make one block's rendering of an actor depend on which origin was built, and
+    the periphery's bytes must not move with the origin.
+
+    `stats` is filled in place by the resolver with the budget it was given and the remote
+    lookups it spent, so the caller can hand the REMAINDER to the next phase.
     """
     names: Dict[str, str] = {}
     human_ids: List[str] = []
@@ -1453,6 +1697,15 @@ async def _build_actor_map(client: Any,
         sender = message.sender_id
         if not sender:
             continue
+        # SKIPPED FIRST, WHATEVER THE SENDER TYPE. `skip_ids` used to guard only the human
+        # branch — the one that spends remote lookups — which left a real hole: a bot appearing
+        # in the periphery WITHOUT a raw name but in the origin WITH one had its name added by
+        # the origin phase, and `render_header` then rendered that name into the PERIPHERY. Two
+        # origins would produce different pre-breakpoint bytes, which is the one thing the
+        # stable prefix may never do. The budget was never the only reason to skip: a periphery
+        # actor's rendering must not depend on which thread the turn originated in.
+        if sender in skip_ids:
+            continue
         if message.sender_type == "self":
             names[sender] = self_name
         elif message.sender_type == "other_bot":
@@ -1462,14 +1715,35 @@ async def _build_actor_map(client: Any,
             human_ids.append(sender)
     for message in messages:
         for mention in message.mention_ids:
-            if mention not in names and mention not in human_ids:
+            if (mention not in names and mention not in human_ids
+                    and mention not in skip_ids):
                 human_ids.append(mention)
     if human_ids:
         resolver = getattr(client, "resolve_usernames", None)
         api_client = getattr(getattr(client, "app", None), "client", None)
         if callable(resolver):
+            budget = (ACTOR_REMOTE_LOOKUP_DEFAULT if max_remote_lookups is None
+                      else max(0, int(max_remote_lookups)))
+            # CAPABILITY IS DETECTED, NOT INFERRED FROM AN EXCEPTION. Catching `TypeError` to
+            # mean "older signature" also catches a TypeError raised INSIDE a real resolver —
+            # and the retry then ran the work twice and handed the origin phase the full default
+            # budget instead of its remainder, silently overspending the cap. Reading the
+            # signature asks the question directly, and every bound the resolver DOES support is
+            # still passed.
+            kwargs: Dict[str, Any] = {}
             try:
-                resolved = await resolver(human_ids, api_client)
+                accepted = inspect.signature(resolver).parameters
+                supports_kwargs = any(pm.kind == inspect.Parameter.VAR_KEYWORD
+                                      for pm in accepted.values())
+                if supports_kwargs or "max_remote_lookups" in accepted:
+                    kwargs["max_remote_lookups"] = budget
+                if supports_kwargs or "stats" in accepted:
+                    kwargs["stats"] = stats
+            except (TypeError, ValueError):
+                # An unintrospectable callable: pass the bounds and let it speak for itself.
+                kwargs = {"max_remote_lookups": budget, "stats": stats}
+            try:
+                resolved = await resolver(human_ids, api_client, **kwargs)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"actor map name resolution failed: {e}")
                 resolved = {}
@@ -1478,6 +1752,24 @@ async def _build_actor_map(client: Any,
                 if clean:
                     names[uid] = clean
     return tuple(sorted(names.items()))
+
+
+async def _drop_dead_root(db: Any, *, team_id: str, channel_id: str, root_ts: str,
+                          event_ts: Optional[str]) -> None:
+    """Compare-and-delete the activity row of a root Slack says is gone (W2-LIVE-2).
+
+    HYGIENE, NOT CORRECTNESS — the build has already succeeded without this root, so a failed
+    cleanup warns and the turn stands; the next turn retries it. What the delete buys is an END
+    to the failure: the row is exempt from the floor, so an undeleted dead root re-fires the same
+    refused fetch on every turn forever.
+    """
+    remover = getattr(db, "delete_thread_activity_if_unchanged_async", None)
+    if not callable(remover):
+        return
+    try:
+        await remover(team_id, channel_id, root_ts, if_event_ts_equals=event_ts)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"activity row for {channel_id}/{root_ts} not cleaned up: {e}")
 
 
 async def _clear_dirty(db: Any, *, team_id: str, channel_id: str, root_ts: str,
@@ -1508,32 +1800,18 @@ async def _gather_or_cancel(tasks: List[asyncio.Task]) -> List[Any]:
 
 # ---------------------------------------------------------------- the build
 
-def _emit_snapshot_read(channel_id: str, pointer: Dict[str, Any]) -> None:
-    """The fail-closed path made observable: a pointer exists, so this turn is about to refuse."""
-    from message_processor import participation_telemetry
+def _emit_stream_render(result: StreamBuildResult, *, turn_id: Optional[str],
+                        origin_root_ts: Optional[str], trigger_ts: Optional[str]) -> None:
+    """One line per BUILD, for the TURN population only. TAKES THE WHOLE CARRIER.
 
-    try:
-        participation_telemetry.compaction_snapshot(
-            op="read", snapshot_id=pointer.get("snapshot_id"),
-            generation=pointer.get("generation"), boundary_ts=pointer.get("boundary_ts"),
-            channel_id=channel_id, serializer_version=SERIALIZER_VERSION)
-    except Exception as e:  # noqa: BLE001 — a lost line is never worth a lost turn
-        logger.debug(f"compaction_snapshot telemetry not emitted: {e}")
+    `result.stream.stream_render_fields()` supplies everything derivable from the build;
+    `reselected`, `anchor_advanced` and all THREE page counts come off the carrier, because none
+    of them is knowable at serialization — the two booleans postdate the bytes and the page
+    counts postdate the pin the bytes were made from.
 
-
-def _emit_stream_render(stream: ChannelStream, *, turn_id: Optional[str],
-                        origin_thread_ts: Optional[str], trigger_ts: Optional[str],
-                        selection_result: Optional[str] = None) -> None:
-    """One line per BUILD, for the TURN population only.
-
-    The identifying fields come from the stream itself — a second enumeration of them here would
-    be a second thing to keep in step with the serializer.
-
-    A build with NO turn_id is not a turn: the dev probes and the out-of-process rebuilds that
-    verify a pinned stream all come through here, and their rows join to nothing, inflate the
-    build count and cannot be told apart from a turn whose id went missing. So they emit nothing,
-    and the production path — which always passes one — cannot lose its row silently: the caller
-    that omits an id gets no line at all, which is loud in exactly the place it matters.
+    A build with NO turn_id is not a turn: the dev probes and out-of-process rebuilds all come
+    through here, and their rows would join to nothing and inflate the build count. So they emit
+    nothing, and the production path — which always passes one — cannot lose its row silently.
     """
     if not turn_id:
         return
@@ -1541,172 +1819,643 @@ def _emit_stream_render(stream: ChannelStream, *, turn_id: Optional[str],
 
     try:
         participation_telemetry.stream_render(
-            turn_id=turn_id, origin_thread_ts=origin_thread_ts, trigger_ts=trigger_ts,
-            # WHICH §1b result this build resolved. A caller-owned fact: `no_eligible_generation`
-            # and `genesis` render identically, so the bytes cannot tell them apart, and a channel
-            # holding a summary that is merely not yet eligible under this H would otherwise be
-            # invisible — indistinguishable from one that has never been compacted at all.
-            selection_result=selection_result,
-            **stream.stream_render_fields())
+            turn_id=turn_id, origin_thread_ts=origin_root_ts, trigger_ts=trigger_ts,
+            reselected=result.reselected, anchor_advanced=result.anchor_advanced,
+            history_pages=result.pages.history, reply_pages=result.pages.reply,
+            origin_pages=result.pages.origin,
+            **result.stream.stream_render_fields())
     except Exception as e:  # noqa: BLE001
         logger.debug(f"stream_render telemetry not emitted: {e}")
 
 
+def guaranteed_eligible_root(m: NormalizedMessage, chrome_ts: FrozenSet[str]) -> bool:
+    """A root that NO pin lookup can later remove from the window.
+
+    The walk cannot count ELIGIBLE roots — eligibility needs the pin, which does not exist yet —
+    and must not count RAW roots, because a run of our own receiptless posts could satisfy a raw
+    count while leaving fewer than TARGET survivors, with older eligible roots never fetched.
+
+    THE PROOF, in one sentence: receipt state can only ever ADD one of OUR OWN roots to the
+    eligible set, never subtract a foreign one — so more than CEILING guaranteed-eligible roots
+    is a LOWER BOUND on the eligible root count, and re-anchoring to TARGET is therefore certain
+    and under-fill impossible. Both predicates are available pre-pin: `sender_type` comes from the
+    normalizer's bot-id test, and chrome is classified from the frozen marker list.
+    """
+    return (not m.is_reply
+            and m.sender_type != "self"
+            and m.ts not in chrome_ts)
+
+
+async def prepare_channel_turn(*, client: Any, db: Any, team_id: str, channel_id: str, h: str,
+                               frontier: int = 0, drain_timeout: Optional[float] = None,
+                               barrier_context: Optional[Dict[str, Any]] = None,
+                               ) -> PreparedTurn:
+    """§4.4 steps 1-4, and NOTHING may fetch until it returns.
+
+    Its existence is structural rather than stylistic. The origin fetch runs CONCURRENTLY with
+    the periphery build, so if the watermark drain lived inside that build, the origin's first
+    `conversations.replies` could begin before the drain had resolved — the one ordering P1
+    established. Splitting the pre-fetch steps into their own awaited phase makes that violation
+    impossible rather than merely discouraged.
+    """
+    checked_h = _checked_ts(h, "H")
+
+    # The index must have caught up to everything inside the window. `drain` is the whole gate:
+    # it raises on a failed-unrepaired write at or below the frontier, and ignores anything above
+    # it, whose event sits outside this window by construction.
+    await admission_watermark.drain(channel_id, frontier, timeout=drain_timeout)
+
+    # FREEZE THE SERIALIZER CONFIG FIRST. It is pure configuration, so it is freezable at turn
+    # start — and freezing it here is what makes the walk's stop predicate legal, because that
+    # predicate needs the frozen chrome-marker list.
+    serializer_config = serializer_config_snapshot()
+
+    # READ 1 STAGE 1 — the anchor and the inventory, BOTH PINNED, and nothing else. Activity and
+    # receipt roots need a window, and the window is not known until the walk has run.
+    anchor_payload = await db.read_channel_window_anchor_async(team_id, channel_id)
+    anchor = (anchor_payload or {}).get("anchor") or None
+    inventory_row = (anchor_payload or {}).get("inventory") or None
+    coverage = None
+    if inventory_row:
+        coverage = InventoryPin(
+            start_ts=_checked_ts(inventory_row.get("inventory_start_ts"), "inventory_start_ts"),
+            status=str(inventory_row.get("bootstrap_status") or ""),
+            reason=inventory_row.get("reason"))
+
+    floor_read = None
+    if anchor and int(anchor.get("selection_version", -1)) == SELECTION_VERSION:
+        raw_floor = str(anchor.get("floor_ts") or "") or None
+        # CHECKED HERE, where the row is read. An unparseable stored floor otherwise reaches a
+        # raw `parse_ts` deep in selection and raises the normalizer's `TimestampError`, which
+        # is not a `ChannelStreamError` — so the turn takes the generic handler and tells the
+        # user "something went wrong" instead of the honest `stream_data_invalid` notice, and
+        # the ledger records no code at all. A malformed floor is a malformed record of ours.
+        floor_read = _checked_ts(raw_floor, "persisted window anchor floor") if raw_floor else None
+
+    # CAPTURED BEFORE THE FETCH, and the ordering is the whole point: `reconcile_window` returns
+    # False without touching anything when the channel's generation has MOVED, so capturing it
+    # afterwards would compare the post-fetch value against itself, the guard could never fire,
+    # and a live event arriving mid-fetch would be silently clobbered by staler data.
+    generation = actor_tail_module.generation(channel_id)
+
+    await dev_barriers.post_admission(**{**(barrier_context or {}), "channel_id": channel_id,
+                                         "H": checked_h, "floor_ts": floor_read or ""})
+    return PreparedTurn(team_id=team_id, channel_id=channel_id, h=checked_h, frontier=frontier,
+                        floor_read=floor_read, coverage=coverage, generation=generation,
+                        selection_version=SELECTION_VERSION,
+                        serializer_config=serializer_config)
+
+
+async def fetch_origin_thread(client: Any, channel_id: str, origin_root_ts: Optional[str],
+                              h: str, budget: FetchBudget,
+                              trigger_ts: Optional[str]) -> OriginFetch:
+    """§4.4 step 5a. The origin thread, PAGED TO COMPLETION and never truncated.
+
+    `trigger_ts` is what lets this evaluate §2e's empty-origin taxonomy: an empty origin is legal
+    in exactly ONE shape — a top-level trigger whose own message Slack has not yet propagated to
+    `conversations.replies`. A reply-triggered turn whose established thread comes back empty
+    FAILS, because silently replacing a real thread with one message is the corruption OWNER-2
+    forbids.
+    """
+    if not origin_root_ts:
+        return OriginFetch(origin_root_ts=None, messages=(), pages=0, empty_fallback=False,
+                           deadline_at=budget.deadline_at)
+
+    method = _web(client, "conversations_replies")
+    if method is None:
+        raise OriginFetchError("no conversations.replies method on this client")
+
+    top_level = str(origin_root_ts) == str(trigger_ts or "")
+    try:
+        raw = await page_messages(method, channel_id=channel_id, latest=h, inclusive=True,
+                                  budget=budget, label="origin thread",
+                                  extra_params={"ts": str(origin_root_ts)})
+    except Exception as e:  # noqa: BLE001 — re-raised as the NAMED failure below
+        code = _origin_error_code(e)
+        # THE ALLOWLIST: only `thread_not_found` on a top-level trigger reaches the fallback.
+        # Anything unrecognised — and `None`, which is what a malformed page or a timeout gives —
+        # fails closed, which is the allowlist's default.
+        if code == "thread_not_found" and top_level:
+            # THE PAGES THE BUDGET ACTUALLY CHARGED, not zero. Slack was called and the attempt
+            # was paid for; reporting 0 would make a fallback turn look free in telemetry and
+            # hide a channel that takes this path on every turn.
+            return OriginFetch(origin_root_ts=str(origin_root_ts), messages=(),
+                               pages=budget.pages_used,
+                               empty_fallback=True, deadline_at=budget.deadline_at)
+        raise OriginFetchError(
+            f"origin thread {channel_id}/{origin_root_ts} could not be read completely: {e}",
+            code=code) from e
+
+    messages = _dedup(_normalize_page(client, raw, channel_id=channel_id,
+                                      team_id=getattr(client, "self_team_id", "") or "",
+                                      origin=ORIGIN_REPLIES, floor_ts="0",
+                                      floor_inclusive=True, high=h))
+    if not messages:
+        if top_level:
+            return OriginFetch(origin_root_ts=str(origin_root_ts), messages=(),
+                               pages=budget.pages_used,
+                               empty_fallback=True, deadline_at=budget.deadline_at)
+        raise OriginFetchError(
+            f"origin thread {channel_id}/{origin_root_ts} came back empty for a reply-triggered "
+            "turn; a real thread is never replaced by a single message", code=None)
+    return OriginFetch(origin_root_ts=str(origin_root_ts), messages=tuple(messages),
+                       pages=budget.pages_used, empty_fallback=False,
+                       deadline_at=budget.deadline_at)
+
+
+def _origin_error_code(error: BaseException) -> Optional[str]:
+    """§2e's PINNED extraction, in this order and NO OTHER. Wrapping otherwise destroys the very
+    string the taxonomy branches on.
+
+    THE TYPES ARE CHECKED, not merely the attribute. Reading `.code` off ANY exception makes the
+    code a duck-typed property of the whole error space: an unrelated failure that happens to
+    carry `code="thread_not_found"` — a wrapper, a library error, one of our own future
+    exceptions — would be read as Slack's answer and silently drop a root, or reach the origin
+    fallback. Both branches decide whether a turn refuses or proceeds, so the only shapes that
+    may speak here are the two that genuinely carry a SLACK code:
+
+      1. `HistoryPageError` — the pager already parsed Slack's error into `.code`;
+      2. a raw `SlackApiError` — extracted through `slack_error_code`.
+
+    Anything else returns None, which is not a taxonomy match and therefore fails closed.
+    """
+    if isinstance(error, HistoryPageError):
+        code = getattr(error, "code", None)
+        return str(code) if code else None
+    if isinstance(error, SlackApiError):
+        return slack_error_code(error) or None
+    return None
+
+
+async def build_channel_pin(prepared: PreparedTurn, *, client: Any, db: Any,
+                            reach_tools: Tuple[str, ...] = (),
+                            capability_profile_hash: str = "", tool_schema_version: str = "",
+                            probe: bool = False,
+                            deadline_at: float,
+                            history_budget: Optional[FetchBudget] = None,
+                            reply_budget: Optional[FetchBudget] = None,
+                            ) -> SharedChannelPin:
+    """§4.4 steps 3a, 5b, 6-8, READ 2a, 10 and 11a — everything ORIGIN-INDEPENDENT.
+
+    `probe=True` skips the dirty compare-and-clear, the one write left in this phase.
+    """
+    team_id, channel_id, h = prepared.team_id, prepared.channel_id, prepared.h
+    cfg = prepared.serializer_config
+    markers = cfg.get("chrome_markers", ())
+    target = int(config.channel_window_target)
+    ceiling = int(config.channel_window_ceiling)
+    floor_read = prepared.floor_read
+
+    # THE DIRECT SEAM IS VALIDATED TOO. `build_channel_pin` is callable on its own — the probe
+    # does exactly that — so an injected budget must agree with the deadline this phase was
+    # handed, or the component it bounds is running on a clock nobody else shares.
+    #
+    # A MISSING DEADLINE IS REFUSED OUTRIGHT. `deadline_at=None` would let this phase build its
+    # own `total_seconds` budgets, each starting its own window — the three-independent-clocks
+    # defect, reintroduced through the seam that exists to test it is gone. The parameter is
+    # required in the signature; this makes it required in fact.
+    if deadline_at is None:
+        raise ChannelStreamError(
+            "build_channel_pin requires an absolute deadline_at; without one each component "
+            "starts its own window and a turn can spend its budget three times over")
+    for name, injected in (("history_budget", history_budget), ("reply_budget", reply_budget)):
+        if injected is not None and injected.deadline_at != deadline_at:
+            raise ChannelStreamError(
+                f"{name} carries deadline_at={injected.deadline_at!r} but this phase was given "
+                f"{deadline_at!r}; every component of one turn shares ONE absolute clock")
+    history_budget = history_budget or FetchBudget(deadline_at=deadline_at)
+    reply_budget = reply_budget or FetchBudget(deadline_at=deadline_at, page_ceiling=None)
+
+    candidates: List[NormalizedMessage] = []
+    chrome_ts: set = set()
+    reached_floor = True
+
+    # STEP 3a — F NEWER THAN H. A floor above H selects nothing, so there is no window to fetch:
+    # the history walk, stage-2 discovery and the reply fan-out are ALL skipped. Only the history
+    # call being skipped is not enough — a dirty root from the index would fan out into
+    # `conversations.replies` with the same inverted bounds.
+    inverted = bool(floor_read) and parse_ts(floor_read) > parse_ts(h)
+
+    if not inverted:
+        # STEP 5b — THE HISTORY WALK, page by page, stopping at whichever bound comes FIRST.
+        method = _web(client, "conversations_history")
+        if method is None:
+            raise HistoryFetchError("no conversations.history method on this client")
+        seen_roots: set = set()
+        reached_floor = floor_read is None
+        async for page in iter_pages(method, channel_id=channel_id,
+                                     oldest=floor_read, latest=h, inclusive=True,
+                                     budget=history_budget, label="channel history"):
+            fresh = _normalize_page(client, page, channel_id=channel_id, team_id=team_id,
+                                    origin=ORIGIN_HISTORY,
+                                    floor_ts=floor_read or "0", floor_inclusive=True, high=h)
+            new = [m for m in fresh if m.ts not in {c.ts for c in candidates}]
+            candidates.extend(new)
+            # Classify chrome on the NEW messages only, memoized by ts — ONE OPERATIONAL
+            # classification per message, which is what lets the stop predicate be evaluated
+            # without a pin.
+            chrome_ts |= classify_chrome(new, chrome_markers=markers)
+            for m in new:
+                if guaranteed_eligible_root(m, frozenset(chrome_ts)):
+                    seen_roots.add(m.ts)
+            if len(seen_roots) > ceiling:
+                # EARLY STOP APPLIES WITH A STORED FLOOR TOO. A stale floor far below a busy
+                # channel's recent traffic would otherwise page all the way down to it before
+                # re-anchoring — the deep walk this design exists to refuse to pay for.
+                reached_floor = False
+                break
+            if floor_read is not None:
+                reached_floor = True
+
+    candidates = _dedup(candidates)
+
+    discovery: Dict[str, Any] = {"activity_roots": {}, "receipt_roots": ()}
+    if not inverted:
+        # STEP 7 — DISCOVERY, windowed on the EFFECTIVE floor: `F` only when the walk actually
+        # reached it, otherwise the walk's early-stop floor. Binding it to a stale stored floor
+        # is precisely the fan-out the staged discovery exists to prevent, reached through the
+        # index instead of through Slack.
+        #
+        # IT ALWAYS RUNS. `conversations.history` returns top-level messages only, so a channel
+        # whose sole in-window activity is a reply under an older root walks back ZERO events —
+        # and that is exactly the channel the index exists to serve.
+        #
+        # THE THREE CASES KEY ON THE WALK'S OUTCOME, in this order:
+        #   1. the walk REACHED F                  -> F. A walk that paged [F, H] to exhaustion
+        #      and found nothing reached it, so a complete EMPTY walk lands here too.
+        #   2. otherwise, it fetched anything      -> the oldest fetched EVENT, root or reply.
+        #      This is the early-stop case, and F is deliberately NOT used even when set: a
+        #      stale stored floor is exactly the fan-out staged discovery exists to prevent.
+        #   3. otherwise                           -> the inventory floor, or "0" with no
+        #      inventory row. A zero-event walk has no oldest event to floor on, and F is
+        #      necessarily unset here (an early stop needs candidates). Bounded and cheap
+        #      precisely where it applies: such a channel has almost nothing to return.
+        if reached_floor and floor_read:
+            effective_floor = floor_read
+        elif candidates:
+            effective_floor = min((m.ts for m in candidates), key=parse_ts)
+        else:
+            effective_floor = prepared.coverage.start_ts if prepared.coverage else "0"
+        discovery = await db.read_channel_discovery_roots_async(
+            team_id, channel_id, floor_ts=effective_floor, high_ts=h)
+
+        # STEP 7a / STEP 8 — the reply fan-out, entered only when there is a candidate root.
+        # THE SHORTCUT IS CHECKED HERE, AFTER DISCOVERY, and it needs BOTH conditions: zero
+        # history events AND zero discovery candidates. Keying it on the empty walk alone
+        # skipped the read above and lost the very reply the index had recorded.
+        roots = _discovery_roots(candidates, discovery, h)
+        if roots:
+            semaphore = asyncio.Semaphore(max(1, int(config.reply_fetch_concurrency)))
+
+            # SEEN vs UNSEEN is decided from the pages ALREADY FETCHED, before the fan-out
+            # starts: a root is SEEN when a normalized candidate carries its ts, or when a
+            # fetched reply or broadcast names it as their thread root. Anything else is known
+            # only to the DB.
+            seen_root_ids = ({m.ts for m in candidates}
+                             | {m.thread_root_ts for m in candidates if m.thread_root_ts})
+
+            async def _one(root_ts: str) -> Tuple[str, Optional[List[NormalizedMessage]]]:
+                async with semaphore:
+                    try:
+                        return root_ts, await _fetch_replies(
+                            client, channel_id=channel_id, team_id=team_id, root_ts=root_ts,
+                            floor_ts=effective_floor, floor_inclusive=True, high=h,
+                            budget=reply_budget)
+                    except Exception as e:  # noqa: BLE001 — re-raised unless it is THE case
+                        # THREAD_NOT_FOUND ON AN UNSEEN ROOT: DROP, DON'T DIE. The code comes
+                        # from the same wrap order §2e's taxonomy uses, never from a string
+                        # match. An unseen root is old — a fresh one would sit in history — so
+                        # this is no propagation race, and nothing visible vouches for it: there
+                        # is no partial periphery to present dishonestly, which is what failure
+                        # condition 4 exists to prevent. A SEEN root answering the same code is
+                        # live evidence contradicting the API and still fails the turn, because
+                        # dropping it would hide a broadcast the room can see.
+                        if (_origin_error_code(e) == "thread_not_found"
+                                and root_ts not in seen_root_ids):
+                            return root_ts, None
+                        raise
+
+            tasks = [asyncio.ensure_future(_one(root)) for root in roots]
+            indexed = dict(discovery.get("activity_roots") or {})
+            for root_ts, messages in await _gather_or_cancel(tasks):
+                if messages is None:
+                    logger.warning(
+                        f"channel {channel_id}: thread root {root_ts} is gone from Slack "
+                        "(thread_not_found, and nothing in this window references it) — "
+                        "dropping it from this build")
+                    if not probe and root_ts in indexed:
+                        await _drop_dead_root(db, team_id=team_id, channel_id=channel_id,
+                                              root_ts=root_ts, event_ts=indexed[root_ts])
+                    continue
+                candidates.extend(messages)
+                chrome_ts |= classify_chrome(messages, chrome_markers=markers)
+                # COMPARE-AND-CLEAR. Without it every dirty root stays dirty forever — a dirty
+                # row is exempt from the floor, so an uncleared historical root is re-fetched on
+                # every turn for the life of the channel. The compare is what keeps it correct:
+                # a root whose stored ts MOVED saw a mutation this fetch did not.
+                if not probe and root_ts in indexed:
+                    await _clear_dirty(db, team_id=team_id, channel_id=channel_id,
+                                       root_ts=root_ts, event_ts=indexed[root_ts])
+            candidates = _dedup(candidates)
+
+    # READ 2a — THE RENDER PIN over the PERIPHERY candidate identities.
+    raw = await db.read_channel_sidecars_for_async(
+        team_id, channel_id, sorted({m.ts for m in candidates}))
+    sidecars = _freeze_sidecars(raw)
+
+    # STEP 10 — SELECT, computed FROM the pin and never before it.
+    epoch = sidecars.receipt_feature_epoch_ts
+    frozen_chrome = frozenset(chrome_ts)
+    eligible = [m for m in candidates
+                if eligible_for_stream(m, sidecars, receipt_feature_epoch_ts=epoch,
+                                       chrome_ts=frozen_chrome)]
+    floor_selected = _select_floor(eligible, floor_read=floor_read, target=target,
+                                   ceiling=ceiling, inverted=inverted)
+    periphery = ([m for m in eligible if parse_ts(m.ts) >= parse_ts(floor_selected)]
+                 if floor_selected else ([] if inverted else eligible))
+    periphery.sort(key=lambda m: parse_ts(m.ts))
+
+    # STEP 11a — THE PERIPHERY ACTOR MAP, resolved ONCE and frozen. The resolver MUTATES an
+    # in-memory cache, so two origin pins resolving separately could render two different
+    # periphery names for one id — pre-breakpoint bytes moving with the origin, which is exactly
+    # what the stable prefix forbids.
+    stats: Dict[str, Any] = {"budget": ACTOR_REMOTE_LOOKUP_DEFAULT,
+                             "remote_lookups": 0, "attempted_ids": set()}
+    actor_map = await _build_actor_map(client, periphery, stats=stats)
+    remaining = max(0, int(stats["budget"]) - int(stats["remote_lookups"]))
+
+    return SharedChannelPin(
+        team_id=team_id, channel_id=channel_id, h=h, deadline_at=deadline_at,
+        serializer_config=cfg, generation=prepared.generation, floor_read=floor_read,
+        periphery_floor_ts=floor_selected,
+        reselected=(floor_selected or None) != (floor_read or None),
+        periphery_candidates=tuple(candidates), periphery=tuple(periphery),
+        periphery_sidecars=sidecars, periphery_chrome_ts=frozen_chrome,
+        actor_map=actor_map,
+        actor_ids_attempted=frozenset(stats.get("attempted_ids") or ()),
+        actor_lookups_remaining=remaining, coverage=prepared.coverage,
+        selection_version=prepared.selection_version, reach_tools=tuple(reach_tools),
+        capability_profile_hash=capability_profile_hash,
+        tool_schema_version=tool_schema_version,
+        pages=SharedPageCounts(history=history_budget.pages_used,
+                               reply=reply_budget.pages_used))
+
+
+def _select_floor(eligible: Sequence[NormalizedMessage], *, floor_read: Optional[str],
+                  target: int, ceiling: int, inverted: bool) -> str:
+    """§2d's count rule. THE COUNT RUNS OVER ROOTS; THE FLOOR SELECTS EVENTS.
+
+    Returns `F'`, or the empty-floor sentinel `""`. A stored floor is NEVER reset: a channel
+    whose events were all deleted keeps its floor and renders nothing above it.
+    """
+    if inverted:
+        return floor_read or ""
+    if not eligible:
+        # Floor-never-backward governs: only a channel that has never had a floor AND has no
+        # events reaches the sentinel.
+        return floor_read or ""
+    roots = sorted((m for m in eligible if not m.is_reply), key=lambda m: parse_ts(m.ts))
+    if len(roots) > ceiling:
+        # The ts of the OLDEST root among the newest TARGET. Strictly greater — a window sitting
+        # exactly AT the ceiling keeps its floor and its cached prefix.
+        return roots[-target].ts
+    if floor_read:
+        return floor_read
+    # A cold channel starts at its oldest eligible EVENT — event, not root, so a channel whose
+    # oldest reachable message is a reply starts there.
+    return min((m.ts for m in eligible), key=parse_ts)
+
+
+def _discovery_roots(candidates: Sequence[NormalizedMessage], discovery: Mapping[str, Any],
+                     high: str) -> List[str]:
+    """Every thread that might hold a message in this window, from all four sources.
+
+    KNOWN ROOTS ARE RETAINED, DELIBERATELY. A root already present among the candidates is still
+    fanned out: `conversations.history` returns top-level messages only, so a root we have does
+    not mean we have its REPLIES, and those replies are exactly what rides free inside the window
+    (§4.4 step 8 collects from all four sources with no known-filter). Filtering here would drop
+    the fan-out for every root the walk happened to return, which is most of them.
+
+    This used to end in `[r for r in roots if r not in known or True]` — an always-true filter
+    that computed a `known` set and then ignored it, leaving a reader unable to tell whether the
+    retention was intended or a bug. It is intended; the set is gone and the rule is written down.
+    """
+    roots: List[str] = []
+    seen: set = set()
+    high_key = parse_ts(high)
+
+    def add(candidate: Optional[str], what: str) -> None:
+        if not candidate:
+            return
+        value = str(candidate)
+        if value in seen:
+            return
+        if parse_ts(_checked_ts(value, what)) > high_key:
+            return
+        seen.add(value)
+        roots.append(value)
+
+    for message in candidates:
+        if message.reply_count or message.latest_reply:
+            add(message.root_ts, "page parent root_ts")
+        if message.is_reply:
+            add(message.thread_root_ts, "page reply thread_root_ts")
+    for root in (discovery.get("activity_roots") or {}):
+        add(root, "activity root_ts")
+    for root in (discovery.get("receipt_roots") or ()):
+        add(root, "receipt thread_root_ts")
+    return roots
+
+
+async def build_origin_pin(shared: SharedChannelPin, origin_fetch: OriginFetch, *,
+                           db: Any, client: Any = None) -> Tuple[PinnedTuple, int]:
+    """The per-origin pin AND that origin's page count. It performs NO Slack fetch.
+
+    IT VALIDATES THE DEADLINE IT CAN ACTUALLY SEE. This is a WIRING assertion, not a timeout: it
+    catches a caller that built the two components against two clocks, which is the defect the
+    one-deadline rule exists to prevent and which no later symptom would name.
+    """
+    # A `None` deadline is a MISMATCH, not an exemption. It means the origin was fetched on a
+    # budget with its own `total_seconds` window rather than the shared clock — precisely the
+    # shape this assertion exists to catch — so skipping the check when it is None would waive
+    # the rule for the only caller that could break it.
+    #
+    # AND EQUAL-BUT-ABSENT IS NOT AGREEMENT. `None == None` passes an equality test while
+    # describing two components that each started their own clock, so the missing case is
+    # refused before the comparison rather than sliding through it.
+    if shared.deadline_at is None or origin_fetch.deadline_at is None:
+        raise ChannelStreamError(
+            "both the shared periphery and the origin fetch must carry an absolute deadline "
+            f"(shared={shared.deadline_at!r}, origin={origin_fetch.deadline_at!r}); two absent "
+            "deadlines are two independent clocks, not one shared one")
+    if origin_fetch.deadline_at != shared.deadline_at:
+        raise ChannelStreamError(
+            "the origin fetch and the shared periphery were built against DIFFERENT deadlines "
+            f"({origin_fetch.deadline_at!r} vs {shared.deadline_at!r}); the two components must "
+            "share one absolute clock or a turn can spend its budget twice")
+
+    origin_messages = tuple(origin_fetch.messages)
+    periphery_ids = {m.ts for m in shared.periphery_candidates}
+    origin_only = sorted({m.ts for m in origin_messages} - periphery_ids)
+
+    # READ 2b — the ORIGIN-ONLY ids. The two id sets are disjoint by construction.
+    if origin_only:
+        origin_raw = await db.read_channel_sidecars_for_async(
+            shared.team_id, shared.channel_id, origin_only)
+        merged = merge_sidecar_pins(shared.periphery_sidecars, _freeze_sidecars(origin_raw),
+                                    ids=sorted(periphery_ids | set(origin_only)))
+    else:
+        merged = shared.periphery_sidecars
+
+    # The chrome memo EXTENDS over the origin candidates with the SAME frozen markers. An
+    # origin-only message is subject to the same eligibility rule, so classifying only the
+    # periphery would let an old pre-epoch chrome message of ours render inside the origin block.
+    markers = shared.serializer_config.get("chrome_markers", ())
+    chrome_ts = shared.periphery_chrome_ts | classify_chrome(
+        [m for m in origin_messages if m.ts not in periphery_ids], chrome_markers=markers)
+
+    # STEP 11b — ORIGIN-ONLY actors, on the REMAINING budget, never re-resolving a periphery id.
+    actor_map = dict(shared.actor_map)
+    if client is not None and origin_messages:
+        # THE RULE: the origin may not name anyone the periphery's own map was built from.
+        #
+        # That covers more than the ids the periphery ATTEMPTED or RESOLVED, and the gap is where
+        # the defect lived: a bot seen in the room without a `raw_bot_name` is never attempted
+        # (bots never reach `human_ids`) and never resolved (nothing lands in `names`), so it fell
+        # straight through to the origin phase, which had a message carrying its name and added
+        # it — into bytes the periphery had already rendered. Mentions are included because they
+        # render into periphery bodies.
+        #
+        # THE SUBJECT IS THE SELECTION, NOT THE CANDIDATES. Only rendered messages produce
+        # pre-breakpoint bytes, so the selection is the exact set the invariant needs; candidates
+        # is a superset that would also gag the origin about actors the room never shows, losing
+        # post-breakpoint naming for nothing. `shared.periphery` is FIXED at compose time — step
+        # 10 selects it, step 11a builds the actor map from it, and `SharedChannelPin` is frozen
+        # before any origin phase runs — so the rule cannot wobble if the fetch order changes.
+        periphery_actor_ids = frozenset(
+            {m.sender_id for m in shared.periphery if m.sender_id}
+            | {uid for m in shared.periphery for uid in m.mention_ids})
+        origin_names = await _build_actor_map(
+            client, origin_messages,
+            skip_ids=(shared.actor_ids_attempted | frozenset(actor_map)
+                      | periphery_actor_ids),
+            max_remote_lookups=shared.actor_lookups_remaining)
+        for uid, name in origin_names:
+            actor_map.setdefault(uid, name)
+
+    pinned = PinnedTuple(
+        team_id=shared.team_id, channel_id=shared.channel_id,
+        window=(shared.periphery_floor_ts, True), H=shared.h,
+        fetch_snapshot=tuple(shared.periphery_candidates),
+        origin_root_ts=origin_fetch.origin_root_ts,
+        origin_snapshot=origin_messages,
+        periphery_floor_ts=shared.periphery_floor_ts,
+        selection_version=shared.selection_version,
+        reach_tools=shared.reach_tools,
+        sidecar_versions_hash=merged.versions_hash,
+        actor_map=tuple(sorted(actor_map.items())),
+        actor_map_hash=_stable_hash(sorted(actor_map.items())),
+        serializer_version=SERIALIZER_VERSION,
+        serializer_config_hash=_stable_hash(dict(shared.serializer_config)),
+        capability_profile_hash=shared.capability_profile_hash,
+        tool_schema_version=shared.tool_schema_version,
+        coverage=shared.coverage,
+        receipt_feature_epoch_ts=merged.receipt_feature_epoch_ts,
+        receipt_map=tuple((r.ts, r.state, r.turn_id, r.thread_root_ts) for r in merged.receipts),
+        sidecars=merged,
+        serializer_config=dict(shared.serializer_config),
+        chrome_ts=chrome_ts)
+    return pinned, origin_fetch.pages
+
+
 async def build_channel_stream(*, client: Any, db: Any, team_id: str, channel_id: str,
                                h: str, frontier: int = 0,
+                               origin_root_ts: Optional[str] = None,
                                capability_profile_hash: str = "",
                                tool_schema_version: str = "",
                                drain_timeout: Optional[float] = None,
-                               budget: Optional[FetchBudget] = None,
+                               reach_tools: Tuple[str, ...] = (),
+                               history_budget: Optional[FetchBudget] = None,
+                               reply_budget: Optional[FetchBudget] = None,
+                               origin_budget: Optional[FetchBudget] = None,
                                barrier_context: Optional[Dict[str, Any]] = None,
                                turn_id: Optional[str] = None,
-                               origin_thread_ts: Optional[str] = None,
-                               trigger_ts: Optional[str] = None,
-                               namespace: str = PROD_NAMESPACE,
-                               snapshot: Optional[Mapping[str, Any]] = None,
-                               selection_result: Optional[str] = None
-                               ) -> ChannelStream:
-    """Build one channel turn's stream. Steps 4–9 of the channel turn (spec §3).
+                               trigger_ts: Optional[str] = None) -> StreamBuildResult:
+    """Build one channel turn's stream. THE COMPOSITION of the phases above.
 
-    `snapshot` is the RESOLVED §1b selection row the caller pinned — None means the caller
-    resolved genesis. Passing it is what makes the window a post-boundary one and puts the A2
-    summary at the head of the stream.
+    Its signature, its position in the turn and its observable behaviour are what every caller
+    sees; internally it awaits `prepare_channel_turn`, then runs the origin fetch CONCURRENTLY
+    with `build_channel_pin`, then `build_origin_pin`. That split is what lets one periphery be
+    serialized under two origins.
 
-    Raises SnapshotUnsupportedError when a pointer exists that the caller never resolved,
-    CoverageNotReady when the bootstrap has not settled or its floor is newer than H,
-    StreamTimestampError when anything on the path cannot be placed in time, and HistoryFetchError
-    when the index has not caught up or a fetch cannot be completed. Every one of those is
-    fail-closed on purpose: a channel turn that cannot see the whole window must say so.
+    The three budget parameters are TEST-ONLY SEAMS. Production passes none: the builder takes
+    ONE absolute deadline the instant the prepare phase returns and constructs all three from it.
     """
-    _checked_ts(h, "H")
+    prepared = await prepare_channel_turn(
+        client=client, db=db, team_id=team_id, channel_id=channel_id, h=h, frontier=frontier,
+        drain_timeout=drain_timeout, barrier_context=barrier_context)
 
-    # Step 4 — selection belongs to the caller (§1a: drain, resolve pending invalidation, THEN
-    # select and pin). A caller that skipped it while a pointer exists is about to render a raw
-    # window that a durable decision says is wrong, so the turn stops instead.
-    if snapshot is None:
-        getter = getattr(db, "get_active_snapshot_async", None)
-        if callable(getter):
-            pointer = await getter(team_id, channel_id, SERIALIZER_VERSION)
-            if pointer:
-                _emit_snapshot_read(channel_id, pointer)
-                raise SnapshotUnsupportedError(
-                    f"{channel_id} has an active compaction snapshot this turn did not resolve")
+    # TAKEN HERE, NOT BEFORE THE DRAIN — "deadline at fetch start" means at FETCH start, and a
+    # drain that waits must not eat the fetch budget it is not part of.
+    # EVERY SUPPLIED BUDGET MUST CARRY THE SAME NON-None ABSOLUTE DEADLINE. The legacy
+    # `total_seconds` form is NOT accepted here, and that is the whole point: three budgets built
+    # with `total_seconds=60` each record their own start instant, so a turn could spend 180
+    # seconds while every budget reported itself within bounds. Accepting an all-None set would
+    # readmit exactly the defect the shared deadline exists to remove — the seam would look
+    # validated while the components ran on three independent clocks.
+    supplied = [b for b in (history_budget, reply_budget, origin_budget) if b is not None]
+    deadlines = {b.deadline_at for b in supplied}
+    if supplied and (None in deadlines or len(deadlines) > 1):
+        raise ChannelStreamError(
+            "injected fetch budgets must each carry the SAME absolute deadline_at; the "
+            "total_seconds form gives every component its own clock and is not accepted here "
+            f"(got {sorted(str(d) for d in deadlines)})")
+    deadline_at = next((d for d in deadlines if d is not None),
+                       time.monotonic() + float(config.fetch_retry_total_seconds))
+    origin_budget = origin_budget or FetchBudget(deadline_at=deadline_at, page_ceiling=None)
 
-    # Step 5 — the index must have caught up to everything inside the window. `drain` is the
-    # whole gate: it raises on a failed-unrepaired write at or below the frontier, and ignores
-    # anything above it, whose event sits outside this window by construction. Pre-checking the
-    # channel-wide degraded flag here would fail a turn for a write it could not have seen.
-    await admission_watermark.drain(channel_id, frontier, timeout=drain_timeout)
-
-    # Step 6 — ONE sidecar transaction, committed and closed before any Slack call. The window
-    # is resolved INSIDE it: at genesis the floor IS the coverage row this read returns, so
-    # deriving it outside would mean a second transaction and a floor that could disagree with
-    # the rows predicated on it. `window=None` means genesis; a pinned snapshot passes its
-    # boundary, EXCLUSIVE — the boundary message is already inside the summary.
-    window = None
-    if snapshot is not None:
-        boundary_ts = _checked_ts(snapshot.get("boundary_ts"), "snapshot boundary_ts")
-        if parse_ts(boundary_ts) > parse_ts(h):
-            raise CoverageNotReady(
-                f"{channel_id} pinned snapshot boundary {boundary_ts} is newer than H={h}")
-        window = (boundary_ts, False)
-    # §1k ATOMICITY: rehydration's pre-boundary receipts are read HERE, inside the ONE canonical
-    # sidecar transaction. A second read would let rehydration see a different world than the
-    # stream it is attached to, and the landed window read retrieves receipts only inside
-    # `(boundary, H]` — not enough for rehydration's role and chrome decisions.
-    raw_sidecars = await db.read_channel_sidecars_async(team_id, channel_id, h, window=window,
-                                                       preboundary_receipts=True)
-    sidecars = _freeze_sidecars(raw_sidecars)
-    coverage = sidecars.coverage
-    if coverage is None or coverage.status not in TERMINAL_COVERAGE_STATUSES:
-        raise CoverageNotReady(
-            f"{channel_id} coverage is {coverage.status if coverage else 'unseeded'}; "
-            "the stream floor is not known yet")
-    if parse_ts(coverage.start_ts) > parse_ts(h):
-        raise CoverageNotReady(
-            f"{channel_id} coverage starts at {coverage.start_ts}, after H={h}")
-
-    floor_ts, floor_inclusive = sidecars.window
-
-    # Step 7 — the seam a live battery freezes to prove the stream is current as of admission.
-    await dev_barriers.post_admission(**{**(barrier_context or {}), "channel_id": channel_id,
-                                         "H": h, "floor_ts": floor_ts})
-
-    # Step 8 — fetch, normalize, serialize.
-    fetch_budget = budget if budget is not None else FetchBudget()
-    generation = actor_tail_module.generation(channel_id)
-    history = await _fetch_history(client, channel_id=channel_id, team_id=team_id,
-                                  floor_ts=floor_ts, floor_inclusive=floor_inclusive,
-                                  high=h, budget=fetch_budget)
-    roots = _root_inventory(history, sidecars, h)
-    collected: List[NormalizedMessage] = list(history)
-    if roots:
-        semaphore = asyncio.Semaphore(max(1, int(config.reply_fetch_concurrency)))
-
-        async def _one(root_ts: str) -> Tuple[str, List[NormalizedMessage]]:
-            async with semaphore:
-                return root_ts, await _fetch_replies(
-                    client, channel_id=channel_id, team_id=team_id, root_ts=root_ts,
-                    floor_ts=floor_ts, floor_inclusive=floor_inclusive, high=h,
-                    budget=fetch_budget)
-
-        tasks = [asyncio.ensure_future(_one(root)) for root in roots]
-        indexed = dict(sidecars.activity_event_ts)
-        for root_ts, messages in await _gather_or_cancel(tasks):
-            collected.extend(messages)
-            # Compare-and-clear, and only for roots the index actually flagged: the replies
-            # fetch for this root completed, so anything newer than what we pinned is a
-            # mutation we did not see and must stay dirty.
-            if root_ts in indexed:
-                await _clear_dirty(db, team_id=team_id, channel_id=channel_id,
-                                   root_ts=root_ts, event_ts=indexed[root_ts])
-
-    fetch_snapshot = tuple(_dedup(collected))
-    actor_map = await _build_actor_map(client, fetch_snapshot)
-    serializer_config = serializer_config_snapshot()
-    pinned = PinnedTuple(
-        team_id=team_id,
-        channel_id=channel_id,
-        snapshot=snapshot,
-        namespace=namespace,
-        window=(floor_ts, floor_inclusive),
-        H=h,
-        fetch_snapshot=fetch_snapshot,
-        sidecar_versions_hash=sidecars.versions_hash,
-        actor_map=actor_map,
-        actor_map_hash=_stable_hash(list(actor_map)),
-        serializer_version=SERIALIZER_VERSION,
-        serializer_config_hash=_stable_hash(serializer_config),
+    # The two components run CONCURRENTLY, and whichever fails first CANCELS the other and
+    # AWAITS it before propagating — an orphaned fetch would keep spending wall clock after the
+    # turn had already failed.
+    shared_task = asyncio.ensure_future(build_channel_pin(
+        prepared, client=client, db=db, reach_tools=reach_tools,
         capability_profile_hash=capability_profile_hash,
-        tool_schema_version=tool_schema_version,
-        coverage=coverage,
-        receipt_feature_epoch_ts=sidecars.receipt_feature_epoch_ts,
-        receipt_map=tuple((r.ts, r.state, r.turn_id, r.thread_root_ts)
-                          for r in sidecars.receipts),
-        sidecars=sidecars,
-        serializer_config=serializer_config,
-    )
-    stream = serialize_stream(pinned)
-    stream = replace(stream, preboundary_receipts=tuple(
-        _frozen_row(row) for row in (raw_sidecars.get("preboundary_receipts") or ())))
-    _emit_stream_render(stream, turn_id=turn_id, origin_thread_ts=origin_thread_ts,
-                        trigger_ts=trigger_ts, selection_result=selection_result)
+        tool_schema_version=tool_schema_version, deadline_at=deadline_at,
+        history_budget=history_budget, reply_budget=reply_budget))
+    origin_task = asyncio.ensure_future(fetch_origin_thread(
+        client, channel_id, origin_root_ts, h, origin_budget, trigger_ts))
+    shared, origin_fetch = await _gather_or_cancel([shared_task, origin_task])
 
-    # Step 9 — hydrate the actor tail from what the fetch actually saw. Live wins on a
-    # mismatch: a message that arrived mid-fetch is newer than anything we just read.
-    #
-    # OUR OWN messages are filtered out, exactly as the live feed filters them. The tail is a
-    # bounded ring answering "has another bot spoken in this thread", and a self record does not
-    # count as another bot but does take a slot — hydrating them can evict the other-bot record
-    # that the continuation veto depends on, turning `thread_has_other_bot` false and letting a
-    # turn past the gate the veto was there to hold.
+    pinned, origin_pages = await build_origin_pin(shared, origin_fetch, db=db, client=client)
+    stream = serialize_stream(pinned)
+
+    # PERSIST F' — skipped when the floor is the sentinel or unchanged. A failure is a WARNING,
+    # never a turn failure: the bytes are already correct and the next turn re-derives the floor.
+    anchor_advanced = False
+    if shared.periphery_floor_ts and shared.periphery_floor_ts != (shared.floor_read or ""):
+        try:
+            anchor_advanced = bool(await db.advance_channel_window_anchor_async(
+                team_id, channel_id, shared.periphery_floor_ts, shared.selection_version))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"window anchor for {channel_id} not advanced: {e}")
+
+    # The actor tail is fed the PERIPHERY only, self messages filtered — feeding it the whole
+    # origin would let an old origin message evict the recent other-bot record the gate's
+    # continuation veto depends on.
     actor_tail_module.reconcile_window(
         channel_id,
-        [actor_tail_module.tail_record(m) for m in fetch_snapshot
+        [actor_tail_module.tail_record(m) for m in shared.periphery
          if m.sender_type != "self"],
-        window=(floor_ts, floor_inclusive, h),
-        expected_generation=generation)
-    return stream
+        window=(shared.periphery_floor_ts, True, h),
+        expected_generation=shared.generation)
+
+    result = StreamBuildResult(
+        stream=stream, reselected=shared.reselected, anchor_advanced=anchor_advanced,
+        pages=PageCounts(history=shared.pages.history, reply=shared.pages.reply,
+                         origin=origin_pages))
+    _emit_stream_render(result, turn_id=turn_id, origin_root_ts=origin_root_ts,
+                        trigger_ts=trigger_ts)
+    return result
 
 
 def _freeze_sidecars(payload: Optional[Dict[str, Any]]) -> SidecarPin:
@@ -1719,9 +2468,9 @@ def _freeze_sidecars(payload: Optional[Dict[str, Any]]) -> SidecarPin:
     data = payload or {}
     coverage_row = data.get("coverage") or None
     coverage = None
-    if coverage_row and coverage_row.get("coverage_start_ts"):
-        coverage = CoveragePin(
-            start_ts=_checked_ts(coverage_row["coverage_start_ts"], "coverage_start_ts"),
+    if coverage_row and coverage_row.get("inventory_start_ts"):
+        coverage = InventoryPin(
+            start_ts=_checked_ts(coverage_row["inventory_start_ts"], "inventory_start_ts"),
             status=str(coverage_row.get("bootstrap_status") or ""),
             reason=coverage_row.get("reason"))
     receipts = tuple(

@@ -50,10 +50,6 @@ KIND_EDIT = "edit"
 KIND_DELETE = "delete"
 KIND_TOMBSTONE = "tombstone"
 
-# NormalizedEvent.kind → the durable mutation vocabulary (spec §1c), which has exactly two
-# values. A tombstone is a deletion: the message is gone, whichever envelope announced it.
-MUTATION_KIND_NAMES = {KIND_EDIT: "edit", KIND_DELETE: "delete", KIND_TOMBSTONE: "delete"}
-
 # Every key Slack uses to name a sender. A deletion payload carrying none of them tells us
 # nothing about who deleted what, which is what sends the caller to the receipt ledger.
 _IDENTITY_KEYS = ("user", "bot_id", "app_id", "api_app_id")
@@ -219,10 +215,6 @@ class NormalizedEvent:
     owner_probe_ts: Optional[str]
     deleted_ts: Optional[str]
     message: Optional[NormalizedMessage]
-    # Slack's own delivery id when the envelope carries one. Bolt hands the listener the inner
-    # `event` object, which usually does not, so this is normally None and the identity falls
-    # back through mutation_observation_identity().
-    event_id: Optional[str] = None
 
 
 def _sender_type(client: Any, payload: Dict[str, Any]) -> str:
@@ -413,38 +405,14 @@ def mutation_subject(event: Dict[str, Any]) -> Any:
 def mutation_subject_ts(event: Dict[str, Any]) -> Optional[str]:
     """The ts of the message that was edited or deleted — never the envelope's own.
 
-    This is the `subject_ts` of a durable snapshot-invalidation observation (spec §1c), so it is
-    computed HERE and nowhere else: a second reader that fell back to `event_ts` would key the
-    observation on when the edit happened instead of on what it changed, and no snapshot covering
-    the edited message would ever be invalidated.
+    Computed HERE and nowhere else: a second reader that fell back to `event_ts` would name when
+    the edit happened rather than what it changed, and the two disagree on every mutation.
     """
     subject = mutation_subject(event)
     if not isinstance(subject, dict):
         return None
     ts = subject.get("ts")
     return str(ts) if ts else None
-
-
-def mutation_kind(event: NormalizedEvent) -> Optional[str]:
-    """`'edit' | 'delete'` for a mutation, None for an ordinary message."""
-    return MUTATION_KIND_NAMES.get(event.kind)
-
-
-def mutation_observation_identity(event: NormalizedEvent) -> str:
-    """The NEVER-NULL identity of one mutation observation (spec §1c).
-
-    Slack's event id when the delivery carries one, else the activity ts, else the subject's own
-    ts. It is a PURE FUNCTION OF THE PAYLOAD by requirement, not by preference: the row is
-    inserted OR IGNORE on a unique key that includes it, and a ticket replay re-derives it — a
-    clock reading or a uuid here would insert a second row for the one event every retry, and the
-    idempotency the unique key exists to give would be gone. SQLite treats NULLs as distinct, so
-    a null identity would defeat it just as completely.
-    """
-    if event.event_id:
-        return str(event.event_id)
-    if event.activity_ts:
-        return str(event.activity_ts)
-    return f"subject:{event.subject_ts}"
 
 
 def _has_reply_hints(payload: Dict[str, Any]) -> bool:
@@ -557,7 +525,6 @@ def normalize_slack_event(client: Any, event: Any) -> Optional[NormalizedEvent]:
         owner_probe_ts=probe,
         deleted_ts=str(deleted_ts) if deleted_ts else None,
         message=message,
-        event_id=str(event["event_id"]) if event.get("event_id") else None,
     )
 
 

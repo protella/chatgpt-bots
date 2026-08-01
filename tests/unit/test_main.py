@@ -1291,6 +1291,39 @@ class TestShutdownQuiescesTurns:
                          "close_issuance", "drain_worker", "late_receipts"]
 
     @pytest.mark.asyncio
+    async def test_the_shutdown_phase_order_is_unchanged(self, bot):
+        """T5. The coordinator used to stop between the late-receipt drain and DB teardown, and
+        removing it must leave the FXC-pinned sequence byte-for-byte in place. Asserted as the
+        WHOLE list rather than as an absence, because a removal that also reordered its
+        neighbours would pass every "is it gone" check and still break the contract."""
+        from message_processor import outbound_receipts
+        from slack_client import admission_watermark
+        from slack_client.event_handlers import registration
+
+        order = []
+        bot.receipt_service = Mock()
+        bot.receipt_service.shutdown = AsyncMock()
+        bot.receipt_service.drain_late_arrivals = AsyncMock(
+            side_effect=lambda *a, **k: order.append("drain_late_arrivals"))
+        with patch.object(admission_watermark, "close_issuance",
+                          side_effect=lambda: order.append("close_issuance")), \
+             patch.object(outbound_receipts, "drain_channel_post_callbacks",
+                          new=AsyncMock()), \
+             patch.object(registration, "drain_ingress_callbacks",
+                          new=AsyncMock(side_effect=lambda *a, **k: (
+                              order.append("drain_ingress_callbacks"),
+                              registration.IngressDrain())[1])), \
+             patch.object(admission_watermark, "shutdown",
+                          new=AsyncMock(
+                              side_effect=lambda *a, **k: order.append("watermark.shutdown"))):
+            bot.client.stop = AsyncMock(side_effect=lambda: order.append("client.stop"))
+            await bot.shutdown()
+
+        assert order == ["client.stop", "drain_ingress_callbacks", "close_issuance",
+                         "watermark.shutdown", "drain_late_arrivals"]
+        assert not hasattr(bot, "snapshot_coordinator")
+
+    @pytest.mark.asyncio
     async def test_a_callback_straddling_client_stop_is_drained_before_the_worker_stops(self, bot):
         """r2-5. `await client.stop()` returning is NOT quiescence: Bolt dispatches each event as
         its own task, and production stop force-marks sessions closed and abandons the handler's
@@ -1441,7 +1474,7 @@ class TestShutdownQuiescesTurns:
             def __init__(self):
                 self.db = Mock()
                 self.db.seed_channel_coverage_async = AsyncMock()
-                self.db.record_activity_and_mutation_async = AsyncMock(side_effect=self._write)
+                self.db.record_thread_activity_async = AsyncMock(side_effect=self._write)
 
             async def _write(self, *a, **k):
                 # Contended WAL for every in-line attempt; the background repair is what lands.

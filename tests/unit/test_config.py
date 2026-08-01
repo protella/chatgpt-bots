@@ -570,3 +570,66 @@ class TestDocExtractionWorkers:
     def test_floor_of_one(self):
         config = BotConfig()
         assert config.doc_extraction_workers == 1
+
+
+# ============================================ the shallow window's two values (§2d, §4.1)
+
+class TestChannelWindowConfig:
+    """The window REJECTS a bad value rather than clamping it.
+
+    `max(1, int(...))` would silently turn an owner's `0` into `1` and call it validated — the
+    bot would then run a policy nobody chose, and the misconfiguration would surface as odd
+    context sizing months later rather than as a refusal to start.
+    """
+
+    def test_the_defaults_are_the_pinned_ones(self):
+        """THE ONE TEST ALLOWED TO NAME THESE NUMBERS. Nothing else may assume 50/100 or that
+        the ratio between them is 2:1 — the owner intends to raise the ceiling."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CHANNEL_WINDOW_TARGET", None)
+            os.environ.pop("CHANNEL_WINDOW_CEILING", None)
+            config = BotConfig()
+        assert config.channel_window_target == 50
+        assert config.channel_window_ceiling == 100
+
+    @pytest.mark.parametrize("target,ceiling", [
+        ("0", "100"),      # zero roots is not a window
+        ("-1", "100"),     # negative
+        ("50", "50"),      # equal: re-anchors on every new root
+        ("100", "50"),     # inverted
+        ("-5", "-1"),      # both negative, still ordered
+    ])
+    def test_an_out_of_range_pair_raises_and_names_both_values(self, target, ceiling):
+        with patch.dict(os.environ, {"CHANNEL_WINDOW_TARGET": target,
+                                     "CHANNEL_WINDOW_CEILING": ceiling}):
+            with pytest.raises(ValueError) as excinfo:
+                BotConfig()
+        message = str(excinfo.value)
+        assert target in message and ceiling in message, (
+            "the refusal must name BOTH values — an operator reading it needs to know which one "
+            f"to change, got: {message}")
+        assert "CHANNEL_WINDOW_TARGET" in message and "CHANNEL_WINDOW_CEILING" in message
+
+    @pytest.mark.parametrize("target,ceiling", [("1", "2"), ("50", "100"), ("200", "400")])
+    def test_a_valid_pair_loads(self, target, ceiling):
+        with patch.dict(os.environ, {"CHANNEL_WINDOW_TARGET": target,
+                                     "CHANNEL_WINDOW_CEILING": ceiling}):
+            config = BotConfig()
+        assert (config.channel_window_target, config.channel_window_ceiling) == (
+            int(target), int(ceiling))
+
+    @pytest.mark.parametrize("bad", ["abc", "", "1.5", "fifty"])
+    def test_a_non_integer_raises_out_of_int(self, bad):
+        """int() is the loud failure we want, and it fires at CONSTRUCTION — before any channel
+        turn can render a window sized by a value nobody could parse."""
+        with patch.dict(os.environ, {"CHANNEL_WINDOW_TARGET": bad}):
+            with pytest.raises(ValueError):
+                BotConfig()
+
+    def test_the_values_are_not_clamped(self):
+        """The mutation this test exists to catch: restoring `max(1, int(...))` makes the zero
+        case load as 1 instead of raising, and the refusal above becomes unreachable."""
+        with patch.dict(os.environ, {"CHANNEL_WINDOW_TARGET": "0",
+                                     "CHANNEL_WINDOW_CEILING": "100"}):
+            with pytest.raises(ValueError):
+                BotConfig()

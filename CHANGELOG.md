@@ -141,10 +141,12 @@ retention** — they're your rollback path, so nothing deletes them but you.
 ### 🧵 Changed - A channel is one conversation now, not a stack of keyholes
 
 Channel answers used to be built from the current thread plus a short "recent activity" list.
-The bot now rebuilds the whole room as a single time-ordered stream — every message, every
-thread labeled in place — so it follows the channel the way a person scrolling it would, and
-stops missing context that lived one thread over. Still stateless: the view is rebuilt from
-Slack on every turn, and nothing new is stored.
+The bot now rebuilds the room as a single time-ordered stream — the most recent ~50
+conversations with their replies in place (`CHANNEL_WINDOW_TARGET`/`CHANNEL_WINDOW_CEILING`),
+plus the *complete* thread it's answering in however far back that goes — so it follows the
+channel the way a person scrolling it would, and stops missing context that lived one thread
+over. Messages inside the window arrive whole: no truncation, no per-thread caps. Still
+stateless: the view is rebuilt from Slack on every turn, and nothing new is stored.
 
 ### 🔀 Added - It answers where the answer belongs
 
@@ -153,14 +155,20 @@ directly into that other thread instead of talking about it from the wrong one. 
 under the right root, and its own posts are tracked with receipts so it never loses track of
 what it already said, even across restarts.
 
-### 🗜️ Added - Busy channels get summarized instead of erroring
+### 🗜️ Changed - Busy channels just work now
 
 Very active channels could fail outright with "Couldn't Load Conversation History" once their
-history outgrew what a single turn may fetch. Hitting that limit now triggers a background
-compaction pass that condenses older history into a stored summary; later turns read the
-summary plus the live recent window. Summaries hold only digests and structure — message text
-still lives exclusively in Slack. (Window sizing is being retuned; the current bounds are
-generous.)
+history outgrew what a single turn may fetch. The recent-window model above makes channel size
+irrelevant: a turn fetches the newest conversations and stops, whether the channel holds a
+hundred messages or a million. (An earlier v3 design summarized old history into stored
+digests; it was replaced by the window before release, and nothing is stored.)
+
+### 🧹 Fixed - A deleted thread can't wedge a channel anymore
+
+If a thread the bot remembered was later deleted from Slack, every answer in that channel
+failed — permanently, because the stale record fed the same failing lookup on every turn. A
+thread that Slack says no longer exists is now quietly skipped and its stale record cleaned
+up, while real fetch errors still stop the turn loudly.
 
 ### 📒 Changed - The participation ledger grew up (operators)
 

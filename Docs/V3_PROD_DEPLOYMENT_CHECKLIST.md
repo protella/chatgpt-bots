@@ -3,7 +3,8 @@
 Everything that has to happen on **beastbox** beyond `git pull`. Written 2026-07-11 from a
 read-only survey of the live prod box. Nothing here has been executed yet.
 
-> **Living document.** v3 work is still landing (pinning/canvas support among it). Re-check the
+> **Living document.** v3 work is still landing (pinning/bookmarks among it; canvas support has
+> since merged, and so has the single-stream channel rebuild). Re-check the
 > `.env` deltas (step 6) and manifest scopes (step 9) against `.env.example` and
 > `slack_app_manifest.example.yml` immediately before running the upgrade — those two files are the
 > source of truth, this is the operator's map.
@@ -78,8 +79,10 @@ Without it, `ENABLE_PDF_OCR=true` degrades **silently** — scanned PDFs just co
 ```bash
 ./bin/pip install --require-hashes -r requirements.txt    # as blackhawk; installs into the in-place venv
 ```
-New since v2.5.1: `pytesseract`, `pdf2image`, `aiofiles`, `striprtf` (F49 .rtf extraction), and an
-`openai >= 2.45` bump. `python-magic` is gone (so libmagic is no longer needed).
+New since v2.5.1: `pytesseract`, `pdf2image`, `aiofiles`, `striprtf` (F49 .rtf extraction),
+`tiktoken` (the channel admission estimate counts real o200k tokens; without it the estimate
+degrades to a byte ratio), and an `openai >= 2.45` bump. `python-magic` is gone (so libmagic is no
+longer needed).
 
 **Do not skip this install even if the code "looks" already pulled.** `beautifulsoup4` was
 added to the lockfile in the pre-release hardening pass — it's imported for canvas parsing but
@@ -121,15 +124,10 @@ bot answer a message aimed at the humans in the room. Note the curve is NOT mono
 scored *worse* than `low` on the headline case, because the extra reasoning talks itself past the
 addressee rules. Do not "improve" this to `high`.
 
-**`GATE_VISION_DETAIL` is the one that matters, and it now defaults to `high`** (no action needed;
-prod inherits it). The participation gate had its own explicit `low`, which hands the model a
-512px thumbnail — and the gate's `image_observations` become the image's *stored description*, the
-durable record every later turn answers from. At `low` it read a rollback token as `RB-7C10-Q9`
-when the pixels said `RB-7C10-QQ`, and the bot repeated that as fact days later. It is `high`
-rather than `auto`/`original` on purpose: this is the highest-volume vision call in the system
-(every channel image while listening is on) and it runs on the debounce hot path, so its cost has
-to stay bounded. Set `GATE_VISION_DETAIL = "low"` if that volume proves too expensive in prod —
-accepting that image descriptions become unreliable on fine text.
+**`GATE_VISION_DETAIL` is gone — do not set it.** The gate no longer looks at images at all; it
+asks one question, wake or don't. Image description is now the ambient-memory path (`ANALYSIS_*`
+efforts above, `ENABLE_AMBIENT_IMAGE_MEMORY`), which runs off the debounce hot path, so the
+cost/fidelity trade the old variable existed to make is no longer a knob anyone has to set.
 
 Everything else model-shaped already matches dev (temperature 1.0, top_p 1.0, image size/quality/
 format/fidelity, empty `WEB_SEARCH_MODEL`).
@@ -142,6 +140,13 @@ REPORTPRO_SLASH_COMMAND
 ELEVENLABS_KEY          # unused by this bot
 OPENAI_KEY_PERSONAL     # unused by this bot
 ```
+Also dead if prod ever picked them up from a dev `.env` — all four are now read by nothing:
+```
+ENABLE_BACKGROUND_IMAGE_GEN   # detached generation is the only path; there is no sync fallback to switch to
+ENABLE_VISION_ENHANCEMENT     # the legacy rewrite hop is gone; vision models answer directly
+SNOOZE_ACK_EMOJI              # nothing snoozes on a timer any more (F15)
+GATE_VISION_DETAIL            # the gate does not look at images at all (see 6a)
+```
 
 ### 6c. Add — prod-specific, must be set explicitly
 ```
@@ -151,15 +156,31 @@ ENABLE_CHANNEL_LISTENING = "true"                                     # all feat
 ENABLE_DEEP_RESEARCH = "true"
 ENABLE_FEEDBACK_BUTTONS = "false"                                     # the one feature we leave off
 SLACK_NATIVE_STREAMING = "true"                                       # validated live in dev since 2026-07-09; kills the "(edited)" markers on streamed replies
-ENABLE_MENTION_PLACEMENT_MODEL = "true"                               # F46 thread-vs-channel judgment for plain-text mentions; code default is false
 ENABLE_EDIT_TRIGGERED_REPLIES = "true"                                # meaningful message edits go through the participation judgment; code default is false
-CHANNEL_PULSE_ENVELOPE_MAX = "50"                                     # dev runs 50 (matches Claude Tag's observed backfill); code default is 15
 ```
-> **Pending — single-stream redesign:** `Docs/SINGLE_STREAM_SPEC.md` (approved, in build)
-> retires the pulse ring/envelope and introduces new env keys (stream/coverage/claims/compaction;
-> dev-only `DEV_TURN_BARRIERS` must stay EMPTY in prod). Update this section from the spec's §11
-> config table when that work merges — until then the line above stands.
-The other ~84 new keys can be omitted — each has a working default (and every remaining feature
+> **The single-stream rebuild has merged** (`Docs/SINGLE_STREAM_SPEC.md`). The channel pulse ring
+> and its envelope are **retired**, so `ENABLE_CHANNEL_PULSE`, `CHANNEL_PULSE_SIZE`,
+> `CHANNEL_PULSE_ENVELOPE_MAX`, `PULSE_TEXT_TRUNCATE` and `PULSE_THREAD_TAILS_MAX` are read by
+> nothing — delete them if prod ever had them set. The per-thread **actor tail survives** under
+> `PARTICIPATION_THREAD_TAIL` (default 15), which is no longer a prompt input: it is only how the
+> bot spots a second agent in a thread. `ENABLE_MENTION_PLACEMENT_MODEL` is likewise gone.
+>
+> The stream/inventory/history keys it introduced (`COVERAGE_BOOTSTRAP_DAYS`,
+> `HISTORY_PAGE_SIZE`/`_CEILING`, `REPLY_FETCH_CONCURRENCY`, `FETCH_RETRY_*`,
+> `COVERAGE_SWEEP_CONCURRENCY`, `INDEX_DRAIN_TIMEOUT_SECONDS`, `INGRESS_DRAIN_TIMEOUT_SECONDS`)
+> **all have working defaults** — nothing here is required, and there is no longer any boot-time
+> rule tying two of them together.
+>
+> **Background compaction was never deployed and has been removed.** `SNAPSHOT_RETAIN_*`,
+> `COMPACTION_TRIGGER_RATIO`/`_TARGET_RATIO` and `ROOT_ANCHOR_TEXT_MAX` are read by nothing —
+> delete them if prod ever had them set. Deeper history is reached with `search_slack` and the
+> history-fetch tools instead. The first boot after this upgrade drops the compaction tables in
+> one recorded migration; nothing dropped is a transcript, and no manual step is needed.
+>
+> **`DEV_TURN_BARRIERS` must stay EMPTY (unset) in prod.** It is a dev-only test seam — the two
+> seams are `post_admission` and `post_partial_post` — and unset it is a hard no-op that touches
+> nothing on the turn path. Same for `DEV_TREAT_BOT_IDS_AS_HUMAN`.
+The other new keys can be omitted — each has a working default (and every remaining feature
 defaults **on**, which is the posture we want), and `.env.example` documents each one inline if you
 prefer to pin them explicitly. Ambient memory (F51: quiet notes on links/images/files for later
 recall) is among the defaults-on set — its ~24 `AMBIENT_*`/`LINK_FETCH_*` knobs and the new
@@ -178,7 +199,7 @@ few seconds after upload:
   carries no provenance. Only read when `ENABLE_TOOL_PROVENANCE` is on.
 
 ### 6d. Consider — log levels
-Prod runs `DEBUG` across the board. v3 is considerably chattier (channel pulse, participation
+Prod runs `DEBUG` across the board. v3 is considerably chattier (channel stream builds, participation
 judgments, tool loop), and DEBUG logs message content. Recommend `INFO` for
 `SLACK_LOG_LEVEL` / `BOT_LOG_LEVEL` / `UTILS_LOG_LEVEL`.
 
@@ -241,9 +262,11 @@ search:read.public · search:read.private · search:read.im · search:read.mpim
 search:read.files · search:read.users
 bookmarks:read · bookmarks:write · canvases:read · canvases:write · pins:write
 ```
-The last line is **staged for the pinning/canvas work still in flight** — no v3 code calls those
-APIs yet. They're included deliberately so this one reinstall covers that feature too, instead of
-needing a second reinstall in a week.
+On that last line, `canvases:read` / `canvases:write` are now **live** — the canvas tools shipped
+(`ENABLE_CANVAS_TOOLS`, default on), and without both scopes they fail quietly. `pins:read` is used
+by the history tool. `bookmarks:read` / `bookmarks:write` / `pins:write` are still **staged for the
+pinning work in flight** — no code calls them yet. They're included deliberately so this one
+reinstall covers that feature too, instead of needing a second reinstall in a week.
 Add to event subscriptions:
 ```
 reaction_added · reaction_removed · app_home_opened · app_context_changed
@@ -277,11 +300,31 @@ DB: Mirror-drop migration complete — removed N cached message row(s), reclaime
 Created backup: data/backups/slack_pre-v3-doc-content-drop_<ts>.db
 DB: Doc-content-drop migration complete — synthesized N summary(ies)
 ```
-Any `DB: Migration step '<name>' FAILED` line means that step did not complete — the bot will still
-start, but stop and investigate.
+Then, only if there is anything to clean up, the participation-redesign steps (per-thread mutes were
+removed entirely, so their storage goes with them):
 
-New tables (`ambient_artifacts`, `thread_summary_addenda`) create themselves silently on first
-boot — no migration line, nothing to do.
+```
+DB: Cleared legacy muted_threads JSON on N channel(s)
+DB: Removed N stale participation-engine memory fact(s)
+```
+Both are conditional — silence just means prod had none. The `channel_thread_mutes` table is
+dropped in the same pass with no line of its own.
+
+Any `DB: Migration step '<name>' FAILED` line means that step did not complete — the bot will still
+start, but stop and investigate. Three migrations are deliberately **fatal** rather than logged —
+the compaction-schema drop, the `channel_coverage` inventory rename and the channel-document
+uniqueness dedup halt startup rather than serve traffic on a half-migrated schema.
+
+The compaction drop and the rename each run **once** and record a `bot_meta` marker; on a database
+that never had the tables, or that has already been renamed, both are no-ops. Expect:
+
+```
+DB: renamed channel_coverage coverage_* columns to inventory_*
+```
+
+New tables create themselves silently on first boot — no migration line, nothing to do:
+`ambient_artifacts`, `thread_summary_addenda`, and the single-stream set (`channel_thread_activity`,
+`channel_coverage`, `outbound_receipts`, `pending_share_receipts`).
 
 **Expect the DB to shrink a lot** (the message mirror and all document content are dropped).
 Everyone's model/effort resets to `gpt-5.6-sol` / `medium` — that's intended, and users can re-pick.

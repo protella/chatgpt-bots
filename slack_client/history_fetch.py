@@ -21,7 +21,8 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional
+from typing import (Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping,
+                    Optional)
 
 from slack_sdk.errors import SlackApiError
 
@@ -68,22 +69,52 @@ class PageResult:
         return bool(self.has_more or self.next_cursor)
 
 
+# The "no ceiling given" sentinel. Module-level so callers can name it and tests can assert
+# identity. A plain object() is deliberate: any typed default would be a value some caller could
+# pass by accident, and `None` already means something else here (see the three-state table).
+_USE_CONFIG_CEILING: Any = object()
+
+
 class FetchBudget:
-    """One per turn: a wall-clock deadline and an atomic total-page counter.
+    """One per COMPONENT: a wall-clock deadline and an atomic total-page counter.
 
     The counter is charged under a lock because concurrent replies fetches share it; without
     that, N tasks each read the same count and the ceiling bounds one fetch instead of the turn.
+
+    THE PAGE CEILING HAS THREE STATES, and the sentinel is what makes them expressible:
+
+      * `page_ceiling` OMITTED  -> read `config.history_page_ceiling` (every landed caller);
+      * `page_ceiling=None`     -> UNBOUNDED: pages are still counted and the deadline is still
+                                   checked, so the component is bounded by wall clock alone;
+      * `page_ceiling=<int>`    -> exactly that ceiling.
+
+    `None` cannot mean "unbounded" and "read config" at once, which is why omission is a distinct
+    sentinel rather than `None` (SHALLOW_STREAM_RESPEC §4.3).
+
+    THE DEADLINE HAS TWO FORMS, and only one of them can be SHARED:
+
+      * `total_seconds` — a window that starts when THIS budget is constructed. Three budgets
+        built with `total_seconds=60` therefore have three different deadlines and a turn could
+        spend 180 seconds;
+      * `deadline_at` — an ABSOLUTE `time.monotonic()` instant, computed once by the caller and
+        handed to every component. When it is set `total_seconds` is IGNORED.
     """
 
     def __init__(self, *, total_seconds: Optional[float] = None,
-                 page_ceiling: Optional[int] = None,
+                 deadline_at: Optional[float] = None,
+                 page_ceiling: Any = _USE_CONFIG_CEILING,
                  clock: Callable[[], float] = time.monotonic):
         self._clock = clock
         self._started = clock()
+        self._deadline_at = None if deadline_at is None else float(deadline_at)
         self._total_seconds = float(
             config.fetch_retry_total_seconds if total_seconds is None else total_seconds)
-        self._ceiling = int(
-            config.history_page_ceiling if page_ceiling is None else page_ceiling)
+        if page_ceiling is _USE_CONFIG_CEILING:
+            self._ceiling: Optional[int] = int(config.history_page_ceiling)
+        elif page_ceiling is None:
+            self._ceiling = None
+        else:
+            self._ceiling = int(page_ceiling)
         self._pages = 0
         self._lock = asyncio.Lock()
 
@@ -91,17 +122,33 @@ class FetchBudget:
     def pages_used(self) -> int:
         return self._pages
 
+    @property
+    def deadline_at(self) -> Optional[float]:
+        """The ABSOLUTE deadline this budget was built against, or None.
+
+        Public because the one-deadline rule is only enforceable at the boundary that can read
+        it: an origin fetch carries this forward on its result so the pin that consumes it can
+        prove both components were built against the same clock.
+        """
+        return self._deadline_at
+
     def remaining_seconds(self) -> float:
+        if self._deadline_at is not None:
+            return self._deadline_at - self._clock()
         return self._total_seconds - (self._clock() - self._started)
 
     def check_deadline(self) -> None:
         if self.remaining_seconds() <= 0:
+            budget = (f"{self._total_seconds:g}s" if self._deadline_at is None
+                      else "shared-deadline")
             raise HistoryFetchError(
-                f"channel history fetch exceeded its {self._total_seconds:g}s budget")
+                f"channel history fetch exceeded its {budget} budget")
 
     async def charge_page(self) -> int:
         async with self._lock:
-            if self._pages >= self._ceiling:
+            # An unbounded budget still COUNTS — `pages_used` is reported per component — it
+            # simply has no ceiling to refuse against.
+            if self._ceiling is not None and self._pages >= self._ceiling:
                 raise HistoryFetchError(
                     f"channel history fetch hit the {self._ceiling}-page ceiling")
             self._pages += 1
@@ -254,6 +301,73 @@ async def fetch_page(method: Callable[..., Awaitable[Any]], params: Dict[str, An
     raise HistoryFetchError(f"{label} failed after {tries} attempt(s): {last}") from last
 
 
+async def iter_pages(method: Callable[..., Awaitable[Any]], *,
+                     channel_id: str,
+                     oldest: Optional[str] = None,
+                     latest: Optional[str] = None,
+                     inclusive: bool = True,
+                     limit: Optional[int] = None,
+                     budget: Optional[FetchBudget] = None,
+                     attempts: Optional[int] = None,
+                     sleeper: Optional[Callable[[float], Awaitable[None]]] = None,
+                     extra_params: Optional[Dict[str, Any]] = None,
+                     require_ts: bool = False,
+                     label: str = "history") -> AsyncIterator[List[Dict[str, Any]]]:
+    """Yield each page's raw message dicts AS IT ARRIVES, so a caller can stop early.
+
+    THIS IS `page_messages`' LOOP, EXPOSED RATHER THAN REWRITTEN. Every check is retained and the
+    cursor is followed identically; the only difference is that a page is handed to the caller
+    instead of accumulated. It exists because the shallow window's history walk must stop as soon
+    as it has proved enough roots — a function that buffers the whole window has already fetched
+    and paid for the pages it should have stopped before.
+
+    EVERY ANOMALY STILL RAISES rather than being yielded:
+      * `has_more`/cursor present with no `next_cursor` -> HistoryFetchError
+      * an empty page that still claims more            -> HistoryFetchError
+      * a page whose SHAPE is not a page                -> HistoryPageInvalid (via fetch_page)
+
+    A consumer that breaks out early simply stops asking; it can never suppress a raise, because
+    the raise happens while PRODUCING the page it is about to receive.
+    """
+    params: Dict[str, Any] = {
+        "channel": channel_id,
+        "limit": max(1, int(config.history_page_size if limit is None else limit)),
+        "inclusive": bool(inclusive),
+    }
+    if oldest is not None:
+        params["oldest"] = str(oldest)
+    if latest is not None:
+        params["latest"] = str(latest)
+    if extra_params:
+        params.update(extra_params)
+
+    cursor = ""
+    while True:
+        page_params = dict(params)
+        if cursor:
+            page_params["cursor"] = cursor
+        page = await fetch_page(method, page_params, budget=budget, attempts=attempts,
+                                sleeper=sleeper, require_ts=require_ts, label=label)
+
+        # VALIDATED BEFORE THE YIELD, and that ordering is the whole guarantee. A consumer that
+        # breaks immediately after receiving a page never resumes this generator, so anything
+        # checked AFTER the yield is skipped entirely by generator cleanup — the early-stopping
+        # walk would swallow exactly the malformed-continuation failures this function promises
+        # to raise. Validating first means a page is proved sound before anyone can act on it.
+        if page.claims_more:
+            if not page.next_cursor:
+                raise HistoryFetchError(
+                    f"{label} for {channel_id} claimed more messages with no cursor to follow")
+            if not page.messages:
+                raise HistoryFetchError(
+                    f"{label} for {channel_id} returned an empty page that still claimed more")
+
+        yield page.messages
+        if not page.claims_more:
+            return
+        cursor = page.next_cursor
+
+
 async def page_messages(method: Callable[..., Awaitable[Any]], *,
                         channel_id: str,
                         oldest: Optional[str] = None,
@@ -268,37 +382,18 @@ async def page_messages(method: Callable[..., Awaitable[Any]], *,
                         label: str = "history") -> List[Dict[str, Any]]:
     """Walk every page of one window and return the raw message dicts.
 
+    UNCHANGED for every existing caller — it is now literally the drain of `iter_pages`, with the
+    same signature, the same return and the same raises. The coverage sweep and the reply and
+    origin fetches keep using it and are byte-identical in behaviour.
+
     Fails closed on an anomalous page: `has_more` with no cursor, an empty page that still claims
     more, or a page whose shape is not a page at all (`_page_result`) — each one means we cannot
     honestly say we saw the whole window.
     """
-    params: Dict[str, Any] = {
-        "channel": channel_id,
-        "limit": max(1, int(config.history_page_size if limit is None else limit)),
-        "inclusive": bool(inclusive),
-    }
-    if oldest is not None:
-        params["oldest"] = str(oldest)
-    if latest is not None:
-        params["latest"] = str(latest)
-    if extra_params:
-        params.update(extra_params)
-
     collected: List[Dict[str, Any]] = []
-    cursor = ""
-    while True:
-        page_params = dict(params)
-        if cursor:
-            page_params["cursor"] = cursor
-        page = await fetch_page(method, page_params, budget=budget, attempts=attempts,
-                                sleeper=sleeper, require_ts=require_ts, label=label)
-        collected.extend(page.messages)
-        if not page.claims_more:
-            return collected
-        if not page.next_cursor:
-            raise HistoryFetchError(
-                f"{label} for {channel_id} claimed more messages with no cursor to follow")
-        if not page.messages:
-            raise HistoryFetchError(
-                f"{label} for {channel_id} returned an empty page that still claimed more")
-        cursor = page.next_cursor
+    async for messages in iter_pages(
+            method, channel_id=channel_id, oldest=oldest, latest=latest, inclusive=inclusive,
+            limit=limit, budget=budget, attempts=attempts, sleeper=sleeper,
+            extra_params=extra_params, require_ts=require_ts, label=label):
+        collected.extend(messages)
+    return collected
